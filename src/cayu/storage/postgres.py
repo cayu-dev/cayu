@@ -1014,7 +1014,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 83
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 76
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 84
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
 
@@ -3057,6 +3057,36 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS conditions_json JSONB",
         "ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS terminal_json JSONB",
         "ALTER TABLE cayu_session_message_deliveries ADD COLUMN IF NOT EXISTS reject_only BOOLEAN NOT NULL DEFAULT FALSE",
+    ),
+    84: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_preparation_holds (
+            hold_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            receipt_json TEXT NOT NULL CHECK (
+                octet_length(receipt_json) BETWEEN 1 AND 1097728
+                AND jsonb_typeof(receipt_json::jsonb) = 'object'
+            )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_lifecycle_receipts (
+            admission_id TEXT PRIMARY KEY
+                REFERENCES cayu_work_attempt_admissions(admission_id) ON DELETE RESTRICT,
+            settlement_id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            retired_contract_binding BOOLEAN NOT NULL,
+            settled_at TIMESTAMPTZ NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                octet_length(receipt_json) BETWEEN 1 AND 1097728
+                AND jsonb_typeof(receipt_json::jsonb) = 'object'
+            )
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_lifecycle_task "
+        "ON cayu_work_attempt_lifecycle_receipts(task_id, retired_contract_binding)",
     ),
     79: (
         """
@@ -5564,6 +5594,8 @@ async def preflight_migration(
         await _reject_populated_pre_verifier_profile_database(cur)
     if current < 59 and any(revision.revision == 59 for revision in planned):
         await _reject_populated_pre_result_resolver_database(cur)
+    if current < 84 and any(revision.revision == 84 for revision in planned):
+        await _reject_pre_worker_admission_history(cur)
     if current < 60 and any(revision.revision == 60 for revision in planned):
         await _reject_populated_pre_knowledge_relation_database(cur)
     if current < 63 and any(revision.revision == 63 for revision in planned):
@@ -5586,6 +5618,24 @@ async def preflight_migration(
     ):
         await _reject_populated_pre_knowledge_activation_database(cur)
     return state
+
+
+async def _reject_pre_worker_admission_history(cur: Any) -> None:
+    for table, authority in (
+        ("cayu_work_attempt_admissions", "work-attempt admissions"),
+        ("cayu_completion_verification_claims", "verification claims"),
+    ):
+        await cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table,))
+        row = await cur.fetchone()
+        if row is None or row[0] is not True:
+            continue
+        await cur.execute(f"SELECT EXISTS(SELECT 1 FROM {table})")
+        row = await cur.fetchone()
+        if row is None or row[0] is not False:
+            raise RuntimeError(
+                "Postgres revision 84 cannot reconstruct executable settings for existing "
+                f"{authority}. Recreate the pre-release database before migrating."
+            )
 
 
 async def _reject_populated_pre_interaction_database(cur: Any) -> None:
@@ -6259,6 +6309,10 @@ class _PostgresStoreBase:
                         revision.revision == 59 for revision in schema.pending(current)
                     ):
                         await _reject_populated_pre_result_resolver_database(cur)
+                    if current < 84 and any(
+                        revision.revision == 84 for revision in schema.pending(current)
+                    ):
+                        await _reject_pre_worker_admission_history(cur)
                     if (
                         current < 60
                         and any(revision.revision == 60 for revision in schema.pending(current))
@@ -6374,6 +6428,8 @@ class _PostgresStoreBase:
                             await self._validate_session_instance_schema(cur)
                         if self._min_required_revision >= 61:
                             await self._validate_work_attempt_admission_schema(cur)
+                        if self._min_required_revision >= 84:
+                            await self._validate_work_attempt_lifecycle_schema(cur)
                         if self._min_required_revision >= 62:
                             await self._validate_deferred_interaction_input_payloads(cur)
                             await self._validate_work_attempt_continuation_authority(cur)
@@ -6680,6 +6736,8 @@ class _PostgresStoreBase:
             await self._validate_session_message_lifecycle_columns(cur)
         if self._min_required_revision >= 61:
             await self._validate_work_attempt_admission_schema(cur)
+        if self._min_required_revision >= 84:
+            await self._validate_work_attempt_lifecycle_schema(cur)
         if self._min_required_revision >= 62:
             await self._validate_deferred_interaction_input_payloads(cur)
             await self._validate_work_attempt_continuation_authority(cur)
@@ -6816,6 +6874,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_relation_schema(cur)
         if revision.revision == 61:
             await self._validate_work_attempt_admission_schema(cur)
+        if revision.revision == 84:
+            await self._validate_work_attempt_lifecycle_schema(cur)
         if revision.revision == 62:
             await self._validate_deferred_interaction_input_payloads(cur)
             await self._validate_work_attempt_continuation_authority(cur)
@@ -9968,6 +10028,100 @@ class _PostgresStoreBase:
                 "revision-55 durability contract. Run `cayu storage migrate` or "
                 "restore the database from a known-good backup."
             )
+
+    async def _validate_work_attempt_lifecycle_schema(self, cur: Any) -> None:
+        await cur.execute(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = current_schema() "
+            "AND table_name = 'cayu_work_attempt_preparation_holds' ORDER BY ordinal_position"
+        )
+        if tuple(await cur.fetchall()) != (
+            ("hold_id", "text", "NO"),
+            ("task_id", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("receipt_json", "text", "NO"),
+        ):
+            raise RuntimeError("Postgres preparation hold columns conflict with revision 84.")
+        await cur.execute(
+            "SELECT c.contype, pg_get_constraintdef(c.oid, TRUE) "
+            "FROM pg_constraint AS c JOIN pg_class AS r ON r.oid = c.conrelid "
+            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+            "WHERE n.nspname = current_schema() AND r.relname = 'cayu_work_attempt_preparation_holds'"
+        )
+        hold_constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        )
+        if any(
+            not any(
+                kind == expected_kind and fragment in definition
+                for kind, definition in hold_constraints
+            )
+            for expected_kind, fragment in (
+                ("p", "primary key (hold_id)"),
+                ("f", "foreign key (task_id) references cayu_tasks(id) on delete restrict"),
+                ("c", "request_sha256 ~ '^[0-9a-f]{64}$'"),
+                ("c", "octet_length(receipt_json) >= 1"),
+                ("c", "octet_length(receipt_json) <= 1097728"),
+                ("c", "jsonb_typeof(receipt_json::jsonb) = 'object'"),
+            )
+        ):
+            raise RuntimeError("Postgres preparation hold constraints conflict with revision 84.")
+        await cur.execute(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = current_schema() "
+            "AND table_name = 'cayu_work_attempt_lifecycle_receipts' ORDER BY ordinal_position"
+        )
+        expected = (
+            ("admission_id", "text", "NO"),
+            ("settlement_id", "text", "NO"),
+            ("task_id", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("retired_contract_binding", "boolean", "NO"),
+            ("settled_at", "timestamp with time zone", "NO"),
+            ("receipt_json", "text", "NO"),
+        )
+        if tuple(await cur.fetchall()) != expected:
+            raise RuntimeError("Postgres work-attempt lifecycle columns conflict with revision 84.")
+        await cur.execute(
+            "SELECT c.contype, pg_get_constraintdef(c.oid, TRUE) "
+            "FROM pg_constraint AS c JOIN pg_class AS r ON r.oid = c.conrelid "
+            "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
+            "WHERE n.nspname = current_schema() AND r.relname = 'cayu_work_attempt_lifecycle_receipts'"
+        )
+        constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        )
+        required = (
+            ("p", "primary key (admission_id)"),
+            ("u", "unique (settlement_id)"),
+            (
+                "f",
+                "foreign key (admission_id) references cayu_work_attempt_admissions(admission_id) on delete restrict",
+            ),
+            ("f", "foreign key (task_id) references cayu_tasks(id) on delete restrict"),
+            ("c", "request_sha256 ~ '^[0-9a-f]{64}$'"),
+            ("c", "octet_length(receipt_json) >= 1"),
+            ("c", "octet_length(receipt_json) <= 1097728"),
+            ("c", "jsonb_typeof(receipt_json::jsonb) = 'object'"),
+        )
+        if any(
+            not any(
+                kind == required_kind and fragment in definition for kind, definition in constraints
+            )
+            for required_kind, fragment in required
+        ):
+            raise RuntimeError(
+                "Postgres work-attempt lifecycle constraints conflict with revision 84."
+            )
+        await cur.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() "
+            "AND indexname = 'idx_cayu_work_attempt_lifecycle_task'"
+        )
+        row = await cur.fetchone()
+        if row is None or "(task_id, retired_contract_binding)" not in str(row[0]):
+            raise RuntimeError("Postgres work-attempt lifecycle index conflicts with revision 84.")
 
     async def _validate_work_attempt_admission_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -26285,6 +26439,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             tool_capability_ceiling=request.tool_capability_ceiling,
                             execution_deadline=request.execution_deadline,
                             parent_session=parent_session,
+                            prepared_request=request,
                         ),
                         labels=request.labels,
                     )
@@ -37887,6 +38042,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
+    supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
@@ -38739,6 +38895,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             clauses.append("assigned_agent_name = %s")
             params.append(query.assigned_agent_name)
 
+        if query.has_work_contract is not None:
+            clauses.append(
+                "work_contract IS NOT NULL" if query.has_work_contract else "work_contract IS NULL"
+            )
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = pg_support.task_order_sql(query.order_by)
         params.extend([query.limit, query.offset])
@@ -41858,6 +42018,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]:
         clauses: list[str] = []
         params: list[object] = []
+        if query.has_work_contract is not None:
+            clauses.append(
+                "work_contract IS NOT NULL" if query.has_work_contract else "work_contract IS NULL"
+            )
         if query.type is not None:
             clauses.append("type = %s")
             params.append(query.type)

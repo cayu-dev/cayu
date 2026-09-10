@@ -36,6 +36,7 @@ from tests.core.task_store_conformance import (
     assert_exact_claimed_task_cancellation_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
+    assert_task_contract_queue_filter_conformance,
     assert_task_session_invocation_binding_conformance,
     assert_worker_terminalization_generation_conformance,
 )
@@ -176,6 +177,8 @@ _TABLES = (
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
     "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_lifecycle_receipts",
+    "cayu_work_attempt_preparation_holds",
     "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
@@ -238,6 +241,18 @@ async def _claim_completion_verification(store, request):
     )
     assert request.verifier_profile_fingerprint == profile.profile.fingerprint
     return await store.claim_completion_verification(request)
+
+
+def test_postgres_filters_contract_queues(postgres_dsn):
+    async def scenario() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await assert_task_contract_queue_filter_conformance(store)
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
@@ -904,6 +919,8 @@ def test_postgres_downgraded_verified_work_records_fail_closed_before_migration(
                         "SET verifier_profile_fingerprint = NULL"
                     )
                 await conn.rollback()
+                await cur.execute("DROP TABLE cayu_work_attempt_lifecycle_receipts")
+                await cur.execute("DROP TABLE cayu_work_attempt_preparation_holds")
                 await cur.execute("DROP TABLE cayu_work_attempt_execution_claims")
                 await cur.execute("DROP TABLE cayu_work_attempt_admissions")
                 await cur.execute("DROP TABLE cayu_completion_verifier_profiles")

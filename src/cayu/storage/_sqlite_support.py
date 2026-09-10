@@ -4109,6 +4109,36 @@ _MIGRATION_STEPS: dict[int, str] = {
         ON cayu_events(session_id, json_extract(payload_json, '$.queue_id'))
         WHERE event_type = 'session.message.queued';
     """,
+    84: """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_preparation_holds (
+            hold_id TEXT PRIMARY KEY NOT NULL,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+                AND length(CAST(receipt_json AS BLOB)) BETWEEN 1 AND 1097728
+            )
+        );
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_lifecycle_receipts (
+            admission_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES cayu_work_attempt_admissions(admission_id) ON DELETE RESTRICT,
+            settlement_id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            retired_contract_binding INTEGER NOT NULL CHECK (retired_contract_binding IN (0, 1)),
+            settled_at TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+                AND length(CAST(receipt_json AS BLOB)) BETWEEN 1 AND 1097728
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_lifecycle_task
+            ON cayu_work_attempt_lifecycle_receipts(task_id, retired_contract_binding);
+    """,
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY
@@ -6215,6 +6245,8 @@ def reconcile_schema(
         _validate_session_instance_schema(connection)
     if app_min_supported >= 61:
         _validate_work_attempt_admission_schema(connection)
+    if app_min_supported >= 84:
+        _validate_work_attempt_lifecycle_schema(connection)
     if app_min_supported >= 62:
         # The revision hook performs the one-time complete payload census.
         # Ordinary startup remains independent of durable history size; each
@@ -8931,6 +8963,76 @@ def _validate_task_retry_reconciliation_schema(connection: sqlite3.Connection) -
         )
 
 
+def _validate_work_attempt_lifecycle_schema(connection: sqlite3.Connection) -> None:
+    hold_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_work_attempt_preparation_holds)")
+    )
+    hold_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_work_attempt_preparation_holds'"
+    ).fetchone()
+    hold_definition = "" if hold_row is None else " ".join(str(hold_row[0]).lower().split())
+    if hold_columns != (
+        ("hold_id", "TEXT", 1, 1),
+        ("task_id", "TEXT", 1, 0),
+        ("request_sha256", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+    ) or any(
+        fragment not in hold_definition
+        for fragment in (
+            "references cayu_tasks(id) on delete restrict",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "json_valid(receipt_json)",
+            "json_type(receipt_json) = 'object'",
+            "length(cast(receipt_json as blob)) between 1 and 1097728",
+        )
+    ):
+        raise RuntimeError(
+            "SQLite work-attempt preparation hold schema conflicts with revision 84."
+        )
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_work_attempt_lifecycle_receipts)")
+    )
+    expected = (
+        ("admission_id", "TEXT", 1, 1),
+        ("settlement_id", "TEXT", 1, 0),
+        ("task_id", "TEXT", 1, 0),
+        ("request_sha256", "TEXT", 1, 0),
+        ("retired_contract_binding", "INTEGER", 1, 0),
+        ("settled_at", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+    )
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_work_attempt_lifecycle_receipts'"
+    ).fetchone()
+    definition = "" if row is None else " ".join(str(row[0]).lower().split())
+    index_columns = tuple(
+        str(row[2])
+        for row in connection.execute("PRAGMA index_info(idx_cayu_work_attempt_lifecycle_task)")
+    )
+    required = (
+        "settlement_id text not null unique",
+        "references cayu_work_attempt_admissions(admission_id) on delete restrict",
+        "references cayu_tasks(id) on delete restrict",
+        "length(request_sha256) = 64",
+        "request_sha256 not glob '*[^0-9a-f]*'",
+        "retired_contract_binding in (0, 1)",
+        "json_valid(receipt_json)",
+        "json_type(receipt_json) = 'object'",
+        "length(cast(receipt_json as blob)) between 1 and 1097728",
+    )
+    if (
+        columns != expected
+        or index_columns != ("task_id", "retired_contract_binding")
+        or any(fragment not in definition for fragment in required)
+    ):
+        raise RuntimeError("SQLite work-attempt lifecycle schema conflicts with revision 84.")
+
+
 def _validate_work_attempt_admission_schema(connection: sqlite3.Connection) -> None:
     admission_columns = tuple(
         (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
@@ -10496,6 +10598,8 @@ def preflight_migration(
         _reject_unprofiled_verified_work_records(connection)
     if current < 59 and any(revision.revision == 59 for revision in schema.pending(current)):
         _reject_populated_pre_result_resolver_database(connection)
+    if current < 84 and any(revision.revision == 84 for revision in schema.pending(current)):
+        _reject_pre_worker_admission_history(connection)
     if current < 60 and any(revision.revision == 60 for revision in schema.pending(current)):
         _reject_populated_pre_knowledge_relation_database(connection)
     if current < 63 and any(revision.revision == 63 for revision in schema.pending(current)):
@@ -10540,6 +10644,26 @@ def _preflight_creation(
         _reject_populated_pre_transcript_search_database(connection)
     if current < 59 and any(revision.revision == 59 for revision in planned):
         _reject_populated_pre_result_resolver_database(connection)
+    if current < 84 and any(revision.revision == 84 for revision in planned):
+        _reject_pre_worker_admission_history(connection)
+
+
+def _reject_pre_worker_admission_history(connection: sqlite3.Connection) -> None:
+    for table, authority in (
+        ("cayu_work_attempt_admissions", "work-attempt admissions"),
+        ("cayu_completion_verification_claims", "verification claims"),
+    ):
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if (
+            exists is not None
+            and connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+        ):
+            raise RuntimeError(
+                "SQLite revision 84 cannot reconstruct executable settings for existing "
+                f"{authority}. Recreate the pre-release database before migrating."
+            )
 
 
 def _apply_pending_after_preflight(
@@ -10688,6 +10812,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_session_instance_schema(connection)
         if rev.revision == 61:
             _validate_work_attempt_admission_schema(connection)
+        if rev.revision == 84:
+            _validate_work_attempt_lifecycle_schema(connection)
         if rev.revision == 62:
             _validate_revision_sixty_two_payload_schema(connection)
         if rev.revision == 60:
@@ -10874,6 +11000,7 @@ def session_from_request(
             tool_capability_ceiling=request.tool_capability_ceiling,
             execution_deadline=request.execution_deadline,
             parent_session=parent_session,
+            prepared_request=request,
         ),
         labels=copy_label_map(request.labels, "labels"),
     )

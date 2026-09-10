@@ -1034,7 +1034,7 @@ def test_app_requires_exact_durable_verification_claim_authority(
         calls_before = store.application_calls
         store.claim_variant = claim_variant
 
-        with pytest.raises(WorkCompletionConflict, match="verification-claim"):
+        with pytest.raises(WorkCompletionConflict, match="verification[- ]claim"):
             await _app(store).apply_completion_decision(request)
 
         persisted = await store.load_task(task.id)
@@ -1169,7 +1169,12 @@ def test_app_rejects_secret_bearing_claim_authority(
             enable_logging=False,
         )
 
-        with pytest.raises(ValueError, match="public identity") as captured:
+        # Mutating a decision-bearing claim field now fails its content-bound
+        # reconstruction before public-identity redaction. It must still be
+        # rejected without mutation or disclosure (asserted below).
+        with pytest.raises(
+            WorkCompletionConflict, match="invalid completion verification claim"
+        ) as captured:
             await app.apply_completion_decision(request)
 
         persisted = await store.load_task(task.id)

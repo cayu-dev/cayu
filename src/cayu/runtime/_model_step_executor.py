@@ -167,7 +167,9 @@ from cayu.providers.deadlines import (
     bind_provider_deadline_admission,
     reset_provider_deadline_admission,
 )
+from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._child_session_notifications import (
@@ -15571,6 +15573,126 @@ def _stream_event_completion(stream_event: ModelStreamEvent) -> ModelCompletion:
     if stream_event.completion is not None:
         return stream_event.completion
     return normalize_model_completion(stream_event.payload)
+
+
+def reconstruct_assistant_step_result(
+    *,
+    stage: ModelCompletionStage,
+    pointer: model_completion_publication.ModelStepPublicationCheckpoint,
+    pending_round: tool_round_recovery.PendingToolRound | None,
+    session_id: str,
+    interaction_id: str,
+    source_run_epoch: int,
+) -> AssistantStepResult | None:
+    """Decode a reconciled publication, without granting execution authority.
+
+    The recovery owner must first validate the stage, receipt and transcript.
+    Expected identities come from the admitted invocation, not the publication.
+    A durable non-turn returns None, even if its earlier completion metadata
+    describes a normal stop. The caller must retain that non-success outcome.
+    """
+
+    stage = _copy_model_completion_stage(stage)
+    publication = stage.publication
+    if (
+        type(pointer) is not model_completion_publication.ModelStepPublicationCheckpoint
+        or type(source_run_epoch) is not int
+        or stage.session_id != session_id
+        or stage.source_run_epoch != source_run_epoch
+        or stage.state != "completed"
+        or stage.purpose != "assistant-turn"
+        or publication is None
+        or publication.kind != "model-step"
+        or publication.interaction_id != interaction_id
+        or publication.publication_id != stage.logical_step_id
+        or stage.intent.get("model_step_id") != stage.logical_step_id
+        or pointer.stage_id != stage.stage_id
+        or pointer.logical_step_id != stage.logical_step_id
+        or pointer.source_transcript_cursor != stage.source_transcript_cursor
+        or len(publication.events) != 1
+    ):
+        raise ValueError("Recovered model result conflicts with its expected publication.")
+    event = publication.events[0]
+    if (
+        event.type is not EventType.MODEL_COMPLETED
+        or event.id != pointer.completion_event_id
+        or event.session_id != session_id
+        or event.interaction_id != interaction_id
+        or event.payload.get("step_classification") != pointer.classification
+        or event.payload.get("transcript_cursor") != pointer.transcript_end_cursor
+        or event.payload.get("model_step_id") != stage.logical_step_id
+        or event.payload.get("model_attempt_id") != stage.intent.get("model_attempt_id")
+        or event.payload.get("tool_round_id") != pointer.tool_round_id
+    ):
+        raise ValueError("Recovered model result conflicts with its completion event.")
+    classification = pointer.classification.get("type")
+    if classification in {"failed", "filtered", "invalid", "length"}:
+        return None
+    if classification not in {"continue", "final", "think_only"}:
+        raise ValueError("Recovered model result has an unsupported classification.")
+    step = event.payload.get("step")
+    if type(step) is not int or step < 1:
+        raise ValueError("Recovered model result requires its original positive step.")
+    metadata = event.payload.get("completion")
+    if type(metadata) is not dict:
+        raise ValueError("Recovered model result requires explicit completion metadata.")
+    # Do not normalize a provider payload or supply a default finish reason.
+    # A portable fallback which omitted invalid metadata is not replay evidence.
+    try:
+        completion = ModelCompletion.model_validate(metadata)
+    except (TypeError, ValueError):
+        raise ValueError("Recovered model result has invalid completion metadata.") from None
+    identity = ModelAttemptIdentity(
+        model_step_id=event.payload["model_step_id"],
+        model_attempt_id=event.payload["model_attempt_id"],
+    )
+    if len(publication.transcript_messages) != int(pointer.assistant_message_published):
+        raise ValueError("Recovered model result conflicts with its message disposition.")
+    assistant_message = (
+        publication.transcript_messages[0] if pointer.assistant_message_published else None
+    )
+    tool_calls: list[runtime_records.ToolCallRequest] = []
+    tool_identity = None
+    if pointer.tool_round_id is not None:
+        if type(pending_round) is not tool_round_recovery.PendingToolRound:
+            raise ValueError("Recovered model tool calls require their original pending round.")
+        tool_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        if (
+            tool_identity.model_step_id != identity.model_step_id
+            or tool_identity.model_attempt_id != identity.model_attempt_id
+            or tool_identity.tool_round_id != pointer.tool_round_id
+            or pending_round.source_model_step_id != stage.logical_step_id
+            or pending_round.source_transcript_cursor != pointer.source_transcript_cursor
+            or pending_round.model_step != step
+            or (pending_round.assistant_message_state == "quarantined")
+            != pointer.assistant_message_deferred
+        ):
+            raise ValueError("Recovered model result conflicts with its pending tool round.")
+        tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        if pointer.assistant_message_deferred:
+            assistant_message = pending_round.quarantined_assistant_message
+    elif pending_round is not None or pointer.assistant_message_deferred:
+        raise ValueError("Recovered model result has an unexpected pending tool round.")
+    if assistant_message is not None:
+        assistant_message = detach_message(assistant_message)
+    text_content = assistant_text_content(assistant_message)
+    result = AssistantStepResult(
+        session_id=session_id,
+        step=step,
+        model_step_id=identity.model_step_id,
+        model_attempt_id=identity.model_attempt_id,
+        tool_round_identity=tool_identity,
+        assistant_message=assistant_message,
+        tool_calls=tool_calls,
+        completion=completion,
+        text_content=text_content,
+        has_user_visible_content=bool(text_content.strip()),
+        provider_state_count=provider_state_count(assistant_message),
+        thinking_count=thinking_count(assistant_message),
+    )
+    if classify_assistant_step(result).type.value != classification:
+        raise ValueError("Recovered model result conflicts with its durable classification.")
+    return result
 
 
 def _assistant_step_result(

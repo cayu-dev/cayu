@@ -294,7 +294,18 @@ class _ConflictingWorkAttemptResultStore(InMemoryTaskStore):
         admission = await super().activate_work_attempt_admission(request)
         if self.forge_activation:
             return admission.model_copy(
-                update={"source_request_sha256": _digest("forged-activation-result")}
+                update={
+                    "source_request_sha256": _digest("forged-activation-result"),
+                    # Keep the forged record internally valid so this fixture
+                    # still exercises the outer exact-operation comparison.
+                    "source_request": (
+                        admission.source_request.model_copy(
+                            update={"source_request_sha256": _digest("forged-activation-result")}
+                        )
+                        if admission.source_request is not None
+                        else None
+                    ),
+                }
             )
         return admission
 
@@ -318,7 +329,16 @@ class _ConflictingWorkAttemptResultStore(InMemoryTaskStore):
             )
         if self.forge_renewal:
             return admission.model_copy(
-                update={"source_request_sha256": _digest("forged-renewal-result")}
+                update={
+                    "source_request_sha256": _digest("forged-renewal-result"),
+                    "source_request": (
+                        admission.source_request.model_copy(
+                            update={"source_request_sha256": _digest("forged-renewal-result")}
+                        )
+                        if admission.source_request is not None
+                        else None
+                    ),
+                }
             )
         return admission
 
@@ -505,9 +525,10 @@ class _LeaseAdvancingWorkAttemptSessionStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
     terminal_interaction_publication_version = 1
 
-    def __init__(self, now: list[datetime]) -> None:
+    def __init__(self, now: list[datetime], renewed: asyncio.Event) -> None:
         super().__init__()
         self._now = now
+        self._renewed = renewed
         self.delay_next_handoff = False
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
@@ -517,10 +538,12 @@ class _LeaseAdvancingWorkAttemptSessionStore(InMemorySessionStore):
             and query.event_type is EventType.INTERACTION_STARTED
         ):
             self.delay_next_handoff = False
-            await asyncio.sleep(0.2)
-            self._now[0] += timedelta(seconds=0.6)
-            await asyncio.sleep(0.2)
-            self._now[0] += timedelta(seconds=0.6)
+            for _ in range(2):
+                self._renewed.clear()
+                self._now[0] += timedelta(seconds=0.6)
+                # Advance logical time only after the real heartbeat has
+                # committed its renewal; scheduler delays must not skip it.
+                await asyncio.wait_for(self._renewed.wait(), 10)
         return await super().query_events(query)
 
 
@@ -762,6 +785,7 @@ class _BlockFirstWorkAttemptSettlementFenceMixin:
 class _BlockFirstWorkAttemptSettlementFence(
     _BlockFirstWorkAttemptSettlementFenceMixin, InMemorySessionStore
 ):
+    supports_completion_result_event_publication_reservations = True
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
@@ -769,6 +793,7 @@ class _BlockFirstWorkAttemptSettlementFence(
 class _BlockFirstSQLiteWorkAttemptSettlementFence(
     _BlockFirstWorkAttemptSettlementFenceMixin, SQLiteSessionStore
 ):
+    supports_completion_result_event_publication_reservations = True
     terminal_interaction_publication_version = 1
     invocation_lifecycle_command_version = 1
 
@@ -1042,6 +1067,56 @@ def _prepare_request(
     )
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_admission_run_semantics_are_durable_exact_authority(backend: str, tmp_path) -> None:
+    from cayu.runtime.work_attempt_admission import require_work_attempt_preparation_result
+    from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+
+    async def scenario() -> None:
+        store = (
+            InMemoryTaskStore()
+            if backend == "memory"
+            else SQLiteTaskStore(tmp_path / "semantics.db")
+        )
+        try:
+            contract = _contract()
+            await store.publish_work_contract(contract)
+            task = await store.create_task(
+                TaskCreate(
+                    task_id="semantics-task", type="work", work_contract=contract.reference()
+                )
+            )
+            request = _prepare_request(
+                task_id=task.id,
+                session_id="semantics-session",
+                session_invocation=await task_backed_session_invocation(
+                    store, task.id, "semantics-session"
+                ),
+            ).model_copy(update={"run_semantics": WorkAttemptRunSemantics(max_steps=7)})
+            assert await store.load_latest_work_attempt_admission(task.id) is None
+            prepared = await store.prepare_work_attempt_admission(request)
+            assert await store.load_latest_work_attempt_admission(task.id) == prepared
+            assert prepared.run_semantics == request.run_semantics
+            restored = WorkAttemptAdmission.model_validate_json(prepared.model_dump_json())
+            assert require_work_attempt_preparation_result(restored, request) == prepared
+            assert await store.prepare_work_attempt_admission(request) == prepared
+            conflicting = request.model_copy(
+                update={"run_semantics": WorkAttemptRunSemantics(max_steps=8)}
+            )
+            with pytest.raises(WorkAttemptAdmissionConflict):
+                await store.prepare_work_attempt_admission(conflicting)
+            with pytest.raises(RuntimeError, match="conflicting authority"):
+                require_work_attempt_preparation_result(
+                    restored.model_copy(update={"run_semantics": conflicting.run_semantics}),
+                    request,
+                )
+        finally:
+            if isinstance(store, SQLiteTaskStore):
+                await store.close()
+
+    asyncio.run(scenario())
+
+
 def test_work_attempt_admission_digest_accepts_pre_lease_receipt() -> None:
     request = _prepare_request(
         task_id="task-1",
@@ -1182,6 +1257,10 @@ def test_public_initial_admission_applies_configured_max_steps_unless_overridden
 
         inherited = await admit(0)
         overridden = await admit(1, max_steps=80)
+        assert inherited.run_semantics is not None
+        assert overridden.run_semantics is not None
+        assert inherited.run_semantics.max_steps == 128
+        assert overridden.run_semantics.max_steps == 80
 
         assert observed_max_steps == {
             "configured-admission-session-0": 128,
@@ -1194,10 +1273,29 @@ def test_public_initial_admission_applies_configured_max_steps_unless_overridden
     asyncio.run(scenario())
 
 
-def test_continuation_admission_reuses_source_profile_across_app_defaults() -> None:
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_continuation_admission_reuses_source_profile_across_app_defaults(
+    backend: str, monkeypatch, tmp_path, request
+) -> None:
+    sessions = (
+        InMemorySessionStore()
+        if backend == "memory"
+        else SQLiteSessionStore(tmp_path / "continuation-sessions.sqlite")
+    )
+    tasks = (
+        InMemoryTaskStore()
+        if backend == "memory"
+        else SQLiteTaskStore(tmp_path / "continuation-tasks.sqlite")
+    )
+    if backend == "sqlite":
+
+        async def close_stores():
+            await tasks.close()
+            await sessions.close()
+
+        request.addfinalizer(lambda: asyncio.run(close_stores()))
+
     async def scenario() -> None:
-        sessions = InMemorySessionStore()
-        tasks = InMemoryTaskStore()
         source_app = CayuApp(
             config=CayuConfig(run=RunDefaults(max_steps=128)),
             session_store=sessions,
@@ -1326,6 +1424,27 @@ def test_continuation_admission_reuses_source_profile_across_app_defaults() -> N
         )
         replacement_app.register_provider(_RecordingProvider(), default=True)
         replacement_app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        prepare_continuation = tasks.prepare_work_attempt_admission
+
+        async def verify_store_rejects_changed_settings(self, request):
+            assert request.run_semantics is not None
+            before = await tasks.load_task(task.id)
+            conflicting = request.model_copy(
+                update={"run_semantics": request.run_semantics.model_copy(update={"max_steps": 96})}
+            )
+            with pytest.raises(WorkAttemptAdmissionConflict, match="source run settings"):
+                await prepare_continuation(conflicting)
+            assert await tasks.load_task(task.id) == before
+            assert await tasks.load_work_attempt_admission(request.admission_id) is None
+            prepared = await prepare_continuation(request)
+            assert await tasks.load_latest_work_attempt_admission(task.id) == prepared
+            return prepared
+
+        monkeypatch.setattr(
+            type(tasks),
+            "prepare_work_attempt_admission",
+            verify_store_rejects_changed_settings,
+        )
         second = await replacement_app.admit_work_attempt(
             ResumeRequest(
                 session_id=first.session_id,
@@ -1345,6 +1464,15 @@ def test_continuation_admission_reuses_source_profile_across_app_defaults() -> N
         )
 
         assert second.state is WorkAttemptAdmissionState.ACTIVE
+        assert second.source_request is not None
+        assert second.source_request.kind == "continuation"
+        assert "max_steps" not in second.source_request.fields_set
+        assert second.source_request.source_request_sha256 == second.source_request_sha256
+        assert WorkAttemptAdmission.model_validate_json(second.model_dump_json()) == second
+        assert first.run_semantics is not None
+        assert second.run_semantics == first.run_semantics
+        assert second.run_semantics.max_steps == 128
+        assert await tasks.load_latest_work_attempt_admission(task.id) == second
         assert second.source_execution_profile_fingerprint == (
             first.source_execution_profile_fingerprint
         )
@@ -2745,7 +2873,9 @@ def test_public_renewal_and_proposal_reject_conflicting_extension_receipts() -> 
             lease_seconds=301,
         )
         tasks.forge_renewal_lease = True
-        with pytest.raises(RuntimeError, match="conflicting renewed authority"):
+        # The claim model now rejects an expiry inconsistent with its durable
+        # renewal evidence before the outer response comparison.
+        with pytest.raises(RuntimeError, match="invalid work-attempt authority"):
             await app.renew_work_attempt_claim(renewal)
         tasks.forge_renewal_lease = False
         tasks.forge_renewal = True
@@ -3434,8 +3564,18 @@ def test_cancelled_interaction_fanout_settles_before_exact_retry_returns() -> No
 def test_public_handoff_keeps_initial_replay_and_recovery_claims_live() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        sessions = _LeaseAdvancingWorkAttemptSessionStore(now)
-        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
+        renewed = asyncio.Event()
+
+        class ObservedRenewalStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            async def renew_work_attempt_execution_claim(self, request):
+                result = await super().renew_work_attempt_execution_claim(request)
+                renewed.set()
+                return result
+
+        sessions = _LeaseAdvancingWorkAttemptSessionStore(now, renewed)
+        tasks = ObservedRenewalStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         sink = InMemoryEventSink()
         app = CayuApp(
             session_store=sessions,
@@ -3712,6 +3852,183 @@ def test_public_recovery_rejects_conflicting_extension_claim_authority(
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("phase", ["preparing", "recovering"])
+def test_public_renewal_keeps_pending_admission_phase_owned(backend, phase, tmp_path, monkeypatch):
+    async def scenario():
+        sessions = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "renew-phase-sessions.sqlite")
+        )
+        tasks = (
+            InMemoryTaskStore()
+            if backend == "memory"
+            else SQLiteTaskStore(tmp_path / "renew-phase-tasks.sqlite")
+        )
+        committed, release = asyncio.Event(), asyncio.Event()
+        operation = None
+        try:
+            app, run, execution = await _configured_public_initial_admission(
+                prefix=f"renew-phase-{phase}-{backend}",
+                sessions=sessions,
+                tasks=tasks,
+                redactor=SecretRedactor(),
+            )
+            execution = execution.model_copy(update={"lease_seconds": 1})
+            if phase == "recovering":
+                initial = await app.admit_work_attempt(run, execution=execution)
+                await asyncio.sleep(
+                    max(0, (initial.claim.lease_expires_at - datetime.now(UTC)).total_seconds())
+                    + 0.05
+                )
+                selected = WorkAttemptRecoveryRequest(
+                    admission_id=initial.admission_id,
+                    claim_id=f"{phase}-claim",
+                    worker_id="replacement",
+                    generation=2,
+                    lease_seconds=1,
+                )
+                method = "claim_work_attempt_recovery"
+
+                def factory():
+                    return app.recover_work_attempt(selected)
+            else:
+                selected = execution
+                method = "prepare_work_attempt_admission"
+
+                def factory():
+                    return app.admit_work_attempt(run, execution=execution)
+
+            original = getattr(type(tasks), method)
+
+            async def pause_after_commit(store, request):
+                result = await original(store, request)
+                if request.claim_id == selected.claim_id:
+                    committed.set()
+                    await release.wait()
+                return result
+
+            with monkeypatch.context() as patch:
+                patch.setattr(type(tasks), method, pause_after_commit)
+                operation = asyncio.create_task(factory())
+                await asyncio.wait_for(committed.wait(), 10)
+                before = await tasks.load_work_attempt_admission(selected.admission_id)
+                assert before.state is WorkAttemptAdmissionState(phase)
+                renewal = WorkAttemptClaimRenewalRequest(
+                    admission_id=selected.admission_id,
+                    claim_id=selected.claim_id,
+                    worker_id=selected.worker_id,
+                    generation=selected.generation,
+                    lease_seconds=10,
+                )
+                renewed = await app.renew_work_attempt_claim(renewal)
+                assert renewed.state is WorkAttemptAdmissionState(phase)
+                assert renewed.claim.request_sha256 == before.claim.request_sha256
+                assert renewed.claim.claimed_at == before.claim.claimed_at
+                assert renewed.claim.renewal is not None
+                assert renewed.claim.renewal.lease_seconds == 10
+                await asyncio.sleep(
+                    max(0, (before.claim.lease_expires_at - datetime.now(UTC)).total_seconds())
+                    + 0.05
+                )
+                assert not operation.done()
+                with pytest.raises(WorkAttemptExecutionClaimLost):
+                    await tasks.claim_work_attempt_recovery(
+                        WorkAttemptExecutionClaimRequest(
+                            admission_id=selected.admission_id,
+                            claim_id="competing-claim",
+                            worker_id="competitor",
+                            execution_owner_id="competing-process",
+                            generation=selected.generation + 1,
+                            lease_seconds=10,
+                        )
+                    )
+                release.set()
+                active = await asyncio.wait_for(operation, 10)
+                assert active.state is WorkAttemptAdmissionState.ACTIVE
+                assert active.claim.generation == selected.generation
+                assert active.claim.claim_id == selected.claim_id
+                assert active.claim.lease_expires_at >= renewed.claim.lease_expires_at
+                assert (
+                    await tasks.load_task(active.task_id)
+                ).lease_expires_at == active.claim.lease_expires_at
+                assert active.claim.renewal is not None
+            if backend == "sqlite":
+                await tasks.close()
+                tasks = SQLiteTaskStore(tmp_path / "renew-phase-tasks.sqlite")
+                assert await tasks.load_work_attempt_admission(active.admission_id) == active
+        finally:
+            release.set()
+            if operation is not None and not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+            if backend == "sqlite":
+                await tasks.close()
+                await sessions.close()
+
+    asyncio.run(scenario())
+
+
+def test_acknowledged_recovery_ownership_is_runtime_bound_and_not_serializable():
+    import pickle
+    from dataclasses import FrozenInstanceError
+
+    from cayu.runtime._work_attempt_invocation import WorkAttemptRecoveryOwnership
+
+    async def scenario():
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
+        source, run, execution = await _configured_public_initial_admission(
+            prefix="owned-recovery", sessions=sessions, tasks=tasks, redactor=SecretRedactor()
+        )
+        admitted = await source.admit_work_attempt(run, execution=execution)
+        now[0] += timedelta(seconds=301)
+        replacement = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        replacement.register_provider(_RecordingProvider(), default=True)
+        replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        ownership = await replacement._claim_work_attempt_recovery(
+            WorkAttemptRecoveryRequest(
+                admission_id=admitted.admission_id,
+                claim_id="replacement-claim",
+                worker_id="replacement",
+                generation=2,
+                lease_seconds=300,
+            )
+        )
+        before = await tasks.load_work_attempt_admission(admitted.admission_id)
+        checkpoint = await sessions.load_checkpoint(admitted.session_id)
+        with pytest.raises(TypeError, match="runtime claim owner"):
+            WorkAttemptRecoveryOwnership(tasks, ownership.admission, ownership.request)
+        with pytest.raises(TypeError, match="acknowledged runtime ownership"):
+            await replacement._recover_claimed_work_attempt(ownership.admission)
+        with pytest.raises(WorkAttemptExecutionClaimLost, match="another runtime"):
+            await source._recover_claimed_work_attempt(ownership)
+        replacement.task_store = InMemoryTaskStore()
+        try:
+            with pytest.raises(WorkAttemptExecutionClaimLost, match="another runtime"):
+                await replacement._recover_claimed_work_attempt(ownership)
+        finally:
+            replacement.task_store = tasks
+        with pytest.raises(TypeError, match="no serialization form"):
+            pickle.dumps(ownership)
+        with pytest.raises(FrozenInstanceError):
+            ownership.store = tasks
+        assert copy.copy(ownership) is copy.deepcopy(ownership) is ownership
+        detached = ownership.admission
+        object.__setattr__(detached.claim, "worker_id", "forged")
+        assert ownership.admission == before
+        assert await tasks.load_work_attempt_admission(admitted.admission_id) == before
+        assert await sessions.load_checkpoint(admitted.session_id) == checkpoint
+        active = await replacement._recover_claimed_work_attempt(ownership)
+        assert active.state is WorkAttemptAdmissionState.ACTIVE
+        assert active.claim.worker_id == "replacement"
+        assert active.claim.generation == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_public_first_crash_recovery_needs_no_direct_store_mutation(
     backend: str,
     tmp_path,
@@ -3918,7 +4235,7 @@ def test_public_work_attempt_recovery_rejects_deleted_v4_lifecycle_authority_bef
     asyncio.run(scenario())
 
 
-def test_migrated_source_only_initial_input_keeps_recovery_fenced(tmp_path) -> None:
+def test_migrated_source_only_session_input_keeps_recovery_fenced(tmp_path) -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         session_path = tmp_path / "migrated-source-only-session.sqlite"
@@ -3962,14 +4279,10 @@ def test_migrated_source_only_initial_input_keeps_recovery_fenced(tmp_path) -> N
         finally:
             session_connection.close()
 
-        task_connection = sqlite3.connect(task_path)
-        try:
-            task_connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
-            task_connection.execute("PRAGMA user_version = 61")
-            task_connection.commit()
-        finally:
-            task_connection.close()
-
+        # Exercise missing session-side transcript provenance with a supported
+        # task database. Revision 84 rejects populated pre-worker task admission
+        # history before runtime recovery; that migration rejection has separate
+        # coverage in test_work_attempt_lifecycle.
         migrated_sessions = SQLiteSessionStore(
             session_path,
             schema_mode=SchemaMode.MIGRATE,
@@ -5606,17 +5919,22 @@ def test_public_rejected_continue_admission_preserves_contract_and_adds_interact
                 connection.commit()
             finally:
                 connection.close()
-            migrated = SQLiteTaskStore(
-                tmp_path / "continuation-admission.db",
-                schema_mode=SchemaMode.MIGRATE,
-            )
-            try:
-                migrated_second = await migrated.load_work_attempt_admission(second.admission_id)
-                assert migrated_second is not None
-                assert migrated_second.continuation is not None
-                assert migrated_second.continuation.prior_admission_id == first.admission_id
-            finally:
-                await migrated.close()
+            # Pre-worker task histories no longer gain reconstructed executable
+            # authority by migration. Reject before rewriting the old evidence.
+            with pytest.raises(RuntimeError, match="revision 84 cannot reconstruct"):
+                SQLiteTaskStore(
+                    tmp_path / "continuation-admission.db",
+                    schema_mode=SchemaMode.MIGRATE,
+                )
+            with sqlite3.connect(tmp_path / "continuation-admission.db") as connection:
+                assert connection.execute("PRAGMA user_version").fetchone()[0] == 61
+                retained = json.loads(
+                    connection.execute(
+                        "SELECT admission_json FROM cayu_work_attempt_admissions WHERE admission_id = ?",
+                        (second.admission_id,),
+                    ).fetchone()[0]
+                )
+                assert retained == payload
 
     asyncio.run(scenario())
 

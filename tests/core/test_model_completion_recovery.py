@@ -59,7 +59,10 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
+from cayu.runtime._model_step_executor import (
+    ModelCompletionRecoveryContext,
+    reconstruct_assistant_step_result,
+)
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -439,6 +442,8 @@ async def _stage_completed_model_boundary(
     limits: RunLimits | None = None,
     pending_source_run_epoch: int | None = 1,
     retain_empty_prefix: bool = False,
+    non_turn_classification: str | None = None,
+    end_turn: bool | None = None,
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
     interaction_id = f"interaction-{session_id}"
@@ -578,6 +583,14 @@ async def _stage_completed_model_boundary(
             "reason": "assistant produced user-visible content",
         }
 
+    if non_turn_classification is not None:
+        assert not with_tool_call
+        assert non_turn_classification in {"failed", "filtered", "invalid", "length"}
+        classification = {"type": non_turn_classification, "reason": "non-turn completion"}
+    elif end_turn is False and not with_tool_call:
+        classification = {"type": "continue", "reason": "provider requested another model step"}
+    message_published = non_turn_classification is None
+    end_cursor = source_cursor + int(message_published)
     completion_event = Event(
         id=f"{session_id}:model-completed",
         type=EventType.MODEL_COMPLETED,
@@ -593,20 +606,21 @@ async def _stage_completed_model_boundary(
                 "finish_reason": "tool_calls" if with_tool_call else "stop",
                 "raw_finish_reason": "tool_calls" if with_tool_call else "stop",
                 "status": None,
+                **({} if end_turn is None else {"end_turn": end_turn}),
             },
             **({} if usage is None else {"usage": dict(usage)}),
             "step_classification": classification,
-            "transcript_cursor": source_cursor + 1,
+            "transcript_cursor": end_cursor,
         },
     )
     pointer = model_completion_publication.ModelStepPublicationCheckpoint(
         logical_step_id=logical_step_id,
         stage_id=stage_id,
         source_transcript_cursor=source_cursor,
-        transcript_end_cursor=source_cursor + 1,
+        transcript_end_cursor=end_cursor,
         completion_event_id=completion_event.id,
         classification=classification,
-        assistant_message_published=True,
+        assistant_message_published=message_published,
         tool_round_id=tool_round_id,
     )
     target_checkpoint[model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY] = (
@@ -621,7 +635,7 @@ async def _stage_completed_model_boundary(
             source_checkpoint,
             target_checkpoint,
         ),
-        transcript_messages=(assistant_message,),
+        transcript_messages=(assistant_message,) if message_published else (),
         events=(completion_event,),
     )
     completed = await store.complete_model_completion_stage(
@@ -1038,6 +1052,246 @@ async def _receiptless_pause_tail(
         terminal_events=tuple(terminal_events),
         tool_result_message=tool_result_message,
     )
+
+
+@pytest.mark.parametrize("already_promoted", [False, True])
+@pytest.mark.parametrize("with_tool_call", [False, True])
+def test_model_reconciliation_retains_exact_detached_completed_stage(
+    already_promoted, with_tool_call
+) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        provider = _RecordingProvider()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-owned-stage",
+            provider_name=provider.name,
+            with_tool_call=with_tool_call,
+        )
+        session = staged.session
+        if already_promoted:
+            publication = await store.promote_model_completion_stage(
+                session.id,
+                stage_id=staged.stage.stage_id,
+                expected_run_epoch=session.run_epoch,
+            )
+            session = publication.session
+        expected = await store.load_model_completion_stage(session.id, staged.stage.stage_id)
+        app = _register_runtime(store, provider)
+        result = await app._recovery_coordinator.reconcile_model_completion_boundary(session)
+        assert result.state == ("already_promoted" if already_promoted else "promoted")
+        assert result.completed_stage == expected
+        assert result.completed_stage.publication.events == (result.completion_event,)
+        assert result.completed_stage.logical_step_id == result.pointer.logical_step_id
+        if with_tool_call:
+            assert result.pending_tool_round.tool_round_id == result.pointer.tool_round_id
+        else:
+            assert result.pending_tool_round is None
+        result.completed_stage.intent["caller-mutation"] = True
+        result.completed_stage.publication.events[0].payload["caller-mutation"] = True
+        assert (
+            await store.load_model_completion_stage(session.id, staged.stage.stage_id) == expected
+        )
+        assert "caller-mutation" not in result.completion_event.payload
+        replay = await app._recovery_coordinator.reconcile_model_completion_boundary(result.session)
+        assert replay.completed_stage == expected
+        assert provider.requests == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("with_tool_call", [False, True])
+@pytest.mark.parametrize("end_turn", [None, False], ids=["default", "follow_up"])
+def test_reconstruct_reconciled_model_result(backend, with_tool_call, end_turn, tmp_path) -> None:
+    async def run():
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "reconstruct.sqlite")
+        )
+        try:
+            provider = _RecordingProvider()
+            staged = await _stage_completed_model_boundary(
+                store,
+                session_id="reconstruct-model-result",
+                provider_name=provider.name,
+                with_tool_call=with_tool_call,
+                end_turn=end_turn,
+            )
+            boundary = await _register_runtime(
+                store, provider
+            )._recovery_coordinator.reconcile_model_completion_boundary(staged.session)
+            result = reconstruct_assistant_step_result(
+                stage=boundary.completed_stage,
+                pointer=boundary.pointer,
+                pending_round=boundary.pending_tool_round,
+                session_id=staged.session.id,
+                interaction_id=staged.publication.interaction_id,
+                source_run_epoch=staged.session.run_epoch,
+            )
+            assert result is not None
+            assert result.step == 1
+            assert result.model_step_id == staged.stage.logical_step_id
+            assert result.model_attempt_id == staged.stage.intent["model_attempt_id"]
+            assert result.assistant_message == staged.assistant_message
+            assert result.assistant_message is not staged.assistant_message
+            assert result.completion.finish_reason.value == (
+                "tool_calls" if with_tool_call else "stop"
+            )
+            assert result.completion.end_turn is end_turn
+            if with_tool_call:
+                assert (
+                    result.tool_round_identity
+                    == tool_round_recovery.pending_tool_round_identity(boundary.pending_tool_round)
+                )
+                assert result.tool_calls == tool_round_recovery.pending_round_tool_calls(
+                    boundary.pending_tool_round
+                )
+                result.tool_calls[0].arguments["caller-mutation"] = True
+                assert "caller-mutation" not in boundary.pending_tool_round.tool_calls[0].arguments
+                result.assistant_message.content[0].arguments["caller-mutation"] = True
+                assert (
+                    "caller-mutation"
+                    not in boundary.completed_stage.publication.transcript_messages[0]
+                    .content[0]
+                    .arguments
+                )
+            else:
+                assert result.tool_round_identity is None
+                assert result.tool_calls == []
+                assert result.text_content == "recovered authoritative answer"
+            result.completion.status = "caller mutation"
+            assert boundary.completion_event.payload["completion"]["status"] is None
+            assert (
+                await store.load_model_completion_stage(staged.session.id, staged.stage.stage_id)
+                == staged.stage
+            )
+            assert provider.requests == []
+        finally:
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("classification", ["failed", "filtered", "invalid", "length"])
+def test_reconstruct_non_turn_does_not_accept_earlier_stop_metadata(
+    backend, classification, tmp_path
+) -> None:
+    async def run():
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "non-turn.sqlite")
+        )
+        try:
+            provider = _RecordingProvider()
+            staged = await _stage_completed_model_boundary(
+                store,
+                session_id="reconstruct-non-turn",
+                provider_name=provider.name,
+                non_turn_classification=classification,
+            )
+            boundary = await _register_runtime(
+                store, provider
+            )._recovery_coordinator.reconcile_model_completion_boundary(staged.session)
+            assert boundary.completion_event.payload["completion"]["finish_reason"] == "stop"
+            assert (
+                reconstruct_assistant_step_result(
+                    stage=boundary.completed_stage,
+                    pointer=boundary.pointer,
+                    pending_round=boundary.pending_tool_round,
+                    session_id=staged.session.id,
+                    interaction_id=staged.publication.interaction_id,
+                    source_run_epoch=staged.session.run_epoch,
+                )
+                is None
+            )
+            assert boundary.pointer.classification["type"] == classification
+            assert await store.load_transcript(staged.session.id) == [staged.user_message]
+            assert provider.requests == []
+        finally:
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "session_id",
+        "interaction_id",
+        "source_run_epoch",
+        "boolean_epoch",
+        "step",
+        "model_attempt_id",
+        "missing_completion",
+        "missing_finish_reason",
+        "boolean_end_turn",
+        "classification",
+        "tool_round_id",
+        "missing_pending_round",
+    ],
+)
+def test_reconstruct_model_result_rejects_conflicting_evidence(conflict) -> None:
+    async def run():
+        store = InMemorySessionStore()
+        provider = _RecordingProvider()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="reconstruct-conflict",
+            provider_name=provider.name,
+            with_tool_call=conflict == "missing_pending_round",
+        )
+        boundary = await _register_runtime(
+            store, provider
+        )._recovery_coordinator.reconcile_model_completion_boundary(staged.session)
+        stage = boundary.completed_stage
+        pointer = boundary.pointer
+        kwargs = {
+            "stage": stage,
+            "pointer": pointer,
+            "pending_round": boundary.pending_tool_round,
+            "session_id": staged.session.id,
+            "interaction_id": staged.publication.interaction_id,
+            "source_run_epoch": staged.session.run_epoch,
+        }
+        payload = stage.publication.events[0].payload
+        if conflict in {"session_id", "interaction_id"}:
+            kwargs[conflict] = "different-owner"
+        elif conflict == "source_run_epoch":
+            kwargs[conflict] += 1
+        elif conflict == "boolean_epoch":
+            kwargs["source_run_epoch"] = True
+        elif conflict == "step":
+            payload["step"] = True
+        elif conflict == "model_attempt_id":
+            payload["model_attempt_id"] = f"matt_{'9' * 32}"
+        elif conflict == "missing_completion":
+            payload.pop("completion")
+        elif conflict == "missing_finish_reason":
+            payload["completion"].pop("finish_reason")
+        elif conflict == "boolean_end_turn":
+            payload["completion"]["end_turn"] = 1
+        elif conflict == "classification":
+            pointer.classification["type"] = "think_only"
+            payload["step_classification"]["type"] = "think_only"
+        elif conflict == "tool_round_id":
+            payload["tool_round_id"] = f"tround_{'9' * 32}"
+        else:
+            kwargs["pending_round"] = None
+        with pytest.raises(ValueError):
+            reconstruct_assistant_step_result(**kwargs)
+        assert provider.requests == []
+        assert (
+            await store.load_model_completion_stage(staged.session.id, staged.stage.stage_id)
+            == staged.stage
+        )
+
+    asyncio.run(run())
 
 
 def test_incomplete_recovery_promotes_completed_model_boundary_without_redispatch() -> None:

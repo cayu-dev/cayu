@@ -82,6 +82,22 @@ def test_required_names_are_importable_from_top_level() -> None:
         assert hasattr(cayu, name), f"cayu.{name} is not exported from the top level"
 
 
+def test_verified_task_worker_exports_share_the_runtime_owner() -> None:
+    from cayu.runtime import verified_task_worker
+
+    for name in (
+        "VerifiedTaskHandler",
+        "VerifiedTaskHandlerReport",
+        "VerifiedTaskPreparationContext",
+        "VerifiedTaskProposalContext",
+        "VerifiedTaskWorker",
+        "VerifiedTaskWorkerDraining",
+    ):
+        assert getattr(cayu, name) is getattr(cayu_runtime, name)
+        assert getattr(cayu, name) is getattr(verified_task_worker, name)
+        assert name in cayu.__all__ and name in cayu_runtime.__all__
+
+
 def test_required_names_are_declared_in_dunder_all() -> None:
     # A name reachable via attribute access but absent from __all__ is invisible
     # to ``from cayu import *`` and to tooling that reads __all__ — pin both.

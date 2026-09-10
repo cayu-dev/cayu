@@ -2306,7 +2306,321 @@ def test_late_claim_renewal_failure_survives_observed_ownership_loss() -> None:
     assert late_failures == 1
 
 
-def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
+@pytest.mark.parametrize("trigger", ["timeout", "caller_cancel"])
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_owned_verification_retains_its_exact_drain_after_retry(trigger, late_failure) -> None:
+    class RetainedVerifier(_TestCompletionVerifier):
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def verify(self, request):
+            del request
+            self.calls += 1
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await self.release.wait()
+                if late_failure:
+                    raise ValueError("owned late cleanup failed") from None
+            return _accepted_decision()
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        app = CayuApp(task_store=store, enable_logging=False)
+        verifier = RetainedVerifier()
+        app.register_completion_verifier(contract.verifier, verifier)
+        coordinator = app._completion_verifier_coordinator
+        request = _execution_request(
+            proposal_id, timeout_seconds=0.05 if trigger == "timeout" else 5
+        )
+        expected = request.model_copy(deep=True)
+        owned = coordinator.start_owned_verification(request)
+        with pytest.raises(RuntimeError, match="has not settled"):
+            owned.acknowledge_settlement()
+        object.__setattr__(request, "worker_id", "mutated-after-dispatch")
+        try:
+            await asyncio.wait_for(verifier.started.wait(), 5)
+            if trigger == "caller_cancel":
+                owned.operation.cancel("stop owned verifier")
+                with pytest.raises(asyncio.CancelledError):
+                    await owned.operation
+                assert owned.operation.cancelling() == 1
+                assert owned.operation.cancelled()
+            else:
+                outcome = await owned.operation
+                assert isinstance(outcome.error, CompletionVerifierExecutionError)
+            await asyncio.wait_for(verifier.cancelled.wait(), 5)
+            with pytest.raises(RuntimeError, match="has not settled"):
+                owned.acknowledge_settlement()
+            claim = await store.load_completion_verification_claim(proposal_id)
+            assert claim.worker_id == expected.worker_id
+            waiter = asyncio.create_task(owned.settlement())
+            await asyncio.sleep(0)
+            waiter.cancel("stop waiting, retain ownership")
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert waiter.cancelling() == 1
+            assert waiter.cancelled()
+            assert len(coordinator._adapter_tasks) == 1
+            contender = coordinator.start_owned_verification(
+                _execution_request(proposal_id, suffix="other")
+            )
+            denied = await contender.operation
+            assert isinstance(denied.error, CompletionVerifierExecutionError)
+            assert "still draining" in str(denied.error)
+            # A denied invocation cannot acquire the incumbent's resources
+            # merely by naming the same proposal.
+            assert (await asyncio.wait_for(contender.settlement(), 5)).failure is None
+            assert len(coordinator._adapter_tasks) == 1
+            verifier.release.set()
+            settled = await asyncio.wait_for(owned.settlement(), 5)
+            if late_failure:
+                assert isinstance(settled.failure, CompletionVerifierExecutionError)
+                with pytest.raises(CompletionVerifierExecutionError, match="owned late cleanup"):
+                    await app.verify_completion_proposal(expected)
+            else:
+                assert settled.failure is None
+            await asyncio.sleep(0)
+            assert proposal_id not in coordinator._draining_adapter_tasks
+            again = await owned.settlement()
+            assert again.failure is settled.failure
+            owned.acknowledge_settlement()
+            owned.acknowledge_settlement()
+            assert verifier.calls == 1
+            assert await store.load_completion_decision_for_proposal(proposal_id) is None
+        finally:
+            verifier.release.set()
+            if not owned.operation.done():
+                owned.operation.cancel()
+                with suppress(BaseException):
+                    await owned.operation
+            await asyncio.wait_for(owned.settlement(), 5)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_before_start", [False, True])
+def test_owned_verification_without_adapter_drain_settles(cancel_before_start) -> None:
+    class ImmediateVerifier(_TestCompletionVerifier):
+        async def verify(self, request):
+            del request
+            return _accepted_decision()
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, ImmediateVerifier())
+        owned = app._completion_verifier_coordinator.start_owned_verification(
+            _execution_request(proposal_id)
+        )
+        if cancel_before_start:
+            owned.operation.cancel("cancel before task entry")
+            with pytest.raises(asyncio.CancelledError):
+                await owned.operation
+            assert owned.operation.cancelling() == 1
+            assert owned.operation.cancelled()
+            assert await store.load_completion_verification_claim(proposal_id) is None
+        else:
+            outcome = await owned.operation
+            assert outcome.error is None
+            assert outcome.result.decision_id == "decision-1"
+        assert (await asyncio.wait_for(owned.settlement(), 5)).failure is None
+
+    asyncio.run(scenario())
+
+
+def test_old_verifier_settlement_acknowledgement_cannot_remove_retried_drain() -> None:
+    class RetriedVerifier(_TestCompletionVerifier):
+        def __init__(self):
+            self.cancelled = [asyncio.Event(), asyncio.Event()]
+            self.release = [asyncio.Event(), asyncio.Event()]
+            self.calls = 0
+
+        async def verify(self, request):
+            del request
+            index = self.calls
+            self.calls += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled[index].set()
+                await self.release[index].wait()
+                raise ValueError("retained verifier cleanup") from None
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = RetriedVerifier()
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        coordinator = app._completion_verifier_coordinator
+        request = _execution_request(proposal_id, timeout_seconds=0.05)
+        handles = []
+        try:
+            for index in range(2):
+                owned = coordinator.start_owned_verification(request)
+                handles.append(owned)
+                outcome = await owned.operation
+                assert isinstance(outcome.error, CompletionVerifierExecutionError)
+                await asyncio.wait_for(verifier.cancelled[index].wait(), 5)
+                current = coordinator._draining_adapter_tasks[proposal_id]
+                if index:
+                    handles[0].acknowledge_settlement()
+                    assert coordinator._draining_adapter_tasks[proposal_id] is current
+                verifier.release[index].set()
+                assert isinstance(
+                    (await asyncio.wait_for(owned.settlement(), 5)).failure,
+                    CompletionVerifierExecutionError,
+                )
+                owned.acknowledge_settlement()
+                assert proposal_id not in coordinator._draining_adapter_tasks
+            assert verifier.calls == 2
+            assert await store.load_completion_decision_for_proposal(proposal_id) is None
+        finally:
+            for release in verifier.release:
+                release.set()
+            for owned in handles:
+                await asyncio.wait_for(owned.settlement(), 5)
+                owned.acknowledge_settlement()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("trigger", ["timeout", "caller_cancel"])
+@pytest.mark.parametrize(
+    "cleanup", ["failure", "nested", "cause", "cause_sibling", "owned_shutdown"]
+)
+def test_background_drain_observes_late_adapter_cleanup_once(trigger, cleanup) -> None:
+    class LateCleanupVerifier(_TestCompletionVerifier):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def verify(self, request):
+            del request
+            self.calls += 1
+            if self.calls > 1:
+                return _accepted_decision()
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                self.cancelled.set()
+                await self.release.wait()
+                if cleanup == "owned_shutdown":
+                    raise
+                if cleanup in {"cause", "cause_sibling"}:
+                    late_failure = ValueError("late cleanup first")
+                    if cleanup == "cause":
+                        raise cancellation from late_failure
+                    cancellation.__cause__ = late_failure
+                    raise BaseExceptionGroup(
+                        "overlapping cleanup evidence", [cancellation, late_failure]
+                    ) from None
+                if cleanup == "nested":
+                    raise BaseExceptionGroup(
+                        "adapter cleanup",
+                        [
+                            cancellation,
+                            ExceptionGroup(
+                                "cleanup phases",
+                                [ValueError("late cleanup first"), OSError("late cleanup second")],
+                            ),
+                        ],
+                    ) from None
+                raise ValueError("late cleanup first") from None
+
+    async def scenario():
+        store = InMemoryTaskStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = LateCleanupVerifier()
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        request = _execution_request(
+            proposal_id, timeout_seconds=0.05 if trigger == "timeout" else 5
+        )
+        invocation = asyncio.create_task(app.verify_completion_proposal(request))
+        try:
+            await asyncio.wait_for(verifier.started.wait(), 5)
+            if trigger == "caller_cancel":
+                invocation.cancel("stop verifier")
+                with pytest.raises(asyncio.CancelledError):
+                    await invocation
+                assert invocation.cancelling() == 1
+                assert invocation.cancelled()
+            else:
+                with pytest.raises(
+                    CompletionVerifierExecutionError, match="bounded execution timeout"
+                ):
+                    await invocation
+            await asyncio.wait_for(verifier.cancelled.wait(), 5)
+            coordinator = app._completion_verifier_coordinator
+            draining = coordinator._draining_adapter_tasks[proposal_id]
+            assert not draining.task.done()
+            with pytest.raises(CompletionVerifierExecutionError, match="still draining"):
+                await app.verify_completion_proposal(request)
+            assert verifier.calls == 1
+            assert await store.load_completion_decision_for_proposal(proposal_id) is None
+            verifier.release.set()
+            await asyncio.wait_for(asyncio.shield(draining.task), 5)
+            # The completion callback installs the existing owned settlement.
+            await asyncio.sleep(0)
+            assert draining.settlement_task is not None
+            settlement = await asyncio.wait_for(asyncio.shield(draining.settlement_task), 5)
+            await asyncio.sleep(0)  # Let the registered finalizer publish settlement.
+            if cleanup == "owned_shutdown":
+                assert settlement.failure is None
+            else:
+                assert settlement.failure is not None
+                with pytest.raises(BaseException) as replayed:
+                    await app.verify_completion_proposal(request)
+                pending = [replayed.value]
+                leaves = []
+                while pending:
+                    error = pending.pop(0)
+                    if isinstance(error, BaseExceptionGroup):
+                        pending[0:0] = error.exceptions
+                    else:
+                        leaves.append(error)
+                assert all(isinstance(error, CompletionVerifierExecutionError) for error in leaves)
+                assert [str(error) for error in leaves] == (
+                    ["ValueError: late cleanup first", "OSError: late cleanup second"]
+                    if cleanup == "nested"
+                    else ["ValueError: late cleanup first"]
+                )
+                assert verifier.calls == 1
+            assert proposal_id not in coordinator._draining_adapter_tasks
+            assert not coordinator._adapter_capacity_reservations
+            # Failure observation is once-only and cannot dispatch another
+            # adapter. A distinct subsequent retry may now complete normally.
+            result = await app.verify_completion_proposal(request)
+            assert result.decision_id == request.decision_id
+            assert verifier.calls == 2
+        finally:
+            verifier.release.set()
+            if not invocation.done():
+                invocation.cancel()
+                with suppress(BaseException):
+                    await invocation
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("late_adapter_failure", [False, True])
+def test_background_drain_replays_late_claim_renewal_failure_once(late_adapter_failure) -> None:
     class LateRenewalFailureStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
@@ -2342,6 +2656,8 @@ def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
                 with suppress(asyncio.CancelledError):
                     await self.release.wait()
             self.finished.set()
+            if late_adapter_failure:
+                raise ValueError("late adapter cleanup failed alongside renewal")
             return _accepted_decision()
 
     async def scenario() -> None:
@@ -2371,11 +2687,21 @@ def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
             await asyncio.sleep(0)
         store.renewal_allowed.set()
         settlement = await draining.settlement_task
-        assert isinstance(settlement.failure, CompletionVerificationClaimLost)
+        if late_adapter_failure:
+            assert isinstance(settlement.failure, ExceptionGroup)
+            assert len(settlement.failure.exceptions) == 2
+            assert isinstance(settlement.failure.exceptions[0], CompletionVerifierExecutionError)
+            assert isinstance(settlement.failure.exceptions[1], CompletionVerificationClaimLost)
+        else:
+            assert isinstance(settlement.failure, CompletionVerificationClaimLost)
 
         with pytest.raises(
-            CompletionVerificationClaimLost,
-            match="not acknowledged before its local lease deadline",
+            ExceptionGroup if late_adapter_failure else CompletionVerificationClaimLost,
+            match=(
+                "adapter and heartbeat drain failed"
+                if late_adapter_failure
+                else "not acknowledged before its local lease deadline"
+            ),
         ) as captured:
             await app.verify_completion_proposal(request)
         assert verifier.calls == 1
@@ -2385,6 +2711,7 @@ def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
         observed: set[int] = set()
         ownership_failures = 0
         late_failures = 0
+        adapter_failures = 0
         while pending:
             failure = pending.pop()
             if id(failure) in observed:
@@ -2394,6 +2721,8 @@ def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
                 ownership_failures += 1
             if "late background claim renewal settlement failed" in str(failure):
                 late_failures += 1
+            if "late adapter cleanup failed alongside renewal" in str(failure):
+                adapter_failures += 1
             if failure.__cause__ is not None:
                 pending.append(failure.__cause__)
             if failure.__context__ is not None:
@@ -2402,6 +2731,7 @@ def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
                 pending.extend(failure.exceptions)
         assert ownership_failures == 1
         assert late_failures == 1
+        assert adapter_failures == int(late_adapter_failure)
 
     asyncio.run(scenario())
 

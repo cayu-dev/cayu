@@ -150,6 +150,7 @@ from cayu.runtime.work_contracts import (
     completion_decision_request_sha256,
     completion_proposal_request_sha256,
     completion_verification_claim_request_sha256,
+    copy_completion_verification_claim,
     work_attempt_request_sha256,
 )
 from cayu.runtime.workspace_observation_recovery import (
@@ -1794,6 +1795,17 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
             == first_verifier_profile
         )
         renewed_claim = await store.renew_completion_verification_claim(first_claim_request)
+        assert (
+            first_claim.lease_seconds
+            == renewed_claim.lease_seconds
+            == first_claim_request.lease_seconds
+        )
+        assert copy_completion_verification_claim(renewed_claim) == renewed_claim
+        for invalid_duration in (True, 0, first_claim_request.lease_seconds + 1):
+            with pytest.raises(ValueError):
+                copy_completion_verification_claim(
+                    renewed_claim.model_copy(update={"lease_seconds": invalid_duration})
+                )
         assert renewed_claim.claimed_at == first_claim.claimed_at
         assert renewed_claim.attempt_number == first_claim.attempt_number
         assert renewed_claim.lease_expires_at >= first_claim.lease_expires_at
@@ -6209,8 +6221,10 @@ def test_sqlite_revision_49_validation_rejects_missing_authority_table(tmp_path)
         SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
+@pytest.mark.parametrize("revision", [57, 83])
 def test_sqlite_downgraded_verified_work_records_fail_closed_before_migration(
     tmp_path,
+    revision,
 ) -> None:
     path = tmp_path / "populated-revision-57.sqlite"
 
@@ -6258,6 +6272,25 @@ def test_sqlite_downgraded_verified_work_records_fail_closed_before_migration(
             await store.close()
 
     asyncio.run(seed())
+    if revision == 83:
+        with sqlite3.connect(path) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM cayu_work_attempt_admissions").fetchone()[
+                    0
+                ]
+                == 0
+            )
+            connection.execute(
+                "UPDATE cayu_completion_verification_claims "
+                "SET claim_json = json_remove(claim_json, '$.lease_seconds')"
+            )
+            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 84")
+            connection.execute("PRAGMA user_version = 83")
+        with pytest.raises(RuntimeError, match="verification claims"):
+            SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 83
+        return
     connection = sqlite3.connect(path)
     try:
         with pytest.raises(sqlite3.IntegrityError):

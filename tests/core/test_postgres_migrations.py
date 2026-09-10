@@ -224,6 +224,8 @@ def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str)
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 for table in (
+                    "cayu_work_attempt_lifecycle_receipts",
+                    "cayu_work_attempt_preparation_holds",
                     "cayu_work_attempt_execution_claims",
                     "cayu_work_attempt_admissions",
                     "cayu_completion_decision_application_receipts",
@@ -275,6 +277,8 @@ def test_revision_sixty_one_migrates_work_attempt_admission_tables(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_work_attempt_lifecycle_receipts")
+                await cur.execute("DROP TABLE cayu_work_attempt_preparation_holds")
                 await cur.execute("DROP TABLE cayu_work_attempt_execution_claims")
                 await cur.execute("DROP TABLE cayu_work_attempt_admissions")
                 await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 61")
@@ -938,6 +942,8 @@ _TABLES = (
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
     "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_lifecycle_receipts",
+    "cayu_work_attempt_preparation_holds",
     "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
@@ -1041,7 +1047,10 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
         finally:
             await creator.close()
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
-            await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision = 83")
+            await conn.execute(
+                "DELETE FROM cayu_schema_migrations WHERE revision = %s",
+                (schema.LATEST_REVISION,),
+            )
             await conn.commit()
 
     asyncio.run(prepare())
@@ -1082,7 +1091,7 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
                 postgres_dsn,
                 "--waive-backup",
                 "--acknowledge-breaking",
-                "83",
+                str(schema.LATEST_REVISION),
             ]
         )
         == 1

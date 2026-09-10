@@ -1040,6 +1040,8 @@ class CompletionVerificationClaim(FrozenWorkContractModel):
     claim_id: str
     proposal_id: str
     worker_id: str
+    # Original request duration, not the remaining or renewed lease window.
+    lease_seconds: StrictInt = Field(ge=1, le=WORK_VERIFICATION_LEASE_MAX_SECONDS)
     execution_owner_id: str | None = None
     execution_timeout_seconds: StrictFloat | None = Field(
         default=None,
@@ -1089,6 +1091,18 @@ class CompletionVerificationClaim(FrozenWorkContractModel):
     def validate_lease_window(self) -> CompletionVerificationClaim:
         if self.lease_expires_at <= self.claimed_at:
             raise ValueError("Verification claim expiry must follow its claim time.")
+        request = CompletionVerificationClaimRequest(
+            claim_id=self.claim_id,
+            proposal_id=self.proposal_id,
+            worker_id=self.worker_id,
+            execution_owner_id=self.execution_owner_id,
+            verifier=self.verifier,
+            verifier_profile_fingerprint=self.verifier_profile_fingerprint,
+            lease_seconds=self.lease_seconds,
+            execution_timeout_seconds=self.execution_timeout_seconds,
+        )
+        if self.request_sha256 != completion_verification_claim_request_sha256(request):
+            raise ValueError("Verification claim conflicts with its retained request authority.")
         return self
 
 
@@ -1764,6 +1778,7 @@ def copy_completion_verification_claim(
     return CompletionVerificationClaim.model_validate(
         {
             "claim_id": value.claim_id,
+            "lease_seconds": value.lease_seconds,
             "proposal_id": value.proposal_id,
             "worker_id": value.worker_id,
             "execution_owner_id": value.execution_owner_id,

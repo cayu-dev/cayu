@@ -8,6 +8,7 @@ from pathlib import Path
 from time import process_time
 
 import pytest
+from tests.core.test_verified_work_contracts import _contract
 
 from cayu import (
     CayuApp,
@@ -22,6 +23,65 @@ from cayu import (
     TaskRetrySettlementRequest,
     run_task_worker,
 )
+from cayu.runtime._durable_worker_loop import DurableWorkerDemandPolicy
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("contracted_queue", [False, True])
+async def test_contract_queue_wakeup_matches_only_its_queue(
+    tmp_path: Path, backend: str, contracted_queue: bool
+) -> None:
+    store = (
+        InMemoryTaskStore()
+        if backend == "memory"
+        else SQLiteTaskStore(tmp_path / "contract-wakeup.sqlite")
+    )
+    contract = await store.publish_work_contract(_contract(contract_id="wakeup-contract"))
+    wakeup = await store._task_admission_wakeup((TaskQuery(has_work_contract=contracted_queue),))
+    assert wakeup is not None
+    hinted = asyncio.create_task(wakeup.wait(10.0, None))
+    try:
+        await store.create_task(
+            TaskCreate(
+                task_id="other-queue",
+                type="mixed",
+                work_contract=None if contracted_queue else contract.reference(),
+            )
+        )
+        await asyncio.sleep(0)
+        assert not hinted.done()
+        await store.create_task(
+            TaskCreate(
+                task_id="matching-queue",
+                type="mixed",
+                work_contract=contract.reference() if contracted_queue else None,
+            )
+        )
+        assert await asyncio.wait_for(hinted, timeout=1.0) is False
+    finally:
+        hinted.cancel()
+        await asyncio.gather(hinted, return_exceptions=True)
+        wakeup.close()
+        if isinstance(store, SQLiteTaskStore):
+            await store.close()
+
+
+def test_contract_queue_pollers_have_distinct_cohorts() -> None:
+    store = InMemoryTaskStore()
+    policy = DurableWorkerDemandPolicy(dispatch_latency_s=1.0)
+    pollers = [
+        store._durable_worker_poller(
+            (TaskQuery(has_work_contract=selection),), policy, clock=lambda: 0.0
+        )
+        for selection in (None, False, True, True)
+    ]
+    try:
+        assert len({id(poller._group) for poller in pollers}) == 3
+        assert pollers[2]._group is pollers[3]._group
+    finally:
+        for poller in pollers:
+            poller.close()
 
 
 class _ObservedInMemoryTaskStore(InMemoryTaskStore):

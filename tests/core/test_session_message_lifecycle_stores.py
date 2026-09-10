@@ -1710,7 +1710,7 @@ def test_sqlite_revision_83_migrates_and_validates_lifecycle_schema(tmp_path):
             connection.execute(
                 "ALTER TABLE cayu_session_message_deliveries DROP COLUMN reject_only"
             )
-            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 83")
+            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 83")
             connection.execute("PRAGMA user_version = 82")
         with pytest.raises(RuntimeError):
             SQLiteSessionStore(path, schema_mode=migrations.SchemaMode.VALIDATE)

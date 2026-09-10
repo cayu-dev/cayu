@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
+from tests.core.test_verified_work_contracts import _contract
 from tests.environments.sync_ownership_assertions import assert_sync_resources_owned
 
 from cayu import (
@@ -34,8 +36,16 @@ from cayu import (
     ToolContext,
     ToolResult,
     ToolSpec,
+    VerifiedTaskHandler,
+    VerifiedTaskWorker,
 )
 from cayu.runtime import InMemoryEventSink, SessionStatus
+from cayu.runtime.work_attempt_admission import (
+    WorkAttemptExecutionRequest,
+    WorkAttemptRecoveryRequest,
+    WorkAttemptRecoveryRequired,
+    WorkAttemptRunRequest,
+)
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.workspaces import LocalWorkspace, WorkspaceMutationResult
 
@@ -885,10 +895,14 @@ def test_sync_completion_stays_running_until_workspace_finalization_commits(
     asyncio.run(exercise_contract())
 
 
-@pytest.mark.parametrize("claimed_task", [False, True])
+@pytest.mark.parametrize("claimed_task,governed", [(False, False), (True, False), (True, True)])
 def test_restarted_completion_finalization_settles_attached_task(
     tmp_path: Path,
     claimed_task: bool,
+    governed: bool,
+    monkeypatch,
+    *,
+    worker_cleanup: bool = False,
 ) -> None:
     source_root = tmp_path / "restarted-source"
     target_root = tmp_path / "restarted-target"
@@ -943,8 +957,15 @@ def test_restarted_completion_finalization_settles_attached_task(
         )
 
     async def exercise_contract() -> None:
+        ownership_now = [datetime.now(UTC)]
         session_store = SQLiteSessionStore(session_path)
-        task_store = SQLiteTaskStore(task_path)
+        task_store = (
+            SQLiteTaskStore(
+                task_path, clock=lambda: ownership_now[0], ownership_clock=lambda: ownership_now[0]
+            )
+            if governed
+            else SQLiteTaskStore(task_path)
+        )
         binding = BlockingCompletionBinding()
         provider = ScriptedModelProvider(
             [[ModelStreamEvent.completed({"finish_reason": "stop"})]],
@@ -972,32 +993,71 @@ def test_restarted_completion_finalization_settles_attached_task(
             "historical-finalize-task",
             {"code": "historical_failure"},
         )
+        contract = _contract(contract_id="restarted-finalize-contract") if governed else None
+        if contract is not None:
+            await task_store.publish_work_contract(contract)
         await task_store.create_task(
-            TaskCreate(task_id="restarted-finalize-task", type="candidate-build")
+            TaskCreate(
+                task_id="restarted-finalize-task",
+                type="candidate-build",
+                work_contract=None if contract is None else contract.reference(),
+            )
         )
         task_worker_id = None
         task_lease_expires_at = None
-        if claimed_task:
+        if claimed_task and not governed:
             claimed = await task_store.claim_task("crashed-finalize-worker", lease_seconds=1)
             assert claimed is not None
             task_worker_id = claimed.worker_id
             task_lease_expires_at = claimed.lease_expires_at
 
-        run_task = asyncio.create_task(
-            _collect_run(
-                app,
-                RunRequest(
-                    agent_name="restarted-finalize-agent",
-                    session_id="restarted-finalize-session",
-                    task_id="restarted-finalize-task",
-                    task_worker_id=task_worker_id,
-                    task_lease_expires_at=task_lease_expires_at,
-                    messages=[Message.text("user", "Finish.")],
+        run_request = RunRequest(
+            agent_name="restarted-finalize-agent",
+            session_id="restarted-finalize-session",
+            task_id="restarted-finalize-task",
+            task_worker_id=task_worker_id,
+            task_lease_expires_at=task_lease_expires_at,
+            messages=[Message.text("user", "Finish.")],
+        )
+        if governed:
+            admission = await app.admit_work_attempt(
+                run_request,
+                execution=WorkAttemptExecutionRequest(
+                    admission_id="finalize-admission",
+                    claim_id="finalize-claim",
+                    attempt_id="finalize-attempt",
+                    interaction_id="finalize-interaction",
+                    worker_id="crashed-finalize-worker",
+                    generation=1,
+                    lease_seconds=300,
                 ),
             )
-        )
+
+            async def collect_governed():
+                return [
+                    event
+                    async for event in app._execute_work_attempt(
+                        WorkAttemptRunRequest(
+                            admission_id=admission.admission_id,
+                            claim_id=admission.claim.claim_id,
+                            worker_id=admission.claim.worker_id,
+                            generation=1,
+                            lease_seconds=300,
+                        )
+                    )
+                ]
+
+            run_task = asyncio.create_task(collect_governed())
+        else:
+            run_task = asyncio.create_task(_collect_run(app, run_request))
         recovery_session_store = SQLiteSessionStore(session_path)
-        recovery_task_store = SQLiteTaskStore(task_path)
+        recovery_task_store = (
+            SQLiteTaskStore(
+                task_path, clock=lambda: ownership_now[0], ownership_clock=lambda: ownership_now[0]
+            )
+            if governed
+            else SQLiteTaskStore(task_path)
+        )
         recovery_provider = ScriptedModelProvider(
             [],
             name="restarted-finalize-provider",
@@ -1020,6 +1080,7 @@ def test_restarted_completion_finalization_settles_attached_task(
             binding=recovery_binding,
             provider=recovery_provider,
         )
+        settlement = None
         try:
             await asyncio.wait_for(binding.finalize_started.wait(), timeout=10)
             pending_checkpoint = await session_store.load_checkpoint("restarted-finalize-session")
@@ -1027,50 +1088,288 @@ def test_restarted_completion_finalization_settles_attached_task(
             assert pending_checkpoint["pending_completion_finalization"]["task_id"] == (
                 "restarted-finalize-task"
             )
-            if claimed_task:
+            if governed:
+                assert provider.requests
+                assert "initial_transcript_pending" not in pending_checkpoint
+            if claimed_task and not governed:
                 await asyncio.sleep(1.05)
-            recovery = await recovery_app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id="restarted-finalize-session",
-                    reason="completion_owner_restarted",
+            if governed:
+                ownership_now[0] = admission.claim.lease_expires_at + timedelta(seconds=1)
+                recovery_request = WorkAttemptRecoveryRequest(
+                    admission_id=admission.admission_id,
+                    claim_id="finalize-recovery",
+                    worker_id="recovery-worker",
+                    generation=2,
+                    lease_seconds=300,
                 )
-            )
+                stop = SQLiteTaskStore.record_work_attempt_execution_stop
+                activate = SQLiteTaskStore.activate_work_attempt_recovery
+                stop_ack_lost = activation_ack_lost = False
+
+                async def lose_stop_ack(store, request):
+                    nonlocal stop_ack_lost
+                    result = await stop(store, request)
+                    if not stop_ack_lost:
+                        stop_ack_lost = True
+                        raise ConnectionError("stop acknowledgement lost")
+                    return result
+
+                async def lose_activation_ack(store, request):
+                    nonlocal activation_ack_lost
+                    result = await activate(store, request)
+                    if not activation_ack_lost:
+                        activation_ack_lost = True
+                        raise ConnectionError("activation acknowledgement lost")
+                    return result
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(
+                        SQLiteTaskStore, "record_work_attempt_execution_stop", lose_stop_ack
+                    )
+                    patch.setattr(
+                        SQLiteTaskStore, "activate_work_attempt_recovery", lose_activation_ack
+                    )
+                    with pytest.raises(ConnectionError, match="stop acknowledgement lost"):
+                        await recovery_app.recover_work_attempt(recovery_request)
+                    stopped = await recovery_task_store.load_work_attempt_admission(
+                        admission.admission_id
+                    )
+                    assert stopped.execution_stop is not None
+                    assert (
+                        "pending_completion_finalization"
+                        in await recovery_session_store.load_checkpoint(admission.session_id)
+                    )
+                    if worker_cleanup:
+                        # Start discovery at the actual missing-ack boundary,
+                        # without manually completing the stopped cleanup first.
+                        from cayu.runtime import verified_task_worker as worker_module
+
+                        class NoNewWork(VerifiedTaskHandler):
+                            async def prepare(self, context):
+                                pytest.fail("Cleanup must not prepare new work.")
+
+                            async def propose(self, context):
+                                pytest.fail("Cleanup must not propose completion.")
+
+                        class DiscoveryClock(datetime):
+                            @classmethod
+                            def now(cls, tz=None):
+                                return ownership_now[0]
+
+                        replacement = CayuApp(
+                            session_store=recovery_session_store,
+                            task_store=recovery_task_store,
+                            enable_logging=False,
+                        )
+                        register_runtime(
+                            replacement, binding=recovery_binding, provider=recovery_provider
+                        )
+                        assert not await replacement._session_engine.has_recoverable_work_attempt_model_result(
+                            stopped
+                        )
+                        assert (
+                            await replacement._session_engine.load_work_attempt_released_recovery_evidence(
+                                stopped
+                            )
+                            is None
+                        )
+                        ownership_now[0] = stopped.claim.lease_expires_at + timedelta(seconds=1)
+                        patch.setattr(worker_module, "datetime", DiscoveryClock)
+                        patch.setattr(SQLiteTaskStore, "activate_work_attempt_recovery", activate)
+                        async with VerifiedTaskWorker(
+                            replacement, NoNewWork(), worker_id="cleanup-replacement"
+                        ) as worker:
+                            assert await asyncio.wait_for(worker.run(max_tasks=1), 30) == 1
+                        current = await recovery_task_store.load_work_attempt_admission(
+                            admission.admission_id
+                        )
+                        settlement = await recovery_task_store.load_work_attempt_lifecycle_receipt(
+                            admission.admission_id
+                        )
+                        assert current.claim.generation == 3
+                        assert current.execution_stop == stopped.execution_stop
+                        assert current.execution_entry == stopped.execution_entry
+                        assert settlement is not None
+                        assert settlement.task.status is TaskStatus.NEEDS_ATTENTION
+                        assert settlement.task.status_reason == "work_contract_execution_failed"
+                        assert not settlement.retired_contract_binding
+                        assert (
+                            await recovery_task_store.settle_work_attempt_lifecycle(
+                                settlement.request
+                            )
+                            == settlement
+                        )
+                        assert (
+                            await recovery_session_store.load(admission.session_id)
+                        ).status is SessionStatus.FAILED
+                        assert (
+                            "pending_completion_finalization"
+                            not in await recovery_session_store.load_checkpoint(
+                                admission.session_id
+                            )
+                        )
+                        assert (
+                            await recovery_task_store.load_completion_proposal_for_attempt(
+                                admission.attempt_id
+                            )
+                            is None
+                        )
+                        assert recovery_provider.requests == []
+                        assert (target_root / "result.txt").read_text(encoding="utf-8") == "ready"
+                        return
+                    with pytest.raises(ConnectionError, match="activation acknowledgement lost"):
+                        await recovery_app.recover_work_attempt(recovery_request)
+                    recovery = await recovery_app.recover_work_attempt(recovery_request)
+                assert recovery.execution_stop == stopped.execution_stop
+                assert await recovery_app.recover_work_attempt(recovery_request) == recovery
+                with pytest.raises(WorkAttemptRecoveryRequired, match="durably stopped"):
+                    async for _ in recovery_app._execute_work_attempt(
+                        WorkAttemptRunRequest(
+                            admission_id=recovery.admission_id,
+                            claim_id=recovery.claim.claim_id,
+                            worker_id=recovery.claim.worker_id,
+                            generation=2,
+                            lease_seconds=300,
+                        )
+                    ):
+                        pytest.fail("Stopped workspace execution must not redispatch.")
+            else:
+                recovery = await recovery_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id="restarted-finalize-session",
+                        reason="completion_owner_restarted",
+                    )
+                )
             recovered_session = await recovery_session_store.load("restarted-finalize-session")
             recovered_task = await recovery_task_store.load_task("restarted-finalize-task")
             checkpoint = await recovery_session_store.load_checkpoint("restarted-finalize-session")
             durable_events = await recovery_session_store.load_events("restarted-finalize-session")
 
-            assert recovery.actions == (
-                IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION,
-            )
+            if not governed:
+                assert recovery.actions == (
+                    IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION,
+                )
             assert recovery_provider.requests == []
             assert recovered_session is not None
             assert recovered_session.status is SessionStatus.FAILED
             assert recovered_task is not None
-            assert recovered_task.status is TaskStatus.FAILED
-            assert recovered_task.error == {
-                "message": (
-                    "Workspace output committed during recovery after the original "
-                    "completion owner became unavailable."
-                ),
-                "type": "WorkspaceCompletionFinalizationRecovered",
-                "session_id": "restarted-finalize-session",
-                "phase": "workspace_finalize_recovery",
-                "workspace_output_committed": True,
-            }
+            assert recovered_task.status is (TaskStatus.RUNNING if governed else TaskStatus.FAILED)
+            if not governed:
+                assert recovered_task.error == {
+                    "message": (
+                        "Workspace output committed during recovery after the original "
+                        "completion owner became unavailable."
+                    ),
+                    "type": "WorkspaceCompletionFinalizationRecovered",
+                    "session_id": "restarted-finalize-session",
+                    "phase": "workspace_finalize_recovery",
+                    "workspace_output_committed": True,
+                }
             assert checkpoint is not None
             assert "pending_completion_finalization" not in checkpoint
-            assert EventType.TASK_FAILED in {event.type for event in durable_events}
+            assert (
+                EventType.TASK_FAILED in {event.type for event in durable_events}
+            ) is not governed
             assert EventType.SESSION_FAILED in {event.type for event in durable_events}
+            if governed:
+                release = await recovery_app._session_engine.load_work_attempt_release_evidence(
+                    recovery
+                )
+                ownership_now[0] = recovery.claim.lease_expires_at + timedelta(seconds=1)
+                # No registered provider/environment or surviving runtime context
+                # is needed to reconcile an already-settled stopped attempt.
+                fresh_app = CayuApp(
+                    session_store=recovery_session_store,
+                    task_store=recovery_task_store,
+                    enable_logging=False,
+                )
+                next_owner = await fresh_app.recover_work_attempt(
+                    WorkAttemptRecoveryRequest(
+                        admission_id=admission.admission_id,
+                        claim_id="finalize-third-claim",
+                        worker_id="third-worker",
+                        generation=3,
+                        lease_seconds=300,
+                    )
+                )
+                assert next_owner.execution_stop == recovery.execution_stop
+                assert next_owner.execution_entry == recovery.execution_entry
+                assert (
+                    await fresh_app._session_engine.load_work_attempt_release_evidence(next_owner)
+                    == release
+                )
+                assert await recovery_session_store.load(admission.session_id) == recovered_session
+                assert (
+                    await recovery_session_store.load_checkpoint(admission.session_id) == checkpoint
+                )
+                from cayu.runtime import verified_task_worker as worker_module
+
+                class NoNewWork(VerifiedTaskHandler):
+                    async def prepare(self, context):
+                        pytest.fail("Stopped workspace recovery must not prepare new work.")
+
+                    async def propose(self, context):
+                        pytest.fail("Stopped workspace recovery must not propose completion.")
+
+                class DiscoveryClock(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return ownership_now[0]
+
+                # This fixture already controls SQLite's ownership clock. Align
+                # only the worker's advisory scan clock with that same timeline.
+                ownership_now[0] = next_owner.claim.lease_expires_at + timedelta(seconds=1)
+                with monkeypatch.context() as patch:
+                    patch.setattr(worker_module, "datetime", DiscoveryClock)
+                    async with VerifiedTaskWorker(
+                        fresh_app, NoNewWork(), worker_id="finalize-worker"
+                    ) as worker:
+                        assert await asyncio.wait_for(worker.run(max_tasks=1), 10) == 1
+                settlement = await recovery_task_store.load_work_attempt_lifecycle_receipt(
+                    next_owner.admission_id
+                )
+                assert settlement is not None
+                current = await recovery_task_store.load_latest_work_attempt_admission(
+                    next_owner.task_id
+                )
+                assert current.claim.generation == 4
+                assert current.execution_stop == next_owner.execution_stop
+                assert current.execution_entry == next_owner.execution_entry
+                assert settlement.request.release_evidence == release
+                assert (
+                    await recovery_task_store.load_completion_proposal_for_attempt(
+                        next_owner.attempt_id
+                    )
+                    is None
+                )
+                assert settlement.task.status is TaskStatus.NEEDS_ATTENTION
+                assert settlement.task.status_reason == "work_contract_execution_failed"
+                assert not settlement.retired_contract_binding
+                assert (
+                    await recovery_task_store.settle_work_attempt_lifecycle(settlement.request)
+                    == settlement
+                )
+                assert (target_root / "result.txt").read_text(encoding="utf-8") == "ready"
         finally:
             binding.allow_finalize.set()
             await asyncio.gather(run_task, return_exceptions=True)
+            if settlement is not None:
+                assert (
+                    await recovery_task_store.load_task("restarted-finalize-task")
+                    == settlement.task
+                )
             await recovery_task_store.close()
             await recovery_session_store.close()
             await task_store.close()
             await session_store.close()
 
     asyncio.run(exercise_contract())
+
+
+def test_worker_discovers_stopped_workspace_cleanup_after_lost_ack(tmp_path, monkeypatch):
+    test_restarted_completion_finalization_settles_attached_task(
+        tmp_path, True, True, monkeypatch, worker_cleanup=True
+    )
 
 
 def test_cancelled_completion_finalization_remains_failed_and_recoverable(
@@ -1138,6 +1437,16 @@ def test_cancelled_completion_finalization_remains_failed_and_recoverable(
         assert checkpoint is not None
         assert "pending_completion_finalization" in checkpoint
 
+        # A child-originated cancellation may leave owned cleanup settling
+        # after the stream returns. Recovery must not race that retained owner.
+        assert await app.drain_environment_cleanups()
+        after_cleanup = await store.load_checkpoint("cancelled-finalize-session")
+        assert after_cleanup is not None
+        expected_action = (
+            IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION
+            if "pending_completion_finalization" in after_cleanup
+            else IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+        )
         recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="cancelled-finalize-session",
@@ -1146,9 +1455,7 @@ def test_cancelled_completion_finalization_remains_failed_and_recoverable(
         )
         recovered = await store.load("cancelled-finalize-session")
         checkpoint = await store.load_checkpoint("cancelled-finalize-session")
-        assert recovery.actions == (
-            IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_FINALIZATION,
-        )
+        assert recovery.actions == (expected_action,)
         assert recovered is not None
         assert recovered.status is SessionStatus.FAILED
         assert checkpoint is not None

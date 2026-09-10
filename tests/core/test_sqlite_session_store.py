@@ -3336,6 +3336,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (81, 81),
         (82, 82),
         (83, 83),
+        (84, 84),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3432,7 +3433,7 @@ def test_sqlite_task_store_validation_requires_revision_seventy_six(tmp_path) ->
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 76"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 84"):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,

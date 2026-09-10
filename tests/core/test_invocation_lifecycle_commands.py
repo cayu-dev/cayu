@@ -4,6 +4,7 @@ import asyncio
 import copy
 import pickle
 from collections.abc import AsyncIterator
+from contextvars import copy_context
 from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, get_type_hints
@@ -62,6 +63,8 @@ from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
     invocation_checkpoint_state_sha256,
     prepare_rebind_invocation_command,
+    released_invocation_evidence,
+    retire_released_invocation_context,
 )
 from cayu.runtime.budgets import BudgetPolicy
 from cayu.runtime.build_provenance import (
@@ -548,6 +551,51 @@ async def _assert_invocation_command_conformance(store, suffix: str) -> None:
     assert type(released) is InvocationReleaseResult
     assert released.session.run_epoch == 2
     assert released.replayed is False
+    release_checkpoint = await store.load_checkpoint(session_id)
+    evidence = released_invocation_evidence(
+        released.session,
+        release_checkpoint,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        active_profile=created.active_profile,
+    )
+    assert evidence.session_id == session_id
+    assert evidence.interaction_id == interaction_id
+    assert evidence.profile_fingerprint == created.active_profile.profile.fingerprint
+    assert evidence.run_epoch == 1
+    assert evidence.released_run_epoch == 2
+    assert type(evidence).model_validate_json(evidence.model_dump_json()) == evidence
+
+    def check_released_context_handoff() -> None:
+        sessions_module._activate_session_run_fence(created.session)
+        sessions_module._activate_session_interaction(session_id, interaction_id)
+        other_id = f"{session_id}-other"
+        sessions_module._activate_session_run_fence(
+            created.session.model_copy(update={"id": other_id, "run_epoch": 9})
+        )
+        sessions_module._activate_session_interaction(other_id, "other-interaction")
+        retire_released_invocation_context(evidence)
+        assert _current_session_run_epoch(session_id) is None
+        assert sessions_module._current_session_interaction_id(session_id) is None
+        assert _current_session_run_epoch(other_id) == 9
+        assert sessions_module._current_session_interaction_id(other_id) == "other-interaction"
+        sessions_module._activate_session_run_fence(
+            created.session.model_copy(update={"run_epoch": 3})
+        )
+        sessions_module._activate_session_interaction(session_id, "new-interaction")
+        retire_released_invocation_context(evidence)
+        assert _current_session_run_epoch(session_id) == 3
+        assert sessions_module._current_session_interaction_id(session_id) == "new-interaction"
+
+    copy_context().run(check_released_context_handoff)
+    with pytest.raises(SessionRunFenced):
+        released_invocation_evidence(
+            released.session,
+            release_checkpoint,
+            session_id=session_id,
+            session_instance_id=str(uuid4()),
+            active_profile=created.active_profile,
+        )
     replayed_release = await store.apply_invocation_lifecycle_command(release)
     assert replayed_release.session == released.session
     assert replayed_release.replayed is True

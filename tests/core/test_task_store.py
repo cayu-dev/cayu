@@ -22,6 +22,7 @@ from tests.core.task_store_conformance import (
     assert_exact_claimed_task_cancellation_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
+    assert_task_contract_queue_filter_conformance,
     assert_task_session_invocation_binding_conformance,
     assert_worker_terminalization_generation_conformance,
 )
@@ -62,6 +63,7 @@ from cayu.runtime.tasks import (
     _legacy_task_terminalization_request_sha256,
     _require_interrupted_task_handoff_authority,
     _task_terminalization_request_matches_sha256,
+    copy_task_query,
     prepare_interrupted_task_handoff,
     prepare_task_terminalization,
 )
@@ -69,6 +71,35 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
 StoreFactory = Callable[[object], TaskStore]
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_filter_contract_queues(store_factory: StoreFactory, tmp_path) -> None:
+    async def scenario() -> None:
+        store = _make_store(store_factory, tmp_path)
+        try:
+            await assert_task_contract_queue_filter_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", "false", [], {}])
+def test_task_contract_query_requires_strict_boolean(value) -> None:
+    with pytest.raises(ValidationError):
+        TaskQuery(has_work_contract=value)
+    query = TaskQuery()
+    query.has_work_contract = value
+    with pytest.raises(ValidationError):
+        copy_task_query(query)
+
+
+def test_task_contract_query_copy_is_detached() -> None:
+    query = TaskQuery(has_work_contract=True)
+    copied = copy_task_query(query)
+    query.has_work_contract = False
+    assert copied.has_work_contract is True
 
 
 async def _exact_task_lease(store: TaskStore, task_id: str) -> datetime:
@@ -2870,7 +2901,7 @@ def test_sqlite_task_store_validate_rejects_pre_handoff_generation_schema(tmp_pa
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 76"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 84"):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 

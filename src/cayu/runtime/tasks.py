@@ -109,6 +109,7 @@ from cayu.runtime.local_execution_attempts import (
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.work_attempt_admission import (
+    WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,
     WorkAttemptAdmissionActivate,
@@ -119,15 +120,30 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptExecutionClaim,
     WorkAttemptExecutionClaimLost,
     WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionEntryDisposition,
+    WorkAttemptExecutionEntryRequest,
+    WorkAttemptExecutionEntryResult,
+    WorkAttemptExecutionStopRequest,
     WorkAttemptRecoveryActivate,
     copy_admitted_completion_proposal_request,
     copy_work_attempt_admission_activate,
     copy_work_attempt_admission_prepare,
     copy_work_attempt_execution_claim_request,
+    copy_work_attempt_execution_entry_request,
+    copy_work_attempt_execution_stop_request,
     copy_work_attempt_recovery_activate,
+    renewed_work_attempt_execution_claim,
     work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
+)
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    copy_work_attempt_lifecycle_settlement,
+    copy_work_attempt_preparation_hold,
+    work_attempt_lifecycle_settlement_sha256,
+    work_attempt_preparation_hold_sha256,
 )
 from cayu.runtime.work_contracts import (
     WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
@@ -2442,6 +2458,112 @@ class CompletionDecisionApplicationReceipt(BaseModel):
         return self
 
 
+class WorkAttemptPreparationHoldReceipt(BaseModel):
+    """Original non-success result for one exact pre-admission callback failure."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    request: WorkAttemptPreparationHold
+    request_sha256: str
+    task: Task
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def copy_request(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptPreparationHold)
+
+    @field_validator("task", mode="before")
+    @classmethod
+    def copy_result_task(cls, value: object) -> object:
+        if type(value) is Task:
+            _preflight_bounded_task_payloads(value, field_label="Preparation hold receipt task")
+        return revalidate_model_input(value, Task)
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> WorkAttemptPreparationHoldReceipt:
+        if (
+            self.request_sha256 != work_attempt_preparation_hold_sha256(self.request)
+            or self.task.id != self.request.task_id
+            or self.task.work_contract != self.request.contract
+            or self.task.status is not TaskStatus.NEEDS_ATTENTION
+            or self.task.status_reason != self.request.reason
+            or self.task.worker_id is not None
+            or self.task.lease_expires_at is not None
+            or self.task.session_id is not None
+            or self.task.session_instance_id is not None
+        ):
+            raise ValueError("Preparation hold receipt conflicts with its exact non-success task.")
+        require_bounded_work_completion_document(
+            self.model_dump(mode="json", warnings=False),
+            "Work-attempt preparation hold receipt",
+            max_bytes=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES + 32 * 1024,
+            max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS + 256,
+        )
+        return self
+
+
+class WorkAttemptLifecycleReceipt(BaseModel):
+    """Original final task result and exact invocation-release evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    request: WorkAttemptLifecycleSettlement
+    request_sha256: str
+    task: Task
+    retired_contract_binding: StrictBool
+    settled_at: datetime
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def copy_request(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptLifecycleSettlement)
+
+    @field_validator("task", mode="before")
+    @classmethod
+    def copy_result_task(cls, value: object) -> object:
+        if type(value) is Task:
+            _preflight_bounded_task_payloads(
+                value, field_label="Work-attempt lifecycle receipt task"
+            )
+        return revalidate_model_input(value, Task)
+
+    @field_validator("settled_at")
+    @classmethod
+    def normalize_settled_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "settled_at")
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> WorkAttemptLifecycleReceipt:
+        if self.request_sha256 != work_attempt_lifecycle_settlement_sha256(self.request):
+            raise ValueError("Work-attempt receipt conflicts with its exact settlement request.")
+        if self.task.id != self.request.task_id or self.task.work_contract is None:
+            raise ValueError("Work-attempt receipt requires its exact contract-bound task.")
+        if self.task.session_id != self.request.release_evidence.session_id or (
+            self.task.session_instance_id != self.request.release_evidence.session_instance_id
+        ):
+            raise ValueError("Work-attempt receipt conflicts with its released invocation.")
+        if self.retired_contract_binding != (self.task.status is TaskStatus.COMPLETED):
+            raise ValueError(
+                "Only successful work-attempt settlement retires its contract binding."
+            )
+        if self.request.kind in {
+            "runtime_stop",
+            "proposal_deadline_stop",
+            "continuation_deadline_stop",
+        } and (
+            self.task.status is not TaskStatus.NEEDS_ATTENTION
+            or self.task.status_reason != self.request.stop_reason
+        ):
+            raise ValueError("Runtime-stop receipt requires its typed non-success result.")
+        require_bounded_work_completion_document(
+            self.model_dump(mode="json", warnings=False),
+            "Work-attempt lifecycle receipt",
+            max_bytes=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES + 32 * 1024,
+            max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS + 256,
+        )
+        return self
+
+
 class TaskTerminalizationRetryPolicy(BaseModel):
     """Finite retry and backoff bounds for acknowledgement-ambiguous writes."""
 
@@ -2520,6 +2642,7 @@ class TaskQuery(BaseModel):
     session_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
+    has_work_contract: StrictBool | None = None
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC
@@ -3171,6 +3294,7 @@ class TaskStore(ABC):
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
     supports_work_attempt_admission: ClassVar[bool] = False
+    supports_verified_task_worker: ClassVar[bool] = False
     supports_local_execution_attempts: ClassVar[bool] = False
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
@@ -3210,6 +3334,13 @@ class TaskStore(ABC):
                             "" if query.status is None else query.status.value,
                             "" if query.type is None else query.type,
                             "" if query.parent_task_id is None else query.parent_task_id,
+                            (
+                                "all"
+                                if query.has_work_contract is None
+                                else "contracted"
+                                if query.has_work_contract
+                                else "ordinary"
+                            ),
                             (
                                 ""
                                 if query.assigned_agent_name is None
@@ -3363,6 +3494,30 @@ class TaskStore(ABC):
         """Create or replay one bounded execution attempt under a task's frozen contract."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
 
+    async def enter_work_attempt_execution(
+        self, request: WorkAttemptExecutionEntryRequest
+    ) -> WorkAttemptExecutionEntryResult:
+        """Elect one dispatch; an existing entry permits reconciliation only."""
+        raise NotImplementedError("This TaskStore does not support verified task workers.")
+
+    async def hold_work_attempt_preparation(
+        self, request: WorkAttemptPreparationHold
+    ) -> WorkAttemptPreparationHoldReceipt:
+        """Atomically park an exact unattached claim and publish its failure receipt."""
+        raise NotImplementedError("This TaskStore does not support verified task workers.")
+
+    async def record_work_attempt_execution_stop(
+        self, request: WorkAttemptExecutionStopRequest
+    ) -> WorkAttemptAdmission:
+        """Record immutable stop intent; exact replay never authorizes dispatch."""
+        raise NotImplementedError("This TaskStore does not support verified task workers.")
+
+    async def load_work_attempt_preparation_hold_receipt(
+        self, hold_id: str
+    ) -> WorkAttemptPreparationHoldReceipt | None:
+        """Read an advisory original result; exact replay must compare the request."""
+        raise NotImplementedError("This TaskStore does not support verified task workers.")
+
     async def prepare_work_attempt_admission(
         self,
         request: WorkAttemptAdmissionPrepare,
@@ -3390,6 +3545,43 @@ class TaskStore(ABC):
     ) -> WorkAttemptExecutionClaim | None:
         """Load one immutable execution-claim generation by stable identity."""
         raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def load_latest_work_attempt_admission(
+        self,
+        task_id: str,
+    ) -> WorkAttemptAdmission | None:
+        """Read the admission with no successor, including pre-dispatch preparation.
+
+        This is discovery, not acquisition of execution authority. The caller
+        must still use exact admission/claim operations before dispatch.
+        """
+        raise NotImplementedError("This TaskStore does not support verified-task discovery.")
+
+    async def settle_work_attempt_lifecycle(
+        self, request: WorkAttemptLifecycleSettlement
+    ) -> WorkAttemptLifecycleReceipt:
+        """Atomically publish or exactly replay final task and release evidence."""
+        raise NotImplementedError("This TaskStore does not support verified-task settlement.")
+
+    async def list_unsettled_work_attempt_admissions(
+        self,
+        *,
+        task_filter: TaskAggregateFilter | None = None,
+        limit: int = 100,
+        after: str | None = None,
+    ) -> list[WorkAttemptAdmission]:
+        """Discover latest unfinished admissions in admission-ID keyset order.
+
+        Includes final decision application awaiting lifecycle retirement, even
+        when the task is already completed. Results never acquire authority.
+        """
+        raise NotImplementedError("This TaskStore does not support verified-task discovery.")
+
+    async def load_work_attempt_lifecycle_receipt(
+        self, admission_id: str
+    ) -> WorkAttemptLifecycleReceipt | None:
+        """Read the original final outcome, including after acknowledgement loss."""
+        raise NotImplementedError("This TaskStore does not support verified-task settlement.")
 
     async def prepare_local_execution_attempt(
         self,
@@ -3445,7 +3637,7 @@ class TaskStore(ABC):
         self,
         request: WorkAttemptExecutionClaimRequest,
     ) -> WorkAttemptAdmission:
-        """Renew one exact active execution claim without changing its generation."""
+        """Renew an exact live preparing, active, or recovering claim in place."""
         raise NotImplementedError("This TaskStore does not support work-attempt admission.")
 
     async def claim_work_attempt_recovery(
@@ -3483,6 +3675,12 @@ class TaskStore(ABC):
     async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
         """Load one completion proposal by stable identity."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_proposal_for_attempt(
+        self, attempt_id: str
+    ) -> CompletionProposal | None:
+        """Load the unique published proposal for an attempt, without guessing its ID."""
+        raise NotImplementedError("This TaskStore does not support verified task workers.")
 
     async def prepare_completion_verifier_profile(
         self,
@@ -4096,6 +4294,7 @@ class InMemoryTaskStore(TaskStore):
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
+    supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
@@ -4134,6 +4333,9 @@ class InMemoryTaskStore(TaskStore):
         self._admission_id_by_session_interaction: dict[tuple[str, str], str] = {}
         self._unreleased_admission_id_by_session: dict[str, str] = {}
         self._latest_admission_id_by_task: dict[str, str] = {}
+        self._work_attempt_lifecycle_receipts: dict[str, WorkAttemptLifecycleReceipt] = {}
+        self._lifecycle_admission_by_settlement_id: dict[str, str] = {}
+        self._work_attempt_preparation_holds: dict[str, WorkAttemptPreparationHoldReceipt] = {}
         self._work_attempt_execution_claims: dict[str, WorkAttemptExecutionClaim] = {}
         self._local_execution_attempts: dict[str, LocalExecutionAttemptRecord] = {}
         self._local_execution_attempt_by_lineage: dict[tuple[str, str], str] = {}
@@ -4381,7 +4583,7 @@ class InMemoryTaskStore(TaskStore):
             contract = self._ensure_task_contract_matches(task, request.contract)
             lease_now = self._ownership_clock()
             availability_now = self._clock()
-            continuation = self._work_attempt_continuation_context(task, contract)
+            continuation = self._work_attempt_continuation_context(task, contract, request)
             if continuation is None:
                 if request.kind != "initial":
                     raise WorkAttemptAdmissionConflict(
@@ -4493,6 +4695,8 @@ class InMemoryTaskStore(TaskStore):
                 contract=request.contract,
                 session_invocation=request.session_invocation,
                 source_execution_profile_fingerprint=(request.source_execution_profile_fingerprint),
+                run_semantics=request.run_semantics,
+                source_request=request.source_request,
                 claim=claim,
                 continuation=continuation,
                 prepared_at=lease_now,
@@ -4607,6 +4811,191 @@ class InMemoryTaskStore(TaskStore):
             admission = self._work_attempt_admissions.get(admission_id)
             return None if admission is None else self._copy_work_attempt_admission(admission)
 
+    async def load_latest_work_attempt_admission(
+        self,
+        task_id: str,
+    ) -> WorkAttemptAdmission | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            admission_id = self._latest_admission_id_by_task.get(task_id)
+            if admission_id is None:
+                return None
+            admission = self._require_work_attempt_admission(admission_id)
+            if admission.task_id != task_id:
+                raise WorkAttemptAdmissionConflict("Latest admission conflicts with its task.")
+            return self._copy_work_attempt_admission(admission)
+
+    async def load_work_attempt_lifecycle_receipt(
+        self, admission_id: str
+    ) -> WorkAttemptLifecycleReceipt | None:
+        admission_id = require_clean_nonblank(admission_id, "admission_id")
+        async with self._lock:
+            receipt = self._work_attempt_lifecycle_receipts.get(admission_id)
+            return None if receipt is None else receipt.model_copy(deep=True)
+
+    async def list_unsettled_work_attempt_admissions(
+        self,
+        *,
+        task_filter: TaskAggregateFilter | None = None,
+        limit: int = 100,
+        after: str | None = None,
+    ) -> list[WorkAttemptAdmission]:
+        query, after = _work_attempt_discovery_query(task_filter, limit=limit, after=after)
+        async with self._lock:
+            selected: list[str] = []
+            for index, (task_id, admission_id) in enumerate(
+                self._latest_admission_id_by_task.items()
+            ):
+                if index % 128 == 0:
+                    await asyncio.sleep(0)
+                if (after is not None and admission_id <= after) or (
+                    admission_id in self._work_attempt_lifecycle_receipts
+                ):
+                    continue
+                task = self._require_task(task_id)
+                if not _task_matches(task, query):
+                    continue
+                insort(selected, admission_id)
+                if len(selected) > limit:
+                    selected.pop()
+            return [
+                self._copy_work_attempt_admission(self._require_work_attempt_admission(identity))
+                for identity in selected
+            ]
+
+    async def enter_work_attempt_execution(
+        self, request: WorkAttemptExecutionEntryRequest
+    ) -> WorkAttemptExecutionEntryResult:
+        from cayu.runtime._work_attempt_lifecycle_policy import plan_work_attempt_execution_entry
+
+        request = copy_work_attempt_execution_entry_request(request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            result = plan_work_attempt_execution_entry(
+                request,
+                admission=admission,
+                task=self._require_task(admission.task_id),
+                now=self._ownership_clock(),
+            )
+            if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED:
+                self._work_attempt_admissions[admission.admission_id] = (
+                    self._copy_work_attempt_admission(result.admission)
+                )
+            return result.model_copy(deep=True)
+
+    async def record_work_attempt_execution_stop(
+        self, request: WorkAttemptExecutionStopRequest
+    ) -> WorkAttemptAdmission:
+        from cayu.runtime._work_attempt_lifecycle_policy import plan_work_attempt_execution_stop
+
+        request = copy_work_attempt_execution_stop_request(request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            result = plan_work_attempt_execution_stop(
+                request,
+                admission=admission,
+                task=self._require_task(admission.task_id),
+                now=self._ownership_clock(),
+            )
+            if admission.execution_stop is None:
+                self._work_attempt_admissions[admission.admission_id] = (
+                    self._copy_work_attempt_admission(result)
+                )
+            return self._copy_work_attempt_admission(result)
+
+    async def load_work_attempt_preparation_hold_receipt(
+        self, hold_id: str
+    ) -> WorkAttemptPreparationHoldReceipt | None:
+        hold_id = validate_work_completion_idempotency_key(hold_id)
+        async with self._lock:
+            receipt = self._work_attempt_preparation_holds.get(hold_id)
+            return None if receipt is None else receipt.model_copy(deep=True)
+
+    async def hold_work_attempt_preparation(
+        self, request: WorkAttemptPreparationHold
+    ) -> WorkAttemptPreparationHoldReceipt:
+        from cayu.runtime._work_attempt_lifecycle_policy import plan_work_attempt_preparation_hold
+
+        request = copy_work_attempt_preparation_hold(request)
+        digest = work_attempt_preparation_hold_sha256(request)
+        async with self._lock:
+            existing = self._work_attempt_preparation_holds.get(request.hold_id)
+            if existing is not None:
+                if existing.request_sha256 != digest:
+                    raise WorkAttemptAdmissionConflict(
+                        "Preparation hold conflicts with its receipt."
+                    )
+                return existing.model_copy(deep=True)
+            task = self._require_task(request.task_id)
+            self._ensure_task_contract_matches(task, request.contract)
+            updated, receipt = plan_work_attempt_preparation_hold(
+                request,
+                task=task,
+                has_attempt=bool(self._attempt_ids_by_task.get(task.id)),
+                now=self._ownership_clock(),
+            )
+            self._store_task(updated)
+            self._work_attempt_preparation_holds[request.hold_id] = receipt
+            return receipt.model_copy(deep=True)
+
+    async def settle_work_attempt_lifecycle(
+        self, request: WorkAttemptLifecycleSettlement
+    ) -> WorkAttemptLifecycleReceipt:
+        from cayu.runtime._work_attempt_lifecycle_policy import (
+            plan_work_attempt_lifecycle_settlement,
+        )
+
+        request = copy_work_attempt_lifecycle_settlement(request)
+        request_sha256 = work_attempt_lifecycle_settlement_sha256(request)
+        async with self._lock:
+            existing = self._work_attempt_lifecycle_receipts.get(request.admission_id)
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkAttemptAdmissionConflict(
+                        "Lifecycle settlement conflicts with its receipt."
+                    )
+                return existing.model_copy(deep=True)
+            if request.settlement_id in self._lifecycle_admission_by_settlement_id:
+                raise WorkAttemptAdmissionConflict(
+                    "Lifecycle settlement identity is already bound."
+                )
+            admission = self._require_work_attempt_admission(request.admission_id)
+            task = self._require_task(request.task_id)
+            proposal_id = self._proposal_id_by_attempt.get(admission.attempt_id)
+            proposal = None if proposal_id is None else self._completion_proposals.get(proposal_id)
+            decision_id = (
+                None if proposal_id is None else self._decision_id_by_proposal.get(proposal_id)
+            )
+            decision = None if decision_id is None else self._completion_decisions.get(decision_id)
+            application = self._decision_application_receipts.get(
+                (task.id, request.application_idempotency_key or "")
+            )
+            updated, settled_admission, receipt = plan_work_attempt_lifecycle_settlement(
+                request,
+                task=task,
+                admission=admission,
+                latest_admission_id=self._latest_admission_id_by_task.get(task.id, ""),
+                proposal=proposal,
+                decision=decision,
+                application=application,
+                now=self._ownership_clock(),
+            )
+            settled_admission = self._copy_work_attempt_admission(settled_admission)
+            self._store_task(updated)
+            if receipt.retired_contract_binding:
+                self._remove_contracted_session_index_entry(updated)
+            self._work_attempt_admissions[admission.admission_id] = settled_admission
+            if (
+                self._unreleased_admission_id_by_session.get(admission.session_id)
+                == admission.admission_id
+            ):
+                del self._unreleased_admission_id_by_session[admission.session_id]
+            self._work_attempt_lifecycle_receipts[admission.admission_id] = receipt
+            self._lifecycle_admission_by_settlement_id[request.settlement_id] = (
+                admission.admission_id
+            )
+            return receipt.model_copy(deep=True)
+
     async def load_work_attempt_execution_claim(
         self,
         claim_id: str,
@@ -4629,9 +5018,9 @@ class InMemoryTaskStore(TaskStore):
         request = copy_work_attempt_execution_claim_request(request)
         async with self._lock:
             admission = self._require_work_attempt_admission(request.admission_id)
-            if admission.state is not WorkAttemptAdmissionState.ACTIVE:
+            if admission.state not in WORK_ATTEMPT_RENEWABLE_STATES:
                 raise WorkAttemptExecutionClaimLost(
-                    "Only an active admission can renew execution authority."
+                    "A released admission cannot renew execution authority."
                 )
             claim = admission.claim
             if (
@@ -4649,14 +5038,7 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkAttemptExecutionClaimLost(
                     "Completion proposal has already closed execution authority."
                 )
-            renewed_claim = claim.model_copy(
-                update={
-                    "lease_expires_at": max(
-                        claim.lease_expires_at,
-                        lease_now + timedelta(seconds=request.lease_seconds),
-                    ),
-                }
-            )
+            renewed_claim = renewed_work_attempt_execution_claim(claim, request, now=lease_now)
             renewed = self._copy_work_attempt_admission(
                 admission.model_copy(update={"claim": renewed_claim})
             )
@@ -4938,6 +5320,7 @@ class InMemoryTaskStore(TaskStore):
             if (
                 admission.state is not WorkAttemptAdmissionState.ACTIVE
                 or admission.claim.execution_owner_id != request.execution_owner_id
+                or admission.execution_stop is not None
             ):
                 raise WorkAttemptExecutionClaimLost(
                     "Completion proposal no longer owns the exact active admission."
@@ -5002,6 +5385,19 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             proposal = self._completion_proposals.get(proposal_id)
             return None if proposal is None else proposal.model_copy(deep=True)
+
+    async def load_completion_proposal_for_attempt(
+        self, attempt_id: str
+    ) -> CompletionProposal | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        async with self._lock:
+            proposal_id = self._proposal_id_by_attempt.get(attempt_id)
+            if proposal_id is None:
+                return None
+            proposal = self._require_completion_proposal(proposal_id)
+            if proposal.attempt_id != attempt_id:
+                raise WorkCompletionConflict("Proposal index conflicts with its attempt.")
+            return proposal.model_copy(deep=True)
 
     async def prepare_completion_verifier_profile(
         self,
@@ -5172,6 +5568,7 @@ class InMemoryTaskStore(TaskStore):
             attempt_number = 1 if current is None else current.attempt_number + 1
             claim = CompletionVerificationClaim(
                 claim_id=request.claim_id,
+                lease_seconds=request.lease_seconds,
                 proposal_id=request.proposal_id,
                 worker_id=request.worker_id,
                 execution_owner_id=request.execution_owner_id,
@@ -5225,6 +5622,7 @@ class InMemoryTaskStore(TaskStore):
             self._ensure_completion_proposal_is_current(proposal)
             renewed = CompletionVerificationClaim(
                 claim_id=current.claim_id,
+                lease_seconds=current.lease_seconds,
                 proposal_id=current.proposal_id,
                 worker_id=current.worker_id,
                 execution_owner_id=current.execution_owner_id,
@@ -7059,6 +7457,7 @@ class InMemoryTaskStore(TaskStore):
         self,
         task: Task,
         contract: WorkContract,
+        request: WorkAttemptAdmissionPrepare,
     ) -> WorkAttemptContinuationContext | None:
         attempt_ids = self._attempt_ids_by_task.get(task.id, [])
         if not attempt_ids:
@@ -7080,6 +7479,10 @@ class InMemoryTaskStore(TaskStore):
                 "The latest work attempt has no exact released admission authority."
             )
         prior_proposal_id = self._proposal_id_by_attempt.get(prior_attempt_id)
+        if prior_admission.run_semantics != request.run_semantics:
+            raise WorkAttemptAdmissionConflict(
+                "Continuation admission cannot change the source run settings."
+            )
         if prior_proposal_id is None:
             raise WorkAttemptAdmissionConflict(
                 "The latest work attempt has no durable completion proposal."
@@ -7520,6 +7923,8 @@ class InMemoryTaskStore(TaskStore):
     def _add_contracted_session_index_entry(self, task: Task) -> None:
         if task.session_id is None or task.work_contract is None:
             return
+        if self._task_contract_binding_is_retired(task.id):
+            return
         self._contracted_task_ids_by_session.setdefault(task.session_id, {}).setdefault(
             task.id,
             None,
@@ -7527,6 +7932,8 @@ class InMemoryTaskStore(TaskStore):
 
     def _remove_contracted_session_index_entry(self, task: Task) -> None:
         if task.session_id is None or task.work_contract is None:
+            return
+        if self._task_contract_binding_is_retired(task.id):
             return
         task_ids = self._contracted_task_ids_by_session.get(task.session_id)
         if task_ids is None or task.id not in task_ids:
@@ -7536,6 +7943,11 @@ class InMemoryTaskStore(TaskStore):
         del task_ids[task.id]
         if not task_ids:
             del self._contracted_task_ids_by_session[task.session_id]
+
+    def _task_contract_binding_is_retired(self, task_id: str) -> bool:
+        admission_id = self._latest_admission_id_by_task.get(task_id)
+        receipt = self._work_attempt_lifecycle_receipts.get(admission_id or "")
+        return receipt is not None and receipt.retired_contract_binding
 
     @staticmethod
     def _add_task_index_entry(
@@ -11026,6 +11438,7 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
         session_id=query.session_id,
         parent_task_id=query.parent_task_id,
         assigned_agent_name=query.assigned_agent_name,
+        has_work_contract=query.has_work_contract,
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -11506,7 +11919,27 @@ def _raise_task_claim_attach_error(
     raise RuntimeError(f"Task {task.id} active claim could not be attached.")
 
 
+def _work_attempt_discovery_query(
+    task_filter: TaskAggregateFilter | None, *, limit: int, after: str | None
+) -> tuple[TaskQuery, str | None]:
+    copied = copy_task_aggregate_filter(task_filter)
+    query = TaskQuery(
+        type=copied.type,
+        session_id=copied.session_id,
+        parent_task_id=copied.parent_task_id,
+        assigned_agent_name=copied.assigned_agent_name,
+        has_work_contract=True,
+        limit=limit,
+    )
+    return query, None if after is None else validate_work_completion_linked_id(after, "after")
+
+
 def _task_matches(task: Task, query: TaskQuery) -> bool:
+    if (
+        query.has_work_contract is not None
+        and (task.work_contract is not None) != query.has_work_contract
+    ):
+        return False
     if query.q is not None and not _task_matches_search(task, query.q):
         return False
     if query.status is not None and task.status != query.status:
@@ -11541,6 +11974,11 @@ def _task_matches_search(task: Task, query: str) -> bool:
 
 
 def _task_matches_claim_filter(task: Task, query: TaskQuery) -> bool:
+    if (
+        query.has_work_contract is not None
+        and (task.work_contract is not None) != query.has_work_contract
+    ):
+        return False
     if query.type is not None and task.type != query.type:
         return False
     if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:

@@ -1093,6 +1093,14 @@ from cayu.runtime.user_input import (
     UserInputRecoveryRequest,
     UserInputResponse,
 )
+from cayu.runtime.verified_task_worker import (
+    VerifiedTaskHandler,
+    VerifiedTaskHandlerReport,
+    VerifiedTaskPreparationContext,
+    VerifiedTaskProposalContext,
+    VerifiedTaskWorker,
+    VerifiedTaskWorkerDraining,
+)
 from cayu.runtime.work_attempt_admission import (
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,
@@ -1104,6 +1112,7 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptContinuationContext,
     WorkAttemptExecutionClaim,
     WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRenewal,
     WorkAttemptExecutionClaimRequest,
     WorkAttemptExecutionRequest,
     WorkAttemptProposalRequest,
@@ -2035,6 +2044,12 @@ __all__ = [
     "UsageUnpricedReason",
     "UserInputRecoveryRequest",
     "UserInputResponse",
+    "VerifiedTaskHandler",
+    "VerifiedTaskHandlerReport",
+    "VerifiedTaskPreparationContext",
+    "VerifiedTaskProposalContext",
+    "VerifiedTaskWorker",
+    "VerifiedTaskWorkerDraining",
     "VirtualCredentialSpec",
     "VirtualEgressEnvironmentFactory",
     "VirtualEgressRunnerRequest",
@@ -2050,6 +2065,7 @@ __all__ = [
     "WorkAttemptCreate",
     "WorkAttemptExecutionClaim",
     "WorkAttemptExecutionClaimLost",
+    "WorkAttemptExecutionClaimRenewal",
     "WorkAttemptExecutionClaimRequest",
     "WorkAttemptExecutionRequest",
     "WorkAttemptProposalRequest",

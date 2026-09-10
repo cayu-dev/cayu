@@ -222,8 +222,18 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundLimitRequest,
 )
+from cayu.runtime._verified_task_decision_coordinator import (
+    VerifiedTaskDecisionCoordinator,
+    VerifiedTaskDecisionDependencies,
+    VerifiedTaskDecisionExecution,
+    VerifiedTaskDecisionResult,
+)
 from cayu.runtime._verified_work_authority import (
     invocation_contains_secret_public_identity,
+)
+from cayu.runtime._work_attempt_invocation import (
+    WorkAttemptRecoveryOwnership,
+    _acknowledged_work_attempt_recovery,
 )
 from cayu.runtime._work_attempt_session_mutation import (
     capture_work_attempt_checkpoint_result,
@@ -440,6 +450,7 @@ from cayu.runtime.sessions import (
     _activate_session_interaction,
     _activate_session_run_fence,
     _checkpoint_after_queued_dispatch_acknowledgement,
+    _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _fork_source_session_instance_fingerprint,
     _initial_transcript_pending_interaction_id,
@@ -544,20 +555,24 @@ from cayu.runtime.user_input import (
 )
 from cayu.runtime.work_attempt_admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
+    WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,
     WorkAttemptClaimRenewalRequest,
+    WorkAttemptExecutionClaimLost,
     WorkAttemptExecutionClaimRequest,
     WorkAttemptExecutionRequest,
     WorkAttemptProposalRequest,
     WorkAttemptRecoveryActivate,
     WorkAttemptRecoveryRequest,
     WorkAttemptRecoveryRequired,
+    WorkAttemptRunRequest,
     copy_work_attempt_claim_renewal_request,
     copy_work_attempt_execution_request,
     copy_work_attempt_proposal_request,
     copy_work_attempt_recovery_request,
+    copy_work_attempt_run_request,
     require_admitted_completion_proposal_result,
     require_work_attempt_admission_result,
     require_work_attempt_claim_result,
@@ -3476,12 +3491,33 @@ class CayuApp:
                 prepared_request,
                 kind="initial",
             )
+            snapshot_validation = capture_sensitive_validation(
+                lambda: (
+                    self._session_engine.work_attempt_source_snapshot(
+                        prepared_request,
+                        kind="initial",
+                        source_request_sha256=source_request_sha256,
+                    ),
+                ),
+                operation_name="Work-attempt source snapshot validation",
+                redactor=self._secret_redactor,
+            )
+            if snapshot_validation.failure is not None:
+                del prepared_request, stable
+                raise_task_store_operation_failure(snapshot_validation.failure)
+            if snapshot_validation.result is None:
+                del prepared_request, stable
+                raise ValueError(
+                    "Work-attempt source snapshot is invalid or exceeds its portable limit."
+                )
             authority = _WorkAttemptRuntimeAuthority(
                 request=stable,
                 execution_owner_id=owner,
                 kind="initial",
                 source_request_sha256=source_request_sha256,
+                source_request=snapshot_validation.result[0],
             )
+            del snapshot_validation
             admission_operation = self._session_engine.admit_initial_work_attempt(
                 prepared_request,
                 authority=authority,
@@ -3520,12 +3556,33 @@ class CayuApp:
                 prepared_request,
                 kind="continuation",
             )
+            snapshot_validation = capture_sensitive_validation(
+                lambda: (
+                    self._session_engine.work_attempt_source_snapshot(
+                        prepared_request,
+                        kind="continuation",
+                        source_request_sha256=source_request_sha256,
+                    ),
+                ),
+                operation_name="Work-attempt source snapshot validation",
+                redactor=self._secret_redactor,
+            )
+            if snapshot_validation.failure is not None:
+                del prepared_request, stable, session_id, _store_resolved_session_id
+                raise_task_store_operation_failure(snapshot_validation.failure)
+            if snapshot_validation.result is None:
+                del prepared_request, stable, session_id, _store_resolved_session_id
+                raise ValueError(
+                    "Work-attempt source snapshot is invalid or exceeds its portable limit."
+                )
             authority = _WorkAttemptRuntimeAuthority(
                 request=stable,
                 execution_owner_id=owner,
                 kind="continuation",
                 source_request_sha256=source_request_sha256,
+                source_request=snapshot_validation.result[0],
             )
+            del snapshot_validation
             admission_operation = self._session_engine.admit_continuation_work_attempt(
                 prepared_request,
                 authority=authority,
@@ -3541,6 +3598,74 @@ class CayuApp:
             )
             return await admission_operation
         raise AssertionError("Validated work-attempt source request has an unknown type.")
+
+    async def _execute_work_attempt(self, request: WorkAttemptRunRequest) -> AsyncIterator[Event]:
+        """Resolve this process's exact claim and delegate governed execution.
+
+        Kept internal until the complete verified-worker capability and
+        recovery contract are exposed together. No caller admission object,
+        source settings or execution-owner identity cross this entrance.
+        """
+        request_type = type(request)
+        request_validation = capture_sensitive_validation(
+            lambda value=request: copy_work_attempt_run_request(value),
+            operation_name="Work-attempt run-request validation",
+            redactor=self._secret_redactor,
+        )
+        del request
+        if request_validation.failure is not None:
+            raise request_validation.failure from None
+        stable = request_validation.result
+        if stable is None:
+            if request_type is not WorkAttemptRunRequest:
+                raise TypeError(
+                    "Work-attempt execution requires a WorkAttemptRunRequest."
+                ) from None
+            raise ValueError("Work-attempt run request is invalid.")
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt execution.")
+        outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(stable.admission_id),
+            operation_name="Work-attempt run admission lookup",
+            redactor=self._secret_redactor,
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result: require_work_attempt_admission_result(
+                value, operation_name="Work-attempt run admission lookup"
+            ),
+            operation_name="Work-attempt run authority validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        admission = validation.result
+        if admission is None:
+            raise WorkAttemptRecoveryRequired("Work-attempt execution has no admission.")
+        claim = admission.claim
+        if (
+            admission.admission_id != stable.admission_id
+            or claim.claim_id != stable.claim_id
+            or claim.worker_id != stable.worker_id
+            or claim.generation != stable.generation
+            or claim.execution_owner_id != self._current_work_attempt_execution_owner_id()
+        ):
+            raise WorkAttemptExecutionClaimLost("Work-attempt execution claim is not owned here.")
+        # The delegated stream owns its execution context and restores this
+        # caller's context between advances. Do not let admission's inherited
+        # epoch escape the stream and fence later decision/result publication.
+        # Removing local tokens is not durable release or a dispatch grant.
+        _deactivate_session_interaction(admission.session_id)
+        _deactivate_session_run_fence(admission.session_id)
+        stream = self._session_engine.execute_admitted_work_attempt(
+            admission, lease_seconds=stable.lease_seconds
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     async def renew_work_attempt_claim(
         self,
@@ -3620,8 +3745,8 @@ class CayuApp:
                 previous,
                 claim_request,
                 operation_name="Work-attempt execution-claim renewal",
-                allowed_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
-                allowed_previous_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
+                allowed_states=WORK_ATTEMPT_RENEWABLE_STATES,
+                allowed_previous_states=WORK_ATTEMPT_RENEWABLE_STATES,
                 renewal=True,
             ),
             operation_name="Work-attempt execution-claim renewal result validation",
@@ -3650,8 +3775,8 @@ class CayuApp:
                     previous,
                     claim_request,
                     operation_name="Work-attempt execution-claim renewal reconciliation",
-                    allowed_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
-                    allowed_previous_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
+                    allowed_states=WORK_ATTEMPT_RENEWABLE_STATES,
+                    allowed_previous_states=WORK_ATTEMPT_RENEWABLE_STATES,
                     renewal=True,
                 )
             ),
@@ -3726,6 +3851,7 @@ class CayuApp:
                 ),
                 before_mutation=require_exact_recovery_claim,
                 interaction_id=recovering.interaction_id,
+                admission=recovering,
             )
         except _WorkAttemptRecoveryAlreadyActive:
             return
@@ -3782,6 +3908,19 @@ class CayuApp:
         request: WorkAttemptRecoveryRequest,
     ) -> WorkAttemptAdmission:
         """Replace an expired generation after positive session quiescence."""
+
+        operation = self._claim_work_attempt_recovery(request)
+        del request
+        try:
+            ownership = await operation
+        finally:
+            del operation
+        return await self._recover_claimed_work_attempt(ownership)
+
+    async def _claim_work_attempt_recovery(
+        self, request: WorkAttemptRecoveryRequest
+    ) -> WorkAttemptRecoveryOwnership:
+        """Acknowledge an exact claim before the worker starts its heartbeat."""
 
         request_type = type(request)
         request_validation = _copied_public_work_attempt_recovery_request(
@@ -3840,6 +3979,18 @@ class CayuApp:
         del prior_validation
         if prior is None:
             raise RuntimeError("Work-attempt recovery authority lookup returned no authority.")
+        if prior.state is WorkAttemptAdmissionState.PREPARING:
+            validation = capture_sensitive_result_validation(
+                lambda prior=prior: self._session_engine.reconstruct_preparing_work_attempt_source(
+                    prior
+                ),
+                operation_name="Prepared recovery source validation",
+                redactor=self._secret_redactor,
+            )
+            if validation.failure is not None:
+                del prior
+                raise_task_store_operation_failure(validation.failure)
+            del validation
         # Reject ambiguous migrated lifecycle state before claiming the next
         # TaskStore generation.  The runtime adapter is the sole owner of root
         # checkpoint migration; bypassing it here could reinterpret pre-v5
@@ -3865,12 +4016,14 @@ class CayuApp:
                 operation_name="Work-attempt recovery claim",
                 allowed_states=frozenset(
                     {
+                        WorkAttemptAdmissionState.PREPARING,
                         WorkAttemptAdmissionState.RECOVERING,
                         WorkAttemptAdmissionState.ACTIVE,
                     }
                 ),
                 allowed_previous_states=frozenset(
                     {
+                        WorkAttemptAdmissionState.PREPARING,
                         WorkAttemptAdmissionState.ACTIVE,
                         WorkAttemptAdmissionState.RECOVERING,
                     }
@@ -3886,13 +4039,44 @@ class CayuApp:
         del claim_validation
         if claimed is None:
             raise RuntimeError("Work-attempt recovery claim returned no authority.")
+        return _acknowledged_work_attempt_recovery(task_store, claimed, claim_request)
+
+    async def _recover_claimed_work_attempt(
+        self, ownership: WorkAttemptRecoveryOwnership
+    ) -> WorkAttemptAdmission:
+        """Continue existing cleanup under acknowledged same-runtime ownership."""
+        if type(ownership) is not WorkAttemptRecoveryOwnership:
+            raise TypeError("Work-attempt recovery requires acknowledged runtime ownership.")
+        task_store, claim_request, claimed = ownership.store, ownership.request, ownership.admission
+        if (
+            task_store is not self.task_store
+            or claim_request.execution_owner_id != self._current_work_attempt_execution_owner_id()
+        ):
+            raise WorkAttemptExecutionClaimLost("Recovery ownership belongs to another runtime.")
+        if claimed.state is WorkAttemptAdmissionState.PREPARING:
+            return await self._session_engine.recover_preparing_work_attempt(ownership)
+        del ownership
+        stable = WorkAttemptRecoveryRequest(
+            admission_id=claim_request.admission_id,
+            claim_id=claim_request.claim_id,
+            worker_id=claim_request.worker_id,
+            generation=claim_request.generation,
+            lease_seconds=claim_request.lease_seconds,
+        )
         # A successful recovery claim replaces the prior execution generation.
         # Retire any predecessor epoch copied into this caller before either
         # replaying an already-active generation or mutating the recovered
         # session.  The active replay branch below reinstalls only the current
         # durable epoch after validating its complete authority.
         _deactivate_session_run_fence(claimed.session_id)
+        released_recovery = await self._session_engine.reconcile_released_work_attempt_recovery(
+            claimed
+        )
+        if released_recovery is not None:
+            return released_recovery
         already_active = claimed.state is WorkAttemptAdmissionState.ACTIVE
+        if already_active and claimed.execution_stop is not None:
+            raise WorkAttemptRecoveryRequired("Stopped work-attempt cleanup is unproven.")
         if already_active and claimed.recovery_evidence_sha256 is None:
             raise RuntimeError("Recovered admission has no durable recovery evidence.")
         if already_active:
@@ -4060,7 +4244,8 @@ class CayuApp:
             and active_profile.profile == profile
         )
         predecessor_settlement_required = checkpoint_recovery_authority is None and (
-            session.status
+            claimed.execution_stop is not None
+            or session.status
             not in {
                 SessionStatus.COMPLETED,
                 SessionStatus.FAILED,
@@ -4089,7 +4274,10 @@ class CayuApp:
                 raise WorkAttemptRecoveryRequired(
                     "Recovery cannot prove the crashed predecessor invocation authority."
                 )
-            if has_active_model_completion:
+            model_result_ready = (
+                await self._session_engine.has_recoverable_work_attempt_model_result(claimed)
+            )
+            if has_active_model_completion and not model_result_ready:
                 raise WorkAttemptRecoveryRequired(
                     "Recovery is fenced while model-completion settlement remains active."
                 )
@@ -4097,6 +4285,7 @@ class CayuApp:
                 session,
                 checkpoint,
                 redactor=self._secret_redactor,
+                allow_pending_tool_round=model_result_ready,
                 allowed_initial_transcript_interaction_id=(
                     claimed.interaction_id if claimed.kind == "initial" else None
                 ),
@@ -4120,6 +4309,8 @@ class CayuApp:
                 predecessor_settlement_required,
             )
             return await self.recover_work_attempt(stable)
+        if claimed.execution_stop is not None:
+            raise WorkAttemptRecoveryRequired("Stopped work-attempt cleanup is unproven.")
         prior_recovery_transition = False
         if (
             not exact_session_replay
@@ -5763,6 +5954,48 @@ class CayuApp:
 
         operation = self._completion_decision_application_coordinator.apply(request)
         del request
+        return await operation
+
+    def _verified_task_decision_owner(self) -> VerifiedTaskDecisionCoordinator:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required for verified task decisions.")
+        return VerifiedTaskDecisionCoordinator(
+            VerifiedTaskDecisionDependencies(
+                store=self.task_store,
+                redactor=self._secret_redactor,
+                verify=self._completion_verifier_coordinator.verify,
+                start_verify=self._completion_verifier_coordinator.start_owned_verification,
+                resolve=self.resolve_completion_result,
+                apply=self.apply_completion_decision,
+                release=self._session_engine.load_work_attempt_release_evidence,
+                admit=self.admit_work_attempt,
+            )
+        )
+
+    async def _settle_verified_task_decision(
+        self, admission_id: str, verification: CompletionVerifierExecutionRequest
+    ) -> VerifiedTaskDecisionResult:
+        """Private worker composition; queue/handler authority is not public yet."""
+        operation = self._verified_task_decision_owner().settle(admission_id, verification)
+        del admission_id, verification
+        return await operation
+
+    async def _start_verified_task_decision(
+        self, admission_id: str, verification: CompletionVerifierExecutionRequest
+    ) -> VerifiedTaskDecisionExecution:
+        """Validate released authority before returning the owned verifier phase."""
+        operation = self._verified_task_decision_owner().start(admission_id, verification)
+        del admission_id, verification
+        return await operation
+
+    async def _continue_verified_task(
+        self, admission_id: str, decision_id: str, *, worker_id: str, lease_seconds: int
+    ) -> WorkAttemptAdmission:
+        """Private worker successor scheduling through exact admission ownership."""
+        operation = self._verified_task_decision_owner().continue_attempt(
+            admission_id, decision_id, worker_id=worker_id, lease_seconds=lease_seconds
+        )
+        del admission_id, decision_id, worker_id, lease_seconds
         return await operation
 
     async def resolve_completion_result(

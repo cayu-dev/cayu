@@ -437,6 +437,9 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=82, kind=RevisionKind.BREAKING, compatible_from=82),
     # All queue writers must enforce freshness and immutable terminal outcomes.
     Revision(revision=83, kind=RevisionKind.BREAKING, compatible_from=83),
+    # Verified-task settlement retires contract bindings through durable receipts.
+    # Older writers neither preserve retirement nor retain executable source settings.
+    Revision(revision=84, kind=RevisionKind.BREAKING, compatible_from=84),
 )
 
 #: The revision an empty database is initialized to.

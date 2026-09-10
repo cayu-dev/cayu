@@ -66,6 +66,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
     handlers = set()
     closed = asyncio.Event()
     release = asyncio.Event()
+    stream_started = asyncio.Event()
     requests = 0
 
     async def serve(reader, writer):
@@ -83,6 +84,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
                 + payload
             )
             await writer.drain()
+            stream_started.set()
             while True:
                 try:
                     x = await asyncio.wait_for(reader.read(), 0.025)
@@ -118,6 +120,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
 
     class Mock(httpx.AsyncByteStream):
         async def __aiter__(self):
+            stream_started.set()
             yield payload
             while True:
                 try:
@@ -157,6 +160,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
 
         monkeypatch.setattr(store, "append_event", reject_receipt)
     provider = None
+    running = opening = None
     try:
         async with httpx.AsyncClient(
             transport=Local() if mode == "socket" else httpx.MockTransport(handle)
@@ -178,10 +182,22 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
             app.register_agent(AgentSpec(name="probe", model="synthetic"))
             ctx = Workflow(app).context("probe")
             await ctx.start()
+            running = asyncio.create_task(
+                step(ctx, agent="probe", step_id="one", prompt="synthetic")
+            )
+            opening = asyncio.create_task(stream_started.wait())
+            # The cleanup watchdog measures an active HTTP stream, not session
+            # preparation/schema/profile work on a loaded CI host. Setup has a
+            # separate deadlock guard; an early step failure must be observed.
+            done, _ = await asyncio.wait(
+                (running, opening), timeout=30, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert done, "Workflow did not reach HTTP dispatch within the setup guard."
+            if opening not in done:
+                await running
+                pytest.fail("Workflow finished without opening its HTTP stream.")
             with pytest.raises(StepError) as raised:
-                await asyncio.wait_for(
-                    step(ctx, agent="probe", step_id="one", prompt="synthetic"), 3
-                )
+                await asyncio.wait_for(running, 3)
             sid = raised.value.session_id
             assert sid is not None
 
@@ -288,6 +304,12 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
             await store.close()
     finally:
         release.set()
+        for owned in (running, opening):
+            if owned is not None and not owned.done():
+                owned.cancel()
+        await asyncio.gather(
+            *(owned for owned in (running, opening) if owned is not None), return_exceptions=True
+        )
         async with asyncio.timeout(2):
             while ds._PROVIDER_DEADLINE_AWAIT_OWNERS:
                 await asyncio.sleep(0.001)
@@ -299,6 +321,22 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
         for task in list(handlers):
             task.cancel()
         await asyncio.gather(*handlers, return_exceptions=True)
+
+
+@pytest.mark.anyio
+async def test_semantic_http_cleanup_watchdog_excludes_session_setup(tmp_path, monkeypatch):
+    from cayu.runtime._session_engine import SessionEngine
+
+    prepare = SessionEngine._prepare_initial_run
+
+    async def slow_prepare(self, request, **kwargs):
+        # Longer than the unchanged post-dispatch watchdog. This must not turn
+        # the provider's semantic-idle result into an unrelated caller timeout.
+        await asyncio.sleep(3.1)
+        return await prepare(self, request, **kwargs)
+
+    monkeypatch.setattr(SessionEngine, "_prepare_initial_run", slow_prepare)
+    await test_semantic_idle_http_cleanup(tmp_path, monkeypatch, "delayed", "whitespace")
 
 
 @pytest.mark.anyio

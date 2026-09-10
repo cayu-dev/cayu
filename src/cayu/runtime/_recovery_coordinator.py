@@ -219,6 +219,8 @@ from cayu.runtime._tool_round_executor import (
     policy_denial_payload_fields,
     restore_staged_terminal_authority,
 )
+from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
+from cayu.runtime._work_attempt_session_mutation import record_work_attempt_execution_stop
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -286,7 +288,11 @@ from cayu.runtime.interactions import (
     InteractionStatus,
     InteractionSummaryEvidence,
 )
-from cayu.runtime.invocation import SessionExecutionSource, inherited_session_invocation
+from cayu.runtime.invocation import (
+    SessionExecutionSource,
+    SessionInvocationBinding,
+    inherited_session_invocation,
+)
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -371,6 +377,7 @@ from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, h
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     copy_structured_output_spec,
     require_secret_free_structured_output_spec,
 )
@@ -385,6 +392,7 @@ from cayu.runtime.tasks import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
     _terminalize_claimed_task,
+    copy_task,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
@@ -1615,6 +1623,10 @@ class ModelCompletionBoundaryReconciliation:
     pending_tool_round: tool_round_recovery.PendingToolRound | None = None
     transcript_cursor: int = 0
     recovery_events: tuple[Event, ...] = ()
+    # Retain the exact validated publication and its original execution
+    # identities for governed replay; this is evidence, not dispatch authority.
+    completed_stage: ModelCompletionStage | None = None
+    structured_output_events: tuple[Event, ...] = ()
 
     @property
     def blocks_provider_dispatch(self) -> bool:
@@ -2160,6 +2172,7 @@ class RecoveryCoordinator:
         budget_policy: BudgetPolicy | None,
         request_loop_policies: tuple[LoopPolicy, ...] = (),
         recovery_claim_id: str | None = None,
+        work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> InvocationContext:
         """Authenticate restart-resolved collaborators before recovery effects."""
 
@@ -2192,6 +2205,7 @@ class RecoveryCoordinator:
             budget_policy=budget_policy,
             tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
             recovery_claim_id=recovery_claim_id,
+            work_attempt=work_attempt,
         )
 
     async def _fence_or_rebind_active_invocation(
@@ -2416,6 +2430,15 @@ class RecoveryCoordinator:
         ):
             return None
         return operation, registered_provider
+
+    async def has_recoverable_provider_operation(self, stage: ModelCompletionStage) -> bool:
+        """Read-only eligibility for this owner's exact background recovery path.
+
+        The operation loader validates durable model/start/cursor identities;
+        a scanner never receives a provider connection or dispatch authority.
+        The elected recovery owner must resolve and validate them again.
+        """
+        return await self._recoverable_provider_operation(stage) is not None
 
     async def load_model_completion_boundary(
         self,
@@ -3189,6 +3212,7 @@ class RecoveryCoordinator:
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
         pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
+        tool_receipt: RuntimePublicationReceipt | None = None
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
@@ -3482,6 +3506,20 @@ class RecoveryCoordinator:
                         "source model step."
                     )
 
+        structured_events: tuple[Event, ...] = ()
+        if (
+            invocation_context is not None
+            and invocation_context.work_attempt is not None
+            and pending_round is None
+            and pointer.tool_round_id is not None
+            and transcript_window.cursor > pointer.transcript_end_cursor
+        ):
+            structured_events = await self._load_closed_structured_output_events(
+                session,
+                completed_stage,
+                invocation_context,
+                None if tool_receipt is None else tool_receipt.model_copy(deep=True),
+            )
         await self._event_writer.fan_out_persisted([completion_event])
         return ModelCompletionBoundaryReconciliation(
             state=("already_promoted" if state == "none" else state),
@@ -3491,7 +3529,137 @@ class RecoveryCoordinator:
             pending_tool_round=pending_round,
             transcript_cursor=transcript_window.cursor,
             recovery_events=recovery_events,
+            completed_stage=completed_stage.model_copy(deep=True),
+            structured_output_events=structured_events,
         )
+
+    async def _load_closed_structured_output_events(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        context: InvocationContext,
+        expected_receipt: RuntimePublicationReceipt | None,
+    ) -> tuple[Event, ...]:
+        """Read exact structured evidence for an already reconciled tool tail."""
+        if context.work_attempt is None or context.work_attempt.admission.run_semantics is None:
+            raise RuntimeError("Closed structured output requires governed run semantics.")
+        expected_spec = context.work_attempt.admission.run_semantics.structured_output
+        if expected_spec is None:
+            return ()
+        if expected_spec.strategy is not StructuredOutputStrategy.TOOL:
+            return ()
+        if stage.publication is None:
+            raise RuntimeError("Closed structured output lost its source publication.")
+        pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+            {
+                operation.key: operation.value
+                for operation in stage.publication.mutation.operations
+                if operation.action == "set"
+            }
+        )
+        if pending is None:
+            raise RuntimeError("Closed structured output lost its source round.")
+        if not any(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending.tool_calls):
+            return ()
+        if not self.has_recoverable_structured_output_round(pending):
+            raise RuntimeError("Closed structured output lacks authoritative validation.")
+        spec, validation = pending.structured_output, pending.structured_output_validation
+        assert spec is not None and validation is not None
+        assert pending.model_step is not None and pending.structured_output_attempt is not None
+        if spec != expected_spec:
+            raise RuntimeError("Closed structured output changed its source specification.")
+        receipt = await self._session_store.load_runtime_publication_receipt(
+            session.id, f"tool-round:{pending.tool_round_id}"
+        )
+        if (
+            type(receipt) is not RuntimePublicationReceipt
+            or expected_receipt is None
+            or receipt != expected_receipt
+            or receipt.session_id != session.id
+            or receipt.kind != "tool-round"
+            or receipt.interaction_id != context.binding.interaction_id
+        ):
+            raise RuntimeError("Closed structured output lost its exact interaction receipt.")
+        auxiliary = receipt.intent.get("auxiliary")
+        if (
+            type(auxiliary) is not dict
+            or any(
+                type(auxiliary.get(key)) is not int for key in ("schema_version", "step", "attempt")
+            )
+            or type(auxiliary.get("valid")) is not bool
+            or type(auxiliary.get("retry_scheduled")) is not bool
+        ):
+            raise RuntimeError("Closed structured output has malformed validation authority.")
+        retry = auxiliary["retry_scheduled"]
+        if retry and (validation.valid or pending.structured_output_attempt > spec.max_retries):
+            raise RuntimeError("Closed structured output retry conflicts with its policy.")
+        identity = tool_round_recovery.pending_tool_round_identity(pending)
+        expected: list[Event] = []
+        expected.append(
+            structured_output_tool_round._structured_output_validating_event(
+                session=session,
+                registered_agent=context.registered_agent,
+                environment_name=_environment_name(context.registered_environment),
+                spec=spec,
+                step=pending.model_step,
+                attempt=pending.structured_output_attempt,
+                tool_round_identity=identity,
+            )
+        )
+        kinds = [
+            EventType.STRUCTURED_OUTPUT_VALIDATED
+            if validation.valid
+            else EventType.STRUCTURED_OUTPUT_FAILED
+        ]
+        if retry:
+            kinds.append(EventType.STRUCTURED_OUTPUT_RETRY)
+        for kind in kinds:
+            expected.append(
+                structured_output_tool_round._structured_output_event(
+                    event_type=kind,
+                    session=session,
+                    registered_agent=context.registered_agent,
+                    environment_name=_environment_name(context.registered_environment),
+                    spec=spec,
+                    validation=validation,
+                    step=pending.model_step,
+                    attempt=pending.structured_output_attempt,
+                    redactor=self._secret_redactor,
+                    tool_round_identity=identity,
+                )
+            )
+        if auxiliary != {
+            "schema_version": 1,
+            "kind": "structured-output-validation",
+            "step": pending.model_step,
+            "attempt": pending.structured_output_attempt,
+            "valid": validation.valid,
+            "retry_scheduled": retry,
+            "event_ids": [event.id for event in expected],
+        } or receipt.appended_event_ids != tuple(event.id for event in expected):
+            raise RuntimeError("Closed structured output receipt conflicts with its source result.")
+        records: list[Event] = []
+        for event in expected:
+            expected_event = event_with_execution_profile_authority(event, context.profile)
+            rows = await self._session_store.query_events(
+                EventQuery(session_id=session.id, event_id=event.id, limit=2)
+            )
+            if len(rows) != 1:
+                raise RuntimeError("Closed structured output event is missing or ambiguous.")
+            actual = rows[0].event
+            if (
+                actual.id != event.id
+                or actual.type != event.type
+                or actual.session_id != session.id
+                or actual.interaction_id != receipt.interaction_id
+                or actual.agent_name != event.agent_name
+                or actual.environment_name != event.environment_name
+                or actual.payload != expected_event.payload
+            ):
+                raise RuntimeError("Closed structured output event conflicts with its receipt.")
+            if actual.type in kinds:
+                records.append(copy_event(actual))
+        return tuple(records)
 
     async def _tool_result_tail_has_durable_lifecycle_provenance(
         self,
@@ -13314,6 +13482,115 @@ class RecoveryCoordinator:
         ):
             yield event
 
+    @staticmethod
+    def has_recoverable_structured_output_round(
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> bool:
+        """Advisory readiness for a recorded, reserved-only finalizer round.
+
+        Unlike application tools this round has no external dispatch to settle.
+        The elected recovery owner still validates and publishes its exact
+        persisted validation through _recover_structured_output_tool_round.
+        """
+        spec = pending_round.structured_output
+        attempt = pending_round.structured_output_attempt
+        return (
+            bool(pending_round.tool_calls)
+            and all(
+                call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls
+            )
+            and spec is not None
+            and spec.strategy is StructuredOutputStrategy.TOOL
+            and pending_round.model_step is not None
+            and attempt is not None
+            and attempt <= spec.max_retries + 1
+            and pending_round.structured_output_validation is not None
+        )
+
+    async def has_completed_tool_round_results(
+        self,
+        *,
+        session_id: str,
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> bool:
+        """Advisory readiness for recorded settled effects, not execution authority."""
+        if pending_round.policy_state != "planned" or any(
+            call.policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE
+            or call.policy_decision != ToolPolicyDecision.ALLOW.value
+            for call in pending_round.tool_calls
+        ):
+            return False
+        events = await self._load_tool_round_lifecycle_events(
+            session_id=session_id, pending_round=pending_round
+        )
+        outcomes, _ = tool_round_recovery.recorded_tool_outcomes(
+            events=events, pending_round=pending_round
+        )
+        terminal_events = [
+            *events,
+            *(
+                staged.event
+                for staged in tool_round_recovery.staged_terminal_records(pending_round)
+            ),
+        ]
+        call_ids = [call.tool_call_id for call in pending_round.tool_calls]
+        return all(
+            call_id in outcomes for call_id in call_ids
+        ) and self._tool_terminals_are_settled(terminal_events, call_ids)
+
+    async def has_settled_published_tool_round_results(
+        self, *, session_id: str, receipt: RuntimePublicationReceipt
+    ) -> bool:
+        """Check recorded outcomes; a publication receipt alone does not prove settlement."""
+        if receipt.kind != "tool-round":
+            return False
+        call_ids = receipt.intent.get("tool_call_ids")
+        identity_fields = {
+            key: receipt.intent.get(key)
+            for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+        }
+        if (
+            type(call_ids) is not list
+            or not call_ids
+            or any(type(value) is not str or not value for value in call_ids)
+            or len(set(call_ids)) != len(call_ids)
+            or any(type(value) is not str or not value for value in identity_fields.values())
+        ):
+            return False
+        identity = ToolRoundIdentity.model_validate(identity_fields)
+        events = await self._session_store.load_tool_round_lifecycle_events_for_round(
+            session_id, call_ids, tool_round_identity=identity
+        )
+        if any(not identity.matches_payload(event.payload) for event in events):
+            return False
+        return self._tool_terminals_are_settled(events, call_ids)
+
+    @staticmethod
+    def _tool_terminals_are_settled(events: list[Event], call_ids: list[str]) -> bool:
+        expected = set(call_ids)
+        settled: set[str] = set()
+        for event in events:
+            if event.type not in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
+                continue
+            call_id = event.payload.get("tool_call_id")
+            if type(call_id) is not str or call_id not in expected:
+                return False
+            controls = tool_results.runtime_terminal_controls(event.payload)
+            if (
+                controls.get("outcome_unknown", False)
+                or controls.get("manual_reconciliation_required", False)
+                or event.payload.get("secret_scope_incomplete", False) is not False
+            ):
+                return False
+            result_payload = event.payload.get("result")
+            if type(result_payload) is not dict:
+                return False
+            result = tool_results.tool_result_from_payload(result_payload)
+            if result.is_error is not (event.type is EventType.TOOL_CALL_FAILED):
+                return False
+            settled.add(call_id)
+        return bool(expected) and settled == expected
+
     async def _load_tool_round_lifecycle_events(
         self,
         *,
@@ -13660,6 +13937,10 @@ class RecoveryCoordinator:
                 ),
                 execution_profile,
             )
+            if invocation_context is not None:
+                expected_event = expected_event.model_copy(
+                    update={"interaction_id": invocation_context.binding.interaction_id}
+                )
             recorded_outcome = recorded_outcomes.get(expected_outcome.call.id)
             if recorded_outcome is None:
                 planned_terminal_events.append(expected_event)
@@ -13694,6 +13975,10 @@ class RecoveryCoordinator:
                 or recorded_event.id != expected_event.id
                 or recorded_event.type != expected_event.type
                 or recorded_event.session_id != expected_event.session_id
+                or (
+                    invocation_context is not None
+                    and recorded_event.interaction_id != expected_event.interaction_id
+                )
                 or recorded_event.agent_name != expected_event.agent_name
                 or recorded_event.environment_name != expected_event.environment_name
                 or recorded_event.tool_name != expected_event.tool_name
@@ -13761,7 +14046,14 @@ class RecoveryCoordinator:
             )
         auxiliary_events = self._event_writer.prepare_many(
             [
-                event_with_execution_profile_authority(event, execution_profile)
+                event_with_execution_profile_authority(
+                    event
+                    if invocation_context is None
+                    else event.model_copy(
+                        update={"interaction_id": invocation_context.binding.interaction_id}
+                    ),
+                    execution_profile,
+                )
                 for event in auxiliary_events
             ]
         )
@@ -15376,8 +15668,19 @@ class RecoveryCoordinator:
         retain_open_interaction_invocation: bool = False,
         retain_invocation_context: Callable[[InvocationContext], None] | None = None,
         preserve_interaction_id: str | None = None,
+        _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> IncompleteSessionRecoveryResult:
         """Repair one incomplete session without executing providers or tools."""
+        if _work_attempt is not None:
+            if type(_work_attempt) is not WorkAttemptInvocationAuthority:
+                raise TypeError("Governed recovery requires authenticated work-attempt authority.")
+            admission = _work_attempt.admission
+            if (
+                before_mutation is None
+                or preserve_interaction_id != admission.interaction_id
+                or request.session_id != admission.session_id
+            ):
+                raise ValueError("Governed recovery conflicts with its exact claim boundary.")
         if retain_invocation_context is not None and not retain_open_interaction_invocation:
             raise ValueError("Invocation context retention requires an open recovery invocation.")
         if preserve_interaction_id is not None:
@@ -15397,7 +15700,22 @@ class RecoveryCoordinator:
         session = await self._session_store.load(request.session_id)
         if session is None:
             raise KeyError(f"Session not found: {request.session_id}") from None
+        if _work_attempt is not None:
+            admitted = _work_attempt.admission
+            profile = execution_profile_from_session_metadata(session.metadata)
+            if (
+                SessionInvocationBinding(
+                    id=session.id,
+                    session_instance_id=session.instance_id,
+                    invocation=session.invocation,
+                )
+                != admitted.session_invocation
+                or profile is None
+                or profile.fingerprint != admitted.source_execution_profile_fingerprint
+            ):
+                raise ValueError("Governed recovery session authority changed before admission.")
         recovered = await self._recover_incomplete_session_scoped(
+            _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
             session=session,
             inactive_for_seconds=request.inactive_for_seconds,
@@ -15968,6 +16286,7 @@ class RecoveryCoordinator:
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
+        _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_json_value(metadata, "metadata")
@@ -15984,6 +16303,7 @@ class RecoveryCoordinator:
             )
 
         return await self._recover_incomplete_session_owned(
+            _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
             session=session,
             inactive_for_seconds=inactive_for_seconds,
@@ -16017,6 +16337,7 @@ class RecoveryCoordinator:
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
+        _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> IncompleteSessionRecoveryResult:
 
         if (provider_disposition_task_id is None) != (
@@ -16425,6 +16746,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     budget_policy=budget_policy_snapshot,
                     recovery_claim_id=claim.claim_id,
+                    work_attempt=_work_attempt,
                 )
             if provider_disposition_after_admission is not None:
                 await provider_disposition_after_admission()
@@ -17288,6 +17610,12 @@ class RecoveryCoordinator:
                         claim_has_not_dispatched_work or recovery_work_quiescent
                     ):
                         # A failed recovery did not prove its work quiescent.
+                        return
+                    if session.status not in _TERMINAL_EVENT_TYPE_BY_STATUS:
+                        # An exact background retrieval can succeed while its
+                        # operation remains pending. Finishing this local claim
+                        # does not settle that invocation or authorize release.
+                        # Keep the fence for the next exact recovery owner.
                         return
                     inspection = await self._inspect_terminal_evidence(
                         session=session,
@@ -19695,6 +20023,58 @@ class RecoveryCoordinator:
             }
         )
 
+    async def _require_governed_completion_task(
+        self,
+        *,
+        session: Session,
+        marker: dict[str, Any],
+        invocation_context: InvocationContext,
+    ) -> Task:
+        """Validate the exact task before governed workspace recovery effects."""
+        if (
+            type(invocation_context) is not InvocationContext
+            or invocation_context.work_attempt is None
+        ):
+            raise TypeError("Governed completion recovery requires its invocation authority.")
+        admission = invocation_context.work_attempt.admission
+        if (
+            admission.execution_entry is None
+            or marker.get("task_id") != admission.task_id
+            or session.id != admission.session_id
+            or session.instance_id != admission.session_invocation.session_instance_id
+            or invocation_context.binding.session_id != session.id
+            or invocation_context.binding.session_instance_id != session.instance_id
+            or invocation_context.profile.fingerprint
+            != admission.source_execution_profile_fingerprint
+        ):
+            raise RuntimeError("Governed completion recovery has conflicting task authority.")
+        if self._task_store is None:
+            raise RuntimeError("Governed completion recovery requires its task store.")
+        raw_task = await self._task_store.load_task(admission.task_id)
+        if type(raw_task) is not Task:
+            raise RuntimeError("Governed completion recovery lost its exact running task.")
+        task = copy_task(raw_task)
+        if (
+            task.id != admission.task_id
+            or task.work_contract != admission.contract
+            or task.session_id != admission.session_id
+            or task.session_instance_id != admission.session_invocation.session_instance_id
+            or task.status is not TaskStatus.RUNNING
+        ):
+            raise RuntimeError("Governed completion recovery lost its exact running task.")
+        return task
+
+    async def _record_governed_completion_stop(self, context: InvocationContext) -> None:
+        """Retain the stop before the workspace marker or its reply can disappear."""
+        if context.work_attempt is None or self._task_store is None:
+            raise RuntimeError("Governed completion stop has no attempt owner.")
+        await record_work_attempt_execution_stop(
+            self._task_store,
+            admission=context.work_attempt.admission,
+            reason="workspace_finalization_recovery",
+            redactor=self._secret_redactor,
+        )
+
     async def _settle_recovered_completion_task(
         self,
         *,
@@ -19702,8 +20082,15 @@ class RecoveryCoordinator:
         marker: dict[str, Any],
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment,
+        invocation_context: InvocationContext | None = None,
     ) -> Event | None:
-        """Fail the one attached task before retiring recovered commit authority."""
+        """Settle ordinary tasks; governed tasks retain their verified owner."""
+
+        if invocation_context is not None and invocation_context.work_attempt is not None:
+            await self._require_governed_completion_task(
+                session=session, marker=marker, invocation_context=invocation_context
+            )
+            return None
 
         marker_has_task_identity = "task_id" in marker
         marker_task_id = marker.get("task_id")
@@ -19866,6 +20253,12 @@ class RecoveryCoordinator:
     ) -> IncompleteSessionRecoveryResult:
         """Reconnect and retry only the retained workspace commit boundary."""
 
+        if invocation_context.work_attempt is not None:
+            await self._require_governed_completion_task(
+                session=session, marker=marker, invocation_context=invocation_context
+            )
+            await self._record_governed_completion_stop(invocation_context)
+
         if session.status is SessionStatus.RUNNING:
             recovery_claim_id = invocation_context.recovery_claim_id
             if recovery_claim_id is None:
@@ -20009,6 +20402,7 @@ class RecoveryCoordinator:
                 marker=marker,
                 registered_agent=registered_agent,
                 registered_environment=resolved_environment,
+                invocation_context=resolved_context,
             )
             if task_failed_event is not None:
                 events.append(task_failed_event)
@@ -20660,6 +21054,38 @@ class RecoveryCoordinator:
         if pending_tool_round is None and await self.materialize_deferred_input_if_present(
             session.id
         ):
+            actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
+
+        if (
+            session.status is SessionStatus.RUNNING
+            and invocation_context is not None
+            and invocation_context.work_attempt is not None
+            and preserve_interaction_id == invocation_context.binding.interaction_id
+            and pending_tool_round is not None
+            and pending_approval is None
+            and pending_user_input is None
+            and self.has_recoverable_structured_output_round(pending_tool_round)
+        ):
+            # Replacement preserves this governed interaction. Reconcile its
+            # reserved validation before interrupting the predecessor epoch so
+            # that interruption cannot consume the original repair allowance.
+            # This publishes validation evidence; only the replacement model
+            # loop may dispatch a later repair under its execution claim.
+            snapshot = await self._session_store.load_transcript_snapshot(session.id)
+            transcript = [detach_message(record.message) for record in snapshot.records]
+            async for event in self.recover_pending_tool_round(
+                session=session,
+                invocation_context=invocation_context,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                messages=transcript,
+                execution_profile=invocation_context.profile,
+                incomplete_recovery_claimed=True,
+                expected_transcript_cursor=snapshot.cursor,
+            ):
+                events.append(event)
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
 
         if (

@@ -49,6 +49,7 @@ from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_decision_matches_recovery_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime.budgets import BudgetPolicy
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
@@ -81,6 +82,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_runtime_component,
 )
 from cayu.runtime.invocation import SessionInvocationBinding
+from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.sessions import (
     ExecutionProfileRejectionResult,
@@ -97,6 +99,9 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
     _authenticated_session_instance_id_for_run_request,
+    _current_session_run_epoch,
+    _deactivate_session_interaction,
+    _deactivate_session_run_fence,
     _invocation_lifecycle_authority_mutation_scope,
     _run_request_invocation_lifecycle_authority_sha256,
     apply_runtime_publication_checkpoint_mutation,
@@ -252,6 +257,7 @@ class InvocationContext:
         "_targeted_tool_grants",
         "_tool_capability_ceiling",
         "_validated_profile",
+        "_work_attempt",
     )
 
     _active_profile: ActiveInvocationExecutionProfile
@@ -268,6 +274,7 @@ class InvocationContext:
     _targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
     _tool_capability_ceiling: ToolCapabilityCeiling
     _validated_profile: ExecutionProfileIdentity
+    _work_attempt: WorkAttemptInvocationAuthority | None
 
     def __init__(
         self,
@@ -286,6 +293,7 @@ class InvocationContext:
         _recovery_claim_id: str | None = None,
         _validated_profile: ExecutionProfileIdentity | None = None,
         _authority_token: object = None,
+        _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> None:
         object.__setattr__(self, "_active_profile", active_profile)
         object.__setattr__(self, "_binding", binding)
@@ -301,6 +309,7 @@ class InvocationContext:
         object.__setattr__(self, "_recovery_claim_id", _recovery_claim_id)
         object.__setattr__(self, "_validated_profile", _validated_profile)
         object.__setattr__(self, "_authority_token", _authority_token)
+        object.__setattr__(self, "_work_attempt", _work_attempt)
         self._validate()
 
     def _validate(self) -> None:
@@ -356,6 +365,17 @@ class InvocationContext:
             raise ValueError("Invocation context profile belongs to another interaction.")
         if self.active_profile.run_epoch != binding.run_epoch:
             raise ValueError("Invocation context profile belongs to another run epoch.")
+        if self.work_attempt is not None:
+            if type(self.work_attempt) is not WorkAttemptInvocationAuthority:
+                raise TypeError("Invocation context requires authenticated work-attempt authority.")
+            admission = self.work_attempt.admission
+            if (
+                admission.session_id != binding.session_id
+                or admission.session_invocation.session_instance_id != binding.session_instance_id
+                or admission.interaction_id != binding.interaction_id
+                or admission.source_execution_profile_fingerprint != self.profile.fingerprint
+            ):
+                raise ValueError("Work-attempt authority conflicts with its invocation binding.")
         if self.registered_agent.spec.name != binding.agent_name:
             raise ValueError("Registered agent conflicts with invocation authority.")
         if self.registered_provider.name != binding.provider_name:
@@ -457,6 +477,11 @@ class InvocationContext:
 
         return self._recovery_claim_id
 
+    @property
+    def work_attempt(self) -> WorkAttemptInvocationAuthority | None:
+        """Return the runtime-only task owner, never caller-supplied metadata."""
+        return self._work_attempt
+
     def with_admitted_session(self, session: Session) -> InvocationContext:
         """Attach the durable admission result without replacing live authority."""
 
@@ -517,6 +542,7 @@ class InvocationContext:
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
             recovery_claim_id=self.recovery_claim_id,
+            work_attempt=self.work_attempt,
         )
 
     def with_registered_environment(
@@ -580,6 +606,7 @@ class InvocationContext:
                 tool_capability_ceiling=self.tool_capability_ceiling,
                 targeted_tool_grants=self.targeted_tool_grants,
                 recovery_claim_id=self.recovery_claim_id,
+                work_attempt=self.work_attempt,
             )
         if self.binding.environment_name is None:
             raise ValueError("Invocation authority does not permit an environment.")
@@ -599,6 +626,7 @@ class InvocationContext:
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
             recovery_claim_id=self.recovery_claim_id,
+            work_attempt=self.work_attempt,
         )
 
     @staticmethod
@@ -779,6 +807,7 @@ class InvocationContext:
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
             recovery_claim_id=self.recovery_claim_id,
+            work_attempt=self.work_attempt,
         )
 
     def with_queued_interaction(
@@ -843,6 +872,7 @@ class InvocationContext:
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
             recovery_claim_id=self.recovery_claim_id,
+            work_attempt=self.work_attempt,
         )
 
     def without_recovery_claim(self) -> InvocationContext:
@@ -863,6 +893,7 @@ class InvocationContext:
             budget_policy=self.budget_policy,
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
+            work_attempt=self.work_attempt,
         )
 
 
@@ -881,6 +912,7 @@ def _authenticated_invocation_context(
     tool_capability_ceiling: ToolCapabilityCeiling,
     targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
     recovery_claim_id: str | None = None,
+    work_attempt: WorkAttemptInvocationAuthority | None = None,
 ) -> InvocationContext:
     """Authenticate independently resolved live collaborators against one profile."""
 
@@ -901,6 +933,7 @@ def _authenticated_invocation_context(
         _recovery_claim_id=recovery_claim_id,
         _validated_profile=validated_profile,
         _authority_token=_INVOCATION_CONTEXT_AUTHORITY_TOKEN,
+        _work_attempt=work_attempt,
     )
 
 
@@ -1846,7 +1879,9 @@ def _require_receipt_result_matches_command(
     _require_receipt_result_matches_live_session(receipt, session)
     result = receipt.result_session
     if type(command) is CreateInvocationCommand:
-        expected_causal_budget_id = command.request.causal_budget_id or command.session_id
+        expected_causal_budget_id = (
+            command.request.causal_budget_id or command.request.task_id or command.session_id
+        )
         if (
             result.status is not SessionStatus.RUNNING
             or result.agent_name != command.request.agent_name
@@ -2350,7 +2385,7 @@ def invocation_release_replay_from_state(
     )
 
 
-def require_released_invocation_command_authority(
+def _require_released_invocation_command_receipt(
     session: Session,
     checkpoint: dict[str, Any] | None,
     *,
@@ -2358,7 +2393,7 @@ def require_released_invocation_command_authority(
     session_instance_id: str,
     active_profile: ActiveInvocationExecutionProfile,
     events: tuple[Event, ...] = (),
-) -> None:
+) -> _InvocationLifecycleCommandReceipt:
     """Require one exact, durably completed release at its successor epoch."""
 
     released_run_epoch = active_profile.run_epoch + 1
@@ -2390,6 +2425,72 @@ def require_released_invocation_command_authority(
     ):
         raise SessionRunFenced("Invocation command lacks exact durable released-profile authority.")
     _require_receipt_result_matches_live_session(receipt, session)
+    return receipt
+
+
+def require_released_invocation_command_authority(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    active_profile: ActiveInvocationExecutionProfile,
+    events: tuple[Event, ...] = (),
+) -> None:
+    """Require one exact, durably completed release at its successor epoch."""
+
+    _require_released_invocation_command_receipt(
+        session,
+        checkpoint,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        active_profile=active_profile,
+        events=events,
+    )
+
+
+def released_invocation_evidence(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    active_profile: ActiveInvocationExecutionProfile,
+) -> InvocationReleaseEvidence:
+    """Project exact durable cleanup proof without exposing checkpoint internals."""
+
+    receipt = _require_released_invocation_command_receipt(
+        session,
+        checkpoint,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        active_profile=active_profile,
+    )
+    return InvocationReleaseEvidence(
+        session_id=receipt.session_id,
+        session_instance_id=receipt.session_instance_id,
+        interaction_id=receipt.active_profile.interaction_id,
+        command_identity=receipt.command_identity,
+        command_sha256=receipt.command_sha256,
+        record_sha256=receipt.record_sha256,
+        profile_fingerprint=receipt.active_profile.profile.fingerprint,
+        run_epoch=receipt.active_profile.run_epoch,
+        released_run_epoch=receipt.result_session.run_epoch,
+    )
+
+
+def retire_released_invocation_context(evidence: InvocationReleaseEvidence) -> None:
+    """Retire stale local context after the caller authenticates exact release.
+
+    This internal phase handoff accepts engine-validated release evidence or
+    its exact retained settlement receipt, never public caller-created proof.
+    It changes no durable ownership and must not clear a newer invocation's
+    epoch or another session's context.
+    """
+    epoch = _current_session_run_epoch(evidence.session_id)
+    if epoch is not None and epoch <= evidence.run_epoch:
+        _deactivate_session_interaction(evidence.session_id)
+        _deactivate_session_run_fence(evidence.session_id)
 
 
 def require_invocation_admission_source_authority(

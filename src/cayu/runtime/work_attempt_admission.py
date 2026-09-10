@@ -23,6 +23,12 @@ from cayu._validation import (
     revalidate_model_input,
 )
 from cayu.runtime.invocation import SessionInvocationBinding
+from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+from cayu.runtime.work_attempt_source import (
+    WORK_ATTEMPT_SOURCE_MAX_BYTES,
+    WORK_ATTEMPT_SOURCE_MAX_ITEMS,
+    WorkAttemptSourceRequest,
+)
 from cayu.runtime.work_contracts import (
     WORK_COMPLETION_DECISION_MAX_BYTES,
     WORK_CONTRACT_TASK_MAX_ITEMS,
@@ -43,8 +49,10 @@ from cayu.runtime.work_contracts import (
 # A continuation embeds one complete valid completion decision.  Reserve fixed
 # headroom for the admission, invocation, claim, and attempt authority around
 # that decision while retaining a single bounded durable receipt.
-WORK_ATTEMPT_ADMISSION_MAX_BYTES = WORK_COMPLETION_DECISION_MAX_BYTES + (128 * 1024)
-WORK_ATTEMPT_ADMISSION_MAX_ITEMS = WORK_CONTRACT_TASK_MAX_ITEMS
+WORK_ATTEMPT_ADMISSION_MAX_BYTES = (
+    WORK_COMPLETION_DECISION_MAX_BYTES + (128 * 1024) + WORK_ATTEMPT_SOURCE_MAX_BYTES
+)
+WORK_ATTEMPT_ADMISSION_MAX_ITEMS = WORK_CONTRACT_TASK_MAX_ITEMS + WORK_ATTEMPT_SOURCE_MAX_ITEMS
 WORK_ATTEMPT_ADMISSION_ID_MAX_BYTES = 256
 WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS = 3_600
 WORK_ATTEMPT_ADMISSION_MAX_GENERATIONS = 64
@@ -85,6 +93,15 @@ class WorkAttemptAdmissionState(StrEnum):
     ACTIVE = "active"
     RECOVERING = "recovering"
     RELEASED = "released"
+
+
+WORK_ATTEMPT_RENEWABLE_STATES = frozenset(
+    {
+        WorkAttemptAdmissionState.PREPARING,
+        WorkAttemptAdmissionState.ACTIVE,
+        WorkAttemptAdmissionState.RECOVERING,
+    }
+)
 
 
 class WorkAttemptAdmissionConflict(ValueError):
@@ -144,6 +161,27 @@ class WorkAttemptExecutionRequest(BaseModel):
         return normalize_utc_datetime(value, "task_lease_expires_at")
 
 
+class WorkAttemptRunRequest(BaseModel):
+    """Stable caller identities for execution of an already admitted attempt.
+
+    Process ownership and all source settings are resolved by the runtime,
+    never supplied by the caller of the execution entrance.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    admission_id: str
+    claim_id: str
+    worker_id: str
+    generation: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_MAX_GENERATIONS)
+    lease_seconds: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS)
+
+    @field_validator("admission_id", "claim_id", "worker_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _identity(value, info.field_name)
+
+
 class WorkAttemptClaimRenewalRequest(BaseModel):
     """Public request to renew the caller's current execution generation."""
 
@@ -200,6 +238,18 @@ class WorkAttemptAdmissionPrepare(BaseModel):
     contract: WorkContractRef
     session_invocation: SessionInvocationBinding
     source_execution_profile_fingerprint: str
+    run_semantics: WorkAttemptRunSemantics | None = None
+    source_request: WorkAttemptSourceRequest | None = None
+
+    @field_validator("source_request", mode="before")
+    @classmethod
+    def copy_source_request(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptSourceRequest)
+
+    @field_validator("run_semantics", mode="before")
+    @classmethod
+    def copy_run_semantics(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptRunSemantics)
 
     @field_validator(
         "admission_id",
@@ -245,6 +295,13 @@ class WorkAttemptAdmissionPrepare(BaseModel):
 
     @model_validator(mode="after")
     def validate_predecessor(self) -> WorkAttemptAdmissionPrepare:
+        if self.source_request is not None:
+            self.source_request.require_binding(
+                kind=self.kind,
+                source_request_sha256=self.source_request_sha256,
+                session_id=self.session_id,
+                task_id=self.task_id,
+            )
         if (self.kind == "continuation") != (self.predecessor_admission_id is not None):
             raise ValueError(
                 "Only continuation admission preparation may carry a predecessor admission."
@@ -312,6 +369,20 @@ class WorkAttemptRecoveryActivate(BaseModel):
         return _sha256(value, "recovery_evidence_sha256")
 
 
+class WorkAttemptExecutionClaimRenewal(BaseModel):
+    """Store-clock evidence for the enclosing claim's latest lease extension."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    renewed_at: datetime
+    lease_seconds: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS)
+
+    @field_validator("renewed_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "renewed_at")
+
+
 class WorkAttemptExecutionClaim(BaseModel):
     """One immutable generation of renewable work-attempt execution authority."""
 
@@ -325,6 +396,16 @@ class WorkAttemptExecutionClaim(BaseModel):
     request_sha256: str
     claimed_at: datetime
     lease_expires_at: datetime
+    renewal: WorkAttemptExecutionClaimRenewal | None = None
+
+    @field_validator("renewal", mode="before")
+    @classmethod
+    def copy_renewal(cls, value: object) -> object:
+        return (
+            None
+            if value is None
+            else revalidate_model_input(value, WorkAttemptExecutionClaimRenewal)
+        )
 
     @field_validator("admission_id", "claim_id", "worker_id", "execution_owner_id")
     @classmethod
@@ -345,7 +426,66 @@ class WorkAttemptExecutionClaim(BaseModel):
     def validate_lease_window(self) -> WorkAttemptExecutionClaim:
         if self.lease_expires_at <= self.claimed_at:
             raise ValueError("Execution-claim lease must expire after it is claimed.")
+        if self.renewal is not None and (
+            self.renewal.renewed_at < self.claimed_at
+            or self.lease_expires_at
+            != self.renewal.renewed_at + timedelta(seconds=self.renewal.lease_seconds)
+        ):
+            raise ValueError("Execution-claim renewal conflicts with its lease.")
         return self
+
+
+def work_attempt_claim_progress_matches(
+    previous: WorkAttemptExecutionClaim, current: WorkAttemptExecutionClaim
+) -> bool:
+    """Compare validated claims, permitting only a proven monotonic renewal."""
+    if (
+        current.model_copy(
+            update={"lease_expires_at": previous.lease_expires_at, "renewal": previous.renewal}
+        )
+        != previous
+    ):
+        return False
+    if current.lease_expires_at == previous.lease_expires_at:
+        return current.renewal == previous.renewal
+    return current.lease_expires_at > previous.lease_expires_at and current.renewal is not None
+
+
+def renewed_work_attempt_execution_claim(
+    claim: WorkAttemptExecutionClaim,
+    request: WorkAttemptExecutionClaimRequest,
+    *,
+    now: datetime,
+) -> WorkAttemptExecutionClaim:
+    """Construct the exact lease projection inside a store-owned transaction."""
+    claim = WorkAttemptExecutionClaim.model_validate(
+        claim.model_dump(mode="python", warnings=False)
+    )
+    request = WorkAttemptExecutionClaimRequest.model_validate(
+        request.model_dump(mode="python", warnings=False)
+    )
+    if (
+        claim.admission_id != request.admission_id
+        or claim.claim_id != request.claim_id
+        or claim.worker_id != request.worker_id
+        or claim.execution_owner_id != request.execution_owner_id
+        or claim.generation != request.generation
+        or claim.lease_expires_at <= now
+    ):
+        raise WorkAttemptExecutionClaimLost("Execution-claim renewal lost its exact live owner.")
+    expires_at = now + timedelta(seconds=request.lease_seconds)
+    if expires_at <= claim.lease_expires_at:
+        return claim
+    return WorkAttemptExecutionClaim.model_validate(
+        claim.model_copy(
+            update={
+                "lease_expires_at": expires_at,
+                "renewal": WorkAttemptExecutionClaimRenewal(
+                    renewed_at=now, lease_seconds=request.lease_seconds
+                ),
+            }
+        ).model_dump(mode="python", warnings=False)
+    )
 
 
 class WorkAttemptContinuationContext(BaseModel):
@@ -448,6 +588,128 @@ def work_attempt_recovery_session_authority_from_checkpoint(
         ) from None
 
 
+class WorkAttemptExecutionEntryRequest(BaseModel):
+    """Elect the first dispatch for one existing claim, without another lease.
+
+    The preparation digest binds immutable task, contract, session incarnation,
+    interaction, source profile and run settings. The remaining fields bind the
+    exact runtime claim and session epoch about to consume that preparation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    admission_id: str
+    prepare_request_sha256: str
+    claim_id: str
+    worker_id: str
+    execution_owner_id: str
+    generation: StrictInt = Field(ge=1)
+    run_epoch: StrictInt = Field(ge=1)
+
+    @field_validator("admission_id", "claim_id", "worker_id", "execution_owner_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _identity(value, info.field_name)
+
+    @field_validator("prepare_request_sha256")
+    @classmethod
+    def validate_digest(cls, value: str) -> str:
+        return _sha256(value, "prepare_request_sha256")
+
+
+class WorkAttemptExecutionEntry(BaseModel):
+    """Durable evidence that a generation may already have dispatched work."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    request: WorkAttemptExecutionEntryRequest
+    entered_at: datetime
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def copy_request(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptExecutionEntryRequest)
+
+    @field_validator("entered_at")
+    @classmethod
+    def normalize_entered_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "entered_at")
+
+
+WorkAttemptExecutionStopReason = Literal[
+    "workspace_finalization_recovery", "budget_limit", "elapsed_limit"
+]
+
+
+class WorkAttemptExecutionStopRequest(BaseModel):
+    """Bind a non-resumable execution outcome before terminal cleanup."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    admission_id: str
+    prepare_request_sha256: str
+    claim_id: str
+    worker_id: str
+    execution_owner_id: str
+    generation: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_MAX_GENERATIONS)
+    execution_entry: WorkAttemptExecutionEntry
+    reason: WorkAttemptExecutionStopReason
+
+    @model_validator(mode="after")
+    def validate_stop_generation(self) -> WorkAttemptExecutionStopRequest:
+        entered_generation = self.execution_entry.request.generation
+        if (
+            self.reason == "workspace_finalization_recovery"
+            and self.generation <= entered_generation
+        ) or (
+            self.reason in {"budget_limit", "elapsed_limit"}
+            and self.generation != entered_generation
+        ):
+            raise ValueError("Execution stop reason conflicts with its entered generation.")
+        return self
+
+    @field_validator("admission_id", "claim_id", "worker_id", "execution_owner_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _identity(value, info.field_name)
+
+    @field_validator("prepare_request_sha256")
+    @classmethod
+    def validate_digest(cls, value: str) -> str:
+        return _sha256(value, "prepare_request_sha256")
+
+    @field_validator("execution_entry", mode="before")
+    @classmethod
+    def copy_entry(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptExecutionEntry)
+
+
+class WorkAttemptExecutionStop(BaseModel):
+    """Immutable stop intent; cleanup release remains independently required."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    request: WorkAttemptExecutionStopRequest
+    recorded_at: datetime
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def copy_request(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptExecutionStopRequest)
+
+    @field_validator("recorded_at")
+    @classmethod
+    def normalize_recorded_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "recorded_at")
+
+
+def copy_work_attempt_execution_stop_request(
+    value: WorkAttemptExecutionStopRequest,
+) -> WorkAttemptExecutionStopRequest:
+    if type(value) is not WorkAttemptExecutionStopRequest:
+        raise TypeError("Execution stop requires WorkAttemptExecutionStopRequest.")
+    return WorkAttemptExecutionStopRequest.model_validate(
+        revalidate_model_input(value, WorkAttemptExecutionStopRequest)
+    )
+
+
 class WorkAttemptAdmission(BaseModel):
     """Durable, bounded admission intent or active receipt."""
 
@@ -465,6 +727,8 @@ class WorkAttemptAdmission(BaseModel):
     contract: WorkContractRef
     session_invocation: SessionInvocationBinding
     source_execution_profile_fingerprint: str
+    run_semantics: WorkAttemptRunSemantics | None = None
+    source_request: WorkAttemptSourceRequest | None = None
     claim: WorkAttemptExecutionClaim
     attempt: WorkAttempt | None = None
     continuation: WorkAttemptContinuationContext | None = None
@@ -472,6 +736,28 @@ class WorkAttemptAdmission(BaseModel):
     recovery_evidence_sha256: str | None = None
     prepared_at: datetime
     activated_at: datetime | None = None
+    execution_entry: WorkAttemptExecutionEntry | None = None
+    execution_stop: WorkAttemptExecutionStop | None = None
+
+    @field_validator("source_request", mode="before")
+    @classmethod
+    def copy_source_request(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptSourceRequest)
+
+    @field_validator("execution_stop", mode="before")
+    @classmethod
+    def copy_execution_stop(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptExecutionStop)
+
+    @field_validator("execution_entry", mode="before")
+    @classmethod
+    def copy_execution_entry(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptExecutionEntry)
+
+    @field_validator("run_semantics", mode="before")
+    @classmethod
+    def copy_run_semantics(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptRunSemantics)
 
     @field_validator("admission_id", "attempt_id", "interaction_id")
     @classmethod
@@ -534,6 +820,47 @@ class WorkAttemptAdmission(BaseModel):
 
     @model_validator(mode="after")
     def validate_state(self) -> WorkAttemptAdmission:
+        if self.source_request is not None:
+            self.source_request.require_binding(
+                kind=self.kind,
+                source_request_sha256=self.source_request_sha256,
+                session_id=self.session_id,
+                task_id=self.task_id,
+            )
+        if self.execution_stop is not None:
+            stop = self.execution_stop.request
+            if (
+                stop.admission_id != self.admission_id
+                or stop.prepare_request_sha256 != self.prepare_request_sha256
+                or stop.execution_entry != self.execution_entry
+                or stop.generation > self.claim.generation
+                or (
+                    stop.generation == self.claim.generation
+                    and (
+                        stop.claim_id != self.claim.claim_id
+                        or stop.worker_id != self.claim.worker_id
+                        or stop.execution_owner_id != self.claim.execution_owner_id
+                    )
+                )
+            ):
+                raise ValueError("Execution stop conflicts with its durable admission.")
+        if self.execution_entry is not None:
+            entry = self.execution_entry.request
+            if (
+                self.state is WorkAttemptAdmissionState.PREPARING
+                or entry.admission_id != self.admission_id
+                or entry.prepare_request_sha256 != self.prepare_request_sha256
+                or entry.generation > self.claim.generation
+                or (
+                    entry.generation == self.claim.generation
+                    and (
+                        entry.claim_id != self.claim.claim_id
+                        or entry.worker_id != self.claim.worker_id
+                        or entry.execution_owner_id != self.claim.execution_owner_id
+                    )
+                )
+            ):
+                raise ValueError("Execution entry conflicts with its durable admission.")
         published = self.state is not WorkAttemptAdmissionState.PREPARING
         if published != (self.attempt is not None):
             raise ValueError("Published admissions must carry their work attempt.")
@@ -596,6 +923,45 @@ class WorkAttemptAdmission(BaseModel):
                 f"Work-attempt admission must not exceed {WORK_ATTEMPT_ADMISSION_MAX_BYTES} bytes."
             )
         return self
+
+
+class WorkAttemptExecutionEntryDisposition(StrEnum):
+    ENTERED = "entered"
+    ALREADY_ENTERED = "already_entered"
+
+
+class WorkAttemptExecutionEntryResult(BaseModel):
+    """Only the original atomic ENTERED response permits first dispatch.
+
+    ALREADY_ENTERED means reconcile or recover; it is never permission to run
+    again, including after a lost acknowledgement. The durable entry itself is
+    replayable evidence, not a replayable authorization to dispatch.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    disposition: WorkAttemptExecutionEntryDisposition
+    admission: WorkAttemptAdmission
+
+    @field_validator("admission", mode="before")
+    @classmethod
+    def copy_admission(cls, value: object) -> object:
+        return revalidate_model_input(value, WorkAttemptAdmission)
+
+    @model_validator(mode="after")
+    def require_entry(self) -> WorkAttemptExecutionEntryResult:
+        if self.admission.execution_entry is None:
+            raise ValueError("Execution-entry result requires durable entry evidence.")
+        return self
+
+
+def copy_work_attempt_execution_entry_request(
+    value: WorkAttemptExecutionEntryRequest,
+) -> WorkAttemptExecutionEntryRequest:
+    if type(value) is not WorkAttemptExecutionEntryRequest:
+        raise TypeError("Execution entry requires WorkAttemptExecutionEntryRequest.")
+    return WorkAttemptExecutionEntryRequest.model_validate(
+        revalidate_model_input(value, WorkAttemptExecutionEntryRequest)
+    )
 
 
 class AdmittedCompletionProposalRequest(BaseModel):
@@ -725,6 +1091,12 @@ def copy_admitted_completion_proposal_request(
     )
 
 
+def copy_work_attempt_run_request(value: WorkAttemptRunRequest) -> WorkAttemptRunRequest:
+    if type(value) is not WorkAttemptRunRequest:
+        raise TypeError("Work-attempt execution requires a WorkAttemptRunRequest.")
+    return WorkAttemptRunRequest.model_validate(value.model_dump(mode="python", warnings=False))
+
+
 def copy_work_attempt_proposal_request(
     value: WorkAttemptProposalRequest,
 ) -> WorkAttemptProposalRequest:
@@ -814,6 +1186,8 @@ def _work_attempt_preparation_authority(
         value.contract,
         value.session_invocation,
         value.source_execution_profile_fingerprint,
+        value.run_semantics,
+        value.source_request,
         value.continuation,
         value.prepared_at,
     )
@@ -828,6 +1202,137 @@ def _work_attempt_publication_authority(
         value.session_evidence_sha256,
         value.activated_at,
     )
+
+
+def _require_execution_entry_progress(
+    previous: WorkAttemptAdmission, result: WorkAttemptAdmission
+) -> None:
+    """A lease/recovery response may observe entry, but cannot erase dispatch."""
+    stop_before, stop_after = previous.execution_stop, result.execution_stop
+    if stop_before != stop_after:
+        if stop_before is not None or stop_after is None:
+            raise RuntimeError("Work-attempt mutation erased or replaced its execution stop.")
+        if not any(
+            stop_after.request.claim_id == claim.claim_id
+            and stop_after.request.worker_id == claim.worker_id
+            and stop_after.request.execution_owner_id == claim.execution_owner_id
+            and stop_after.request.generation == claim.generation
+            for claim in (previous.claim, result.claim)
+        ):
+            raise RuntimeError("Work-attempt mutation introduced an unrelated execution stop.")
+    before, after = previous.execution_entry, result.execution_entry
+    if before == after:
+        return
+    if after is None or (
+        before is not None and after.request.generation <= before.request.generation
+    ):
+        raise RuntimeError("Work-attempt mutation erased or replaced existing execution entry.")
+    expected_claims = (previous.claim, result.claim)
+    if not any(
+        after.request.claim_id == claim.claim_id
+        and after.request.worker_id == claim.worker_id
+        and after.request.execution_owner_id == claim.execution_owner_id
+        and after.request.generation == claim.generation
+        for claim in expected_claims
+    ):
+        raise RuntimeError("Work-attempt mutation introduced unrelated execution entry.")
+
+
+def require_work_attempt_execution_stop_result(
+    value: object,
+    previous: WorkAttemptAdmission,
+    request: WorkAttemptExecutionStopRequest,
+) -> WorkAttemptAdmission:
+    """Validate a stop owner's exact transaction response, not caller authority."""
+    previous = require_work_attempt_admission_result(previous, operation_name="Execution stop")
+    request = copy_work_attempt_execution_stop_request(request)
+    result = require_work_attempt_admission_result(value, operation_name="Execution stop")
+    if (
+        result.execution_stop is None
+        or result.execution_stop.request != request
+        or not work_attempt_claim_progress_matches(previous.claim, result.claim)
+        or result.model_copy(
+            update={
+                "execution_stop": previous.execution_stop,
+                "claim": result.claim.model_copy(
+                    update={
+                        "lease_expires_at": previous.claim.lease_expires_at,
+                        "renewal": previous.claim.renewal,
+                    }
+                ),
+            }
+        )
+        != previous
+    ):
+        raise RuntimeError("Execution stop returned conflicting admission authority.")
+    _require_execution_entry_progress(previous, result)
+    return result
+
+
+def require_work_attempt_execution_entry_result(
+    value: object,
+    previous: WorkAttemptAdmission,
+    request: WorkAttemptExecutionEntryRequest,
+) -> WorkAttemptExecutionEntryResult:
+    """Bind a store election response to the exact runtime-supplied operation.
+
+    This validates a response from the mutation owner, not a caller-provided
+    receipt. In particular, reconstructing an ENTERED result cannot grant a
+    second dispatch. The execution owner must consume only its original store
+    response and treat every readback as reconciliation-only.
+    """
+    if type(value) is not WorkAttemptExecutionEntryResult:
+        raise TypeError("Execution entry returned an invalid result type.")
+    previous = require_work_attempt_admission_result(
+        previous, operation_name="Prior execution-entry admission lookup"
+    )
+    request = copy_work_attempt_execution_entry_request(request)
+    result = WorkAttemptExecutionEntryResult.model_validate(
+        value.model_dump(mode="python", warnings=False)
+    )
+    admission = result.admission
+    entry = admission.execution_entry
+    if (
+        entry is None
+        or entry.request != request
+        or request.admission_id != previous.admission_id
+        or request.prepare_request_sha256 != previous.prepare_request_sha256
+        or request.claim_id != previous.claim.claim_id
+        or request.worker_id != previous.claim.worker_id
+        or request.execution_owner_id != previous.claim.execution_owner_id
+        or request.generation != previous.claim.generation
+        or _work_attempt_preparation_authority(admission)
+        != _work_attempt_preparation_authority(previous)
+        or _work_attempt_publication_authority(admission)
+        != _work_attempt_publication_authority(previous)
+        or admission.state != previous.state
+        or admission.recovery_evidence_sha256 != previous.recovery_evidence_sha256
+        or not work_attempt_claim_progress_matches(previous.claim, admission.claim)
+    ):
+        raise RuntimeError("Execution entry returned conflicting authority.")
+    _require_execution_entry_progress(previous, admission)
+    if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED and (
+        previous.state is not WorkAttemptAdmissionState.ACTIVE
+        or (
+            previous.execution_entry is not None
+            and previous.execution_entry.request.generation == request.generation
+        )
+    ):
+        raise RuntimeError("Execution entry returned a duplicate dispatch grant.")
+    if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED:
+        deadline = admission.run_semantics.deadline_expires_at if admission.run_semantics else None
+        stop = admission.execution_stop
+        expired = deadline is not None and deadline <= entry.entered_at
+        if (
+            expired
+            and (
+                stop is None
+                or stop.request.reason != "elapsed_limit"
+                or stop.recorded_at != entry.entered_at
+            )
+        ) or (not expired and stop is not None):
+            raise RuntimeError("Execution entry returned conflicting deadline-stop authority.")
+    return result
 
 
 def require_work_attempt_preparation_result(
@@ -864,6 +1369,8 @@ def require_work_attempt_preparation_result(
         or admission.kind != request.kind
         or admission.source_request_sha256 != request.source_request_sha256
         or admission.contract != request.contract
+        or admission.run_semantics != request.run_semantics
+        or admission.source_request != request.source_request
         or admission.session_invocation != request.session_invocation
         or admission.source_execution_profile_fingerprint
         != request.source_execution_profile_fingerprint
@@ -873,7 +1380,11 @@ def require_work_attempt_preparation_result(
         or claim.execution_owner_id != request.execution_owner_id
         or claim.generation != request.generation
         or claim.request_sha256 != work_attempt_execution_claim_request_sha256(claim_request)
-        or claim.lease_expires_at - claim.claimed_at != timedelta(seconds=request.lease_seconds)
+        or (
+            claim.renewal is None
+            and claim.lease_expires_at - claim.claimed_at
+            != timedelta(seconds=request.lease_seconds)
+        )
     ):
         raise RuntimeError("Work-attempt admission preparation returned conflicting authority.")
     return admission
@@ -898,7 +1409,7 @@ def require_work_attempt_activation_result(
     if (
         _work_attempt_preparation_authority(active) != _work_attempt_preparation_authority(prepared)
         or active.state is not WorkAttemptAdmissionState.ACTIVE
-        or active.claim != prepared.claim
+        or not work_attempt_claim_progress_matches(prepared.claim, active.claim)
         or active.attempt is None
         or active.attempt.worker_id != prepared.claim.worker_id
         or active.session_evidence_sha256 != request.session_evidence_sha256
@@ -909,6 +1420,7 @@ def require_work_attempt_activation_result(
         _work_attempt_publication_authority(active) != _work_attempt_publication_authority(prepared)
     ):
         raise RuntimeError("Work-attempt admission activation changed its exact receipt.")
+    _require_execution_entry_progress(prepared, active)
     return active
 
 
@@ -952,19 +1464,29 @@ def require_work_attempt_claim_result(
         _work_attempt_publication_authority(result) != _work_attempt_publication_authority(previous)
     ):
         raise RuntimeError(f"{operation_name} changed immutable published authority.")
+    forward_activation = (
+        previous.state
+        in {WorkAttemptAdmissionState.PREPARING, WorkAttemptAdmissionState.RECOVERING}
+        and result.state is WorkAttemptAdmissionState.ACTIVE
+    )
     if renewal and (
-        previous.state is not WorkAttemptAdmissionState.ACTIVE
-        or result.state is not WorkAttemptAdmissionState.ACTIVE
-        or claim.claim_id != previous.claim.claim_id
-        or claim.claimed_at != previous.claim.claimed_at
-        or claim.lease_expires_at < previous.claim.lease_expires_at
-        or result.recovery_evidence_sha256 != previous.recovery_evidence_sha256
+        not work_attempt_claim_progress_matches(previous.claim, claim)
+        or (previous.state != result.state and not forward_activation)
+        or (
+            not forward_activation
+            and result.recovery_evidence_sha256 != previous.recovery_evidence_sha256
+        )
+        or (
+            forward_activation
+            and (result.recovery_evidence_sha256 is not None)
+            != (previous.state is WorkAttemptAdmissionState.RECOVERING)
+        )
     ):
         raise RuntimeError(f"{operation_name} returned conflicting renewed authority.")
     if not renewal:
         same_claim = claim.claim_id == previous.claim.claim_id
         if same_claim:
-            if claim != previous.claim:
+            if not work_attempt_claim_progress_matches(previous.claim, claim):
                 raise RuntimeError(f"{operation_name} changed immutable claim authority.")
             forward_activation = (
                 previous.state
@@ -974,7 +1496,17 @@ def require_work_attempt_claim_result(
                 }
                 and result.state is WorkAttemptAdmissionState.ACTIVE
             )
-            if not forward_activation and result != previous:
+            if (
+                not forward_activation
+                and result.model_copy(
+                    update={
+                        "execution_entry": previous.execution_entry,
+                        "execution_stop": previous.execution_stop,
+                        "claim": previous.claim,
+                    }
+                )
+                != previous
+            ):
                 raise RuntimeError(f"{operation_name} changed its exact replay receipt.")
             if previous.state is WorkAttemptAdmissionState.RECOVERING and (
                 result.state is WorkAttemptAdmissionState.ACTIVE
@@ -1002,8 +1534,11 @@ def require_work_attempt_claim_result(
                 result.state not in replacement_states
                 or claim.generation != previous.claim.generation + 1
                 or claim.claimed_at < previous.claim.lease_expires_at
-                or claim.lease_expires_at - claim.claimed_at
-                != timedelta(seconds=request.lease_seconds)
+                or (
+                    claim.renewal is None
+                    and claim.lease_expires_at - claim.claimed_at
+                    != timedelta(seconds=request.lease_seconds)
+                )
             ):
                 raise RuntimeError(f"{operation_name} returned conflicting replacement authority.")
             if (
@@ -1025,6 +1560,7 @@ def require_work_attempt_claim_result(
         result.recovery_evidence_sha256 is not None
     ):
         raise RuntimeError(f"{operation_name} returned premature recovery evidence.")
+    _require_execution_entry_progress(previous, result)
     return result
 
 
@@ -1048,10 +1584,11 @@ def require_work_attempt_recovery_activation_result(
         _work_attempt_publication_authority(active)
         != _work_attempt_publication_authority(recovering)
         or active.state is not WorkAttemptAdmissionState.ACTIVE
-        or active.claim != recovering.claim
+        or not work_attempt_claim_progress_matches(recovering.claim, active.claim)
         or active.recovery_evidence_sha256 != request.recovery_evidence_sha256
     ):
         raise RuntimeError("Work-attempt recovery activation returned conflicting authority.")
+    _require_execution_entry_progress(recovering, active)
     return active
 
 
@@ -1108,6 +1645,7 @@ __all__ = [
     "WorkAttemptContinuationContext",
     "WorkAttemptExecutionClaim",
     "WorkAttemptExecutionClaimLost",
+    "WorkAttemptExecutionClaimRenewal",
     "WorkAttemptExecutionClaimRequest",
     "WorkAttemptExecutionRequest",
     "WorkAttemptProposalRequest",

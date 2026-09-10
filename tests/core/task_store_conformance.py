@@ -26,6 +26,36 @@ from cayu import (
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 
 
+async def assert_task_contract_queue_filter_conformance(store: TaskStore) -> None:
+    from tests.core.test_verified_work_contracts import _contract
+
+    contract = await store.publish_work_contract(_contract(contract_id="queue-filter-contract"))
+    ordinary = await store.create_task(TaskCreate(task_id="queue-ordinary", type="mixed"))
+    contracted = await store.create_task(
+        TaskCreate(task_id="queue-contracted", type="mixed", work_contract=contract.reference())
+    )
+    for selection, expected in (
+        (None, {ordinary.id, contracted.id}),
+        (False, {ordinary.id}),
+        (True, {contracted.id}),
+    ):
+        tasks = await store.list_tasks(TaskQuery(type="mixed", has_work_contract=selection))
+        assert {task.id for task in tasks} == expected
+
+    claimed = await store.claim_task(
+        "verified-worker", TaskQuery(type="mixed", has_work_contract=True)
+    )
+    assert claimed is not None and claimed.id == contracted.id
+    assert (
+        await store.claim_task("verified-peer", TaskQuery(type="mixed", has_work_contract=True))
+        is None
+    )
+    claimed = await store.claim_task(
+        "ordinary-worker", TaskQuery(type="mixed", has_work_contract=False)
+    )
+    assert claimed is not None and claimed.id == ordinary.id
+
+
 async def assert_interrupted_continuation_scan_bound_conformance(
     store: TaskStore,
 ) -> None:

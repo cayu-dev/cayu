@@ -1696,6 +1696,7 @@ class RunRequest(BaseModel):
     _runtime_session_create_claim: object | None = PrivateAttr(default=None)
     _runtime_session_instance_authority: object | None = PrivateAttr(default=None)
     _runtime_initial_transcript_authority: object | None = PrivateAttr(default=None)
+    _runtime_work_attempt_creation: object | None = PrivateAttr(default=None)
     _input_redactions_applied: bool = PrivateAttr(default=False)
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
@@ -14087,6 +14088,7 @@ class InMemorySessionStore(SessionStore):
                     tool_capability_ceiling=request.tool_capability_ceiling,
                     execution_deadline=request.execution_deadline,
                     parent_session=parent_session,
+                    prepared_request=request,
                 ),
                 run_epoch=1 if admission is not None else 0,
             )
@@ -21328,6 +21330,13 @@ def copy_run_request(request: RunRequest) -> RunRequest:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
     copied._runtime_generated_authority = request._runtime_generated_authority
+    prepared_creation = request._runtime_work_attempt_creation
+    copied._runtime_work_attempt_creation = (
+        prepared_creation
+        if type(prepared_creation) is _PreparedWorkAttemptCreation
+        and prepared_creation.token is _PREPARED_WORK_ATTEMPT_CREATION_TOKEN
+        else None
+    )
     create_claim = request._runtime_session_create_claim
     copied._runtime_session_create_claim = (
         create_claim
@@ -22998,6 +23007,73 @@ def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
     )
 
 
+_PREPARED_WORK_ATTEMPT_CREATION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedWorkAttemptCreation:
+    """Permission to finish exactly one already-admitted metadata creation.
+
+    This capability is not serialized and never authorizes execution. Recovery
+    must reconstruct it from the acknowledged durable preparation each time.
+    """
+
+    request_sha256: str
+    token: object = dataclass_field(repr=False)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _PreparedWorkAttemptCreation:
+        return self
+
+
+def _prepared_work_attempt_creation_sha256(request: RunRequest, identity: SessionIdentity) -> str:
+    return hashlib.sha256(
+        canonical_durable_json_bytes(
+            {
+                "request": request.model_dump(mode="json", warnings=False),
+                "private_authority": _run_request_invocation_lifecycle_authority_sha256(request),
+                "identity": identity.model_dump(mode="json", warnings=False),
+            },
+            "prepared_work_attempt_creation",
+        )
+    ).hexdigest()
+
+
+def run_request_with_prepared_work_attempt_creation(
+    request: RunRequest, *, identity: SessionIdentity, admission: object
+) -> RunRequest:
+    """Internal runtime entrance; raw request equality cannot confer this authority."""
+    from cayu.runtime.work_attempt_admission import (
+        WorkAttemptAdmissionState,
+        require_work_attempt_admission_result,
+    )
+
+    prepared = require_work_attempt_admission_result(
+        admission, operation_name="Prepared session creation authority"
+    )
+    copied = copy_run_request(request)
+    if (
+        prepared.state is not WorkAttemptAdmissionState.PREPARING
+        or prepared.kind != "initial"
+        or prepared.execution_entry is not None
+        or prepared.run_semantics is None
+        or copied.session_id != prepared.session_id
+        or copied.task_id != prepared.task_id
+        or _authenticated_session_instance_id_for_run_request(
+            copied, session_id=prepared.session_id
+        )
+        != prepared.session_invocation.session_instance_id
+        or copied.execution_deadline.model_dump() != prepared.run_semantics.deadline.model_dump()
+        or identity.execution_profile is None
+        or identity.execution_profile.fingerprint != prepared.source_execution_profile_fingerprint
+    ):
+        raise ValueError("Prepared session creation conflicts with admission authority.")
+    copied._runtime_work_attempt_creation = _PreparedWorkAttemptCreation(
+        _prepared_work_attempt_creation_sha256(copied, identity),
+        _PREPARED_WORK_ATTEMPT_CREATION_TOKEN,
+    )
+    return copied
+
+
 def session_metadata_for_creation(
     metadata: dict[str, Any],
     *,
@@ -23005,6 +23081,7 @@ def session_metadata_for_creation(
     tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     execution_deadline: ExecutionDeadline | None = None,
     parent_session: Session | None = None,
+    prepared_request: RunRequest | None = None,
 ) -> dict[str, Any]:
     """Combine caller metadata with runtime-owned creation authority."""
 
@@ -23016,7 +23093,23 @@ def session_metadata_for_creation(
         current_execution_deadline(),
         parent_session.execution_deadline if parent_session is not None else ExecutionDeadline(),
     )
-    boundary.require_admission("session_creation")
+    prepared_creation = (
+        None if prepared_request is None else prepared_request._runtime_work_attempt_creation
+    )
+    if prepared_creation is not None:
+        if (
+            type(prepared_creation) is not _PreparedWorkAttemptCreation
+            or prepared_creation.token is not _PREPARED_WORK_ATTEMPT_CREATION_TOKEN
+            or prepared_request is None
+            or prepared_creation.request_sha256
+            != _prepared_work_attempt_creation_sha256(prepared_request, identity)
+            or prepared_request.metadata != metadata
+            or prepared_request.tool_capability_ceiling != tool_capability_ceiling
+            or prepared_request.execution_deadline.model_dump() != boundary.model_dump()
+        ):
+            raise ValueError("Prepared session creation authority changed.")
+    else:
+        boundary.require_admission("session_creation")
     if boundary.expires_at is not None:
         copied[EXECUTION_DEADLINE_METADATA_KEY] = boundary.model_dump(mode="json")
     if EXECUTION_PROFILE_METADATA_KEY in copied:

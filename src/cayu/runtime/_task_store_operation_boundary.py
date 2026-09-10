@@ -50,6 +50,40 @@ _WORK_ATTEMPT_ADMISSION_READS = (
     "load_work_attempt_admission",
     "load_work_attempt_execution_claim",
 )
+_VERIFIED_TASK_WORKER_MUTATIONS = (
+    *_WORK_ATTEMPT_ADMISSION_MUTATIONS,
+    "claim_task",
+    "heartbeat",
+    "reclaim_expired",
+    "enter_work_attempt_execution",
+    "record_work_attempt_execution_stop",
+    "hold_work_attempt_preparation",
+    "settle_work_attempt_lifecycle",
+    "prepare_completion_verifier_profile",
+    "claim_completion_verification",
+    "renew_completion_verification_claim",
+    "record_completion_decision",
+    "apply_completion_decision",
+)
+_VERIFIED_TASK_WORKER_READS = (
+    *_WORK_ATTEMPT_ADMISSION_READS,
+    "load_task",
+    "load_work_contract",
+    "load_active_work_contract_task_for_session",
+    "load_work_attempt",
+    "load_latest_work_attempt_admission",
+    "list_unsettled_work_attempt_admissions",
+    "load_work_attempt_preparation_hold_receipt",
+    "load_work_attempt_lifecycle_receipt",
+    "load_completion_proposal",
+    "load_completion_proposal_for_attempt",
+    "load_completion_decision",
+    "load_completion_decision_for_proposal",
+    "load_completion_verification_claim",
+    "load_completion_verifier_profile",
+    "load_prior_completion_verifier_profile",
+    "load_completion_decision_application_receipt",
+)
 _INTERRUPTED_TASK_HANDOFF_MUTATIONS = (
     "release_interrupted_task_worker",
     "recover_interrupted_task_worker",
@@ -226,6 +260,22 @@ def task_store_work_attempt_admission_capability_is_complete(
     return all(
         task_store_mutation_is_cancellation_quiescent(task_store, method_name)
         for method_name in _WORK_ATTEMPT_ADMISSION_MUTATIONS
+    )
+
+
+def task_store_verified_task_worker_capability_is_complete(task_store: TaskStore) -> bool:
+    """Require the entire worker family before any queue claim or callback."""
+    declarations = type.__getattribute__(type(task_store), "__dict__")
+    if declarations.get("supports_verified_task_worker") is not True:
+        return False
+    if not task_store_work_attempt_admission_capability_is_complete(task_store):
+        return False
+    return all(
+        _task_store_method_has_stable_concrete_implementation(task_store, method_name)
+        for method_name in (*_VERIFIED_TASK_WORKER_MUTATIONS, *_VERIFIED_TASK_WORKER_READS)
+    ) and all(
+        task_store_mutation_is_cancellation_quiescent(task_store, method_name)
+        for method_name in _VERIFIED_TASK_WORKER_MUTATIONS
     )
 
 
@@ -1069,5 +1119,6 @@ __all__ = [
     "raise_task_store_operation_failure",
     "task_store_cancellation_reconciliation_capability_is_complete",
     "task_store_mutation_is_cancellation_quiescent",
+    "task_store_verified_task_worker_capability_is_complete",
     "task_store_work_attempt_admission_capability_is_complete",
 ]

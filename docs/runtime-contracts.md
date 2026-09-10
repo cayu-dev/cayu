@@ -4841,11 +4841,102 @@ cancellation and discard the settlement evidence.
 The ordinary built-in task worker does not execute contract-bound tasks. After
 claiming one, it atomically parks the task in `needs_attention` with
 `status_reason="verified_work_contract_runner_required"`; that claimed item
-counts toward `max_tasks`. The runtime-owned admission primitive described
-below is not an automatic queue consumer. Until that worker is available,
-deployments must keep contract-bound and ordinary work in separately filtered
-queues and have application orchestration call the dedicated admission entrance;
-ordinary workers otherwise consume capacity by parking governed tasks.
+counts toward `max_tasks`. Use `VerifiedTaskWorker` for the contracted queue and
+`TaskQuery(has_work_contract=False)` for an ordinary worker that must not claim
+governed work. The admission primitive below is not itself a queue consumer.
+
+### Verified task worker
+
+`VerifiedTaskWorker`, `VerifiedTaskHandler`, `VerifiedTaskHandlerReport`,
+`VerifiedTaskPreparationContext`, `VerifiedTaskProposalContext`, and
+`VerifiedTaskWorkerDraining` are exported from both `cayu` and `cayu.runtime`.
+The worker requires an app with a task store and selects contract-bound tasks;
+it does not run ordinary tasks. Register the contract's exact completion
+verifier and result resolver on that app before processing work.
+
+The handler's `prepare(context)` returns a `RunRequest`; the worker assigns
+task, session, and lease coordinates. `propose(context)` returns a
+`VerifiedTaskHandlerReport` containing an explicit `CompletionProposalCreate`
+with the supplied proposal and attempt IDs. Final model prose is not a proposal
+or a verdict. Both callbacks are read-only application code and must tolerate
+retry; domain mutations belong inside governed execution. See
+[`ReferencedResultHandler`](../examples/verified_task_handler.py) for a typed
+candidate-reference adapter. The application supplies its read-only candidate
+reader; the registered verifier, not that reader, decides acceptance.
+
+```python
+from cayu import VerifiedTaskWorker
+
+# app, handler, and the enqueued contract-bound task are application-owned.
+async def process_one(app, handler):
+    async with VerifiedTaskWorker(app, handler, worker_id="verified-worker-1") as worker:
+        return await worker.run(max_tasks=1)
+```
+
+The worker coordinates the existing admission, governed session execution,
+proposal, verifier, decision-application, and lifecycle-settlement owners.
+Accepted results complete the task through the registered resolver and exact
+application receipt; rejection continues only when the frozen contract policy
+allows it. Attempt/repeated-gap limits and elapsed/budget stops do not fabricate
+success. A released user-input or tool-approval pause settles as
+`needs_attention` with `work_contract_execution_interrupted`, preserving the
+pending human decision. It is not automatically answered or retried.
+
+Elapsed expiry before initial admission produces a preparation-hold receipt and
+`needs_attention` with `work_contract_elapsed_limit`, without dispatching work.
+Expiry after an applied rejected/continue decision produces an exact continuation
+deadline settlement with the same status reason. The original decision and
+application receipt remain unchanged; settlement cannot replace an admitted
+successor. Both outcomes retain contracted authority rather than fabricate success.
+
+Once preparation has committed a `PREPARING` admission, expiry does not discard
+that attached task or reset its deadline. Recovery finishes or reconciles the exact
+prepared session creation/continuation under the replacement claim, preserving
+the original absolute deadline. The governed run rejects execution before provider
+dispatch, records the elapsed stop, and completes owned cleanup and invocation
+release before publishing the `needs_attention` lifecycle receipt. It does not
+repeat the preparation callback. Finishing an already-prepared creation uses
+request-bound internal authority; an identical raw or serialized request does not
+gain permission to create an expired session. Fresh admissions retain their normal
+deadline checks.
+
+When the stored deadline has expired at execution entry, the task transaction
+records the entry and elapsed stop together. Process loss before cleanup therefore
+leaves durable cleanup-only authority; replay cannot grant a second dispatch.
+
+Queued steering is rejected while a contracted task binding retains authority
+over the session. An admitted attempt does not consume queued input or start an
+implicit successor interaction. Input accepted through a lower-level store or
+an app without the task store remains queued; encountering it at completion
+settles the worker task as `needs_attention` with
+`work_contract_execution_failed`, without proposing completion. Ordinary queued
+steering retains its existing behavior after the contract binding is retired.
+
+Recovery uses durable claims and receipts; lease expiry alone does not prove
+that dispatched work stopped. Unknown external outcomes remain fenced.
+A durable workspace-finalization recovery stop is eligible for cleanup-only
+worker discovery even before its release receipt exists. Budget and elapsed
+stops are also eligible when the exact invocation has no unresolved model,
+tool, human-decision, or durable-operation boundary. A local coroutine returning
+is not sufficient evidence to clear an in-flight model dispatch. The elected
+recovery owner finishes cleanup and validates the release receipt before final
+task settlement; the stopped attempt cannot redispatch or propose work.
+An exact recorded background-provider operation enters the existing provider
+recovery owner after replacement admission. That owner retrieves the original
+operation, not a new dispatch. A still-pending operation retains the invocation
+fence and returns `WorkAttemptRecoveryRequired`; after the replacement lease
+expires, a later recovery can reconcile that same operation and attempt.
+When replacement preserves the governed interaction, recorded structured-output
+validation retains the original retry allowance. A reserved structured-output
+tool round is reconciled before predecessor interruption; any permitted repair
+is dispatched only by the replacement execution owner. Ordinary interruption
+does not gain this continuation authority.
+Cancellation can return while owned cleanup drains. If `aclose()` raises
+`VerifiedTaskWorkerDraining`, retain the worker and its stores, then retry close
+after that work settles; do not close stores or treat the attempt as retryable
+merely because the caller stopped waiting. The worker does not own store closure.
+
+### Governed work-attempt admission
 
 `CayuApp.admit_work_attempt(RunRequest | ResumeRequest, execution=...)` is the
 only runtime-owned entrance that admits contract-bound provider work. It ends at
@@ -4948,7 +5039,40 @@ the bounded decision and expose the same typed tuple through
 `continuation.gaps`; their byte and item ceilings include the complete maximum-
 size valid decision plus fixed admission authority headroom.
 
+Portable work-attempt admissions additionally retain a redacted source-request
+snapshot before session creation can commit. Its separate 1 MiB / 32,768-value
+budget includes the explicit field names (at most 256); oversized sources are
+rejected before admission mutation. This budget is reserved in addition to the
+continuation decision and admission headroom. The original public-input digest
+remains distinct from the sanitized snapshot's content digest: redaction cannot
+make different original requests into exact retries. The preparation receipt
+binds both representations. Explicit defaults and an explicitly unbounded
+initial deadline survive serialization. This data does not carry private
+invocation provenance or authorize a caller to resume work. Request-local Python
+loop policies are not portable snapshots; their existing admission-only path
+retains its original policy-bound digest.
+
+Recovery of a `preparing` admission requires its portable source and resolved
+run semantics before acquiring replacement ownership. The runtime reconstructs
+the explicit source controls and preserves the original input identity and
+absolute deadline; only the effective worker/lease attachment changes to the
+acknowledged owner. The verified worker heartbeats that same claim while the
+existing session creation or continuation owner reconciles and activates the
+attempt. It does not call the preparation handler again. Missing initial
+sessions are created through the original lifecycle command; existing sessions
+and lost acknowledgements require exact receipt/interaction evidence. An
+admission without a portable source is not automatically recoverable this way.
+
 `renew_work_attempt_claim(...)` extends only the exact current live generation.
+Renewal is permitted while its admission is `preparing`, `active`, or
+`recovering`, never after `released`. Extending the lease records bounded
+store-clock renewal evidence on the same execution claim; the original claim
+identity, process owner, generation, request digest, and creation time do not
+change. An expiry inconsistent with that evidence is rejected during
+reconstruction. Renewal does not activate an admission or recovery, authorize
+provider work, or release the predecessor. A concurrent activation may be
+observed only with the same claim authority and the existing activation
+evidence.
 After an active owner expires, `recover_work_attempt(...)` first installs the
 next generation under the task-store fence, then proves the prior session epoch,
 interaction, provider stage, checkpoint, hooks, and run fence are quiescent or
@@ -5097,6 +5221,13 @@ or transition. Exact retries reconcile the original proposal record without
 rerunning policy; conflicting adoption input fails closed. An
 already prepared live attempt can only resolve the recorded profile and cannot
 adopt current registration defaults.
+
+Verification claims retain the original `lease_seconds` and optional execution
+timeout alongside their complete request digest. Renewal changes the expiry,
+not those original settings. Reconstruction validates the retained request
+against its digest; a remaining lease window is not replay authority. Revision
+84 rejects populated pre-release verification-claim history whose original
+settings cannot be reconstructed, rather than guessing those settings.
 
 Adapters must be deterministic and side-effect-free. An external check that
 requires mutation belongs behind Cayu's ordinary effect, idempotency, approval,

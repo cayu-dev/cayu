@@ -11,12 +11,19 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 from psycopg import AsyncConnection as PsycopgAsyncConnection
 from psycopg import AsyncCursor
+from psycopg.errors import DeadlockDetected, LockNotAvailable
 from psycopg.rows import tuple_row
 from psycopg_pool import AsyncConnectionPool
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.runtime import _verified_work_policy as verified_work_support
+from cayu.runtime._work_attempt_lifecycle_policy import (
+    plan_work_attempt_execution_entry,
+    plan_work_attempt_execution_stop,
+    plan_work_attempt_lifecycle_settlement,
+    plan_work_attempt_preparation_hold,
+)
 from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
@@ -30,15 +37,21 @@ from cayu.runtime.completion_verifier_profiles import (
 from cayu.runtime.tasks import (
     CompletionDecisionApplicationReceipt,
     Task,
+    TaskAggregateFilter,
     TaskClaimLost,
+    TaskQuery,
     TaskStatus,
     TaskTopologyInconsistent,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
     _ensure_exact_owned_active_task_lease,
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
+    _work_attempt_discovery_query,
     copy_task,
 )
 from cayu.runtime.work_attempt_admission import (
+    WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,
     WorkAttemptAdmissionActivate,
@@ -49,15 +62,30 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptExecutionClaim,
     WorkAttemptExecutionClaimLost,
     WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionEntryDisposition,
+    WorkAttemptExecutionEntryRequest,
+    WorkAttemptExecutionEntryResult,
+    WorkAttemptExecutionStopRequest,
     WorkAttemptRecoveryActivate,
     copy_admitted_completion_proposal_request,
     copy_work_attempt_admission_activate,
     copy_work_attempt_admission_prepare,
     copy_work_attempt_execution_claim_request,
+    copy_work_attempt_execution_entry_request,
+    copy_work_attempt_execution_stop_request,
     copy_work_attempt_recovery_activate,
+    renewed_work_attempt_execution_claim,
     work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
+)
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    copy_work_attempt_lifecycle_settlement,
+    copy_work_attempt_preparation_hold,
+    work_attempt_lifecycle_settlement_sha256,
+    work_attempt_preparation_hold_sha256,
 )
 from cayu.runtime.work_contracts import (
     CompletionDecision,
@@ -302,6 +330,8 @@ class PostgresVerifiedWorkMixin:
         _postgres_mutation_allowed_configure: Any
 
         async def _ensure_ready(self) -> None: ...
+
+        def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]: ...
 
     async def _await_owned_store_mutation(
         self,
@@ -1122,6 +1152,8 @@ class PostgresVerifiedWorkMixin:
             await cur.execute(
                 f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
                 "WHERE session_id = %s AND work_contract IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM cayu_work_attempt_lifecycle_receipts AS receipt "
+                "WHERE receipt.task_id = cayu_tasks.id AND receipt.retired_contract_binding) "
                 'ORDER BY created_at, id COLLATE "C" LIMIT 1',
                 (session_id,),
             )
@@ -1203,6 +1235,7 @@ class PostgresVerifiedWorkMixin:
         cur: Any,
         task: Task,
         contract: WorkContract,
+        request: WorkAttemptAdmissionPrepare,
     ) -> WorkAttemptContinuationContext | None:
         prior_attempt_id = await self._latest_attempt_id(cur, task.id)
         if prior_attempt_id is None:
@@ -1220,6 +1253,10 @@ class PostgresVerifiedWorkMixin:
         ):
             raise WorkAttemptAdmissionConflict(
                 "The latest work attempt has no exact released admission authority."
+            )
+        if prior_admission.run_semantics != request.run_semantics:
+            raise WorkAttemptAdmissionConflict(
+                "Continuation admission cannot change the source run settings."
             )
         await cur.execute(
             "SELECT proposal.proposal_id, decision.decision_id, "
@@ -1385,6 +1422,7 @@ class PostgresVerifiedWorkMixin:
                 cur,
                 task,
                 contract,
+                request,
             )
             await self._ensure_session_authority(cur, request.session_id, "contracted")
             lease_now = await self._verified_lease_now(cur)
@@ -1499,6 +1537,8 @@ class PostgresVerifiedWorkMixin:
                 contract=request.contract,
                 session_invocation=request.session_invocation,
                 source_execution_profile_fingerprint=(request.source_execution_profile_fingerprint),
+                run_semantics=request.run_semantics,
+                source_request=request.source_request,
                 claim=claim,
                 continuation=continuation,
                 prepared_at=lease_now,
@@ -1672,6 +1712,330 @@ class PostgresVerifiedWorkMixin:
             claim = await self._load_work_attempt_execution_claim_row(cur, claim_id)
             return None if claim is None else claim.model_copy(deep=True)
 
+    async def load_latest_work_attempt_admission(
+        self,
+        task_id: str,
+    ) -> WorkAttemptAdmission | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            return await self._load_latest_work_attempt_admission(cur, task_id)
+
+    async def _load_latest_work_attempt_admission(
+        self, cur: Any, task_id: str
+    ) -> WorkAttemptAdmission | None:
+        await cur.execute(
+            "SELECT current.admission_id FROM cayu_work_attempt_admissions AS current "
+            "WHERE current.task_id = %s AND NOT EXISTS ("
+            "SELECT 1 FROM cayu_work_attempt_admissions AS successor "
+            "WHERE successor.task_id = current.task_id AND "
+            "successor.admission_json->'continuation'->>'prior_admission_id' "
+            "= current.admission_id) LIMIT 2",
+            (task_id,),
+        )
+        rows = await cur.fetchall()
+        if len(rows) > 1:
+            raise WorkAttemptAdmissionConflict("Task admission history has no unique successor.")
+        if not rows:
+            return None
+        admission = await self._load_work_attempt_admission_row(cur, rows[0][0])
+        if admission is None or admission.task_id != task_id:
+            raise WorkAttemptAdmissionConflict("Latest admission conflicts with its task.")
+        return admission.model_copy(deep=True)
+
+    async def _load_work_attempt_lifecycle_receipt(
+        self, cur: Any, admission_id: str
+    ) -> WorkAttemptLifecycleReceipt | None:
+        await cur.execute(
+            "SELECT settlement_id, task_id, request_sha256, retired_contract_binding, settled_at, receipt_json "
+            "FROM cayu_work_attempt_lifecycle_receipts WHERE admission_id = %s",
+            (admission_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        receipt = WorkAttemptLifecycleReceipt.model_validate_json(row[5])
+        if (
+            receipt.request.admission_id != admission_id
+            or receipt.request.settlement_id != row[0]
+            or receipt.task.id != row[1]
+            or receipt.request_sha256 != row[2]
+            or receipt.retired_contract_binding is not row[3]
+            or receipt.settled_at != pg_support.to_utc(row[4])
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "Lifecycle receipt indexes conflict with canonical content."
+            )
+        return receipt
+
+    async def load_work_attempt_lifecycle_receipt(
+        self, admission_id: str
+    ) -> WorkAttemptLifecycleReceipt | None:
+        admission_id = require_clean_nonblank(admission_id, "admission_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            return await self._load_work_attempt_lifecycle_receipt(cur, admission_id)
+
+    async def enter_work_attempt_execution(
+        self, request: WorkAttemptExecutionEntryRequest
+    ) -> WorkAttemptExecutionEntryResult:
+        request = copy_work_attempt_execution_entry_request(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptExecutionEntryResult:
+            del conn
+            await self._lock_verified_work_identity(cur, "admission", request.admission_id)
+            admission = await self._load_work_attempt_admission_row(
+                cur, request.admission_id, for_update=True
+            )
+            if admission is None:
+                raise WorkAttemptAdmissionConflict("Execution entry has no admission.")
+            await self._lock_verified_work_task(cur, admission.task_id)
+            task = await self._load_task_locked(cur, admission.task_id)
+            result = plan_work_attempt_execution_entry(
+                request, admission=admission, task=task, now=await self._database_now(cur)
+            )
+            if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED:
+                await self._update_work_attempt_admission_row(cur, result.admission)
+            return result
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def record_work_attempt_execution_stop(
+        self, request: WorkAttemptExecutionStopRequest
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_execution_stop_request(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
+            del conn
+            await self._lock_verified_work_identity(cur, "admission", request.admission_id)
+            admission = await self._load_work_attempt_admission_row(
+                cur, request.admission_id, for_update=True
+            )
+            if admission is None:
+                raise WorkAttemptAdmissionConflict("Execution stop has no admission.")
+            await self._lock_verified_work_task(cur, admission.task_id)
+            result = plan_work_attempt_execution_stop(
+                request,
+                admission=admission,
+                task=await self._load_task_locked(cur, admission.task_id),
+                now=await self._database_now(cur),
+            )
+            if admission.execution_stop is None:
+                await self._update_work_attempt_admission_row(cur, result)
+            return result
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def _load_work_attempt_preparation_hold(
+        self, cur: Any, hold_id: str
+    ) -> WorkAttemptPreparationHoldReceipt | None:
+        await cur.execute(
+            "SELECT task_id, request_sha256, receipt_json "
+            "FROM cayu_work_attempt_preparation_holds WHERE hold_id = %s",
+            (hold_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        receipt = WorkAttemptPreparationHoldReceipt.model_validate_json(row[2])
+        if (
+            receipt.request.hold_id != hold_id
+            or receipt.task.id != row[0]
+            or receipt.request_sha256 != row[1]
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "Preparation hold indexes conflict with canonical content."
+            )
+        return receipt
+
+    async def load_work_attempt_preparation_hold_receipt(
+        self, hold_id: str
+    ) -> WorkAttemptPreparationHoldReceipt | None:
+        hold_id = validate_work_completion_idempotency_key(hold_id)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            return await self._load_work_attempt_preparation_hold(cur, hold_id)
+
+    async def hold_work_attempt_preparation(
+        self, request: WorkAttemptPreparationHold
+    ) -> WorkAttemptPreparationHoldReceipt:
+        request = copy_work_attempt_preparation_hold(request)
+        digest = work_attempt_preparation_hold_sha256(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptPreparationHoldReceipt:
+            del conn
+            await self._lock_verified_work_identity(cur, "preparation-hold", request.hold_id)
+            existing = await self._load_work_attempt_preparation_hold(cur, request.hold_id)
+            if existing is not None:
+                if existing.request_sha256 != digest:
+                    raise WorkAttemptAdmissionConflict(
+                        "Preparation hold conflicts with its receipt."
+                    )
+                return existing
+            await self._lock_verified_work_task(cur, request.task_id)
+            task = await self._load_task_locked(cur, request.task_id)
+            await self._require_task_contract(cur, task, request.contract)
+            has_attempt = await self._latest_attempt_id(cur, task.id) is not None
+            now = await self._database_now(cur)
+            updated, receipt = plan_work_attempt_preparation_hold(
+                request, task=task, has_attempt=has_attempt, now=now
+            )
+            encoded = receipt.model_dump_json(warnings=False)
+            await self._update_task_snapshot(cur, updated)
+            await cur.execute(
+                "INSERT INTO cayu_work_attempt_preparation_holds "
+                "(hold_id, task_id, request_sha256, receipt_json) VALUES (%s, %s, %s, %s)",
+                (request.hold_id, task.id, digest, encoded),
+            )
+            return receipt
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def list_unsettled_work_attempt_admissions(
+        self,
+        *,
+        task_filter: TaskAggregateFilter | None = None,
+        limit: int = 100,
+        after: str | None = None,
+    ) -> list[WorkAttemptAdmission]:
+        query, after = _work_attempt_discovery_query(task_filter, limit=limit, after=after)
+        clauses, params = self._task_filter_clauses(query)
+        cursor_clause = "" if after is None else 'AND admission.admission_id COLLATE "C" > %s '
+        if after is not None:
+            params.append(after)
+        params.append(limit)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT admission.admission_id FROM cayu_work_attempt_admissions AS admission "
+                "JOIN (SELECT id FROM cayu_tasks WHERE "
+                + " AND ".join(clauses)
+                + ") AS task ON task.id = admission.task_id "
+                "WHERE NOT EXISTS (SELECT 1 FROM cayu_work_attempt_lifecycle_receipts AS receipt "
+                "WHERE receipt.admission_id = admission.admission_id) "
+                "AND NOT EXISTS (SELECT 1 FROM cayu_work_attempt_admissions AS successor "
+                "WHERE successor.task_id = admission.task_id AND "
+                "successor.admission_json->'continuation'->>'prior_admission_id' = admission.admission_id) "
+                + cursor_clause
+                + 'ORDER BY admission.admission_id COLLATE "C" LIMIT %s',
+                params,
+            )
+            rows = await cur.fetchall()
+            admissions = []
+            for row in rows:
+                admission = await self._load_work_attempt_admission_row(cur, row[0])
+                if admission is None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Discovered admission lost its durable record."
+                    )
+                admissions.append(admission)
+            return admissions
+
+    async def settle_work_attempt_lifecycle(
+        self, request: WorkAttemptLifecycleSettlement
+    ) -> WorkAttemptLifecycleReceipt:
+        request = copy_work_attempt_lifecycle_settlement(request)
+        request_sha256 = work_attempt_lifecycle_settlement_sha256(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptLifecycleReceipt:
+            del conn
+            # Existing admission, decision and task owners acquire different
+            # subsets of these locks. Contention must roll back to discovery,
+            # not wait while fencing another owner that needs our row.
+            await cur.execute("SET LOCAL lock_timeout = '100ms'")
+            await self._lock_verified_work_identity(
+                cur, "lifecycle-settlement", request.settlement_id
+            )
+            await self._lock_verified_work_identity(cur, "admission", request.admission_id)
+            existing = await self._load_work_attempt_lifecycle_receipt(cur, request.admission_id)
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkAttemptAdmissionConflict(
+                        "Lifecycle settlement conflicts with its receipt."
+                    )
+                return existing
+            await cur.execute(
+                "SELECT 1 FROM cayu_work_attempt_lifecycle_receipts WHERE settlement_id = %s",
+                (request.settlement_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Lifecycle settlement identity is already bound."
+                )
+            admission = await self._load_work_attempt_admission_row(
+                cur, request.admission_id, for_update=True
+            )
+            if admission is None:
+                raise WorkAttemptAdmissionConflict("Lifecycle settlement has no admission.")
+            await self._lock_verified_work_identity(cur, "admission-session", admission.session_id)
+            await self._lock_verified_work_task(cur, request.task_id)
+            task = await self._load_task_locked(cur, request.task_id)
+            latest = await self._load_latest_work_attempt_admission(cur, task.id)
+            await cur.execute(
+                "SELECT proposal.proposal_id, decision.decision_id FROM cayu_completion_proposals AS proposal "
+                "LEFT JOIN cayu_completion_decisions AS decision ON decision.proposal_id = proposal.proposal_id "
+                "WHERE proposal.attempt_id = %s",
+                (admission.attempt_id,),
+            )
+            row = await cur.fetchone()
+            proposal = None if row is None else await self._load_proposal_row(cur, row[0])
+            decision = (
+                None
+                if row is None or row[1] is None
+                else await self._load_decision_row(cur, row[1])
+            )
+            application = await self._load_application_receipt(
+                cur, task.id, request.application_idempotency_key or ""
+            )
+            updated, settled_admission, receipt = plan_work_attempt_lifecycle_settlement(
+                request,
+                task=task,
+                admission=admission,
+                latest_admission_id="" if latest is None else latest.admission_id,
+                proposal=proposal,
+                decision=decision,
+                application=application,
+                now=await self._verified_lease_now(cur),
+            )
+            encoded = receipt.model_dump_json(warnings=False)
+            await self._update_task_snapshot(cur, updated)
+            await self._update_work_attempt_admission_row(cur, settled_admission)
+            await cur.execute(
+                "INSERT INTO cayu_work_attempt_lifecycle_receipts "
+                "(admission_id, settlement_id, task_id, request_sha256, retired_contract_binding, settled_at, receipt_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    request.admission_id,
+                    request.settlement_id,
+                    task.id,
+                    request_sha256,
+                    receipt.retired_contract_binding,
+                    receipt.settled_at,
+                    encoded,
+                ),
+            )
+            if receipt.retired_contract_binding:
+                await cur.execute(
+                    "DELETE FROM cayu_task_session_execution_authority WHERE session_id = %s "
+                    "AND authority_kind = 'contracted' AND NOT EXISTS ("
+                    "SELECT 1 FROM cayu_tasks AS task WHERE task.session_id = %s AND task.work_contract IS NOT NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM cayu_work_attempt_lifecycle_receipts AS receipt "
+                    "WHERE receipt.task_id = task.id AND receipt.retired_contract_binding))",
+                    (admission.session_id, admission.session_id),
+                )
+            return receipt
+
+        try:
+            return await self._run_verified_work_mutation(operation)
+        except (LockNotAvailable, DeadlockDetected):
+            raise WorkAttemptExecutionClaimLost(
+                "Lifecycle settlement is contending with another owner."
+            ) from None
+
     async def renew_work_attempt_execution_claim(
         self,
         request: WorkAttemptExecutionClaimRequest,
@@ -1695,7 +2059,7 @@ class PostgresVerifiedWorkMixin:
                 raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
             claim = admission.claim
             if (
-                admission.state is not WorkAttemptAdmissionState.ACTIVE
+                admission.state not in WORK_ATTEMPT_RENEWABLE_STATES
                 or claim.claim_id != request.claim_id
                 or claim.worker_id != request.worker_id
                 or claim.execution_owner_id != request.execution_owner_id
@@ -1727,16 +2091,7 @@ class PostgresVerifiedWorkMixin:
                 raise WorkAttemptExecutionClaimLost(
                     "Execution-claim renewal lost exact task ownership."
                 )
-            renewed_claim = WorkAttemptExecutionClaim.model_validate(
-                claim.model_copy(
-                    update={
-                        "lease_expires_at": max(
-                            claim.lease_expires_at,
-                            lease_now + timedelta(seconds=request.lease_seconds),
-                        )
-                    }
-                ).model_dump(mode="python", warnings=False)
-            )
+            renewed_claim = renewed_work_attempt_execution_claim(claim, request, now=lease_now)
             renewed = WorkAttemptAdmission.model_validate(
                 admission.model_copy(update={"claim": renewed_claim}).model_dump(
                     mode="python", warnings=False
@@ -2273,6 +2628,7 @@ class PostgresVerifiedWorkMixin:
             if (
                 admission.state is not WorkAttemptAdmissionState.ACTIVE
                 or admission.claim.execution_owner_id != request.execution_owner_id
+                or admission.execution_stop is not None
             ):
                 raise WorkAttemptExecutionClaimLost(
                     "Completion proposal no longer owns the exact active admission."
@@ -2363,6 +2719,24 @@ class PostgresVerifiedWorkMixin:
         async with self._pool.connection() as conn, conn.cursor() as cur:
             proposal = await self._load_proposal_row(cur, proposal_id)
             return None if proposal is None else proposal.model_copy(deep=True)
+
+    async def load_completion_proposal_for_attempt(
+        self, attempt_id: str
+    ) -> CompletionProposal | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT proposal_id FROM cayu_completion_proposals WHERE attempt_id = %s",
+                (attempt_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            proposal = await self._load_proposal_row(cur, row[0])
+            if proposal is None or proposal.attempt_id != attempt_id:
+                raise WorkCompletionConflict("Proposal index conflicts with its attempt.")
+            return proposal.model_copy(deep=True)
 
     async def prepare_completion_verifier_profile(
         self,
@@ -2588,6 +2962,7 @@ class PostgresVerifiedWorkMixin:
             attempt_number = 1 if current is None else current.attempt_number + 1
             claim = CompletionVerificationClaim(
                 claim_id=request.claim_id,
+                lease_seconds=request.lease_seconds,
                 proposal_id=request.proposal_id,
                 worker_id=request.worker_id,
                 execution_owner_id=request.execution_owner_id,

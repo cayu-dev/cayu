@@ -17,6 +17,9 @@ from tests.core.test_verified_work_contracts import (
     _result_reference,
     _verifier_profile_fingerprint,
 )
+from tests.core.verified_worker_fixtures import (
+    verified_work_postgres_dsn as verified_work_postgres_dsn,
+)
 
 from cayu import (
     AgentSpec,
@@ -517,7 +520,13 @@ def test_postgres_cancelled_admission_is_quiescent_before_successor_retry(
     asyncio.run(scenario())
 
 
-def test_postgres_work_attempt_admission_continuation_and_recovery(postgres_dsn) -> None:
+def test_postgres_work_attempt_admission_continuation_and_recovery(
+    verified_work_postgres_dsn,
+) -> None:
+    # This scenario deliberately leaves rejected historical schema/data intact.
+    # Its database must not become the input to later current-schema tests.
+    postgres_dsn = verified_work_postgres_dsn
+
     async def scenario() -> None:
         suffix = uuid4().hex
         first_store = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
@@ -872,14 +881,26 @@ def test_postgres_work_attempt_admission_continuation_and_recovery(postgres_dsn)
             schema_mode=SchemaMode.MIGRATE,
         )
         try:
-            migrated_continuation = await migrated_store.load_work_attempt_admission(
-                continued.admission_id
-            )
-            assert migrated_continuation is not None
-            assert migrated_continuation.continuation is not None
-            assert migrated_continuation.continuation.prior_admission_id == active.admission_id
+            # Current binaries cannot reconstruct frozen executable settings
+            # from populated pre-worker admission history. Do not silently
+            # backfill one field and bless the remaining historical authority.
+            with pytest.raises(RuntimeError, match="revision 84 cannot reconstruct"):
+                await migrated_store.load_work_attempt_admission(continued.admission_id)
         finally:
             await migrated_store.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (61,)
+            await cursor.execute(
+                "SELECT admission_json #> '{continuation,prior_admission_id}' "
+                "FROM cayu_work_attempt_admissions WHERE admission_id = %s",
+                (continued.admission_id,),
+            )
+            assert await cursor.fetchone() == (None,)
 
     asyncio.run(scenario())
 

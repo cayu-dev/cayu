@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from cayu._task_wait import (
     await_shielded_task_outcome,
@@ -12,6 +13,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import copy_json_value
+from cayu.core.messages import Message, detach_message
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._diagnostics import (
     credential_safe_runtime_exception,
@@ -25,15 +27,216 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
+from cayu.runtime.invocation import SessionInvocationBinding
 from cayu.runtime.sessions import (
     DeferredInteractionInput,
     EventRecord,
     Session,
+    SessionStore,
+    TranscriptSnapshot,
+    _initial_transcript_pending_interaction_id,
     copy_session,
+)
+from cayu.runtime.work_attempt_admission import (
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionState,
+    WorkAttemptExecutionStopReason,
+    WorkAttemptExecutionStopRequest,
+    require_work_attempt_admission_result,
+    require_work_attempt_execution_stop_result,
 )
 from cayu.vaults import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")
+
+if TYPE_CHECKING:
+    from cayu.runtime.tasks import TaskStore
+
+
+async def record_work_attempt_execution_stop(
+    store: TaskStore,
+    *,
+    admission: WorkAttemptAdmission,
+    reason: WorkAttemptExecutionStopReason,
+    redactor: SecretRedactor,
+) -> None:
+    """Preserve the first authoritative stop before terminal cleanup effects."""
+    if admission.execution_stop is not None:
+        return
+    entry = admission.execution_entry
+    if entry is None:
+        raise RuntimeError("Governed execution stop has no execution entry.")
+    request = WorkAttemptExecutionStopRequest(
+        admission_id=admission.admission_id,
+        prepare_request_sha256=admission.prepare_request_sha256,
+        claim_id=admission.claim.claim_id,
+        worker_id=admission.claim.worker_id,
+        execution_owner_id=admission.claim.execution_owner_id,
+        generation=admission.claim.generation,
+        execution_entry=entry,
+        reason=reason,
+    )
+    outcome = await capture_task_store_operation(
+        lambda: store.record_work_attempt_execution_stop(request),
+        operation_name="Governed execution stop",
+        redactor=redactor,
+        mutation_store=store,
+        mutation_method_name="record_work_attempt_execution_stop",
+    )
+    if outcome.failure is not None:
+        raise_task_store_operation_failure(outcome.failure)
+    validation = capture_sensitive_result_validation(
+        lambda: require_work_attempt_execution_stop_result(outcome.result, admission, request),
+        operation_name="Governed execution stop validation",
+        redactor=redactor,
+    )
+    if validation.failure is not None:
+        raise_task_store_operation_failure(validation.failure)
+
+
+async def reconcile_work_attempt_initial_publication(
+    store: SessionStore,
+    *,
+    admission: WorkAttemptAdmission,
+    expected_source: list[Message],
+    expected_transcript: list[Message],
+    redactor: SecretRedactor,
+) -> bool:
+    """Recognize only the exact committed initial projection after a lost reply.
+
+    This is readback inside the existing run owner, not dispatch or release
+    authority. A remaining deferred record must still use the atomic publisher.
+    """
+    deferred = await read_work_attempt_session_store(
+        lambda: store.load_deferred_interaction_input(admission.session_id),
+        operation_name="Initial publication deferred-input readback",
+        redactor=redactor,
+    )
+    if deferred is not None:
+        return False
+    session = await read_work_attempt_session_store(
+        lambda: store.load(admission.session_id),
+        operation_name="Initial publication session readback",
+        redactor=redactor,
+    )
+    snapshot = await read_work_attempt_session_store(
+        lambda: store.load_transcript_snapshot(admission.session_id),
+        operation_name="Initial publication transcript readback",
+        redactor=redactor,
+    )
+    checkpoint = await read_work_attempt_session_store(
+        lambda: store.load_checkpoint(admission.session_id),
+        operation_name="Initial publication checkpoint readback",
+        redactor=redactor,
+    )
+
+    def validate() -> bool:
+        if type(session) is not Session or type(snapshot) is not TranscriptSnapshot:
+            raise TypeError("Initial publication readback returned invalid records.")
+        current = copy_session(session)
+        transcript = TranscriptSnapshot.model_validate(
+            snapshot.model_dump(mode="python", warnings=False)
+        )
+        prefix_count = len(expected_transcript) - len(expected_source)
+        entry = admission.execution_entry
+        if (
+            admission.kind != "initial"
+            or entry is None
+            or current.run_epoch != entry.request.run_epoch
+            or SessionInvocationBinding(
+                id=current.id,
+                session_instance_id=current.instance_id,
+                invocation=current.invocation,
+            )
+            != admission.session_invocation
+            or _initial_transcript_pending_interaction_id(checkpoint) is not None
+            or prefix_count < 0
+            or expected_transcript[prefix_count:] != expected_source
+            or transcript.cursor != len(expected_transcript)
+            or len(transcript.records) != len(expected_transcript)
+            or any(
+                record.index != index
+                or record.message != expected_transcript[index]
+                or record.interaction_id
+                != (None if index < prefix_count else admission.interaction_id)
+                for index, record in enumerate(transcript.records)
+            )
+        ):
+            raise RuntimeError("Initial publication readback conflicts with admitted input.")
+        return True
+
+    outcome = capture_sensitive_result_validation(
+        validate,
+        operation_name="Initial publication exact readback validation",
+        redactor=redactor,
+    )
+    if outcome.failure is not None:
+        raise_task_store_operation_failure(outcome.failure)
+    return outcome.result is True
+
+
+@dataclass(frozen=True, slots=True)
+class WorkAttemptExecutionInput:
+    """Detached transcript projection; materialization stays with the run owner."""
+
+    messages: tuple[Message, ...]
+    messages_to_append: tuple[Message, ...]
+    deferred: bool
+
+
+def capture_work_attempt_execution_input_result(
+    transcript: object,
+    deferred: object,
+    *,
+    admission: WorkAttemptAdmission,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkAttemptExecutionInput]:
+    def prepare_input() -> WorkAttemptExecutionInput:
+        admitted = require_work_attempt_admission_result(
+            admission, operation_name="Execution-input admission"
+        )
+        initial = admitted.kind == "initial"
+        if type(transcript) is not list:
+            raise TypeError("Work-attempt transcript must be a list.")
+        detached: list[Message] = []
+        for message in transcript:
+            if type(message) is not Message:
+                raise TypeError("Work-attempt transcript contains an invalid message.")
+            detached.append(detach_message(message))
+        messages = tuple(detached)
+        if deferred is None:
+            if initial and not (
+                admitted.state is WorkAttemptAdmissionState.ACTIVE
+                and admitted.claim.generation > 1
+                and admitted.recovery_evidence_sha256 is not None
+            ):
+                raise RuntimeError("Initial work-attempt execution lacks deferred input.")
+            return WorkAttemptExecutionInput(messages, (), False)
+        if type(deferred) is not DeferredInteractionInput:
+            raise TypeError("Work-attempt deferred input has an invalid type.")
+        copied = DeferredInteractionInput.model_validate(
+            deferred.model_dump(mode="python", warnings=False)
+        )
+        if copied.interaction_id != admitted.interaction_id:
+            raise RuntimeError("Work-attempt deferred input belongs to another interaction.")
+        source = tuple(detach_message(message) for message in copied.source_messages)
+        if initial:
+            if messages or copied.initial_transcript_messages is None:
+                raise RuntimeError("Initial work-attempt transcript conflicts with deferred input.")
+            messages = tuple(
+                detach_message(message) for message in copied.initial_transcript_messages
+            )
+        else:
+            if copied.initial_transcript_messages is not None:
+                raise RuntimeError("Continuation input unexpectedly replaces the transcript.")
+            messages = (*messages, *source)
+        return WorkAttemptExecutionInput(messages, source, True)
+
+    return capture_sensitive_result_validation(
+        prepare_input,
+        operation_name="Work-attempt execution-input validation",
+        redactor=redactor,
+    )
 
 
 def capture_work_attempt_session_result(
