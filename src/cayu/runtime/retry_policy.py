@@ -53,6 +53,7 @@ _PERMANENT_ERROR_PATTERNS = (
 
 
 class RetryReason(StrEnum):
+    OUTPUT = "output"
     HTTP_STATUS = "http_status"
     TIMEOUT = "timeout"
     CONNECTION = "connection"
@@ -156,6 +157,7 @@ def retry_decision(
     retryable: bool | None = None,
     retry_after_s: float | None = None,
     unknown_provider_error: bool = False,
+    retryable_output: bool = False,
     suppression: RetrySuppression | None = None,
 ) -> RetryDecision:
     """Classify one failed model attempt into a retry decision.
@@ -172,6 +174,9 @@ def retry_decision(
     retry budget by default. `suppression` carries existing runtime authority
     independently of the provider verdict and always prevents another attempt.
     `disposition` explains terminal decisions even when `reason` is absent.
+    `retryable_output` marks a caller-validated output failure, independently of
+    transport retry settings. It requires an explicit retryable verdict and no
+    HTTP status; suppression and the general attempt ceiling still apply.
     """
 
     policy = copy_retry_policy(policy)
@@ -183,6 +188,8 @@ def retry_decision(
         raise TypeError("error must be a string.")
     if type(unknown_provider_error) is not bool:
         raise TypeError("unknown_provider_error must be a boolean.")
+    if type(retryable_output) is not bool:
+        raise TypeError("retryable_output must be a boolean.")
     if retry_after_s is not None:
         if type(retry_after_s) not in {int, float}:
             raise ValueError("retry_after_s must be a finite non-negative number.")
@@ -201,6 +208,15 @@ def retry_decision(
         status_code=status_code,
         retryable=retryable,
     )
+    if (
+        retryable_output
+        and retryable is True
+        and classified_status is None
+        and not _is_permanent_provider_error(
+            status_code=classified_status, normalized_error=error.lower()
+        )
+    ):
+        reason = RetryReason.OUTPUT
     if reason is None and unknown_provider_error and status_code is None and retryable is None:
         reason = RetryReason.UNKNOWN_PROVIDER
     if suppression is not None:

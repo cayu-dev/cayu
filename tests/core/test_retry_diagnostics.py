@@ -60,6 +60,62 @@ def test_retry_disposition(fields, attempt, expected, retry, effective):
     assert decision.provider_retryable is fields.get("retryable")
 
 
+def test_output_retry_preserves_attempt_cap_and_backoff():
+    policy = RetryPolicy(
+        max_attempts=3,
+        max_unknown_attempts=1,
+        initial_delay_s=0.25,
+        backoff_multiplier=2.0,
+        jitter_s=0.0,
+        retry_on_connection_error=False,
+    )
+    decision = retry_decision(
+        policy=policy,
+        attempt=2,
+        error="Blank output",
+        retryable=True,
+        retryable_output=True,
+    )
+    assert decision.reason.value == "output"
+    assert decision.next_attempt == 3
+    assert decision.delay_seconds == 0.5
+    assert decision.effective_max_attempts == 3
+    exhausted = retry_decision(
+        policy=policy,
+        attempt=3,
+        error="Blank output",
+        retryable=True,
+        retryable_output=True,
+    )
+    assert not exhausted.retry
+    assert exhausted.disposition.value == "configured_attempt_exhaustion"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"retryable": False},
+        {"retryable": None},
+        {"status_code": 401},
+        {"error": "insufficient_quota"},
+        *[{"suppression": value} for value in RetrySuppression],
+    ],
+)
+def test_output_retry_does_not_override_terminal_controls(fields):
+    decision = retry_decision(
+        policy=RetryPolicy(retry_on_connection_error=False),
+        attempt=1,
+        **{"error": "Blank output", "retryable": True, "retryable_output": True, **fields},
+    )
+    assert not decision.retry
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "true"])
+def test_output_retry_requires_boolean(invalid):
+    with pytest.raises(TypeError, match="retryable_output"):
+        retry_decision(policy=RetryPolicy(), attempt=1, error="Blank", retryable_output=invalid)
+
+
 @pytest.mark.parametrize("suppression", list(RetrySuppression))
 @pytest.mark.parametrize("retryable", [None, False, True])
 def test_suppression_preserves_tristate_and_budget(suppression, retryable):

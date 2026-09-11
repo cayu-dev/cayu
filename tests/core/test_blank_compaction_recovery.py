@@ -49,12 +49,12 @@ class SummaryProvider(ModelProvider):
         )
 
 
-def compactor(provider, *, enabled=True, attempts=2):
+def compactor(provider, *, enabled=True, attempts=2, policy=None):
     return ModelCompactor(
         provider=provider,
         model="summary",
         retry_empty_summaries=enabled,
-        retry_policy=RetryPolicy(max_attempts=attempts, initial_delay_s=0.0),
+        retry_policy=policy or RetryPolicy(max_attempts=attempts, initial_delay_s=0.0),
     )
 
 
@@ -83,6 +83,35 @@ def test_completed_blank_summary_retries_and_accounts_for_both_calls(blank):
     assert len(result.model_completed_payloads) == 2
     assert result.model_completed_payloads[0]["compaction_outcome"] == "empty_summary"
     assert sum(p["usage_metrics"]["input_tokens"] for p in result.model_completed_payloads) == 20
+
+
+def test_output_recovery_does_not_enable_network_retries():
+    policy = RetryPolicy(
+        max_attempts=3,
+        max_unknown_attempts=1,
+        initial_delay_s=0.0,
+        jitter_s=0.0,
+        retry_on_connection_error=False,
+        retry_on_timeout=False,
+        retry_on_rate_limit=False,
+        retry_on_status_codes=(),
+    )
+    provider = SummaryProvider(["", "Recovered"])
+    result = asyncio.run(compact(provider, policy=policy))
+    assert result.summary == "Recovered"
+    assert len(provider.requests) == 2
+    assert len(result.model_completed_payloads) == 2
+
+    provider = SummaryProvider(
+        [
+            "",
+            ModelProviderError("Connection reset", provider="test-summary", retryable=True),
+            "Must not be reached",
+        ]
+    )
+    with pytest.raises(ModelProviderError, match="Connection reset"):
+        asyncio.run(compact(provider, policy=policy))
+    assert len(provider.requests) == 2
 
 
 def test_empty_summary_attempts_are_bounded():

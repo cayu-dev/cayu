@@ -4940,6 +4940,12 @@ async def _run_compaction_model(
                         policy=retry_policy,
                         attempt=attempt,
                         error=provider_failure.message,
+                        retryable_output=(
+                            retry_empty_summaries
+                            and provider_error is not None
+                            and provider_error.error_code == "compaction_empty_summary"
+                            and bool(attempt_payloads)
+                        ),
                         status_code=(
                             None if provider_error is None else provider_error.status_code
                         ),

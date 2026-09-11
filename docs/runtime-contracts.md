@@ -828,6 +828,8 @@ reported only by the returned result.
 a cleanly closed, explicitly successful (`status="completed"`, normalized finish
 reason `stop`) stream as `compaction_empty_summary`. Its existing `RetryPolicy`
 caps all attempts, including replacements; `max_attempts=1` still means no retry.
+This output-recovery opt-in is independent of transport retry switches such as
+`retry_on_connection_error`; it does not enable retries for network failures.
 Each rejected completion retains usage with `compaction_outcome="empty_summary"`.
 Replacement requests pass through the same admission, deadline and budget checks.
 No summary or source coverage is committed until valid output is obtained.
