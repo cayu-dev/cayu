@@ -40,6 +40,7 @@ from cayu.providers._credential_boundary import (
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    _SAFE_INTERNAL_PROVIDER_ERROR_TYPES,
     aclose_transport,
     copy_headers,
     credential_safe_post_completion_failure,
@@ -1252,6 +1253,9 @@ def _safe_subscription_error_identity(
         return None
     allowed = (
         {
+            # Match the shared HTTP provider boundary: these are fixed Cayu/httpx
+            # categories, not arbitrary exception messages or response content.
+            *_SAFE_INTERNAL_PROVIDER_ERROR_TYPES,
             "authentication_error",
             "context_length_exceeded",
             "error",

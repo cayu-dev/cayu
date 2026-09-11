@@ -154,6 +154,20 @@ carry `reason="unknown_provider"`, including the terminal failure at the nested
 ceiling. Conflicting explicit SSE statuses remain terminal and omit
 `status_code` from durable evidence rather than reporting a synthesized status.
 
+## Transport failure diagnostics
+
+Subscription error events retain the same fixed internal transport categories
+as the shared HTTP adapters in `provider_error_type`, for example `ConnectTimeout`,
+`ReadError`, and `SseEventLimitError`. These survive runtime `model.error` events
+and session-store reloads alongside the model-step/attempt IDs and retry decision.
+The Python wrapper type (such as `OpenAIAPIError`) remains in `error_type`.
+
+These fields identify the observed failure category, not its ultimate cause:
+`ReadError` alone cannot distinguish a server disconnect from a proxy or local
+network failure. Unknown identity strings, raw exception messages, response
+bodies, and arbitrary request IDs remain excluded. Retaining a category does
+not authorize a retry; existing retryability and runtime policy still govern it.
+
 ## Support and policy boundary
 
 This is not an OpenAI API key and does not turn a ChatGPT subscription into
