@@ -41,6 +41,53 @@ def test_registry_names_are_unique_and_every_scenario_has_a_boundary():
     assert all(s.invariant and s.boundary and s.selectors for s in scenarios)
 
 
+def test_maintenance_partition_selects_every_collected_case_exactly_once():
+    import subprocess
+    import sys
+    from collections import Counter
+    from pathlib import Path
+
+    from tests.qualification.registry import MAINTENANCE_SCENARIOS
+
+    root = Path(__file__).resolve().parents[2]
+    modules = sorted(
+        str(path.relative_to(root))
+        for path in (root / "tests/qualification").glob("test_repository_maintenance_*.py")
+    )
+    modules += [
+        "tests/recovery/test_worker_harness_ownership.py",
+        "tests/core/test_subagent_registry_drain.py",
+    ]
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *modules],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=True,
+    )
+    nodes = [
+        line for line in collected.stdout.splitlines() if line.startswith("tests/") and "::" in line
+    ]
+    assert nodes and len(nodes) == len(set(nodes))
+    coverage = Counter()
+    for scenario in MAINTENANCE_SCENARIOS:
+        for selector in scenario.selectors:
+            matches = [
+                node
+                for node in nodes
+                if node == selector or node.startswith((selector + "::", selector + "["))
+            ]
+            assert matches, f"Empty or obsolete qualification selector: {selector}"
+            coverage.update(matches)
+    assert set(coverage) == set(nodes), f"Unregistered cases: {set(nodes) - set(coverage)}"
+    assert all(count == 1 for count in coverage.values()), {
+        node: count for node, count in coverage.items() if count != 1
+    }
+    journeys = [scenario for scenario in MAINTENANCE_SCENARIOS if "-journey-" in scenario.name]
+    assert len(journeys) == 18 and all(len(scenario.selectors) == 1 for scenario in journeys)
+
+
 def test_retained_subprocess_fails_report_and_is_reaped(tmp_path, monkeypatch):
     import subprocess
     import sys

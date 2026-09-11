@@ -28,6 +28,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     thaw_json_value,
 )
+from cayu.artifacts import ArtifactStore
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import ToolContext
 from cayu.credentials import CredentialMode
@@ -812,6 +813,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         *,
         source_workspace: LocalWorkspace,
         toolchain_profile: DockerCodingToolchainProfile,
+        artifact_store: ArtifactStore | None = None,
         transfer_limits: DockerWorkspaceTransferLimits | None = None,
         runtime: str | None = None,
         seccomp_profile: str | None = None,
@@ -824,6 +826,10 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             raise TypeError("source_workspace must be LocalWorkspace.")
         if type(toolchain_profile) is not DockerCodingToolchainProfile:
             raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
+        # Reuse the concrete environment's validation before any allocation.
+        self._artifact_store = Environment(
+            EnvironmentSpec(name="coding"), artifact_store=artifact_store
+        ).artifact_store
         if transfer_limits is not None and not isinstance(
             transfer_limits, DockerWorkspaceTransferLimits
         ):
@@ -859,6 +865,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self._configuration_fingerprint = _docker_coding_configuration_fingerprint(
             image_identity=self.image_identity,
             restrictions=self.restrictions,
+            artifact_store_fingerprint=(
+                None
+                if self._artifact_store is None
+                else "sha256:" + sha256(self._artifact_store.id.encode("utf-8")).hexdigest()
+            ),
             required_executables=self.required_executables,
             transfer_limits=self.transfer_limits,
             runtime=self.runtime,
@@ -875,7 +886,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="14",
+            behavior_version="15",
             implementation_version=self._configuration_fingerprint,
         )
         self._execution_environment_authority = ExecutionEnvironmentAuthority(
@@ -886,6 +897,12 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
         return self._profile_identity
+
+    @property
+    def configured_artifact_store(self) -> ArtifactStore | None:
+        """Host-side store shared by results; its lifetime belongs to the application."""
+
+        return self._artifact_store
 
     def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
         """Return the exact authority every runner from this factory preserves."""
@@ -1368,6 +1385,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                     execution_profile_identity=self.execution_profile_identity,
                 ),
                 workspace=self.source_workspace,
+                artifact_store=self.configured_artifact_store,
                 runner=runner,
                 binding=binding,
             )
@@ -2269,6 +2287,7 @@ def _docker_coding_configuration_fingerprint(
     *,
     image_identity: DockerImageIdentity,
     restrictions: DockerWorkloadRestrictions,
+    artifact_store_fingerprint: str | None,
     required_executables: tuple[str, ...],
     transfer_limits: DockerWorkspaceTransferLimits,
     runtime: str | None,
@@ -2280,7 +2299,8 @@ def _docker_coding_configuration_fingerprint(
     immutable_input_runtime_compatibility_fingerprint: str | None,
 ) -> str:
     material = {
-        "schema": "cayu.docker_coding_environment.v2",
+        "schema": "cayu.docker_coding_environment.v3",
+        "artifact_store_fingerprint": artifact_store_fingerprint,
         "image_identity": image_identity.model_dump(mode="json"),
         "restrictions": restrictions.model_dump(mode="json"),
         "required_executables": list(required_executables),

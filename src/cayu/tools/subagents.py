@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from enum import StrEnum
 from functools import partial
 from hashlib import sha256
+from math import isfinite
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -146,6 +147,29 @@ class BackgroundSubagentTaskRegistry:
         if record is None:
             return None
         return copy_json_value(record, "background_failure")
+
+    async def drain(self, *, timeout_s: float = 10.0) -> bool:
+        """Observe registry-wide stream settlement without cancelling children.
+
+        Callers must first stop external dispatch. This does not seal the registry
+        or prove remote-effect/environment cleanup; Runtime cleanup drains still
+        apply after streams settle. A timeout or cancelled waiter retains owners
+        for a later call. Failed streams count as settled, not successful.
+        """
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            tasks = tuple(task for task in self._tasks.values() if not task.done())
+            if not tasks:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            # Unlike wait_for/gather cancellation, wait never cancels children.
+            # Refresh afterward: a finishing child may have registered more work.
+            await asyncio.wait(tasks, timeout=remaining)
 
     async def cancel_parent(self, parent_session_id: str) -> None:
         """Cancel and drain every background subagent task for a parent session."""
@@ -364,6 +388,11 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                 },
             )
         )
+
+    @property
+    def background_task_registry(self) -> BackgroundSubagentTaskRegistry:
+        """Existing process-local owner; default registries may span applications."""
+        return self._background_registry
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:

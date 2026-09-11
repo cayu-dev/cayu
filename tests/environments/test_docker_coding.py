@@ -41,6 +41,7 @@ from cayu import (
     ExecutionToolRequirement,
     ImmutableInputProjectionCapability,
     ImmutableInputStore,
+    LocalArtifactStore,
     LocalRunner,
     Message,
     NoWorkspaceBinding,
@@ -1259,12 +1260,19 @@ def test_docker_coding_factory_refuses_weakened_privilege_restrictions(
     assert decision.status == "refused"
 
 
+@pytest.mark.parametrize("with_artifacts", [False, True])
 def test_docker_coding_factory_returns_only_exact_final_evidence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    with_artifacts: bool,
 ) -> None:
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
+    artifacts = (
+        LocalArtifactStore(tmp_path / "artifacts", store_id="host-artifacts")
+        if with_artifacts
+        else None
+    )
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         del kwargs
@@ -1285,6 +1293,7 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(tmp_path),
+        artifact_store=artifacts,
         toolchain_profile=docker_toolchain_profile(
             image_identity=_image_identity(), restrictions=restrictions
         ),
@@ -1316,6 +1325,8 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
 
     async def run() -> None:
         result = await factory.create(request)
+        assert factory.configured_artifact_store is artifacts
+        assert result.environment.artifact_store is artifacts
         evidence = result.metadata["execution_capabilities"]
         assert evidence["environment_fingerprint"].startswith("sha256:")
         assert result.metadata["execution_requirements"]["required_executables"] == [
@@ -1341,10 +1352,36 @@ def test_docker_coding_factory_returns_only_exact_final_evidence(
         assert result.environment.workspace is factory.source_workspace
         assert result.release is not None
         await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+        if artifacts is not None:
+            retained = await artifacts.put_bytes(
+                b"still application-owned", filename="proof.txt", session_id="session"
+            )
+            assert (await artifacts.read_bytes(retained.id)).content == b"still application-owned"
 
     asyncio.run(run())
 
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
+
+
+def test_docker_coding_artifact_identity_is_bound_before_allocation(tmp_path: Path) -> None:
+    (tmp_path / "source").mkdir()
+
+    def factory(store):
+        return DockerCodingEnvironmentFactory(
+            source_workspace=LocalWorkspace(tmp_path / "source"),
+            toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+            artifact_store=store,
+        )
+
+    first = factory(LocalArtifactStore(tmp_path / "a", store_id="stable"))
+    reopened = factory(LocalArtifactStore(tmp_path / "a", store_id="stable"))
+    other = factory(LocalArtifactStore(tmp_path / "b", store_id="other"))
+    assert first.execution_profile_identity == reopened.execution_profile_identity
+    assert first.execution_profile_identity != other.execution_profile_identity
+    assert first.execution_profile_identity != factory(None).execution_profile_identity
+    with pytest.raises(TypeError, match="artifact_store must be an ArtifactStore"):
+        factory(object())
+    assert str(tmp_path) not in first.execution_profile_identity.model_dump_json()
 
 
 def test_docker_coding_factory_reconnects_exact_preserved_container(
@@ -1368,6 +1405,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
     )
     store = ImmutableInputStore(tmp_path / "managed")
     mount_source: str | None = None
+    artifacts = LocalArtifactStore(tmp_path / "host-artifacts", store_id="reconnect-artifacts")
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         nonlocal mount_source
@@ -1403,6 +1441,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
         source_workspace=LocalWorkspace(workspace_root),
+        artifact_store=artifacts,
         toolchain_profile=docker_toolchain_profile(
             image_identity=image_identity, restrictions=restrictions
         ),
@@ -1419,6 +1458,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
 
     async def run() -> None:
         created = await factory.create(create_request)
+        assert created.environment.artifact_store is artifacts
         assert created.reconnect_metadata["container_id"] == _CONTAINER_ID
         assert len(created.reconnect_metadata["allocation_fingerprint"]) == 64
         assert created.release is not None
@@ -1433,7 +1473,21 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         )
         candidate = factory.execution_admission_candidate(reconnect_request)
         assert candidate.evidence.claim_for("reconnect").state == "declared"  # type: ignore[union-attr]
+        conflicting = DockerCodingEnvironmentFactory(
+            source_workspace=factory.source_workspace,
+            toolchain_profile=factory.toolchain_profile,
+            docker_path="/usr/bin/docker",
+            immutable_inputs=(immutable_input,),
+            immutable_input_store=store,
+            immutable_input_runtime_compatibility_fingerprint=image_identity.fingerprint,
+            artifact_store=LocalArtifactStore(tmp_path / "other-artifacts", store_id="other"),
+        )
+        calls_before_conflict = len(calls)
+        with pytest.raises(ValueError, match="reconnect metadata does not match"):
+            await conflicting.create(reconnect_request)
+        assert len(calls) == calls_before_conflict
         reconnected = await factory.create(reconnect_request)
+        assert reconnected.environment.artifact_store is artifacts
         assert reconnected.reconnect_metadata == created.reconnect_metadata
         assert reconnected.environment.runner is not None
         assert reconnected.environment.runner.container_id == _CONTAINER_ID
@@ -1527,6 +1581,7 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
     calls: list[list[str]] = []
     container_exists = False
     container_labels: dict[str, str] = {}
+    artifacts = LocalArtifactStore(tmp_path / "artifacts", store_id="recoverable-artifacts")
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
         nonlocal container_exists
@@ -1563,6 +1618,7 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
             image_identity=_image_identity(), restrictions=restrictions
         ),
         docker_path="/usr/bin/docker",
+        artifact_store=artifacts,
     )
     request = EnvironmentFactoryRequest(
         session_id="recoverable-create",
@@ -1581,6 +1637,7 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
     async def run() -> None:
         first_context = _TestAllocationContext(intent)
         first = await factory.create_recoverable(request, first_context)
+        assert first.environment.artifact_store is artifacts
         assert first_context.state is EnvironmentAllocationState.ACKNOWLEDGED
         assert first_context.acknowledged_reconnect_metadata == first.reconnect_metadata
 
@@ -1589,6 +1646,7 @@ def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
             state=EnvironmentAllocationState.DISPATCHED,
         )
         recovered = await factory.create_recoverable(request, recovered_context)
+        assert recovered.environment.artifact_store is artifacts
         assert recovered_context.state is EnvironmentAllocationState.ACKNOWLEDGED
         assert recovered.reconnect_metadata == first.reconnect_metadata
         assert first.release is not None

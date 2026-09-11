@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -25,7 +25,9 @@ from cayu._coding_product_authority import (
     CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY,
     CodingProductSourceCopyAuthority,
     is_final_git_result_envelope,
+    source_copy_authority_from_metadata,
 )
+from cayu._exception_groups import exception_cause, failure_control_cause
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -40,6 +42,11 @@ from cayu.artifacts import (
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message
+from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
+from cayu.runtime._invocation_lifecycle import (
+    released_invocation_evidence,
+    require_invocation_rebind_lineage,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolver,
@@ -49,8 +56,16 @@ from cayu.runtime.completion_verifiers import (
     CompletionVerifierRequest,
     DeterministicCompletionVerifier,
 )
+from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
+from cayu.runtime.invocation import SessionInvocationBinding
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.runtime.sessions import RunRequest, session_input_messages_sha256
+from cayu.runtime.sessions import (
+    RunRequest,
+    SessionStatus,
+    parse_session_input_contract_evidence,
+    session_input_messages_sha256,
+)
 from cayu.runtime.work_contracts import (
     CompletionConstraintOutcome,
     CompletionContinuationPolicy,
@@ -341,6 +356,13 @@ class CodingProductRequest(_FrozenCodingModel):
     task: CodingTaskAuthority
     runtime: CodingRuntimeAuthority
     settlement: CodingSettlementPolicy = Field(default_factory=CodingSettlementPolicy)
+    parent_session_id: str | None = None
+    causal_budget_id: str | None = None
+
+    @field_validator("parent_session_id", "causal_budget_id")
+    @classmethod
+    def validate_optional_lineage(cls, value: str | None, info) -> str | None:
+        return None if value is None else _validated_identifier(value, info.field_name)
 
     @field_validator("product_run_id", "session_id", "agent_name")
     @classmethod
@@ -1039,6 +1061,27 @@ class CodingProductPublication:
     artifact: CodingArtifactReference
 
 
+class _CodingProductExecutionAnchor(_FrozenCodingModel):
+    schema_version: Literal["cayu.coding_product_execution_anchor.v1"] = (
+        "cayu.coding_product_execution_anchor.v1"
+    )
+    request_fingerprint: str
+    binding: SessionInvocationBinding
+    start_event_id: str
+    interaction_id: str
+    run_epoch: StrictInt = Field(ge=1)
+
+    @field_validator("request_fingerprint")
+    @classmethod
+    def validate_request_fingerprint(cls, value: str) -> str:
+        return _validated_fingerprint(value, "request_fingerprint")
+
+    @field_validator("start_event_id", "interaction_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _validated_identifier(value, info.field_name)
+
+
 class CodingProductArtifactRepository:
     """Durable append-only lifecycle and result storage over an ArtifactStore."""
 
@@ -1062,6 +1105,52 @@ class CodingProductArtifactRepository:
 
     def execution_claim_artifact_id(self, product_run_id: str) -> str:
         return _artifact_id("coding-product-execution-claim-v1", product_run_id)
+
+    async def _retain_execution_anchor(
+        self,
+        request: CodingProductRequest,
+        binding: SessionInvocationBinding,
+        event: Event,
+    ) -> None:
+        if event.type is not EventType.SESSION_STARTED or event.interaction_id is None:
+            raise CodingProductEvidenceError("Execution anchor requires the session start event.")
+        run_epoch = event.payload.get("run_epoch")
+        if type(run_epoch) is not int or run_epoch < 1:
+            raise CodingProductEvidenceError("Execution anchor requires the exact run epoch.")
+        anchor = _CodingProductExecutionAnchor(
+            request_fingerprint=request.fingerprint,
+            binding=binding,
+            start_event_id=event.id,
+            interaction_id=event.interaction_id,
+            run_epoch=run_epoch,
+        )
+        content = _canonical_model_bytes(anchor, "coding_product_execution_anchor")
+        await self.store.put_bytes(
+            content,
+            artifact_id=_artifact_id("coding-product-execution-anchor-v1", request.product_run_id),
+            filename="coding-product-execution-anchor.json",
+            content_type="application/json",
+            scope=ArtifactScope.SESSION,
+            session_id=request.session_id,
+            metadata={"content_sha256": "sha256:" + sha256(content).hexdigest()},
+        )
+        if await self._load_execution_anchor(request) != anchor:
+            raise CodingProductEvidenceError("Execution anchor publication changed authority.")
+
+    async def _load_execution_anchor(
+        self, request: CodingProductRequest
+    ) -> _CodingProductExecutionAnchor:
+        artifact_id = _artifact_id("coding-product-execution-anchor-v1", request.product_run_id)
+        result = self._validate_session_json_artifact(
+            await self.store.read_bytes(artifact_id, max_bytes=CODING_PRODUCT_MAX_RESULT_BYTES),
+            artifact_id=artifact_id,
+            session_id=request.session_id,
+            filename="coding-product-execution-anchor.json",
+        )
+        anchor = _CodingProductExecutionAnchor.model_validate_json(result.content)
+        if anchor.request_fingerprint != request.fingerprint:
+            raise CodingProductEvidenceError("Execution anchor conflicts with admitted authority.")
+        return anchor
 
     async def acquire_execution_claim(
         self,
@@ -1492,6 +1581,82 @@ class CodingProductArtifactRepository:
             receipts.append(receipt)
             artifact_ids.append(artifact_id)
         return tuple(receipts), tuple(artifact_ids)
+
+    async def load_initial_source_observation(
+        self,
+        request: CodingProductRequest,
+    ) -> WorkspaceRevisionObservation:
+        """Read the exact retained baseline; this does not authorize execution."""
+
+        if type(request) is not CodingProductRequest:
+            raise TypeError("Initial source reads require CodingProductRequest.")
+        request = CodingProductRequest.model_validate(
+            request.model_dump(mode="python", warnings=False)
+        )
+        admitted = await self.load_request(
+            request.product_run_id,
+            session_id=request.session_id,
+        )
+        if admitted != request:
+            raise CodingProductAdmissionError(
+                "Initial source request conflicts with admitted authority."
+            )
+        receipts, _ = await self.load_lifecycle(
+            request.product_run_id,
+            session_id=request.session_id,
+            request_fingerprint=request.fingerprint,
+        )
+        active = tuple(
+            receipt for receipt in receipts if receipt.state is CodingProductState.ACTIVE
+        )
+        if len(active) != 1 or active[0].evidence_sha256 is None:
+            raise CodingProductReconstructionRequiredError(
+                "Coding-product initial source has no exact active receipt."
+            )
+        digest = active[0].evidence_sha256
+        artifact_id = _artifact_id(
+            "coding-product-source-observation-v1",
+            request.session_id,
+            "initial",
+            digest.removeprefix("sha256:"),
+        )
+        probe = copy_artifact_read_result(
+            await self.store.read_bytes(artifact_id, max_bytes=1),
+            expected_artifact_id=artifact_id,
+            max_content_bytes=1,
+        )
+        content = await self._read_evidence_artifact(
+            CodingArtifactReference(
+                artifact_id=artifact_id,
+                sha256=digest,
+                size_bytes=probe.metadata.size_bytes,
+            ),
+            session_id=request.session_id,
+            agent_name=request.agent_name,
+            environment_name=request.runtime.environment_name,
+            filename="coding-product-source-initial.json",
+            content_type="application/json",
+            max_bytes=CODING_PRODUCT_MAX_SOURCE_ARTIFACT_BYTES,
+            expected_metadata={
+                "schema_version": "cayu.coding_product_source_observation.v1",
+                "phase": "initial",
+                "workspace_id": request.source.workspace_id,
+                "observer": "cayu-coding-product-source",
+                "status": WorkspaceRevisionObservationStatus.SUPPORTED.value,
+            },
+        )
+        observation = WorkspaceRevisionObservation.model_validate_json(content)
+        if (
+            observation.identity.workspace_id != request.source.workspace_id
+            or observation.identity.observer != "cayu-coding-product-source"
+            or observation.status is not WorkspaceRevisionObservationStatus.SUPPORTED
+            or observation.path_scope != "complete"
+            or observation.revision != request.source.baseline_revision
+        ):
+            raise CodingProductEvidenceError(
+                "Retained initial source conflicts with admitted authority."
+            )
+        return observation
 
     async def publish_source_observation(
         self,
@@ -3275,26 +3440,69 @@ class CodingProductRunner:
             result = await self.source_git_authority_validator(request.source.git_baseline)
             if result is not None:
                 raise TypeError("source_git_authority_validator must return None.")
-        except asyncio.CancelledError:
-            await self._append_state(
+        except asyncio.CancelledError as failure:
+            await self._append_failure_state(
                 request,
                 receipts,
                 artifact_ids,
                 CodingProductState.CANCELLED,
+                failure=failure,
                 reason_code="caller_cancelled",
             )
-            raise
         except Exception:
+            # Establish the sanitized failure as the active exception before
+            # publication, so its failure cannot inherit the raw validator as
+            # an implicitly rendered context.
+            try:
+                raise CodingProductAdmissionError(
+                    "Coding-product source Git authority changed after admission."
+                ) from None
+            except CodingProductAdmissionError as failure:
+                await self._append_failure_state(
+                    request,
+                    receipts,
+                    artifact_ids,
+                    CodingProductState.SOURCE_CONFLICT,
+                    failure=failure,
+                    reason_code="source_git_authority_mismatch",
+                )
+
+    async def _append_failure_state(
+        self,
+        request: CodingProductRequest,
+        receipts: list[CodingLifecycleReceipt],
+        artifact_ids: list[str],
+        state: CodingProductState,
+        *,
+        failure: BaseException,
+        reason_code: str,
+    ) -> NoReturn:
+        """Retain failure evidence without replacing the authoritative signal.
+
+        ArtifactStore still owns dispatched writes and uncertain settlement.
+        This boundary neither retries a write nor releases execution authority.
+        """
+
+        try:
             await self._append_state(
-                request,
-                receipts,
-                artifact_ids,
-                CodingProductState.SOURCE_CONFLICT,
-                reason_code="source_git_authority_mismatch",
+                request, receipts, artifact_ids, state, reason_code=reason_code
             )
-            raise CodingProductAdmissionError(
-                "Coding-product source Git authority changed after admission."
-            ) from None
+        except BaseException as publication_failure:
+            preserve_primary = isinstance(publication_failure, Exception) or (
+                isinstance(publication_failure, asyncio.CancelledError)
+                and not isinstance(failure, Exception)
+            )
+            authoritative = failure if preserve_primary else publication_failure
+            preceding = (
+                [exception_cause(failure), publication_failure]
+                if preserve_primary
+                else [failure, exception_cause(publication_failure)]
+            )
+            cause = failure_control_cause(
+                [error for error in preceding if error is not None], authoritative
+            )
+            raise authoritative from cause
+        raise failure from exception_cause(failure)
 
     async def _append_state(
         self,
@@ -3338,15 +3546,15 @@ class CodingProductRunner:
                 observer="cayu-coding-product-source",
                 limits=self.observation_limits,
             )
-        except asyncio.CancelledError:
-            await self._append_state(
+        except asyncio.CancelledError as failure:
+            await self._append_failure_state(
                 request,
                 receipts,
                 artifact_ids,
                 CodingProductState.CANCELLED,
+                failure=failure,
                 reason_code="caller_cancelled",
             )
-            raise
         if (
             observed.status is not WorkspaceRevisionObservationStatus.SUPPORTED
             or observed.path_scope != "complete"
@@ -3381,6 +3589,8 @@ class CodingProductRunner:
             or run_request.agent_name != request.agent_name
             or run_request.environment_name != request.runtime.environment_name
             or run_request.task_id not in {None, request.task.task_id}
+            or run_request.parent_session_id != request.parent_session_id
+            or run_request.causal_budget_id != request.causal_budget_id
             or session_input_messages_sha256(run_request.messages)
             != request.task.instruction_sha256.removeprefix("sha256:")
         ):
@@ -3462,17 +3672,9 @@ class CodingProductRunner:
                     raise CodingProductReconstructionRequiredError(
                         "Recovered coding-product result conflicts with current authority."
                     )
-                if latest.state in {
-                    CodingProductState.READY_TO_PUBLISH,
-                    CodingProductState.PUBLISHING,
-                }:
-                    await self._append_state(
-                        request,
-                        receipt_list,
-                        artifact_list,
-                        recovered.candidate.state,
-                        evidence_sha256="sha256:" + recovered.candidate.digest,
-                    )
+                await self._complete_publication_lifecycle(
+                    request, recovered, receipt_list, artifact_list
+                )
                 return recovered
         await self.repository.acquire_execution_claim(
             request,
@@ -3531,50 +3733,305 @@ class CodingProductRunner:
             receipt_list,
             artifact_list,
         )
+        initial_source = await self.repository.publish_source_observation(
+            session_id=request.session_id,
+            agent_name=request.agent_name,
+            environment_name=request.runtime.environment_name,
+            phase="initial",
+            observation=initial,
+        )
         await self._append_state(
             request,
             receipt_list,
             artifact_list,
             CodingProductState.ACTIVE,
-            evidence_sha256=initial.revision,
+            evidence_sha256=initial_source.artifact.sha256,
         )
 
         events: list[Event] = []
         event_bytes = 0
         try:
-            async for event in self.app.run(admitted_run_request):
-                copied = copy_event(event)
-                events.append(copied)
-                event_bytes += _event_bytes(copied)
-                if len(events) > request.settlement.max_events:
-                    raise ValueError("Coding-product event count exceeds the admitted bound.")
-                if event_bytes > request.settlement.max_event_bytes:
-                    raise ValueError("Coding-product event bytes exceed the admitted bound.")
-        except asyncio.CancelledError:
-            await self._append_state(
+            run_stream = cast("AsyncGenerator[Event, None]", self.app.run(admitted_run_request))
+            async with _close_delegated_event_stream(run_stream) as stream:
+                async for event in stream:
+                    copied = copy_event(event)
+                    events.append(copied)
+                    event_bytes += _event_bytes(copied)
+                    if len(events) > request.settlement.max_events:
+                        raise ValueError("Coding-product event count exceeds the admitted bound.")
+                    if event_bytes > request.settlement.max_event_bytes:
+                        raise ValueError("Coding-product event bytes exceed the admitted bound.")
+                    if copied.type is EventType.SESSION_STARTED:
+                        await self.repository._retain_execution_anchor(
+                            request,
+                            await self.app.session_invocation_for_dispatch(request.session_id),
+                            copied,
+                        )
+        except asyncio.CancelledError as failure:
+            await self._append_failure_state(
                 request,
                 receipt_list,
                 artifact_list,
                 CodingProductState.CANCELLED,
+                failure=failure,
                 reason_code="caller_cancelled",
             )
-            raise
-        except BaseException:
-            await self._append_state(
+        except BaseException as failure:
+            await self._append_failure_state(
                 request,
                 receipt_list,
                 artifact_list,
                 CodingProductState.FAILED,
+                failure=failure,
                 reason_code="session_execution_failed",
             )
-            raise
 
+        return await self._compile_and_publish(
+            request,
+            events,
+            initial=initial,
+            receipt_list=receipt_list,
+            artifact_list=artifact_list,
+            review_settlement=review_settlement,
+        )
+
+    async def recover_settled_execution(
+        self,
+        request: CodingProductRequest,
+        *,
+        review_settlement: CodingReviewSettlement | None = None,
+    ) -> CodingProductPublication:
+        """Publish an exact settled original invocation without executing it again.
+
+        Unfinished or resumed invocations require registered Runtime recovery;
+        this entrance does not grant continuation or clear the execution claim.
+        """
+
+        if type(request) is not CodingProductRequest:
+            raise TypeError("Recovery requires CodingProductRequest.")
+        request = CodingProductRequest.model_validate(
+            request.model_dump(mode="python", warnings=False)
+        )
+        initial = await self.repository.load_initial_source_observation(request)
+        if (
+            self.source_workspace.id != request.source.workspace_id
+            or self.observation_limits != request.source.observation_limits
+        ):
+            raise CodingProductAdmissionError("Recovery source conflicts with admitted authority.")
+        receipts, artifact_ids = await self.repository.load_lifecycle(
+            request.product_run_id,
+            session_id=request.session_id,
+            request_fingerprint=request.fingerprint,
+        )
+        latest = receipts[-1]
+        pending_index = self._pending_publication_index(receipts)
+        selected = latest if pending_index is None else receipts[pending_index]
+        if selected.state is not CodingProductState.ACTIVE and selected.evidence_sha256 is not None:
+            try:
+                publication = await self.repository.load_publication(
+                    request_fingerprint=request.fingerprint,
+                    digest=selected.evidence_sha256,
+                )
+            except FileNotFoundError:
+                if pending_index is None:
+                    raise
+            else:
+                await self._complete_publication_lifecycle(
+                    request, publication, list(receipts), list(artifact_ids)
+                )
+                return publication
+        binding = await self.app.session_invocation_for_dispatch(request.session_id)
+        anchor = await self.repository._load_execution_anchor(request)
+        if anchor.binding != binding:
+            raise CodingProductReconstructionRequiredError("Recovery session incarnation changed.")
+        snapshot = await self.app.session_store.load_session_export_snapshot(
+            binding.id,
+            limits=SessionExportLimits(
+                max_bytes=request.settlement.max_event_bytes,
+                max_record_bytes=min(
+                    request.settlement.max_event_bytes, CODING_PRODUCT_MAX_RESULT_BYTES
+                ),
+            ),
+        )
+        if type(snapshot) is not SessionExportSnapshot:
+            raise CodingProductReconstructionRequiredError(
+                "Recovery session snapshot is unavailable."
+            )
+        document = snapshot.document()
+        session = snapshot.session
+        expected_source = CodingProductSourceCopyAuthority(
+            request_fingerprint=request.fingerprint,
+            source_workspace_id=request.source.workspace_id,
+            baseline_revision=request.source.baseline_revision,
+            observation_limits=request.source.observation_limits,
+        )
+        if (
+            session.id != binding.id
+            or session.instance_id != binding.session_instance_id
+            or session.invocation != binding.invocation
+            or session.agent_name != request.agent_name
+            or session.parent_session_id != request.parent_session_id
+            or (
+                request.causal_budget_id is not None
+                and session.causal_budget_id != request.causal_budget_id
+            )
+            or session.environment_name != request.runtime.environment_name
+            or source_copy_authority_from_metadata(session.metadata) != expected_source
+            or session.status
+            not in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.INTERRUPTED}
+        ):
+            raise CodingProductReconstructionRequiredError(
+                "Recovery session authority is unsettled."
+            )
+        checkpoint = document["checkpoint"]
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        starts = [
+            record.event
+            for record in snapshot.events
+            if record.event.type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}
+        ]
+        if (
+            active is None
+            or active.profile.fingerprint
+            != request.runtime.execution_profile_fingerprint.removeprefix("sha256:")
+            or len(starts) != 1
+            or starts[0].type is not EventType.SESSION_STARTED
+            or starts[0].interaction_id != active.interaction_id
+            or type(starts[0].payload.get("run_epoch")) is not int
+            or starts[0].payload["run_epoch"] != anchor.run_epoch
+            or parse_session_input_contract_evidence(
+                starts[0].payload.get("input_contract")
+            ).messages_sha256
+            != request.task.instruction_sha256.removeprefix("sha256:")
+        ):
+            raise CodingProductReconstructionRequiredError("Recovery invocation is not exact.")
+        try:
+            require_invocation_rebind_lineage(
+                checkpoint,
+                session_instance_id=binding.session_instance_id,
+                original=active.model_copy(update={"run_epoch": anchor.run_epoch}),
+                current=active,
+            )
+            released_invocation_evidence(
+                session,
+                checkpoint,
+                session_id=binding.id,
+                session_instance_id=binding.session_instance_id,
+                active_profile=active,
+            )
+        except (RuntimeError, ValueError):
+            raise CodingProductReconstructionRequiredError(
+                "Recovery invocation lacks exact lineage or release evidence."
+            ) from None
+        events = tuple(
+            self.app._project_persisted_event_record_for_exposure(record).event
+            for record in snapshot.events
+        )
+        public_starts = [event for event in events if event.type is EventType.SESSION_STARTED]
+        if (
+            len(public_starts) != 1
+            or public_starts[0].id != anchor.start_event_id
+            or public_starts[0].interaction_id != anchor.interaction_id
+        ):
+            raise CodingProductReconstructionRequiredError("Recovery execution anchor changed.")
+        return await self._compile_and_publish(
+            request,
+            events,
+            initial=initial,
+            receipt_list=list(receipts),
+            artifact_list=list(artifact_ids),
+            review_settlement=review_settlement,
+        )
+
+    @staticmethod
+    def _pending_publication_index(receipts: Sequence[CodingLifecycleReceipt]) -> int | None:
+        """Identify an unfinished publication without discarding its selected digest."""
+        starts = [
+            index
+            for index, receipt in enumerate(receipts)
+            if receipt.state is CodingProductState.READY_TO_PUBLISH
+        ]
+        if len(starts) > 1:
+            raise CodingProductReconstructionRequiredError("Publication selection is ambiguous.")
+        # A cancellation or source conflict can be recorded while the final
+        # source checks are running, after READY_TO_PUBLISH/PUBLISHING has
+        # already selected a candidate.  Never treat that trailing receipt as
+        # permission to compile a replacement candidate from the full history.
+        if (
+            receipts[-1].state
+            in {
+                CodingProductState.CANCELLED,
+                CodingProductState.SOURCE_CONFLICT,
+            }
+            and starts
+            and receipts[-1].evidence_sha256 is None
+        ):
+            raise CodingProductReconstructionRequiredError(
+                "Publication selection is followed by an unreconciled terminal state."
+            )
+        if receipts[-1].state not in {
+            CodingProductState.READY_TO_PUBLISH,
+            CodingProductState.PUBLISHING,
+        } and not (
+            receipts[-1].state is CodingProductState.RECONSTRUCTION_REQUIRED
+            and receipts[-1].reason_code == "result_publication_unsettled"
+        ):
+            return None
+        if len(starts) != 1:
+            raise CodingProductReconstructionRequiredError("Publication selection is ambiguous.")
+        index = starts[0]
+        selected = receipts[index]
+        if selected.evidence_sha256 is None or any(
+            not (
+                receipt.state
+                in {CodingProductState.READY_TO_PUBLISH, CodingProductState.PUBLISHING}
+                and receipt.evidence_sha256 == selected.evidence_sha256
+            )
+            and not (
+                receipt.state is CodingProductState.RECONSTRUCTION_REQUIRED
+                and receipt.reason_code == "result_publication_unsettled"
+                and receipt.evidence_sha256 is None
+            )
+            for receipt in receipts[index:]
+        ):
+            raise CodingProductReconstructionRequiredError("Publication selection conflicts.")
+        return index
+
+    async def _complete_publication_lifecycle(
+        self,
+        request: CodingProductRequest,
+        publication: CodingProductPublication,
+        receipts: list[CodingLifecycleReceipt],
+        artifact_ids: list[str],
+    ) -> None:
+        if self._pending_publication_index(receipts) is not None:
+            await self._append_state(
+                request,
+                receipts,
+                artifact_ids,
+                publication.candidate.state,
+                evidence_sha256="sha256:" + publication.candidate.digest,
+            )
+
+    async def _compile_and_publish(
+        self,
+        request: CodingProductRequest,
+        events: Sequence[Event],
+        *,
+        initial: WorkspaceRevisionObservation,
+        receipt_list: list[CodingLifecycleReceipt],
+        artifact_list: list[str],
+        review_settlement: CodingReviewSettlement | None,
+    ) -> CodingProductPublication:
+        pending_index = self._pending_publication_index(receipt_list)
+        candidate_receipt_ids = (
+            artifact_list if pending_index is None else artifact_list[:pending_index]
+        )
         await self._require_source_git_authority(
             request,
             receipt_list,
             artifact_list,
         )
-
         final = await observe_deterministic_workspace(
             self.source_workspace,
             observer="cayu-coding-product-source",
@@ -3586,10 +4043,16 @@ class CodingProductRunner:
             initial_observation=initial,
             final_observation=final,
             repository=self.repository,
-            lifecycle_receipt_ids=tuple(artifact_list),
+            lifecycle_receipt_ids=tuple(candidate_receipt_ids),
             review_settlement=review_settlement,
             public_authority_alias_codec=(self.app.session_store.public_authority_alias_codec),
         )
+        if pending_index is not None and (
+            receipt_list[pending_index].evidence_sha256 != "sha256:" + candidate.digest
+        ):
+            raise CodingProductReconstructionRequiredError(
+                "Reconstructed candidate conflicts with the selected publication."
+            )
         decision = coding_product_completion_decision(
             request,
             candidate,
@@ -3612,20 +4075,22 @@ class CodingProductRunner:
             raise CodingProductEvidenceError(
                 "Patch-ready candidate did not satisfy its deterministic verifier."
             )
-        await self._append_state(
-            request,
-            receipt_list,
-            artifact_list,
-            CodingProductState.READY_TO_PUBLISH,
-            evidence_sha256="sha256:" + candidate.digest,
-        )
-        await self._append_state(
-            request,
-            receipt_list,
-            artifact_list,
-            CodingProductState.PUBLISHING,
-            evidence_sha256="sha256:" + candidate.digest,
-        )
+        if pending_index is None:
+            await self._append_state(
+                request,
+                receipt_list,
+                artifact_list,
+                CodingProductState.READY_TO_PUBLISH,
+                evidence_sha256="sha256:" + candidate.digest,
+            )
+        if receipt_list[-1].state is CodingProductState.READY_TO_PUBLISH:
+            await self._append_state(
+                request,
+                receipt_list,
+                artifact_list,
+                CodingProductState.PUBLISHING,
+                evidence_sha256="sha256:" + candidate.digest,
+            )
         if candidate.state is CodingProductState.PATCH_READY_FOR_DELIVERY:
             final_revision = candidate.final_revision
             if final_revision is None:
@@ -3668,9 +4133,15 @@ async def admit_coding_product_request(
     runtime: CodingRuntimeAuthority,
     settlement: CodingSettlementPolicy | None = None,
     observation_limits: WorkspaceRevisionObservationLimits | None = None,
+    parent_session_id: str | None = None,
+    causal_budget_id: str | None = None,
 ) -> CodingProductRequest:
     """Observe exact source authority and construct one immutable product request."""
 
+    if parent_session_id is not None:
+        parent_session_id = _validated_identifier(parent_session_id, "parent_session_id")
+    if causal_budget_id is not None:
+        causal_budget_id = _validated_identifier(causal_budget_id, "causal_budget_id")
     if not isinstance(source_workspace, Workspace):
         raise TypeError("source_workspace must implement Workspace.")
     if type(runtime) is not CodingRuntimeAuthority:
@@ -3717,6 +4188,8 @@ async def admit_coding_product_request(
         ),
         runtime=runtime,
         settlement=settlement or CodingSettlementPolicy(),
+        parent_session_id=parent_session_id,
+        causal_budget_id=causal_budget_id,
     )
 
 
@@ -3735,9 +4208,15 @@ async def admit_or_recover_coding_product_request(
     runtime: CodingRuntimeAuthority,
     settlement: CodingSettlementPolicy | None = None,
     observation_limits: WorkspaceRevisionObservationLimits | None = None,
+    parent_session_id: str | None = None,
+    causal_budget_id: str | None = None,
 ) -> CodingProductRequest:
     """Recover immutable admission authority or create and retain it exactly once."""
 
+    if parent_session_id is not None:
+        parent_session_id = _validated_identifier(parent_session_id, "parent_session_id")
+    if causal_budget_id is not None:
+        causal_budget_id = _validated_identifier(causal_budget_id, "causal_budget_id")
     if type(repository) is not CodingProductArtifactRepository:
         raise TypeError("repository must be CodingProductArtifactRepository.")
     selected_settlement = settlement or CodingSettlementPolicy()
@@ -3761,6 +4240,8 @@ async def admit_or_recover_coding_product_request(
             runtime=runtime,
             settlement=selected_settlement,
             observation_limits=selected_limits,
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
         )
         await repository.ensure_request(request)
         return request
@@ -3772,6 +4253,8 @@ async def admit_or_recover_coding_product_request(
         ) from None
     if (
         recovered.agent_name != agent_name
+        or recovered.parent_session_id != parent_session_id
+        or recovered.causal_budget_id != causal_budget_id
         or recovered.task.task_id != task_id
         or recovered.task.instruction_sha256.removeprefix("sha256:") != instruction_sha256
         or recovered.source.workspace_id != source_workspace.id

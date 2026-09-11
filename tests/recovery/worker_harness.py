@@ -88,6 +88,9 @@ class RecoveryScenario(StrEnum):
     TERMINAL_RACE = "terminal_race"
     TOOL_EFFECT = "tool_effect"
     FOREGROUND_SUBAGENT = "foreground_subagent"
+    CODING_PRODUCT = "coding_product"
+    MAINTENANCE_APPROVAL = "maintenance_approval"
+    MAINTENANCE_CODING = "maintenance_coding"
 
 
 class RecoveryAction(StrEnum):
@@ -108,6 +111,7 @@ class RecoveryAction(StrEnum):
 
 
 _SCENARIO_ACTIONS = {
+    RecoveryScenario.MAINTENANCE_CODING: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
     RecoveryScenario.MODEL: frozenset(
         {RecoveryAction.START, RecoveryAction.PLAN_MODEL_INTERRUPTED}
     ),
@@ -135,6 +139,10 @@ _SCENARIO_ACTIONS = {
     RecoveryScenario.TERMINAL_RACE: frozenset({RecoveryAction.RUN}),
     RecoveryScenario.TOOL_EFFECT: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
     RecoveryScenario.FOREGROUND_SUBAGENT: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
+    RecoveryScenario.CODING_PRODUCT: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
+    RecoveryScenario.MAINTENANCE_APPROVAL: frozenset(
+        {RecoveryAction.START, RecoveryAction.RECOVER}
+    ),
 }
 
 
@@ -277,16 +285,19 @@ class WorkerHandle:
 
 
 class RecoveryHarness:
-    def __init__(self, root: Path, backend: BackendConfig) -> None:
+    def __init__(self, root: Path, backend: BackendConfig, *, owns_backend: bool = True) -> None:
         self.root = root
         self.backend = backend
+        # Application integration fixtures retain and close their own stores.
+        # Process/control-file ownership always remains with this harness.
+        self.owns_backend = owns_backend
         self.marker_path = root / "side-effects.jsonl"
         self._workers: list[WorkerHandle] = []
         self._session_ids: set[str] = set()
         self._task_ids: set[str] = set()
 
     def __enter__(self) -> RecoveryHarness:
-        if self.backend.kind == "postgres":
+        if self.owns_backend and self.backend.kind == "postgres":
             if self.backend.dsn is None:
                 raise ValueError("Postgres backend requires dsn")
             asyncio.run(_reset_postgres_public_authority_registry(self.backend.dsn))
@@ -442,7 +453,7 @@ class RecoveryHarness:
             "stderr-*.log",
         ):
             paths.update(self.root.glob(pattern))
-        if self.backend.kind == "sqlite":
+        if self.owns_backend and self.backend.kind == "sqlite":
             for raw_path in (self.backend.session_path, self.backend.task_path):
                 if raw_path is None:
                     continue
@@ -457,7 +468,7 @@ class RecoveryHarness:
                 )
         for path in paths:
             path.unlink(missing_ok=True)
-        if self.backend.kind == "postgres":
+        if self.owns_backend and self.backend.kind == "postgres":
             asyncio.run(self._cleanup_postgres_rows())
 
     def _durable_diagnostics(self, config: dict[str, Any]) -> str:
@@ -1541,7 +1552,16 @@ async def _run_foreground_subagent(config: dict[str, Any]) -> dict[str, Any]:
     return await run_foreground_subagent_worker(config)
 
 
+async def _run_maintenance_approval(config: dict[str, Any]) -> dict[str, Any]:
+    from maintenance_approval_scenario import run_maintenance_approval
+
+    return await run_maintenance_approval(config)
+
+
 async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
+    from coding_product_scenario import run_coding_product
+    from maintenance_coding_scenario import run_maintenance_coding
+
     scenario = RecoveryScenario(config["scenario"])
     action = RecoveryAction(config["action"])
     if action not in _SCENARIO_ACTIONS[scenario]:
@@ -1555,6 +1575,9 @@ async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
         RecoveryScenario.TERMINAL_RACE: _run_terminal_race,
         RecoveryScenario.TOOL_EFFECT: _run_tool_effect,
         RecoveryScenario.FOREGROUND_SUBAGENT: _run_foreground_subagent,
+        RecoveryScenario.CODING_PRODUCT: run_coding_product,
+        RecoveryScenario.MAINTENANCE_APPROVAL: _run_maintenance_approval,
+        RecoveryScenario.MAINTENANCE_CODING: run_maintenance_coding,
     }
     return await handlers[scenario](config)
 

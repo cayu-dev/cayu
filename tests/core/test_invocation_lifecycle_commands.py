@@ -64,6 +64,7 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_checkpoint_state_sha256,
     prepare_rebind_invocation_command,
     released_invocation_evidence,
+    require_invocation_rebind_lineage,
     retire_released_invocation_context,
 )
 from cayu.runtime.budgets import BudgetPolicy
@@ -687,10 +688,31 @@ async def _assert_invocation_command_conformance(store, suffix: str) -> None:
     assert len(rebound_conflicts) == 1
     rebound = rebound_results[0]
     assert type(rebound) is InvocationMutationResult
+    assert isinstance(rebound, InvocationMutationResult)
     assert rebound.session.run_epoch == 3
     assert rebound.active_profile == rebound_profile
     rebound_checkpoint = await store.load_checkpoint(session_id)
     assert rebound_checkpoint is not None
+    require_invocation_rebind_lineage(
+        rebound_checkpoint,
+        session_instance_id=session_instance_id,
+        original=created.active_profile,
+        current=rebound.active_profile,
+    )
+    with pytest.raises(SessionRunFenced, match="conflicting authority"):
+        require_invocation_rebind_lineage(
+            rebound_checkpoint,
+            session_instance_id=str(uuid4()),
+            original=created.active_profile,
+            current=rebound.active_profile,
+        )
+    with pytest.raises(SessionRunFenced, match="unavailable"):
+        require_invocation_rebind_lineage(
+            {},
+            session_instance_id=session_instance_id,
+            original=created.active_profile,
+            current=rebound.active_profile,
+        )
     assert rebound_checkpoint["rebind-winner"] in (
         {"candidate": "first"},
         {"candidate": "second"},

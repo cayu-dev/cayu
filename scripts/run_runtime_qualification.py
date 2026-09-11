@@ -18,6 +18,7 @@ from pathlib import Path
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURES_RECIPE = "cayu.qualification-fixtures.v2"
 sys.path.insert(0, str(ROOT))
 from tests.qualification.postgres_cleanup import DATABASE_ENV, postgres_operation  # noqa: E402
 from tests.qualification.process_cleanup import (  # noqa: E402
@@ -47,6 +48,19 @@ assert p.origin.value != 'development_source_tree'
 print(json.dumps({'package': str(package), 'build': {
     'availability': p.availability.value, 'origin': p.origin.value, 'fingerprint': p.fingerprint}}))
 """
+
+
+def fixture_fingerprint(stage: Path) -> str:
+    """Bind all staged inputs, including non-Python assets consumed by emitters."""
+    files = [file for file in (stage / "tests").rglob("*") if file.is_file()]
+    files.extend((stage / "pyproject.toml", stage / "scripts" / Path(__file__).name))
+    digest = hashlib.sha256(FIXTURES_RECIPE.encode() + b"\0")
+    for file in sorted(files, key=lambda file: file.relative_to(stage).as_posix()):
+        relative = file.relative_to(stage).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(hashlib.sha256(file.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def run_bounded(command, *, cwd, env, timeout, cleanup=None):
@@ -247,13 +261,8 @@ def main():
                 sort_keys=True,
             ).encode()
             report["registry_sha256"] = hashlib.sha256(manifest).hexdigest()
-            fixture_hash = hashlib.sha256()
-            for file in sorted((stage / "tests").rglob("*.py")):
-                fixture_hash.update(str(file.relative_to(stage)).encode() + b"\0")
-                fixture_hash.update(file.read_bytes())
-            fixture_hash.update((stage / "pyproject.toml").read_bytes())
-            fixture_hash.update(Path(__file__).read_bytes())
-            report["fixtures_sha256"] = fixture_hash.hexdigest()
+            report["fixtures_recipe"] = FIXTURES_RECIPE
+            report["fixtures_sha256"] = fixture_fingerprint(stage)
             report["status"] = "running"
             write_report(args.report, report)
             scenarios = (

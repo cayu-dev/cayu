@@ -105,6 +105,93 @@ def test_worker_failure_reports_durable_state_and_cleans_control_artifacts(tmp_p
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("publication_phase", "managed_task"),
+    [
+        ("compile", False),
+        ("ready", False),
+        ("publish", False),
+        ("model", False),
+        pytest.param("compile", True, id="managed-compile"),
+        pytest.param("model", True, id="managed-model"),
+    ],
+)
+def test_sigkill_after_coding_session_settlement_recovers_product_without_redispatch(
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
+    publication_phase: str,
+    managed_task: bool,
+) -> None:
+    source = tmp_path / "coding-source"
+    source.mkdir()
+    (source / "example.py").write_text("value = 1\n", encoding="utf-8")
+    artifacts = tmp_path / "coding-artifacts"
+    controls = tmp_path / "controls"
+    controls.mkdir()
+    session_id = "coding-product-process-loss"
+    values = {
+        "product_run_id": "coding-product-process-loss",
+        "source_path": str(source),
+        "artifact_path": str(artifacts),
+        "publication_phase": publication_phase,
+        "managed_task": managed_task,
+        "task_id": "coding-process-task",
+    }
+    with RecoveryHarness(controls, recovery_backend) as harness:
+        original = harness.launch(
+            scenario="coding_product", action="start", session_id=session_id, **values
+        )
+        phase = original.wait_for_phase(
+            "model_request_dispatched" if publication_phase == "model" else "coding_session_settled"
+        )
+        before = asyncio.run(harness.load_session_state(session_id))
+        assert before.session is not None
+        assert before.session.status is (
+            SessionStatus.RUNNING if publication_phase == "model" else SessionStatus.COMPLETED
+        )
+        marker = harness.read_marker()
+        assert marker == [{"session_id": session_id, "operation": "provider_dispatch"}]
+        if managed_task:
+            claimed = asyncio.run(harness.load_task("coding-process-task"))
+            assert claimed is not None and claimed.status is TaskStatus.CLAIMED
+            assert claimed.worker_id == "coding-start" and claimed.session_id is None
+        original.sigkill()
+        replacement = harness.launch(
+            scenario="coding_product", action="recover", session_id=session_id, **values
+        )
+        result = replacement.wait_success()
+        assert result["state"] == (
+            "cancelled" if publication_phase == "model" else "reconstruction_required"
+        )
+        assert result["terminal_lifecycle_state"] == result["state"]
+        assert result["digest"] == result["replay_digest"]
+        if publication_phase in {"ready", "publish"}:
+            assert result["digest"] == phase["candidate_digest"]
+        assert result["session_id"] == session_id
+        assert result["initial_revision"] == result["final_revision"]
+        if managed_task:
+            terminal = asyncio.run(harness.load_task("coding-process-task"))
+            assert terminal is not None and terminal.status is TaskStatus.CANCELLED
+            assert terminal.worker_id is None and terminal.lease_expires_at is None
+            assert terminal.error == {"code": "task_worker_lease_expired_after_dispatch"}
+            assert terminal.status_payload is not None
+            assert terminal.model_dump(mode="json") == result["task"]
+        assert harness.read_marker() == marker
+        after = asyncio.run(harness.load_session_state(session_id))
+        assert after.session is not None
+        assert after.session.instance_id == before.session.instance_id
+        if publication_phase == "model":
+            assert after.session.status is SessionStatus.INTERRUPTED
+            assert result["recovery_receipt"]["items"][0]["status"] == "executed"
+            assert {event.id for event in before.events} <= {event.id for event in after.events}
+        else:
+            assert after.session.run_epoch == before.session.run_epoch
+            assert [event.id for event in after.events] == [event.id for event in before.events]
+    assert list(controls.iterdir()) == []
+    assert (source / "example.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert artifacts.is_dir()  # Durable product evidence is retained, not a leaked worker.
+
+
 @pytest.mark.parametrize("recovery_action", ["automatic", "manual"])
 def test_sigkill_during_ordinary_tool_execution_retains_unknown_effect_without_reexecution(
     tmp_path: Path,

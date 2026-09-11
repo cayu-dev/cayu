@@ -24,3 +24,7 @@ the installed distribution, and its package-shipped guides for task knowledge.
 The durable environment and deterministic receipts are recorded in
 `results/2026-08-30.md`. Each transcript includes the exact prompt, chronological
 commands and results, resulting source tree, and limits of the evidence.
+
+The additional [repository-maintenance contract](repository-maintenance.md) pins
+the repository-maintenance bug corpus and independent acceptance boundary. Its production journey
+is not yet qualified; the historical two-case results do not prove that journey.

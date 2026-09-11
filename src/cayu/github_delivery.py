@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+from math import isfinite
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 from urllib.parse import quote, urlsplit
@@ -2261,6 +2262,7 @@ def github_connector_behavior_fingerprint() -> str:
         "polling": "one-durable-observation-per-call-v1",
         "recovery": "durable-per-effect-intent-and-settlement-v3",
         "concurrency": "bounded-connector-run-single-flight-v1",
+        "lifecycle": "sealed-noncancelling-owner-and-artifact-drain-v1",
         "reviews": "exact-head-explicit-approver-settlement-v2",
         "artifacts": "consumer-validated-session-authority-v1",
         "merge": "forbidden-v1",
@@ -2468,6 +2470,53 @@ class GitHubPullRequestConnector:
         self._owners: dict[
             str, tuple[str, asyncio.Task, asyncio.Event, ArtifactWriteSettlementObserver]
         ] = {}
+        self._sealed = False
+
+    def seal(self) -> None:
+        """Reject new calls and stop subsequent effects in retained calls."""
+
+        self._sealed = True
+        for _, _, stopped, _ in self._owners.values():
+            stopped.set()
+
+    async def aclose(self, *, timeout_s: float = 30.0) -> bool:
+        """Seal and observe local quiescence without cancelling owned mutations.
+
+        False (or cancellation) requires retaining this connector and its loop;
+        a later call may observe settlement. True is not proof of remote success.
+        Shared transports and artifact stores are not closed by this method.
+        """
+
+        if type(timeout_s) not in (int, float):
+            raise ValueError("timeout_s must be a finite non-negative number.")
+        try:
+            timeout = float(timeout_s)
+        except OverflowError:
+            raise ValueError("timeout_s must be a finite non-negative number.") from None
+        if not isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout_s must be a finite non-negative number.")
+        self.seal()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            pending = []
+            for run_id, owned in tuple(self._owners.items()):
+                _, owner, _, observer = owned
+                if not owner.done():
+                    pending.append(owner)
+                elif not observer.record_active_candidates() and self._owners.get(run_id) is owned:
+                    del self._owners[run_id]
+            if not self._owners:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            if pending:
+                await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # Artifact callbacks may finish after their coroutine. They are
+                # thread-owned; never mistake a done task for their settlement.
+                await asyncio.sleep(min(remaining, 0.01))
 
     def _config(self, request):
         try:
@@ -2954,6 +3003,8 @@ class GitHubPullRequestConnector:
         *,
         approval: GitHubDeliveryApproval | None = None,
     ) -> GitHubDeliveryPublication:
+        if self._sealed:
+            raise GitHubDeliveryAdmissionError("GitHub connector is sealed.")
         if type(request) is not GitHubPullRequestDeliveryRequest:
             raise TypeError("request must be GitHubPullRequestDeliveryRequest.")
         identity = request.fingerprint + ("" if approval is None else approval.fingerprint)

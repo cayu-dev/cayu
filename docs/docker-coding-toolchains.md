@@ -85,6 +85,14 @@ strict Docker runner to re-inspect the same container ID and repeat live
 restriction, immutable-input, and executable probes before it evaluates the
 fresh candidate. Named checks and structured commands repeat that validation
 defensively; those downstream checks do not authorize an unexposed runner.
+
+Pass `artifact_store=store` to `DockerCodingEnvironmentFactory` when tools need
+durable artifacts, including complete named-check output. The same host-side store
+is exposed on created and reconnected environments; it is not mounted into the
+guest, closed, or deleted by factory cleanup. Its stable ID participates in the
+factory configuration identity. Register that same store with
+`app.register_environment_factory(..., artifact_store=store)` for inventory and
+prompt attachments; registration alone does not attach it to factory results.
 Concurrent renewals share one probe pass; fresh evidence needs no additional
 Docker calls. Renewal preserves image, toolchain profile, and environment
 identity, and never extends an old observation's lifetime. Invocation-scoped

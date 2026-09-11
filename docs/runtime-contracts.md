@@ -10097,6 +10097,18 @@ operational meaning and are not mapped to `not_found`.
 
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
 
+`SubagentTool.background_task_registry` exposes the existing process-local owner
+of background child streams. `BackgroundSubagentTaskRegistry.drain(timeout_s=...)`
+boundedly observes all tasks in that registry, including work registered while
+earlier children finish. It never cancels child tasks when its wait times out or
+the caller is cancelled; owners remain retained for a later drain. `True` means
+the streams have settled, not that they succeeded or their remote effects and
+environment cleanup are settled. Stop external dispatch before using it for
+shutdown, then run the application's remaining cleanup drains before closing
+shared dependencies. This is not a registration seal. The default registry can
+span applications; an explicitly supplied registry keeps the host's ownership
+scope separate. Durable queued subagents retain their task-worker recovery owner.
+
 Default built-in tool caps are intentionally large enough for normal coding work but small enough to protect model context and runtime memory:
 
 - `read_file`: 256 KB by default, 4 MB maximum per call

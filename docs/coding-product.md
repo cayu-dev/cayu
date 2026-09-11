@@ -39,6 +39,29 @@ door. Its async `run(CodingProductTask(...))` method returns a
 `CodingProductPublication` whose candidate contains the terminal product state
 and bounded evidence references.
 
+The generated `build_app()` and `build_coding_product_application()` accept
+`budget_policy` and `budget_ledger` and pass them to `CayuApp`. The ledger remains
+caller-owned. For shared reservation enforcement, supply the same durable ledger,
+session history and pinned app-level policy to every participating worker; the
+default ledger is in-memory. Supplying these dependencies does not establish live
+pricing or provider token bounds by itself.
+
+For shutdown, stop top-level dispatch before observing background reviewers. A
+registered `SubagentTool` exposes `background_task_registry`; its bounded `drain()`
+waits for child streams without cancelling them. The generated composition uses a
+separate registry per app. A false result leaves work owned and dependencies must
+remain available. After streams settle, the app's other cleanup drains are still
+required before closing provider transports or stores; registry settlement alone
+does not establish remote-effect or environment cleanup.
+
+`await application.inspect_execution_profile(task)` inspects the exact runtime
+request shape used by `run()` without creating a session or product admission or
+dispatching work. It delegates Cayu's read-only run preflights and reflects the
+current runtime controls, including budget-policy identity. This fingerprint is
+not source verification, authentication, or delivery approval. Execution still
+reconstructs and validates current authority; retain and compare the expected
+fingerprint when binding an application-owned accepted request.
+
 Use stable, caller-owned `product_run_id`, `session_id`, and `task_id` values.
 Reconstructing the application with the same IDs and the same admitted source
 and runtime authority recovers an already published result instead of blindly
@@ -54,6 +77,8 @@ Admission observes a complete bounded source manifest and binds:
   package stores, caches, build outputs, and the application-owned
   `docker-coding-image.json` authority receipt before copy-in or copy-back;
 - task identity and the digest of the exact input messages;
+- explicit parent-session and causal-budget IDs, when supplied; these are bound
+  into admission and replay, not inferred from an enclosing Python workflow;
 - Docker image, toolchain profile, dependency inputs, and no-network boundary;
 - the exact Cayu execution-profile fingerprint for the requested run;
 - tool-manifest, tool-policy, approval-policy, and redaction identities; and
@@ -151,8 +176,8 @@ runner records ready-to-publish and publishing receipts bound to the exact
 candidate digest. If the result artifact becomes durable before its final
 lifecycle receipt, retry reconstructs and returns that exact result without
 dispatching the session again. An active or ambiguous prior attempt is not
-silently replayed: the runner requires evidence reconstruction. Before any new
-lifecycle mutation or session dispatch, the runner atomically creates one
+silently replayed: the runner requires evidence reconstruction. Before initial
+execution lifecycle mutation or session dispatch, the runner atomically creates one
 deterministic execution-claim artifact. This is a compare-and-swap boundary:
 among concurrent callers for the same product run, one wins and every loser
 fails without modifying the winner's lifecycle. If the source baseline changed
@@ -161,6 +186,33 @@ dependency authority drifted, the toolchain must be rebuilt and explicitly
 readopted. Dependency-sensitive checks verify the exact inputs both before
 dispatch and after the runner is quiescent, so a repository check cannot modify
 its own toolchain authority and retain a passing result.
+
+`CodingProductRunner.recover_settled_execution(request)` reconstructs product
+publication for the exact original invocation after that invocation has settled.
+It checks the retained initial source observation, original session incarnation
+and invocation anchor, a consistent durable event snapshot, and Runtime's
+invocation-release evidence. It does not dispatch a provider or remove the
+execution claim. Cleanup may advance the run epoch: retained Runtime rebind
+receipts must prove the unchanged invocation identity and profile across those
+advances. Missing lineage remains reconstruction-required; identical values in a
+new admission do not substitute for that proof.
+A missing result after `ready_to_publish` or `publishing` is
+recompiled with the original lifecycle prefix and must match the already-selected
+candidate digest; changed evidence cannot select a replacement candidate. An
+ordinary retry's `result_publication_unsettled` diagnostic does not discard that
+selection. Malformed published evidence is rejected rather than overwritten.
+
+This entrance does not resume unfinished work or accept a later resumed or
+recreated invocation as the original execution. It can reconstruct a non-success
+result and does not manufacture Docker publication or check evidence. A recovered
+result is historical evidence, not permission to execute or deliver; delivery
+retains its separate current-source and destination checks.
+
+Generated `CodingProductApplication` exposes this as `recover_settled(task)`.
+Reconstruct the application with the same persistent stores and pass the original
+`CodingProductTask`. Missing admission and changed task/runtime authority fail
+instead of starting a new run. The workflow delegates reconstruction to Runtime;
+it does not parse checkpoints or create its own recovery owner.
 
 ## Extending the product
 

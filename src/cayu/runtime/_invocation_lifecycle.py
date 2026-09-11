@@ -2449,6 +2449,69 @@ def require_released_invocation_command_authority(
     )
 
 
+def require_invocation_rebind_lineage(
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_instance_id: str,
+    original: ActiveInvocationExecutionProfile,
+    current: ActiveInvocationExecutionProfile,
+) -> None:
+    """Prove cleanup-only epoch transfers from retained store-owned receipts.
+
+    Rebinding preserves an invocation's complete profile and interaction. A new
+    admission is not a rebind, even if it happens to use identical values.
+    """
+
+    if (
+        current.session_id != original.session_id
+        or current.interaction_id != original.interaction_id
+        or current.profile != original.profile
+        or current.run_epoch < original.run_epoch
+    ):
+        raise SessionRunFenced("Invocation rebind lineage conflicts with its origin.")
+    if current.run_epoch == original.run_epoch:
+        return
+    ledger = _invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
+    relevant = [
+        receipt
+        for receipt in ledger.receipts
+        if original.run_epoch <= receipt.active_profile.run_epoch <= current.run_epoch
+    ]
+    if any(
+        receipt.session_id != original.session_id
+        or receipt.session_instance_id != session_instance_id
+        or receipt.active_profile.interaction_id != original.interaction_id
+        or receipt.active_profile.profile != original.profile
+        for receipt in relevant
+    ):
+        raise SessionRunFenced("Invocation rebind lineage contains conflicting authority.")
+    transfers = sorted(
+        (
+            receipt
+            for receipt in relevant
+            if receipt.kind is not InvocationLifecycleCommandKind.RELEASE
+            and receipt.active_profile.run_epoch > original.run_epoch
+        ),
+        key=lambda receipt: receipt.active_profile.run_epoch,
+    )
+    epoch = original.run_epoch
+    for receipt in transfers:
+        target = receipt.active_profile.run_epoch
+        released = any(
+            prior.kind is InvocationLifecycleCommandKind.RELEASE
+            and prior.active_profile.run_epoch == epoch
+            and prior.result_session.run_epoch == target - 1
+            for prior in relevant
+        )
+        if receipt.kind is not InvocationLifecycleCommandKind.REBIND or not (
+            target == epoch + 1 or (target == epoch + 2 and released)
+        ):
+            raise SessionRunFenced("Invocation rebind lineage is incomplete.")
+        epoch = target
+    if epoch != current.run_epoch:
+        raise SessionRunFenced("Invocation rebind lineage is unavailable.")
+
+
 def released_invocation_evidence(
     session: Session,
     checkpoint: dict[str, Any] | None,

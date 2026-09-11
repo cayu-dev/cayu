@@ -234,6 +234,8 @@ from cayu import (
     ApplyPatchTool,
     ArtifactStore,
     BackgroundSubagentTaskRegistry,
+    BudgetLedger,
+    BudgetPolicy,
     CayuApp,
     CodingGitBaselineAuthority,
     DeleteFileTool,
@@ -1246,6 +1248,8 @@ def build_coding_app(
     workspace_root: str | os.PathLike[str] | None = None,
     artifact_store: ArtifactStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
+    budget_policy: BudgetPolicy | None = None,
+    budget_ledger: BudgetLedger | None = None,
 ) -> CayuApp:
     """Build one fresh, process-scoped coding composition."""
 
@@ -1304,6 +1308,8 @@ def build_coding_app(
         knowledge_store=selected_knowledge_store,
         knowledge_access_scope=selected_scope,
         knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -1849,6 +1855,8 @@ _APP_BUILD = '''def build_app(
     workspace_root=None,
     artifact_store=None,
     knowledge_store=None,
+    budget_policy=None,
+    budget_ledger=None,
 ) -> CayuApp:
     """Construct the explicit coding composition for one process."""
 
@@ -1863,6 +1871,8 @@ _APP_BUILD = '''def build_app(
         workspace_root=workspace_root,
         artifact_store=artifact_store,
         knowledge_store=knowledge_store,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
     )
 '''
 
@@ -2029,6 +2039,8 @@ class CodingProductTask:
     source_destination_id: str = "local-working-tree"
     settlement: CodingSettlementPolicy | None = None
     review_settlement: CodingReviewSettlement | None = None
+    parent_session_id: str | None = None
+    causal_budget_id: str | None = None
 '''
 
 
@@ -2047,6 +2059,7 @@ from cayu import (
     CodingGitBaselineAuthority,
     CodingProductArtifactRepository,
     CodingProductPublication,
+    CodingProductRequest,
     CodingProductRunner,
     CodingRuntimeAuthority,
     CodingSettlementPolicy,
@@ -2109,15 +2122,43 @@ class CodingProductApplication:
     async def run(self, task: CodingProductTask) -> CodingProductPublication:
         """Run or recover one stable product identity without external delivery."""
 
+        runner, request, run_request = await self._prepare(task, require_existing=False)
+        return await runner.run(request, run_request, review_settlement=task.review_settlement)
+
+    async def recover_settled(self, task: CodingProductTask) -> CodingProductPublication:
+        """Reconstruct settled execution; never dispatch or resume the session."""
+
+        runner, request, _ = await self._prepare(task, require_existing=True)
+        return await runner.recover_settled_execution(
+            request,
+            review_settlement=task.review_settlement,
+        )
+
+    def _build_run_request(self, task: CodingProductTask) -> RunRequest:
         if type(task) is not CodingProductTask:
             raise TypeError("task must be CodingProductTask.")
         messages = [Message.text("user", task.instruction)]
-        run_request = RunRequest(
+        return RunRequest(
             agent_name=self.agent_name,
             messages=messages,
             session_id=task.session_id,
             environment_name="coding",
+            parent_session_id=task.parent_session_id,
+            causal_budget_id=task.causal_budget_id,
         )
+
+    async def inspect_execution_profile(self, task: CodingProductTask) -> str:
+        """Inspect exact runtime controls without product admission or dispatch."""
+        return await self.app.inspect_run_execution_profile(self._build_run_request(task))
+
+    async def _prepare(
+        self,
+        task: CodingProductTask,
+        *,
+        require_existing: bool,
+    ) -> tuple[CodingProductRunner, CodingProductRequest, RunRequest]:
+        run_request = self._build_run_request(task)
+        messages = run_request.messages
         execution_profile = await self.app.inspect_run_execution_profile(run_request)
         primary = self.app.get_agent(self.agent_name)
         tool_manifest = [
@@ -2170,6 +2211,8 @@ class CodingProductApplication:
                 session_id=task.session_id,
             )
         except FileNotFoundError:
+            if require_existing:
+                raise
             source_git_baseline = await asyncio.to_thread(
                 observe_clean_coding_product_git_baseline,
                 self.project_root,
@@ -2183,6 +2226,8 @@ class CodingProductApplication:
             agent_name=self.agent_name,
             task_id=task.task_id,
             messages=messages,
+            parent_session_id=task.parent_session_id,
+            causal_budget_id=task.causal_budget_id,
             source_workspace=self.source_workspace,
             source_origin_id=task.source_origin_id,
             source_destination_id=task.source_destination_id,
@@ -2201,16 +2246,13 @@ class CodingProductApplication:
         if request.fingerprint not in self._registered_contracts:
             await register_coding_product_contract(self.app, request, repository)
             self._registered_contracts.add(request.fingerprint)
-        return await CodingProductRunner(
+        runner = CodingProductRunner(
             self.app,
             source_workspace=self.source_workspace,
             repository=repository,
             source_git_authority_validator=self._validate_source_git_authority,
-        ).run(
-            request,
-            run_request,
-            review_settlement=task.review_settlement,
         )
+        return runner, request, run_request
 '''
 
 
@@ -2386,6 +2428,13 @@ The application orchestration order is explicit:
 5. call `GitHubPullRequestConnector.run(...)` once per durable observation; and
 6. schedule the same request again only when `next_poll_after_seconds` is set.
 
+Retain the connector and its event loop after a caller timeout or cancellation:
+opaque dispatched work may still be settling. For shutdown, seal new dispatch
+with `connector.seal()` and await `connector.aclose(timeout_s=30)`. A false result
+means ownership must remain fenced; observe settlement with a later close call.
+Do not release a task or construct a replacement connector on that evidence.
+A true close result proves local quiescence, not successful remote delivery.
+
 Read `checks_state`, `review_state`, and the pull-request snapshot independently.
 When policy permits follow-up, select retained provider IDs through
 `github_follow_up_coding_input(...)`; its output is untrusted task input for a
@@ -2459,6 +2508,8 @@ _DOCKER_APP_BUILD = '''def build_app(
     workspace_root=None,
     artifact_store=None,
     knowledge_store=None,
+    budget_policy=None,
+    budget_ledger=None,
 ) -> CayuApp:
     """Construct the explicit trusted-repository Docker composition."""
 
@@ -2473,6 +2524,8 @@ _DOCKER_APP_BUILD = '''def build_app(
         workspace_root=workspace_root,
         artifact_store=artifact_store,
         knowledge_store=knowledge_store,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
     )
 
 
@@ -2484,6 +2537,8 @@ def build_coding_product_application(
     workspace_root=None,
     artifact_store=None,
     knowledge_store=None,
+    budget_policy=None,
+    budget_ledger=None,
 ) -> CodingProductApplication:
     """Construct the maintained patch-ready coding-product front door."""
 
@@ -2498,6 +2553,8 @@ def build_coding_product_application(
         workspace_root=workspace_root,
         artifact_store=artifact_store,
         knowledge_store=knowledge_store,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
     )
     return CodingProductApplication(
         composition.app,
@@ -3486,6 +3543,8 @@ def build_coding_composition(
     workspace_root: str | os.PathLike[str] | None = None,
     artifact_store: ArtifactStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
+    budget_policy: BudgetPolicy | None = None,
+    budget_ledger: BudgetLedger | None = None,
 ) -> CodingComposition:
     """Build one fresh process-scoped trusted-repository Docker composition."""
 
@@ -3579,6 +3638,7 @@ def build_coding_composition(
     factory = DockerCodingEnvironmentFactory(
         source_workspace=source_workspace,
         toolchain_profile=toolchain_profile,
+        artifact_store=selected_artifact_store,
         transfer_limits=DockerWorkspaceTransferLimits(
             max_files=10_000,
             max_file_bytes=8 * 1024 * 1024,
@@ -3597,6 +3657,8 @@ def build_coding_composition(
         knowledge_store=selected_knowledge_store,
         knowledge_access_scope=selected_scope,
         knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -3736,6 +3798,8 @@ def build_coding_app(
     workspace_root: str | os.PathLike[str] | None = None,
     artifact_store: ArtifactStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
+    budget_policy: BudgetPolicy | None = None,
+    budget_ledger: BudgetLedger | None = None,
 ) -> CayuApp:
     """Build the ordinary Cayu application without the product convenience layer."""
 
@@ -3750,6 +3814,8 @@ def build_coding_app(
         workspace_root=workspace_root,
         artifact_store=artifact_store,
         knowledge_store=knowledge_store,
+        budget_policy=budget_policy,
+        budget_ledger=budget_ledger,
     ).app
 '''
 
@@ -3770,8 +3836,23 @@ authority before dispatch. The workflow validates Git control state again after
 execution and immediately before patch-ready publication, then retains lifecycle,
 check, mutation, Git diff, copy-back, review, and final source evidence in the
 configured artifact store.
+Use `await application.inspect_execution_profile(task)` for the same runtime
+request preflight without session creation, product admission, or dispatch.
+It describes current runtime controls, not source verification or delivery
+approval; execution still validates current authority independently.
 Keep the same product, session, and task IDs when reconstructing the application
-to recover a settled result. Use new IDs for a new attempt.
+to recover a settled result. Call `await application.recover_settled(task)` with
+the original task and the same configured persistent stores after execution has
+settled but product publication was interrupted. This method requires an existing
+admission, validates the task and runtime authority, and never dispatches or
+resumes a session. It can return a truthful non-success result; recovery does not
+make missing checks or source-publication evidence pass. Unfinished execution
+requires registered Runtime recovery separately. Use new IDs for a new attempt.
+Before shutdown, stop top-level dispatch and observe registered background
+reviewers through the subagent tool's public `background_task_registry.drain()`.
+The generated app has its own registry. Timeout or caller cancellation does not
+cancel child streams; keep their dependencies available. Once streams settle,
+the app's remaining cleanup drains still apply before closing providers/stores.
 Application-owned environment adapters must construct their request-bound copy
 seam with `DockerCodingEnvironmentFactory.create_workspace_binding(...)`; do
 not parse private Cayu metadata or import `cayu._*` modules.
@@ -4643,6 +4724,7 @@ def _install_fake_docker_factory(
                 execution_profile_identity=factory.execution_profile_identity,
             ),
             workspace=factory.source_workspace,
+            artifact_store=factory.configured_artifact_store,
             runner=runner,
             binding=binding,
         )

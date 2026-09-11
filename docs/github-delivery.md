@@ -118,6 +118,18 @@ keep the connector and its event loop alive while owners drain; replacing a live
 owner is not crash recovery. Durable effect intents support recovery after an
 actual process restart without blindly repeating uncertain writes.
 
+For shutdown, `connector.seal()` synchronously rejects new calls and prevents
+further provider effects after already-dispatched work returns.
+`await connector.aclose(timeout_s=30)` seals and waits within the given finite,
+non-negative budget for both retained coroutines and registered artifact writes.
+It never cancels those mutations or closes shared transport/store dependencies.
+`True` proves local quiescence only; durable delivery state still determines
+remote success or uncertainty. `False`, or cancellation of the close waiter,
+requires keeping the connector and event loop alive and ownership fenced; call
+`aclose` again to observe eventual settlement. A sealed connector cannot dispatch
+again. A worker must not treat a returned delivery timeout or `False` close result
+as permission to release its task or start a replacement owner.
+
 Transport failures cross a bounded, content-free diagnostic boundary, including
 response-close failures. Process-control signals remain catchable by their
 ordinary Python handlers; background ownership does not turn them into an
