@@ -100,6 +100,9 @@ def test_cleanup_diagnostics_preserve_cancellation(failure, reason, exception_ty
             "cleanup_cause_type",
             "cleanup_cause_message",
             "cleanup_local_stack",
+            "cleanup_failure_phase",
+            "cleanup_close_exception_type",
+            "cleanup_close_exception_message",
         }
         assert tuple(
             {k: v for k, v in failure.items() if k not in extended} for failure in failures
@@ -581,3 +584,136 @@ def test_cleanup_stack_matches_native_provider_paths(monkeypatch, path_style, lo
     else:
         assert "cleanup_local_stack" not in fields
     assert diagnostics.copy_cleanup_diagnostics(fields) == fields
+
+
+@pytest.mark.parametrize(
+    "read_kind,close_fails,phase,reason,close_state",
+    [
+        ("failed", False, "read", "read_exception", "confirmed"),
+        ("cancelled", True, "close", "close_exception", "not_confirmed"),
+        ("failed", True, "read_and_close", "read_and_close_exception", "not_confirmed"),
+        ("suppressed", False, "read", "read_exception", "confirmed"),
+    ],
+)
+def test_interrupted_read_and_close_failures_are_distinct(
+    read_kind, close_fails, phase, reason, close_state
+):
+    async def scenario():
+        read = asyncio.get_running_loop().create_future()
+        if read_kind == "failed":
+            read.set_exception(httpx.ReadError(CANARY))
+        elif read_kind == "suppressed":
+            read.set_result(None)
+        else:
+            read.cancel()
+        stream = InjectedStream(httpx.CloseError(CANARY) if close_fails else None)
+        retained = []
+
+        async def consume():
+            async with aclosing_provider_stream(
+                stream,
+                pending_read=lambda: read,
+                retain_cleanup=retained.append,
+                cancellation_grace_s=1,
+            ):
+                await anext(stream)
+
+        task = asyncio.create_task(consume())
+        await stream.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert task.cancelling() == 1
+        assert stream.close_calls == 1
+        assert len(retained) == 1 and retained[0].done()
+        (fields,) = provider_cancellation_failures(raised.value)
+        assert fields["cleanup_failure_phase"] == phase
+        assert fields["cleanup_reason"] == reason
+        assert fields["stream_close_state"] == close_state
+        if read_kind != "cancelled":
+            assert fields["cleanup_read_exception_type"] == (
+                "ReadError" if read_kind == "failed" else "RuntimeError"
+            )
+            assert fields["cleanup_read_exception_message"] == "redacted"
+        else:
+            assert "cleanup_read_exception_type" not in fields
+        if close_fails:
+            assert fields["cleanup_close_exception_type"] == "CloseError"
+            assert fields["cleanup_close_exception_message"] == "redacted"
+        else:
+            assert "cleanup_close_exception_type" not in fields
+        assert fields["remote_cancellation_state"] == "unknown"
+        assert fields["remote_settlement_state"] == "unknown"
+        assert CANARY not in json.dumps(fields)
+        assert copy_provider_cancellation_failures(json.loads(json.dumps([fields]))) == (fields,)
+
+    asyncio.run(scenario())
+
+
+def test_failed_read_with_pending_close_keeps_local_settlement_unknown():
+    async def scenario():
+        read = asyncio.get_running_loop().create_future()
+        read.set_exception(httpx.ReadError(CANARY))
+        closing = asyncio.Event()
+        release = asyncio.Event()
+        retained = []
+
+        class Stream(InjectedStream):
+            async def aclose(self):
+                self.close_calls += 1
+                closing.set()
+                await release.wait()
+
+        stream = Stream(None)
+
+        async def consume():
+            async with aclosing_provider_stream(
+                stream,
+                pending_read=lambda: read,
+                retain_cleanup=retained.append,
+                cancellation_grace_s=1,
+            ):
+                await anext(stream)
+
+        task = asyncio.create_task(consume())
+        await stream.started.wait()
+        task.cancel()
+        await closing.wait()
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+            (fields,) = provider_cancellation_failures(raised.value)
+            assert fields["cleanup_failure_phase"] == "read"
+            assert fields["cleanup_read_exception_type"] == "ReadError"
+            assert fields["stream_close_state"] == "pending"
+            assert "cleanup_close_exception_type" not in fields
+            assert fields["remote_settlement_state"] == "unknown"
+            assert not retained[0].done()
+        finally:
+            release.set()
+            await retained[0]
+        assert stream.close_calls == 1
+        # Later close completion must not mutate an already published snapshot.
+        assert fields["stream_close_state"] == "pending"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("cleanup_failure_phase", CANARY),
+        ("cleanup_read_exception_type", CANARY),
+        ("cleanup_close_exception_type", []),
+        ("cleanup_read_exception_message", CANARY),
+        ("cleanup_close_exception_message", {}),
+    ],
+)
+def test_read_close_evidence_is_revalidated(name, value):
+    from cayu.providers._cleanup_diagnostics import cleanup_diagnostics, copy_cleanup_diagnostics
+
+    fields = cleanup_diagnostics(RuntimeError(CANARY), unsettled=False, action="stream_close")
+    fields[name] = value
+    with pytest.raises(ValueError):
+        copy_cleanup_diagnostics(fields)

@@ -37,13 +37,15 @@ _ENUM_FIELDS = {
     "cleanup_action": {"stream_close", "stream_close_lookup", "unknown"},
     "cleanup_reason": {
         "close_exception",
+        "read_exception",
+        "read_and_close_exception",
         "cleanup_timeout",
         "cleanup_cancelled",
         "cleanup_pending",
         "unknown_exception",
     },
     "cleanup_exception_type": {"unknown", *(name for _, name in _EXCEPTION_TYPES)},
-    "stream_close_state": {"not_confirmed", "pending"},
+    "stream_close_state": {"confirmed", "not_confirmed", "pending"},
     "remote_cancellation_state": {"unknown"},
     "remote_settlement_state": {"unknown"},
 }
@@ -58,6 +60,11 @@ _OPTIONAL_FIELDS = {
     "cleanup_cause_type",
     "cleanup_cause_message",
     "cleanup_local_stack",
+    "cleanup_failure_phase",
+    "cleanup_read_exception_type",
+    "cleanup_read_exception_message",
+    "cleanup_close_exception_type",
+    "cleanup_close_exception_message",
 }
 MAX_CLEANUP_DIAGNOSTIC_FIELDS = len(_REQUIRED_FIELDS | _OPTIONAL_FIELDS)
 _PROVIDER_CODES = {
@@ -208,7 +215,23 @@ def copy_cleanup_diagnostics(fields: dict[str, Any]) -> dict[str, Any]:
         code = fields["cleanup_error_code"]
         if type(code) is not str or provider is None or code not in _PROVIDER_CODES[provider]:
             raise ValueError("Provider cleanup code is invalid.")
-    for name in ("cleanup_exception_message", "cleanup_cause_message"):
+    if "cleanup_failure_phase" in fields and (
+        type(fields["cleanup_failure_phase"]) is not str
+        or fields["cleanup_failure_phase"] not in {"read", "close", "read_and_close"}
+    ):
+        raise ValueError("Provider cleanup failure phase is invalid.")
+    for name in ("cleanup_read_exception_type", "cleanup_close_exception_type"):
+        if name in fields and (
+            type(fields[name]) is not str
+            or fields[name] not in _ENUM_FIELDS["cleanup_exception_type"]
+        ):
+            raise ValueError("Provider cleanup phase exception type is invalid.")
+    for name in (
+        "cleanup_exception_message",
+        "cleanup_cause_message",
+        "cleanup_read_exception_message",
+        "cleanup_close_exception_message",
+    ):
         if name in fields and (
             type(fields[name]) is not str or fields[name] not in {*_SAFE_MESSAGES, "redacted"}
         ):

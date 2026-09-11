@@ -493,6 +493,7 @@ def _contains_fatal_signal(failure: BaseException) -> bool:
 async def _close_after_provider_read(
     close: Callable[[], Awaitable[None]] | None,
     read: asyncio.Future[Any] | None,
+    evidence: dict[str, Any],
 ) -> None:
     """Join an interrupted read before closing its iterator, preserving both failures."""
 
@@ -512,16 +513,33 @@ async def _close_after_provider_read(
             read_failure = read.exception()
             if read_failure is None:
                 read_failure = RuntimeError("Provider read suppressed cancellation")
+    if read_failure is not None:
+        fields = cleanup_diagnostics(read_failure, unsettled=False, action="stream_close")
+        evidence.update(
+            cleanup_failure_phase="read",
+            cleanup_read_exception_type=fields["cleanup_exception_type"],
+            cleanup_read_exception_message=fields["cleanup_exception_message"],
+        )
     try:
         if close is not None:
             await close()
     except BaseException as close_failure:
+        fields = cleanup_diagnostics(close_failure, unsettled=False, action="stream_close")
+        evidence.update(
+            cleanup_failure_phase="close" if read_failure is None else "read_and_close",
+            cleanup_close_exception_type=fields["cleanup_exception_type"],
+            cleanup_close_exception_message=fields["cleanup_exception_message"],
+        )
         if read_failure is not None:
+            evidence["cleanup_reason"] = "read_and_close_exception"
             raise BaseExceptionGroup(
                 "Provider read and close failed", [read_failure, close_failure]
             ) from None
         raise
+    if close is not None:
+        evidence["stream_close_state"] = "confirmed"
     if read_failure is not None:
+        evidence["cleanup_reason"] = "read_exception"
         raise read_failure
 
 
@@ -608,6 +626,7 @@ async def aclosing_provider_stream(
     cleanup_unsettled = False
     cleanup_task_tracked = False
     cleanup_action = "stream_close_lookup"
+    cleanup_evidence: dict[str, Any] = {}
     closing: GeneratorExit | None = None
     task = asyncio.current_task()
     if cancellation_baseline is None:
@@ -648,12 +667,14 @@ async def aclosing_provider_stream(
                     cast("Callable[[], Awaitable[None]]", close) if callable(close) else None
                 )
                 if cleanup_ownership is None and read is None:
-                    await _close_after_provider_read(close_operation, read)
+                    await _close_after_provider_read(close_operation, read, cleanup_evidence)
                 else:
 
                     async def capture_close() -> _ProviderStreamCleanupOutcome:
                         try:
-                            await _close_after_provider_read(close_operation, read)
+                            await _close_after_provider_read(
+                                close_operation, read, cleanup_evidence
+                            )
                         except BaseException as exc:
                             return _ProviderStreamCleanupOutcome(error=exc)
                         return _ProviderStreamCleanupOutcome()
@@ -762,6 +783,7 @@ async def aclosing_provider_stream(
                     **cleanup_diagnostics(
                         cleanup_failure, unsettled=cleanup_unsettled, action=cleanup_action
                     ),
+                    **cleanup_evidence,
                 }
             )
         cancellation = credential_safe_provider_cancellation(

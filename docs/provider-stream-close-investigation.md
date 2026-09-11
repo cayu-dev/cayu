@@ -50,3 +50,27 @@ python -m pytest -q tests/core/test_provider_cleanup_diagnostics.py tests/core/t
 
 Local HTTP tests require socket permission. Passing synthetic controls does not
 identify the cause of an unobserved provider failure or prove remote settlement.
+
+## Interrupted read versus close failure
+
+Joining an interrupted read can fail even when the subsequent `aclose()` returns
+successfully. Cleanup diagnostics now retain `cleanup_failure_phase` (`read`,
+`close`, or `read_and_close`) and separate `cleanup_read_exception_type/message`
+and `cleanup_close_exception_type/message` fields. These use the same closed
+exception classification and exact message allowlist as the original envelope.
+A settled read-only failure has `cleanup_reason=read_exception`; two failures
+have `cleanup_reason=read_and_close_exception`, even when the combined exception
+is a group. The original exception propagation and cancellation behavior remain
+unchanged.
+
+`stream_close_state=confirmed` means the local close hook returned successfully,
+including when joining the read failed. No close hook leaves closure unconfirmed;
+a retained close still running remains pending. Remote cancellation and settlement
+remain unknown. New fields are optional and revalidated on persistence/export,
+so older version-1 records remain readable. Published pending snapshots do not
+change when the retained close later finishes.
+
+The regression controls distinguish failed reads with successful closure,
+close-only failures, simultaneous failures, and suppressed read cancellation.
+They also exercise repeated cancellation while closure is pending. These reproduce
+the diagnostic ambiguity; they do not attribute the historical transport failure.
