@@ -209,7 +209,15 @@ class ToolEffectRecord(BaseModel):
     observation: ToolEffectObservation | None = None
     reconciliation_attempt: ToolEffectReconciliationAttempt | None = None
     resource_versions: dict[str, str] = Field(default_factory=dict)
+    child_recovery_arguments: dict[str, Any] | None = Field(default=None, repr=False)
     publication_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("child_recovery_arguments", mode="before")
+    @classmethod
+    def detach_child_arguments(cls, value):
+        if value is None:
+            return None
+        return copy_durable_json_object(value, "child_recovery_arguments")
 
     @field_validator("resource_versions", mode="before")
     @classmethod
@@ -218,6 +226,15 @@ class ToolEffectRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_state(self) -> ToolEffectRecord:
+        if self.child_recovery_arguments is not None and (
+            sha256(
+                canonical_durable_json_bytes(
+                    self.child_recovery_arguments, "child_recovery_arguments"
+                )
+            ).hexdigest()
+            != self.intent.arguments_digest
+        ):
+            raise ValueError("Child recovery arguments conflict with the prepared effect.")
         if self.reconciliation_attempt is not None and (
             self.state != "outcome_unknown"
             or self.revision != self.reconciliation_attempt.source_revision + 1
@@ -494,7 +511,13 @@ class ToolEffectStateOwner:
             raise ToolEffectConflict("Stored effect intent differs from the expected call.")
         return record
 
-    async def prepare(self, intent: ToolEffectIntent, *, run_epoch: int) -> ToolEffectRecord:
+    async def prepare(
+        self,
+        intent: ToolEffectIntent,
+        *,
+        run_epoch: int,
+        child_recovery_arguments: dict[str, Any] | None = None,
+    ) -> ToolEffectRecord:
         intent = _copy_model(intent, ToolEffectIntent)
         return await self._publish(
             intent=intent,
@@ -505,16 +528,25 @@ class ToolEffectStateOwner:
             run_epoch=run_epoch,
             mutation=RuntimePublicationMutation(),
             events=(),
+            child_recovery_arguments=child_recovery_arguments,
         )
 
-    async def begin(self, intent: ToolEffectIntent, *, run_epoch: int) -> ToolEffectRecord:
+    async def begin(
+        self,
+        intent: ToolEffectIntent,
+        *,
+        run_epoch: int,
+        child_recovery_arguments: dict[str, Any] | None = None,
+    ) -> ToolEffectRecord:
         """Durably prepare and consume one call before its external implementation starts.
 
         A prior executing/unknown/terminal record cannot be mistaken for a fresh
         dispatch grant. Even exact duplicate preparation does not permit a
         second consumer of the prepared revision.
         """
-        prepared = await self.prepare(intent, run_epoch=run_epoch)
+        prepared = await self.prepare(
+            intent, run_epoch=run_epoch, child_recovery_arguments=child_recovery_arguments
+        )
         return await self.transition(prepared, state="executing", run_epoch=run_epoch)
 
     async def start_reconciliation(
@@ -615,6 +647,7 @@ class ToolEffectStateOwner:
         observation: ToolEffectObservation | None = None,
         reconciliation_attempt: ToolEffectReconciliationAttempt | None = None,
         failure_evidence: FailureEvidence | None = None,
+        child_recovery_arguments: dict[str, Any] | None = None,
     ) -> ToolEffectRecord:
         if type(run_epoch) is not int or run_epoch < 0:
             raise ValueError("Effect publication requires an exact run epoch.")
@@ -688,14 +721,30 @@ class ToolEffectStateOwner:
                 )
             resources[key] = value
         resources = _copy_string_map(resources, "effect_resource_versions", maximum_items=32)
+        child_recovery_arguments = (
+            child_recovery_arguments if expected is None else expected.child_recovery_arguments
+        )
+        child_recovery_arguments = (
+            None
+            if child_recovery_arguments is None
+            else copy_durable_json_object(child_recovery_arguments, "child_recovery_arguments")
+        )
         material = {
             "intent": intent.model_dump(mode="json"),
             "state": state,
             "dispatch_id": dispatch_id,
-            "expected": None if expected is None else expected.model_dump(mode="json"),
+            # Argument content is already bound by intent.arguments_digest.
+            # Do not duplicate potentially large private inputs in the bounded
+            # publication material on every state transition.
+            "expected": (
+                None
+                if expected is None
+                else expected.model_dump(mode="json", exclude={"child_recovery_arguments"})
+            ),
             "terminal": None if terminal is None else terminal.model_dump(mode="json"),
             "observation": None if observation is None else observation.model_dump(mode="json"),
             "resource_versions": resources,
+            "has_child_recovery_arguments": child_recovery_arguments is not None,
             "reconciliation_attempt": (
                 None
                 if reconciliation_attempt is None
@@ -768,6 +817,7 @@ class ToolEffectStateOwner:
             terminal=terminal,
             observation=observation,
             resource_versions=resources,
+            child_recovery_arguments=child_recovery_arguments,
             reconciliation_attempt=reconciliation_attempt,
             publication_digest=_digest(material),
         )

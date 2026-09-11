@@ -6004,6 +6004,7 @@ def test_crashed_queued_run_recovery_preserves_terminal_identity_and_does_not_re
     [
         IncompleteSessionRecoveryAction.REPAIRED_PROVIDER_OPERATION_RESOLUTION,
         IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT,
+        IncompleteSessionRecoveryAction.PENDING_SUBAGENT,
     ],
 )
 def test_stalled_dispatch_recovery_recognizes_retained_recovery_actions(action) -> None:

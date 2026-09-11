@@ -5507,6 +5507,11 @@ class ToolRoundExecutor:
                 effect_dispatch = await ToolEffectStateOwner(self._session_store).begin(
                     effect_intent,
                     run_epoch=session.run_epoch,
+                    child_recovery_arguments=(
+                        effective_tool_call.arguments
+                        if registered_tool.child_session_recovery is not None
+                        else None
+                    ),
                 )
             execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,

@@ -87,6 +87,7 @@ class RecoveryScenario(StrEnum):
     TASK_CLAIM = "task_claim"
     TERMINAL_RACE = "terminal_race"
     TOOL_EFFECT = "tool_effect"
+    FOREGROUND_SUBAGENT = "foreground_subagent"
 
 
 class RecoveryAction(StrEnum):
@@ -133,6 +134,7 @@ _SCENARIO_ACTIONS = {
     ),
     RecoveryScenario.TERMINAL_RACE: frozenset({RecoveryAction.RUN}),
     RecoveryScenario.TOOL_EFFECT: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
+    RecoveryScenario.FOREGROUND_SUBAGENT: frozenset({RecoveryAction.START, RecoveryAction.RECOVER}),
 }
 
 
@@ -1533,6 +1535,12 @@ async def _run_tool_effect(config: dict[str, Any]) -> dict[str, Any]:
     return await run_tool_effect_worker(config)
 
 
+async def _run_foreground_subagent(config: dict[str, Any]) -> dict[str, Any]:
+    from foreground_subagent_worker import run_foreground_subagent_worker
+
+    return await run_foreground_subagent_worker(config)
+
+
 async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
     scenario = RecoveryScenario(config["scenario"])
     action = RecoveryAction(config["action"])
@@ -1546,6 +1554,7 @@ async def _run_worker(config: dict[str, Any]) -> dict[str, Any]:
         RecoveryScenario.TASK_CLAIM: _run_task_claim,
         RecoveryScenario.TERMINAL_RACE: _run_terminal_race,
         RecoveryScenario.TOOL_EFFECT: _run_tool_effect,
+        RecoveryScenario.FOREGROUND_SUBAGENT: _run_foreground_subagent,
     }
     return await handlers[scenario](config)
 

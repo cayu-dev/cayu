@@ -662,41 +662,23 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                     ]
                 ) from cleanup_error
             raise
-        structured = {
-            **structured,
-            "status": None if result.terminal is None else str(result.terminal.type),
-            "events": result.event_count,
-            "result_truncated": result.text_truncated,
-        }
-        if result.terminal is None:
-            return ToolResult(
-                content="Subagent finished without a terminal session event.",
-                structured=structured,
-                is_error=True,
-            )
-        if result.terminal.type == EventType.SESSION_COMPLETED:
-            return ToolResult(
-                content=result.text or f"Subagent {agent_alias} completed.",
+        if self._session_store is not None:
+            # Live and reconstructed calls consume the same durable projection,
+            # not a different answer assembled from process-local stream deltas.
+            durable_result = await self._existing_child_result(
+                child_session_id=child_session_id,
+                agent_alias=agent_alias,
+                spec=spec,
+                parent_session_id=ctx.session_id,
+                causal_budget_id=causal_budget_id,
+                environment_name=ctx.environment_name,
+                spawn_fingerprint=spawn_fingerprint,
                 structured=structured,
             )
-        error = (
-            result.terminal.payload.get("error")
-            if isinstance(result.terminal.payload, dict)
-            else None
-        )
-        return ToolResult(
-            content=str(
-                error or f"Subagent {agent_alias} did not complete: {result.terminal.type}"
-            ),
-            structured={
-                **structured,
-                "terminal_payload": copy_json_value(
-                    result.terminal.payload,
-                    "terminal_payload",
-                ),
-            },
-            is_error=True,
-        )
+            if durable_result is None:
+                raise RuntimeError("Foreground child disappeared before result projection.")
+            return durable_result
+        return _foreground_tool_result(result, agent_alias=agent_alias, structured=structured)
 
     async def _existing_child_result(
         self,
@@ -753,6 +735,10 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                 },
                 is_error=True,
             )
+        if spec.mode is SubagentExecutionMode.FOREGROUND:
+            return await self._foreground_result_from_child(
+                child, agent_alias=agent_alias, spec=spec
+            )
         summary = await _summarize_child_session(
             session_store,
             child,
@@ -761,6 +747,63 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         )
         summary = {**structured, **summary, "reused": True}
         return _tool_result_from_child_summary(summary)
+
+    async def project_recoverable_child(self, child: Session) -> ToolResult | None:
+        subagent = child.metadata.get("subagent")
+        if type(subagent) is not dict or subagent.get("mode") != "foreground":
+            return None
+        agent_alias = subagent.get("agent")
+        spec = self._agents.get(agent_alias) if type(agent_alias) is str else None
+        if spec is None or spec.mode is not SubagentExecutionMode.FOREGROUND:
+            raise RuntimeError("Foreground recovery has no matching registered specification.")
+        if child.status not in _SUBAGENT_TERMINAL_STATUSES:
+            # The pending-child lifecycle is handled separately from terminal
+            # projection. Never manufacture a successful result for live work.
+            return None
+        return await self._foreground_result_from_child(child, agent_alias=agent_alias, spec=spec)
+
+    async def _foreground_result_from_child(
+        self, child: Session, *, agent_alias: str, spec: SubagentSpec
+    ) -> ToolResult:
+        store = self._session_store
+        if store is None:
+            raise RuntimeError("Foreground recovery requires a durable session store.")
+        if child.parent_session_id is None:
+            raise RuntimeError("Foreground child has no parent authority.")
+        current = await store.load(child.id)
+        if current != child:
+            raise RuntimeError("Foreground child changed before result projection.")
+        text, truncated = await _load_last_assistant_text(
+            store, child.id, max_chars=spec.result_max_chars
+        )
+        summary = await store.summarize_events(child.id)
+        outcome = await store.summarize_outcome(child.id)
+        terminal = None if outcome.terminal_event is None else outcome.terminal_event.event
+        expected = {
+            SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+            SessionStatus.FAILED: EventType.SESSION_FAILED,
+            SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+        }.get(child.status)
+        if terminal is None or terminal.type != expected:
+            raise RuntimeError("Foreground child lacks consistent terminal evidence.")
+        if await store.load(child.id) != child:
+            raise RuntimeError("Foreground child changed during result projection.")
+        return _foreground_tool_result(
+            _SubagentResult(
+                text=text,
+                text_truncated=truncated,
+                event_count=summary.total_events,
+                terminal=terminal,
+            ),
+            agent_alias=agent_alias,
+            structured=_subagent_result_payload(
+                agent_alias=agent_alias,
+                spec=spec,
+                parent_session_id=child.parent_session_id,
+                child_session_id=child.id,
+                causal_budget_id=child.causal_budget_id,
+            ),
+        )
 
     def matches_recoverable_child(
         self,
@@ -1369,6 +1412,38 @@ class _SubagentResult(BaseModel):
     text_truncated: bool
     event_count: int
     terminal: Event | None
+
+
+def _foreground_tool_result(
+    result: _SubagentResult, *, agent_alias: str, structured: dict[str, Any]
+) -> ToolResult:
+    """One model-facing contract for live and durably reconstructed foreground work."""
+    structured = {
+        **structured,
+        "status": None if result.terminal is None else str(result.terminal.type),
+        "events": result.event_count,
+        "result_truncated": result.text_truncated,
+    }
+    if result.terminal is None:
+        return ToolResult(
+            content="Subagent finished without a terminal session event.",
+            structured=structured,
+            is_error=True,
+        )
+    if result.terminal.type == EventType.SESSION_COMPLETED:
+        return ToolResult(
+            content=result.text or f"Subagent {agent_alias} completed.",
+            structured=structured,
+        )
+    error = result.terminal.payload.get("error")
+    return ToolResult(
+        content=str(error or f"Subagent {agent_alias} did not complete: {result.terminal.type}"),
+        structured={
+            **structured,
+            "terminal_payload": copy_json_value(result.terminal.payload, "terminal_payload"),
+        },
+        is_error=True,
+    )
 
 
 async def _list_background_subagent_children(

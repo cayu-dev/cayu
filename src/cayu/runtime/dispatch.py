@@ -733,6 +733,7 @@ _STALLED_RECOVERED_ACTIONS = {
     IncompleteSessionRecoveryAction.PENDING_APPROVAL,
     IncompleteSessionRecoveryAction.PENDING_USER_INPUT,
     IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT,
+    IncompleteSessionRecoveryAction.PENDING_SUBAGENT,
     IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,
 }
 

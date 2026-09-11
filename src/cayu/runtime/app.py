@@ -1422,6 +1422,10 @@ class CayuApp:
         updates: dict[str, Any] = {
             "events": projected_events,
             "session_id": self.project_session_id_for_exposure(result.session_id),
+            "pending_subagent_session_ids": tuple(
+                self.project_session_id_for_exposure(child_id)
+                for child_id in result.pending_subagent_session_ids
+            ),
         }
         unavailable_linkage: list[str] = []
         for result_field, event_field in (

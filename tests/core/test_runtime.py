@@ -29001,6 +29001,26 @@ async def _seed_crashed_spawn_parent(
         [Message.text("user", "review"), Message.text("assistant", "looks good")],
     )
     await store.update_status(child_session_id, child_status)
+    if mode == "foreground" and child_status in {
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.INTERRUPTED,
+    }:
+        await store.append_events(
+            child_session_id,
+            [
+                Event(
+                    type={
+                        SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+                        SessionStatus.FAILED: EventType.SESSION_FAILED,
+                        SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+                    }[child_status],
+                    session_id=child_session_id,
+                    agent_name="reviewer",
+                    payload={},
+                )
+            ],
+        )
     if conflicting_linkage:
         await store.create(
             sessions_module.run_request_with_runtime_invocation(
@@ -29097,6 +29117,7 @@ def _recover_parent(
     linkage: str = "correct",
     conflicting_linkage: bool = False,
     generated_identity_conflict: bool = False,
+    resume: bool = False,
 ):
     async def run():
         store = InMemorySessionStore()
@@ -29144,6 +29165,13 @@ def _recover_parent(
         result = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="parent", reason="worker restart")
         )
+        if resume:
+            result = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(session_id="parent", messages=[Message.text("user", "continue")])
+                )
+            ]
         return store, result
 
     return asyncio.run(run())
@@ -29221,19 +29249,58 @@ def test_recovery_reattaches_completed_foreground_child():
     store, result = _recover_parent(SessionStatus.COMPLETED, mode="foreground")
     recovered = _recovered_parent_tool_result(store)
 
-    assert recovered.structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
     assert recovered.structured["child_session_id"] == "child"
     assert recovered.structured["mode"] == "foreground"
-    assert recovered.structured["status"] == "completed"
-    assert recovered.structured["outcome_unknown"] is False
-    assert "subagent_result" not in recovered.content
+    assert recovered.structured["status"] == "session.completed"
+    assert recovered.structured["result_truncated"] is False
+    assert recovered.content == "looks good"
     assert _recovered_tool_event(result).type == EventType.TOOL_CALL_COMPLETED
 
 
 @pytest.mark.parametrize("mode", ["foreground", "background"])
-def test_recovery_keeps_nonterminal_child_effect_unknown(mode):
-    store, result = _recover_parent(SessionStatus.RUNNING, mode=mode)
+@pytest.mark.parametrize(
+    "child_status", [SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING]
+)
+def test_recovery_keeps_nonterminal_child_effect_unknown(mode, child_status):
+    store, result = _recover_parent(child_status, mode=mode)
     _assert_recovered_parent_effect_unknown(store, result)
+    if mode == "foreground":
+        assert IncompleteSessionRecoveryAction.PENDING_SUBAGENT in result.actions
+        assert IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT not in result.actions
+        assert result.pending_subagent_session_ids == ("child",)
+        assert "before parent continuation" in result.message
+    else:
+        assert IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT in result.actions
+        assert result.pending_subagent_session_ids == ()
+
+
+@pytest.mark.parametrize(
+    "child_status", [SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING]
+)
+def test_resume_reports_exact_nonterminal_foreground_child(child_status):
+    store, events = _recover_parent(child_status, mode="foreground", resume=True)
+    assert events[-1].type is EventType.SESSION_INTERRUPTED
+    assert events[-1].payload["recovery_required"] == "foreground_subagent"
+    assert events[-1].payload["pending_subagent_session_ids"] == ["child"]
+    # Public streams alias execution identifiers; durable evidence keeps the
+    # exact internal call/round rather than granting public bearer authority.
+    stored = next(
+        event
+        for event in reversed(asyncio.run(store.load_events("parent")))
+        if event.type is EventType.SESSION_INTERRUPTED
+    )
+    assert stored.payload["recovery_required"] == "foreground_subagent"
+    assert stored.payload["pending_subagent_session_ids"] == ["child"]
+    assert stored.payload["tool_call_id"] == "call_spawn"
+    assert stored.payload["tool_round_id"] == _tool_round_identity().tool_round_id
+    assert not any(
+        event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        for event in events
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("parent"))
+    from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+
+    assert pending_tool_round_from_checkpoint(checkpoint) is not None
 
 
 def _assert_recovered_parent_effect_unknown(store, result):

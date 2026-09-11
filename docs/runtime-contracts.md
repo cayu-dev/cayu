@@ -3827,7 +3827,40 @@ idempotency lineage; they are not rewritten into the new format.
 `SubagentExecutionMode.FOREGROUND` subagents wait for the child terminal
 event; the parent receives only a bounded `ToolResult` containing the child session id,
 status, and model-facing result. `SubagentSpec.result_max_chars` caps the child
-text copied into the parent transcript. `SubagentExecutionMode.BACKGROUND`
+text copied into the parent transcript.
+
+Foreground recovery does not restart the child. When a parent loses its process
+before recording the tool outcome, pending-round recovery resolves the original
+child using the complete parent-scoped tool-execution identity (including the
+round, call, and any approval or user-input pause). Runtime-retained effective
+arguments bind the spawn even when a before-tool hook changed the proposal.
+Missing, conflicting, or ambiguous linkage retains the existing typed manual
+tool-effect recovery requirement; a copied child id is not retrieval authority.
+
+For an exactly matched terminal foreground child, the live and reconstructed
+paths share the same child-to-result projection: bounded final assistant text,
+success/error classification, child identity, truncation flag, and safe terminal
+diagnostics. Recovery settles the parent effect and terminal tool event through
+the existing atomic publication owner, then repairs the provider-valid tool
+message. It does not merge child transcripts or invoke the child again.
+
+A matched `pending`, `running`, or `interrupting` child is not a terminal unknown
+tool result. Incomplete-session recovery reports `pending_subagent` and
+`pending_subagent_session_ids`, retains the pending parent call, and leaves any
+approval or user-input gate intact. Operators must use the normal fenced child
+interruption/incomplete-session recovery lifecycle to establish its terminal
+outcome before continuing the parent. If a provider dispatch was in flight, its
+model-completion fence still requires an explicit operator settlement (for
+example, a `MODEL_MARK_INTERRUPTED` decision from the registered recovery plan);
+foreground recovery does not infer that a killed process stopped a remote call.
+Stored nonterminal status alone does not prove that a worker is alive.
+General interruption evidence contains child
+identities and recovery reasons, not the child's assistant answer. Foreground
+execution is still process-bound: this reconciliation capability restores a
+durable outcome, not ongoing execution, scheduling, or automatic replay after
+process loss. Task-backed execution remains the separate durable mode below.
+
+`SubagentExecutionMode.BACKGROUND`
 subagents return after the child emits its first runtime event, so the parent receives the child session id
 without waiting for completion. The active runtime process must keep running for
 in-process background child work to finish; external queue placement remains a

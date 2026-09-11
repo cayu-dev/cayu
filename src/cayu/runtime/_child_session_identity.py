@@ -73,6 +73,15 @@ class ChildSessionRecoveryMatcher(ABC):
         del parent_session, tool_name, tool_round_id, tool_call_id, idempotency_key, arguments
         return child
 
+    async def project_recoverable_child(self, child: Session) -> ToolResult | None:
+        """Project terminal output only after the runtime authenticates this child.
+
+        This internal seam does not grant model-facing retrieval authority and
+        must not execute or resume the child. None retains ordinary reattachment.
+        """
+        del child
+        return None
+
 
 class ChildSessionKind(StrEnum):
     """Runtime-owned namespaces for generated child-session identities."""

@@ -13,6 +13,7 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectConflict,
     ToolEffectIntent,
     ToolEffectObservation,
+    ToolEffectRecord,
     ToolEffectStateOwner,
     ToolEffectTerminal,
     validate_tool_effect_uncertainty_event,
@@ -68,6 +69,68 @@ def _event(intent, *, event_id="terminal", failed=False):
             "result": {"content": "done", "is_error": failed, "artifacts": [], "structured": None},
         },
     )
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("task_repetitions", [1, 10000])
+def test_child_recovery_arguments_are_private_bound_and_reconstructed(
+    tmp_path, backend, task_repetitions
+):
+    async def scenario():
+        path = tmp_path / "child-effect.sqlite"
+        store = InMemorySessionStore() if backend == "memory" else SQLiteSessionStore(path)
+        try:
+            intent = await _intent(store)
+            task = "private-child-task-canary" * task_repetitions
+            arguments = {"agent": "child", "task": task}
+            intent = intent.model_copy(
+                update={
+                    "arguments_digest": sha256(
+                        canonical_durable_json_bytes(arguments, "arguments")
+                    ).hexdigest(),
+                }
+            )
+            owner = ToolEffectStateOwner(store)
+            with pytest.raises(ValueError, match="Child recovery arguments conflict"):
+                await owner.begin(intent, run_epoch=0, child_recovery_arguments={"task": "wrong"})
+            assert await owner.load(intent) is None
+            executing = await owner.begin(intent, run_epoch=0, child_recovery_arguments=arguments)
+            arguments["task"] = "caller mutation"
+            assert executing.child_recovery_arguments is not None
+            assert executing.child_recovery_arguments["task"] == task
+            unknown = await owner.transition(executing, state="outcome_unknown", run_epoch=0)
+            assert unknown.child_recovery_arguments == executing.child_recovery_arguments
+            assert "private-child-task-canary" not in repr(
+                await store.load_events(intent.session_id)
+            )
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+                store = SQLiteSessionStore(path)
+                owner = ToolEffectStateOwner(store)
+            restored = await owner.load(intent)
+            assert restored is not None
+            assert restored == unknown
+            malformed = restored.model_dump(mode="json")
+            malformed["child_recovery_arguments"]["task"] = "tampered"
+            with pytest.raises(ValueError, match="Child recovery arguments conflict"):
+                ToolEffectRecord.model_validate(malformed)
+            event = _event(intent)
+            completed = await owner.transition(
+                restored,
+                state="completed",
+                run_epoch=0,
+                terminal=_terminal(event),
+                events=(event,),
+            )
+            assert completed.child_recovery_arguments == executing.child_recovery_arguments
+            assert "private-child-task-canary" not in repr(
+                await store.load_events(intent.session_id)
+            )
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("mismatch", ["session", "epoch", "transition"])
@@ -753,18 +816,38 @@ def test_child_only_cancellation_is_not_caller_cancellation():
         ("approval_id", "other"),
         ("reconciler_fingerprint", "other"),
         ("source_run_epoch", 1),
+        ("interaction_id", "other"),
+        ("model_step_id", "other"),
+        ("model_attempt_id", "other"),
+        ("agent_name", "other"),
+        ("pause_id", "other"),
+        ("environment_name", "other"),
+        ("allocation_fingerprint", "other"),
+        ("targeted_invocation_digest", "c" * 64),
     ],
 )
-def test_stable_call_identity_does_not_hide_conflicting_intent(field, value):
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_stable_call_identity_does_not_hide_conflicting_intent(field, value, backend, tmp_path):
     async def scenario():
-        store = InMemorySessionStore()
-        intent = await _intent(store)
-        owner = ToolEffectStateOwner(store)
-        await owner.prepare(intent, run_epoch=0)
-        changed = intent.model_copy(update={field: value})
-        with pytest.raises(ToolEffectConflict):
-            await owner.load(changed)
-        with pytest.raises(ToolEffectConflict):
-            await owner.prepare(changed, run_epoch=0)
+        path = tmp_path / "intent.sqlite"
+        store = InMemorySessionStore() if backend == "memory" else SQLiteSessionStore(path)
+        try:
+            intent = await _intent(store)
+            owner = ToolEffectStateOwner(store)
+            prepared = await owner.prepare(intent, run_epoch=0)
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+                store = SQLiteSessionStore(path)
+                owner = ToolEffectStateOwner(store)
+            changed = intent.model_copy(update={field: value})
+            with pytest.raises(ToolEffectConflict):
+                await owner.load(changed)
+            with pytest.raises(ToolEffectConflict):
+                await owner.prepare(changed, run_epoch=0)
+            assert await owner.load(intent) == prepared
+            assert not await store.load_events(intent.session_id)
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
 
     asyncio.run(scenario())

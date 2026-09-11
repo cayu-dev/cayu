@@ -14,6 +14,8 @@ from cayu.runtime._child_session_identity import ChildSessionKind, generate_chil
 from cayu.runtime.app import CayuApp
 from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.runtime.stop_policy import RunLimits
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.subagents import (
     BackgroundSubagentTaskRegistry,
     SubagentExecutionMode,
@@ -40,6 +42,12 @@ class _RecoveryMatcherNameOnlyTool(Tool):
 
 def test_only_explicit_child_session_recovery_capabilities_are_registered() -> None:
     class UncalledRuntime:
+        async def _submit_durable_subagent(self, **kwargs):
+            raise AssertionError("durable submission must not be called")
+
+        async def _reconcile_durable_subagent(self, **kwargs):
+            raise AssertionError("durable reconciliation must not be called")
+
         def run(self, request):
             raise AssertionError("run must not be called")
 
@@ -116,6 +124,12 @@ def test_every_subagent_mode_builds_the_parent_scoped_tool_identity(mode) -> Non
     requests = []
 
     class RecordingRuntime:
+        async def _submit_durable_subagent(self, **kwargs):
+            raise AssertionError("durable submission must not be called")
+
+        async def _reconcile_durable_subagent(self, **kwargs):
+            raise AssertionError("durable reconciliation must not be called")
+
         def run(self, request):
             requests.append(request)
 
@@ -224,8 +238,12 @@ def test_every_subagent_mode_reuses_matching_durable_child(mode) -> None:
     provider, first, second = asyncio.run(run())
 
     assert first.structured["child_session_id"] == second.structured["child_session_id"]
-    assert second.structured["reused"] is True
-    assert second.structured["status"] == "completed"
+    if mode is SubagentExecutionMode.FOREGROUND:
+        assert second == first
+        assert second.structured["status"] == "session.completed"
+    else:
+        assert second.structured["reused"] is True
+        assert second.structured["status"] == "completed"
     assert second.content == "review complete"
     assert len(provider.requests) == 1
 
@@ -288,3 +306,112 @@ def test_every_subagent_mode_fails_closed_on_existing_identity_conflict(mode) ->
     assert loaded is not None
     assert loaded.metadata["subagent"]["agent"] == "unrelated"
     assert provider.requests == []
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_foreground_spawn_reuse_binds_every_variable_fingerprint_input(backend, tmp_path):
+    async def scenario():
+        path = tmp_path / "spawn.sqlite"
+        store = InMemorySessionStore() if backend == "memory" else SQLiteSessionStore(path)
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("review complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+
+        def app():
+            runtime = CayuApp(session_store=store, enable_logging=False)
+            runtime.register_provider(provider, default=True)
+            runtime.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+            return runtime
+
+        spec = SubagentSpec(agent_name="reviewer")
+        context = ToolContext(
+            session_id="parent",
+            causal_budget_id="parent",
+            idempotency_key="spawn-key",
+            metadata={"tool_call_id": "call", "idempotency_key": "spawn-key"},
+        )
+        arguments = {"agent": "reviewer", "task": "review", "metadata": {"a": 1, "b": 2}}
+        try:
+            await store.create(
+                RunRequest(
+                    session_id="parent", agent_name="parent", messages=[Message.text("user", "go")]
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            first = await SubagentTool(app(), agents={"reviewer": spec}).run(context, arguments)
+            assert not first.is_error
+            assert first.structured is not None
+            child_id = first.structured["child_session_id"]
+            child = await store.load(child_id)
+            assert child is not None
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+                store = SQLiteSessionStore(path)
+            variants = [
+                ("alias", spec, context, {**arguments, "agent": "other"}),
+                ("agent_name", spec.model_copy(update={"agent_name": "other"}), context, arguments),
+                (
+                    "mode",
+                    spec.model_copy(update={"mode": SubagentExecutionMode.BACKGROUND}),
+                    context,
+                    arguments,
+                ),
+                ("max_steps", spec.model_copy(update={"max_steps": 1}), context, arguments),
+                (
+                    "result_max_chars",
+                    spec.model_copy(update={"result_max_chars": 1}),
+                    context,
+                    arguments,
+                ),
+                (
+                    "limits",
+                    spec.model_copy(update={"limits": RunLimits(max_tool_calls=1)}),
+                    context,
+                    arguments,
+                ),
+                (
+                    "registered_metadata",
+                    spec.model_copy(update={"metadata": {"different": True}}),
+                    context,
+                    arguments,
+                ),
+                (
+                    "budget",
+                    spec,
+                    context.model_copy(update={"causal_budget_id": "other"}),
+                    arguments,
+                ),
+                (
+                    "environment",
+                    spec,
+                    context.model_copy(update={"environment_name": "other"}),
+                    arguments,
+                ),
+                ("task", spec, context, {**arguments, "task": "other"}),
+                ("caller_metadata", spec, context, {**arguments, "metadata": {"a": 2, "b": 2}}),
+            ]
+            for name, candidate, candidate_context, candidate_arguments in variants:
+                alias = candidate_arguments["agent"]
+                assert isinstance(alias, str)
+                result = await SubagentTool(app(), agents={alias: candidate}).run(
+                    candidate_context, candidate_arguments
+                )
+                assert result.is_error, name
+                assert result.structured is not None
+                assert result.structured["status"] == "identity_conflict", name
+                assert await store.load(child_id) == child, name
+                assert len(provider.requests) == 1, name
+            # Canonical ordering alone is not a new operation.
+            replay = await SubagentTool(app(), agents={"reviewer": spec}).run(
+                context, {**arguments, "metadata": {"b": 2, "a": 1}}
+            )
+            assert replay == first
+            assert len(provider.requests) == 1
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    asyncio.run(scenario())

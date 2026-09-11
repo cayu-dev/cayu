@@ -141,6 +141,7 @@ from cayu.runtime._event_writer import (
     _reconcile_exact_persisted_event,
     prepare_runtime_event,
 )
+from cayu.runtime._foreground_subagent_recovery import ForegroundSubagentRecoveryRequired
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
@@ -1135,6 +1136,11 @@ def _continuation_failure_payload(
 ) -> dict[str, Any]:
     return {
         **exception_failure_payload(error, redactor=redactor),
+        **(
+            error.interruption_evidence()
+            if isinstance(error, ForegroundSubagentRecoveryRequired)
+            else {}
+        ),
         "failure_evidence": exception_evidence(error)
         .model_copy(update={"session_id": session.id, "run_epoch": session.run_epoch})
         .model_dump(mode="json"),
@@ -8656,6 +8662,17 @@ class RecoveryCoordinator:
             # side-effecting tool. The round was already projected against limits at pause time;
             # its remaining tools run on resume without a fresh budget projection (so the user's
             # answer is never discarded by a limit check here).
+            native_events = await self._recover_terminal_foreground_effects_at_human_gate(
+                session=session,
+                pending=pending,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            )
+            resume_events.extend(native_events)
+            for native_event in native_events:
+                yield native_event
             recorded_outcomes = approval_support.recorded_round_tool_outcomes(
                 events=resume_events,
                 pending_calls=pending.tool_calls,
@@ -9803,15 +9820,18 @@ class RecoveryCoordinator:
                     registered_agent.tool_capabilities,
                     catalogue_revision=registered_agent.tool_catalogue.revision,
                 )
-            recorded_outcomes = approval_support.recorded_tool_outcomes(
-                events=approval_events,
-                approval=pending_approval,
-                staged_terminals=publication_round.staged_terminals,
-            )
-            terminal_outcomes_cover_round = set(recorded_outcomes) == {
-                pending_call.tool_call_id
-                for pending_call in approval_support.pending_round_tool_calls(pending_approval)
-            }
+            # Validate existing evidence before selecting any recovered native
+            # result. A missing claim must not hide a contradictory descriptor.
+            try:
+                recorded_outcomes = approval_support.recorded_tool_outcomes(
+                    events=approval_events,
+                    approval=pending_approval,
+                    staged_terminals=publication_round.staged_terminals,
+                )
+            except approval_support.ToolApprovalManualRecoveryRequired:
+                # An exact native child may settle this missing outcome below.
+                # Scope and staged-evidence conflicts must still fail above it.
+                recorded_outcomes = {}
             if claimed_resolution_intent is None:
                 if history.has_resolution_activity or recorded_outcomes:
                     raise RuntimeError(
@@ -9838,6 +9858,33 @@ class RecoveryCoordinator:
                     "Tool approval cannot be retried automatically because its durable "
                     "resolution intent predates exact resolution request identity."
                 )
+            if (
+                not recovery_closure_only
+                and claimed_resolution_intent.resolution_request_digest != resolution_request_digest
+            ):
+                raise RuntimeError(
+                    "Tool approval was already claimed with a different resolution request."
+                )
+            native_events = await self._recover_terminal_foreground_effects_at_human_gate(
+                session=session,
+                pending=pending_approval,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            )
+            approval_events.extend(native_events)
+            for native_event in native_events:
+                yield native_event
+            recorded_outcomes = approval_support.recorded_tool_outcomes(
+                events=approval_events,
+                approval=pending_approval,
+                staged_terminals=publication_round.staged_terminals,
+            )
+            terminal_outcomes_cover_round = set(recorded_outcomes) == {
+                pending_call.tool_call_id
+                for pending_call in approval_support.pending_round_tool_calls(pending_approval)
+            }
             if recovery_closure_only:
                 if claimed_resolution_intent.decision is not ToolApprovalDecision.APPROVE:
                     raise RuntimeError(
@@ -9849,10 +9896,6 @@ class RecoveryCoordinator:
                         "execution; retry the exact original approval request."
                     )
                 resolution_request_digest = claimed_resolution_intent.resolution_request_digest
-            elif claimed_resolution_intent.resolution_request_digest != (resolution_request_digest):
-                raise RuntimeError(
-                    "Tool approval was already claimed with a different resolution request."
-                )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
                 registered_agent=registered_agent,
@@ -13887,13 +13930,10 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=(
-                    _recovery_abandonment_signal(
-                        authoritative_failure,
-                        cancellation_baseline=cancellation_baseline,
-                    )
-                    is not None
-                ),
+                # The manual-recovery supervisor drains this worker before
+                # finalizing the session and releasing its claim. This nested
+                # continuation owns stream closure, not a second finalization.
+                finalize_abandoned=False,
                 release_run_fence=False,
                 abort_environment_setup=False,
                 execution_profile=execution_profile_snapshot.profile,
@@ -14205,7 +14245,6 @@ class RecoveryCoordinator:
             raise RuntimeError("Receipt recovery substituted frozen invocation authority.")
         stream: AsyncGenerator[Event, None] | None = None
         failure: BaseException | None = None
-        cancellation_baseline = _task_cancellation_count()
         try:
             await self._preflight_tool_effect_reconciliation(
                 session=session, request=request, source_run_epoch=loaded_session.run_epoch
@@ -14327,12 +14366,8 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 authoritative_failure=failure,
-                finalize_abandoned=(
-                    _recovery_abandonment_signal(
-                        failure, cancellation_baseline=cancellation_baseline
-                    )
-                    is not None
-                ),
+                # Same supervisor ownership as manual tool-round recovery.
+                finalize_abandoned=False,
                 release_run_fence=False,
                 abort_environment_setup=False,
                 execution_profile=execution_profile_snapshot.profile,
@@ -15401,7 +15436,7 @@ class RecoveryCoordinator:
             if idempotency_key not in children and not marker_backed:
                 reattached.append(outcome)
                 continue
-            recovery_arguments = self._subagent_recovery_arguments(
+            recovery_arguments = await self._subagent_recovery_arguments(
                 checkpoint=source_checkpoint,
                 parent_session=session,
                 tool_name=outcome.call.name,
@@ -15422,7 +15457,7 @@ class RecoveryCoordinator:
             )
             result = reconciled_result
             if result is None:
-                result = self._reattached_subagent_result(
+                result = await self._reattached_subagent_result(
                     children,
                     idempotency_key,
                     tool_call_id=outcome.call.id,
@@ -15869,7 +15904,7 @@ class RecoveryCoordinator:
                 tool_round_id=pending_round.tool_round_id,
                 tool_call_id=pending_tool_call.tool_call_id,
             )
-            recovery_arguments = self._subagent_recovery_arguments(
+            recovery_arguments = await self._subagent_recovery_arguments(
                 checkpoint=subagent_recovery_checkpoint,
                 parent_session=session,
                 tool_name=pending_tool_call.tool_name,
@@ -16074,7 +16109,7 @@ class RecoveryCoordinator:
                     # a durably settled submission, not an unverified child.
                     confirmed_native_effect_records[pending_tool_call.tool_call_id] = effect_record
             if result is None:
-                result = self._reattached_subagent_result(
+                result = await self._reattached_subagent_result(
                     subagent_children,
                     expected_idempotency_key,
                     tool_call_id=pending_tool_call.tool_call_id,
@@ -16381,25 +16416,9 @@ class RecoveryCoordinator:
             if confirmed_native_effect_records is None:
                 raise RuntimeError("Native terminal publication lost its evidence owner.")
             record = confirmed_native_effect_records[event.payload["tool_call_id"]]
-            prepared_event = self._event_writer.prepare(event)
-            await ToolEffectStateOwner(self._session_store).transition(
-                record,
-                state="failed"
-                if prepared_event.type is EventType.TOOL_CALL_FAILED
-                else "completed",
-                run_epoch=session.run_epoch,
-                terminal=ToolEffectTerminal(
-                    event_id=prepared_event.id,
-                    result_digest=sha256(
-                        canonical_durable_json_bytes(
-                            prepared_event.payload["result"], "native_result"
-                        )
-                    ).hexdigest(),
-                ),
-                events=(prepared_event,),
+            return await self._emit_confirmed_native_tool_terminal(
+                session=session, record=record, event=event
             )
-            await self._event_writer.fan_out_persisted([prepared_event])
-            return copy_event(prepared_event)
 
         for expected_outcome, terminal_event, hooks_state in zip(
             planned_outcomes,
@@ -22573,7 +22592,7 @@ class RecoveryCoordinator:
                     expected_transcript_cursor=expected_transcript_cursor,
                 ):
                     events.append(event)
-            except ToolEffectReconciliationRequired:
+            except ToolEffectReconciliationRequired as unresolved:
                 # Unknown external effects are a retained recovery pause. Finish
                 # this owner's interruption before exposing the next explicit
                 # receipt action; do not make that action drain our old marker.
@@ -22597,9 +22616,25 @@ class RecoveryCoordinator:
                     session_id=session.id,
                     previous_status=previous_status,
                     status=session.status,
-                    actions=(*actions, IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT),
+                    actions=(
+                        *actions,
+                        (
+                            IncompleteSessionRecoveryAction.PENDING_SUBAGENT
+                            if isinstance(unresolved, ForegroundSubagentRecoveryRequired)
+                            else IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT
+                        ),
+                    ),
                     events=tuple(events),
-                    message="External effect requires explicit receipt reconciliation or continuation.",
+                    pending_subagent_session_ids=(
+                        (unresolved.child_session_id,)
+                        if isinstance(unresolved, ForegroundSubagentRecoveryRequired)
+                        else ()
+                    ),
+                    message=(
+                        str(unresolved)
+                        if isinstance(unresolved, ForegroundSubagentRecoveryRequired)
+                        else "External effect requires explicit receipt reconciliation or continuation."
+                    ),
                 )
             except ToolApprovalRequired:
                 # Fail-closed planning of an ambiguous crash boundary may
@@ -22672,9 +22707,18 @@ class RecoveryCoordinator:
                 tool_round_id=pending_approval.tool_round_id,
                 tool_call_ids=tuple(call.tool_call_id for call in pending_approval.tool_calls),
             )
+            pending_child_ids: tuple[str, ...] = ()
             if unresolved_effect:
                 events.extend(await self.deliver_pending_tool_effect_uncertainty(session))
                 actions.append(IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT)
+                pending_child_ids = await self._pending_foreground_children_at_human_gate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    pending=pending_approval,
+                    registered_agent=registered_agent,
+                )
+                if pending_child_ids:
+                    actions.append(IncompleteSessionRecoveryAction.PENDING_SUBAGENT)
             if session.status == SessionStatus.FAILED:
                 interrupt_payload = {
                     "model_step_id": pending_approval.model_step_id,
@@ -22722,8 +22766,11 @@ class RecoveryCoordinator:
                 actions=tuple(actions),
                 events=tuple(events),
                 pending_approval_id=pending_approval.approval_id,
+                pending_subagent_session_ids=pending_child_ids,
                 message=(
-                    "External effect remains unresolved; explicit receipt reconciliation is required."
+                    "Foreground children require recovery; the pending approval remains intact."
+                    if pending_child_ids
+                    else "External effect remains unresolved; explicit receipt reconciliation is required."
                     if unresolved_effect
                     else "Session has a pending tool approval; resolve it with ToolApprovalRequest."
                 ),
@@ -22767,9 +22814,18 @@ class RecoveryCoordinator:
                 tool_round_id=pending_user_input.tool_round_id,
                 tool_call_ids=tuple(call.tool_call_id for call in pending_user_input.tool_calls),
             )
+            pending_child_ids = ()
             if unresolved_effect:
                 events.extend(await self.deliver_pending_tool_effect_uncertainty(session))
                 actions.append(IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT)
+                pending_child_ids = await self._pending_foreground_children_at_human_gate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    pending=pending_user_input,
+                    registered_agent=registered_agent,
+                )
+                if pending_child_ids:
+                    actions.append(IncompleteSessionRecoveryAction.PENDING_SUBAGENT)
             session = await self._finalize_interrupting_for_recovery(
                 recovery_claim_id=claim_id,
                 preserve_interaction_id=preserve_interaction_id,
@@ -22793,8 +22849,11 @@ class RecoveryCoordinator:
                 actions=tuple(actions),
                 events=tuple(events),
                 pending_user_input_id=pending_user_input.input_id,
+                pending_subagent_session_ids=pending_child_ids,
                 message=(
-                    "External effect remains unresolved; explicit receipt reconciliation is required."
+                    "Foreground children require recovery; the pending user input remains intact."
+                    if pending_child_ids
+                    else "External effect remains unresolved; explicit receipt reconciliation is required."
                     if unresolved_effect
                     else "Session is awaiting user input; answer it with UserInputResponse."
                 ),
@@ -22975,7 +23034,7 @@ class RecoveryCoordinator:
                 tool_round_id=pending_round.tool_round_id,
                 tool_call_id=call.tool_call_id,
             )
-            recovery_arguments = self._subagent_recovery_arguments(
+            recovery_arguments = await self._subagent_recovery_arguments(
                 checkpoint=checkpoint,
                 parent_session=session,
                 tool_name=call.tool_name,
@@ -23011,8 +23070,211 @@ class RecoveryCoordinator:
                 pending.append(child.model_copy(deep=True))
         return tuple(pending)
 
-    @staticmethod
-    def _subagent_recovery_arguments(
+    async def _emit_confirmed_native_tool_terminal(
+        self, *, session: Session, record: ToolEffectRecord, event: Event
+    ) -> Event:
+        """Select native evidence and its terminal event in the existing effect transaction."""
+        prepared = self._event_writer.prepare(event)
+        await ToolEffectStateOwner(self._session_store).transition(
+            record,
+            state="failed" if prepared.type is EventType.TOOL_CALL_FAILED else "completed",
+            run_epoch=session.run_epoch,
+            terminal=ToolEffectTerminal(
+                event_id=prepared.id,
+                result_digest=sha256(
+                    canonical_durable_json_bytes(prepared.payload["result"], "native_result")
+                ).hexdigest(),
+            ),
+            events=(prepared,),
+        )
+        await self._event_writer.fan_out_persisted([prepared])
+        return copy_event(prepared)
+
+    async def _recover_terminal_foreground_effects_at_human_gate(
+        self,
+        *,
+        session: Session,
+        pending: PendingToolApproval | PendingUserInput,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity,
+        invocation_context: InvocationContext | None,
+    ) -> list[Event]:
+        """Restore native outcomes under an admitted gate resolution, without consuming it."""
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        children = await self._subagent_children_by_idempotency_key(session.id)
+        emitted: list[Event] = []
+        for call in pending.tool_calls:
+            registered_tool = registered_agent.executable_tool(call.tool_name)
+            if registered_tool is None or registered_tool.child_session_recovery is None:
+                continue
+            record = await ToolEffectStateOwner(self._session_store).resolve_call(
+                session, tool_round_id=pending.tool_round_id, tool_call_id=call.tool_call_id
+            )
+            if record is None or record.state not in {"executing", "outcome_unknown"}:
+                continue
+            intent = record.intent
+            approval_id = pending.approval_id if isinstance(pending, PendingToolApproval) else None
+            input_id = pending.input_id if isinstance(pending, PendingUserInput) else None
+            key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                approval_id=approval_id,
+                pause_id=input_id,
+            )
+            if (
+                intent.tool_name != call.tool_name
+                or intent.idempotency_key != key
+                or intent.approval_id != approval_id
+                or intent.pause_id != input_id
+                or intent.execution_profile_fingerprint != execution_profile.fingerprint
+            ):
+                raise RuntimeError("Foreground recovery conflicts with the admitted gate identity.")
+            child = children.get(key)
+            metadata = None if child is None else child.metadata.get("subagent")
+            if type(metadata) is not dict or metadata.get("mode") != "foreground":
+                continue
+            arguments = await self._subagent_recovery_arguments(
+                checkpoint=checkpoint,
+                parent_session=session,
+                tool_name=call.tool_name,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                idempotency_key=key,
+                fallback=call.arguments,
+            )
+            result = await self._reattached_subagent_result(
+                children,
+                key,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                tool_round_id=pending.tool_round_id,
+                arguments=arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
+            )
+            if result is None:
+                continue
+            tool_call = runtime_records.ToolCallRequest(
+                id=call.tool_call_id, name=call.tool_name, arguments=arguments
+            )
+            event = Event(
+                type=EventType.TOOL_CALL_FAILED
+                if result.is_error
+                else EventType.TOOL_CALL_COMPLETED,
+                session_id=session.id,
+                interaction_id=intent.interaction_id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                tool_name=call.tool_name,
+                payload={
+                    "model_step_id": intent.model_step_id,
+                    "model_attempt_id": intent.model_attempt_id,
+                    "tool_round_id": intent.tool_round_id,
+                    "tool_call_id": intent.tool_call_id,
+                    "idempotency_key": key,
+                    "recovered": True,
+                    **(
+                        {"approval_id": approval_id}
+                        if approval_id is not None
+                        else {"input_id": input_id}
+                    ),
+                    **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                },
+            )
+
+            async def publish(event: Event, selected: ToolEffectRecord = record) -> Event:
+                return await self._emit_confirmed_native_tool_terminal(
+                    session=session, record=selected, event=event
+                )
+
+            async for (
+                published,
+                _outcome,
+            ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
+                event=event,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=result,
+                task_id=pending.task_id,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+                allow_modification=False,
+                hooks_already_completed=True,
+                terminal_event_emitter=publish,
+                redactor=self._tool_round_executor.redactor_for_tool_calls(
+                    registered_agent=registered_agent, tool_calls=[tool_call]
+                ),
+            ):
+                emitted.append(published)
+        return emitted
+
+    async def _pending_foreground_children_at_human_gate(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        pending: PendingToolApproval | PendingUserInput,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> tuple[str, ...]:
+        """Read exact child obligations without repairing submissions or consuming a gate."""
+        children = await self._subagent_children_by_idempotency_key(session.id)
+        selected: list[str] = []
+        owner = ToolEffectStateOwner(self._session_store)
+        for call in pending.tool_calls:
+            effect = await owner.resolve_call(
+                session, tool_round_id=pending.tool_round_id, tool_call_id=call.tool_call_id
+            )
+            if effect is None or effect.state != "outcome_unknown":
+                continue
+            key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                approval_id=effect.intent.approval_id,
+                pause_id=effect.intent.pause_id,
+            )
+            if effect.intent.idempotency_key != key or effect.intent.tool_name != call.tool_name:
+                raise RuntimeError(
+                    "Foreground child effect conflicts with its gated call identity."
+                )
+            child = children.get(key)
+            if child is None:
+                continue
+            arguments = await self._subagent_recovery_arguments(
+                checkpoint=checkpoint,
+                parent_session=session,
+                tool_name=call.tool_name,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                idempotency_key=key,
+                fallback=call.arguments,
+            )
+            if not _matches_recoverable_subagent_child(
+                child,
+                idempotency_key=key,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments=arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
+            ):
+                continue
+            metadata = child.metadata.get("subagent")
+            if (
+                type(metadata) is dict
+                and metadata.get("mode") == "foreground"
+                and child.status
+                in {SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+            ):
+                selected.append(child.id)
+        return tuple(selected)
+
+    async def _subagent_recovery_arguments(
+        self,
         *,
         checkpoint: dict[str, Any] | None,
         parent_session: Session,
@@ -23022,7 +23284,19 @@ class RecoveryCoordinator:
         idempotency_key: str,
         fallback: dict[str, Any],
     ) -> dict[str, Any]:
-        """Restore post-hook arguments only from the exact durable spawn seed."""
+        """Restore post-hook arguments from the exact store-owned dispatched call."""
+
+        effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+            parent_session, tool_round_id=tool_round_id, tool_call_id=tool_call_id
+        )
+        effect_arguments = None
+        if effect is not None:
+            if (
+                effect.intent.tool_name != tool_name
+                or effect.intent.idempotency_key != idempotency_key
+            ):
+                raise RuntimeError("Child recovery effect conflicts with its tool call.")
+            effect_arguments = effect.child_recovery_arguments
 
         seed = durable_subagent_submission_seed_from_checkpoint(
             checkpoint,
@@ -23037,7 +23311,10 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Durable subagent submission intent has no effective-argument seed."
                 )
-            copied = copy_json_value(fallback, "subagent_recovery.arguments")
+            copied = copy_json_value(
+                fallback if effect_arguments is None else effect_arguments,
+                "subagent_recovery.arguments",
+            )
             if type(copied) is not dict:
                 raise TypeError("Subagent recovery arguments must be an object.")
             return copied
@@ -23059,6 +23336,8 @@ class RecoveryCoordinator:
         )
         if type(copied) is not dict:
             raise AssertionError("Durable subagent effective arguments must be an object.")
+        if effect_arguments is not None and copied != effect_arguments:
+            raise RuntimeError("Child recovery argument authorities conflict.")
         return copied
 
     @staticmethod
@@ -23106,7 +23385,7 @@ class RecoveryCoordinator:
         return None
 
     @staticmethod
-    def _reattached_subagent_result(
+    async def _reattached_subagent_result(
         children: dict[str, Session | None],
         idempotency_key: str,
         *,
@@ -23128,6 +23407,27 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
         ):
             return None
+        matcher = registered_agent.tools[tool_name].child_session_recovery
+        assert matcher is not None
+        subagent_metadata = child.metadata.get("subagent")
+        if (
+            type(subagent_metadata) is dict
+            and subagent_metadata.get("mode") == "foreground"
+            and child.status
+            in {
+                SessionStatus.PENDING,
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+            }
+        ):
+            raise ForegroundSubagentRecoveryRequired(
+                child_session_id=child.id, tool_round_id=tool_round_id, tool_call_id=tool_call_id
+            )
+        projected = await matcher.project_recoverable_child(child.model_copy(deep=True))
+        if projected is not None:
+            if type(projected) is not ToolResult:
+                raise TypeError("Child result projection must return a ToolResult or None.")
+            return projected.model_copy(deep=True)
         return tool_round_recovery.recovered_subagent_tool_result(
             tool_call_id=tool_call_id,
             tool_name=tool_name,

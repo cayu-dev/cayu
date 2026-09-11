@@ -7740,6 +7740,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     PENDING_APPROVAL = "pending_approval"
     PENDING_USER_INPUT = "pending_user_input"
     PENDING_TOOL_EFFECT = "pending_tool_effect"
+    PENDING_SUBAGENT = "pending_subagent"
     AMBIGUOUS_PENDING_USER_INPUT = "ambiguous_pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
@@ -7858,7 +7859,17 @@ class IncompleteSessionRecoveryResult(BaseModel):
     events: tuple[Event, ...] = Field(default_factory=tuple)
     pending_approval_id: str | None = None
     pending_user_input_id: str | None = None
+    pending_subagent_session_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=1000)
     message: str
+
+    @field_validator("pending_subagent_session_ids")
+    @classmethod
+    def validate_pending_subagent_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for session_id in value:
+            _require_bounded_session_id(session_id, "pending_subagent_session_ids")
+        if len(set(value)) != len(value):
+            raise ValueError("Pending subagent session identifiers must be unique.")
+        return value
 
     @field_validator("session_id", "message")
     @classmethod

@@ -197,6 +197,7 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._foreground_subagent_recovery import ForegroundSubagentRecoveryRequired
 from cayu.runtime._fork_source_snapshot import (
     fork_source_checkpoint_sha256,
     strip_source_owned_fork_checkpoint_state,
@@ -13058,9 +13059,9 @@ class SessionEngine:
             raise
         finally:
             finalizer_failure = sys.exception()
-            if (
-                finalizer_failure is not None
-                and workspace_observation_pending_cancellation_requests(finalizer_failure)
+            if finalizer_failure is not None and (
+                isinstance(finalizer_failure, asyncio.CancelledError)
+                or workspace_observation_pending_cancellation_requests(finalizer_failure)
             ):
                 finalizer_steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = ()
                 if release_before_run:
@@ -24947,6 +24948,11 @@ class SessionEngine:
             )
             events, propagated = await self._handle_session_interrupted_preserving_failure(
                 authoritative_failure=authoritative_failure,
+                foreground_subagent_pending=(
+                    unresolved
+                    if isinstance(unresolved, ForegroundSubagentRecoveryRequired)
+                    else None
+                ),
                 prepare_interruption=lambda: (
                     self._recovery_coordinator.deliver_pending_tool_effect_uncertainty(session)
                 ),
@@ -25134,13 +25140,31 @@ class SessionEngine:
                 billing_identity_cancellation is not None
                 or detach_credential_safe_provider_cancellation(cancellation) is not None
             )
-            if await self._session_control.interrupt_requested(session.id):
-                try:
-                    preserve_caller_cancellation = await self._has_promoted_safe_stop(session)
-                except Exception as classification_failure:
-                    # Without positive classification, do not consume the caller's
-                    # cancellation. The durable interruption remains recoverable.
-                    raise cancellation from classification_failure
+            interruption_classification: tuple[bool, bool] | None = None
+
+            async def classify_cancelled_interruption() -> None:
+                nonlocal interruption_classification
+                requested = await self._session_control.interrupt_requested(session.id)
+                promoted = await self._has_promoted_safe_stop(session) if requested else False
+                interruption_classification = (requested, promoted)
+
+            # A completed owned mutation may restore cancellation requests before
+            # propagating its original signal. These reads are part of cancellation
+            # cleanup too: redelivery must not skip terminal settlement or turn the
+            # ensuing fence release into the primary failure.
+            cancellation_had_cause = exception_cause(cancellation) is not None
+            classification_failures = await self._run_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=(("cancelled interruption classification", classify_cancelled_interruption),),
+            )
+            if classification_failures or interruption_classification is None:
+                if len(classification_failures) == 1 and not cancellation_had_cause:
+                    # Keep the established single-read failure shape; retain the
+                    # supervisor's aggregate when earlier failures also exist.
+                    raise cancellation from classification_failures[0][1]
+                raise cancellation
+            interruption_requested, preserve_caller_cancellation = interruption_classification
+            if interruption_requested:
                 interruption_events = []
 
                 async def finish_requested_interruption() -> None:
@@ -26001,9 +26025,9 @@ class SessionEngine:
             raise propagated_failure from None
         finally:
             finalizer_failure = sys.exception()
-            if (
-                finalizer_failure is not None
-                and workspace_observation_pending_cancellation_requests(finalizer_failure)
+            if finalizer_failure is not None and (
+                isinstance(finalizer_failure, asyncio.CancelledError)
+                or workspace_observation_pending_cancellation_requests(finalizer_failure)
             ):
 
                 async def discard_interrupt_signal() -> None:
@@ -28845,6 +28869,7 @@ class SessionEngine:
         self,
         *,
         authoritative_failure: BaseException,
+        foreground_subagent_pending: ForegroundSubagentRecoveryRequired | None = None,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -28898,6 +28923,7 @@ class SessionEngine:
                         events.extend(prepared_events)
             async for event in self._handle_session_interrupted(
                 session=persisted_session,
+                foreground_subagent_pending=foreground_subagent_pending,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
@@ -28990,7 +29016,16 @@ class SessionEngine:
         authoritative_failure: BaseException,
         steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...],
     ) -> BaseException:
-        """Settle finalizer awaits without replacing an interruption aggregate."""
+        """Settle finalizer awaits without replacing the authoritative interruption."""
+
+        if isinstance(authoritative_failure, asyncio.CancelledError) and not (
+            workspace_observation_pending_cancellation_requests(authoritative_failure)
+        ):
+            # Ordinary caller cancellation retains its public exception shape.
+            # A failed classifier can leave no terminal settlement; fence-release
+            # failure is then secondary, not a replacement for cancellation.
+            await self._run_cleanup_steps(authoritative_failure=authoritative_failure, steps=steps)
+            return authoritative_failure
 
         propagated_failure = authoritative_failure
         current_task = asyncio.current_task()
@@ -29076,6 +29111,7 @@ class SessionEngine:
         self,
         *,
         session: Session,
+        foreground_subagent_pending: ForegroundSubagentRecoveryRequired | None = None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
@@ -29172,6 +29208,8 @@ class SessionEngine:
                 ),
                 operation_name="Live interruption payload read",
             )
+            if foreground_subagent_pending is not None:
+                payload.update(foreground_subagent_pending.interruption_evidence())
             user_input_supersession_retained = (
                 USER_INPUT_SUPERSESSION_INTENT_KEY in payload
                 or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in payload
