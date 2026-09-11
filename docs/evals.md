@@ -42,6 +42,34 @@ schema, HTTP, storage, embedding, and operational reference.
 
 ## Minimal Example
 
+### Spacing case starts from the CLI
+
+`cayu eval run --stagger-seconds N` sets a minimum interval in **seconds**
+between concrete case-trial admissions. The default is `0` (no pacing).
+Values must be finite and nonnegative. For example, two minutes is
+`--stagger-seconds 120`:
+
+```bash
+cayu eval run --max-concurrency 15 --processes 15 --stagger-seconds 30 \
+  --output results.json
+```
+
+The first eligible trial starts immediately. Initial and replacement trials
+share one launch-wide clock, including across process workers. Capacity must
+be available before admission; missed intervals never accumulate into a burst.
+Queue waiting does not consume a per-case timeout. Cancellation and existing
+overall deadlines still stop admission, without extending those deadlines.
+This experimental control paces trial starts, not provider requests, and does
+not establish the cause of provider failures.
+
+Direct JSON reports record `metadata.cayu_launch_scheduling`; corpus execution
+JSON reports record `launch_scheduling` (included in the result's content
+revision). Both include `stagger_seconds` and an `admissions` array with case ID,
+trial number, UTC `admitted_at`, and host `monotonic_seconds`. Process directories
+also retain the interval in `launch.json` and incremental `admissions-N.json`
+worker evidence, including when a launch is interrupted. Monotonic timestamps
+are comparable within a launch on one host, not between hosts or reboots.
+
 ### Multiple CPU cores from the CLI
 
 For a project with a configured native `EvalPlan` factory:

@@ -8062,6 +8062,16 @@
             "title": "External Trials",
             "type": "array"
           },
+          "launch_scheduling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchScheduling"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "revision": {
             "title": "Revision",
             "type": "string"
@@ -18771,6 +18781,29 @@
         "title": "LabelSelectorRequirement",
         "type": "object"
       },
+      "LaunchScheduling": {
+        "additionalProperties": false,
+        "properties": {
+          "admissions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TrialAdmission"
+            },
+            "title": "Admissions",
+            "type": "array"
+          },
+          "stagger_seconds": {
+            "minimum": 0.0,
+            "title": "Stagger Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "stagger_seconds"
+        ],
+        "title": "LaunchScheduling",
+        "type": "object"
+      },
       "ListSessionEventsResponse": {
         "additionalProperties": false,
         "properties": {
@@ -21591,6 +21624,16 @@
                 "maxItems": 100000,
                 "title": "External Trials",
                 "type": "array"
+              },
+              "launch_scheduling": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/LaunchScheduling"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "revision": {
                 "title": "Revision",
@@ -33314,6 +33357,38 @@
           "total_messages"
         ],
         "title": "TranscriptSummary",
+        "type": "object"
+      },
+      "TrialAdmission": {
+        "additionalProperties": false,
+        "properties": {
+          "admitted_at": {
+            "format": "date-time",
+            "title": "Admitted At",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "monotonic_seconds": {
+            "minimum": 0.0,
+            "title": "Monotonic Seconds",
+            "type": "number"
+          },
+          "trial_number": {
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "case_id",
+          "trial_number",
+          "admitted_at",
+          "monotonic_seconds"
+        ],
+        "title": "TrialAdmission",
         "type": "object"
       },
       "TrialRequestSpec": {

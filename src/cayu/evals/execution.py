@@ -23,6 +23,7 @@ from pydantic import (
 from cayu._validation import copy_durable_json_object, json_utf8_size_within_limit
 from cayu.core.messages import Message, MessageRole, TextPart, detach_message
 from cayu.core.workflows import WorkflowSpec, copy_workflow_spec
+from cayu.evals._admission import LaunchScheduling
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.capacity import (
     DEFAULT_EVAL_MAX_ACTIVE_TRIALS,
@@ -1295,6 +1296,9 @@ class CorpusExecutionResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
+    launch_scheduling: LaunchScheduling | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     schema_version: Literal[3] = CORPUS_EXECUTION_RESULT_SCHEMA_VERSION
     revision: StrictStr
     target: EvaluationTargetIdentity
@@ -1427,6 +1431,7 @@ class CorpusExecutionResult(BaseModel):
         target: EvaluationTargetIdentity,
         run: PublishedEvalRun,
         external_trials: tuple[ExternalTrialIdentityV1, ...] = (),
+        launch_scheduling: LaunchScheduling | None = None,
     ) -> CorpusExecutionResult:
         if type(target) is not EvaluationTargetIdentity:
             raise TypeError("target must be an exact EvaluationTargetIdentity.")
@@ -1441,6 +1446,8 @@ class CorpusExecutionResult(BaseModel):
             "target": target.model_dump(mode="json"),
             "run": run.model_dump(mode="json"),
         }
+        if launch_scheduling is not None:
+            document["launch_scheduling"] = launch_scheduling.model_dump(mode="json")
         if external_trials:
             document["external_trials"] = [
                 trial.model_dump(mode="json") for trial in external_trials
@@ -1450,6 +1457,7 @@ class CorpusExecutionResult(BaseModel):
             target=target,
             run=run,
             external_trials=external_trials,
+            launch_scheduling=launch_scheduling,
         )
 
 

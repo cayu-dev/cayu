@@ -15,6 +15,12 @@ from uuid import uuid4
 
 from cayu.build_provenance import current_runtime_build_provenance
 from cayu.evals import EvalPlan, EvalRun, EvalSuite, eval_run_to_json
+from cayu.evals._admission import (
+    LaunchAdmission,
+    LaunchScheduling,
+    admission_scope,
+    validate_stagger_seconds,
+)
 from cayu.evals._inspection_documents import write_process_document as _write_json
 from cayu.evals._process_progress import ProcessEvalProgress
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
@@ -44,8 +50,9 @@ def _read_json(path: Path):
 async def _plan_identity(plan: EvalPlan) -> dict:
     if plan.suite is None or plan.corpus_target is not None:
         raise ValueError("Process execution currently requires a native direct EvalSuite.")
-    if _METADATA_KEY in plan.suite.metadata:
-        raise ValueError(f"Suite metadata reserves {_METADATA_KEY!r} for process provenance.")
+    for key in (_METADATA_KEY, "cayu_launch_scheduling"):
+        if key in plan.suite.metadata:
+            raise ValueError(f"Suite metadata reserves {key!r} for process provenance.")
     target = plan.workflow_target
     app = target.app if target is not None else plan.app
     if app is None:
@@ -119,9 +126,11 @@ async def run_process_eval(
     processes: int,
     max_concurrency: int,
     case_timeout_seconds: float | None,
+    stagger_seconds: float = 0,
     startup_timeout_seconds: float = 120,
     shutdown_grace_seconds: float = 30,
 ) -> EvalRun:
+    stagger_seconds = validate_stagger_seconds(stagger_seconds)
     if os.name != "posix":
         raise ValueError("Multi-process Cayu execution currently requires POSIX.")
     if type(processes) is not int or not 1 <= processes <= 256:
@@ -150,6 +159,7 @@ async def run_process_eval(
         "processes": count,
         "max_concurrency": max_concurrency,
         "case_timeout_seconds": case_timeout_seconds,
+        "stagger_seconds": stagger_seconds,
         "startup_timeout_seconds": startup_timeout_seconds,
         "shutdown_grace_seconds": shutdown_grace_seconds,
     }
@@ -212,6 +222,7 @@ async def run_process_eval(
             raise RuntimeError("Process eval never reached admission.")
         cases = {}
         provenance = []
+        admissions = []
         for index, expected in enumerate(assignments):
             if not expected:
                 continue
@@ -223,6 +234,14 @@ async def run_process_eval(
                 or run.run_contract is not None
             ):
                 raise RuntimeError("Eval worker result does not match its admitted cases.")
+            worker_scheduling = LaunchScheduling.model_validate(
+                _read_json(directory / f"admissions-{index}.json")
+            )
+            if worker_scheduling.stagger_seconds != stagger_seconds or sorted(
+                (item.case_id, item.trial_number) for item in worker_scheduling.admissions
+            ) != sorted((case_id, 1) for case_id in expected):
+                raise RuntimeError("Eval worker scheduling does not match its assigned cases.")
+            admissions.extend(worker_scheduling.admissions)
             for case in run.cases:
                 if case.case_id in cases:
                     raise RuntimeError("Duplicate case in process eval results.")
@@ -237,6 +256,10 @@ async def run_process_eval(
             )
         if set(cases) != set(identity["case_ids"]):
             raise RuntimeError("Process eval results are incomplete.")
+        scheduling = LaunchScheduling(
+            stagger_seconds=stagger_seconds,
+            admissions=tuple(sorted(admissions, key=lambda item: item.monotonic_seconds)),
+        )
         ordered = tuple(cases[key] for key in identity["case_ids"])
         completed_at = datetime.now(UTC)
         result = EvalRun(
@@ -250,6 +273,7 @@ async def run_process_eval(
             duration_ms=int((completed_at - started_at).total_seconds() * 1000),
             metadata={
                 **identity["metadata"],
+                "cayu_launch_scheduling": scheduling.model_dump(mode="json"),
                 _METADATA_KEY: {
                     "schema_version": 1,
                     "plan_fingerprint": identity["fingerprint"],
@@ -339,7 +363,10 @@ async def _worker(directory: Path, index: int) -> None:
             fingerprint=identity["fingerprint"],
             case_ids=tuple(assigned),
         )
-        with progress.activate():
+        pacing = LaunchAdmission(
+            launch.get("stagger_seconds", 0), directory=directory, worker=index
+        )
+        with progress.activate(), admission_scope(pacing):
             if plan.workflow_target is not None:
                 result = await run_workflow_eval_suite(
                     plan.workflow_target,

@@ -1273,9 +1273,11 @@ def test_cli_project_eval_target_runs_workflow_without_a_custom_command(
     )
     monkeypatch.chdir(tmp_path)
 
-    assert main(["eval", "run", "--output", "workflow-run.json"]) == 0
+    assert main(["eval", "run", "--stagger-seconds", "30", "--output", "workflow-run.json"]) == 0
 
     loaded = load_eval_run(tmp_path / "workflow-run.json")
+    assert loaded.metadata["cayu_launch_scheduling"]["stagger_seconds"] == 30
+    assert len(loaded.metadata["cayu_launch_scheduling"]["admissions"]) == 1
     assert loaded.status is EvalStatus.PASSED
     assert loaded.cases[0].trials[0].final_output == "done"
 

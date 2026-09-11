@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -290,12 +291,15 @@ def test_startup_failure_reaps_already_started_children(tmp_path, failure):
     asyncio.run(scenario())
 
 
-def test_native_eval_processes_preserve_complete_ordered_results(tmp_path):
+@pytest.mark.parametrize("stagger", [0, 0.15])
+def test_native_eval_processes_preserve_complete_ordered_results(tmp_path, stagger):
     _project(tmp_path)
     process = _start(
         tmp_path,
         "eval",
         "run",
+        "--stagger-seconds",
+        str(stagger),
         "--processes",
         "2",
         "--max-concurrency",
@@ -312,6 +316,12 @@ def test_native_eval_processes_preserve_complete_ordered_results(tmp_path):
         [(p.name, p.read_text()) for p in (tmp_path / "workers").glob("*.log")],
     )
     result = json.loads((tmp_path / "result.json").read_text())
+    evidence = result["metadata"]["cayu_launch_scheduling"]
+    assert evidence["stagger_seconds"] == stagger
+    stamps = [item["monotonic_seconds"] for item in evidence["admissions"]]
+    assert len(stamps) == 4
+    assert all(b - a >= stagger for a, b in pairwise(stamps))
+    assert json.loads((tmp_path / "workers/launch.json").read_text())["stagger_seconds"] == stagger
     assert result["status"] == "passed"
     assert [c["case_id"] for c in result["cases"]] == [f"case-{i}" for i in range(4)]
     provenance = result["metadata"]["cayu_process_execution"]["workers"]
@@ -760,3 +770,45 @@ while True:
                     os.kill(pid, signal.SIGKILL)
 
     asyncio.run(scenario())
+
+
+def test_staggered_process_launch_cancellation_stops_queued_cases(tmp_path):
+    _project(tmp_path)
+    process = _start(
+        tmp_path,
+        "eval",
+        "run",
+        "--processes",
+        "2",
+        "--max-concurrency",
+        "2",
+        "--stagger-seconds",
+        "60",
+        "--process-directory",
+        "workers",
+        "--output",
+        "result.json",
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not list((tmp_path / "workers").glob("admissions-*.json")):
+            assert process.poll() is None, process.communicate()
+            if time.monotonic() >= deadline:
+                pytest.fail("first trial was never admitted")
+            time.sleep(0.02)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = _finished(process, 40)
+        assert process.returncode == 2, (stdout, stderr)
+        admissions = [
+            item
+            for path in (tmp_path / "workers").glob("admissions-*.json")
+            for item in json.loads(path.read_text())["admissions"]
+        ]
+        assert len(admissions) == 1
+        assert not (tmp_path / "result.json").exists()
+        assert (tmp_path / "workers/incomplete.json").exists()
+        _assert_dead([int(p.stem.split("-")[1]) for p in tmp_path.glob("factory-*.json")])
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)

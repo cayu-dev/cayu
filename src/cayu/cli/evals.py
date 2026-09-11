@@ -54,6 +54,7 @@ from cayu.evals import (
     render_memory_experiment_report_html,
     run_eval_plan,
 )
+from cayu.evals._admission import LaunchAdmission, admission_scope
 from cayu.runtime._process_workers import positive_process_count
 from cayu.runtime.app import CayuApp
 
@@ -103,6 +104,13 @@ def add_eval_parser(subparsers: Any) -> None:
         default=1,
         metavar="COUNT",
         help="Maximum concurrently executing cases (default: 1).",
+    )
+    run.add_argument(
+        "--stagger-seconds",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="Minimum interval between case admissions (default: 0); 2 minutes = 120 seconds.",
     )
     run.add_argument(
         "--processes",
@@ -414,6 +422,12 @@ def _inspection_text(value: str) -> str:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    admission = LaunchAdmission(getattr(args, "stagger_seconds", 0))
+    with admission_scope(admission):
+        return await _run_with_admission(args, admission)
+
+
+async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmission) -> int:
     project = resolve_eval_project(args.target)
     label = (
         "Command-line eval target"
@@ -452,6 +466,7 @@ async def _run(args: argparse.Namespace) -> int:
                 project_root=project.root,
                 directory=directory,
                 processes=args.processes,
+                stagger_seconds=admission.stagger_seconds,
                 max_concurrency=args.max_concurrency,
                 case_timeout_seconds=args.case_timeout_seconds,
             )
@@ -462,6 +477,8 @@ async def _run(args: argparse.Namespace) -> int:
         if getattr(args, "process_directory", None) is not None:
             raise ValueError("--process-directory requires --processes greater than one.")
         plan = await _load_eval_plan(project.target, label=label)
+        if plan.suite is not None and "cayu_launch_scheduling" in plan.suite.metadata:
+            raise ValueError("Suite metadata reserves cayu_launch_scheduling for CLI evidence.")
         if args.corpus is None:
             if plan.corpus_target is not None or (
                 plan.workflow_target is not None and plan.suite is None
@@ -476,6 +493,10 @@ async def _run(args: argparse.Namespace) -> int:
             )
             if type(run) is not EvalRun:
                 raise TypeError("Direct EvalPlan returned an unexpected corpus result.")
+            run.metadata = {
+                **run.metadata,
+                "cayu_launch_scheduling": admission.evidence().model_dump(mode="json"),
+            }
             output = eval_run_to_json(run)
             _write_or_print(output, args.output)
             if args.html_output is not None:
@@ -498,6 +519,12 @@ async def _run(args: argparse.Namespace) -> int:
         )
         if type(result) is not CorpusExecutionResult:
             raise TypeError("Corpus EvalPlan returned an unexpected direct result.")
+        result = CorpusExecutionResult.create(
+            target=result.target,
+            run=result.run,
+            external_trials=result.external_trials,
+            launch_scheduling=admission.evidence(),
+        )
         _write_or_print(corpus_execution_result_to_json(result), args.output)
         if args.html_output is not None:
             Path(args.html_output).write_text(

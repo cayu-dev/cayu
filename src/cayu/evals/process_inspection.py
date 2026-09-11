@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu.build_provenance import RuntimeBuildProvenance
+from cayu.evals._admission import LaunchScheduling, TrialAdmission
 from cayu.evals._inspection_documents import ProcessDocuments, decode_document, read_regular_file
 from cayu.evals.models import EvalRun, EvalStatus, aggregate_eval_score, aggregate_eval_status
 from cayu.evals.session_inspection import EvalSessionInspectionV1, inspect_eval_sessions
@@ -75,6 +76,7 @@ class EvalProcessInspectionV1(_Model):
     plan_fingerprint: str | None = None
     plan_metadata: dict[str, Any] = Field(default_factory=dict)
     max_concurrency: int
+    launch_scheduling: LaunchScheduling | None = None
     case_timeout_seconds: float | None
     supervisor_pid: int | None = None
     python_version: str | None = None
@@ -101,6 +103,7 @@ class _Launch(_Model):
     target: str = Field(min_length=1, max_length=4096)
     processes: StrictInt = Field(ge=1, le=256)
     max_concurrency: StrictInt = Field(ge=1, le=100)
+    stagger_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
     case_timeout_seconds: float | None
     startup_timeout_seconds: float
     shutdown_grace_seconds: float
@@ -287,12 +290,22 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
             raise ValueError("Process assignments do not match the admitted plan.")
         if len({item.pid for item in ready.values()}) != launch.processes:
             raise ValueError("Admitted worker PIDs are not distinct.")
+    observed_admissions: list[TrialAdmission] = []
     workers: list[EvalProcessWorkerInspectionV1] = []
     cases: dict[str, EvalProcessCaseInspectionV1] = {}
     statuses: list[EvalStatus] = []
     scores: list[float | None] = []
     for index in range(launch.processes):
         expected = assignments[index]
+        scheduling_document = documents.read(f"admissions-{index}.json")
+        if scheduling_document is not None:
+            scheduling = LaunchScheduling.model_validate(scheduling_document)
+            if scheduling.stagger_seconds != launch.stagger_seconds or any(
+                entry.case_id not in expected or entry.trial_number != 1
+                for entry in scheduling.admissions
+            ):
+                raise ValueError("Worker scheduling evidence does not match its admission.")
+            observed_admissions.extend(scheduling.admissions)
         item = ready.get(index)
         progress_document = documents.read(f"progress-{index}.json")
         progress = (
@@ -412,6 +425,10 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
         plan_fingerprint=None if identity is None else identity.fingerprint,
         plan_metadata={} if identity is None else identity.metadata,
         max_concurrency=launch.max_concurrency,
+        launch_scheduling=LaunchScheduling(
+            stagger_seconds=launch.stagger_seconds,
+            admissions=tuple(sorted(observed_admissions, key=lambda item: item.monotonic_seconds)),
+        ),
         case_timeout_seconds=launch.case_timeout_seconds,
         supervisor_pid=launch.supervisor_pid,
         python_version=launch.python_version,

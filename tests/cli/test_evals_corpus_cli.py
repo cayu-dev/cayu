@@ -209,6 +209,8 @@ def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
             "eval",
             "run",
             f"{__name__}:build_corpus_eval_plan",
+            "--stagger-seconds",
+            "30",
             "--corpus",
             str(corpus_path),
             "--output",
@@ -220,6 +222,9 @@ def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
 
     result = load_corpus_execution_result(result_path)
     assert exit_code == 0
+    assert result.launch_scheduling.stagger_seconds == 30
+    assert len(result.launch_scheduling.admissions) == 1
+    assert result.launch_scheduling.admissions[0].case_id == "refund-approved"
     assert result.run.status == "passed"
     assert result.run.suite_id == "refunds"
     assert result.target.application_release_id == "release-2026-08-06"

@@ -521,3 +521,58 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
     assert f"Configured eval target from {pyproject}" in invalid_error
     assert "returned an invalid eval plan" in invalid_error
     assert "Eval target must return EvalPlan" in invalid_error
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "-inf"])
+def test_stagger_rejects_invalid_values_before_loading_target(monkeypatch, capsys, value):
+    from cayu.cli import evals
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid stagger loaded the target")
+
+    monkeypatch.setattr(evals, "resolve_eval_project", unexpected)
+    assert main(["eval", "run", f"--stagger-seconds={value}"]) == 2
+    assert "finite and nonnegative" in _captured_eval_error(capsys)
+
+
+def build_stagger_eval_plan() -> EvalPlan:
+    plan = build_slow_eval_plan()
+    first = plan.suite.cases[0]
+    return EvalPlan(
+        app=plan.app,
+        suite=EvalSuite(
+            id="stagger",
+            cases=[
+                first,
+                EvalCase(id="replacement", request=first.request, assertions=first.assertions),
+            ],
+        ),
+    )
+
+
+def test_stagger_queue_does_not_consume_real_case_timeout(tmp_path):
+    output = tmp_path / "paced.json"
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_stagger_eval_plan",
+                "--max-concurrency",
+                "2",
+                "--stagger-seconds",
+                "4",
+                "--case-timeout-seconds",
+                "3",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    run = load_eval_run(output)
+    assert all(case.status == EvalStatus.PASSED for case in run.cases)
+    scheduling = run.metadata["cayu_launch_scheduling"]
+    assert scheduling["stagger_seconds"] == 4
+    first, second = scheduling["admissions"]
+    assert second["monotonic_seconds"] - first["monotonic_seconds"] >= 4

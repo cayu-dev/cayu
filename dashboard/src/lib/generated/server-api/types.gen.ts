@@ -3941,6 +3941,7 @@ export type CorpusExecutionResult = {
      * External Trials
      */
     external_trials?: Array<ExternalTrialIdentityV1>;
+    launch_scheduling?: LaunchScheduling | null;
     /**
      * Revision
      */
@@ -9267,6 +9268,20 @@ export type LabelSelectorRequirement = {
 };
 
 /**
+ * LaunchScheduling
+ */
+export type LaunchScheduling = {
+    /**
+     * Admissions
+     */
+    admissions?: Array<TrialAdmission>;
+    /**
+     * Stagger Seconds
+     */
+    stagger_seconds: number;
+};
+
+/**
  * ListSessionEventsResponse
  */
 export type ListSessionEventsResponse = {
@@ -10776,6 +10791,7 @@ export type MemoryPublishedResultEvidence = {
          * External Trials
          */
         external_trials?: Array<ExternalTrialIdentityV1>;
+        launch_scheduling?: LaunchScheduling | null;
         /**
          * Revision
          */
@@ -16813,6 +16829,28 @@ export type TranscriptSummary = {
      * Total Messages
      */
     total_messages: number;
+};
+
+/**
+ * TrialAdmission
+ */
+export type TrialAdmission = {
+    /**
+     * Admitted At
+     */
+    admitted_at: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Monotonic Seconds
+     */
+    monotonic_seconds: number;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
 };
 
 /**

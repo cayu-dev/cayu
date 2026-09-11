@@ -34,6 +34,7 @@ from cayu.artifacts import (
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
 from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
+from cayu.evals._admission import admission_scope, current_launch_admission
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
@@ -1267,6 +1268,7 @@ async def _schedule_suite_trials(
             _EvalTrialPublicData.model_validate(public_data.model_dump(mode="python")),
         )
     semaphore = asyncio.Semaphore(max_concurrency)
+    admission = current_launch_admission()
 
     async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
         async with semaphore:
@@ -1274,7 +1276,11 @@ async def _schedule_suite_trials(
                 nullcontext() if execution_capacity is None else execution_capacity.slot()
             )
             async with capacity_slot:
-                execution = await execute_trial(case, trial_number)
+                if admission is not None:
+                    await admission.admit(case.id, trial_number)
+                # Nested evaluations are not additional cases of this CLI launch.
+                with admission_scope(None):
+                    execution = await execute_trial(case, trial_number)
                 result, public_data = execution
                 if trial_completed is not None:
                     if public_data is None:
