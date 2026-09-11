@@ -1,5 +1,15 @@
 # Release notes
 
+## v0.5.2
+
+- Generated projects disable automatic knowledge maintenance by default.
+- Stabilize CI deadline, cancellation, and process cleanup checks under
+  scheduling delays.
+
+This release requires storage revision **84**; older populated stores may
+require recreation. Server contract **44** and manifest/generator schema **17**
+are unchanged.
+
 ## v0.5.1
 
 A reliability update for retry settlement and release verification.

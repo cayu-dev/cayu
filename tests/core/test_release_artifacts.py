@@ -5,6 +5,8 @@ import json
 import runpy
 import shutil
 import stat
+import subprocess
+import sys
 import tarfile
 import tomllib
 import zipfile
@@ -34,6 +36,42 @@ validate_sdist = artifact_validator["validate_sdist"]
 validate_wheel = artifact_validator["validate_wheel"]
 validate_sidecar_equivalence = artifact_validator["validate_sidecar_equivalence"]
 validate_dashboard_source_equivalence = artifact_validator["validate_dashboard_source_equivalence"]
+
+
+def test_built_wheel_serve_startup_timeout_reaps_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    smoke = runpy.run_path(str(_ROOT / "scripts" / "smoke_built_wheel_serve.py"))
+    start_server = smoke["_start_server"]
+    processes: list[subprocess.Popen[str]] = []
+    original_popen = subprocess.Popen
+
+    def spawn(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        process = original_popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        processes.append(process)
+        return process
+
+    def timeout(process: subprocess.Popen[str], port: int) -> None:
+        raise TimeoutError("health startup deadline expired")
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setitem(start_server.__globals__, "_available_port", lambda: 12345)
+    monkeypatch.setitem(start_server.__globals__, "_wait_for_health", timeout)
+    try:
+        with pytest.raises(TimeoutError, match="health startup deadline expired"):
+            start_server(tmp_path, {})
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
 
 
 def _canonical_sidecar() -> dict[str, bytes]:

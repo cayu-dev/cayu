@@ -70,9 +70,9 @@
         ]
       },
       "name": "Compaction and cross-source follow-up",
-      "revision": "sha256:70ee06c462f8a23061d1d531c7dc0ee2a298f3f344cc7791b94c30eb68a29a00",
+      "revision": "sha256:30c54c82ff01b32398b25ab41dcf5800e6b35d323f0b1275ba0f933707dcbf40",
       "source": {
-        "app_manifest_fingerprint": "cc8797fd29dea6221ddbbe3c687595c189ebf031f754268fe9daff9e4e1f323f",
+        "app_manifest_fingerprint": "a5a6cd4efbf63cae29ec7019d3fdd0f6e57b210d83ee42d298e87949260aee03",
         "app_manifest_schema_version": "17",
         "application_release_id": "cayu-causal-memory-reference-v2",
         "evidence_revision": "sha256:0d50262c4a95687aa7e5ecd65627ef3b32f01574730e4ae84ab5982a85d4b935",
@@ -142,9 +142,9 @@
         ]
       },
       "name": "Current memory improves the answer without stale claims",
-      "revision": "sha256:297385ecc355b2066a06fdd8bb9703a635c8ff825bcc868c27e95558b465db77",
+      "revision": "sha256:d574d3692f2ac89d464cb23fe8bc0f0cdc7b2da736de0f2a2563fb0f2a4f476e",
       "source": {
-        "app_manifest_fingerprint": "cc8797fd29dea6221ddbbe3c687595c189ebf031f754268fe9daff9e4e1f323f",
+        "app_manifest_fingerprint": "a5a6cd4efbf63cae29ec7019d3fdd0f6e57b210d83ee42d298e87949260aee03",
         "app_manifest_schema_version": "17",
         "application_release_id": "cayu-causal-memory-reference-v2",
         "evidence_revision": "sha256:0d50262c4a95687aa7e5ecd65627ef3b32f01574730e4ae84ab5982a85d4b935",
@@ -214,9 +214,9 @@
         ]
       },
       "name": "Admitted memory is neutral and unauthorized memory stays silent",
-      "revision": "sha256:e7b7d778a2916d7dab35d82a24ecd9f152c8adb899175d52c50fe91521f1b6e8",
+      "revision": "sha256:0532e3e2276c900df3c901a32b7685de6b14069b411b022f5e03131bee0b4942",
       "source": {
-        "app_manifest_fingerprint": "cc8797fd29dea6221ddbbe3c687595c189ebf031f754268fe9daff9e4e1f323f",
+        "app_manifest_fingerprint": "a5a6cd4efbf63cae29ec7019d3fdd0f6e57b210d83ee42d298e87949260aee03",
         "app_manifest_schema_version": "17",
         "application_release_id": "cayu-causal-memory-reference-v2",
         "evidence_revision": "sha256:0d50262c4a95687aa7e5ecd65627ef3b32f01574730e4ae84ab5982a85d4b935",
@@ -241,7 +241,7 @@
     "schema_version": 1
   },
   "pricing_profile": null,
-  "revision": "sha256:ac5d131f8c59e22b0d2887da83733981f5ea6703331c30fe06ba3f16e1a8f7b8",
+  "revision": "sha256:879094029d92509d8a9bec8763250e332c08f25a1af75f54a47185bf9939ad5f",
   "schema_version": 4,
   "suites": [
     {

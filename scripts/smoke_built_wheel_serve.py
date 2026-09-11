@@ -106,10 +106,12 @@ def _start_server(
         )
         try:
             _wait_for_health(process, port)
-        except RuntimeError as exc:
+        except (RuntimeError, TimeoutError) as exc:
             if process.poll() is None:
                 process.kill()
-                process.communicate(timeout=5)
+                stdout, stderr = process.communicate(timeout=5)
+                if isinstance(exc, TimeoutError):
+                    raise TimeoutError(f"{exc}\n{stdout}{stderr}") from exc
             if "address already in use" in str(exc).lower() and attempt < 4:
                 continue
             raise
@@ -118,7 +120,7 @@ def _start_server(
 
 
 def _wait_for_health(process: subprocess.Popen[str], port: int) -> None:
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 60
     url = f"http://127.0.0.1:{port}/api/health"
     while time.monotonic() < deadline:
         if process.poll() is not None:

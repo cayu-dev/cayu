@@ -42,6 +42,30 @@ class _StopAfterDurableTrials(RuntimeError):
     pass
 
 
+def test_reference_campaign_corpus_matches_current_application(tmp_path: Path) -> None:
+    async def verify() -> None:
+        sessions = causal_memory_campaign.SQLiteSessionStore(tmp_path / "sessions.sqlite")
+        budgets = causal_memory_campaign.SQLiteBudgetLedger(tmp_path / "budgets.sqlite")
+        try:
+            factory = causal_memory_campaign._CampaignApplicationFactory(
+                sessions=sessions,
+                budgets=budgets,
+                provider=causal_memory_campaign._scripted_provider(recover_only=False),
+            )
+            target = causal_memory_campaign._target(
+                factory, policy=causal_memory_campaign._recall_policy()
+            )
+            expected = causal_memory_campaign.build_causal_memory_reference_corpus(
+                app_manifest=target.app.describe()
+            )
+            assert load_causal_memory_reference_corpus(_CORPUS) == expected
+        finally:
+            await budgets.close()
+            await sessions.close()
+
+    asyncio.run(verify())
+
+
 @pytest.mark.qualification
 def test_reference_campaign_runs_real_paired_trials_and_recovers_in_fresh_process(
     tmp_path: Path,

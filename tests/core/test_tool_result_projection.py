@@ -2655,7 +2655,7 @@ def test_interruption_during_artifact_persistence_does_not_repeat_tool_or_store(
                 )
             )
         )
-        await asyncio.wait_for(artifact_store.started.wait(), timeout=10)
+        await asyncio.wait_for(artifact_store.started.wait(), timeout=30)
         interrupt_task = asyncio.create_task(
             _collect(
                 app.interrupt_session(
@@ -2674,10 +2674,10 @@ def test_interruption_during_artifact_persistence_does_not_repeat_tool_or_store(
                     return
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_until_interrupting(), timeout=5)
+        await asyncio.wait_for(wait_until_interrupting(), timeout=30)
         artifact_store.release.set()
-        interrupt_events = await asyncio.wait_for(interrupt_task, timeout=5)
-        run_events = await asyncio.wait_for(run_task, timeout=5)
+        interrupt_events = await asyncio.wait_for(interrupt_task, timeout=30)
+        run_events = await asyncio.wait_for(run_task, timeout=30)
         resumed_events = await asyncio.wait_for(
             _collect(
                 app.resume(
@@ -2687,7 +2687,7 @@ def test_interruption_during_artifact_persistence_does_not_repeat_tool_or_store(
                     )
                 )
             ),
-            timeout=5,
+            timeout=30,
         )
         return tool, artifact_store, interrupt_events, run_events, resumed_events
 
@@ -2761,7 +2761,7 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
                 )
             )
         )
-        await asyncio.wait_for(artifact_store.started.wait(), timeout=10)
+        await asyncio.wait_for(artifact_store.started.wait(), timeout=30)
         interrupt_events = await asyncio.wait_for(
             _collect(
                 app.interrupt_session(
@@ -2771,9 +2771,9 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
                     )
                 )
             ),
-            timeout=1,
+            timeout=30,
         )
-        run_events = await asyncio.wait_for(run_task, timeout=1)
+        run_events = await asyncio.wait_for(run_task, timeout=30)
         return interrupt_events, run_events, artifact_store
 
     interrupt_events, run_events, artifact_store = asyncio.run(scenario())
@@ -2783,6 +2783,7 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
     terminal = next(event for event in run_events if event.type is EventType.TOOL_CALL_COMPLETED)
     assert terminal.payload["tool_result_projection"]["status"] == "failed"
     assert terminal.payload["tool_result_projection"]["failure_type"] == "projection_timeout"
+    assert not artifact_store.release.is_set()
     assert artifact_store.writes == 1
 
 
@@ -2805,7 +2806,7 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
     def blocked_rename(*args, **kwargs) -> None:
         started.set()
         try:
-            if not release.wait(timeout=30):
+            if not release.wait(timeout=120):
                 raise TimeoutError("test did not release local artifact publication")
             rename(*args, **kwargs)
         finally:
@@ -2870,9 +2871,9 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
                         )
                     )
                 ),
-                timeout=10,
+                timeout=30,
             )
-            run_events = await asyncio.wait_for(run_task, timeout=10)
+            run_events = await asyncio.wait_for(run_task, timeout=30)
             # The external writer must still be held when interruption returns;
             # extra observation headroom must not let it settle before this check.
             assert not finished.is_set()
@@ -2965,20 +2966,20 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
                 events.append(event)
 
         run_task = asyncio.create_task(collect_run())
-        await asyncio.wait_for(artifact_store.cancellation_observed.wait(), timeout=10)
+        await asyncio.wait_for(artifact_store.cancellation_observed.wait(), timeout=30)
 
         async def wait_for_terminal_projection() -> None:
             while not any(event.type is EventType.TOOL_CALL_COMPLETED for event in events):
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_for_terminal_projection(), timeout=10)
+        await asyncio.wait_for(wait_for_terminal_projection(), timeout=30)
         terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
         settlement = terminal.payload["tool_result_projection"]["artifact_write_settlement"]
         assert settlement["status"] == "reconciliation_required"
         assert settlement["phase"] == "content"
         assert not run_task.done()
         artifact_store.release.set()
-        await asyncio.wait_for(run_task, timeout=10)
+        await asyncio.wait_for(run_task, timeout=30)
 
         async def wait_for_orphan() -> dict[str, Any]:
             while True:
@@ -2987,7 +2988,7 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
                     return dict(listed.artifacts[0].metadata)
                 await asyncio.sleep(0)
 
-        metadata = await asyncio.wait_for(wait_for_orphan(), timeout=10)
+        metadata = await asyncio.wait_for(wait_for_orphan(), timeout=30)
         return events, metadata
 
     events, metadata = asyncio.run(scenario())
