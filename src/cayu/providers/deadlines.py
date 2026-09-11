@@ -115,8 +115,18 @@ class ProviderStreamDeadlineEvidence:
     last_progress_elapsed_s: float | None
     last_progress_at: datetime | None
     whitespace_since_progress: bool = False
+    semantic_idle_elapsed_s: float | None = None
+    excluded_semantic_pause_s: float | None = None
 
     def __post_init__(self) -> None:
+        for name in ("semantic_idle_elapsed_s", "excluded_semantic_pause_s"):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) not in {int, float} or not math.isfinite(value) or value < 0
+            ):
+                raise ValueError(f"{name} must be finite and non-negative.")
+        if (self.semantic_idle_elapsed_s is None) != (self.excluded_semantic_pause_s is None):
+            raise ValueError("Semantic timing evidence must be present or absent together.")
         if type(self.whitespace_since_progress) is not bool:
             raise TypeError("whitespace_since_progress must be a bool.")
         if type(self.deadline_kind) is not ProviderDeadlineKind:
@@ -152,6 +162,9 @@ class ProviderStreamDeadlineEvidence:
             "provider_deadline_timeout_s": self.configured_timeout_s,
             "provider_stream_elapsed_s": self.elapsed_s,
         }
+        if self.semantic_idle_elapsed_s is not None:
+            payload["provider_semantic_idle_elapsed_s"] = self.semantic_idle_elapsed_s
+            payload["provider_excluded_semantic_pause_s"] = self.excluded_semantic_pause_s
         if self.whitespace_since_progress:
             payload["provider_whitespace_since_progress"] = True
         if self.last_progress_kind is not None:
@@ -359,6 +372,7 @@ class ProviderStreamDeadlineController:
         self._cleanup_observer = _local_http_cleanup_observer.get()
         self._terminal_observed = False
         self._whitespace_since_progress = False
+        self._excluded_semantic_pause_s = 0.0
 
     def close(self) -> None:
         """Release admission only after every retained provider read settles."""
@@ -394,6 +408,7 @@ class ProviderStreamDeadlineController:
             raise TypeError("kind must be ProviderProgressKind.")
         observed_at = self._loop.time()
         self._whitespace_since_progress = False
+        self._excluded_semantic_pause_s = 0.0
         self._last_semantic_at = observed_at
         self._last_progress_observed_at = observed_at
         self._last_progress_kind = kind
@@ -417,6 +432,7 @@ class ProviderStreamDeadlineController:
             self._last_protocol_at += elapsed
         if ProviderDeadlineKind.SEMANTIC_IDLE in selected:
             self._last_semantic_at += elapsed
+            self._excluded_semantic_pause_s += elapsed
 
     def _deadline_at(self, kind: ProviderDeadlineKind) -> float:
         if kind is ProviderDeadlineKind.ABSOLUTE:
@@ -461,6 +477,8 @@ class ProviderStreamDeadlineController:
         )
         return ProviderStreamDeadlineEvidence(
             whitespace_since_progress=self._whitespace_since_progress,
+            semantic_idle_elapsed_s=max(0.0, observed_at - self._last_semantic_at),
+            excluded_semantic_pause_s=self._excluded_semantic_pause_s,
             deadline_kind=selected,
             configured_timeout_s=self._configured_timeout(selected),
             elapsed_s=elapsed,

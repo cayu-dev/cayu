@@ -1752,7 +1752,7 @@ def test_wrong_type_provider_error_code_cannot_bypass_deadline_claim(
 @pytest.mark.parametrize("whitespace", [" ", "\n", " \t\r\n\u00a0\u2003\u2028"])
 @pytest.mark.parametrize("chunks", [1, 16, 256])
 @pytest.mark.parametrize("adapter", ["normalized", "openai", "chat"])
-@pytest.mark.parametrize("initial_text", ["", "substantive"])
+@pytest.mark.parametrize("initial_text", ["", "substantive", '{"value":'])
 async def test_whitespace_stream_has_chunk_independent_semantic_bound(
     monkeypatch: pytest.MonkeyPatch, whitespace: str, chunks: int, adapter: str, initial_text: str
 ) -> None:

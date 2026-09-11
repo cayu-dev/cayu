@@ -2263,6 +2263,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "provider_effect_outcome",
         "provider_last_progress_at",
         "provider_whitespace_since_progress",
+        "provider_semantic_idle_elapsed_s",
+        "provider_excluded_semantic_pause_s",
         "provider_last_progress_elapsed_s",
         "provider_last_progress_kind",
         "provider_recovery_disposition",
@@ -2289,6 +2291,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "provider_last_progress_elapsed_s",
         "provider_last_progress_kind",
         "provider_whitespace_since_progress",
+        "provider_semantic_idle_elapsed_s",
+        "provider_excluded_semantic_pause_s",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )

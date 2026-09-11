@@ -8996,6 +8996,28 @@ text, counts, or raw content. It describes an observation, not the origin of the
 output or a new deadline kind; the actual expired clock and unknown-effect
 settlement authority remain unchanged.
 
+New deadline evidence also retains `provider_semantic_idle_elapsed_s` (effective
+idle time since the last accepted semantic progress, or stream start) and
+`provider_excluded_semantic_pause_s` (consumer pause time excluded from that
+semantic interval). Both reset on accepted semantic progress. These finite,
+non-negative values survive error copying, durable `model.error` readback,
+provider-operation evidence, and local HTTP cleanup projection. Older evidence
+may omit both. Wall-clock stream elapsed and the original last-progress timestamp
+remain unchanged; subtracting wall times alone does not prove a late timer.
+
+The credential-free controls in `tests/core/test_whitespace_stream_attribution.py`
+compare synthetic transport chunk/byte counts with normalized text event/UTF-8
+byte counts, and assert exact accepted-prefix preservation across spaces,
+newlines, tabs, Unicode whitespace, and HTTP chunk boundaries. Incomplete JSON
+prefixes are bounded by semantic idle; ordinary JSON whitespace completes when
+substantive progress resumes. Deadline controls also vary logical delta chunking
+and exercise excluded consumer pauses. Local response closure is checked
+independently from unknown remote effect outcome. These fixtures retain no live
+model content and do not establish an upstream origin, a historical timer bug,
+or remote settlement. Live structural capture requires separate authorization
+and must not replay a request.
+
+
 `stream_deadlines` is the sole bundled-provider deadline configuration input.
 Custom transport protocols receive the four explicit clocks independently,
 preserving transport and decoded-protocol ownership.

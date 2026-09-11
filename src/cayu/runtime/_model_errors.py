@@ -59,6 +59,8 @@ _PROVIDER_STREAM_DEADLINE_PAYLOAD_KEYS = frozenset(
         "provider_last_progress_elapsed_s",
         "provider_last_progress_at",
         "provider_whitespace_since_progress",
+        "provider_semantic_idle_elapsed_s",
+        "provider_excluded_semantic_pause_s",
         "provider_effect_outcome",
         "provider_recovery_disposition",
         "stream_cleanup_failed",
@@ -856,6 +858,8 @@ def copy_model_provider_error_control(error: ModelProviderError) -> ModelProvide
                     last_progress_elapsed_s=evidence.last_progress_elapsed_s,
                     last_progress_at=evidence.last_progress_at,
                     whitespace_since_progress=evidence.whitespace_since_progress,
+                    semantic_idle_elapsed_s=evidence.semantic_idle_elapsed_s,
+                    excluded_semantic_pause_s=evidence.excluded_semantic_pause_s,
                 ),
                 stream_cleanup_failed=error.stream_cleanup_failed,
                 recovery_disposition=error.recovery_disposition,
@@ -996,6 +1000,8 @@ def model_provider_error_from_payload(
                 last_progress_elapsed_s=payload.get("provider_last_progress_elapsed_s"),
                 last_progress_at=progress_at,
                 whitespace_since_progress=payload.get("provider_whitespace_since_progress", False),
+                semantic_idle_elapsed_s=payload.get("provider_semantic_idle_elapsed_s"),
+                excluded_semantic_pause_s=payload.get("provider_excluded_semantic_pause_s"),
             )
             recovery_disposition = cast(
                 "ModelStreamRecoveryDisposition",
