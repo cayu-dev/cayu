@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Iterable, Mapping
+from dataclasses import replace
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, urlencode
@@ -55,6 +56,7 @@ from cayu.providers._credential_boundary import (
 from cayu.providers._http import (
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
+    _trusted_sse_response_structure,
     _trusted_sse_retry_after_s,
     aclose_transport,
     copy_headers,
@@ -492,6 +494,7 @@ class HttpxOpenAITransport:
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
+            capture_response_structure=True,
             client=self._client.get(),
             url=url,
             headers=headers,
@@ -541,6 +544,7 @@ class HttpxOpenAITransport:
     ) -> AsyncIterator[Mapping[str, Any]]:
         reconnect_url = f"{url}?{urlencode({'stream': 'true', 'starting_after': starting_after})}"
         events = stream_sse_json_events(
+            capture_response_structure=True,
             client=self._client.get(),
             method="GET",
             url=reconnect_url,
@@ -3092,7 +3096,10 @@ async def openai_stream_events(
 
     pending_call_ids: set[str] = set()
     seen_call_ids: set[str] = set()
-    parsed_events = _openai_stream_events(events, reasoning_state=reasoning_state)
+    search_trace = SearchStreamTrace()
+    parsed_events = _openai_stream_events(
+        events, reasoning_state=reasoning_state, search_trace=search_trace
+    )
     try:
         async with aclosing_provider_stream(parsed_events):
             async for event in parsed_events:
@@ -3121,18 +3128,31 @@ async def openai_stream_events(
                     elif status in {"completed", "incomplete", "failed", "outcome_unknown"}:
                         pending_call_ids.discard(call_id)
                 yield event
-    except Exception:
+    except Exception as exc:
+        if (
+            isinstance(exc, OpenAIProtocolError)
+            and exc.stream_diagnostic is None
+            and search_trace.has_search
+        ):
+            exc.stream_diagnostic = search_trace.snapshot()
         for call_id in sorted(pending_call_ids):
             yield _web_search_outcome_unknown_event(call_id)
         raise
 
 
 async def _openai_stream_events(
-    events: AsyncIterator[Mapping[str, Any]], *, reasoning_state: str = "inline"
+    events: AsyncIterator[Mapping[str, Any]],
+    *,
+    reasoning_state: str = "inline",
+    search_trace: SearchStreamTrace | None = None,
 ) -> AsyncIterator[ModelStreamEvent]:
     trace = FunctionStreamTrace()
+    search_trace = search_trace or SearchStreamTrace()
     parsed_events = _openai_stream_events_impl(
-        events, reasoning_state=reasoning_state, function_trace=trace
+        events,
+        reasoning_state=reasoning_state,
+        function_trace=trace,
+        search_trace=search_trace,
     )
     try:
         async with aclosing_provider_stream(parsed_events):
@@ -3140,7 +3160,18 @@ async def _openai_stream_events(
                 yield event
     except OpenAIProtocolError as exc:
         if trace.has_function and exc.stream_diagnostic is None:
-            exc.stream_diagnostic = trace.snapshot()
+            diagnostic = trace.snapshot()
+            if search_trace.has_search:
+                # Preserve function registration evidence while adding the shared
+                # boundary structure and search identity relationships.
+                search = search_trace.snapshot()
+                diagnostic = replace(
+                    diagnostic,
+                    identities=search.identities,
+                    structure=search.structure,
+                    transport=search.transport,
+                )
+            exc.stream_diagnostic = diagnostic
         raise
 
 
@@ -3219,6 +3250,7 @@ async def _openai_stream_events_impl(
     *,
     reasoning_state: str,
     function_trace: FunctionStreamTrace,
+    search_trace: SearchStreamTrace,
 ) -> AsyncIterator[ModelStreamEvent]:
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
     pending_reasoning_items: set[int] = set()
@@ -3234,13 +3266,13 @@ async def _openai_stream_events_impl(
     fallback_output_items: dict[int, dict[str, Any]] = {}
     pending_replay_items: dict[int, tuple[str, str]] = {}
     lifecycle = StreamLifecycle(_OPENAI_STREAM_POLICY, error_factory=_openai_lifecycle_error)
-    search_trace = SearchStreamTrace()
     async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
             raise OpenAIProtocolError(
                 "OpenAI stream event must be a JSON object.",
                 reason_code="stream_event_must_be_a_json_object",
             )
+        search_trace.transport_snapshot(_trusted_sse_response_structure(event))
         search_trace.record(
             event, pending_web_search_calls, fallback_output_items, lifecycle.response_id
         )

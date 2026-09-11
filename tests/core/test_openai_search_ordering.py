@@ -317,6 +317,13 @@ async def test_bounded_trace_survives_native_sse_error(tmp_path):
     _, durable = await run_sse(tmp_path, [raw, normal()])
     error = diagnostics(durable)[0]
     assert error["provider_protocol_stream_trace_truncated"] == 1
+    for boundary in ("native", "transport"):
+        assert error[f"provider_protocol_{boundary}_structure_truncated"] == 1
+        assert len(json.loads(error[f"provider_protocol_{boundary}_structure"])) == 16
+    assert (
+        error["provider_protocol_native_structure"]
+        == error["provider_protocol_transport_structure"]
+    )
     rows = json.loads(error["provider_protocol_stream_trace"])
     assert len(rows) == 16
     assert rows[-1] == [

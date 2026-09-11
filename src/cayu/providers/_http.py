@@ -34,6 +34,7 @@ from cayu.providers._credential_boundary import (
     provider_cancellation_failures,
     stream_cleanup_cancelled_after_provider_failure,
 )
+from cayu.providers._openai_search_trace import ResponseStructureDiagnostic, ResponseStructureTrace
 from cayu.providers._sse import (
     DEFAULT_SSE_MAX_EVENT_BYTES,
     SseEventLimitError,
@@ -71,6 +72,7 @@ class _TrustedSseJsonEvent(dict[str, Any]):
     def __init__(self, event: Mapping[str, Any], *, retry_after_s: float | None) -> None:
         super().__init__(event)
         self._retry_after_s = retry_after_s
+        self._response_structure: ResponseStructureDiagnostic | None = None
 
 
 def _trusted_sse_retry_after_s(event: Mapping[str, Any]) -> float | None:
@@ -78,6 +80,10 @@ def _trusted_sse_retry_after_s(event: Mapping[str, Any]) -> float | None:
     if type(event) is not _TrustedSseJsonEvent:
         return None
     return event._retry_after_s
+
+
+def _trusted_sse_response_structure(event: Mapping[str, Any]) -> object:
+    return event._response_structure if type(event) is _TrustedSseJsonEvent else None
 
 
 def _identity_sse_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -551,6 +557,7 @@ async def stream_sse_json_events(
     raise_context_overflow_from_status: _RaiseContextOverflowFromStatus | None = None,
     api_error_from_response: _ApiErrorFromResponse | None = None,
     method: str = "POST",
+    capture_response_structure: bool = False,
 ) -> AsyncIterator[Mapping[str, Any]]:
     """Send a streaming JSON request and yield decoded SSE data objects.
 
@@ -671,6 +678,7 @@ async def stream_sse_json_events(
                 emit_byte_activity=True,
                 deadline_controller=deadline_controller,
             )
+            structure = ResponseStructureTrace() if capture_response_structure else None
             async for event in aiter_sse_json_events(
                 bounded_lines,
                 deadline_controller=deadline_controller,
@@ -678,7 +686,11 @@ async def stream_sse_json_events(
                 protocol_error=protocol_error,
                 on_interrupted=retain_interrupted_read,
             ):
-                yield _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
+                envelope = _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
+                if structure is not None:
+                    structure.record(event)
+                    envelope._response_structure = structure.snapshot()
+                yield envelope
     except ProviderStreamDeadlineExceeded as exc:
         raise ModelStreamDeadlineError(
             provider=response_label.lower().replace(" ", "_"),

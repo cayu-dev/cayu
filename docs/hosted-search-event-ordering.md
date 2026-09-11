@@ -40,7 +40,7 @@ attempt fails; that evidence is not a successful model completion.
 
 ## Bounded diagnostic contract
 
-Ordering/identity guards attach three scalar fields to the protocol error:
+Ordering/identity guards retain the existing scalar fields:
 
 - `provider_protocol_stream_boundary`: `native_adapter`.
 - `provider_protocol_stream_trace`: compact JSON with at most 16 rows.
@@ -64,15 +64,73 @@ headers, credentials, endpoint identity, or exception text, and serializes to
 less than 4 KiB. Error projection revalidates every field. The existing output
 item map supplies completed-state lookup; diagnostics add no unbounded identity
 registry. Trace rows do not enforce new response/item identity requirements.
-The trace is published on the targeted ordering/identity failures, not on every
-successful response or unrelated protocol error. Retry attempts retain separate
+The trace is published on ordering/identity failures and other protocol failures
+after search activity, including malformed lifecycle identities and repeated
+identities rejected by the outer settlement guard. Successful responses do not
+publish traces. Retry attempts retain separate
 error receipts and start with empty trace/registration state.
+
+## Cross-index identity and boundary structure
+
+`provider_protocol_stream_identities` adds rows of `[ordinal, relation, matched_index]`
+aligned with the existing trace. Relations are `missing`, `invalid`, `unknown`,
+`pending_here`, `pending_elsewhere`, `completed_here`, `completed_elsewhere`, or
+`ambiguous`. A unique match has its registered index (or -1 above 1,000,000);
+other relations use -1. These relationships inspect the parser's current pending
+and completed search maps before processing the event, including matches outside
+the trace window. Multiple registrations with the same identity are ambiguous;
+no registration is selected. Missing identities include omitted/null IDs; invalid
+identities include non-string or blank values. Item comparison uses the adapter's
+whitespace normalization. Existing reason codes and stream acceptance stay unchanged.
+
+`provider_protocol_stream_item_types` adds aligned
+`[ordinal, incoming_item_type, registered_item_type]` rows. Item types are allowlisted;
+missing types become `missing` and unrecognized values become `other`.
+
+`provider_protocol_native_structure` and `provider_protocol_transport_structure`
+contain independently captured JSON rows:
+
+```
+[ordinal, event_type, index_status, index, incoming_item_type,
+ sequence_status, sequence_number, identity_status, identity_alias]
+```
+
+Index and upstream sequence statuses are `present`, `missing`, `invalid`, or
+`out_of_range`. Explicit nulls, booleans, negative numbers and non-integers are
+invalid; values above 1,000,000 are out of range. Unavailable numbers use -1.
+Runtime ordinals start at 1 and saturate at 1,000,000; supplied upstream sequences
+are never inferred from arrival order.
+
+Each boundary gives the first 128 distinct nonblank item identities local integer
+aliases starting at 1. Identity status is `present`, `missing` (omitted/null),
+`invalid`, `oversized` (over 1024 characters), or `exhausted`; unavailable aliases
+use 0. Aliases never evict or reuse slots, and known aliases remain available after
+exhaustion. Only keyed per-attempt digests are held internally for alias lookup;
+raw IDs, digests and keys are never projected. All other content is excluded.
+Each boundary retains the last 16 rows and reports separate
+`provider_protocol_{native,transport}_structure_truncated` and
+`provider_protocol_{native,transport}_aliases_exhausted` flags (0 or 1).
+
+HTTP metadata travels outside decoded JSON in a private typed envelope. Custom
+transports without this envelope omit transport evidence. Both boundaries start
+fresh for each invocation/attempt. Aliases are comparable within an attempt when
+the observed identity order agrees; they are not global identity identifiers.
+An event inserted, removed or changed between boundaries can change alias
+assignment and ordinals. Compare full structure, not isolated alias numbers.
+Every new field is revalidated before API/subscription projection and durable
+`model.error` persistence. Invalid diagnostic objects are omitted.
+
+`tests/core/test_openai_search_identity_diagnostics.py` covers shifted matching
+versus unrelated IDs, interleaving, completed and duplicate identities, missing
+and malformed fields, bounded capture/exhaustion, hostile projection values,
+retry isolation, SQLite readback, and a synthetic change between boundaries.
+These controls are diagnostic evidence, not permission to reconcile identities.
 
 ## Remaining evidence and fault ownership
 
 These synthetic invalid inputs establish the rejection location and eliminate
 ambiguity in future diagnostics. They do not establish the cause of the original
-incident. Runtime currently sees only the native adapter input; this change does
+incident. Runtime compares decoded HTTP transport and native adapter input; this does
 not instrument an external upstream or proxy.
 
 For a fresh occurrence, compare bounded structural metadata at upstream egress,
