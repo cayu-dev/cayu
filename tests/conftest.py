@@ -3,9 +3,23 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+from tests.sqlite_resources import SQLiteResourceScope
+
+
+@pytest.fixture
+def sqlite_resources(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[SQLiteResourceScope]:
+    """Enter inside asyncio.run so work and teardown share the same loop."""
+    scope = SQLiteResourceScope(tmp_path, request.node.nodeid)
+    yield scope
+    scope.assert_finished()
+
 
 _DOCKER_SKIP_REASON = "Docker is unavailable; skipping Postgres store tests."
 _DSN_ENV_VAR = "CAYU_TEST_POSTGRES_DSN"

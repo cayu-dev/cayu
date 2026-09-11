@@ -74,13 +74,13 @@ StoreFactory = Callable[[object], TaskStore]
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
-def test_task_stores_filter_contract_queues(store_factory: StoreFactory, tmp_path) -> None:
+def test_task_stores_filter_contract_queues(store_factory: StoreFactory, sqlite_resources) -> None:
     async def scenario() -> None:
-        store = _make_store(store_factory, tmp_path)
-        try:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
             await assert_task_contract_queue_filter_conformance(store)
-        finally:
-            await _close_store(store)
 
     asyncio.run(scenario())
 
@@ -271,14 +271,13 @@ def test_sqlite_consumed_continuation_generation_survives_restart(tmp_path) -> N
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
-def test_task_stores_task_claim_lost_conformance(store_factory: StoreFactory, tmp_path):
-    store = _make_store(store_factory, tmp_path)
-
+def test_task_stores_task_claim_lost_conformance(store_factory: StoreFactory, sqlite_resources):
     async def run_store_operations() -> None:
-        try:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
             await assert_task_claim_lost_conformance(store)
-        finally:
-            await _close_store(store)
 
     asyncio.run(run_store_operations())
 
@@ -286,15 +285,14 @@ def test_task_stores_task_claim_lost_conformance(store_factory: StoreFactory, tm
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_worker_terminalization_generation_conformance(
     store_factory: StoreFactory,
-    tmp_path,
+    sqlite_resources,
 ):
-    store = _make_store(store_factory, tmp_path)
-
     async def run_store_operations() -> None:
-        try:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
             await assert_worker_terminalization_generation_conformance(store)
-        finally:
-            await _close_store(store)
 
     asyncio.run(run_store_operations())
 
@@ -302,15 +300,14 @@ def test_task_stores_worker_terminalization_generation_conformance(
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_exact_claimed_cancellation_conformance(
     store_factory: StoreFactory,
-    tmp_path,
+    sqlite_resources,
 ):
-    store = _make_store(store_factory, tmp_path)
-
     async def run_store_operations() -> None:
-        try:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
             await assert_exact_claimed_task_cancellation_conformance(store)
-        finally:
-            await _close_store(store)
 
     asyncio.run(run_store_operations())
 
@@ -397,13 +394,14 @@ def test_task_stores_reject_wrong_worker_before_terminalization(
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_store_retry_conformance_for_acknowledgement_failures(
     store_factory: StoreFactory,
-    tmp_path,
+    sqlite_resources,
 ):
-    store = _make_store(store_factory, tmp_path)
-
     async def run_store_operations() -> None:
-        await assert_task_terminalization_acknowledgement_conformance(store)
-        await _close_store(store)
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
+            await assert_task_terminalization_acknowledgement_conformance(store)
 
     asyncio.run(run_store_operations())
 

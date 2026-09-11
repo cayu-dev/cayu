@@ -79,21 +79,21 @@ async def _close_store(store: SessionStore) -> None:
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 def test_session_operation_fault_harness_store_conformance(
     store_kind: str,
-    tmp_path: Path,
+    sqlite_resources,
 ) -> None:
     async def run() -> None:
-        store: SessionStore
-        if store_kind == "memory":
-            store = InMemorySessionStore()
-        else:
-            store = SQLiteSessionStore(tmp_path / "publication-faults.sqlite")
-        try:
+        async with sqlite_resources as resources:
+            store: SessionStore
+            if store_kind == "memory":
+                store = InMemorySessionStore()
+            else:
+                store = resources.own(
+                    SQLiteSessionStore(resources.path("publication-faults.sqlite"))
+                )
             await assert_session_operation_fault_conformance(
                 store,
                 session_id_prefix=store_kind,
             )
-        finally:
-            await _close_store(store)
 
     asyncio.run(run())
 

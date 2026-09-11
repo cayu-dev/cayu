@@ -189,6 +189,81 @@ uv run ty check src/cayu examples maintenance
 Note: `ruff format --check` is a CI gate, not a suggestion. `ty` is the type oracle for
 this repo; don't submit `mypy`/`pyright` suppressions.
 
+### SQLite test resource ownership
+
+Use the test-only `sqlite_resources` fixture for new or migrated SQLite fixture
+lifetimes. Enter it **inside** the test's `asyncio.run()` coroutine, so cleanup
+runs on the same loop as database work:
+
+```python
+def test_store(sqlite_resources):
+    async def scenario():
+        async with sqlite_resources as resources:
+            store = resources.own(SQLiteSessionStore(resources.path()))
+            # Exercise the real store; no production behavior is patched.
+
+    asyncio.run(scenario())
+```
+
+Register dependent cursors after their connections; resources close in reverse
+registration order. `own(..., kind="connection" | "cursor" | "registry")` also
+supports explicit synchronous, nonblocking close methods. Blocking work belongs
+in `resources.executor().submit(callable)` or a registered
+`resources.thread(callable)` (start the returned thread explicitly).
+Use `resources.task(coroutine)` for test-owned background operations. All such
+work must reach a terminal state before database closure. Release test barriers
+in `finally`; registration does not imply permission to kill an opaque operation.
+Store-internal SQLite dispatch continues to use the production connection owner.
+
+Cleanup has a five-second total bound, not a new SQLite busy timeout. It reports
+the owning test, generated resource identity, kind and lifecycle state without
+printing SQL, database contents, task names or exception payloads. Parameter values
+are omitted from the diagnostic node ID. Failed work is reported even if it finished
+before teardown. The fixture rejects an unentered or unclosed scope. A timeout
+does not establish quiescence: the scope keeps ownership, and fault tests must
+release their controlled worker and retry `aclose()` on the same loop before
+returning. Do not delete an in-use database to make teardown appear successful.
+No failed database or diagnostic bundle is uploaded or intentionally archived.
+
+Migration is deliberately selective: the publication-fault conformance fixture,
+knowledge owned-publication conformance, and task queue, claim-loss, cancellation,
+generation and acknowledgement-loss conformance use this scope.
+Existing backend-specific locking, migration and fault assertions remain in place.
+Do not replace the SessionStore publication fault harness or change production
+SQLite semantics to make a fixture pass; report a demonstrated runtime defect
+separately under the durability program.
+
+Run the scope and its repeated forward/reverse storage sequence:
+
+```bash
+uv run pytest tests/core/test_sqlite_resources.py -q
+uv run pytest tests/core/test_sqlite_resources.py -q -n 2
+```
+
+The sequence runs the selected real storage groups three times in one interpreter,
+checking that owned roots are removed. For a reproducible randomized development
+order without installing a pytest plugin:
+
+```bash
+uv run python - <<'PY'
+import random
+import pytest
+from tests.core.test_sqlite_resources import _STORAGE_CASES
+
+cases = list(_STORAGE_CASES)
+random.Random(1142).shuffle(cases)
+for _ in range(3):
+    result = pytest.main(["-q", *cases])
+    if result:
+        raise SystemExit(result)
+PY
+```
+
+These sequences detect fixture carryover; they are not proof that every historical
+late-suite SQLite timeout had the same cause. Expand migration only when diagnostics
+identify another concrete ownership gap. Correctness tests use readiness events and
+barriers; the scope's bounded thread polling is cleanup machinery, not a test oracle.
+
 ### Dashboard
 
 Dashboard changes require Node.js ≥ 22.18.0 and npm. Run the complete dashboard job

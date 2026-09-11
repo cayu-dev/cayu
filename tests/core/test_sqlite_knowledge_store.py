@@ -504,17 +504,17 @@ def test_sqlite_knowledge_store_rejects_out_of_range_chunk_index_atomically(tmp_
     asyncio.run(run())
 
 
-def test_sqlite_knowledge_store_owned_publication_conformance(tmp_path) -> None:
+def test_sqlite_knowledge_store_owned_publication_conformance(sqlite_resources) -> None:
     async def run() -> None:
-        store = SQLiteKnowledgeStore(
-            tmp_path / "owned-publication.sqlite", access_scope=_ACCESS_SCOPE
-        )
-        try:
+        async with sqlite_resources as resources:
+            store = resources.own(
+                SQLiteKnowledgeStore(
+                    resources.path("owned-publication.sqlite"), access_scope=_ACCESS_SCOPE
+                )
+            )
             await assert_owned_publication_conformance(store)
             await assert_concurrent_publication_conformance(store)
             await assert_stale_operation_cannot_replace_newer_publication(store)
-        finally:
-            await _close(store)
 
     asyncio.run(run())
 

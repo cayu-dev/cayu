@@ -172,10 +172,10 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
         except KnowledgeRevisionConflict as exc:
             return operation_id, exc
 
-    outcomes = await asyncio.gather(
-        publish("concurrent-a", entry_a, chunks_a),
-        publish("concurrent-b", entry_b, chunks_b),
-    )
+    async with asyncio.TaskGroup() as group:
+        first = group.create_task(publish("concurrent-a", entry_a, chunks_a))
+        second = group.create_task(publish("concurrent-b", entry_b, chunks_b))
+    outcomes = [first.result(), second.result()]
     receipts = [item for item in outcomes if isinstance(item[1], KnowledgePublicationReceipt)]
     conflicts = [item for item in outcomes if isinstance(item[1], KnowledgeRevisionConflict)]
     assert len(receipts) == 1
@@ -217,10 +217,14 @@ async def assert_concurrent_publication_conformance(store: Any) -> None:
         except KnowledgeChunkConflict as exc:
             return operation_id, exc
 
-    chunk_outcomes = await asyncio.gather(
-        publish_shared_chunk("concurrent-chunk-a", chunk_entry_a, chunk_material_a),
-        publish_shared_chunk("concurrent-chunk-b", chunk_entry_b, chunk_material_b),
-    )
+    async with asyncio.TaskGroup() as group:
+        first_chunk = group.create_task(
+            publish_shared_chunk("concurrent-chunk-a", chunk_entry_a, chunk_material_a)
+        )
+        second_chunk = group.create_task(
+            publish_shared_chunk("concurrent-chunk-b", chunk_entry_b, chunk_material_b)
+        )
+    chunk_outcomes = [first_chunk.result(), second_chunk.result()]
     chunk_receipts = [
         item for item in chunk_outcomes if isinstance(item[1], KnowledgePublicationReceipt)
     ]
