@@ -9,6 +9,7 @@ import sys
 import threading
 import tracemalloc
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from importlib import import_module
 from pathlib import PurePosixPath
 
@@ -765,10 +766,154 @@ def test_edit_file_redacts_complete_diff_before_bounding_it(tmp_path):
     rendered = json.dumps(result.model_dump(mode="json"))
     assert result.is_error is False
     assert result.structured["diff_truncated"] is True
+    assert json.loads(result.content.splitlines()[1]) == {
+        "after_revision": result.structured["after_revision"],
+    }
     assert secret not in rendered
     assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
     assert REDACTED_SECRET in rendered
     assert path.read_bytes() == (("x" * 165) + secret + "\ntarget = new\n").encode()
+
+
+@pytest.mark.parametrize("new_text", ["after", "before"])
+def test_edit_file_visible_revision_supports_chaining_and_still_rejects_conflicts(
+    tmp_path, new_text
+):
+    path = tmp_path / "notes.txt"
+    path.write_text("before\n")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    async def edit(revision, old, new):
+        return await EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": revision,
+                "edits": [{"old_text": old, "new_text": new}],
+            },
+        )
+
+    async def scenario():
+        read = await ReadFileTool().run(ctx, {"path": "notes.txt"})
+        revision = json.loads(read.content.splitlines()[1])["revision"]
+        if new_text == "before":
+            # Two individually changing, non-overlapping edits can cancel out.
+            first = await EditFileTool().run(
+                ctx,
+                {
+                    "path": "notes.txt",
+                    "expected_revision": revision,
+                    "edits": [
+                        {"old_text": "b", "new_text": "be"},
+                        {"old_text": "ef", "new_text": "f"},
+                    ],
+                },
+            )
+        else:
+            first = await edit(revision, "before", new_text)
+        assert not first.is_error
+        assert first.content.startswith("[edit_file metadata]\n")
+        next_revision = json.loads(first.content.splitlines()[1])["after_revision"]
+        assert next_revision == first.structured["after_revision"]
+        assert next_revision == f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        if new_text == "before":
+            assert first.structured["diff"] == ""
+        second = await edit(next_revision, new_text, "final")
+        assert not second.is_error
+        assert path.read_text() == "final\n"
+        final_revision = json.loads(second.content.splitlines()[1])["after_revision"]
+        path.write_text("concurrent\n")
+        refused = await edit(final_revision, "final", "overwrite")
+        assert refused.is_error
+        assert refused.structured["reason"] == "stale_content"
+        assert "[edit_file metadata]" not in refused.content
+        assert path.read_text() == "concurrent\n"
+
+    asyncio.run(scenario())
+
+
+def test_edit_file_publishes_opaque_mutation_revision_without_an_extra_read(tmp_path):
+    opaque_revision = 'backend:revision-2"\nopaque'
+
+    class OpaqueMutationWorkspace(LocalWorkspace):
+        read_count = 0
+
+        async def read_bytes(self, path, *, offset=0, max_bytes=None):
+            self.read_count += 1
+            return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
+        async def replace_bytes(self, path, content, *, expected_revision):
+            result = await super().replace_bytes(path, content, expected_revision=expected_revision)
+            return replace(result, after_revision=opaque_revision)
+
+    original = b"before\n"
+    (tmp_path / "notes.txt").write_bytes(original)
+    workspace = OpaqueMutationWorkspace(tmp_path, workspace_id="opaque")
+    result = asyncio.run(
+        EditFileTool().run(
+            ToolContext(session_id="sess_1", workspace=workspace),
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [{"old_text": "before", "new_text": "after"}],
+            },
+        )
+    )
+    assert not result.is_error
+    assert workspace.read_count == 1
+    assert json.loads(result.content.splitlines()[1]) == {"after_revision": opaque_revision}
+    assert result.structured["after_revision"] == opaque_revision
+
+
+def test_edit_file_revision_reaches_next_model_request(tmp_path):
+    original = b"before\n"
+    (tmp_path / "notes.txt").write_bytes(original)
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="edit",
+                    name="edit_file",
+                    arguments={
+                        "path": "notes.txt",
+                        "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                        "edits": [{"old_text": "before", "new_text": "after"}],
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="files"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake"), tools=[EditFileTool()])
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="edit-revision-feedback",
+                messages=[Message.text("user", "Edit the file")],
+            ),
+        )
+    )
+    assert len(provider.requests) == 2
+    tool_message = next(m for m in provider.requests[1].messages if m.role == "tool")
+    result = tool_message.content[0]
+    assert not result.is_error
+    expected = "sha256:" + hashlib.sha256(b"after\n").hexdigest()
+    assert json.loads(result.content.splitlines()[1]) == {"after_revision": expected}
 
 
 def test_edit_file_rolls_back_all_replacements_when_one_precondition_fails(tmp_path):

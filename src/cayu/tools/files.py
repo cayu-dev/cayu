@@ -1722,8 +1722,10 @@ class EditFileTool(Tool):
         workspace_mutation=True,
         description=(
             "Atomically edit an existing UTF-8 workspace file using one or more exact "
-            "text replacements. Requires the opaque revision returned by read_file and "
-            "refuses stale content, ambiguous matches, partial edits, and oversized files."
+            "text replacements. Requires the opaque revision from a complete read_file "
+            "result or after_revision from a successful edit_file result. Returns the "
+            "new after_revision for subsequent edits and refuses stale content, "
+            "ambiguous matches, partial edits, and oversized files."
         ),
         input_schema={
             "type": "object",
@@ -1736,7 +1738,10 @@ class EditFileTool(Tool):
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_FILE_REVISION_CHARS,
-                    "description": "Opaque revision from a complete read_file result.",
+                    "description": (
+                        "Opaque revision from a complete read_file result or after_revision "
+                        "from the latest successful edit_file result for this file."
+                    ),
                 },
                 "edits": {
                     "type": "array",
@@ -1956,8 +1961,14 @@ class EditFileTool(Tool):
             f"Edited {path}: {len(edits)} edit(s), {replacement_count} replacement(s), "
             f"{len(read.content)} -> {len(encoded)} bytes."
         )
+        metadata = json.dumps(
+            {"after_revision": mutation.after_revision},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        content = f"[edit_file metadata]\n{metadata}\n[/edit_file metadata]\n{summary}"
         return ToolResult(
-            content=f"{summary}\n\n{diff_preview}" if diff_preview else summary,
+            content=f"{content}\n\n{diff_preview}" if diff_preview else content,
             structured={
                 "path": path,
                 "edit_count": len(edits),
