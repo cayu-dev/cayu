@@ -1200,6 +1200,290 @@ def test_per_trial_factory_isolates_concurrent_workflow_instances_and_closes_the
         assert trial.trajectory.transcript == (Message.text(MessageRole.USER, case.case_id),)
 
 
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("background", [False, True])
+def test_per_trial_script_ownership_covers_nonoverlapping_background_dispatch(shared, background):
+    done = asyncio.Event()
+    providers = []
+    shared_provider = ScriptedModelProvider(
+        [
+            [ModelStreamEvent.text_delta("second-case"), ModelStreamEvent.completed()],
+            [ModelStreamEvent.text_delta("first-case"), ModelStreamEvent.completed()],
+        ],
+        background=background,
+    )
+
+    class ScriptWorkflow(WorkflowBase):
+        spec = WorkflowSpec(name="script-isolation")
+
+        async def run(self, session_id):
+            ctx = self.context(session_id)
+            yield await ctx.start()
+            if self.case_id == "first-case":
+                await asyncio.wait_for(done.wait(), 15)
+            try:
+                output = await step(ctx, agent="first", step_id="answer", prompt=self.case_id)
+                yield await ctx.completed({"answer": output.text})
+            finally:
+                if self.case_id == "second-case":
+                    done.set()
+
+    def factory(invocation):
+        provider = (
+            shared_provider
+            if shared
+            else ScriptedModelProvider(
+                [ModelStreamEvent.text_delta(invocation.case_id), ModelStreamEvent.completed()],
+                background=background,
+            )
+        )
+        providers.append(provider)
+        app = _register_app(provider=provider)
+        workflow = ScriptWorkflow(app)
+        workflow.case_id = invocation.case_id
+        return WorkflowEvalExecution(app=app, workflow=workflow)
+
+    target = _target(
+        _register_app(provider=ScriptedModelProvider([], background=background)),
+        ScriptWorkflow,
+        factory=factory,
+        instance_scope=WorkflowEvalInstanceScope.PER_TRIAL,
+    )
+    suite = EvalSuite(
+        id="isolation",
+        cases=[
+            EvalCase(
+                id=key,
+                request=RunRequest(agent_name="first", messages=[Message.text("user", key)]),
+                assertions=[FinalOutputContains(key)],
+            )
+            for key in ("first-case", "second-case")
+        ],
+    )
+    result = asyncio.run(run_workflow_eval_suite(target, suite, max_concurrency=2))
+    if shared:
+        assert all(case.status is not EvalStatus.PASSED for case in result.cases)
+        assert shared_provider.requests == []
+        assert shared_provider.background_operation_ids == ()
+    else:
+        assert result.status is EvalStatus.PASSED
+        assert all(len(provider.requests) == 1 for provider in providers)
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("cancel_first", [False, True])
+@pytest.mark.parametrize("pause_in_factory", [False, True])
+def test_independent_sequential_workflows_reserve_providers_before_setup(
+    background, shared, cancel_first, pause_in_factory
+):
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        constructed = []
+        shared_provider = ScriptedModelProvider(
+            [
+                [ModelStreamEvent.text_delta(key), ModelStreamEvent.completed()]
+                for key in ("a", "b")
+            ],
+            background=background,
+        )
+
+        class ScriptWorkflow(WorkflowBase):
+            spec = WorkflowSpec(name="independent-isolation")
+
+            async def run(self, session_id):
+                ctx = self.context(session_id)
+                yield await ctx.start()
+                if self.case_id == "a" and not pause_in_factory:
+                    entered.set()
+                    await release.wait()
+                output = await step(ctx, agent="first", step_id="answer", prompt=self.case_id)
+                yield await ctx.completed({"answer": output.text})
+
+        async def factory(invocation):
+            provider = (
+                shared_provider
+                if shared
+                else ScriptedModelProvider(
+                    [ModelStreamEvent.text_delta(invocation.case_id), ModelStreamEvent.completed()],
+                    background=background,
+                )
+            )
+            app = _register_app(provider=provider)
+            workflow = ScriptWorkflow(app)
+            workflow.case_id = invocation.case_id
+            constructed.append(provider)
+            if invocation.case_id == "a" and pause_in_factory:
+                entered.set()
+                await release.wait()
+            return WorkflowEvalExecution(app=app, workflow=workflow)
+
+        target = _target(
+            _register_app(
+                provider=shared_provider
+                if shared
+                else ScriptedModelProvider([], background=background)
+            ),
+            ScriptWorkflow,
+            factory=factory,
+            instance_scope=WorkflowEvalInstanceScope.SHARED
+            if shared
+            else WorkflowEvalInstanceScope.PER_TRIAL,
+        )
+
+        async def evaluate(key):
+            return await run_workflow_eval_suite(
+                target,
+                EvalSuite(
+                    id=key,
+                    cases=[
+                        EvalCase(
+                            id=key,
+                            request=RunRequest(
+                                agent_name="first", messages=[Message.text("user", key)]
+                            ),
+                            assertions=[FinalOutputContains(key)],
+                        )
+                    ],
+                ),
+                max_concurrency=1,
+            )
+
+        first = asyncio.create_task(evaluate("a"))
+        try:
+            await asyncio.wait_for(entered.wait(), 15)
+            if not shared and pause_in_factory:
+                # Exporting a just-created provider must not let another target
+                # consume it while its creating factory has not returned yet.
+                foreign = _target(_register_app(provider=constructed[0]), ScriptWorkflow)
+                with pytest.raises(ValueError, match="Concurrent eval invocations"):
+                    await run_workflow_eval_suite(
+                        foreign, _suite(FinalOutputContains("a")), max_concurrency=1
+                    )
+                assert constructed[0].requests == []
+                assert constructed[0]._active_eval_invocation is not None
+            if shared:
+                with pytest.raises(ValueError, match="Concurrent eval invocations"):
+                    await evaluate("b")
+                assert shared_provider.requests == []
+                assert shared_provider.background_operation_ids == ()
+                assert shared_provider._active_eval_invocation is not None
+            else:
+                second = await evaluate("b")
+                assert second.status is EvalStatus.PASSED
+            if cancel_first:
+                first.cancel()
+                assert first.cancelling() == 1
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(first, 15)
+                assert first.cancelled()
+                release.set()
+                assert (await evaluate("a")).status is EvalStatus.PASSED
+            else:
+                release.set()
+                assert (await asyncio.wait_for(first, 15)).status is EvalStatus.PASSED
+            if shared:
+                assert shared_provider._active_eval_invocation is None
+                assert (await evaluate("b")).status is EvalStatus.PASSED
+                assert len(shared_provider.requests) == 2
+                assert shared_provider._active_eval_invocation is None
+        finally:
+            release.set()
+            if not first.done():
+                first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("dispatch_in_factory", [False, True])
+def test_async_factory_cannot_import_an_undeclared_shared_positional_provider(
+    background, dispatch_in_factory
+):
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        provider = ScriptedModelProvider(
+            [
+                [ModelStreamEvent.text_delta(key), ModelStreamEvent.completed()]
+                for key in ("a", "b")
+            ],
+            background=background,
+        )
+
+        class ScriptWorkflow(WorkflowBase):
+            spec = WorkflowSpec(name="opaque-factory-isolation")
+
+            async def run(self, session_id):
+                ctx = self.context(session_id)
+                yield await ctx.start()
+                output = await step(ctx, agent="first", step_id="answer", prompt="answer")
+                yield await ctx.completed({"answer": output.text})
+
+        async def factory(invocation):
+            app = _register_app(provider=provider)
+            if invocation.case_id == "a":
+                entered.set()
+                await release.wait()
+            if dispatch_in_factory:
+                # Even an actual runtime dispatch before handoff must traverse
+                # the ownership check, including background-operation start.
+                async for _ in app.run(
+                    RunRequest(
+                        agent_name="first", messages=[Message.text("user", invocation.case_id)]
+                    )
+                ):
+                    pass
+            return WorkflowEvalExecution(app=app, workflow=ScriptWorkflow(app))
+
+        target = _target(
+            _register_app(provider=ScriptedModelProvider([], background=background)),
+            ScriptWorkflow,
+            factory=factory,
+            instance_scope=WorkflowEvalInstanceScope.PER_TRIAL,
+        )
+
+        async def evaluate(key):
+            return await run_workflow_eval_suite(
+                target,
+                EvalSuite(
+                    id=key,
+                    cases=[
+                        EvalCase(
+                            id=key,
+                            request=RunRequest(
+                                agent_name="first", messages=[Message.text("user", key)]
+                            ),
+                        )
+                    ],
+                ),
+                max_concurrency=1,
+            )
+
+        first = asyncio.create_task(evaluate("a"))
+        try:
+            await asyncio.wait_for(entered.wait(), 15)
+            second = await evaluate("b")
+            assert second.status is EvalStatus.ERROR
+            assert second.cases[0].trials[0].final_output == ""
+            assert "case-owned or predeclared" in second.cases[0].trials[0].error
+            assert provider.requests == []
+            release.set()
+            result = await asyncio.wait_for(first, 15)
+            assert result.status is EvalStatus.ERROR
+            assert "case-owned or predeclared" in result.cases[0].trials[0].error
+            assert provider.requests == []
+            assert provider.background_operation_ids == ()
+            assert provider._active_eval_invocation is None
+        finally:
+            release.set()
+            if not first.done():
+                first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
 def test_shared_workflow_target_rejects_concurrent_execution() -> None:
     app = _register_app()
     with pytest.raises(ValueError, match="shared workflow target"):

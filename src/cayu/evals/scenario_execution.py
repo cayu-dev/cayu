@@ -53,6 +53,7 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.runner import (
     _FreshMemoryAttributionReadLifecycle,
+    _require_scripted_provider_concurrency,
     _run_case_once_with_public_projection,
     _schedule_suite_trials,
 )
@@ -834,6 +835,22 @@ async def run_compiled_eval_scenario(
         or current.ownership.epoch != claim.epoch
     ):
         raise EvalRunClaimLost("Scenario claim is no longer current.")
+    case = compiled.suite.cases[0]
+    checkpoints = await store.load_trial_checkpoints(claim)
+    for checkpoint in checkpoints:
+        if checkpoint.case_id != case.id or checkpoint.trial_number > binding.trials:
+            raise EvalRunStateConflict("Recovered scenario trial does not match its run.")
+    completed_trials = {
+        (checkpoint.case_id, checkpoint.trial_number): (checkpoint.result, checkpoint.public_data)
+        for checkpoint in checkpoints
+    }
+    scripted_providers_by_case = _require_scripted_provider_concurrency(
+        target.app,
+        compiled.suite.cases,
+        trials=binding.trials,
+        max_concurrency=max_concurrency,
+        completed_trials=completed_trials,
+    )
     progress = current.scenario_progress
     if progress is None:
         initialized = await store.initialize_scenario_progress(
@@ -855,7 +872,6 @@ async def run_compiled_eval_scenario(
         progress = initialized.scenario_progress
     if progress is None or progress.attempt != claim.epoch:
         raise EvalRunStateConflict("Scenario progress is unavailable for the current claim.")
-    case = compiled.suite.cases[0]
     output_preview_bytes = min(
         EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
         PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES // binding.trials,
@@ -865,14 +881,6 @@ async def run_compiled_eval_scenario(
         binding.trials
     )
     memory_attribution_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(binding.trials)
-    checkpoints = await store.load_trial_checkpoints(claim)
-    for checkpoint in checkpoints:
-        if checkpoint.case_id != case.id or checkpoint.trial_number > binding.trials:
-            raise EvalRunStateConflict("Recovered scenario trial does not match its run.")
-    completed_trials = {
-        (checkpoint.case_id, checkpoint.trial_number): (checkpoint.result, checkpoint.public_data)
-        for checkpoint in checkpoints
-    }
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
         max_operations=max_concurrency
     )
@@ -945,6 +953,7 @@ async def run_compiled_eval_scenario(
     async with memory_attribution_read_lifecycle:
         results, public_data_by_case = await _schedule_suite_trials(
             compiled.suite,
+            scripted_providers_by_case=scripted_providers_by_case,
             trials=binding.trials,
             max_concurrency=max_concurrency,
             trial_policy=compiled.run_contract.trial_policy,

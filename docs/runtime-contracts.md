@@ -89,6 +89,64 @@ policy and unresolved `SecretRef`, while retaining the explicitly supplied trans
 and credential-proxy handles. `ScriptedModelProvider` snapshots configured events and
 records detached request history so tests can inspect stable request-aware evidence.
 
+`ScriptedModelProvider(response_factory=...)` accepts a synchronous factory receiving
+a detached complete `ModelRequest` and returning one non-empty event batch ending
+in `COMPLETED`. Positional batches and a factory are mutually exclusive. Factories
+should select by stable request content, not global arrival order; the provider
+does not make arbitrary application callbacks deterministic. Factory-backed
+providers are opaque/process-local unless application-versioned through the existing
+`execution_profile_identity` contract. The explicit boolean
+`supports_native_structured_output` defaults to false, and positional providers
+include it in their structural execution identity. Browser acceptance currently
+requires positional scripts and rejects factory-backed scripted providers.
+
+Concurrent ordinary agent eval suites reject positional scripted providers selected
+by more than one trial before dispatch. Unused registrations and providers isolated to one
+trial remain valid. Participating positional providers include those reachable
+through the exact built-in `SubagentTool`'s
+declared foreground/background routes into a `CayuApp`. Discovery follows nested
+routes and deduplicates aliases and cycles within each case; shared descendant
+providers are checked across cases just like root providers. Opaque custom tools,
+subclasses, runtime wrappers, and durable worker routes do not supply this
+in-process ownership proof and remain subject to the consumption guard.
+Built-in scalar and structured model-judge assertions, including compiled portable
+assertions, also predeclare their judge provider. Judge providers participate in
+the same cross-trial sharing checks and remain reserved through assertion
+evaluation. Judge agents' tool routes are excluded because judge execution has a
+zero-application-tool capability ceiling.
+Participating providers remain reserved across setup
+and all tool rounds, so overlapping eval invocations cannot share them even when
+each invocation uses `max_concurrency=1`. Per-trial workflow factories may
+construct independent positional providers; sharing one across concurrent trial
+owners is rejected at batch consumption, including background-operation start. Sequential positional scripts
+retain their request-order semantics. Request factories are the shared-provider
+option for concurrent suites.
+
+Each concrete trial has a revocable lifetime, including repetitions in
+`run_eval_case`. When the trial exits, background tasks retaining its context
+cannot consume additional positional batches or borrow provider ownership for a
+nested eval. This also applies when an ancestor trial has ended. Revocation
+prevents further batch consumption; it does not cancel or drain background work.
+
+Workflow ownership covers asynchronous factory execution too. Shared workflow
+targets predeclare positional providers through their target app; these providers
+are reserved before the factory is invoked. Per-trial factories must construct
+their positional providers inside the trial or use request-aware factories, even
+at `max_concurrency=1`. Newly constructed positional providers are reserved
+immediately, including while their factory is suspended before handoff.
+A returned app cannot import an undeclared pre-existing
+positional provider. Because workflow child routing is opaque, this ownership
+check covers every registered positional provider on the returned app, and actual
+batch consumption during factory execution passes the same check.
+
+Nested evals may exclusively borrow explicitly selected positional providers from
+their direct parent invocation. While delegated, neither the parent nor a sibling
+may consume that provider; normal completion or cancellation restores the parent's
+reservation. Completed parent contexts cannot authorize later child dispatch.
+Recovery validates restored trial evidence before deciding participation. Only
+pending trials contribute to positional sharing checks and provider reservations;
+completed-only recovery does not acquire providers to publish retained results.
+
 ## Root checkpoint schema compatibility
 
 The runtime-owned root checkpoint object carries

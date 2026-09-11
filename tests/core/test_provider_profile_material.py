@@ -51,8 +51,8 @@ _BASE_MATERIAL_SHA256 = {
     "openai-background": "12d4c2badb4988320ae573ffd75f602ffb46a1fe444b82901966b28789cd9b4a",
     "openai-search": "902b8510f3b60f4d5b22c831fe4d592656390b7f0c64146134a6551a554a7014",
     "openrouter": "238bdd76b4e6cbead2f89ed3462935c660a7f8445dd439acc34f267ff5cb7312",
-    "scripted": "cd8a343352e9c14f261c619ea4bfdb538bbfb31c8b9ea36856035a046d159c45",
-    "scripted-background": "756612fad3d73854b2b4dcddb5bc60c7644af36dfb7965404ee64959f765267f",
+    "scripted": "06548d202a0bac8275f5b0440ef995d442f547383da12717e99a84d23d30e803",
+    "scripted-background": "019d2934ee5f333b455cd092d2adb2ca99d8c7d399253444befad745921ada5a",
 }
 
 

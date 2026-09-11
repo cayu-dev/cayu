@@ -1088,8 +1088,6 @@ class IdentityConfiguredRunner(LocalRunner):
 
 
 class PreflightRecordingProvider(ScriptedModelProvider):
-    supports_native_structured_output = True
-
     def __init__(self) -> None:
         super().__init__(
             [
@@ -1097,6 +1095,7 @@ class PreflightRecordingProvider(ScriptedModelProvider):
                 ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
             ],
             name="fake",
+            supports_native_structured_output=True,
         )
         self.native_preflight_calls = 0
 
@@ -2377,6 +2376,85 @@ def test_scripted_provider_is_structural_only_for_the_exact_builtin_type() -> No
     assert derived.execution_profile_identity is None
     assert provider_component(built_in).strength is ExecutionProfileIdentityStrength.STRUCTURAL
     assert provider_component(derived).strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+
+
+def test_scripted_factory_identity_is_process_local_and_native_flag_is_structural() -> None:
+    def component(provider):
+        provider.name = "fake"
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        return _registered_context_profile(app).component(
+            ExecutionProfileComponentClass.PROVIDER_ADAPTER
+        )
+
+    def factory_a(request):
+        return [ModelStreamEvent.text_delta("a"), ModelStreamEvent.completed()]
+
+    def factory_b(request):
+        return [ModelStreamEvent.text_delta("b"), ModelStreamEvent.completed()]
+
+    a = component(ScriptedModelProvider(response_factory=factory_a))
+    b = component(ScriptedModelProvider(response_factory=factory_b))
+    assert a.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert b.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+    assert a != b
+    assert component(ScriptedModelProvider([])) != component(
+        ScriptedModelProvider([], supports_native_structured_output=True)
+    )
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+def test_factory_provider_cross_app_continuation_requires_explicit_version(versioned) -> None:
+    class VersionedFactory(ScriptedModelProvider):
+        @property
+        def execution_profile_identity(self):
+            return _test_behavior_identity("request-aware-test-provider")
+
+    async def exercise():
+        store = InMemorySessionStore()
+
+        def make_app(answer):
+            provider_type = VersionedFactory if versioned else ScriptedModelProvider
+            provider = provider_type(
+                response_factory=lambda request: [
+                    ModelStreamEvent.text_delta(answer),
+                    ModelStreamEvent.completed(),
+                ],
+                name="fake",
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            return app, provider
+
+        first, _ = make_app("first")
+        events = await _collect(
+            first.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="factory-continuation",
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+        assert any(event.type is EventType.SESSION_COMPLETED for event in events)
+        replacement, provider = make_app("replacement")
+        stream = replacement.resume(
+            ResumeRequest(
+                session_id="factory-continuation", messages=[Message.text("user", "next")]
+            )
+        )
+        if versioned:
+            events = await _collect(stream)
+            assert any(event.type is EventType.SESSION_COMPLETED for event in events)
+            assert len(provider.requests) == 1
+        else:
+            with pytest.raises(ExecutionProfileMismatchError):
+                await _collect(stream)
+            assert provider.requests == []
+
+    asyncio.run(exercise())
 
 
 def test_opaque_provider_options_are_secret_safe_and_content_bound_within_process() -> None:

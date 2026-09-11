@@ -2202,6 +2202,14 @@ def _browser_acceptance_execution_suite_fingerprint(plan: BrowserAcceptancePlanV
             "model": target.model,
         }
         if type(provider) is ScriptedModelProvider:
+            if provider._batches is None:
+                raise ValueError(
+                    "Browser acceptance requires positional scripted batches; "
+                    "request factories do not provide a reproducible script identity."
+                )
+            provider_material["supports_native_structured_output"] = (
+                provider.supports_native_structured_output
+            )
             provider_material["script"] = [
                 [event.model_dump(mode="json", warnings="error") for event in batch]
                 for batch in provider._batches

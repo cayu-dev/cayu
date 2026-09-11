@@ -788,7 +788,11 @@ def test_trial_aggregation_error_does_not_cancel_concurrent_sibling_case():
         ModelStreamEvent.text_delta("complete output"),
         ModelStreamEvent.completed({"finish_reason": "stop"}),
     ]
-    app = _scripted_app(batch, batch, batch, batch)
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(response_factory=lambda request: batch), default=True
+    )
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
     suite = EvalSuite(
         id="concurrent-aggregation",
         cases=[

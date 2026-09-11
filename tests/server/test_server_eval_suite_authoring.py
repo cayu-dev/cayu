@@ -111,7 +111,9 @@ def test_v3_authored_suite_executes_all_trials_and_applies_pass_threshold(tmp_pa
         trial_request=EvalSuiteTrialRequestDraftV3(
             trials=3,
             minimum_passed_trials=2,
-            max_concurrency=2,
+            # This threshold test deliberately assigns distinct outcomes to
+            # identical trial requests. Positional outcomes require serial order.
+            max_concurrency=1,
             timeout_seconds=30,
         ),
         cases=(EvalCaseDraftV2.model_validate(_simple_case().model_dump(mode="python")),),
@@ -167,7 +169,7 @@ def test_v3_authored_suite_executes_all_trials_and_applies_pass_threshold(tmp_pa
             reviewed = launch_preview.json()
             assert reviewed["ready"] is True
             assert reviewed["exposure"]["candidate_trials"] == 3
-            assert reviewed["exposure"]["max_concurrency"] == 2
+            assert reviewed["exposure"]["max_concurrency"] == 1
             assert reviewed["exposure"]["maximum_candidate_model_steps"] == 24
             assert reviewed["exposure"]["maximum_candidate_total_tokens"] is None
 
@@ -671,16 +673,10 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
     monkeypatch,
 ) -> None:
     provider = ScriptedModelProvider(
-        [
-            (
-                ModelStreamEvent.text_delta("refund current scenario result"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ),
-            (
-                ModelStreamEvent.text_delta("refund current scenario result"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ),
-        ]
+        response_factory=lambda request: (
+            ModelStreamEvent.text_delta("refund current scenario result"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
     )
     target, _, _ = _target(tmp_path, provider)
     store = SQLiteEvalStore(tmp_path / "evals.db")

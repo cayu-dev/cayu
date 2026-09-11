@@ -26,7 +26,10 @@ _LIVE_CREDENTIAL_ENV = {
 _WORKSPACE_FILE = "runtime-acceptance/workspace-roundtrip.txt"
 
 
-def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(monkeypatch) -> None:
+@pytest.mark.parametrize("max_concurrency", [1, 2])
+def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(
+    monkeypatch, max_concurrency
+) -> None:
     from cayu.evals.internal.runtime_acceptance import build
 
     environ_type = type(os.environ)
@@ -50,6 +53,7 @@ def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(monkeypatch) 
         plan = await build()
         result = await run_eval_plan(
             plan,
+            max_concurrency=max_concurrency,
             case_timeout_seconds=20,
             retain_trajectory=True,
         )

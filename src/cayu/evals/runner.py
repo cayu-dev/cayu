@@ -93,6 +93,12 @@ from cayu.evals.result_contract import (
     EvalTrialOutputPreviewV1,
     _EvalTrialPublicData,
 )
+from cayu.evals.testing import (
+    ScriptedModelProvider,
+    _claim_positional_provider,
+    _scripted_eval_invocation,
+    _scripted_eval_trial,
+)
 from cayu.evals.trajectory import (
     SessionTrajectoryBounds,
     SessionTrajectoryError,
@@ -856,10 +862,11 @@ async def run_eval_suite(
 
     `max_concurrency` runs up to that many concrete case trials at once. When
     omitted, an explicit trial policy wins, then `app.config.evals.max_concurrency`
-    (default 1 = sequential). Results always keep suite and trial order. Note:
-    `ScriptedModelProvider` consumes batches by positional request index, so with
-    concurrency > 1 interleaved cases may pull each other's batches — keep the
-    default for scripted multi-case suites.
+    (default 1 = sequential). Results always keep suite and trial order.
+    Concurrent suites reject positional `ScriptedModelProvider` instances shared
+    by multiple trials. Unused registrations and isolated per-case providers are
+    allowed. Overlapping invocations reserve participating positional providers
+    even at concurrency 1. Request-aware factories support shared providers.
 
     `case_timeout_seconds` bounds each case's run; a case that exceeds it is
     cancelled and recorded as `EvalStatus.ERROR` instead of stalling the suite.
@@ -1037,6 +1044,14 @@ async def _run_eval_suite(
             )
     elif workflow_execution_profile_fingerprint is not None:
         raise ValueError("workflow_execution_profile_fingerprint requires a workflow eval target.")
+    if workflow_target is None:
+        _require_scripted_provider_concurrency(
+            app,
+            suite.cases,
+            trials=trials,
+            max_concurrency=max_concurrency,
+            completed_trials=completed_trials,
+        )
     started_at = datetime.now(UTC)
     trial_count = len(suite.cases) * trials
     memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
@@ -1215,8 +1230,18 @@ async def _run_suite_cases(
             observe_eval_trial_result(result[0])
             return result
 
+    scripted_providers = _require_scripted_provider_concurrency(
+        app,
+        suite.cases,
+        trials=trials,
+        max_concurrency=max_concurrency,
+        completed_trials=completed_trials,
+        workflow_target=workflow_target,
+    )
     return await _schedule_suite_trials(
         suite,
+        scripted_providers_by_case=scripted_providers,
+        require_owned_scripted_providers=workflow_target is not None,
         trials=trials,
         max_concurrency=max_concurrency,
         trial_policy=trial_policy,
@@ -1226,6 +1251,158 @@ async def _run_suite_cases(
         trial_completed=trial_completed,
         execute_trial=execute_trial,
     )
+
+
+def _validated_completed_trials(
+    cases: Sequence[EvalCase],
+    trials: int,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]],
+) -> dict[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]:
+    case_ids = {case.id for case in cases}
+    restored = {}
+    for key, execution in completed_trials.items():
+        if type(key) is not tuple or len(key) != 2:
+            raise ValueError("Completed trial keys must be (case_id, trial_number) pairs.")
+        case_id, trial_number = key
+        if (
+            type(case_id) is not str
+            or case_id not in case_ids
+            or type(trial_number) is not int
+            or not 1 <= trial_number <= trials
+        ):
+            raise ValueError("Completed trial slot does not belong to the eval suite.")
+        result, public_data = execution
+        if type(result) is not EvalTrialResult or type(public_data) is not _EvalTrialPublicData:
+            raise TypeError("Completed trials require exact result and public-data values.")
+        if result.trial_number != trial_number:
+            raise ValueError("Completed trial result does not match its slot.")
+        restored[key] = (
+            EvalTrialResult.model_validate(result.model_dump(mode="python", warnings=False)),
+            _EvalTrialPublicData.model_validate(public_data.model_dump(mode="python")),
+        )
+    return restored
+
+
+def _case_positional_providers(
+    app: CayuApp, request: RunRequest
+) -> tuple[ScriptedModelProvider, ...]:
+    from cayu.tools.subagents import SubagentExecutionMode, SubagentTool
+
+    pending = [(app, request)]
+    visited: set[tuple[int, str, str, str]] = set()
+    providers: dict[int, ScriptedModelProvider] = {}
+    while pending:
+        runtime, routed_request = pending.pop()
+        try:
+            target = runtime.resolve_run_model_target(routed_request)
+        except (KeyError, ValueError, RuntimeError):
+            # Ordinary routing errors belong to the case/child execution handler.
+            continue
+        key = (id(runtime), routed_request.agent_name, target.provider_name, target.model)
+        if key in visited:
+            continue
+        visited.add(key)
+        provider = runtime.get_provider(target.provider_name)
+        if isinstance(provider, ScriptedModelProvider) and provider._response_factory is None:
+            providers[id(provider)] = provider
+        for registered in runtime.get_agent(routed_request.agent_name).tools.values():
+            tool = registered.tool
+            # Only the exact built-in implementation proves these routes. An
+            # opaque wrapper/subclass may dispatch elsewhere; it remains subject
+            # to the consumption guard, not an inferred declaration.
+            if type(tool) is not SubagentTool or not isinstance(tool._runtime, CayuApp):
+                continue
+            for spec in tool._agents.values():
+                if spec.mode in (
+                    SubagentExecutionMode.FOREGROUND,
+                    SubagentExecutionMode.BACKGROUND,
+                ):
+                    pending.append(
+                        (tool._runtime, RunRequest(agent_name=spec.agent_name, messages=[]))
+                    )
+    return tuple(providers.values())
+
+
+def _assertion_positional_providers(
+    assertions: Sequence[EvalAssertion],
+) -> tuple[ScriptedModelProvider, ...]:
+    from cayu.evals.judges import LLMJudge, StructuredLLMJudge
+    from cayu.evals.portable_assertions import (
+        _CompiledModelJudgeAssertion,
+        _CompiledStructuredModelJudgeAssertion,
+    )
+
+    providers: dict[int, ScriptedModelProvider] = {}
+    for assertion in assertions:
+        if (
+            type(assertion) is _CompiledModelJudgeAssertion
+            or type(assertion) is _CompiledStructuredModelJudgeAssertion
+        ):
+            judge = assertion._judge
+        elif type(assertion) is LLMJudge or type(assertion) is StructuredLLMJudge:
+            judge = assertion
+        else:
+            continue
+        # Judges run with a zero-application-tool ceiling. Their own model is
+        # attributable, but registered subagent tools are not execution routes.
+        try:
+            target = judge._app.resolve_run_model_target(
+                RunRequest(agent_name=judge._agent_name, messages=[])
+            )
+        except (KeyError, ValueError, RuntimeError):
+            continue  # Preserve ordinary judge configuration error reporting.
+        provider = judge._app.get_provider(target.provider_name)
+        if isinstance(provider, ScriptedModelProvider) and provider._response_factory is None:
+            providers[id(provider)] = provider
+    return tuple(providers.values())
+
+
+def _require_scripted_provider_concurrency(
+    app: CayuApp,
+    cases: Sequence[EvalCase],
+    *,
+    trials: int,
+    max_concurrency: int,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
+    | None = None,
+    workflow_target: WorkflowEvalTarget | None = None,
+) -> dict[str, tuple[ScriptedModelProvider, ...]]:
+    restored = _validated_completed_trials(cases, trials, completed_trials or {})
+    participating: dict[str, tuple[ScriptedModelProvider, ...]] = {}
+    seen: set[int] = set()
+    for case in cases:
+        pending = sum((case.id, number) not in restored for number in range(1, trials + 1))
+        if not pending:
+            continue
+        if workflow_target is None:
+            candidates = _case_positional_providers(app, case.request)
+        elif workflow_target.instance_scope.value == "shared":
+            # Reserve declared resources before an asynchronous workflow factory
+            # runs. Per-trial factories instead prove creation ownership.
+            candidates = tuple(
+                provider
+                for name in app.list_providers()
+                if isinstance(provider := app.get_provider(name), ScriptedModelProvider)
+                and provider._response_factory is None
+            )
+        else:
+            candidates = ()
+        providers = tuple(
+            {
+                id(provider): provider
+                for provider in (*candidates, *_assertion_positional_providers(case.assertions))
+            }.values()
+        )
+        for provider in providers:
+            if max_concurrency > 1 and (id(provider) in seen or pending > 1):
+                raise ValueError(
+                    "Concurrent eval suites cannot share positional ScriptedModelProvider "
+                    "instances across trials; use response_factory or isolated providers."
+                )
+            seen.add(id(provider))
+        if providers:
+            participating[case.id] = providers
+    return participating
 
 
 async def _schedule_suite_trials(
@@ -1242,6 +1419,8 @@ async def _schedule_suite_trials(
         [EvalCase, int], Awaitable[tuple[EvalTrialResult, _EvalTrialPublicData | None]]
     ],
     group_serial_trials: bool = False,
+    scripted_providers_by_case: Mapping[str, tuple[ScriptedModelProvider, ...]] | None = None,
+    require_owned_scripted_providers: bool = False,
 ) -> tuple[list[EvalCaseResult], dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     """Own capacity through reconciliation/publication and preserve ordered recovered slots."""
     # Schedule concrete trials, not whole cases, so one repeated case can consume
@@ -1251,22 +1430,18 @@ async def _schedule_suite_trials(
         [None] * trials for _ in suite.cases
     ]
     case_by_id = {case.id: index for index, case in enumerate(suite.cases)}
-    for key, execution in completed_trials.items():
-        if type(key) is not tuple or len(key) != 2:
-            raise ValueError("Completed trial keys must be (case_id, trial_number) pairs.")
+    for key, execution in _validated_completed_trials(
+        suite.cases, trials, completed_trials
+    ).items():
         case_id, trial_number = key
-        index = case_by_id.get(case_id)
-        if index is None or type(trial_number) is not int or not 1 <= trial_number <= trials:
-            raise ValueError("Completed trial slot does not belong to the eval suite.")
-        result, public_data = execution
-        if type(result) is not EvalTrialResult or type(public_data) is not _EvalTrialPublicData:
-            raise TypeError("Completed trials require exact result and public-data values.")
-        if result.trial_number != trial_number:
-            raise ValueError("Completed trial result does not match its slot.")
-        slots[index][trial_number - 1] = (
-            EvalTrialResult.model_validate(result.model_dump(mode="python", warnings=False)),
-            _EvalTrialPublicData.model_validate(public_data.model_dump(mode="python")),
-        )
+        slots[case_by_id[case_id]][trial_number - 1] = execution
+    # Reservations must follow restored, validated slots, including shared
+    # workflow declarations. Completed-only recovery acquires no providers.
+    scripted_providers_by_case = {
+        case.id: (scripted_providers_by_case or {}).get(case.id, ())
+        for index, case in enumerate(suite.cases)
+        if any(slot is None for slot in slots[index])
+    }
     semaphore = asyncio.Semaphore(max_concurrency)
     admission = current_launch_admission()
 
@@ -1279,7 +1454,14 @@ async def _schedule_suite_trials(
                 if admission is not None:
                     await admission.admit(case.id, trial_number)
                 # Nested evaluations are not additional cases of this CLI launch.
-                with admission_scope(None):
+                with (
+                    admission_scope(None),
+                    _scripted_eval_trial(
+                        concurrent=max_concurrency > 1,
+                        providers=(scripted_providers_by_case or {}).get(case.id, ()),
+                        require_owned=require_owned_scripted_providers,
+                    ),
+                ):
                     execution = await execute_trial(case, trial_number)
                 result, public_data = execution
                 if trial_completed is not None:
@@ -1294,15 +1476,19 @@ async def _schedule_suite_trials(
         for trial_number in range(1, trials + 1)
         if slots[index][trial_number - 1] is None
     )
-    if max_concurrency == 1 and not group_serial_trials:
-        # Preserve direct cancellation identity and avoid TaskGroup overhead for
-        # the common sequential policy while still honoring recovered slots.
-        for index, case, trial_number in pending_slots:
-            await _run_slot(index, case, trial_number)
-    else:
-        async with asyncio.TaskGroup() as group:
+    with _scripted_eval_invocation(
+        provider
+        for providers in (scripted_providers_by_case or {}).values()
+        for provider in providers
+    ):
+        if max_concurrency == 1 and not group_serial_trials:
+            # Preserve direct cancellation identity for the sequential policy.
             for index, case, trial_number in pending_slots:
-                group.create_task(_run_slot(index, case, trial_number))
+                await _run_slot(index, case, trial_number)
+        else:
+            async with asyncio.TaskGroup() as group:
+                for index, case, trial_number in pending_slots:
+                    group.create_task(_run_slot(index, case, trial_number))
 
     results: list[EvalCaseResult] = []
     public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] = {}
@@ -1420,25 +1606,30 @@ async def _run_eval_case(
         raise ValueError("run_eval_case trial_policy must match trials.")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
     started_at = datetime.now(UTC)
-    trial_executions = [
-        await _run_case_once_with_public_projection(
-            app,
-            case,
-            trial_number=trial_number,
-            suite_id=suite_id,
-            retain_trajectory=retain_trajectory,
-            retain_final_output=retain_final_output,
-            timeout_seconds=timeout_seconds,
-            public_output_preview_bytes=public_output_preview_bytes,
-            memory_attribution_bounds=memory_attribution_bounds,
-            memory_attribution_source_limit=memory_attribution_source_limit,
-            memory_attribution_max_bytes=memory_attribution_max_bytes,
-            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-            run_stream=run_stream,
-            trial_request_transform=trial_request_transform,
-        )
-        for trial_number in range(1, trials + 1)
-    ]
+    providers = _require_scripted_provider_concurrency(
+        app, (case,), trials=trials, max_concurrency=1
+    ).get(case.id, ())
+    trial_executions = []
+    with _scripted_eval_invocation(providers):
+        for trial_number in range(1, trials + 1):
+            with _scripted_eval_trial(concurrent=False, providers=providers):
+                execution = await _run_case_once_with_public_projection(
+                    app,
+                    case,
+                    trial_number=trial_number,
+                    suite_id=suite_id,
+                    retain_trajectory=retain_trajectory,
+                    retain_final_output=retain_final_output,
+                    timeout_seconds=timeout_seconds,
+                    public_output_preview_bytes=public_output_preview_bytes,
+                    memory_attribution_bounds=memory_attribution_bounds,
+                    memory_attribution_source_limit=memory_attribution_source_limit,
+                    memory_attribution_max_bytes=memory_attribution_max_bytes,
+                    memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                    run_stream=run_stream,
+                    trial_request_transform=trial_request_transform,
+                )
+                trial_executions.append(execution)
     trial_results = [result for result, _ in trial_executions]
     trial_public_data: tuple[_EvalTrialPublicData, ...] | None = None
     if public_output_preview_bytes is not None:
@@ -1800,6 +1991,21 @@ async def _run_workflow_case_once_with_public_projection(
             execution = built
             workflow_instance_tracker.observe(execution)
             runtime_app = execution.app
+            # Shared providers were reserved before the factory ran. Other
+            # positional providers must have been constructed by this trial.
+            # Validate all possible child-step providers before further awaits.
+            for provider_name in runtime_app.list_providers():
+                provider = runtime_app.get_provider(provider_name)
+                if (
+                    isinstance(provider, ScriptedModelProvider)
+                    and provider._response_factory is None
+                ):
+                    try:
+                        _claim_positional_provider(provider)
+                    except ValueError as exc:
+                        raise WorkflowEvalFailure(
+                            WorkflowEvalFailureCode.TARGET_FAILED, str(exc)
+                        ) from None
             observe_eval_session(runtime_app.session_store, root_session_id)
             if runtime_app.describe().fingerprint != app_manifest.fingerprint:
                 raise WorkflowEvalFailure(

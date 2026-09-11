@@ -40,6 +40,7 @@ from cayu import (
     ScenarioResumedInputEventV2,
     ScenarioTextPartV2,
     ScenarioUserMessageV2,
+    ScriptedModelProvider,
     SessionMessageQuery,
     SQLiteEvalStore,
     SQLiteSessionStore,
@@ -431,10 +432,20 @@ def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result
     asyncio.run(exercise())
 
 
-def test_scenario_execution_partitions_memory_limits_before_trial_dispatch() -> None:
+@pytest.mark.parametrize("positional_background", [None, False, True])
+def test_scenario_execution_partitions_memory_limits_before_trial_dispatch(
+    positional_background,
+) -> None:
     async def exercise() -> None:
         trial_count = 10
-        provider = _ApprovalProvider(request_approval=False)
+        provider = (
+            _ApprovalProvider(request_approval=False)
+            if positional_background is None
+            else ScriptedModelProvider(
+                [[ModelStreamEvent.completed()] for _ in range(trial_count)],
+                background=positional_background,
+            )
+        )
         target = _approval_target(provider, max_trials=trial_count)
         scenario = _scenario()
         preflight = await preflight_eval_scenario(
@@ -478,6 +489,24 @@ def test_scenario_execution_partitions_memory_limits_before_trial_dispatch() -> 
         await store.admit_run(request, redact_json=target.app.redact_json)
         claimed = await store.claim_run(target_key=target.key, lease_seconds=30)
         assert claimed is not None
+
+        if positional_background is not None:
+            with pytest.raises(ValueError, match="Concurrent eval suites"):
+                await run_compiled_eval_scenario(
+                    target,
+                    compiled,
+                    scenario,
+                    binding,
+                    store=store,
+                    claim=claimed.claim,
+                    max_concurrency=2,
+                    poll_seconds=0.001,
+                )
+            assert provider.requests == []
+            assert provider.background_operation_ids == ()
+            retained = await store.load_run(claimed.claim.run_id)
+            assert retained.scenario_progress is None
+            return
 
         result = await run_compiled_eval_scenario(
             target,

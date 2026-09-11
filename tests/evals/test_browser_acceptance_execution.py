@@ -1155,6 +1155,16 @@ def test_protocol_browser_fixture_proves_only_its_fixed_worker(requirement_kind:
     asyncio.run(run())
 
 
+def test_browser_acceptance_rejects_factory_script_identity(tmp_path: Path) -> None:
+    def provider_factory(events):
+        return ScriptedModelProvider(response_factory=lambda request: events[0])
+
+    with BrowserAcceptanceFixtureV1() as fixture:
+        plan = _plan(tmp_path, fixture, provider_type=provider_factory)
+        with pytest.raises(ValueError, match="requires positional scripted batches"):
+            asyncio.run(inspect_browser_acceptance_runtime_identity(plan))
+
+
 def test_browser_acceptance_runs_through_public_app_webbridge_and_runner(tmp_path: Path) -> None:
     with BrowserAcceptanceFixtureV1() as fixture:
         report = asyncio.run(
