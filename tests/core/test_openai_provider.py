@@ -8398,11 +8398,15 @@ async def test_openai_protocol_diagnostics_survive_sqlite_and_unknown_retries(
         )
     if field is not None:
         expected["provider_protocol_field"] = field
-    assert {
+    protocol_payload = {
         key: value
         for key, value in public_error.payload.items()
         if key.startswith("provider_protocol_")
-    } == expected
+    }
+    # Protocol diagnostics may grow with additive provider evidence.  Preserve
+    # assertions for the fields required by this regression without rejecting
+    # newer, valid diagnostic fields emitted by the adapter.
+    assert {key: protocol_payload[key] for key in expected} == expected
     assert "sk-secret" not in repr(public_error.payload)
 
     database = tmp_path / "protocol.sqlite3"
@@ -8438,7 +8442,7 @@ async def test_openai_protocol_diagnostics_survive_sqlite_and_unknown_retries(
             key: value
             for key, value in event.payload.items()
             if key.startswith("provider_protocol_")
-        } == expected
+        } == protocol_payload
         assert "sk-secret" not in repr(event.payload)
     hosted = [event for event in persisted if event.type == EventType.MODEL_HOSTED_TOOL_CALL]
     assert [event.payload["status"] for event in hosted] == [

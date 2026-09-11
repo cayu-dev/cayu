@@ -77,7 +77,8 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test shard ${{ matrix.shard }}/32 (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    # Includes dependency setup and collection, not just measured test calls.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

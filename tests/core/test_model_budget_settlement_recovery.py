@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -22,6 +23,10 @@ from cayu.runtime import (
     InMemorySessionStore,
     ModelCompactor,
     ModelCompletionStageDisposition,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
+    RecoveryRegistrationStatus,
     RunRequest,
 )
 from cayu.runtime._event_projection import public_event_sequence
@@ -36,8 +41,12 @@ from cayu.runtime.costs import (
     PriceBook,
     Provenance,
 )
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.sessions import EventQuery
+from cayu.runtime.work_contracts import TaskCompletionDecisionRequired
+from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -1030,10 +1039,18 @@ def test_automatic_compaction_settlement_redacts_dynamic_pricing() -> None:
     )
 
 
-def test_recovery_settles_durable_model_completion_without_redispatch() -> None:
+@pytest.mark.parametrize("remove_policy", [False, True])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_recovery_settles_durable_model_completion_without_redispatch(
+    remove_policy: bool, backend: str, tmp_path
+) -> None:
     async def scenario() -> None:
         session_id = "sess_model_budget_reconcile_recovery"
-        store = InMemorySessionStore()
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "historical-budget.sqlite3")
+        )
         clock = _MutableClock(datetime(2026, 7, 29, tzinfo=UTC))
         ledger = _CrashBeforeFirstReconciliation(clock=clock)
         provider = _CompletedProvider()
@@ -1056,9 +1073,19 @@ def test_recovery_settles_durable_model_completion_without_redispatch() -> None:
             pass
         assert len(provider.requests) == 1
 
-        await _app(store, ledger, provider).recover_incomplete_session(
-            IncompleteSessionRecoveryRequest(session_id=session_id)
-        )
+        if backend == "sqlite":
+            store = SQLiteSessionStore(tmp_path / "historical-budget.sqlite3")
+        recovery_app = _app(store, ledger, provider)
+        if remove_policy:
+            recovery_app.budget_policy = None
+            with pytest.raises(ExecutionProfileMismatchError):
+                await recovery_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+        else:
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
 
         assert len(provider.requests) == 1
         settled = next(iter(ledger._records.values()))
@@ -1068,6 +1095,243 @@ def test_recovery_settles_durable_model_completion_without_redispatch() -> None:
         assert len(budget_events) == 1
         assert budget_events[0].type == EventType.BUDGET_RECONCILED
         assert budget_events[0].payload["settlement_kind"] == "completed"
+
+        if remove_policy:
+            with pytest.raises(ExecutionProfileMismatchError):
+                await recovery_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+            assert await _budget_events(store, session_id) == budget_events
+            assert len(ledger._settlements) == 1
+            assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("policy_change", ["unchanged", "replace", "remove"])
+@pytest.mark.parametrize("settled", [False, True])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_recovery_plan_validates_policy_before_reporting_published_budget_ready(
+    policy_change: str, settled: bool, backend: str, tmp_path
+) -> None:
+    async def scenario() -> None:
+        session_id = "historical-budget-plan"
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "historical-budget-plan.sqlite3")
+        )
+        ledger = _CrashBeforeFirstReconciliation()
+        provider = _CompletedProvider()
+        try:
+            await _run_until_process_loss(_app(store, ledger, provider), session_id)
+            if backend == "sqlite":
+                await store.close()
+                store = SQLiteSessionStore(tmp_path / "historical-budget-plan.sqlite3")
+            app = _app(store, ledger, provider)
+            if settled:
+                app.budget_policy = None
+                with pytest.raises(ExecutionProfileMismatchError):
+                    await app.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(session_id=session_id)
+                    )
+                assert next(iter(ledger._records.values())).status == "reconciled"
+            else:
+                assert next(iter(ledger._records.values())).status == "active"
+
+            policy = _budget_policy()
+            if policy_change == "replace":
+                policy.limits[0].max_estimated_cost = Decimal("2")
+            app.budget_policy = None if policy_change == "remove" else policy
+
+            async def snapshot():
+                return (
+                    await store.load(session_id),
+                    await store.load_checkpoint(session_id),
+                    await store.load_events(session_id),
+                    deepcopy(ledger._records),
+                    deepcopy(ledger._settlements),
+                )
+
+            before = await snapshot()
+            plan = await app.plan_recovery(
+                RecoveryPlanRequest(
+                    selection=RecoveryPlanSelection(
+                        session_ids=(session_id,), inactive_for_seconds=0
+                    )
+                )
+            )
+            assert await snapshot() == before
+            assert len(provider.requests) == 1
+            assert len(plan.items) == 1
+            item = plan.items[0]
+            if policy_change == "unchanged":
+                assert item.registration.status is RecoveryRegistrationStatus.READY
+                assert item.registration.validated_execution_profile_fingerprint is not None
+                assert item.registration.validated_execution_profile_fingerprint == (
+                    item.registration.expected_execution_profile_fingerprint
+                )
+                assert RecoveryPlanAction.AUTOMATIC_REPAIR in item.allowed_actions
+            else:
+                assert item.registration.status is RecoveryRegistrationStatus.INCOMPATIBLE
+                assert item.registration.reason_code == "ExecutionProfileMismatchError"
+                assert item.registration.validated_execution_profile_fingerprint is None
+                assert item.allowed_actions == (RecoveryPlanAction.LEAVE_INTACT,)
+        finally:
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signal", ["ack_loss", "cancel"])
+def test_changed_policy_recovery_replays_committed_settlement(monkeypatch, signal: str) -> None:
+    async def scenario() -> None:
+        session_id = "historical-budget-settlement-signal"
+        store = InMemorySessionStore()
+        ledger = _CrashBeforeFirstReconciliation()
+        provider = _CompletedProvider()
+        await _run_until_process_loss(_app(store, ledger, provider), session_id)
+        app = _app(store, ledger, provider)
+        app.budget_policy = None
+        original_reconcile = ledger.reconcile
+        committed = asyncio.Event()
+
+        async def lose_acknowledgement(**kwargs):
+            await original_reconcile(**kwargs)
+            committed.set()
+            if signal == "cancel":
+                await asyncio.Event().wait()
+            raise _SimulatedProcessLoss("historical settlement acknowledgement lost")
+
+        monkeypatch.setattr(ledger, "reconcile", lose_acknowledgement)
+        task = asyncio.create_task(
+            app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+        )
+        await asyncio.wait_for(committed.wait(), timeout=10)
+        if signal == "cancel":
+            task.cancel()
+            assert task.cancelling() == 1
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+        else:
+            with pytest.raises(_SimulatedProcessLoss):
+                await task
+        assert next(iter(ledger._records.values())).status == "reconciled"
+        assert len(ledger._settlements) == 1
+        monkeypatch.setattr(ledger, "reconcile", original_reconcile)
+        with pytest.raises(ExecutionProfileMismatchError):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        assert len(ledger._settlements) == 1
+        assert len(await _budget_events(store, session_id)) == 1
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_changed_policy_recovery_reopens_sqlite_session_and_ledger(tmp_path, monkeypatch) -> None:
+    async def scenario() -> None:
+        session_id = "historical-budget-full-reopen"
+        session_path = tmp_path / "sessions.sqlite3"
+        ledger_path = tmp_path / "budgets.sqlite3"
+        store = SQLiteSessionStore(session_path)
+        ledger = SQLiteBudgetLedger(ledger_path)
+        provider = _CompletedProvider()
+
+        async def stop_before_settlement(**kwargs):
+            raise _SimulatedProcessLoss("stop before persistent settlement")
+
+        monkeypatch.setattr(ledger, "reconcile", stop_before_settlement)
+        try:
+            await _run_until_process_loss(_app(store, ledger, provider), session_id)
+        finally:
+            await ledger.close()
+            await store.close()
+
+        store = SQLiteSessionStore(session_path)
+        ledger = SQLiteBudgetLedger(ledger_path)
+        try:
+            reserved = await store.query_events(
+                EventQuery(session_id=session_id, event_types=(EventType.BUDGET_RESERVED,))
+            )
+            assert len(reserved) == 1
+            reservation_id = reserved[0].event.payload["reservation_id"]
+            app = _app(store, ledger, provider)
+            app.budget_policy = None
+            for _ in range(2):
+                with pytest.raises(ExecutionProfileMismatchError):
+                    await app.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(session_id=session_id)
+                    )
+                record = await ledger.load_reservation(reservation_id)
+                assert record is not None
+                assert record.status == "reconciled"
+                assert record.actual_amount == Decimal("0.000037")
+                assert len(await _budget_events(store, session_id)) == 1
+                assert len(provider.requests) == 1
+        finally:
+            await ledger.close()
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_changed_policy_recovery_checks_admission_before_settlement(monkeypatch) -> None:
+    async def scenario() -> None:
+        session_id = "historical-budget-admission-denied"
+        store = InMemorySessionStore()
+        ledger = _CrashBeforeFirstReconciliation()
+        provider = _CompletedProvider()
+        await _run_until_process_loss(_app(store, ledger, provider), session_id)
+        app = _app(store, ledger, provider)
+        app.budget_policy = None
+        gates = []
+
+        async def deny_mutation(task_id, *, session_id=None, admit_session=True, **kwargs):
+            gates.append(admit_session)
+            return admit_session, None
+
+        monkeypatch.setattr(
+            app._session_engine, "_verifier_aware_task_execution_outcome", deny_mutation
+        )
+        with pytest.raises(TaskCompletionDecisionRequired):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        assert gates == [False, True]
+        assert next(iter(ledger._records.values())).status == "active"
+        assert not ledger._settlements
+        assert await _budget_events(store, session_id) == []
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_changed_policy_recovery_rejects_missing_completion_receipt(monkeypatch) -> None:
+    async def scenario() -> None:
+        session_id = "historical-budget-missing-receipt"
+        store = InMemorySessionStore()
+        ledger = _CrashBeforeFirstReconciliation()
+        provider = _CompletedProvider()
+        await _run_until_process_loss(_app(store, ledger, provider), session_id)
+        app = _app(store, ledger, provider)
+        app.budget_policy = None
+
+        async def missing_receipt(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(store, "load_runtime_publication_receipt", missing_receipt)
+        with pytest.raises(RuntimeError, match="no publication receipt"):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        assert next(iter(ledger._records.values())).status == "active"
+        assert not ledger._settlements
+        assert await _budget_events(store, session_id) == []
+        assert len(provider.requests) == 1
 
     asyncio.run(scenario())
 

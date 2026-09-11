@@ -8004,7 +8004,13 @@ is reached, but it does not emit `session.limit_reached`, does not interrupt the
 session, and does not close pending tool rounds.
 
 App-level budgets are configured separately on `CayuApp` through
-`BudgetPolicy`. A policy contains app-wide, agent-scoped, and causal
+`BudgetPolicy`. `CayuApp` is the authoritative in-process owner: construction
+and later `app.budget_policy = replacement` use the same validation and deep-copy
+boundary, reads return defensive copies, and `None` explicitly removes the
+app-level policy. Mutating a constructor, replacement, or getter value does not
+change the installed policy. Use request-scoped limits for dynamic
+tenant/work-item policy rather than mutating an installed app policy. A policy
+contains app-wide, agent-scoped, and causal
 `BudgetLimit` entries. Budget windows default to `BudgetWindow.all_time()`.
 `BudgetWindow.rolling(seconds=...)` evaluates durable model events whose UTC
 event timestamp is inside the trailing moving window at the time Cayu checks the

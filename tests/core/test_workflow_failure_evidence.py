@@ -201,7 +201,10 @@ def test_native_deadline_and_sqlite_replay(
             diagnostics = terminal.payload.get("provider_cancellation_failures", [])
             assert bool(diagnostics) is cleanup_failure
             if cleanup_failure:
-                assert diagnostics[0]["cleanup_reason"] == "close_exception"
+                assert diagnostics[0]["cleanup_reason"] == "read_exception"
+                assert diagnostics[0]["cleanup_failure_phase"] == "read"
+                assert diagnostics[0]["cleanup_read_exception_type"] == "RuntimeError"
+                assert diagnostics[0]["cleanup_read_exception_message"] == "redacted"
                 assert diagnostics[0]["cleanup_exception_type"] == "RuntimeError"
                 assert diagnostics[0]["remote_settlement_state"] == "unknown"
         calls = provider.calls

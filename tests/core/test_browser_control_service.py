@@ -129,7 +129,7 @@ def test_invalid_sealed_scope_fails_before_bootstrap_issuance(
     asyncio.run(scenario())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not recwarn, [(warning.category.__name__, str(warning.message)) for warning in recwarn]
 
 
 def test_concurrent_bootstrap_scopes_merge_under_exact_existing_owner(monkeypatch):

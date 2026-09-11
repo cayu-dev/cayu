@@ -104,7 +104,7 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         assert job.index("sudo apt-get install --yes ripgrep") < job.index("scripts/run_ci.py")
 
     assert "github.event_name == 'pull_request'" not in shards
-    assert "timeout-minutes: 15" in shards
+    assert "timeout-minutes: 20" in shards
     assert (
         "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]"
         in shards

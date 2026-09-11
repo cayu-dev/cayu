@@ -3342,60 +3342,10 @@ class RecoveryCoordinator:
                 recovery_events=recovery_events,
             )
 
-        receipt = await self._session_store.load_runtime_publication_receipt(
-            session.id,
-            pointer.logical_step_id,
+        completion_event, completed_stage = await self._reconcile_published_model_budget(
+            session=session,
+            pointer=pointer,
         )
-        if receipt is None:
-            raise RuntimeError("The durable model-step pointer has no publication receipt.")
-        if (
-            receipt.kind != "model-step"
-            or receipt.transcript_start_cursor != pointer.source_transcript_cursor
-            or receipt.transcript_end_cursor != pointer.transcript_end_cursor
-            or receipt.appended_event_ids != (pointer.completion_event_id,)
-            or receipt.referenced_events
-        ):
-            raise RuntimeError(
-                "The durable model-step pointer conflicts with its publication receipt."
-            )
-
-        event_records = await self._session_store.query_events(
-            EventQuery(
-                session_id=session.id,
-                event_id=pointer.completion_event_id,
-                limit=1,
-            )
-        )
-        if len(event_records) != 1:
-            raise RuntimeError("The durable model-step pointer has no exact completion event.")
-        completion_event = event_records[0].event
-        if (
-            completion_event.type != EventType.MODEL_COMPLETED
-            or completion_event.payload.get("step_classification") != pointer.classification
-            or completion_event.payload.get("transcript_cursor") != pointer.transcript_end_cursor
-        ):
-            raise RuntimeError(
-                "The durable model-step pointer conflicts with its completion event."
-            )
-        completed_stage = await self._session_store.load_model_completion_stage(
-            session.id,
-            pointer.stage_id,
-        )
-        if (
-            completed_stage is None
-            or completed_stage.state != "completed"
-            or completed_stage.logical_step_id != pointer.logical_step_id
-            or completed_stage.publication is None
-            or completed_stage.publication.events != (completion_event,)
-        ):
-            raise RuntimeError(
-                "The durable model-step pointer conflicts with its completion stage."
-            )
-        if completed_stage.reservation_ids:
-            await self._run_limit_controller.reconcile_model_completion_settlements(
-                completion_event,
-                reservation_ids=completed_stage.reservation_ids,
-            )
 
         transcript_window = await self._session_store.load_transcript_window(
             session.id,
@@ -3616,6 +3566,64 @@ class RecoveryCoordinator:
             completed_stage=completed_stage.model_copy(deep=True),
             structured_output_events=structured_events,
         )
+
+    async def _reconcile_published_model_budget(
+        self,
+        *,
+        session: Session,
+        pointer: model_completion_publication.ModelStepPublicationCheckpoint,
+        before_mutation: RecoveryMutationHook | None = None,
+    ) -> tuple[Event, ModelCompletionStage]:
+        """Settle immutable published evidence without admitting provider or tool work."""
+        receipt = await self._session_store.load_runtime_publication_receipt(
+            session.id, pointer.logical_step_id
+        )
+        if receipt is None:
+            raise RuntimeError("The durable model-step pointer has no publication receipt.")
+        if (
+            receipt.kind != "model-step"
+            or receipt.transcript_start_cursor != pointer.source_transcript_cursor
+            or receipt.transcript_end_cursor != pointer.transcript_end_cursor
+            or receipt.appended_event_ids != (pointer.completion_event_id,)
+            or receipt.referenced_events
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer conflicts with its publication receipt."
+            )
+        event_records = await self._session_store.query_events(
+            EventQuery(session_id=session.id, event_id=pointer.completion_event_id, limit=1)
+        )
+        if len(event_records) != 1:
+            raise RuntimeError("The durable model-step pointer has no exact completion event.")
+        completion_event = event_records[0].event
+        if (
+            completion_event.type != EventType.MODEL_COMPLETED
+            or completion_event.payload.get("step_classification") != pointer.classification
+            or completion_event.payload.get("transcript_cursor") != pointer.transcript_end_cursor
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer conflicts with its completion event."
+            )
+        completed_stage = await self._session_store.load_model_completion_stage(
+            session.id, pointer.stage_id
+        )
+        if (
+            completed_stage is None
+            or completed_stage.state != "completed"
+            or completed_stage.logical_step_id != pointer.logical_step_id
+            or completed_stage.publication is None
+            or completed_stage.publication.events != (completion_event,)
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer conflicts with its completion stage."
+            )
+        if completed_stage.reservation_ids:
+            if before_mutation is not None:
+                await before_mutation()
+            await self._run_limit_controller.reconcile_model_completion_settlements(
+                completion_event, reservation_ids=completed_stage.reservation_ids
+            )
+        return completion_event, completed_stage
 
     async def _load_closed_structured_output_events(
         self,
@@ -17456,7 +17464,8 @@ class RecoveryCoordinator:
         The sentinel is raised only by the same ``before_mutation`` hook used by
         verifier-aware recovery admission, so registration and execution-profile
         incompatibilities are reported before an operator plan can authorize a
-        write.
+        write. Historical accounting defers this sentinel until continuation
+        preflight; profile rejection diagnostics are not published by planning.
         """
 
         if type(session) is not Session:
@@ -17472,6 +17481,7 @@ class RecoveryCoordinator:
                 reason="operator_recovery_plan_preflight",
                 metadata={"source": "registered_application_recovery_plan"},
                 before_mutation=prevent_mutation,
+                record_profile_rejection=False,
             )
         except _RecoveryPreflightMutationRequired:
             return None
@@ -17565,6 +17575,7 @@ class RecoveryCoordinator:
         reason: str,
         metadata: dict[str, Any],
         before_mutation: RecoveryMutationHook | None = None,
+        record_profile_rejection: bool = True,
         retain_open_interaction_invocation: bool = False,
         retain_invocation_context: Callable[[InvocationContext], None] | None = None,
         provider_disposition_task_id: str | None = None,
@@ -17598,6 +17609,7 @@ class RecoveryCoordinator:
             metadata=metadata,
             previous_status=previous_status,
             before_mutation=before_mutation,
+            record_profile_rejection=record_profile_rejection,
             retain_open_interaction_invocation=retain_open_interaction_invocation,
             retain_invocation_context=retain_invocation_context,
             provider_disposition_task_id=provider_disposition_task_id,
@@ -17618,6 +17630,7 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None,
         retain_open_interaction_invocation: bool,
         retain_invocation_context: Callable[[InvocationContext], None] | None,
+        record_profile_rejection: bool = True,
         provider_disposition_task_id: str | None = None,
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
@@ -17917,6 +17930,23 @@ class RecoveryCoordinator:
         execution_profile_snapshot = None
         budget_policy_snapshot: BudgetPolicy | None = None
         if requires_execution_profile:
+            published_model = model_completion_publication.model_step_publication_from_checkpoint(
+                checkpoint
+            )
+            if published_model is not None and active_model_completion is None:
+                # This accounts for already-published work under its original
+                # reservation identity. It neither promotes a model stage nor
+                # permits continuation under the current configuration.
+                # Planning skips this accounting write but must still validate
+                # continuation compatibility below. Its mutation gate remains
+                # unadmitted, so subsequent writes still stop preflight.
+                # Real recovery settles first.
+                with contextlib.suppress(_RecoveryPreflightMutationRequired):
+                    await self._reconcile_published_model_budget(
+                        session=session,
+                        pointer=published_model,
+                        before_mutation=admit_before_mutation,
+                    )
             budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
             pending_disposition = (
                 None if pending_provider_disposition is None else pending_provider_disposition[0]
@@ -17955,6 +17985,7 @@ class RecoveryCoordinator:
                         if pending_disposition is None
                         else (pending_disposition.execution_profile_fingerprint,)
                     ),
+                    record_rejection=record_profile_rejection,
                 )
             if pending_completion_finalization is not None:
                 if session.status not in {SessionStatus.RUNNING, SessionStatus.FAILED}:

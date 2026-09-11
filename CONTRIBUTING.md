@@ -216,7 +216,8 @@ before regenerating the source bundle.
 
 Every pull request runs repository-wide static checks and the Python 3.14 regression
 suite without coverage instrumentation. The PR gate targets approximately ten minutes; test
-jobs allow fifteen minutes and package verification jobs allow ten minutes. A small fail-open path selector additionally
+jobs allow twenty minutes for general shards (including setup and collection),
+fifteen minutes for specialist lanes, and ten minutes for package verification. A small fail-open path selector additionally
 runs the retained SQLite cancellation, package/sidecar, and dashboard gates whenever their
 contracts can change. `main` runs every retained gate.
 Duration-balanced general tests run across 32 jobs, and Postgres conformance

@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from decimal import Decimal, localcontext
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 from tests.evals.eval_store_conformance import captured_result_for_corpus
 
+import cayu.evals.judges as judges_module
 import cayu.evals.result_presentation as result_presentation_module
 from cayu import (
     AgentSpec,
@@ -1285,9 +1287,11 @@ class _HangingProvider(ModelProvider):
 
     def __init__(self) -> None:
         self.cancelled = False
+        self.started = asyncio.Event()
 
     async def stream(self, request):
         del request
+        self.started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -1296,7 +1300,7 @@ class _HangingProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-def test_judge_timeout_cancels_execution_without_candidate_score():
+def test_judge_timeout_cancels_execution_without_candidate_score(monkeypatch):
     provider = _HangingProvider()
     app = CayuApp(enable_logging=False)
     app.register_provider(provider, default=True)
@@ -1306,16 +1310,39 @@ def test_judge_timeout_cancels_execution_without_candidate_score():
         label="Quality judge",
         app=app,
         agent_name="judge",
-        timeout_seconds=1,
+        timeout_seconds=30,
     )
     target, _ = _target(judge)
 
-    result = asyncio.run(run_corpus_suite(target, _corpus(judge), "quality-suite"))
+    async def scenario():
+        # Expire a real timeout only once provider dispatch is established;
+        # slow CI admission must not turn this into a pre-dispatch timeout test.
+        deadline = asyncio.timeout(None)
+
+        def controlled_timeout(seconds):
+            assert seconds == 30
+            return deadline
+
+        monkeypatch.setattr(judges_module, "asyncio", SimpleNamespace(timeout=controlled_timeout))
+
+        async def expire_after_dispatch():
+            await provider.started.wait()
+            deadline.reschedule(asyncio.get_running_loop().time())
+
+        async with asyncio.timeout(30):
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(expire_after_dispatch())
+                result = await run_corpus_suite(target, _corpus(judge), "quality-suite")
+        assert deadline.expired()
+        return result
+
+    result = asyncio.run(scenario())
 
     assertion = result.run.cases[0].trials[0].assertions[0]
     assert assertion.outcome == "error"
     assert assertion.score is None
     assert assertion.detail.criteria == ()
     assert assertion.detail.aggregate_score is None
-    assert assertion.detail.judge_profile.timeout_seconds == 1
+    assert assertion.detail.judge_profile.timeout_seconds == 30
+    assert provider.started.is_set()
     assert provider.cancelled is True

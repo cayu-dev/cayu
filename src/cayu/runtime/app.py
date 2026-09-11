@@ -1045,7 +1045,7 @@ class CayuApp:
             "knowledge_review_labels",
         )
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
-        self.budget_policy = copy_budget_policy(budget_policy)
+        self.budget_policy = budget_policy
         self.budget_store = (
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
@@ -1319,6 +1319,19 @@ class CayuApp:
             enqueue=self._enqueue_session_message_private,
             fan_out=self._event_writer.fan_out_persisted,
         )
+
+    @property
+    def budget_policy(self) -> BudgetPolicy | None:
+        """Return a defensive copy of the app-owned budget policy."""
+
+        return copy_budget_policy(self._budget_policy)
+
+    @budget_policy.setter
+    def budget_policy(self, value: BudgetPolicy | None) -> None:
+        """Install a complete, validated app budget-policy replacement."""
+
+        copied = copy_budget_policy(value)
+        self._budget_policy = copied
 
     def redact_json(self, value: Any) -> Any:
         """Return a JSON-compatible value with configured secret values redacted."""

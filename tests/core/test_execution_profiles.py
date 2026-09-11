@@ -8982,7 +8982,8 @@ def test_application_budget_profile_and_dispatch_share_one_pre_yield_snapshot(
         interaction_started = await anext(stream)
         assert interaction_started.type is EventType.INTERACTION_STARTED
         assert app.budget_policy is not None
-        app.budget_policy.limits = (replacement_limit,)
+        app.budget_policy = BudgetPolicy(limits=(replacement_limit,))
+        assert app.budget_policy.limits[0].max_estimated_cost == Decimal("11")
         remaining = [event async for event in stream]
 
         budget_events = [event for event in remaining if event.type is EventType.BUDGET_CHECKED]
@@ -9025,15 +9026,19 @@ def test_model_attempt_footprint_usage_cost_and_evidence_share_governing_profile
         )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        await _collect(
-            app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="execution-profile-model-evidence",
-                    messages=[Message.text("user", "attribute this request")],
-                )
+        replaced = False
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="execution-profile-model-evidence",
+                messages=[Message.text("user", "attribute this request")],
             )
-        )
+        ):
+            if event.type is EventType.BUDGET_RESERVED:
+                app.budget_policy = None
+                replaced = True
+        assert replaced
+        assert app.budget_policy is None
 
         session = await store.load("execution-profile-model-evidence")
         assert session is not None

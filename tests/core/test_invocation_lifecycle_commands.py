@@ -3194,6 +3194,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
             tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
         )
 
+    budget_snapshot = app.budget_policy
     context = _authenticated_invocation_context(
         active_profile=active,
         binding=PreparedInvocationBinding(
@@ -3216,7 +3217,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
         runtime_hooks=app._runtime_hooks,
         loop_policies=app._loop_policies,
         request_loop_policies=(),
-        budget_policy=app.budget_policy,
+        budget_policy=budget_snapshot,
         tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
     )
 
@@ -3225,7 +3226,9 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
     assert context.registered_agent is registered_agent
     assert context.registered_provider is registered_provider
     assert context.loop_policies[0] is policy
-    assert context.budget_policy is app.budget_policy
+    assert context.budget_policy is budget_snapshot
+    assert context.budget_policy == app.budget_policy
+    assert context.budget_policy is not app.budget_policy
     assert repr(context) == "InvocationContext(<authenticated>)"
     assert repr(provider) not in repr(context)
     assert copy.copy(context) is context
@@ -3330,7 +3333,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
         runtime_hooks=app._runtime_hooks,
         loop_policies=app._loop_policies,
         request_loop_policies=(),
-        budget_policy=app.budget_policy,
+        budget_policy=budget_snapshot,
         tool_capability_ceiling=ToolCapabilityCeiling(tool_names=("original_tool",)),
     )
     assert (
@@ -3376,7 +3379,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
         runtime_hooks=app._runtime_hooks,
         loop_policies=app._loop_policies,
         request_loop_policies=(),
-        budget_policy=app.budget_policy,
+        budget_policy=budget_snapshot,
         tool_capability_ceiling=environment_context.tool_capability_ceiling,
     )
     _retain_cleanup_invocation_context(owner, other_context)
@@ -3393,7 +3396,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
         runtime_hooks=app._runtime_hooks,
         loop_policies=tuple([policy]),
         request_loop_policies=(),
-        budget_policy=app.budget_policy,
+        budget_policy=budget_snapshot,
         tool_capability_ceiling=environment_context.tool_capability_ceiling,
     )
     retained = owner.invocation_context

@@ -1695,6 +1695,7 @@ def test_reject_only_skips_live_prefix_and_receipt_binds_mode(lifecycle_case):
 
 def test_sqlite_revision_83_migrates_and_validates_lifecycle_schema(tmp_path):
     import sqlite3
+    from contextlib import closing
 
     from cayu.storage import migrations
     from cayu.storage.sqlite import SQLiteSessionStore
@@ -1703,7 +1704,7 @@ def test_sqlite_revision_83_migrates_and_validates_lifecycle_schema(tmp_path):
         path = tmp_path / "migration.sqlite"
         store = SQLiteSessionStore(path)
         await store.close()
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("DROP INDEX idx_cayu_events_queue_acceptance")
             connection.execute("ALTER TABLE cayu_session_message_queue DROP COLUMN conditions_json")
             connection.execute("ALTER TABLE cayu_session_message_queue DROP COLUMN terminal_json")
@@ -1725,7 +1726,7 @@ def test_sqlite_revision_83_migrates_and_validates_lifecycle_schema(tmp_path):
             ).records[0].validity == "valid"
         finally:
             await store.close()
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             assert connection.execute(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 83"
             ).fetchone() == ("breaking", 83)

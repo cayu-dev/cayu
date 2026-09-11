@@ -231,3 +231,13 @@ A failed compaction with no completion usage remains unpriceable even when its
 provider/model tariff is configured. Budget admission reports the missing usage
 and remains closed; it does not invent zero usage or use a reservation as observed
 usage. Diagnostics contain fixed categories rather than provider error text.
+
+## Application budget-policy ownership
+
+Configure durable app-wide, agent, and causal budget limits with
+`CayuApp(budget_policy=...)`. `CayuApp` owns a validated defensive copy of the
+policy: assign a complete replacement through `app.budget_policy = replacement`
+when policy changes, and use `None` to remove app-level enforcement. Reads and
+inputs are copied, so mutating a policy object after construction or reading it
+does not update the running application. Use request-scoped `budget_limits` for
+dynamic tenant or work-item policy; do not mutate an installed policy in place.

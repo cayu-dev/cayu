@@ -624,6 +624,10 @@ def test_user_input_recovery_dispatch_reuses_its_validated_budget_snapshot() -> 
                     ModelStreamEvent.text_delta("continued"),
                     ModelStreamEvent.completed({"finish_reason": "stop"}),
                 ],
+                [
+                    ModelStreamEvent.text_delta("later invocation"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
             ],
             name="fake",
         )
@@ -664,7 +668,8 @@ def test_user_input_recovery_dispatch_reuses_its_validated_budget_snapshot() -> 
         )
         assert active_profile is not None
         assert app.budget_policy is not None
-        app.budget_policy.limits = (replacement_limit,)
+        app.budget_policy = BudgetPolicy(limits=(replacement_limit,))
+        assert app.budget_policy.limits[0].max_estimated_cost == Decimal("11")
         remaining = [event async for event in continuation]
 
         checks = [event for event in remaining if event.type is EventType.BUDGET_CHECKED]
@@ -673,6 +678,29 @@ def test_user_input_recovery_dispatch_reuses_its_validated_budget_snapshot() -> 
         assert {event.payload["execution_profile_fingerprint"] for event in checks} == {
             active_profile.profile.fingerprint
         }
+        assert any(event.type is EventType.SESSION_COMPLETED for event in remaining)
+
+        later_session_id = f"{session_id}-later"
+        later_events = await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=later_session_id,
+                    messages=[Message.text("user", "use the replacement policy")],
+                )
+            )
+        )
+        later_checks = [event for event in later_events if event.type is EventType.BUDGET_CHECKED]
+        assert later_checks
+        assert {event.payload["maximum"] for event in later_checks} == {"11"}
+        later_session = await store.load(later_session_id)
+        assert later_session is not None
+        later_profile = execution_profile_from_session_metadata(later_session.metadata)
+        assert later_profile.fingerprint != active_profile.profile.fingerprint
+        assert {event.payload["execution_profile_fingerprint"] for event in later_checks} == {
+            later_profile.fingerprint
+        }
+        assert any(event.type is EventType.SESSION_COMPLETED for event in later_events)
 
     asyncio.run(scenario())
 

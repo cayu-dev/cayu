@@ -28,6 +28,7 @@ from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     BudgetLimit,
+    BudgetPolicy,
     CayuApp,
     EventQuery,
     ExecutionProfileComponentClass,
@@ -57,6 +58,7 @@ from cayu.runtime import (
     ToolRoundIdentity,
     UserInputRecoveryRequest,
     UserInputResponse,
+    default_price_book,
 )
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import sessions as sessions_module
@@ -1949,6 +1951,46 @@ def test_ask_user_is_opt_in_not_registered_by_default() -> None:
     )
     assert not any(e.type == EventType.SESSION_AWAITING_USER_INPUT for e in events)
     assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_budget_replacement_preserves_pending_user_input_until_original_profile_restored() -> None:
+    async def scenario() -> None:
+        app, store = _build([("call_input", "ask_user", {"question": "continue?"})])
+        session_id = "user-input-budget-replacement"
+        events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant", session_id=session_id, messages=[Message.text("user", "go")]
+            ),
+        )
+        awaiting = next(e for e in events if e.type is EventType.SESSION_AWAITING_USER_INPUT)
+        checkpoint = await store.load_checkpoint(session_id)
+        pending = deepcopy(checkpoint["pending_user_input"])
+        response = UserInputResponse(
+            session_id=session_id, input_id=awaiting.payload["input_id"], answer="yes"
+        )
+        app.budget_policy = BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("10"),
+                    pricing=default_price_book(),
+                    allow_unpriced=True,
+                ),
+            )
+        )
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _drain(app.resolve_user_input(response))
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+        )
+        assert (await store.load_checkpoint(session_id))["pending_user_input"] == pending
+        app.budget_policy = None
+        resumed = await _drain(app.resolve_user_input(response))
+        assert any(e.type is EventType.SESSION_COMPLETED for e in resumed)
+        assert "pending_user_input" not in (await store.load_checkpoint(session_id))
+
+    asyncio.run(scenario())
 
 
 def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() -> None:
