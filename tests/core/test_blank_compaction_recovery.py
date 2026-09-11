@@ -113,6 +113,52 @@ def test_retry_option_requires_a_boolean(invalid):
         ModelCompactor(provider=SummaryProvider([]), model="summary", retry_empty_summaries=invalid)
 
 
+def test_invalid_completion_metadata_keeps_completed_usage_without_retry():
+    class MalformedCompletionProvider(SummaryProvider):
+        async def stream(self, request):
+            async for event in super().stream(request):
+                if event.type == "completed":
+                    event.completion = ModelCompletion.model_construct(
+                        finish_reason="not-a-finish-reason",
+                        raw_finish_reason=None,
+                        status="completed",
+                        end_turn=None,
+                    )
+                yield event
+
+    async def run():
+        provider = MalformedCompletionProvider(["", "Must not be reached"])
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="summary"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=compactor(provider), max_user_turns=1, compact_after_messages=2
+            ),
+        )
+        events = [
+            e
+            async for e in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "answer"),
+                        Message.text("user", "new"),
+                    ],
+                )
+            )
+        ]
+        assert len(provider.requests) == 1
+        completions = [e for e in events if e.type == "model.completed"]
+        assert len(completions) == 1
+        assert completions[0].payload["usage_metrics"]["total_tokens"] == 12
+        assert any(e.type == "session.failed" for e in events)
+        assert not any(e.type == "context.compaction.completed" for e in events)
+
+    asyncio.run(run())
+
+
 def test_cancellation_after_completed_blank_stream_is_not_retried():
     class CancelAfterCompletion(SummaryProvider):
         async def stream(self, request):

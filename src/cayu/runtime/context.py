@@ -5017,10 +5017,6 @@ async def _stream_compaction_model(
                     str(event.payload.get("error") or "Compaction model provider error")
                 )
             elif event.type == ModelStreamEventType.COMPLETED:
-                if retry_empty_summaries:
-                    completion = copy_model_completion(raw_event.completion)
-                    if completion is not None:
-                        terminal_finish_reason = completion.finish_reason.value
                 try:
                     portable_payload = copy_durable_json_object(event.payload, "payload")
                 except DurableValueError as exc:
@@ -5050,6 +5046,13 @@ async def _stream_compaction_model(
                 completed_payload = observe_completion(
                     _provider_completed_metadata(portable_payload)
                 )
+                # Terminal usage is authoritative even if optional normalized
+                # completion metadata is malformed. Validate it only after the
+                # accounting observer has retained the completed attempt.
+                if retry_empty_summaries:
+                    completion = copy_model_completion(raw_event.completion)
+                    if completion is not None:
+                        terminal_finish_reason = completion.finish_reason.value
             else:
                 raise RuntimeError(f"Compaction provider emitted unsupported event: {event.type}")
         # Validate only after the completed stream has closed cleanly. An unknown
