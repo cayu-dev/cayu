@@ -6,6 +6,15 @@ the model may select only selectors the profile exposes. It never supplies an
 image, executable, Dockerfile, mount, environment secret, package-install command,
 or probe.
 
+Native runner workspace revision observations hash regular files inside one
+bounded guest operation instead of transferring each file to the host. The
+canonical revision includes the same paths, content hashes, byte counts, and
+executable modes as local observation. Protected/excluded paths and symlinks
+remain outside this regular-file view. Size limits, mutation checks, and the
+runtime's finalization deadline still apply; incomplete evidence never becomes
+a successful revision or permits unsafe publication. Custom workspace subclasses
+retain their own list/read behavior.
+
 ```python
 from hashlib import sha256
 

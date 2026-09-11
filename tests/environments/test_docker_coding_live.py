@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,6 +24,10 @@ from cayu import (
     ImmutableInputStore,
     LocalWorkspace,
     inspect_local_immutable_input,
+)
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservationLimits,
+    observe_deterministic_workspace,
 )
 
 _REQUIRE_ENV = "CAYU_REQUIRE_DOCKER_CODING"
@@ -62,6 +67,60 @@ def _unavailable(reason: str) -> None:
     if os.environ.get(_REQUIRE_ENV) == "1":
         pytest.fail(reason)
     pytest.skip(reason)
+
+
+def test_real_docker_revision_observation_uses_one_guest_operation(tmp_path: Path) -> None:
+    docker_path, image, image_id = _configuration_or_skip()
+    for index in range(600):
+        (tmp_path / f"file-{index}.txt").write_text(f"content {index}\n")
+    source = LocalWorkspace(tmp_path, workspace_id="bulk-revision-source")
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=source,
+        toolchain_profile=docker_toolchain_profile(
+            image_identity=DockerImageIdentity(reference=image, content_digest=image_id),
+            platform_architecture=subprocess.check_output(
+                [docker_path, "image", "inspect", "--format", "{{.Architecture}}", image], text=True
+            ).strip(),
+        ),
+        docker_path=docker_path,
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="bulk-revision-test", agent_name="coding-agent", environment_name="coding"
+    )
+
+    async def run() -> None:
+        result = await factory.create(request)
+        environment = result.environment
+        runner, binding = environment.runner, environment.binding
+        assert runner is not None and binding is not None
+        try:
+            bound = await binding.bind(source, runner, session_id=request.session_id)
+            original_exec = runner.exec
+            calls = 0
+
+            async def counted_exec(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                return await original_exec(*args, **kwargs)
+
+            runner.exec = counted_exec
+            started = time.monotonic()
+            observed = await asyncio.wait_for(binding.observe_revision(bound), timeout=30)
+            elapsed = time.monotonic() - started
+            assert calls == 1
+            runner.exec = original_exec
+            reference = await observe_deterministic_workspace(
+                source, observer="reference", limits=WorkspaceRevisionObservationLimits()
+            )
+            assert observed.status == "supported"
+            assert observed.revision == reference.revision
+            assert observed.paths == reference.paths and observed.total_paths == 600
+            print(f"600-file Docker revision: {elapsed:.3f}s; {calls} guest operation")
+            await binding.finalize(bound, outcome="completed")
+        finally:
+            await runner.close()
+
+    asyncio.run(run())
 
 
 def test_real_docker_coding_round_trip_is_bounded_and_excludes_host_git(

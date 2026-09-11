@@ -588,6 +588,12 @@ async def observe_deterministic_workspace(
     """Observe one backend-neutral workspace through its bounded public API."""
 
     identity = WorkspaceIdentity(workspace_id=workspace.id, observer=observer)
+    # Native runner workspaces hash in the guest; no per-file RPC or content
+    # transfer is necessary. Do not bypass custom subclass list/read semantics.
+    from cayu.workspaces.runner import RunnerWorkspace
+
+    if type(workspace) is RunnerWorkspace:
+        return await _observe_runner_workspace(workspace, identity=identity, limits=limits)
     try:
         raw_listed = await workspace.list("**/*", limit=limits.max_paths + 1)
         if type(raw_listed) is not WorkspaceListResult:
@@ -710,6 +716,65 @@ async def observe_deterministic_workspace(
         revision=_deterministic_workspace_manifest_revision(encoded),
         paths=tuple(revisions),
         total_paths=len(revisions),
+    )
+
+
+async def _observe_runner_workspace(
+    workspace: Workspace,
+    *,
+    identity: WorkspaceIdentity,
+    limits: WorkspaceRevisionObservationLimits,
+) -> WorkspaceRevisionObservation:
+    from cayu.workspaces.runner import RunnerWorkspace
+
+    assert type(workspace) is RunnerWorkspace
+    try:
+        captured = await workspace._capture_revision_manifest(
+            max_paths=limits.max_paths,
+            max_path_bytes=limits.max_path_bytes,
+            max_file_bytes=limits.max_file_bytes,
+            max_total_bytes=limits.max_total_file_bytes,
+        )
+    except Exception:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.INCOMPLETE,
+            detail_code="workspace_manifest_capture_failed",
+        )
+    if isinstance(captured, str):
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.TRUNCATED,
+            detail_code=captured,
+        )
+    manifest: list[dict[str, object]] = [
+        {"path": path, "sha256": digest, "bytes": size, "git_mode": mode}
+        for path, digest, size, mode in captured.entries
+    ]
+    encoded = _deterministic_workspace_manifest_bytes(manifest)
+    if len(encoded) > limits.max_manifest_bytes:
+        return WorkspaceRevisionObservation(
+            identity=identity,
+            status=WorkspaceRevisionObservationStatus.TRUNCATED,
+            total_paths=len(manifest),
+            detail_code="manifest_byte_limit_exceeded",
+        )
+    return WorkspaceRevisionObservation(
+        identity=identity,
+        status=WorkspaceRevisionObservationStatus.SUPPORTED,
+        revision=_deterministic_workspace_manifest_revision(encoded),
+        paths=tuple(
+            WorkspacePathRevision(
+                path=path,
+                working_tree="present",
+                kind="file",
+                content_sha256=digest,
+                worktree_mode=mode,
+                present=True,
+            )
+            for path, digest, _, mode in captured.entries
+        ),
+        total_paths=len(manifest),
     )
 
 

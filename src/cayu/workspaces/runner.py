@@ -338,6 +338,7 @@ def collect_git_entries(
     excluded_directory_names,
     excluded_path_regexes,
     limit,
+    regular_files_only=False,
 ):
     if os.listdir not in getattr(os, "supports_fd", ()):
         raise GuardPathError("unsupported")
@@ -362,6 +363,8 @@ def collect_git_entries(
                     fail("workspace_error", "Workspace changed during Git entry observation.")
                 raise
             if stat.S_ISLNK(entry.st_mode):
+                if regular_files_only:
+                    continue
                 target = os.fsencode(os.readlink(name, dir_fd=dir_fd))
                 entries.append({
                     "path": rel_path,
@@ -385,6 +388,7 @@ def collect_git_entries(
                         excluded_directory_names,
                         excluded_path_regexes,
                         limit,
+                        regular_files_only,
                     ):
                         return True
                 finally:
@@ -398,6 +402,8 @@ def collect_git_entries(
                     "symlink_target_bytes": None,
                 })
             else:
+                if regular_files_only:
+                    continue
                 fail(
                     "workspace_error",
                     "Workspace contains an unsupported Git-significant entry type.",
@@ -456,20 +462,29 @@ def git_entries_operation(root_fd):
 
 
 def content_manifest_operation(root_fd):
+    revision_only = sys.argv[1] == "revision_manifest"
     limit = int(sys.argv[2])
     max_file_bytes = int(sys.argv[3])
     max_total_bytes = int(sys.argv[4])
     payload_limit = int(sys.argv[5])
     excluded_names = frozenset(json.loads(sys.argv[6]))
     excluded_patterns = tuple(re.compile(p) for p in json.loads(sys.argv[7]))
+    max_path_bytes = int(sys.argv[8]) if revision_only else None
+
+    def limit_exceeded(code, message):
+        if revision_only:
+            print(json.dumps({"ok": True, "limit": code}))
+            raise SystemExit(0)
+        fail("workspace_error", message)
 
     def listing():
         entries = []
         truncated = collect_git_entries(
             root_fd, "", entries, set(), excluded_names, excluded_patterns, limit,
+            revision_only,
         )
         if truncated or len(entries) > limit:
-            fail("workspace_error", "Workspace manifest exceeds its path limit.")
+            limit_exceeded("path_count_limit_exceeded", "Workspace manifest exceeds its path limit.")
         return sorted(entries, key=lambda item: item["path"])
 
     def identity(info):
@@ -482,6 +497,8 @@ def content_manifest_operation(root_fd):
     total = 0
     for entry in before:
         path = entry["path"]
+        if revision_only and len(path.encode("utf-8")) > max_path_bytes:
+            limit_exceeded("path_byte_limit_exceeded", "Workspace manifest path is too long.")
         if entry["git_mode"] == "120000":
             size = entry["symlink_target_bytes"]
             digest = entry["symlink_target_sha256"]
@@ -491,8 +508,14 @@ def content_manifest_operation(root_fd):
                 parent_fd, leaf = open_path(root_fd, path)
                 leaf_fd, info = open_guarded_regular(leaf, parent_fd)
                 mode = "100755" if info.st_mode & 0o111 else "100644"
-                if mode != entry["git_mode"] or info.st_size > max_file_bytes:
+                if mode != entry["git_mode"]:
                     fail("workspace_error", "Workspace manifest file mode or size is invalid.")
+                if info.st_size > min(max_file_bytes, max_total_bytes - total):
+                    limit_exceeded(
+                        "total_file_byte_limit_exceeded" if max_total_bytes - total < max_file_bytes
+                        else "file_byte_limit_exceeded",
+                        "Workspace manifest file mode or size is invalid.",
+                    )
                 if total + info.st_size > max_total_bytes:
                     fail("workspace_error", "Workspace manifest exceeds its byte limit.")
                 hasher = hashlib.sha256()
@@ -503,7 +526,11 @@ def content_manifest_operation(root_fd):
                         break
                     size += len(chunk)
                     if size > max_file_bytes or total + size > max_total_bytes:
-                        fail("workspace_error", "Workspace manifest exceeds its byte limit.")
+                        limit_exceeded(
+                            "total_file_byte_limit_exceeded" if max_total_bytes - total < max_file_bytes
+                            else "file_byte_limit_exceeded",
+                            "Workspace manifest exceeds its byte limit.",
+                        )
                     hasher.update(chunk)
                 if size != info.st_size or identity(os.fstat(leaf_fd)) != identity(info):
                     fail("workspace_error", "Workspace changed during content observation.")
@@ -530,7 +557,7 @@ def content_manifest_operation(root_fd):
             close_fd(parent_fd)
     payload = json.dumps({"ok": True, "entries": entries, "total_bytes": total}) + "\n"
     if len(payload.encode("utf-8")) > payload_limit:
-        fail("workspace_error", "Workspace manifest exceeds its transfer limit.")
+        limit_exceeded("manifest_byte_limit_exceeded", "Workspace manifest exceeds its transfer limit.")
     sys.stdout.write(payload)
 
 
@@ -867,7 +894,7 @@ def main():
     _BINARY_STDOUT = operation == "read_tar_stream"
     root_fd = None
     try:
-        root_fd = open_guard_root(".", operation in ("list", "git_entries", "content_manifest"))
+        root_fd = open_guard_root(".", operation in ("list", "git_entries", "content_manifest", "revision_manifest"))
         with workspace_source_lock(root_fd, operation == "prune_empty_directories"):
             if operation == "read":
                 read_operation(root_fd)
@@ -881,7 +908,7 @@ def main():
                 list_operation(root_fd)
             elif operation == "git_entries":
                 git_entries_operation(root_fd)
-            elif operation == "content_manifest":
+            elif operation in ("content_manifest", "revision_manifest"):
                 content_manifest_operation(root_fd)
             elif operation == "read_tar":
                 read_tar_operation(root_fd)
@@ -1380,6 +1407,61 @@ class RunnerWorkspace(
             raise RuntimeError("Workspace manifest exceeds its limits.")
         for path, *_ in manifest.entries:
             self._require_path_allowed(path)
+        return manifest
+
+    async def _capture_revision_manifest(
+        self,
+        *,
+        max_paths: int,
+        max_path_bytes: int,
+        max_file_bytes: int,
+        max_total_bytes: int,
+    ) -> WorkspaceContentManifest | str:
+        """Observe regular files in one guest call, matching list/read semantics."""
+        result = await self._run_json_operation(
+            "revision_manifest",
+            str(_validate_required_limit(max_paths, "max_paths")),
+            str(_validate_required_limit(max_file_bytes, "max_file_bytes")),
+            str(_validate_required_limit(max_total_bytes, "max_total_bytes")),
+            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            json.dumps(tuple(sorted(self._excluded_directory_keys))),
+            json.dumps(self._excluded_path_regexes),
+            str(_validate_required_limit(max_path_bytes, "max_path_bytes")),
+            output_limit_bytes=_json_list_output_limit(),
+        )
+        if "limit" in result:
+            code = result["limit"]
+            if (
+                type(code) is not str
+                or code
+                not in {
+                    "path_count_limit_exceeded",
+                    "path_byte_limit_exceeded",
+                    "file_byte_limit_exceeded",
+                    "total_file_byte_limit_exceeded",
+                    "manifest_byte_limit_exceeded",
+                }
+                or set(result) != {"ok", "limit"}
+            ):
+                raise RuntimeError("Invalid workspace revision limit evidence.")
+            return code
+        rows = result.get("entries")
+        if type(rows) is not list or any(type(row) is not list for row in rows):
+            raise RuntimeError("Invalid workspace revision manifest entries.")
+        total_bytes = result.get("total_bytes")
+        if type(total_bytes) is not int:
+            raise RuntimeError("Invalid workspace revision byte accounting.")
+        manifest = WorkspaceContentManifest(tuple(tuple(row) for row in rows), total_bytes)
+        if len(manifest.entries) > max_paths or manifest.total_bytes > max_total_bytes:
+            raise RuntimeError("Workspace revision manifest exceeds its limits.")
+        for path, _, size, mode in manifest.entries:
+            self._require_path_allowed(path)
+            if (
+                len(path.encode("utf-8")) > max_path_bytes
+                or size > max_file_bytes
+                or mode == "120000"
+            ):
+                raise RuntimeError("Workspace revision manifest contains an invalid file.")
         return manifest
 
     def _require_path_allowed(self, path: str) -> None:
