@@ -25,6 +25,7 @@ import httpx
 
 from cayu._exception_state import exception_state_contains
 from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     _contains_fatal_signal,
@@ -1005,6 +1006,7 @@ def credential_safe_error_event(
                 payload["retry_after_s"] = exc.retry_after_s
         if isinstance(exc, ProviderStreamCleanupError):
             payload["stream_cleanup_failed"] = True
+        payload.update(api_error_diagnostic_fields(exc))
         return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
     if isinstance(exc, ModelProviderError):
         safe_exception = credential_safe_provider_exception(
@@ -1033,7 +1035,11 @@ def credential_safe_error_event(
                 "error_type": safe_provider_exception_type_name(exc),
             },
         )
-    redacted = SecretRedactor(credential_values).redact_json_values(event.payload)
+    diagnostic_payload = dict(event.payload)
+    diagnostic_payload.update(
+        api_error_diagnostic_fields(exc, credential_values=tuple(credential_values))
+    )
+    redacted = SecretRedactor(credential_values).redact_json_values(diagnostic_payload)
     if type(redacted) is not dict:  # pragma: no cover - SecretRedactor contract guard
         raise AssertionError("provider error payload redaction returned a non-object")
     return ModelStreamEvent(type=event.type, payload=redacted)

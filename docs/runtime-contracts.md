@@ -15266,3 +15266,33 @@ admission before resuming existing processes. Terminal/uncertain cleanup never
 reattaches a replacement by name. See
 [Docker reconnect](virtual-egress.md#docker-retained-allocation-reconnect) for
 platform requirements, typed outcomes and browser fidelity.
+
+
+### OpenAI API-error classification diagnostics
+
+Sanitized API and subscription `model.error` events retain
+`provider_api_classification_origin` (`http` or `stream`) and the bounded
+`provider_api_classification_reason` produced by the API-error classifier:
+
+| Reason | Established evidence |
+| --- | --- |
+| `explicit_status_conflict` | Explicit stream status fields disagree; no single status is authoritative. |
+| `identity_conflict` | Supported type/code classifications disagree. |
+| `status_identity_conflict` | An explicit status conflicts with a supported identity. |
+| `recognized_identity` | At least one supported identity classified the error without a conflicting status. |
+| `explicit_status` | An explicit status is available without a supported type/code classification. |
+| `unsupported_identity` | Labels were present but unsupported, with no explicit status. |
+| `absent_identity` | Neither usable labels nor an explicit status were available. |
+
+These fields survive durable event projection and readback. Known server identities
+allow the existing 500/502/503/504 status family; the documented stale-chain
+identity exception retains its existing precedence. Unsupported labels, raw bodies,
+endpoints, and credentials are not added to these diagnostics. A canonical label
+that overlaps a known credential is omitted. Manually constructed exceptions and
+older events can lack this evidence; absence does not establish a specific reason.
+Protocol failures retain their separate `provider_protocol_reason` contract.
+
+The reason describes classifier inputs, not incident root cause or provider intent.
+Supported type/code identities retain the existing sanitization policy. Diagnostic
+fields do not control retry, cleanup, cancellation, or unknown-effect settlement;
+existing typed status and retry authority are unchanged.

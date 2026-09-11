@@ -277,6 +277,8 @@ class OpenAIAPIError(OpenAIError, ModelProviderError):
     """
 
     param: str | None = None
+    classification_origin: str | None = None
+    classification_reason: str | None = None
 
     def __init__(
         self,
@@ -290,6 +292,8 @@ class OpenAIAPIError(OpenAIError, ModelProviderError):
         retryable: bool | None = None,
         retry_after_s: float | None = None,
         response_body: str | None = None,
+        classification_origin: str | None = None,
+        classification_reason: str | None = None,
     ) -> None:
         ModelProviderError.__init__(
             self,
@@ -306,6 +310,8 @@ class OpenAIAPIError(OpenAIError, ModelProviderError):
         if param is not None:
             param = require_clean_nonblank(param, "param")
         self.param = param
+        self.classification_origin = classification_origin
+        self.classification_reason = classification_reason
 
 
 class OpenAIContextOverflowError(OpenAIAPIError, ModelContextOverflowError):
@@ -5313,6 +5319,10 @@ def _openai_error_value_exception(
         retryable = False
     return OpenAIAPIError(
         safe_message,
+        classification_origin="stream",
+        classification_reason=_openai_classification_reason(
+            transport_status_code, error_type, error_code, status_conflict=status_conflict
+        ),
         status_code=status_code,
         error_type=error_type,
         error_code=error_code,
@@ -5363,6 +5373,43 @@ _OPENAI_ERROR_CODE_CLASSIFICATION = {
     "server_is_overloaded": (500, True),
 }
 _OPENAI_RETRYABLE_SERVER_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+
+def _openai_classification_reason(
+    status: int | None,
+    error_type: str | None,
+    error_code: str | None,
+    *,
+    status_conflict: bool = False,
+) -> str:
+    if status_conflict:
+        return "explicit_status_conflict"
+    identities = {
+        value
+        for value in (
+            _OPENAI_ERROR_TYPE_CLASSIFICATION.get(error_type or ""),
+            _OPENAI_ERROR_CODE_CLASSIFICATION.get(error_code or ""),
+        )
+        if value is not None
+    }
+    if error_type == "invalid_request_error" and error_code == _STALE_CHAIN_ERROR_CODE:
+        identities = {_OPENAI_ERROR_CODE_CLASSIFICATION[_STALE_CHAIN_ERROR_CODE]}
+    if len(identities) > 1:
+        return "identity_conflict"
+    if identities:
+        canonical, retryable = next(iter(identities))
+        if (
+            status is not None
+            and status != canonical
+            and not (
+                retryable and canonical == 500 and status in _OPENAI_RETRYABLE_SERVER_STATUS_CODES
+            )
+        ):
+            return "status_identity_conflict"
+        return "recognized_identity"
+    if status is not None:
+        return "explicit_status"
+    return "unsupported_identity" if error_type or error_code else "absent_identity"
 
 
 def _openai_retry_metadata(
@@ -7090,6 +7137,10 @@ def _openai_api_error_from_response(
     )
     return OpenAIAPIError(
         message,
+        classification_origin="http",
+        classification_reason=_openai_classification_reason(
+            response.status_code, error_type, error_code
+        ),
         status_code=status_code,
         error_type=error_type,
         error_code=error_code,

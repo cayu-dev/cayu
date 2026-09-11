@@ -2241,6 +2241,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "provider",
         "provider_error_code",
         "provider_error_type",
+        "provider_api_classification_reason",
+        "provider_api_classification_origin",
         "provider_protocol_reason",
         "provider_protocol_stage",
         "provider_protocol_field",

@@ -31,6 +31,7 @@ from cayu._validation import require_clean_nonblank
 from cayu._version import package_version
 from cayu.core.billing import BillingIdentity
 from cayu.core.messages import Message
+from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
@@ -1190,6 +1191,15 @@ def _safe_subscription_error_event(
                 ),
             )
         )
+    payload.update(
+        api_error_diagnostic_fields(
+            exc,
+            credential_values=credential_sanitization_values(
+                *_subscription_credential_values(credentials),
+                *extra_header_values,
+            ),
+        )
+    )
     if isinstance(exc, ProviderStreamCleanupError):
         payload["stream_cleanup_failed"] = True
     return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
