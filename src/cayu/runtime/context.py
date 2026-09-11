@@ -75,6 +75,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    copy_model_completion,
     copy_usage_dialect,
 )
 from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
@@ -2819,6 +2820,7 @@ class _ModelCompactorInvocationIdentity:
     retry_policy: RetryPolicy
     max_input_chars: int | None
     max_hierarchy_calls: int
+    retry_empty_summaries: bool
 
 
 _MODEL_COMPACTOR_INVOCATION_IDENTITY: ContextVar[_ModelCompactorInvocationIdentity | None] = (
@@ -2870,6 +2872,7 @@ class ModelCompactor(ContextCompactor):
         max_input_chars: int | None = 120_000,
         max_hierarchy_calls: int = 64,
         retry_policy: RetryPolicy | None = None,
+        retry_empty_summaries: bool = False,
         _usage_dialect: UsageDialect | None = None,
         _provider_snapshot: _CompactionProviderSnapshot | None = None,
     ) -> None:
@@ -2884,6 +2887,8 @@ class ModelCompactor(ContextCompactor):
             raise TypeError("max_hierarchy_calls must be an integer.")
         if max_hierarchy_calls < 2:
             raise ValueError("max_hierarchy_calls must be at least 2.")
+        if type(retry_empty_summaries) is not bool:
+            raise TypeError("retry_empty_summaries must be a boolean.")
         if _provider_snapshot is not None and type(_provider_snapshot) is not (
             _CompactionProviderSnapshot
         ):
@@ -2920,6 +2925,7 @@ class ModelCompactor(ContextCompactor):
         self.options = copy_json_value({} if options is None else options, "options")
         self.max_input_chars = max_input_chars
         self.max_hierarchy_calls = max_hierarchy_calls
+        self.retry_empty_summaries = retry_empty_summaries
         # `None` selects the shared default retry policy.
         self.retry_policy = copy_retry_policy(retry_policy)
 
@@ -2996,6 +3002,9 @@ class ModelCompactor(ContextCompactor):
         max_hierarchy_calls = self.max_hierarchy_calls
         if type(max_hierarchy_calls) is not int or max_hierarchy_calls < 2:
             raise ValueError("max_hierarchy_calls must be an integer of at least 2.")
+        retry_empty_summaries = self.retry_empty_summaries
+        if type(retry_empty_summaries) is not bool:
+            raise TypeError("retry_empty_summaries must be a boolean.")
         return _ModelCompactorInvocationIdentity(
             owner_id=id(self),
             provider=provider,
@@ -3010,6 +3019,7 @@ class ModelCompactor(ContextCompactor):
             retry_policy=copy_retry_policy(self.retry_policy),
             max_input_chars=max_input_chars,
             max_hierarchy_calls=max_hierarchy_calls,
+            retry_empty_summaries=retry_empty_summaries,
         )
 
     def _current_invocation_identity(self) -> _ModelCompactorInvocationIdentity:
@@ -3080,6 +3090,7 @@ class ModelCompactor(ContextCompactor):
         model = identity.model
         compactor_name = identity.compactor_name
         retry_policy = identity.retry_policy
+        retry_empty_summaries = identity.retry_empty_summaries
         provider_name = identity.provider_snapshot.provider_name
         pricing_provider_name = identity.provider_snapshot.pricing_provider_name
         usage_dialect = identity.provider_snapshot.usage_dialect
@@ -3109,6 +3120,7 @@ class ModelCompactor(ContextCompactor):
                     pricing_provider_name=pricing_provider_name,
                     model_request=model_request,
                     retry_policy=retry_policy,
+                    retry_empty_summaries=retry_empty_summaries,
                     compactor=compactor_name,
                     usage_dialect=usage_dialect,
                     observe_completion=_compaction_completion_observer(
@@ -4528,6 +4540,7 @@ async def _run_compaction_model(
     compactor: str,
     usage_dialect: UsageDialect,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
+    retry_empty_summaries: bool = False,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     # Keep this validated template private. Provider hooks and each stream
     # attempt receive independent copies so mutation cannot alter a later
@@ -4669,6 +4682,7 @@ async def _run_compaction_model(
                     model_request=_detach_compaction_model_request(request_template),
                     usage_dialect=usage_dialect,
                     observe_completion=observe_completion_with_billing_identity,
+                    retry_empty_summaries=retry_empty_summaries,
                 )
             )
         except (
@@ -4796,6 +4810,12 @@ async def _run_compaction_model(
                             failed_payload["error_type"] = failure_type
                         elif isinstance(failure, _CompactionToolCallError):
                             failed_payload["compaction_outcome"] = "rejected_tool_call"
+                            failed_payload["error_type"] = failure_type
+                        elif (
+                            isinstance(failure, ModelProviderError)
+                            and failure.error_code == "compaction_empty_summary"
+                        ):
+                            failed_payload["compaction_outcome"] = "empty_summary"
                             failed_payload["error_type"] = failure_type
                         else:
                             failed_payload["compaction_outcome"] = "provider_error_after_completion"
@@ -4958,6 +4978,7 @@ async def _stream_compaction_model(
     model_request: ModelRequest,
     usage_dialect: UsageDialect,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
+    retry_empty_summaries: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     provider_name = require_durable_clean_nonblank(provider_name, "provider.name")
     # The owned provider child may start after its parent's admission expires.
@@ -4967,6 +4988,7 @@ async def _stream_compaction_model(
         await environment_admission()
     text_parts: list[str] = []
     completed_payload: dict[str, Any] | None = None
+    terminal_finish_reason: str | None = None
     tool_call_seen = False
     tool_call_failure: _CompactionToolCallError | None = None
     completed_dispatch_failure: _ProviderDispatchFailed | None = None
@@ -4995,6 +5017,10 @@ async def _stream_compaction_model(
                     str(event.payload.get("error") or "Compaction model provider error")
                 )
             elif event.type == ModelStreamEventType.COMPLETED:
+                if retry_empty_summaries:
+                    completion = copy_model_completion(raw_event.completion)
+                    if completion is not None:
+                        terminal_finish_reason = completion.finish_reason.value
                 try:
                     portable_payload = copy_durable_json_object(event.payload, "payload")
                 except DurableValueError as exc:
@@ -5026,6 +5052,25 @@ async def _stream_compaction_model(
                 )
             else:
                 raise RuntimeError(f"Compaction provider emitted unsupported event: {event.type}")
+        # Validate only after the completed stream has closed cleanly. An unknown
+        # outcome, refusal/incomplete completion, tool call, cancellation or close
+        # failure must retain its original classification. The existing dispatch
+        # loop owns admission, attempt caps and accounting for a replacement call.
+        if (
+            retry_empty_summaries
+            and completed_payload is not None
+            and not tool_call_seen
+            and not "".join(text_parts).strip()
+            and completed_payload.get("status") == "completed"
+            and terminal_finish_reason == "stop"
+            and completed_payload.get("incomplete_details") is None
+        ):
+            raise ModelProviderError(
+                "Compaction model completed without a nonblank summary.",
+                provider=provider_name,
+                error_code="compaction_empty_summary",
+                retryable=True,
+            )
     except asyncio.CancelledError as exc:
         if completed_payload is not None:
             exc.__dict__["completed_metadata"] = copy_json_value(

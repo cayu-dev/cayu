@@ -1622,6 +1622,8 @@ def _cayu_compactor_material(
             "max_hierarchy_calls": compactor.max_hierarchy_calls,
             "retry_policy": compactor.retry_policy.model_dump(mode="json"),
         }
+        if compactor.retry_empty_summaries:
+            material["retry_empty_summaries"] = True
         if compactor.system_prompt != default_prompt or compactor.options:
             material["private_configuration"] = {
                 "kind": "process_local_private_configuration",

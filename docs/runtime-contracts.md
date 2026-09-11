@@ -824,6 +824,17 @@ checkpoint unchanged. A stream that ends without a provider completion does
 not fabricate usage telemetry. If a custom compactor recovers from the invalid
 summary, Cayu still records the completed failed attempt once, before payloads
 reported only by the returned result.
+`ModelCompactor(retry_empty_summaries=True)` optionally treats blank output from
+a cleanly closed, explicitly successful (`status="completed"`, normalized finish
+reason `stop`) stream as `compaction_empty_summary`. Its existing `RetryPolicy`
+caps all attempts, including replacements; `max_attempts=1` still means no retry.
+Each rejected completion retains usage with `compaction_outcome="empty_summary"`.
+Replacement requests pass through the same admission, deadline and budget checks.
+No summary or source coverage is committed until valid output is obtained.
+The option defaults to false and participates in execution-profile identity when
+enabled. It does not retry unknown/incomplete/filtered completions, tool-call
+violations, cancellation, stream-close failures or invalid durable text as empty
+output. Exhaustion fails compaction without substituting a placeholder summary.
 Provider-backed compactors register each completion in provider-call order as
 soon as it is observed. Wrapping compactors preserve the internal attempt ID so
 later outcome annotations or returned payloads update that original position
