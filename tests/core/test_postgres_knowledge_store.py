@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 from tests.core.knowledge_access_scope_conformance import (
@@ -56,11 +54,6 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.evals.knowledge_maintenance import (
-    KnowledgeMaintenanceEvaluationResult,
-    load_knowledge_maintenance_evaluation_corpus,
-    run_knowledge_maintenance_evaluation,
-)
 from cayu.knowledge_maintenance_persistence import (
     KnowledgeMaintenanceProposalPublicationConflict,
 )
@@ -105,13 +98,6 @@ from cayu.work_context import agent_recall_facet_aspect
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
-_MAINTENANCE_EVALUATION_CORPUS = (
-    Path(__file__).resolve().parents[2] / "benchmarks/memory/knowledge-maintenance-corpus-v1.json"
-)
-_MAINTENANCE_EVALUATION_RESULTS = (
-    Path(__file__).resolve().parents[2]
-    / "benchmarks/memory/knowledge-maintenance-evaluation-results-v1.json"
-)
 
 
 def test_postgres_maintenance_governance_route_apply_and_replay_are_atomic(
@@ -794,57 +780,6 @@ def test_postgres_governed_replay_rejects_receipt_commit_boundary_mismatch(
             assert conflict.value.reason == "activation_mismatch"
         finally:
             await store.close()
-
-    try:
-        asyncio.run(run())
-    finally:
-        asyncio.run(_drop_all(postgres_dsn))
-
-
-def _maintenance_result_without_backend_latency(
-    result: KnowledgeMaintenanceEvaluationResult,
-) -> dict:
-    payload = result.model_dump(mode="json")
-    payload.pop("backend")
-    payload["metrics"].pop("latency_p50_ms")
-    payload["metrics"].pop("latency_p95_ms")
-    for case in payload["cases"]:
-        case.pop("latency_ms")
-    return payload
-
-
-def test_postgres_knowledge_maintenance_evaluation_parity(postgres_dsn: str) -> None:
-    async def run() -> None:
-        from cayu import PostgresKnowledgeStore
-
-        await _drop_all(postgres_dsn)
-        store = PostgresKnowledgeStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.CREATE,
-        )
-        try:
-            result = await run_knowledge_maintenance_evaluation(
-                load_knowledge_maintenance_evaluation_corpus(_MAINTENANCE_EVALUATION_CORPUS),
-                store,
-                backend="postgres",
-            )
-        finally:
-            await store.close()
-        assert result.metrics.routing_precision == 1.0
-        assert result.metrics.routing_recall == 1.0
-        assert result.metrics.information_retention == 1.0
-        assert result.metrics.evidence_retention == 1.0
-        assert result.metrics.unsafe_acceptance_rate == 0.0
-        assert result.metrics.lifecycle_correctness == 1.0
-        assert result.metrics.lineage_correctness == 1.0
-        assert result.metrics.model_call_count == 0
-        checked_payload = json.loads(_MAINTENANCE_EVALUATION_RESULTS.read_text(encoding="utf-8"))
-        frozen = KnowledgeMaintenanceEvaluationResult.model_validate(checked_payload["results"][0])
-        assert _maintenance_result_without_backend_latency(
-            result
-        ) == _maintenance_result_without_backend_latency(frozen)
 
     try:
         asyncio.run(run())

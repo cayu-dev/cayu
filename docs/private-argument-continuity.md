@@ -98,8 +98,7 @@ projections never gain these retained arguments.
 native publication fault injection, store reopening, fork isolation, deletion,
 export exclusion, bounds, authority changes, late secret discovery and context
 selection. Existing secret, publication, profile and compaction suites remain
-regression gates. `benchmarks/argument_continuity.py` measures overlay overhead
-without provider calls; it is not an evaluation of model reasoning or memory quality.
+regression gates.
 
 Preserving readable arguments is a deterministic runtime improvement. It does
 **not** prove that argument omission caused repeated remembering, or that retention

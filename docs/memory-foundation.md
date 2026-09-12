@@ -281,35 +281,6 @@ The nearby context concepts have different lifetimes and owners:
 - A future notification consumer must keep its own delivery/consumption
   evidence. Advancing a checkpoint does not acknowledge a notification.
 
-The checked [agent work-context performance baseline](../benchmarks/memory/agent-work-context-performance-v1.json)
-measures current-runtime zero-record store construction, indexed current reads,
-CAS revision appends, CAS checkpoint advances, and incremental SQLite storage
-without provider calls. Its runner and fixed regression ceilings are documented
-with the other hermetic memory benchmarks.
-
-The checked [checkpoint-recall performance baseline](../benchmarks/memory/checkpoint-recall-performance-v1.json)
-measures full-index, one-revision delta, maximum 250-reference delta (249
-knowledge changes plus one ready index projection), and no-work processing over
-500 existing records with 50 samples per in-memory and SQLite backend. It makes
-no provider calls. PostgreSQL and pgvector use behavioral integration tests,
-including a query-plan regression proving that frontier-filtered semantic recall
-retains the partial HNSW index; exact scanning remains the bounded-revision,
-negative-filter, oversized-vector, and filtered-underfill fallback.
-
-The checked [staged-recall delivery performance baseline](../benchmarks/memory/recall-delivery-performance-v1.json)
-measures 50 atomic stage/checkpoint commits followed by deterministic claims and
-acknowledgements, plus the indexed no-pending path after all 50 records are
-terminal. It records fixed p50 and p95 ceilings for in-memory and SQLite stores,
-makes no provider calls, and keeps PostgreSQL performance outside the hermetic
-credential-free matrix while exercising the same behavior in integration tests.
-
-The checked [idle recall-subscription performance baseline](../benchmarks/memory/recall-subscription-performance-v1.json)
-measures 50 indexed zero-due claims, silent evaluation commits, atomic relevant
-wake publications, scheduler claims, and scheduler acknowledgements for both
-in-memory and SQLite stores. It makes no provider calls and applies fixed p50
-and p95 ceilings; PostgreSQL exercises the same lifecycle through shared
-conformance, concurrency, migration, reopen, and cancellation tests.
-
 ## Bounded cross-source recall
 
 `RecallEngine` runs registered `RecallSource` adapters concurrently under
@@ -587,32 +558,6 @@ authority is unavailable while rows exist, the result is explicitly `redacted` a
 private rows are not released. A broken receipt/exposure/item relationship is
 `contradictory` and likewise releases no projected records.
 
-The hermetic performance runner separates document preparation, evidence persistence,
-steady-state SQLite storage, empty-report projection, memory-bearing projection, and
-serialized projection size. It makes no provider calls:
-
-```bash
-PYTHONPATH=src python scripts/run_memory_evidence_performance.py --check
-```
-
-The checked 50-pair baseline is
-[`benchmarks/memory/memory-evidence-performance-v1.json`](../benchmarks/memory/memory-evidence-performance-v1.json).
-The zero-record `runtime_evidence(...)` run is a same-process current-runtime control,
-not a historical pre-feature measurement. It exposes the always-on cost paid by a
-session with no receipt or exposure rows; the populated-minus-control measurement then
-isolates the incremental cost of projecting 50 pairs. Regression checks require
-zero-record p95 at or below 5 ms in memory and 10 ms on SQLite, preparation p95 at or
-below 10 ms, in-memory and SQLite persistence p95 at or below 15 ms and 25 ms
-respectively, p95 incremental projection overhead at or below 10 ms per pair,
-projected size at or below 6,000 bytes per pair, and steady-state SQLite storage at or
-below 32 KiB per pair. The normal test suite validates the checked artifact and every
-regression lane. Run the hermetic command above to measure current code before accepting
-performance-sensitive changes.
-The absolute ceilings include headroom for shared-runner scheduling variance while still
-bounding the complete 50-pair workload. Latency is environment-sensitive; the artifact
-records its Python/platform identity, p50/p95 observations, zero-record control, and
-absolute overhead without mixing provider latency into the result.
-
 ## Storage-enforced access
 
 Every built-in knowledge operation requires a `KnowledgeAccessScope`. A store
@@ -853,20 +798,6 @@ directly. Any populated pre-60 canonical, evidence, receipt, outbox, readiness,
 embedding, or relation table makes migration fail before DDL. There is no
 backfill, metadata fallback, dual write, or legacy relation interpretation.
 
-The hermetic relation performance checker makes no provider calls:
-
-```bash
-PYTHONPATH=src python scripts/run_knowledge_relation_performance.py --check
-```
-
-Its checked report returns 50 matching relations and safe lineage links from a
-store containing 5,000 additional unrelated relations, so both endpoint lookups
-must remain index-bound. The
-result is recorded in
-[`benchmarks/memory/knowledge-relation-performance-v1.json`](../benchmarks/memory/knowledge-relation-performance-v1.json).
-The zero-relation lane is a current-runtime control with the same canonical
-entries, not a historical binary comparison.
-
 ## Atomic reviewed knowledge maintenance
 
 Revision-bound relations describe lineage but do not change lifecycle by
@@ -955,18 +886,6 @@ Fresh databases and completely empty earlier knowledge schemas initialize
 directly. A populated pre-63 knowledge schema fails before any DDL or data
 change and must be explicitly replaced. There is no backfill, legacy proposal
 interpretation, compatibility wrapper, or dual-write path.
-
-The hermetic performance gate runs with no provider calls:
-
-```bash
-PYTHONPATH=src python scripts/run_knowledge_maintenance_performance.py --check
-```
-
-Its checked workload applies 20 decisions with 20 sources each and compares
-them with a current-runtime zero-decision control containing the same 420
-entries. It measures preparation, atomic application, exact replay, receipt
-loading, and incremental SQLite storage. Results are recorded in
-[`benchmarks/memory/knowledge-maintenance-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-performance-v1.json).
 
 ## Deterministic maintenance candidate routing
 
@@ -1071,18 +990,6 @@ initialize directly. A populated pre-65 knowledge schema fails before DDL or dat
 and must be explicitly replaced. There is no size backfill, legacy read fallback,
 compatibility wrapper, or dual-write path.
 
-The hermetic performance gate uses the full supported 50 exact candidates across
-in-memory and SQLite stores, plus a zero-candidate control that performs no store reads.
-It makes no model or provider calls and verifies that routing leaves every canonical
-revision unchanged:
-
-```bash
-PYTHONPATH=src python scripts/run_knowledge_maintenance_routing_performance.py --check
-```
-
-Results are recorded in
-[`benchmarks/memory/knowledge-maintenance-routing-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-routing-performance-v1.json).
-
 ## Bounded maintenance planning and independent evaluation
 
 `KnowledgeMaintenancePlanningWorkflow` is the read-only semantic boundary after
@@ -1186,19 +1093,6 @@ not selected by the evaluator.
 The planning workflow revalidates the public routing result into its own snapshot contract
 and rejects more than the hard 50-source bound before any storage read or component
 disclosure. It does not trust caller-supplied router limit fields to establish that bound.
-
-The hermetic performance gate uses the full 50-source bound across in-memory and SQLite
-stores. Its deterministic planner and evaluator make no provider or model calls, report
-zero cost, perform the required three currentness reads per source, and verify that no
-knowledge revision changes. The separate zero-candidate control performs no store read or
-component call:
-
-```bash
-PYTHONPATH=src python scripts/run_knowledge_maintenance_planning_performance.py --check
-```
-
-Results are recorded in
-[`benchmarks/memory/knowledge-maintenance-planning-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-planning-performance-v1.json).
 
 ## Atomic pending maintenance proposals
 
@@ -1343,15 +1237,11 @@ receipt = await governor.govern(
 Breaking storage revision 77 adds only route-to-review attribution. Existing reviewed
 proposals and decisions are preserved as reviewed history; migration creates no inferred
 automatic authority, performs no backfill, and adds no legacy read or dual-write path.
-The complete credential-free example and fixed performance gate are:
+Run the complete credential-free example:
 
 ```bash
 PYTHONPATH=src python examples/knowledge_maintenance_governance.py
-PYTHONPATH=src python scripts/run_knowledge_maintenance_governance_performance.py --check
 ```
-
-Recorded evidence lives in
-[`benchmarks/memory/knowledge-maintenance-governance-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-governance-performance-v1.json).
 
 ## Policy-governed semantic watches
 
@@ -1421,15 +1311,11 @@ Breaking storage revision 78 creates only an empty semantic-watch receipt table.
 not evaluate historical observations, infer signals, backfill outcomes, dual-write, or
 install a legacy read path. Stop pre-78 knowledge writers before migration.
 
-The credential-free example and fixed performance gate are:
+Run the credential-free example:
 
 ```bash
 PYTHONPATH=src python examples/knowledge_semantic_watch.py
-PYTHONPATH=src python scripts/run_knowledge_semantic_watch_performance.py --check
 ```
-
-Recorded evidence lives in
-[`benchmarks/memory/knowledge-semantic-watch-performance-v1.json`](../benchmarks/memory/knowledge-semantic-watch-performance-v1.json).
 
 ## Explicit reviewed knowledge curation
 
@@ -1693,46 +1579,6 @@ application's explicit responsibility and no longer has Cayu's prior replay evid
 
 See [`durable_knowledge_enrichment.py`](../examples/durable_knowledge_enrichment.py) for a
 credential-free SQLite producer, fresh worker process, and durable pending-knowledge result.
-Provider-free lifecycle and latency evidence is recorded in
-[`knowledge-enrichment-jobs-performance-v1.json`](../benchmarks/memory/knowledge-enrichment-jobs-performance-v1.json).
-
-## End-to-end reviewed-maintenance evaluation
-
-The provider-free `run_knowledge_maintenance_evaluation(...)` contract connects the
-maintenance router, planner/evaluator boundary, pending-proposal publisher, explicit
-review transaction, active recall, and exact historical lineage in one reusable corpus
-runner. Its public corpus contains six reference outcomes: duplicate merge,
-authoritative supersession, unresolved contradiction, stale proposal, reviewer
-rejection, and historical lineage after approval. In-memory and SQLite results are
-checked into the repository; PostgreSQL executes the same correctness corpus in its
-store parity suite.
-
-The runner measures exact routed-set precision and recall, replacement claim retention
-with its exact source mappings, exact source-revision evidence retained after review,
-unsafe acceptance, exact lifecycle preservation, lineage correctness, and end-to-end
-latency. Historical correctness requires both the archived exact-revision read and its
-typed replacement lineage. It requires an empty store so pre-existing records cannot
-hide leakage or change the expected lifecycle. Every case has a separate namespace and
-application-owned access scope. Corpus validation applies the executable 50-source
-maintenance bound and the recall primitive's 8,192-byte query bound, and recall inspects
-that complete permitted lineage set. Receipt, evidence, lifecycle, and lineage checks bind
-the full returned contracts to the proposal-derived entry revisions, relation identities,
-and requested result queries; a matching logical entry ID is not sufficient.
-
-The fixture planner and evaluator are separate components with explicit identities, but
-both have a hard zero-model-call and zero-cost budget. This intentionally separates the
-framework question—whether Cayu safely carries a known semantic decision through all
-boundaries—from the provider-dependent question of whether a particular model produces
-good semantic decisions. The evaluation does not discover signals, judge real-world
-truth, change `ContextExposure`, or decide what memory enters agent context. Private
-production-shaped corpora use the same bounded schema with
-`origin="external_private"` and remain outside the public repository.
-
-Run the public backend matrix from the repository root:
-
-```bash
-PYTHONPATH=src python scripts/run_knowledge_maintenance_evaluation.py
-```
 
 ## Derived-index identity and readiness
 
@@ -1904,24 +1750,7 @@ availability. Inputs that omit a configured channel, add an unconfigured channel
 exceed a budget, duplicate a rank, or disagree on canonical feature values fail
 closed.
 
-
-
-## Reproducible baselines
-
-[`benchmarks/memory`](../benchmarks/memory/README.md) contains public hermetic
-corpora and checked in-memory/SQLite results for both knowledge-only retrieval
-and cross-source recall. The runners require no model or network calls. They
-measure retrieval quality, false injection/results, stale results,
-authorization leaks, source/locator correctness, honest partial coverage,
-candidate/truncation counts, byte/token overhead, latency, multilingual
-queries, duplicate provenance, and short follow-ups.
-
-The same bounded corpus schema accepts `origin="external_private"`, trajectory
-identity, and turn index. Production-shaped long trajectories stay outside the
-public repository and use the same runner locally; reports identify the corpus
-revision, backend, search mode, embedding/reranker identity, and configuration.
-
-### Current question resolution (v2)
+## Current question resolution (v2)
 
 Automatic recall no longer expands queries based on whitespace length. The fixed
 `cayu.query_resolution.v2` resolver recognizes a bounded set of explicit follow-up
@@ -2030,7 +1859,7 @@ candidates, 128,000 UTF-8 bytes per candidate and an 8,192-byte current query), 
 no provider calls. Local tests exercise in-memory and SQLite stores, generated
 configuration, deterministic replay, weak hybrid agreement and semantic timeout.
 These are focused regression controls; broader held-out quality and real embedding
-provider effectiveness belong to the shipped-default evaluation gate.
+provider effectiveness require separate evaluation.
 
 ### Compact automatic-memory presentation (v2)
 
@@ -2054,11 +1883,3 @@ the frozen audit projection. Presentation v2 changes the configuration identity 
 automatic-recall checkpoint version to 3. Old frames fail closed under the existing
 schema transition policy; retry/recovery of current frames retains the exact output.
 Context pressure and provider counting consume the rendered envelope.
-
-`PYTHONPATH=src python scripts/run_memory_presentation_benchmark.py` reproduces the
-committed UTF-8 measurements in `benchmarks/memory/presentation-v2.json`. The fixed
-five-focus/five-offer fixture renders at 2,017 bytes versus the pinned 6,879-byte v1
-reference (70.7% reduction), retaining 215 bytes of focused text and all ten exact
-references. The benchmark also covers empty, one/five items, long text, Unicode,
-and redacted/escaped text. Token counts are explicitly byte-based estimates; no
-provider token counter is configured and no live-model attention claim is made.
