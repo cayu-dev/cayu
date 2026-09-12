@@ -1272,6 +1272,7 @@ def _safe_subscription_error_identity(
             "context_length_exceeded",
             "insufficient_quota",
             "internal_error",
+            "invalid_prompt",
             "previous_response_not_found",
             "rate_limit_exceeded",
             "server_error",

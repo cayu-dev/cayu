@@ -56,6 +56,11 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlines,
     current_provider_deadline_controller,
 )
+from cayu.providers.diagnostics import (
+    _record_http_error,
+    _record_stream_error,
+    _record_transport_error,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
@@ -325,6 +330,7 @@ _SAFE_PROVIDER_ERROR_CODES = {
             "bad_request",
             "context_length_exceeded",
             "internal_error",
+            "invalid_prompt",
             "previous_response_not_found",
             "rate_limit_exceeded",
             "server_error",
@@ -507,6 +513,7 @@ async def request_json(
             response = await client.request(method, url, **request_kwargs)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
+        _record_http_error(exc.response, headers=headers, body_response=exc.response)
         if raise_context_overflow is not None:
             try:
                 raise_context_overflow(exc.response)
@@ -524,6 +531,7 @@ async def request_json(
             api_error_from_response=api_error_from_response,
         ) from exc
     except httpx.RequestError as exc:
+        _record_transport_error(_trusted_httpx_request_error_type(exc), headers=headers)
         raise _request_api_error(
             api_error, request_label=request_label, url=url, cause=exc
         ) from exc
@@ -590,6 +598,7 @@ async def stream_sse_json_events(
     )
     timeout = httpx.Timeout(timeout_s, read=None)
     successful_response_established = False
+    response: httpx.Response | None = None
     try:
         request_kwargs: dict[str, Any] = {
             "headers": _identity_sse_headers(headers),
@@ -635,8 +644,13 @@ async def stream_sse_json_events(
                         idle_timeout_s=error_body_idle_timeout_s,
                         max_duration_s=error_body_max_duration_s,
                     )
-                    if error_response is not None and raise_context_overflow is not None:
-                        raise_context_overflow(error_response)
+                _record_http_error(
+                    response,
+                    headers=headers,
+                    body_response=error_response,
+                )
+                if error_response is not None and raise_context_overflow is not None:
+                    raise_context_overflow(error_response)
                 if error_response is None and raise_context_overflow_from_status is not None:
                     # Only classifiers explicitly wired for status-only
                     # evidence may run here. Unsupported, oversized, or stalled
@@ -690,26 +704,35 @@ async def stream_sse_json_events(
                 if structure is not None:
                     structure.record(event)
                     envelope._response_structure = structure.snapshot()
+                _record_stream_error(event, headers=headers, response=response)
                 yield envelope
     except ProviderStreamDeadlineExceeded as exc:
+        _record_transport_error(
+            "ProviderStreamDeadlineExceeded", headers=headers, response=response
+        )
         raise ModelStreamDeadlineError(
             provider=response_label.lower().replace(" ", "_"),
             evidence=exc.evidence,
             stream_cleanup_failed=exc.stream_cleanup_failed,
         ) from None
     except SseEventTimeoutError as exc:
+        _record_transport_error("SseEventTimeoutError", headers=headers, response=response)
         raise api_error(
             str(exc),
             error_type=type(exc).__name__,
             retryable=True,
         ) from exc
     except SseEventLimitError as exc:
+        _record_transport_error("SseEventLimitError", headers=headers, response=response)
         raise api_error(
             str(exc),
             error_type=type(exc).__name__,
             retryable=False,
         ) from exc
     except httpx.RequestError as exc:
+        _record_transport_error(
+            _trusted_httpx_request_error_type(exc), headers=headers, response=response
+        )
         raise _request_api_error(
             api_error,
             request_label=request_label,

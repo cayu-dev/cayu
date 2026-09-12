@@ -5398,9 +5398,14 @@ def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
             transport_status_code=status_code,
             status_conflict=status_conflict,
         )
-    status_code, status_conflict = _openai_stream_status_code(event)
+    # Responses uses flat error events; the subscription endpoint can wrap the
+    # same fields in ``error``. The outer ``type=error`` is then an envelope,
+    # not the provider's error identity. Preserve explicit status conflicts.
+    nested_error = event.get("error")
+    error_mapping = nested_error if isinstance(nested_error, Mapping) else event
+    status_code, status_conflict = _openai_stream_status_code(error_mapping, event)
     return _openai_error_value_exception(
-        event,
+        error_mapping,
         safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
         request_id=optional_error_string(event.get("request_id")),
         retry_after_s=retry_after_s,

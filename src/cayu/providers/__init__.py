@@ -67,6 +67,7 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlineEvidence,
     ProviderStreamDeadlines,
 )
+from cayu.providers.diagnostics import ProviderErrorCapture, capture_provider_errors
 from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.openai import (
     HttpxOpenAITransport,
@@ -179,6 +180,7 @@ __all__ = [
     "OpenAIUnsupportedSearchSourceError",
     "OpenAIWebSearch",
     "ProviderDeadlineKind",
+    "ProviderErrorCapture",
     "ProviderOperationAdapter",
     "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",
@@ -214,6 +216,7 @@ __all__ = [
     "build_chat_completions_payload",
     "build_openai_embedding_payload",
     "build_openai_payload",
+    "capture_provider_errors",
     "chat_completions_stream_events",
     "completed_bedrock_billing_identity",
     "copy_input_token_count_result",

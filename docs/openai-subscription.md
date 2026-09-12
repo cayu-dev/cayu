@@ -4,6 +4,10 @@ Cayu can experimentally run an agent against the Codex backend using the
 developer's own ChatGPT subscription. This is useful for local agent testing
 when separate per-token API billing is not affordable.
 
+For unexplained HTTP or streaming failures, see
+[private provider-error diagnostics](provider-error-diagnostics.md). This opt-in
+capture keeps bounded provider explanations separate from ordinary runtime logs.
+
 ## Sign in
 
 ```bash

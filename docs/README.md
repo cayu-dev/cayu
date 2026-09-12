@@ -50,6 +50,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Diagnostic support bundles](diagnostic-support-bundles.md)
 - [Git command policy](git-command-policy.md)
 - [Nightly verification](nightly-verification.md)
+- [Private provider-error diagnostics](provider-error-diagnostics.md)
 - [Provider stream-close diagnostics](provider-stream-close-investigation.md)
 - [Runtime stability qualification](runtime-qualification.md)
 - [Release notes](release-notes.md)
