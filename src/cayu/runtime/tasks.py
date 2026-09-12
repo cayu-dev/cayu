@@ -3301,6 +3301,7 @@ class TaskStore(ABC):
     supports_work_attempt_admission: ClassVar[bool] = False
     supports_verified_task_worker: ClassVar[bool] = False
     supports_local_execution_attempts: ClassVar[bool] = False
+    supports_session_closure_deletion: ClassVar[bool] = False
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
@@ -3853,6 +3854,17 @@ class TaskStore(ABC):
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         """List tasks for dashboards, queues, and orchestration."""
 
+    async def delete_session_tasks(
+        self,
+        session_id: str,
+        *,
+        task_ids: tuple[str, ...],
+        policy: Any,
+    ) -> None:
+        """Delete a quiescent session task set owned by this store."""
+
+        raise NotImplementedError("This TaskStore does not support session task closure deletion.")
+
     async def aggregate_operational_snapshot(
         self,
         filters: TaskAggregateFilter | None = None,
@@ -4301,6 +4313,7 @@ class InMemoryTaskStore(TaskStore):
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
+    supports_session_closure_deletion: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
@@ -5942,6 +5955,69 @@ class InMemoryTaskStore(TaskStore):
             tasks = _sort_tasks(tasks, query.order_by)
             page = tasks[query.offset : query.offset + query.limit]
             return [task.model_copy(deep=True) for task in page]
+
+    async def delete_session_tasks(
+        self,
+        session_id: str,
+        *,
+        task_ids: tuple[str, ...],
+        policy: Any,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        task_id_set = set(task_ids)
+        async with self._lock:
+            tasks = [self._tasks.get(task_id) for task_id in task_ids]
+            if any(task is None or task.session_id != session_id for task in tasks):
+                raise ValueError("Task closure authority changed during deletion.")
+            tasks = [task for task in tasks if task is not None]
+            if any(
+                task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                or task.worker_id is not None
+                or task.lease_expires_at is not None
+                for task in tasks
+            ):
+                raise ValueError("Task closure requires quiescent terminal tasks.")
+            for task_id in task_id_set:
+                self._tasks.pop(task_id, None)
+            self._task_id_by_interrupted_handoff_id = {
+                key: value
+                for key, value in self._task_id_by_interrupted_handoff_id.items()
+                if value not in task_id_set
+            }
+            self._interrupted_continuation_claims = {
+                key: value
+                for key, value in self._interrupted_continuation_claims.items()
+                if not task_id_set.intersection(value)
+            }
+            for name, mapping in vars(self).items():
+                if not isinstance(mapping, dict) or name in {
+                    "_tasks",
+                    "_task_id_by_interrupted_handoff_id",
+                    "_interrupted_continuation_claims",
+                }:
+                    continue
+                for key, value in list(mapping.items()):
+                    value_task_id = getattr(value, "task_id", None)
+                    nested_task = getattr(value, "task", None)
+                    if value_task_id is None and nested_task is not None:
+                        value_task_id = getattr(nested_task, "id", None)
+                    key_contains_task = isinstance(key, tuple) and bool(
+                        task_id_set.intersection(key)
+                    )
+                    if value_task_id in task_id_set or key in task_id_set or key_contains_task:
+                        mapping.pop(key, None)
+            self._contracted_task_ids_by_session.pop(session_id, None)
+            self._task_keys_by_session.pop(session_id, None)
+            for parent_id in list(self._task_keys_by_parent):
+                entries = [
+                    entry
+                    for entry in self._task_keys_by_parent[parent_id]
+                    if entry[1] not in task_id_set
+                ]
+                if entries:
+                    self._task_keys_by_parent[parent_id] = entries
+                else:
+                    self._task_keys_by_parent.pop(parent_id, None)
 
     async def query_task_topology(
         self,

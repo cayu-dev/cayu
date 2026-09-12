@@ -6285,6 +6285,7 @@ def test_sqlite_downgraded_verified_work_records_fail_closed_before_migration(
                 "SET claim_json = json_remove(claim_json, '$.lease_seconds')"
             )
             connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 84")
+            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 85")
             connection.execute("PRAGMA user_version = 83")
         with pytest.raises(RuntimeError, match="verification claims"):
             SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)

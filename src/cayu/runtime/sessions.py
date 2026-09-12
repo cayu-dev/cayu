@@ -9736,6 +9736,10 @@ class SessionStore(ABC):
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_session_operation_initialization: ClassVar[bool] = False
     supports_atomic_model_completion_stage_release: ClassVar[bool] = False
+    # Session closure erasure must leave a durable, replayable receipt even
+    # after the session row has been removed.  Stores opt in only when they can
+    # persist that receipt as part of their deletion/recovery boundary.
+    supports_session_closure_receipts: ClassVar[bool] = False
     supports_completion_result_event_publication_reservations: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
     supports_recall_evidence: ClassVar[bool] = False
@@ -12116,7 +12120,12 @@ class SessionStore(ABC):
         snapshot before any pending state is interpreted.
         """
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+    ) -> None:
         """Delete a session and cascade to its events, transcript, and checkpoint.
 
         Raises ``ValueError`` if the session is in-flight (``RUNNING`` or
@@ -12130,6 +12139,12 @@ class SessionStore(ABC):
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.
         """
         raise NotImplementedError("This SessionStore does not support delete_session.")
+
+    async def load_session_closure_receipt(
+        self, session_id: str, plan_id: str
+    ) -> dict[str, Any] | None:
+        """Load an exact durable closure receipt, if this store supports them."""
+        raise NotImplementedError("This SessionStore does not support session closure receipts.")
 
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         """Replace a session's labels (full replacement, not a merge) and return it.
@@ -12514,6 +12529,17 @@ class _InMemoryMessageDeliveryRecord:
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
+    supports_session_closure_receipts: ClassVar[bool] = True
+
+    async def load_session_closure_receipt(
+        self, session_id: str, plan_id: str
+    ) -> dict[str, Any] | None:
+        require_clean_nonblank(session_id, "session_id")
+        require_clean_nonblank(plan_id, "plan_id")
+        async with self._lock:
+            receipt = self._session_closure_receipts.get((session_id, plan_id))
+            return None if receipt is None else deepcopy(receipt)
+
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
@@ -12574,6 +12600,7 @@ class InMemorySessionStore(SessionStore):
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._sessions: dict[str, Session] = {}
+        self._session_closure_receipts: dict[tuple[str, str], dict[str, Any]] = {}
         self._public_authority_aliases: dict[tuple[str, str, str], str] = {}
         self._targeted_tool_grants: dict[str, TargetedToolGrantRecord] = {}
         self._targeted_tool_grant_ids_by_session: dict[str, list[str]] = {}
@@ -14612,7 +14639,12 @@ class InMemorySessionStore(SessionStore):
             to_status=status,
         )
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+    ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -14919,6 +14951,15 @@ class InMemorySessionStore(SessionStore):
                 if child is None or child.parent_session_id != session_id:
                     raise RuntimeError("Inconsistent in-memory session topology index.")
                 self._sessions[child_id] = child.model_copy(update={"parent_session_id": None})
+            if closure_receipt is not None:
+                receipt_plan_id = closure_receipt.get("plan_id")
+                if type(receipt_plan_id) is not str:
+                    raise ValueError("Session closure receipt is missing plan identity.")
+                receipt_key = (session_id, receipt_plan_id)
+                existing = self._session_closure_receipts.get(receipt_key)
+                if existing is not None and existing != closure_receipt:
+                    raise ValueError("Session closure receipt identity conflict.")
+                self._session_closure_receipts[receipt_key] = deepcopy(closure_receipt)
 
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")

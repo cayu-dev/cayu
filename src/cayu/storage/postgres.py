@@ -3088,6 +3088,20 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_lifecycle_task "
         "ON cayu_work_attempt_lifecycle_receipts(task_id, retired_contract_binding)",
     ),
+    85: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_session_closure_receipts (
+            session_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL CHECK (plan_id ~ '^[0-9a-f]{64}$'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            receipt_json JSONB NOT NULL CHECK (
+                octet_length(receipt_json::text) BETWEEN 1 AND 384000
+                AND jsonb_typeof(receipt_json) = 'object'
+            ),
+            PRIMARY KEY (session_id, plan_id)
+        )
+        """,
+    ),
     79: (
         """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
@@ -24728,6 +24742,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
+    supports_session_closure_receipts: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -27681,7 +27696,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             to_status=status,
         )
 
-    async def delete_session(self, session_id: str) -> None:
+    async def load_session_closure_receipt(
+        self, session_id: str, plan_id: str
+    ) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT receipt_json FROM cayu_session_closure_receipts "
+                "WHERE session_id = %s AND plan_id = %s",
+                (session_id, plan_id),
+            )
+            row = await cur.fetchone()
+        return None if row is None else dict(row[0])
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+    ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -27824,6 +27859,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         "DELETE FROM cayu_sessions WHERE id = %s",
                         (session_id,),
                     )
+                    if closure_receipt is not None:
+                        receipt_plan_id = closure_receipt.get("plan_id")
+                        if type(receipt_plan_id) is not str:
+                            raise ValueError("Session closure receipt is missing plan identity.")
+                        await cur.execute(
+                            "INSERT INTO cayu_session_closure_receipts "
+                            "(session_id, plan_id, committed_at, receipt_json) "
+                            "VALUES (%s, %s, clock_timestamp(), %s) "
+                            "ON CONFLICT (session_id, plan_id) DO UPDATE SET receipt_json = EXCLUDED.receipt_json",
+                            (session_id, receipt_plan_id, closure_receipt),
+                        )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -38131,6 +38177,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
+    supports_session_closure_deletion: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
@@ -39009,6 +39056,73 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             )
             rows = await cur.fetchall()
             return [pg_support.task_from_row(row) for row in rows]
+
+    async def delete_session_tasks(
+        self,
+        session_id: str,
+        *,
+        task_ids: tuple[str, ...],
+        policy: Any,
+    ) -> None:
+        """Delete a bounded, quiescent session task graph transactionally."""
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not task_ids:
+            return
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, status, worker_id, lease_expires_at "
+                    "FROM cayu_tasks WHERE session_id = %s AND id = ANY(%s) "
+                    "FOR UPDATE",
+                    (session_id, list(task_ids)),
+                )
+                rows = await cur.fetchall()
+                if {row[0] for row in rows} != set(task_ids):
+                    raise ValueError("Task closure authority changed during deletion.")
+                if any(
+                    row[1]
+                    not in {
+                        TaskStatus.COMPLETED.value,
+                        TaskStatus.FAILED.value,
+                        TaskStatus.CANCELLED.value,
+                    }
+                    or row[2] is not None
+                    or row[3] is not None
+                    for row in rows
+                ):
+                    raise ValueError("Task closure requires quiescent terminal tasks.")
+                await cur.execute(
+                    """
+                    SELECT DISTINCT kcu.table_name, kcu.column_name
+                    FROM information_schema.table_constraints AS tc
+                    JOIN information_schema.key_column_usage AS kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                    JOIN information_schema.constraint_column_usage AS ccu
+                      ON tc.constraint_name = ccu.constraint_name
+                     AND tc.constraint_schema = ccu.constraint_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                      AND tc.table_schema = current_schema()
+                      AND ccu.table_name = 'cayu_tasks'
+                      AND ccu.column_name = 'id'
+                    """
+                )
+                for table, column in await cur.fetchall():
+                    if table == "cayu_tasks":
+                        continue
+                    await cur.execute(
+                        sql.SQL("DELETE FROM {} WHERE {} = ANY(%s)").format(
+                            sql.Identifier(table), sql.Identifier(column)
+                        ),
+                        (list(task_ids),),
+                    )
+                await cur.execute(
+                    "DELETE FROM cayu_tasks WHERE session_id = %s AND id = ANY(%s)",
+                    (session_id, list(task_ids)),
+                )
+            await conn.commit()
 
     async def query_task_topology(
         self,

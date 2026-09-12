@@ -308,7 +308,7 @@ class LLMJudge(EvalAssertion):
         if session_id is None:
             return
         with contextlib.suppress(Exception):
-            await self._app.session_store.delete_session(session_id)
+            await self._app.erase_session_closure(session_id)
 
     async def _failure_audit_metadata(self, prompt: str, session_id: str | None) -> dict[str, Any]:
         if session_id is None:

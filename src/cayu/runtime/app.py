@@ -404,6 +404,18 @@ from cayu.runtime.retry_policy import (
     RetryPolicy,
     copy_retry_policy,
 )
+from cayu.runtime.session_closure import (
+    ArtifactSessionClosureStore,
+    RetainedSessionClosureStore,
+    SessionClosureCoordinator,
+    SessionClosureExport,
+    SessionClosurePolicy,
+    SessionClosureReport,
+    SessionClosureStore,
+    SessionEvidenceClosureStore,
+    SharedSessionClosureStore,
+    TaskSessionClosureStore,
+)
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
     SessionMessageAccessPolicy,
@@ -840,6 +852,7 @@ class CayuApp:
         enable_logging: bool = True,
         secret_redactor: SecretRedactor | None = None,
         public_authority_alias_keyring: PublicAuthorityAliasKeyring | None = None,
+        session_closure_stores: Iterable[SessionClosureStore] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         # Resolve once at application startup. Strict deployments fail here,
@@ -1029,8 +1042,22 @@ class CayuApp:
                 "durable public authority aliases and an explicit alias keyring."
             )
         self._runtime_session_store = runtime_checkpoint_session_store(self.session_store)
+        closure_stores = () if session_closure_stores is None else tuple(session_closure_stores)
+        for closure_store in closure_stores:
+            if not isinstance(getattr(closure_store, "store_id", None), str):
+                raise TypeError("session_closure_stores must expose a string store_id.")
         self.task_store = task_store
         self.knowledge_store = knowledge_store
+        owned_store_ids = list(closure_stores)
+        if self.task_store is not None:
+            owned_store_ids.append(TaskSessionClosureStore(self.task_store))
+        if self.knowledge_store is not None:
+            owned_store_ids.append(
+                SharedSessionClosureStore("knowledge-store", "knowledge_references")
+            )
+        owned_store_ids.append(RetainedSessionClosureStore("budget-store", "budget_ledger"))
+        self._session_closure_external_stores = tuple(owned_store_ids)
+        self._rebuild_session_closure()
         self.knowledge_access_scope = (
             None
             if knowledge_access_scope is None
@@ -1342,6 +1369,74 @@ class CayuApp:
         """Redact text after the same uppercase normalization used by authorities."""
 
         return self._secret_redactor.redact_uppercase_text(value)
+
+    def _rebuild_session_closure(self) -> None:
+        stores = list(self._session_closure_external_stores)
+        known_ids = {store.store_id for store in stores}
+        if (
+            hasattr(self.session_store, "list_recall_receipts")
+            and hasattr(self.session_store, "list_context_exposures")
+            and "session-store-evidence" not in known_ids
+        ):
+            stores.append(SessionEvidenceClosureStore(self.session_store))
+            known_ids.add("session-store-evidence")
+        for store_id in getattr(self, "_artifact_store_registrations_by_id", {}):
+            if store_id not in known_ids:
+                stores.append(
+                    ArtifactSessionClosureStore(
+                        self._artifact_store_registrations_by_id[store_id].store
+                    )
+                )
+                known_ids.add(store_id)
+        self._session_closure = SessionClosureCoordinator(
+            self.session_store,
+            dependent_stores=tuple(stores),
+            clock=self._clock,
+        )
+
+    async def inspect_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+    ):
+        """Inspect all explicitly configured Cayu-owned closure stores."""
+
+        return await self._session_closure.inspect(session_id, policy=policy)
+
+    async def erase_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+        expected_plan_id: str | None = None,
+    ) -> SessionClosureReport:
+        """Perform a bounded, dependent-first session closure."""
+
+        return await self._session_closure.erase(
+            session_id,
+            policy=policy,
+            expected_plan_id=expected_plan_id,
+        )
+
+    async def validate_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+    ):
+        """Validate closure admission before any external cleanup begins."""
+        return await self._session_closure.validate(session_id, policy=policy)
+
+    async def export_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+    ) -> SessionClosureExport:
+        """Export a bounded, redaction-safe closure manifest."""
+
+        return await self._session_closure.export(session_id, policy=policy)
 
     def stream_redacted_bytes(
         self,
@@ -2763,6 +2858,7 @@ class CayuApp:
             self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
                 artifact_store_registration
             )
+            self._rebuild_session_closure()
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return environment
 
@@ -2813,6 +2909,7 @@ class CayuApp:
             self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
                 artifact_store_registration
             )
+            self._rebuild_session_closure()
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return factory
 

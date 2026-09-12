@@ -680,6 +680,23 @@ from cayu.runtime.retry_policy import (
     retry_decision,
 )
 from cayu.runtime.service_manifest import PublicServiceManifest, RuntimeStoreDurability
+from cayu.runtime.session_closure import (
+    ArtifactSessionClosureStore,
+    SessionClosureBudgetDisposition,
+    SessionClosureChildPolicy,
+    SessionClosureCoordinator,
+    SessionClosureDisposition,
+    SessionClosureExport,
+    SessionClosureManifest,
+    SessionClosureOperation,
+    SessionClosurePolicy,
+    SessionClosureRecord,
+    SessionClosureReport,
+    SessionClosureStore,
+    SessionEvidenceClosureStore,
+    SharedSessionClosureStore,
+    TaskSessionClosureStore,
+)
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
     SessionMessageAccessDenied,
@@ -2224,8 +2241,23 @@ __all__ = [
 
 
 __all__ += [
+    "ArtifactSessionClosureStore",
     "ExecutionDeadline",
     "ExecutionDeadlineExceeded",
+    "SessionClosureBudgetDisposition",
+    "SessionClosureChildPolicy",
+    "SessionClosureCoordinator",
+    "SessionClosureDisposition",
+    "SessionClosureExport",
+    "SessionClosureManifest",
+    "SessionClosureOperation",
+    "SessionClosurePolicy",
+    "SessionClosureRecord",
+    "SessionClosureReport",
+    "SessionClosureStore",
+    "SessionEvidenceClosureStore",
+    "SharedSessionClosureStore",
+    "TaskSessionClosureStore",
     "current_execution_deadline",
     "execution_deadline_scope",
 ]

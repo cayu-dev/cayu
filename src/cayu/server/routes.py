@@ -11325,11 +11325,22 @@ def create_router(
     async def delete_session(session_id: NonBlankString):
         session_id = await _resolve_public_session_id(session_id)
         try:
+            if await session_store.load(session_id) is None:
+                return None
+            inspection = await cayu_app.validate_session_closure(session_id)
+            if not inspection.complete:
+                raise ValueError(
+                    "Session closure inventory is incomplete; no destructive work was started."
+                )
             if not await cayu_app.discard_parked_egress_allocations(session_id):
                 raise ValueError(
                     "Session has a parked egress allocation whose cleanup remains in flight."
                 )
-            await session_store.delete_session(session_id)
+            closure = await cayu_app.erase_session_closure(session_id)
+            if not closure.complete:
+                raise ValueError(
+                    closure.error or "Session closure is incomplete; no deletion was acknowledged."
+                )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None

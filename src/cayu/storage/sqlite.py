@@ -1947,6 +1947,7 @@ class SQLiteSessionStore(SessionStore):
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
+    supports_session_closure_receipts: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -4873,7 +4874,25 @@ class SQLiteSessionStore(SessionStore):
             to_status=status,
         )
 
-    async def delete_session(self, session_id: str) -> None:
+    async def load_session_closure_receipt(
+        self, session_id: str, plan_id: str
+    ) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT receipt_json FROM cayu_session_closure_receipts "
+                "WHERE session_id = ? AND plan_id = ?",
+                (session_id, plan_id),
+            ).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+    ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             try:
@@ -5012,6 +5031,21 @@ class SQLiteSessionStore(SessionStore):
                     "DELETE FROM cayu_sessions WHERE id = ?",
                     (session_id,),
                 )
+                if closure_receipt is not None:
+                    receipt_plan_id = closure_receipt.get("plan_id")
+                    if type(receipt_plan_id) is not str:
+                        raise ValueError("Session closure receipt is missing plan identity.")
+                    self._connection.execute(
+                        "INSERT INTO cayu_session_closure_receipts "
+                        "(session_id, plan_id, committed_at, receipt_json) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(session_id, plan_id) DO UPDATE SET receipt_json = excluded.receipt_json",
+                        (
+                            session_id,
+                            receipt_plan_id,
+                            datetime.now(UTC).isoformat(),
+                            json.dumps(closure_receipt, ensure_ascii=False, separators=(",", ":")),
+                        ),
+                    )
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
@@ -15126,6 +15160,7 @@ class SQLiteTaskStore(TaskStore):
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
+    supports_session_closure_deletion: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
 
     def __init__(
@@ -18089,6 +18124,74 @@ class SQLiteTaskStore(TaskStore):
                 params,
             ).fetchall()
             return [sqlite_support.task_from_row(row) for row in rows]
+
+    async def delete_session_tasks(
+        self,
+        session_id: str,
+        *,
+        task_ids: tuple[str, ...],
+        policy: Any,
+    ) -> None:
+        """Delete one session's terminal task graph in the store transaction.
+
+        The closure coordinator supplies a bounded, revalidated identity set;
+        this method owns the SQL dependency cleanup so receipts and attempt
+        records cannot outlive their task rows.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not task_ids:
+            return
+        async with self._lock:
+            placeholders = ", ".join("?" for _ in task_ids)
+            rows = self._connection.execute(
+                f"SELECT id, session_id, status, worker_id, lease_expires_at "
+                f"FROM cayu_tasks WHERE session_id = ? AND id IN ({placeholders})",
+                (session_id, *task_ids),
+            ).fetchall()
+            if {row["id"] for row in rows} != set(task_ids):
+                raise ValueError("Task closure authority changed during deletion.")
+            if any(
+                row["status"]
+                not in {
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                }
+                or row["worker_id"] is not None
+                or row["lease_expires_at"] is not None
+                for row in rows
+            ):
+                raise ValueError("Task closure requires quiescent terminal tasks.")
+            try:
+                with self._verified_transaction_unlocked():
+                    table_rows = self._connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall()
+                    for table_row in table_rows:
+                        table = table_row["name"]
+                        if table == "cayu_tasks":
+                            continue
+                        foreign_keys = self._connection.execute(
+                            f"PRAGMA foreign_key_list('{table.replace(chr(39), chr(39) * 2)}')"
+                        ).fetchall()
+                        for foreign_key in foreign_keys:
+                            if foreign_key["table"] != "cayu_tasks":
+                                continue
+                            column = foreign_key["from"]
+                            self._connection.execute(
+                                f'DELETE FROM "{table.replace(chr(34), chr(34) * 2)}" '
+                                f'WHERE "{column.replace(chr(34), chr(34) * 2)}" IN ({placeholders})',
+                                task_ids,
+                            )
+                    self._connection.execute(
+                        f"DELETE FROM cayu_tasks WHERE session_id = ? AND id IN ({placeholders})",
+                        (session_id, *task_ids),
+                    )
+            except Exception:
+                self._connection.rollback()
+                raise
 
     async def query_task_topology(
         self,

@@ -4139,6 +4139,21 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_lifecycle_task
             ON cayu_work_attempt_lifecycle_receipts(task_id, retired_contract_binding);
     """,
+    85: """
+        CREATE TABLE IF NOT EXISTS cayu_session_closure_receipts (
+            session_id TEXT COLLATE BINARY NOT NULL,
+            plan_id TEXT COLLATE BINARY NOT NULL CHECK (
+                length(plan_id) = 64 AND plan_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json)
+                AND json_type(receipt_json) = 'object'
+                AND length(CAST(receipt_json AS BLOB)) BETWEEN 1 AND 384000
+            ),
+            PRIMARY KEY (session_id, plan_id)
+        );
+    """,
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY

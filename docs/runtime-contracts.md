@@ -15566,3 +15566,20 @@ The reason describes classifier inputs, not incident root cause or provider inte
 Supported type/code identities retain the existing sanitization policy. Diagnostic
 fields do not control retry, cleanup, cancellation, or unknown-effect settlement;
 existing typed status and retry authority are unchanged.
+# Session closure
+
+Cayu's session-store deletion and closure-complete deletion are distinct
+operations. `CayuApp.inspect_session_closure()` returns a versioned, bounded
+manifest for the selected session; `export_session_closure()` emits bounded
+session records only when the configured store snapshot and every required
+dependent capability are complete. `erase_session_closure()` inventories and
+settles eligible dependents before deleting the session-store row. It fails
+closed for unsupported, unavailable, truncated, active, or retained state and
+never reports those records as erased. Session-scoped artifacts are matched by
+both scope and exact session ID. Budget records currently support retention
+only; no destructive or pseudonymizing budget disposition is available.
+Descendant
+sessions currently support only the explicit ``reject`` policy; the default and
+only supported behavior rejects them without mutation. The HTTP
+session DELETE route uses this closure boundary and returns conflict when a
+complete closure cannot be proven.

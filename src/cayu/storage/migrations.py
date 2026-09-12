@@ -440,6 +440,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Verified-task settlement retires contract bindings through durable receipts.
     # Older writers neither preserve retirement nor retain executable source settings.
     Revision(revision=84, kind=RevisionKind.BREAKING, compatible_from=84),
+    # Session closure now requires every writer to preserve an exact erase
+    # receipt; pre-85 workers can delete the session without that boundary.
+    Revision(revision=85, kind=RevisionKind.BREAKING, compatible_from=85),
 )
 
 #: The revision an empty database is initialized to.

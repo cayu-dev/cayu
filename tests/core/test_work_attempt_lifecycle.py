@@ -1036,6 +1036,7 @@ def test_revision_84_migration_requires_empty_pre_worker_admission_history(
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE cayu_work_attempt_lifecycle_receipts")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 84")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 85")
         connection.execute("PRAGMA user_version = 83")
     if populated:
         with pytest.raises(RuntimeError, match="cannot reconstruct executable settings"):
@@ -1054,7 +1055,7 @@ def test_revision_84_migration_requires_empty_pre_worker_admission_history(
             store = SQLiteTaskStore(path, schema_mode=SchemaMode.MIGRATE)
             try:
                 assert await store.load_task("ordinary") is not None
-                assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 84
+                assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 85
             finally:
                 await store.close()
 
