@@ -70,7 +70,7 @@ arguments, `D(i)` complete the output item, and `T` complete the response.
 | No deltas, or an empty delta, then complete JSON in G(0) | Accepted from registered identity and complete arguments |
 | Identical repeated D(0) | Existing idempotent reconciliation; no second tool call |
 | Empty/omitted terminal output after complete streamed evidence | Existing fallback behavior retained |
-| T followed by more transport input | Accepted completed response closes the stream without consuming the tail |
+| T followed by more transport input | Post-terminal mutation fails before Runtime tool execution; previously accepted completion remains accounting evidence |
 | Incomplete terminal followed by G(0) | Direct parser rejects post-terminal mutation; native Runtime does not execute the partial call |
 | Abandoned partial attempt, then valid retry with the same IDs | Fresh registration/trace state; one execution from the accepted attempt |
 
@@ -91,9 +91,12 @@ fields are `provider_protocol_stream_boundary`,
 1. Received ordinal, saturated at 1,000,000, local to the parser invocation.
 2. Allowlisted event type (including function delta/completion); otherwise `other`.
 3. Output index, or -1 if absent, invalid, or over 1,000,000.
-4. Function state immediately before processing: `absent`, `pending`, or
-   `completed`. Here `completed` means validated arguments are in the existing
-   fallback map; it does **not** prove that `output_item.done` has arrived.
+4. Registration state at the received index immediately before processing:
+   `absent`, `pending`, or `completed`. Consult the aligned registered-item-type
+   column to distinguish an active function from a conflicting reasoning,
+   message or hosted-tool item. For a function, `completed` means validated
+   arguments are in the existing fallback map; it does **not** prove that
+   `output_item.done` has arrived.
 5. Item identity relation to registration/evidence at that index.
 6. Response identity relation to the registered response.
 
@@ -118,3 +121,30 @@ externally correlated attempt. Locate where the sequence first diverges. The
 adapter trace alone cannot distinguish upstream ordering from a proxy dropping
 an event, nor recover registration outside its retained window. No raw streams,
 argument contents, or workload identifiers are needed in the issue or PR.
+
+## Active item conflicts and shared boundary capture
+
+An argument delta/completion addressed to an active reasoning, message or hosted
+search index is a known type conflict. It now retains
+`function_call_output_index_type_mismatch`, just like a function registration
+that collides with that index. Previously these argument events reported missing
+function registration and omitted the known active item type. The existing
+pending maps supply this observation; no remapping or additional registry is
+introduced. A genuinely unregistered index still reports the existing
+before-registration reason, even if the supplied item ID matches another index.
+
+Function-only errors now carry the existing bounded native/transport structural
+fields when available. The shared recorder already observes all Responses events;
+hosted-search activity is no longer required to attach its snapshots. Transport
+evidence remains absent when a custom transport supplies no authenticated capture.
+Identity aliases, truncation and exhaustion retain the limits described in the
+hosted-search document. No argument or response content is added to diagnostics.
+
+`tests/core/test_openai_function_registration.py` checks both public provider
+variants over byte-chunked SSE and SQLite. Two functions, two searches and a
+reasoning item interleave, including fragmented arguments, an empty JSON object,
+repeated permitted search progress and an abandoned attempt using the same IDs.
+Exactly the intended tool IDs/names/arguments execute once. Invalid active-item
+collisions and shifted function identities never dispatch and stop at the existing
+unknown-attempt cap. These diagnostic corrections reproduce on unchanged main;
+they do not establish ownership of any historical malformed stream.

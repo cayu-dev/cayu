@@ -193,11 +193,11 @@ async def test_mixed_stream_retains_function_and_search_evidence(tmp_path, failu
     native = json.loads(error["provider_protocol_native_structure"])
     assert native == json.loads(error["provider_protocol_transport_structure"])
     assert native[-1][-2:] == ["invalid", 0]
-    # The existing registration columns still describe the function map.
+    # Registration columns include a known conflicting item at the received index.
     trace = json.loads(error["provider_protocol_stream_trace"])
     types = json.loads(error["provider_protocol_stream_item_types"])
-    assert trace[-1][3] == ("pending" if failure == "function" else "absent")
-    assert types[-1][2] == ("function_call" if failure == "function" else "missing")
+    assert trace[-1][3] == "pending"
+    assert types[-1][2] == ("function_call" if failure == "function" else "web_search_call")
     fields = {k: v for k, v in error.items() if k.startswith("provider_protocol_")}
     assert fields == {
         k: v for k, v in diagnostics(events)[0].items() if k.startswith("provider_protocol_")

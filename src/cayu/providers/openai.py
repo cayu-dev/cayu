@@ -3160,18 +3160,15 @@ async def _openai_stream_events(
                 yield event
     except OpenAIProtocolError as exc:
         if trace.has_function and exc.stream_diagnostic is None:
-            diagnostic = trace.snapshot()
-            if search_trace.has_search:
-                # Preserve function registration evidence while adding the shared
-                # boundary structure and search identity relationships.
-                search = search_trace.snapshot()
-                diagnostic = replace(
-                    diagnostic,
-                    identities=search.identities,
-                    structure=search.structure,
-                    transport=search.transport,
-                )
-            exc.stream_diagnostic = diagnostic
+            # The shared structure recorder observes every event, including
+            # function-only streams. Search activity is not capture authority.
+            search = search_trace.snapshot()
+            exc.stream_diagnostic = replace(
+                trace.snapshot(),
+                identities=search.identities if search_trace.has_search else (),
+                structure=search.structure,
+                transport=search.transport,
+            )
         raise
 
 
@@ -3276,8 +3273,18 @@ async def _openai_stream_events_impl(
         search_trace.record(
             event, pending_web_search_calls, fallback_output_items, lifecycle.response_id
         )
+        nonfunction_registration = _pending_nonfunction_item(
+            event.get("output_index"),
+            pending_replay_items,
+            pending_web_search_calls,
+            pending_tool_search_calls,
+        )
         function_trace.record(
-            event, pending_function_calls, fallback_output_items, lifecycle.response_id
+            event,
+            pending_function_calls,
+            fallback_output_items,
+            lifecycle.response_id,
+            nonfunction_registration=nonfunction_registration,
         )
         event_type = event.get("type")
         if event_type == "cayu.internal.transport_cancelled":
@@ -3288,7 +3295,12 @@ async def _openai_stream_events_impl(
         accepted = lifecycle.accept(_openai_stream_transition(event))
         if accepted.identity_started:
             observe_provider_semantic_progress(ProviderProgressKind.RESPONSE_IDENTITY)
-        _validate_function_stream_boundary(event, pending_function_calls, fallback_output_items)
+        _validate_function_stream_boundary(
+            event,
+            pending_function_calls,
+            fallback_output_items,
+            nonfunction_registration=nonfunction_registration,
+        )
         if event_type == "response.created":
             continue
         if event_type == "response.output_text.delta":
@@ -3360,18 +3372,6 @@ async def _openai_stream_events_impl(
             continue
         if event_type == "response.output_item.added":
             item = event.get("item")
-            if isinstance(item, Mapping) and item.get("type") == "function_call":
-                output_index = _stream_output_index(event)
-                if (
-                    output_index in pending_replay_items
-                    or output_index in pending_reasoning_items
-                    or output_index in pending_web_search_calls
-                    or output_index in pending_tool_search_calls
-                ):
-                    raise OpenAIProtocolError(
-                        "OpenAI function call output index changed item type.",
-                        reason_code="function_call_output_index_type_mismatch",
-                    )
             reasoning_added = False
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 output_index = _stream_output_index(event)
@@ -5115,10 +5115,30 @@ def _reconcile_fallback_visible_text(
         )
 
 
+def _pending_nonfunction_item(
+    index: object,
+    replay: Mapping[int, tuple[str, str]],
+    searches: Mapping[int, tuple[str, str]],
+    tool_searches: Mapping[int, Mapping[str, Any]],
+) -> tuple[str, str | None] | None:
+    """Inspect existing active-item maps without creating a second registry."""
+    if type(index) is not int or index < 0:
+        return None
+    if index in replay:
+        return replay[index]
+    if index in searches:
+        return "web_search_call", searches[index][0]
+    if index in tool_searches:
+        return "tool_search_call", tool_searches[index].get("id")
+    return None
+
+
 def _validate_function_stream_boundary(
     event: Mapping[str, Any],
     pending: Mapping[int, _PendingFunctionCall],
     finished: Mapping[int, Mapping[str, Any]],
+    *,
+    nonfunction_registration: tuple[str, str | None] | None,
 ) -> None:
     """Validate supplied identities and distinguish missing from consumed registration."""
     kind = event.get("type")
@@ -5140,6 +5160,11 @@ def _validate_function_stream_boundary(
                 )
         return
     index = _stream_output_index(event)
+    if nonfunction_registration is not None:
+        raise OpenAIProtocolError(
+            "OpenAI function call output index changed item type.",
+            reason_code="function_call_output_index_type_mismatch",
+        )
     existing = finished.get(index)
     if existing is not None:
         if existing.get("type") != "function_call":

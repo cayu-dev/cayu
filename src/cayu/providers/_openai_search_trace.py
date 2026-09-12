@@ -267,6 +267,8 @@ class FunctionStreamTrace(SearchStreamTrace):
         pending: Mapping[int, Any],
         completed: Mapping[int, dict[str, Any]],
         response_id: str | None,
+        *,
+        nonfunction_registration: tuple[str, str | None] | None = None,
     ) -> None:
         self._truncated |= len(self._entries) == _TRACE_LIMIT
         self._ordinal = min(self._ordinal + 1, _COUNTER_LIMIT)
@@ -281,6 +283,8 @@ class FunctionStreamTrace(SearchStreamTrace):
             state, expected = "pending", registered.item_id
         elif finished is not None:
             state, expected = "completed", finished.get("id")
+        elif nonfunction_registration is not None:
+            state, expected = "pending", nonfunction_registration[1]
         item = event.get("item")
         self._item_types.append(
             (
@@ -288,6 +292,8 @@ class FunctionStreamTrace(SearchStreamTrace):
                 _item_type(item.get("type") if isinstance(item, Mapping) else None),
                 "function_call"
                 if registered is not None
+                else _item_type(nonfunction_registration[0])
+                if nonfunction_registration is not None and finished is None
                 else _item_type(finished.get("type") if finished is not None else None),
             )
         )

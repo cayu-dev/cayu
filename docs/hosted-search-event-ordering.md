@@ -145,3 +145,23 @@ an adapter defect. Neither outcome is yet established.
 
 The rejection policy, retry caps, and hosted-effect accounting are unchanged.
 No buffering or permissive orphan handling is justified by these controls.
+
+## Native API/subscription retry controls
+
+`tests/core/test_openai_search_retry_contract.py` drives the same byte-chunked SSE
+through both public providers and SQLite. It separately checks a lifecycle event
+without registration, an added item already marked completed, a missing added
+status, and a stable item ID received at a changed index. The first two preserve
+the observed before-registration and must-be-in-progress reason codes; missing
+status remains unsupported. Shifted identity is retained structurally and is
+never remapped. Attempts have distinct native identities and exhaust the existing
+two unknown-attempt allowance without dispatching a client tool.
+
+The companion function-registration controls verify valid two-search interleaving
+with reasoning and two client functions, including retry with reused synthetic
+IDs. Each completed search retains its exact call identity and sources once.
+These controls supplement the existing truncated-history and boundary-change
+fixtures. A dropped prefix cannot be reconstructed from the last 16 rows: the
+historical cause still requires a captured registration-to-rejection sequence at
+each relevant boundary of the same response/attempt. Uncaptured upstream data
+must remain explicitly unavailable, even when downstream validation succeeds.
