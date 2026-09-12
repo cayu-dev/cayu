@@ -8924,6 +8924,20 @@ Once a provider has completed a request, structurally invalid `provider_state` c
 
 `OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces separate transport, decoded-protocol, semantic-progress, and absolute stream deadlines so wire activity cannot disguise a semantically stalled model step. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
 
+`OpenAIProvider(streaming=False)` explicitly requests one final JSON response.
+The adapter validates that response before yielding normalized text, reasoning,
+hosted-search, function-call and completion events through the same Runtime
+path. This mode avoids intermediate SSE ordering and supplies no incremental
+progress before the response arrives. The HTTP request timeout and Runtime's
+semantic-progress, absolute and execution deadlines still apply; a slow final
+response can therefore expire at the existing semantic-progress limit. No
+timeout, retry allowance or token budget is increased. The mode participates
+in request footprints and fingerprints and cannot be combined with
+`background=True`. It is not an automatic fallback for a failed streamed
+attempt and does not change the streaming parser's identity checks. Compatible
+endpoints must actually support non-streaming Responses; subscription-backend
+support is not implied.
+
 `OpenAIWebSearch` is immutable provider-hosted execution authority registered
 through `hosted_tools`, never a Cayu `Tool` or raw provider option. Its complete
 configuration participates in agent registration, execution-profile identity,

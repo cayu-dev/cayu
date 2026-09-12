@@ -1186,10 +1186,14 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         projected = privacy_safe_provider_option_projection(
             _effective_openai_request_options_for_request(request)
         )
+        if not self.streaming:
+            projected["stream"] = False
         return {"openai": projected} if projected else {}
 
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective = _effective_openai_request_options_for_request(request)
+        if not self.streaming:
+            effective["stream"] = False
         return {"openai": effective} if effective else {}
 
     def __init__(
@@ -1208,6 +1212,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         client_tool_search_models: Iterable[str] | None = None,
         hosted_tool_search_models: Iterable[str] | None = None,
         background: bool = False,
+        streaming: bool = True,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.api_key = resolve_api_key(
@@ -1244,11 +1249,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         )
         if type(background) is not bool:
             raise TypeError("background must be a bool.")
+        if type(streaming) is not bool:
+            raise TypeError("streaming must be a bool.")
+        if background and not streaming:
+            raise ValueError("OpenAI background operations require streaming=True.")
         if background and self.base_url != _validate_base_url(DEFAULT_OPENAI_BASE_URL):
             raise ValueError(
                 "OpenAI background operations require the official OpenAI API base URL."
             )
         self.background = background
+        self.streaming = streaming
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
         self._stream_deadlines = _resolve_provider_stream_deadlines(
             stream_deadlines=stream_deadlines,
@@ -1291,7 +1301,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         try:
             self._preflight_dynamic_tool_request(request)
             payload = build_openai_payload(
-                request, stream=True, reasoning_state=self.reasoning_state
+                request, stream=self.streaming, reasoning_state=self.reasoning_state
             )
             yielded_any = False
             try:
@@ -1327,7 +1337,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     raise
             # Recovery: one clean full resend rebuilt from neutral parts.
             recovery_payload = build_openai_payload(
-                request, stream=True, reasoning_state=self.reasoning_state, chain=False
+                request, stream=self.streaming, reasoning_state=self.reasoning_state, chain=False
             )
             events = self._consume(recovery_payload)
             async with aclosing_provider_stream(events):
@@ -1552,6 +1562,21 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         raise failure
 
     async def _consume(self, payload: dict[str, Any]) -> AsyncIterator[ModelStreamEvent]:
+        if not self.streaming:
+            # Keep typed transport errors intact until stream() has evaluated
+            # stale-chain recovery and protocol classification. Its outer
+            # exception boundary sanitizes errors before exposing them.
+            response = await self.transport.create_response(
+                url=f"{self.base_url}/v1/responses",
+                headers=self._headers(),
+                payload=payload,
+                timeout_s=self.timeout_s,
+            )
+            # Parse the entire final response before exposing any tool or replay
+            # state. No intermediate SSE lifecycle is inferred or repaired.
+            for event in openai_response_events(response, reasoning_state=self.reasoning_state):
+                yield event
+            return
         raw_events = self.transport.stream_response_events(
             url=f"{self.base_url}/v1/responses",
             headers=self._headers(),
@@ -1907,9 +1932,15 @@ def openai_response_events(
     provider_state_items: list[dict[str, Any]] = []
     completion_output_items: list[Mapping[str, Any]] = []
     hosted_call_indexes: dict[str, int] = {}
+    function_identities: set[tuple[str, str]] = set()
     tool_search_call_count = 0
     assistant_text_offset = 0
     response_status = _optional_string(response, "status")
+    if response_status not in {None, "completed", "incomplete", "failed"}:
+        raise OpenAIProtocolError(
+            "OpenAI final response must have a terminal status.",
+            reason_code="final_response_requires_terminal_status",
+        )
     for index, item in enumerate(output):
         if not isinstance(item, Mapping):
             raise OpenAIProtocolError(
@@ -1931,7 +1962,27 @@ def openai_response_events(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
         elif item_type == "function_call":
-            events.append(_function_call_event(item, index))
+            if _optional_string(item, "status") not in {
+                None,
+                "completed",
+            }:
+                raise OpenAIProtocolError(
+                    "OpenAI final response function call must be completed.",
+                    reason_code="final_response_function_call_must_be_completed",
+                )
+            call_event = _function_call_event(item, index)
+            for field in ("id", "call_id"):
+                identity = _mapping_optional_string(item, field)
+                if identity is None:
+                    continue
+                key = (field, identity)
+                if key in function_identities:
+                    raise OpenAIProtocolError(
+                        "OpenAI function call identity was reused.",
+                        reason_code="final_response_function_call_identity_was_reused",
+                    )
+                function_identities.add(key)
+            events.append(call_event)
             completion_output_items.append(item)
             provider_state_items.append(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
@@ -7329,7 +7380,7 @@ def _execution_profile_material(provider: OpenAIProvider) -> dict[str, Any] | No
     """Bounded configuration material for runtime exact-type identity selection."""
     if type(provider.transport) is not HttpxOpenAITransport or provider.extra_headers:
         return None
-    return {
+    material = {
         "base_url": provider.base_url,
         "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
         "reasoning_state": provider.reasoning_state,
@@ -7340,3 +7391,6 @@ def _execution_profile_material(provider: OpenAIProvider) -> dict[str, Any] | No
         "timeout_s": provider.timeout_s,
         "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
     }
+    if not provider.streaming:
+        material["streaming"] = False
+    return material

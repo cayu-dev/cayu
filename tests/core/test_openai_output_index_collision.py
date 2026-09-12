@@ -44,6 +44,66 @@ async def test_completed_message_index_cannot_be_reused_by_function():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("terminal_output", [None, []])
+async def test_reasoning_index_shift_followed_by_reuse_cannot_drop_a_completed_item(
+    terminal_output,
+):
+    # Synthetic structural reproduction: one identity moves from 8 to 9, then
+    # another starts at 9. A map that overwrites by index silently loses rs_a.
+    first = {"type": "reasoning", "id": "rs_a", "summary": []}
+    second = {"type": "reasoning", "id": "rs_b", "summary": []}
+    raw = [
+        created(),
+        {"type": "response.output_item.added", "output_index": 8, "item": first},
+        {"type": "response.output_item.done", "output_index": 9, "item": first},
+        {"type": "response.output_item.added", "output_index": 9, "item": second},
+        {"type": "response.output_item.done", "output_index": 9, "item": second},
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_safe", "status": "completed", "output": terminal_output},
+        },
+    ]
+    seen = []
+    with pytest.raises(OpenAIProtocolError) as caught:
+        await parse(raw, seen)
+    assert caught.value.reason_code == "reasoning_output_item_added_was_repeated"
+    assert not seen
+
+
+@pytest.mark.anyio
+async def test_sparse_reasoning_indexes_preserve_both_completed_items():
+    from cayu.providers import ModelStreamEventType
+
+    raw = [created()]
+    for index, identity in [(8, "rs_a"), (10, "rs_b")]:
+        item = {
+            "type": "reasoning",
+            "id": identity,
+            "summary": [],
+            "encrypted_content": f"synthetic-{identity}",
+        }
+        raw.extend(
+            [
+                {"type": "response.output_item.added", "output_index": index, "item": item},
+                {"type": "response.output_item.done", "output_index": index, "item": item},
+            ]
+        )
+    raw.append(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_safe", "status": "completed", "output": []},
+        }
+    )
+    seen = []
+    await parse(raw, seen)
+    assert len(seen) == 1 and seen[0].type == ModelStreamEventType.COMPLETED
+    assert [part["state"]["id"] for part in seen[0].payload["provider_state"]] == [
+        "rs_a",
+        "rs_b",
+    ]
+
+
+@pytest.mark.anyio
 async def test_collision_retries_preserve_bounded_durable_diagnostics(tmp_path):
     events, durable, executed = await run_sse(tmp_path, [collision(), collision()])
     assert not executed
