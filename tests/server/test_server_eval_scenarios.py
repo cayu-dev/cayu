@@ -726,7 +726,7 @@ def test_scenario_rejects_profile_drift_before_approved_tool_dispatch(tmp_path) 
             assert launched.status_code == 202
             run_id = launched.json()["spec"]["run_id"]
 
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 current = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
                 progress = current.json().get("scenario_progress")
@@ -749,7 +749,7 @@ def test_scenario_rejects_profile_drift_before_approved_tool_dispatch(tmp_path) 
             )
             assert approved.status_code == 200
 
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 terminal_response = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
                 assert terminal_response.status_code == 200

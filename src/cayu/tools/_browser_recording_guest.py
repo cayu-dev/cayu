@@ -200,7 +200,7 @@ async def capture_recording_frame(daemon: Any, policy: dict[str, Any]) -> tuple[
         while pending:
             node = pending.pop()
             count += 1
-            if count > 4096 or node.get("shadowRoots") or node.get("contentDocument"):
+            if count > 4096 or node.get("contentDocument"):
                 raise RecordingCaptureDenied()
             name = node.get("nodeName", "").lower()
             attrs = node.get("attributes", [])
@@ -219,6 +219,14 @@ async def capture_recording_frame(daemon: Any, policy: dict[str, Any]) -> tuple[
                 )
             ):
                 raise RecordingCaptureDenied()
+            # Chromium supplies native shadow trees for ordinary form controls.
+            # They are browser-owned, unlike page-authored open/closed roots.
+            # Inspect their descendants with the same bounds and sensitive-field
+            # checks; never treat a page-authored or unknown root as transparent.
+            for root in node.get("shadowRoots", []):
+                if root.get("shadowRootType") != "user-agent":
+                    raise RecordingCaptureDenied()
+                pending.append(root)
             pending.extend(node.get("children", []))
 
     debugger_enabled = False

@@ -8374,28 +8374,88 @@ async def test_openai_protocol_diagnostics_survive_sqlite_and_unknown_retries(
     ]
     public_error = next(event for event in public if event.type == ModelStreamEventType.ERROR)
     expected = {"provider_protocol_reason": reason, "provider_protocol_stage": stage}
-    if reason == "web_search_lifecycle_item_id_mismatch":
-        expected.update(
-            {
-                "provider_protocol_stream_boundary": "native_adapter",
-                "provider_protocol_stream_trace": json.dumps(
+    trace_tail, type_tail, identity_tail, native_tail = {
+        "web_search_action_type_is_unsupported": (
+            [3, "response.output_item.done", 0, "pending", "matches", "missing"],
+            [3, "web_search_call", "web_search_call"],
+            [3, "pending_here", 0],
+            [
+                3,
+                "response.output_item.done",
+                "present",
+                0,
+                "web_search_call",
+                "missing",
+                -1,
+                "present",
+                1,
+            ],
+        ),
+        "web_search_lifecycle_item_id_mismatch": (
+            [3, "response.web_search_call.searching", 0, "pending", "differs", "missing"],
+            [3, "missing", "web_search_call"],
+            [3, "unknown", -1],
+            [
+                3,
+                "response.web_search_call.searching",
+                "present",
+                0,
+                "missing",
+                "missing",
+                -1,
+                "present",
+                2,
+            ],
+        ),
+        "stream_emitted_conflicting_response_identities": (
+            [3, "response.created", -1, "absent", "missing", "differs"],
+            [3, "missing", "missing"],
+            [3, "missing", -1],
+            [3, "response.created", "missing", -1, "missing", "missing", -1, "missing", 0],
+        ),
+    }[reason]
+    expected.update(
+        {
+            "provider_protocol_stream_boundary": "native_adapter",
+            "provider_protocol_stream_trace": json.dumps(
+                [
+                    [1, "response.created", -1, "absent", "missing", "unregistered"],
+                    [2, "response.output_item.added", 0, "absent", "unregistered", "missing"],
+                    trace_tail,
+                ],
+                separators=(",", ":"),
+            ),
+            "provider_protocol_stream_trace_truncated": 0,
+            "provider_protocol_stream_item_types": json.dumps(
+                [[1, "missing", "missing"], [2, "web_search_call", "missing"], type_tail],
+                separators=(",", ":"),
+            ),
+            "provider_protocol_stream_identities": json.dumps(
+                [[1, "missing", -1], [2, "unknown", -1], identity_tail],
+                separators=(",", ":"),
+            ),
+            "provider_protocol_native_structure": json.dumps(
+                [
+                    [1, "response.created", "missing", -1, "missing", "missing", -1, "missing", 0],
                     [
-                        [1, "response.created", -1, "absent", "missing", "unregistered"],
-                        [2, "response.output_item.added", 0, "absent", "unregistered", "missing"],
-                        [
-                            3,
-                            "response.web_search_call.searching",
-                            0,
-                            "pending",
-                            "differs",
-                            "missing",
-                        ],
+                        2,
+                        "response.output_item.added",
+                        "present",
+                        0,
+                        "web_search_call",
+                        "missing",
+                        -1,
+                        "present",
+                        1,
                     ],
-                    separators=(",", ":"),
-                ),
-                "provider_protocol_stream_trace_truncated": 0,
-            }
-        )
+                    native_tail,
+                ],
+                separators=(",", ":"),
+            ),
+            "provider_protocol_native_structure_truncated": 0,
+            "provider_protocol_native_aliases_exhausted": 0,
+        }
+    )
     if field is not None:
         expected["provider_protocol_field"] = field
     protocol_payload = {

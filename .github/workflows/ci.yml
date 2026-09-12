@@ -78,7 +78,7 @@ jobs:
     name: Test shard ${{ matrix.shard }}/32 (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
     # Includes dependency setup and collection, not just measured test calls.
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

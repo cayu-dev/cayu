@@ -10,6 +10,7 @@ import pytest
 from cayu import (
     AgentSpec,
     CayuApp,
+    InMemorySessionStore,
     ModelStreamEvent,
     RunLimits,
     RuntimeHook,
@@ -110,7 +111,13 @@ def test_native_limit_identity_and_replay(tmp_path, sqlite, kind):
                 )
 
         path = tmp_path / "sessions.db"
-        store = SQLiteSessionStore(path) if sqlite else None
+        # Session creation and elapsed-limit evaluation must share the test
+        # clock; real setup latency must not consume the synthetic advance.
+        store = (
+            SQLiteSessionStore(path, ownership_clock=lambda: now)
+            if sqlite
+            else InMemorySessionStore(ownership_clock=lambda: now)
+        )
         provider = Provider([])
 
         def make_app(store):
@@ -206,9 +213,9 @@ def test_native_limit_identity_and_replay(tmp_path, sqlite, kind):
         assert completed == [result.successes[0].session_id]
         assert not any(e.type == "session.completed" for e in events)
         before = list(calls), list(executed)
-        if store:
+        if sqlite:
             await store.close()
-            store = SQLiteSessionStore(path)
+            store = SQLiteSessionStore(path, ownership_clock=lambda: now)
             app = make_app(store)
         replay = Workflow(app).context("root")
         await replay.start()
@@ -219,7 +226,7 @@ def test_native_limit_identity_and_replay(tmp_path, sqlite, kind):
         assert raised.value.evidence == evidence
         assert raised.value.workflow_attempt_id == replay.attempt_id
         assert (calls, executed) == before
-        if store:
+        if sqlite:
             await store.close()
 
     asyncio.run(run())

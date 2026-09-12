@@ -20,6 +20,7 @@ pytestmark = [
 
 _PROGRAM = r"""
 import asyncio
+import hashlib
 import sys
 from types import SimpleNamespace
 sys.path.insert(0, "/repo/src/cayu/tools")
@@ -33,6 +34,13 @@ async def main():
         try:
             context = await browser.new_context(viewport={"width":1280,"height":720})
             html = '<html><body style="background:green"><h1>Public page</h1></body></html>'
+            if mode == "catalog-transition": html += '<input type="search" placeholder="Search"><a href="https://public.test/product">Inspect product</a>'
+            if mode == "text-input": html += '<input type="text" placeholder="Search products">'
+            if mode == "search-input": html += '<input type="search" placeholder="Search products">'
+            if mode == "textarea": html += '<textarea placeholder="Public notes"></textarea>'
+            if mode == "file-input": html += '<input type="file">'
+            if mode == "autocomplete": html += '<input type="text" autocomplete="cc-number">'
+            if mode == "open-shadow": html += '<div id="host"></div><script>host.attachShadow({mode:"open"}).innerHTML="<p>Public</p>"</script>'
             if mode == "password": html += '<input type="password" value="prohibited">'
             if mode == "dom-race": html += '<div id="entry"></div>'
             if mode == "iframe": html += '<iframe src="https://other.test/"></iframe>'
@@ -42,7 +50,9 @@ async def main():
             if mode == "delayed-parser":
                 html = '<html><body><h1>Public page</h1><script src="https://public.test/slow.js"></script><input type="password" value="prohibited"></body></html>'
             async def serve(route):
-                if route.request.url.endswith("slow.js"):
+                if mode == "catalog-transition" and route.request.url.endswith("/product"):
+                    await route.fulfill(status=200, content_type="text/html", body='<html><body style="background:blue"><h1>Product details</h1></body></html>')
+                elif route.request.url.endswith("slow.js"):
                     await parser_release.wait()
                     await route.fulfill(status=200, content_type="text/javascript", body="")
                 else:
@@ -95,10 +105,20 @@ async def main():
                       "max_width":1280,"max_height":720}
             try:
                 page_id, pixels = await capture_recording_frame(daemon,policy)
-                assert mode in {"allowed", "timer"}, mode
+                assert mode in {"allowed", "timer", "text-input", "search-input", "textarea", "catalog-transition"}, mode
                 assert page_id == "page" and pixels.startswith(b"\x89PNG")
+                if mode == "catalog-transition":
+                    catalog_hash = hashlib.sha256(pixels).digest()
+                    await page.get_by_role("link", name="Inspect product").click()
+                    await page.wait_for_load_state("load")
+                    state.navigation_epoch += 1
+                    next_page_id, next_pixels = await capture_recording_frame(daemon, policy)
+                    assert next_page_id == page_id
+                    assert hashlib.sha256(next_pixels).digest() != catalog_hash
+                    assert await page.title() == ""
+                    assert await page.locator("h1").inner_text() == "Product details"
             except RecordingCaptureDenied:
-                assert mode not in {"allowed", "timer"}
+                assert mode not in {"allowed", "timer", "text-input", "search-input", "textarea", "catalog-transition"}
                 assert count == (1 if mode in {"navigation-race", "dom-race"} else 0), (mode,count)
             except asyncio.CancelledError:
                 assert mode == "timer-cancel"
@@ -122,6 +142,13 @@ asyncio.run(main())
     "mode",
     [
         "allowed",
+        "catalog-transition",
+        "text-input",
+        "search-input",
+        "textarea",
+        "file-input",
+        "autocomplete",
+        "open-shadow",
         "timer",
         "timer-cancel",
         "password",

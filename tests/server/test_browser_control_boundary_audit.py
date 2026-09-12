@@ -120,17 +120,23 @@ def test_audit_warning_capture_preserves_earlier_connection_finalizers():
 
     earlier = sqlite3.connect(":memory:", factory=CyclicConnection)
     earlier.cycle = earlier
+    earlier_identity = repr(earlier)
     with pytest.warns(ResourceWarning, match="unclosed database") as unrelated:
         with scenario_warning_capture() as captured:
             del earlier
             current = sqlite3.connect(":memory:", factory=CyclicConnection)
             current.cycle = current
+            current_identity = repr(current)
             del current
             gc.collect()
         gc.collect()
     assert len(captured) == 1
     assert "unclosed database" in captured[0]
-    assert len(unrelated) == 1
+    assert current_identity in captured[0]
+    # Other threads may finalize unrelated resources during this scope. Check
+    # the connection owned by this test without claiming their warning count.
+    assert sum(earlier_identity in str(item.message) for item in unrelated) == 1
+    assert all(current_identity not in str(item.message) for item in unrelated)
 
 
 @asynccontextmanager
