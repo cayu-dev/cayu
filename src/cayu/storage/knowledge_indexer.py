@@ -9,8 +9,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
-    copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
     copy_label_map,
     require_clean_nonblank,
     require_durable_text,
@@ -89,7 +89,7 @@ class KnowledgeIndexRequest(BaseModel):
     @field_validator("metadata", "chunk_metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_durable_json_object(value, info.field_name)
+        return copy_durable_metadata(value, info.field_name)
 
     @field_validator("namespace", "kind", "created_by")
     @classmethod
@@ -391,8 +391,8 @@ def copy_knowledge_index_request(request: KnowledgeIndexRequest) -> KnowledgeInd
         confidence=request.confidence,
         expires_at=request.expires_at,
         title=request.title,
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
-        chunk_metadata=copy_durable_json_object(request.chunk_metadata, "chunk_metadata"),
+        metadata=copy_durable_metadata(request.metadata, "metadata"),
+        chunk_metadata=copy_durable_metadata(request.chunk_metadata, "chunk_metadata"),
         entry_text_max_bytes=request.entry_text_max_bytes,
         chunk_target_bytes=request.chunk_target_bytes,
         chunk_overlap_bytes=request.chunk_overlap_bytes,

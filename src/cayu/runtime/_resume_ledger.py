@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_durable_metadata, copy_json_value
 from cayu.core.events import Event, EventType
 from cayu.core.tools import _bound_policy_denial_text
 from cayu.runtime import _runtime_records as runtime_records
@@ -287,7 +287,7 @@ def policy_result_from_pending_tool_call(
         decision=ToolPolicyDecision(pending_tool_call.policy_decision),
         reason=pending_tool_call.reason,
         command_denial_code=pending_tool_call.command_denial_code,
-        metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
+        metadata=copy_durable_metadata(pending_tool_call.metadata),
     )
 
 

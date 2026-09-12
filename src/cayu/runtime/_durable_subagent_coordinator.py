@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
-from cayu._validation import canonical_durable_json_bytes, copy_json_value
+from cayu._validation import canonical_durable_json_bytes, copy_durable_metadata, copy_json_value
 from cayu.core.events import Event
 from cayu.core.tools import ToolContext, ToolResult, _runtime_tool_invocation_authority
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -306,7 +306,7 @@ class DurableSubagentCoordinator:
             task_type=self.dispatcher.prepared_subagent_task_type,
             dispatch_id=dispatch_id,
         )
-        metadata = copy_json_value(request.metadata, "durable_subagent.metadata")
+        metadata = copy_durable_metadata(request.metadata, "durable_subagent.metadata")
         subagent_metadata = metadata.get("subagent")
         if type(subagent_metadata) is not dict:
             raise ValueError("Durable subagent request has no subagent identity metadata.")

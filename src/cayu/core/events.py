@@ -6,10 +6,13 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from cayu._validation import (
-    copy_durable_json_value,
+    DURABLE_DOCUMENT_LIMITS,
+    DURABLE_EVENT_LIMITS,
+    copy_durable_record,
+    inspect_bounded_durable_json,
     require_durable_clean_nonblank,
 )
 
@@ -284,6 +287,14 @@ class Event(BaseModel):
         self._runtime_generated_id = self.id if self._id_origin == "runtime" else None
         self._payload_validation_stamp = _durable_payload_stamp(self.payload)
 
+    @model_validator(mode="after")
+    def validate_durable_envelope(self) -> Event:
+        # Unpublished candidates can retain pre-hook content in a bounded
+        # checkpoint. Store/writer/SSE admission separately applies the smaller
+        # full event-envelope ceiling; candidate validity is not publication.
+        _validate_event_candidate(self)
+        return self
+
     def __eq__(self, other: object) -> bool:
         """Compare only public durable fields, never private projection metadata."""
 
@@ -316,7 +327,7 @@ class Event(BaseModel):
     @field_validator("payload", mode="before")
     @classmethod
     def copy_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_value(value, "payload")
+        return copy_durable_record(value, "payload", limits=DURABLE_DOCUMENT_LIMITS)
 
     @field_validator("session_id", "id")
     @classmethod
@@ -354,6 +365,47 @@ class Event(BaseModel):
         return _validate_custom_event_type(value)
 
 
+def event_durable_envelope(event: Event) -> dict[str, Any]:
+    """One explicit envelope, including every durable correlation field."""
+
+    return {
+        "id": event.id,
+        "type": str(event.type),
+        "session_id": event.session_id,
+        "interaction_id": event.interaction_id,
+        "timestamp": event.timestamp.isoformat(),
+        "agent_name": event.agent_name,
+        "environment_name": event.environment_name,
+        "workflow_name": event.workflow_name,
+        "tool_name": event.tool_name,
+        "payload": event.payload,
+    }
+
+
+def validate_event_envelope(event: Event) -> None:
+    inspect_bounded_durable_json(
+        event_durable_envelope(event),
+        "event",
+        max_bytes=DURABLE_EVENT_LIMITS.max_bytes,
+        max_nodes=DURABLE_EVENT_LIMITS.max_nodes,
+        max_nesting=DURABLE_EVENT_LIMITS.max_nesting,
+        canonical_numbers=False,
+    )
+
+
+def _validate_event_candidate(event: Event) -> None:
+    """Bound private preparation without admitting the candidate for publication."""
+
+    inspect_bounded_durable_json(
+        event_durable_envelope(event),
+        "event",
+        max_bytes=DURABLE_DOCUMENT_LIMITS.max_bytes,
+        max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
+        max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
+        canonical_numbers=False,
+    )
+
+
 def copy_event(event: Event) -> Event:
     if type(event) is not Event:
         raise TypeError("Events must be Event instances.")
@@ -364,7 +416,7 @@ def copy_event(event: Event) -> Event:
         )
     except _PayloadStampMismatch:
         payload_is_unchanged = False
-        payload = copy_durable_json_value(event.payload, "payload")
+        payload = copy_durable_record(event.payload, "payload", limits=DURABLE_DOCUMENT_LIMITS)
     else:
         payload_is_unchanged = True
     copied = Event(
@@ -384,6 +436,7 @@ def copy_event(event: Event) -> Event:
     )
     if payload_is_unchanged:
         copied.payload = payload
+        _validate_event_candidate(copied)
         copied._payload_validation_stamp = _durable_payload_stamp(payload)
     copied._id_origin = event._id_origin
     copied._runtime_generated_id = event._runtime_generated_id

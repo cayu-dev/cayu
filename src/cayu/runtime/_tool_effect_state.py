@@ -30,6 +30,7 @@ from cayu._task_wait import (
 from cayu._validation import (
     canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
+    copy_bounded_durable_json_value,
     copy_durable_json_object,
 )
 from cayu.core.events import Event, EventType, copy_event
@@ -197,6 +198,20 @@ class ToolEffectReconciliationAttempt(BaseModel):
     lookup: bool = Field(strict=True)
 
 
+def _copy_unverified_output(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if type(value) is not dict:
+        raise TypeError("Unverified output must be an object.")
+    return copy_bounded_durable_json_value(
+        value,
+        "unverified_output",
+        max_bytes=16 * 1024,
+        max_nodes=512,
+        max_nesting=20,
+    )
+
+
 class ToolEffectRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -210,7 +225,14 @@ class ToolEffectRecord(BaseModel):
     reconciliation_attempt: ToolEffectReconciliationAttempt | None = None
     resource_versions: dict[str, str] = Field(default_factory=dict)
     child_recovery_arguments: dict[str, Any] | None = Field(default=None, repr=False)
+    # Diagnostic output is never a validated receipt or permission to replay.
+    unverified_output: dict[str, Any] | None = Field(default=None, repr=False)
     publication_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("unverified_output", mode="before")
+    @classmethod
+    def detach_unverified_output(cls, value):
+        return _copy_unverified_output(value)
 
     @field_validator("child_recovery_arguments", mode="before")
     @classmethod
@@ -226,6 +248,8 @@ class ToolEffectRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_state(self) -> ToolEffectRecord:
+        if self.unverified_output is not None and self.dispatch_id is None:
+            raise ValueError("Unverified output requires a consumed effect dispatch.")
         if self.child_recovery_arguments is not None and (
             sha256(
                 canonical_durable_json_bytes(
@@ -448,6 +472,7 @@ class ToolEffectStateOwner:
         tool_round_id: str,
         tool_call_ids: tuple[str, ...],
         failure_evidence: FailureEvidence | None = None,
+        unverified_output: dict[str, Any] | None = None,
     ) -> bool:
         """Fence consumed calls before any generic interrupted-round synthesis.
 
@@ -456,6 +481,9 @@ class ToolEffectStateOwner:
         Only consumed, nonterminal calls become unknown.
         The returned boolean reports unresolved work; it is not replay authority.
         """
+        unverified_output = _copy_unverified_output(unverified_output)
+        if unverified_output is not None and len(tool_call_ids) != 1:
+            raise ToolEffectConflict("Output evidence requires one exact effect call.")
         unresolved = False
         for call_id in tool_call_ids:
             record = await self.resolve_call(
@@ -463,12 +491,19 @@ class ToolEffectStateOwner:
             )
             if record is None or record.state not in {"prepared", "executing", "outcome_unknown"}:
                 continue
+            if (
+                record.state == "outcome_unknown"
+                and unverified_output is not None
+                and record.unverified_output != unverified_output
+            ):
+                raise ToolEffectConflict("Output evidence conflicts with the retained dispatch.")
             if record.state == "executing":
                 await self.transition(
                     record,
                     state="outcome_unknown",
                     run_epoch=session.run_epoch,
                     failure_evidence=failure_evidence,
+                    unverified_output=unverified_output,
                 )
             unresolved = True
         return unresolved
@@ -594,6 +629,7 @@ class ToolEffectStateOwner:
         mutation: RuntimePublicationMutation | None = None,
         events: tuple[Event, ...] = (),
         failure_evidence: FailureEvidence | None = None,
+        unverified_output: dict[str, Any] | None = None,
     ) -> ToolEffectRecord:
         expected = _copy_model(expected, ToolEffectRecord)
         if state not in _NEXT.get(expected.state, frozenset()):
@@ -631,6 +667,7 @@ class ToolEffectStateOwner:
             mutation=RuntimePublicationMutation() if mutation is None else mutation,
             events=events,
             failure_evidence=failure_evidence,
+            unverified_output=unverified_output,
         )
 
     async def _publish(
@@ -647,12 +684,18 @@ class ToolEffectStateOwner:
         observation: ToolEffectObservation | None = None,
         reconciliation_attempt: ToolEffectReconciliationAttempt | None = None,
         failure_evidence: FailureEvidence | None = None,
+        unverified_output: dict[str, Any] | None = None,
         child_recovery_arguments: dict[str, Any] | None = None,
     ) -> ToolEffectRecord:
         if type(run_epoch) is not int or run_epoch < 0:
             raise ValueError("Effect publication requires an exact run epoch.")
         mutation = RuntimePublicationMutation(operations=mutation.operations)
         events = tuple(copy_event(event) for event in events)
+        unverified_output = _copy_unverified_output(unverified_output)
+        if unverified_output is not None and (
+            expected is None or expected.state != "executing" or state != "outcome_unknown"
+        ):
+            raise ToolEffectConflict("Output evidence does not match the uncertain dispatch.")
         if failure_evidence is not None:
             failure_evidence = _copy_model(failure_evidence, FailureEvidence)
             if (
@@ -676,6 +719,11 @@ class ToolEffectStateOwner:
                     payload={
                         "schema_version": 1,
                         "state": "outcome_unknown",
+                        **(
+                            {"unverified_output": unverified_output}
+                            if unverified_output is not None
+                            else {}
+                        ),
                         **(
                             {"failure_evidence": failure_evidence.model_dump(mode="json")}
                             if failure_evidence is not None
@@ -729,7 +777,10 @@ class ToolEffectStateOwner:
             if child_recovery_arguments is None
             else copy_durable_json_object(child_recovery_arguments, "child_recovery_arguments")
         )
+        if unverified_output is None and expected is not None:
+            unverified_output = expected.unverified_output
         material = {
+            "unverified_output": unverified_output,
             "intent": intent.model_dump(mode="json"),
             "state": state,
             "dispatch_id": dispatch_id,
@@ -820,6 +871,7 @@ class ToolEffectStateOwner:
             child_recovery_arguments=child_recovery_arguments,
             reconciliation_attempt=reconciliation_attempt,
             publication_digest=_digest(material),
+            unverified_output=unverified_output,
         )
         operation = asyncio.create_task(
             capture_awaitable_outcome(

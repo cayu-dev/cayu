@@ -6,7 +6,6 @@ from cayu.core import Event, EventType, Message
 from cayu.runtime import RunRequest, SessionIdentity, SessionStatus, SessionStore
 from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
-    MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PendingActionKind,
     PendingActionQuery,
@@ -1167,88 +1166,6 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
     assert len(reused.actions) == 1
     assert reused.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
     assert reused.issues == []
-
-    # An oversized event still retains a bounded execution identity. Reusing
-    # the provider call id in a later round must therefore exclude the stale
-    # event before its size can suppress the current recovery action.
-    oversized_reused_call_id = "conformance_oversized_reused_call"
-    oversized_reused_round_id = f"tround_{'e' * 32}"
-    await create(
-        "conformance_oversized_reused_call_identity",
-        status=SessionStatus.FAILED,
-        events=[
-            Event(
-                id="conformance_oversized_old_started",
-                type=EventType.TOOL_CALL_STARTED,
-                session_id="conformance_oversized_reused_call_identity",
-                tool_name="charge",
-                payload={
-                    **old_identity,
-                    "tool_call_id": oversized_reused_call_id,
-                    "arguments": {},
-                    "manual_recovery": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
-                },
-            ),
-            Event(
-                id="conformance_oversized_current_started",
-                type=EventType.TOOL_CALL_STARTED,
-                session_id="conformance_oversized_reused_call_identity",
-                tool_name="charge",
-                payload={
-                    **_tool_round_identity_payload(oversized_reused_round_id),
-                    "tool_call_id": oversized_reused_call_id,
-                    "arguments": {},
-                },
-            ),
-        ],
-        checkpoint=_round_checkpoint(
-            oversized_reused_round_id,
-            oversized_reused_call_id,
-        ),
-    )
-    oversized_reused = await store.query_pending_actions(
-        PendingActionQuery(session_id="conformance_oversized_reused_call_identity")
-    )
-    assert len(oversized_reused.actions) == 1
-    assert oversized_reused.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
-    assert oversized_reused.actions[0].tool_call_id == oversized_reused_call_id
-    assert oversized_reused.issues == []
-
-    # The same bounded envelope keeps oversized evidence for the active round
-    # visible as an explicit issue instead of silently treating the call as
-    # never started.
-    oversized_current_call_id = "conformance_oversized_current_call"
-    oversized_current_round_id = f"tround_{'f' * 32}"
-    await create(
-        "conformance_oversized_current_identity",
-        status=SessionStatus.FAILED,
-        events=[
-            Event(
-                id="conformance_oversized_current_identity_started",
-                type=EventType.TOOL_CALL_STARTED,
-                session_id="conformance_oversized_current_identity",
-                tool_name="charge",
-                payload={
-                    **_tool_round_identity_payload(oversized_current_round_id),
-                    "tool_call_id": oversized_current_call_id,
-                    "arguments": {},
-                    "manual_recovery": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
-                },
-            )
-        ],
-        checkpoint=_round_checkpoint(
-            oversized_current_round_id,
-            oversized_current_call_id,
-        ),
-    )
-    oversized_current = await store.query_pending_actions(
-        PendingActionQuery(session_id="conformance_oversized_current_identity")
-    )
-    assert oversized_current.actions == []
-    assert [issue.session_id for issue in oversized_current.issues] == [
-        "conformance_oversized_current_identity"
-    ]
-    assert oversized_current.issues[0].code == "source_too_large"
 
     # Current-identity evidence remains bounded even when durable history is
     # corrupted or adversarial. The query fails closed without materializing an

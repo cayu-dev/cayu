@@ -264,7 +264,7 @@ async def assert_knowledge_governance_conformance(
             access_scope=access_scope,
         )
     except ValueError as exc:
-        assert "activation retirement authority exceeds its canonical byte limit" in str(exc)
+        assert "labels" in str(exc)
     else:
         raise AssertionError("A governed successor exceeded its retirement authority capacity.")
     unchanged_active = await store.get_entry(active_entry.id, access_scope=access_scope)

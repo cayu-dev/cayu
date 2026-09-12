@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from cayu._validation import json_utf8_size_within_limit, require_clean_nonblank
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event
+from cayu._validation import (
+    DURABLE_EVENT_LIMITS,
+    DurableValueError,
+    inspect_bounded_durable_json,
+    require_clean_nonblank,
+)
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, validate_event_envelope
 
-SSE_EVENT_DATA_MAX_BYTES = 2 * 1024 * 1024
+SSE_EVENT_DATA_MAX_BYTES = DURABLE_EVENT_LIMITS.max_bytes
 SSE_ERROR_TEXT_MAX_BYTES = 512
 SSE_ERROR_TYPE_MAX_BYTES = 128
 SSE_ERROR_SESSION_ID_MAX_BYTES = 512
@@ -84,7 +89,8 @@ def _event_to_sse_payload(event: Event) -> dict[str, Any]:
 
 def event_to_sse_data(event: Event) -> str:
     """Serialize a runtime Event to a compact JSON string for SSE."""
-    return json.dumps(_event_to_sse_payload(event), separators=(",", ":"))
+    validate_event_envelope(event)
+    return json.dumps(_event_to_sse_payload(event), separators=(",", ":"), ensure_ascii=False)
 
 
 def sse_event_id(event: Event) -> str:
@@ -111,12 +117,23 @@ def event_to_sse_message(
     if type(max_data_bytes) is not int or max_data_bytes <= 0:
         raise ValueError("max_data_bytes must be a positive integer.")
     payload = _event_to_sse_payload(event)
-    if not json_utf8_size_within_limit(payload, max_data_bytes, ensure_ascii=True):
+    try:
+        inspect_bounded_durable_json(
+            payload,
+            "event",
+            max_bytes=max_data_bytes,
+            max_nodes=DURABLE_EVENT_LIMITS.max_nodes,
+            max_nesting=DURABLE_EVENT_LIMITS.max_nesting,
+            canonical_numbers=False,
+        )
+    except DurableValueError as exc:
+        if exc.code != "json_value_too_large":
+            raise
         raise SseEventFrameTooLargeError(
             session_id=event.session_id,
             max_bytes=max_data_bytes,
-        )
-    data = json.dumps(payload, separators=(",", ":"))
+        ) from None
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     actual_bytes = len(data.encode("utf-8"))
     # Defensive verification keeps the wire ceiling authoritative if JSON
     # encoding behavior ever diverges from the allocation-free preflight.

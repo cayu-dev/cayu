@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import pickle
 from copy import deepcopy
 from datetime import date
 from decimal import Decimal
@@ -19,7 +20,9 @@ from cayu._validation import (
     DurableValueError,
     JsonUtf8SizeCounter,
     canonical_durable_json_bytes,
+    copy_bounded_durable_json_value,
     copy_durable_json_value,
+    inspect_bounded_durable_json,
     json_utf8_size_within_limit,
 )
 
@@ -47,6 +50,36 @@ _DURABLE_VALUES = st.recursive(
     ),
     max_leaves=30,
 )
+
+
+@pytest.mark.parametrize("suffix", ["\x00", "\ud800"])
+@pytest.mark.parametrize("as_key", [False, True])
+def test_bounded_json_stops_before_invalid_text_beyond_byte_limit(
+    suffix: str, as_key: bool
+) -> None:
+    text = "x" * 1000 + suffix
+    value = {text: None} if as_key else text
+    with pytest.raises(DurableValueError) as caught:
+        copy_bounded_durable_json_value(value, "record", max_bytes=32, max_nodes=10)
+    assert caught.value.code == "json_value_too_large"
+
+
+@pytest.mark.parametrize(
+    ("text", "code"), [("\x00", "nul_character"), ("\ud800", "unicode_surrogate")]
+)
+def test_bounded_json_rejects_invalid_text_within_byte_limit(text: str, code: str) -> None:
+    with pytest.raises(DurableValueError) as caught:
+        copy_bounded_durable_json_value(text, "record", max_bytes=32, max_nodes=10)
+    assert caught.value.code == code
+
+
+@pytest.mark.parametrize("text", ["ascii", "é", "€", "😀", "\n", '"', "\\"])
+def test_bounded_json_text_exact_utf8_limit(text: str) -> None:
+    size = len(json.dumps(text, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    assert copy_bounded_durable_json_value(text, "record", max_bytes=size, max_nodes=1) == text
+    with pytest.raises(DurableValueError) as caught:
+        copy_bounded_durable_json_value(text, "record", max_bytes=size - 1, max_nodes=1)
+    assert caught.value.code == "json_value_too_large"
 
 
 def test_json_utf8_size_counter_supports_dates() -> None:
@@ -113,6 +146,40 @@ def test_durable_values_round_trip_portably_and_are_defensively_copied(value: An
     elif type(source) is dict:
         source["mutation_probe"] = "mutated"
         assert copied != source
+
+
+@settings(max_examples=250, deadline=None)
+@given(_DURABLE_VALUES)
+def test_bounded_copy_matches_canonical_copy_and_detaches(value: Any) -> None:
+    expected = copy_durable_json_value(value, "record")
+    size = len(canonical_durable_json_bytes(expected, "record"))
+    copied = copy_bounded_durable_json_value(value, "record", max_bytes=size, max_nodes=1000)
+    assert copied == expected
+    inspect_bounded_durable_json(value, "record", max_bytes=size, max_nodes=1000)
+    if type(value) is list:
+        value.append("mutation")
+        assert copied == expected
+    elif type(value) is dict:
+        value["mutation"] = True
+        assert copied == expected
+    with pytest.raises(DurableValueError) as caught:
+        copy_bounded_durable_json_value(expected, "record", max_bytes=size - 1, max_nodes=1000)
+    assert caught.value.dimension == "bytes"
+    assert caught.value.limit == size - 1
+    assert caught.value.observed_lower_bound >= size
+
+
+@pytest.mark.parametrize("is_object", [False, True])
+def test_bounded_container_cardinality_reports_content_free_limits(is_object: bool) -> None:
+    value = {"private-key": None, "other": None} if is_object else [None, None]
+    limits = {"max_object_entries": 1} if is_object else {"max_array_entries": 1}
+    with pytest.raises(DurableValueError) as caught:
+        copy_bounded_durable_json_value(value, "record", max_bytes=100, max_nodes=10, **limits)
+    error = pickle.loads(pickle.dumps(caught.value))
+    assert error.dimension == "entries"
+    assert error.limit == 1
+    assert error.observed_lower_bound == 2
+    assert "private-key" not in str(error)
 
 
 @settings(max_examples=80, deadline=None)

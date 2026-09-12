@@ -17,7 +17,9 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    DURABLE_DOCUMENT_LIMITS,
     copy_durable_json_value,
+    inspect_bounded_durable_json,
     require_durable_clean_nonblank,
     require_durable_nonblank,
     require_durable_text,
@@ -512,6 +514,16 @@ class Message(BaseModel):
             )
         elif self.role == MessageRole.TOOL:
             _require_parts(self.role, self.content, ToolResultPart)
+        inspect_bounded_durable_json(
+            self,
+            "transcript.message",
+            max_bytes=DURABLE_DOCUMENT_LIMITS.max_bytes,
+            max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
+            max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
+            canonical_numbers=False,
+            allow_models=True,
+            allow_tuples=True,
+        )
         return self
 
     @classmethod

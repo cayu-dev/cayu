@@ -8,7 +8,11 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._command_diagnostics import COMMAND_DENIAL_HINTS
-from cayu._validation import copy_durable_json_value, require_durable_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    copy_durable_metadata,
+    require_durable_clean_nonblank,
+)
 from cayu.core.events import (
     Event,
     EventType,
@@ -1293,7 +1297,7 @@ def pending_tool_call_approvals(
                 ),
                 metadata=(
                     (
-                        copy_durable_json_value(policy_result.metadata, "metadata")
+                        copy_durable_metadata(policy_result.metadata, "metadata")
                         if redactor is None
                         else copy_durable_json_value(
                             redactor.redact_json_values(policy_result.metadata),

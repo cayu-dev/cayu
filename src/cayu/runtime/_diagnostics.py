@@ -13,6 +13,7 @@ from cayu._validation import (
     copy_durable_json_object,
     extract_durable_value_error,
     require_durable_text,
+    safe_durable_value_error_bounds,
     safe_durable_value_error_details,
 )
 from cayu.vaults import SecretRedactor
@@ -154,6 +155,8 @@ class ExceptionDiagnostic:
     error_type: str
     durable_value_error_code: str | None = None
     durable_value_error_path: str | None = None
+    durable_value_error_limit: int | None = None
+    durable_value_error_observed_lower_bound: int | None = None
 
     def payload_fields(
         self,
@@ -171,6 +174,12 @@ class ExceptionDiagnostic:
         if self.durable_value_error_code is not None:
             fields[f"{detail_prefix}durable_value_error_code"] = self.durable_value_error_code
             fields[f"{detail_prefix}durable_value_error_path"] = self.durable_value_error_path
+            if self.durable_value_error_limit is not None:
+                fields[f"{detail_prefix}durable_value_error_limit"] = self.durable_value_error_limit
+                if self.durable_value_error_observed_lower_bound is not None:
+                    fields[f"{detail_prefix}durable_value_error_observed_lower_bound"] = (
+                        self.durable_value_error_observed_lower_bound
+                    )
         return fields
 
 
@@ -340,6 +349,7 @@ def exception_diagnostic(
     durable_error = extract_durable_value_error(exc)
     if durable_error is not None:
         code, path = safe_durable_value_error_details(durable_error)
+        limit, observed = safe_durable_value_error_bounds(durable_error)
         return ExceptionDiagnostic(
             message=resolved_redactor.redact_text_bounded(
                 nonportable_message,
@@ -348,6 +358,8 @@ def exception_diagnostic(
             error_type=error_type,
             durable_value_error_code=code,
             durable_value_error_path=path,
+            durable_value_error_limit=limit,
+            durable_value_error_observed_lower_bound=observed,
         )
     rendering_failed = False
     try:
@@ -361,8 +373,10 @@ def exception_diagnostic(
         except BaseException as validation_error:
             durable_error = extract_durable_value_error(validation_error)
             code = path = None
+            limit = observed = None
             if durable_error is not None:
                 code, path = safe_durable_value_error_details(durable_error)
+                limit, observed = safe_durable_value_error_bounds(durable_error)
             return ExceptionDiagnostic(
                 message=resolved_redactor.redact_text_bounded(
                     nonportable_message,
@@ -371,6 +385,8 @@ def exception_diagnostic(
                 error_type=error_type,
                 durable_value_error_code=code,
                 durable_value_error_path=path,
+                durable_value_error_limit=limit,
+                durable_value_error_observed_lower_bound=observed,
             )
         message = rendered
     elif preserve_empty_message and not rendering_failed:

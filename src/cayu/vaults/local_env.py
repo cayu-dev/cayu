@@ -8,6 +8,7 @@ from pydantic import SecretStr
 
 from cayu._validation import (
     copy_durable_json_object,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_nonblank,
 )
@@ -44,7 +45,7 @@ class LocalEnvVault(Vault):
                     raise ValueError(f"Metadata provided for unknown secret: {secret_name}")
                 if not isinstance(value, Mapping):
                     raise TypeError("LocalEnvVault metadata values must be mappings.")
-                self._metadata[secret_name] = copy_durable_json_object(
+                self._metadata[secret_name] = copy_durable_metadata(
                     dict(value),
                     "metadata",
                 )
@@ -92,7 +93,7 @@ class LocalEnvVault(Vault):
         name: str,
         scope: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        metadata = copy_durable_json_object(self._metadata.get(name, {}), "metadata")
+        metadata = copy_durable_metadata(self._metadata.get(name, {}), "metadata")
         if scope:
             metadata["scope"] = copy_durable_json_object(scope, "scope")
-        return metadata
+        return copy_durable_metadata(metadata, "metadata")

@@ -18,6 +18,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 from cayu._command_diagnostics import CommandDenialCode
 from cayu._validation import (
     copy_durable_json_value,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
@@ -218,7 +219,7 @@ class ToolApprovalRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_value(value, "metadata")
+        return copy_durable_metadata(value)
 
     @field_validator("resolved_by")
     @classmethod
@@ -332,6 +333,8 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
@@ -454,6 +457,8 @@ class PendingToolCallApproval(BaseModel):
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_value(value, info.field_name)
 
     @model_validator(mode="after")
@@ -646,6 +651,8 @@ class PendingToolApproval(BaseModel):
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output")
@@ -707,6 +714,8 @@ class PendingToolCallApprovalEventView(BaseModel):
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any] | None, info):
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         if value is None:
             return None
         return copy_durable_json_value(value, info.field_name)
@@ -763,6 +772,8 @@ class PendingToolApprovalEventView(BaseModel):
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any] | None, info):
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         if value is None:
             return None
         return copy_durable_json_value(value, info.field_name)
@@ -920,7 +931,7 @@ def _copy_approval_resume_fields(
         "task_worker_id": request.task_worker_id,
         "task_handoff_id": request.task_handoff_id,
         "reason": request.reason,
-        "metadata": copy_durable_json_value(request.metadata, "metadata"),
+        "metadata": copy_durable_metadata(request.metadata),
         "resolved_by": copy_resolution_actor(request.resolved_by),
         "max_steps": request.max_steps,
         "limits": copy_run_limits(request.limits) if request.limits is not None else None,
@@ -999,7 +1010,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         publish_arguments=approval.publish_arguments,
         secret_resolution_scope=approval.secret_resolution_scope,
         reason=approval.reason,
-        metadata=copy_durable_json_value(approval.metadata, "metadata"),
+        metadata=copy_durable_metadata(approval.metadata),
         tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
         structured_output=copy_structured_output_spec(approval.structured_output),
         thinking=approval.thinking,
@@ -1033,7 +1044,7 @@ def copy_pending_tool_call_approval(
         policy_decision=call.policy_decision,
         command_denial_code=call.command_denial_code,
         reason=call.reason,
-        metadata=copy_durable_json_value(call.metadata, "metadata"),
+        metadata=copy_durable_metadata(call.metadata),
         active_taint_labels=list(call.active_taint_labels),
     )
 

@@ -64,6 +64,12 @@ _PRIORITY_EVIDENCE_KEYS = (
     "effect",
     "outcome",
     "status",
+    "projection_evidence",
+    # ToolResult wrappers contain reconciliation evidence below these fields.
+    # Preserve it before spending the evidence budget on display content, also
+    # when a later redaction/copy pass has changed object insertion order.
+    "structured",
+    "artifacts",
 )
 _TERMINAL_OUTCOMES = frozenset(
     {
@@ -80,6 +86,8 @@ _RUNTIME_TERMINAL_CONTROL_FIELDS = frozenset(
         "manual_reconciliation_required",
         "durable_value_error_code",
         "durable_value_error_path",
+        "durable_value_error_limit",
+        "durable_value_error_observed_lower_bound",
         "isolated_tool_failure_code",
         "isolated_tool_cleanup_failure_code",
         "tool_execution_boundary",
@@ -738,8 +746,18 @@ def terminal_failure_result(
     if diagnostic is not None and diagnostic.durable_value_error_code is not None:
         controls["durable_value_error_code"] = diagnostic.durable_value_error_code
         controls["durable_value_error_path"] = diagnostic.durable_value_error_path
+        if diagnostic.durable_value_error_limit is not None:
+            controls["durable_value_error_limit"] = diagnostic.durable_value_error_limit
+            controls["durable_value_error_observed_lower_bound"] = (
+                diagnostic.durable_value_error_observed_lower_bound
+            )
         structured["durable_value_error_code"] = diagnostic.durable_value_error_code
         structured["durable_value_error_path"] = diagnostic.durable_value_error_path
+        if diagnostic.durable_value_error_limit is not None:
+            structured["durable_value_error_limit"] = diagnostic.durable_value_error_limit
+            structured["durable_value_error_observed_lower_bound"] = (
+                diagnostic.durable_value_error_observed_lower_bound
+            )
     if raw_evidence is not _NO_EVIDENCE:
         evidence = portable_result_evidence(raw_evidence, redactor=redactor)
         if evidence.included:

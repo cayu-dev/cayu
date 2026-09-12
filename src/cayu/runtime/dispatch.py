@@ -30,7 +30,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
-    copy_durable_json_value,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
@@ -296,7 +296,7 @@ class DispatchRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_value(value, "metadata")
+        return copy_durable_metadata(value)
 
     @field_validator("structured_output")
     @classmethod
@@ -375,7 +375,7 @@ class DispatchHandle(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_handle_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_value(value, "metadata")
+        return copy_durable_metadata(value)
 
     @field_validator("dispatch_id", "session_id", "backend", "task_id")
     @classmethod
@@ -3026,7 +3026,7 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
             if request.profile_adoption is None
             else copy_execution_profile_adoption_intent(request.profile_adoption)
         ),
-        metadata=copy_durable_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
@@ -3810,7 +3810,7 @@ def copy_dispatch_handle(handle: DispatchHandle) -> DispatchHandle:
         task_id=handle.task_id,
         backend=handle.backend,
         status=handle.status,
-        metadata=copy_durable_json_value(handle.metadata, "metadata"),
+        metadata=copy_durable_metadata(handle.metadata),
     )
 
 

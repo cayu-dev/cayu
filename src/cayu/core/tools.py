@@ -29,6 +29,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
     freeze_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -1173,7 +1174,7 @@ class ToolContext(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("session_id")
     @classmethod

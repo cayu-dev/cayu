@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cayu._command_diagnostics import CommandDenialCode
 from cayu._validation import (
     copy_durable_json_value,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_durable_clean_nonblank,
     require_durable_nonblank,
@@ -117,7 +118,7 @@ class ToolPolicyResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_value(value, "metadata")
+        return copy_durable_metadata(value)
 
     @field_validator("approval_expires_in_seconds", mode="before")
     @classmethod
@@ -598,7 +599,7 @@ def metadata_with_taint_labels(
     metadata: Mapping[str, Any],
     labels: Iterable[str],
 ) -> dict[str, Any]:
-    copied = copy_durable_json_value(dict(metadata), "metadata")
+    copied = copy_durable_metadata(dict(metadata))
     copied[TAINT_LABELS_METADATA_KEY] = sorted(
         _copy_taint_labels(labels, "labels", allow_any=False)
     )

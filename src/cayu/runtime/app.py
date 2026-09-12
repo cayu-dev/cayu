@@ -21,6 +21,7 @@ from uuid import uuid4
 from cayu._knowledge_publication_owner import KnowledgePublicationLifecycle
 from cayu._validation import (
     canonical_durable_json_bytes,
+    copy_durable_metadata,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
@@ -8832,7 +8833,7 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
         system_prompt=spec.system_prompt,
         workflow_tool_names=spec.workflow_tool_names,
         authoring_state=spec.authoring_state,
-        metadata=copy_json_value(spec.metadata, "metadata"),
+        metadata=copy_durable_metadata(spec.metadata),
         provider_options=copy_json_value(spec.provider_options, "provider_options"),
         thinking=spec.thinking,
     )
@@ -8849,7 +8850,7 @@ def _validate_environment_spec(
         raise ValueError("`name` must be a string.")
     return EnvironmentSpec(
         name=spec.name,
-        metadata=copy_json_value(spec.metadata, "metadata"),
+        metadata=copy_durable_metadata(spec.metadata),
         execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
             spec.execution_profile_identity,
             redactor=redactor,

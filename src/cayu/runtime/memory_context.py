@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import (
     canonical_durable_json_bytes,
+    copy_durable_record,
     copy_json_value,
     require_durable_clean_nonblank,
     require_execution_unit_id,
@@ -1083,7 +1084,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         readiness = readiness.model_copy(deep=True)
         knowledge_sequence = changes.next_after_sequence
         index_readiness_sequence = readiness.next_after_sequence
-        copied = copy_json_value(state, "automatic recall state")
+        copied = copy_durable_record(state, "automatic recall state")
         copied_delta_state = copied["delta_state"]
         copied_delta_state["last_evaluated_model_step_id"] = request.model_step_id
         if (
@@ -1503,7 +1504,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         ):
             return state, None
 
-        copied = copy_json_value(state, "automatic recall state")
+        copied = copy_durable_record(state, "automatic recall state")
         copied_delta_state = copied["delta_state"]
         if len(copied_delta_state["deltas"]) >= policy.max_deltas_per_interaction:
             _append_reanchor_refresh_outcome(
@@ -2636,7 +2637,7 @@ def _state_with_runtime_anchor(
     anchor_index: int,
     anchor_digest: str,
 ) -> dict[str, Any]:
-    copied = copy_json_value(state, "automatic recall state")
+    copied = copy_durable_record(state, "automatic recall state")
     anchors = [
         item
         for item in copied["runtime_authored_anchors"]
@@ -3476,7 +3477,7 @@ def _load_automatic_recall_state(
     }:
         return None
     try:
-        copied = copy_json_value(raw, "automatic recall checkpoint")
+        copied = copy_durable_record(raw, "automatic recall checkpoint")
     except (TypeError, ValueError):
         return None
     anchor_index = copied.get("anchor_transcript_index")
@@ -3579,7 +3580,7 @@ def _state_without_original_projections(
     *,
     key: MemoryEvidenceKey,
 ) -> dict[str, Any]:
-    copied = copy_json_value(state, "automatic recall state")
+    copied = copy_durable_record(state, "automatic recall state")
     receipt_document_sha256 = copied.get("receipt_document_sha256")
     if type(receipt_document_sha256) is not str:
         raise ValueError("Automatic recall state lost its receipt-document digest.")
@@ -3663,7 +3664,7 @@ def _expire_reanchor_projections(
         for item in state["delta_state"]["deltas"]
     ):
         return state
-    copied = copy_json_value(state, "automatic recall state")
+    copied = copy_durable_record(state, "automatic recall state")
     changed = False
     for item in copied["delta_state"]["deltas"]:
         trigger = item["trigger"]
@@ -4556,13 +4557,13 @@ def _with_automatic_recall_state(
     checkpoint = (
         {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
         if source is None
-        else copy_json_value(source, "checkpoint")
+        else copy_durable_record(source, "checkpoint")
     )
     previous = checkpoint.get(AUTOMATIC_RECALL_CHECKPOINT_KEY)
     if state is None:
         checkpoint.pop(AUTOMATIC_RECALL_CHECKPOINT_KEY, None)
     else:
-        checkpoint[AUTOMATIC_RECALL_CHECKPOINT_KEY] = copy_json_value(
+        checkpoint[AUTOMATIC_RECALL_CHECKPOINT_KEY] = copy_durable_record(
             state,
             "automatic recall state",
         )

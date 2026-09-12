@@ -60,7 +60,7 @@ async def _seed(store: SessionStore) -> None:
     mixed_labels = {
         f"{prefix}{index:03d}": "value"
         for prefix in ("-", "A", "a", "Á", "ä", "Ω")
-        for index in range(35)
+        for index in range(33)
     }
     await store.create(
         RunRequest(
@@ -315,9 +315,9 @@ def test_session_commands_have_sqlite_postgres_semantic_parity(
                 name, postgres_payload
             )
             if name == "show":
-                assert sqlite_payload["session"]["label_count"] == 211
-                assert len(sqlite_payload["session"]["labels"]) == 200
-                assert sqlite_payload["session"]["labels_truncated"] is True
+                assert sqlite_payload["session"]["label_count"] == 199
+                assert len(sqlite_payload["session"]["labels"]) == 199
+                assert sqlite_payload["session"]["labels_truncated"] is False
     finally:
         asyncio.run(_drop_postgres_schema(postgres_dsn))
 

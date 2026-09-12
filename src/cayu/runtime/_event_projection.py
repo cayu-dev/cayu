@@ -314,6 +314,8 @@ _TERMINAL_CONTROL_KEYS = frozenset(
         "manual_reconciliation_required",
         "durable_value_error_code",
         "durable_value_error_path",
+        "durable_value_error_limit",
+        "durable_value_error_observed_lower_bound",
         "isolated_tool_failure_code",
         "isolated_tool_cleanup_failure_code",
         "tool_execution_boundary",
@@ -1466,6 +1468,8 @@ _TOOL_RESULT_NESTED_PATHS = frozenset(
         ("result", "structured", "manual_reconciliation_required"),
         ("result", "structured", "durable_value_error_code"),
         ("result", "structured", "durable_value_error_path"),
+        ("result", "structured", "durable_value_error_limit"),
+        ("result", "structured", "durable_value_error_observed_lower_bound"),
         ("result", "structured", "isolated_tool_failure_code"),
         ("result", "structured", "isolated_tool_cleanup_failure_code"),
         ("result", "structured", "tool_execution_boundary"),
@@ -2478,6 +2482,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         for field_name in {
             "durable_value_error_code",
             "durable_value_error_path",
+            "durable_value_error_limit",
+            "durable_value_error_observed_lower_bound",
             "error",
             "error_type",
             "phase",
@@ -2579,6 +2585,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "arguments_exact",
         "durable_value_error_code",
         "durable_value_error_path",
+        "durable_value_error_limit",
+        "durable_value_error_observed_lower_bound",
         "isolated_tool_failure_code",
         "isolated_tool_cleanup_failure_code",
         "manual_reconciliation_required",
@@ -2597,6 +2605,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.TOOL_EFFECT_OUTCOME_UNKNOWN] = _policy(
         "schema_version",
         "failure_evidence",
+        "unverified_output",
         "state",
         "record_revision",
         "intent_digest",
@@ -2608,6 +2617,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "approval_id",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"tool_call_id", "approval_id"},
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
+        untrusted_container_keys={"unverified_output"},
     )
     policies[EventType.TOOL_EFFECT_CLEANUP_OBSERVED] = _policy(
         "schema_version",

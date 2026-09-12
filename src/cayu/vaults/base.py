@@ -8,8 +8,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from cayu._validation import (
-    copy_durable_json_object,
-    copy_json_value,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_nonblank,
 )
@@ -31,7 +30,7 @@ class SecretRef(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("name")
     @classmethod
@@ -58,7 +57,7 @@ class SecretEnv(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("name")
     @classmethod
@@ -77,7 +76,7 @@ def copy_secret_ref(ref: SecretRef) -> SecretRef:
     return SecretRef(
         name=ref.name,
         handle=ref.handle,
-        metadata=copy_durable_json_object(ref.metadata, "metadata"),
+        metadata=copy_durable_metadata(ref.metadata, "metadata"),
     )
 
 
@@ -87,7 +86,7 @@ def copy_secret_env(secret_env: SecretEnv) -> SecretEnv:
     return SecretEnv(
         name=secret_env.name,
         ref=copy_secret_ref(secret_env.ref),
-        metadata=copy_json_value(secret_env.metadata, "metadata"),
+        metadata=copy_durable_metadata(secret_env.metadata, "metadata"),
     )
 
 
@@ -108,7 +107,7 @@ class ResolvedSecret(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("name")
     @classmethod
@@ -128,7 +127,7 @@ def copy_resolved_secret(secret: ResolvedSecret) -> ResolvedSecret:
     return ResolvedSecret(
         name=secret.name,
         value=SecretStr(secret.value.get_secret_value()),
-        metadata=copy_json_value(secret.metadata, "metadata"),
+        metadata=copy_durable_metadata(secret.metadata, "metadata"),
     )
 
 

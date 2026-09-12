@@ -12,6 +12,7 @@ from cayu.core.events import (
     copy_event,
     event_with_durable_sequence,
     event_with_runtime_envelope_authority,
+    validate_event_envelope,
 )
 from cayu.runtime._event_projection import (
     prepare_budget_settlement_event_template,
@@ -587,6 +588,13 @@ class RuntimeEventWriter:
 
     def prepare(self, event: Event) -> Event:
         """Return an event validated for its first durable append."""
+
+        prepared = self.prepare_candidate(event)
+        validate_event_envelope(prepared)
+        return prepared
+
+    def prepare_candidate(self, event: Event) -> Event:
+        """Prepare bounded private state without granting append admission."""
 
         return prepare_new_runtime_event(
             attribute_event_to_current_interaction(event),

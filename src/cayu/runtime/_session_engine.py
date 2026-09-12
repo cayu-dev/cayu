@@ -53,7 +53,10 @@ from cayu._validation import (
     MIN_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_value,
+    copy_durable_metadata,
+    copy_durable_record,
     copy_json_value,
+    copy_session_metadata,
     require_clean_nonblank,
 )
 from cayu.core.billing import (
@@ -1276,7 +1279,7 @@ async def _reconcile_committed_prompt_transition_intents(
     def reconciled_value(current_checkpoint: dict[str, Any] | None) -> dict[str, Any]:
         if current_checkpoint is None:
             raise RuntimeError("Prompt-anatomy transition intent disappeared.")
-        updated = copy_json_value(current_checkpoint, "checkpoint")
+        updated = copy_durable_record(current_checkpoint, "checkpoint")
         current_ledger = _PromptTransitionIntentLedger.from_checkpoint(
             updated,
             required=True,
@@ -1617,7 +1620,7 @@ class _ForkPromptWorkflow:
             source_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any]:
             validated = validate_source_checkpoint(current_source, source_checkpoint)
-            updated = {} if validated is None else copy_json_value(validated, "checkpoint")
+            updated = {} if validated is None else copy_durable_record(validated, "checkpoint")
             intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
                 updated,
                 required=False,
@@ -1682,7 +1685,7 @@ class _ForkPromptWorkflow:
         ) -> dict[str, Any]:
             if source_checkpoint is None:
                 raise RuntimeError("Prompt-anatomy transition intent disappeared.")
-            updated = copy_json_value(source_checkpoint, "checkpoint")
+            updated = copy_durable_record(source_checkpoint, "checkpoint")
             intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
                 updated,
                 required=True,
@@ -2976,7 +2979,7 @@ def _complete_session_operation_checkpoint(
         raise SessionCompactionAttemptSuperseded(
             "Session compaction attempt was superseded before publication."
         )
-    updated = copy_json_value(checkpoint, "checkpoint")
+    updated = copy_durable_record(checkpoint, "checkpoint")
     operations = _session_operation_state(updated)
     record = operations["records"].get(idempotency_key)
     if type(record) is not dict or record.get("operation_id") != operation_id:
@@ -3008,7 +3011,7 @@ def _complete_session_operation_checkpoint(
                 "Session compaction attempt was superseded before publication."
             )
     on_terminalize(claim_expires_at)
-    compacted_state = copy_json_value(compacted_checkpoint, "compacted_checkpoint")
+    compacted_state = copy_durable_record(compacted_checkpoint, "compacted_checkpoint")
     compacted_context = compacted_state.get(_CONTEXT_COMPACTION_OPERATION_KIND)
     if type(compacted_context) is not dict:
         raise ValueError("Compacted checkpoint is missing context compaction state.")
@@ -3050,7 +3053,7 @@ def _renew_session_operation_claim_publication(
         raise SessionCompactionAttemptSuperseded(
             "Session compaction attempt was superseded before claim renewal."
         )
-    updated = copy_json_value(checkpoint, "checkpoint")
+    updated = copy_durable_record(checkpoint, "checkpoint")
     operations = _session_operation_state(updated)
     record = operations["records"].get(idempotency_key)
     if type(record) is not dict or record.get("operation_id") != operation_id:
@@ -3144,7 +3147,7 @@ def _fail_session_operation_checkpoint(
         completed_at = clock()
         if completed_at.tzinfo is None or completed_at.utcoffset() is None:
             raise ValueError("Session compaction failure time must be timezone-aware.")
-        updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        updated = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         operations = _session_operation_state(updated)
         record = operations["records"].get(idempotency_key)
         if type(record) is not dict or record.get("operation_id") != operation_id:
@@ -3991,7 +3994,9 @@ def _checkpoint_with_pending_session_interrupt(
 
     def transform(session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
         transition_payload = copy_json_value(copied_payload, "interrupt_payload")
-        copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint = (
+            {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+        )
         active_profile = active_invocation_execution_profile_from_checkpoint(copied_checkpoint)
         existing_terminal_decision = invocation_terminal_decision_from_checkpoint(copied_checkpoint)
         if active_profile is not None:
@@ -4244,10 +4249,10 @@ def _runtime_interruption_event(
 def _replace_checkpoint_preserving_runtime_state(
     checkpoint: dict[str, Any],
 ):
-    replacement = copy_json_value(checkpoint, "checkpoint")
+    replacement = copy_durable_record(checkpoint, "checkpoint")
 
     def transform(_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
-        updated = copy_json_value(replacement, "checkpoint")
+        updated = copy_durable_record(replacement, "checkpoint")
         updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
         for key, field_name in (
             ("workspace_checkpoints", "workspace_checkpoints"),
@@ -8159,7 +8164,7 @@ class SessionEngine:
                 raise SessionRunFenced(
                     "Status-only interaction transition lost its exact terminal recovery claim."
                 )
-            return copy_json_value(checkpoint, "checkpoint")
+            return copy_durable_record(checkpoint, "checkpoint")
 
         return await self.session_store.transition_status_and_checkpoint(
             session.id,
@@ -12058,7 +12063,7 @@ class SessionEngine:
                 )
             if current_checkpoint is None:
                 return None
-            updated = copy_json_value(current_checkpoint, "checkpoint")
+            updated = copy_durable_record(current_checkpoint, "checkpoint")
             # Recovery authority is scoped to the admission that published it.
             # Retire the predecessor marker in the same session transaction that
             # admits a distinct continuation interaction.
@@ -12307,7 +12312,7 @@ class SessionEngine:
         await self._settle_fork_source_expiring_authority(source.id)
         checkpoint = await self.session_store.load_checkpoint(source.id)
         copied_checkpoint = (
-            None if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            None if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         )
         try:
             _validate_fork_source_checkpoint_state(
@@ -12339,7 +12344,7 @@ class SessionEngine:
                 return None
             if checkpoint is None or _SESSION_OPERATIONS_CHECKPOINT_KEY not in checkpoint:
                 return None
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             operations = _session_operation_state(updated)
             active_before = operations.get("active_operation_id")
             _abandon_expired_session_operation(operations, now=store_now)
@@ -14215,7 +14220,7 @@ class SessionEngine:
                 redactor=self._secret_redactor,
                 allow_active_operation=True,
             )
-            updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            updated = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             operations = _session_operation_state(updated)
             _abandon_expired_session_operation(operations, now=claim_now)
             records = operations["records"]
@@ -14269,7 +14274,7 @@ class SessionEngine:
                     existing["updated_at"] = claim_now.isoformat()
                     existing.pop("abandoned_at", None)
                     updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
-                    claimed_checkpoint = copy_json_value(updated, "checkpoint")
+                    claimed_checkpoint = copy_durable_record(updated, "checkpoint")
                     claimed_operation_expires_at = claim_expires_at
                     archived_records = _archive_inactive_session_operation_records(
                         updated,
@@ -14313,7 +14318,7 @@ class SessionEngine:
                 "updated_at": claim_now.isoformat(),
             }
             updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
-            claimed_checkpoint = copy_json_value(updated, "checkpoint")
+            claimed_checkpoint = copy_durable_record(updated, "checkpoint")
             claimed_operation_expires_at = claim_expires_at
             archived_records = _archive_inactive_session_operation_records(
                 updated,
@@ -16944,7 +16949,7 @@ class SessionEngine:
                 raise SessionCompactionAttemptSuperseded(
                     "Initial compaction claim expired before acknowledgement reconciliation."
                 )
-            observed = (copy_json_value(checkpoint, "checkpoint"), expiry)
+            observed = (copy_durable_record(checkpoint, "checkpoint"), expiry)
             return None
 
         await self.session_store.transform_checkpoint_with_store_time(session.id, inspect)
@@ -19300,7 +19305,7 @@ class SessionEngine:
                     or _SESSION_OPERATIONS_CHECKPOINT_KEY not in current_checkpoint
                 ):
                     return None
-                updated = copy_json_value(current_checkpoint, "checkpoint")
+                updated = copy_durable_record(current_checkpoint, "checkpoint")
                 operations = _session_operation_state(updated)
                 active_before = operations.get("active_operation_id")
                 _abandon_expired_session_operation(operations, now=store_now)
@@ -19330,7 +19335,7 @@ class SessionEngine:
             updated_checkpoint = (
                 None
                 if current_checkpoint is None
-                else copy_json_value(current_checkpoint, "checkpoint")
+                else copy_durable_record(current_checkpoint, "checkpoint")
             )
             if _incomplete_recovery_claim_from_checkpoint(updated_checkpoint) is not None:
                 raise RuntimeError("Session has an active incomplete-session recovery operation.")
@@ -20789,7 +20794,7 @@ class SessionEngine:
                         ) -> dict[str, Any] | None:
                             if current_checkpoint is None:
                                 return None
-                            updated = copy_json_value(current_checkpoint, "checkpoint")
+                            updated = copy_durable_record(current_checkpoint, "checkpoint")
                             current_ledger = _PromptTransitionIntentLedger.from_checkpoint(
                                 updated,
                                 required=False,
@@ -21457,7 +21462,7 @@ class SessionEngine:
             policy=source_registered_agent.tool_policy,
             request_metadata=source_session.metadata,
         )
-        fork_metadata = copy_json_value(request.metadata, "metadata")
+        fork_metadata = copy_durable_metadata(request.metadata)
         if inherited_taint_labels:
             fork_metadata = metadata_with_taint_labels(
                 fork_metadata,
@@ -21506,7 +21511,7 @@ class SessionEngine:
             status=source_session.status,
             invocation=fork_session_invocation(source_session),
             labels=source_session.labels,
-            metadata=copy_json_value(fork_metadata, "metadata"),
+            metadata=copy_session_metadata(fork_metadata),
         )
         try:
             fork_session = session_request_boundary.prepare_derived_fork_session(
@@ -21532,7 +21537,7 @@ class SessionEngine:
             runtime_generated_session_id = None
             raise
         if expected_source_snapshot is not None:
-            authoritative_metadata = copy_json_value(fork_session.metadata, "metadata")
+            authoritative_metadata = copy_session_metadata(fork_session.metadata)
             authoritative_metadata[FORK_SOURCE_SNAPSHOT_METADATA_KEY] = {
                 "source_session_id": source_session.id,
                 "source_instance_fingerprint": (
@@ -21570,7 +21575,7 @@ class SessionEngine:
             preflight_checkpoint = (
                 None
                 if source_checkpoint_preflight is None
-                else copy_json_value(source_checkpoint_preflight, "checkpoint")
+                else copy_durable_record(source_checkpoint_preflight, "checkpoint")
             )
             prepare_fork_checkpoint(
                 source_session,
@@ -21792,7 +21797,7 @@ class SessionEngine:
             decision=decision_record,
             fork_event_id=fork_event.id,
         )
-        authoritative_metadata = copy_json_value(fork_session.metadata, "metadata")
+        authoritative_metadata = copy_session_metadata(fork_session.metadata)
         authoritative_metadata[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
             selected_execution_profile
         )
@@ -22284,7 +22289,7 @@ class SessionEngine:
         target_checkpoint = (
             {}
             if target_checkpoint is None
-            else copy_json_value(target_checkpoint, "model_completion_checkpoint")
+            else copy_durable_record(target_checkpoint, "model_completion_checkpoint")
         )
         classification = publication.completion_event.payload.get("step_classification")
         if type(classification) is not dict:
@@ -28354,7 +28359,7 @@ class SessionEngine:
         checkpoint = await self.session_store.load_checkpoint(session_id)
         if checkpoint is None:
             return
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
         current = tool_round_recovery.pending_tool_round_from_checkpoint(
             copied_checkpoint,
             redactor=self._secret_redactor,
@@ -28377,7 +28382,7 @@ class SessionEngine:
         checkpoint = await self.session_store.load_checkpoint(session_id)
         if checkpoint is None:
             return copy_json_value(default, "interrupt_payload")
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
         value = copied_checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
         if value is None:
             return copy_json_value(default, "interrupt_payload")
@@ -28474,7 +28479,7 @@ class SessionEngine:
         expected_run_epoch: int | None = None,
     ) -> None:
         def transform(_session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
-            copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            copied = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             if expected_payload is not None:
                 current = copied.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
                 if current != expected_payload:
@@ -28538,7 +28543,7 @@ class SessionEngine:
                 raise SessionRuntimePublicationConflict(
                     "Terminal event lost its exact session authority."
                 )
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             if updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY) != expected_payload:
                 raise SessionRuntimePublicationConflict(
                     "Terminal event lost its exact interruption authority."
@@ -28631,7 +28636,7 @@ class SessionEngine:
         ) -> dict[str, Any] | None:
             nonlocal resolved_marker
             copied_checkpoint = (
-                {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+                {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             )
             existing = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
             if existing is None:
@@ -28708,7 +28713,7 @@ class SessionEngine:
             nonlocal recorded
             if checkpoint is None:
                 return None
-            copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
             marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
             if (
                 type(marker) is not dict
@@ -28750,7 +28755,7 @@ class SessionEngine:
             nonlocal cleared, failure_recorded
             if checkpoint is None:
                 return None
-            copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
             marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
             if (
                 type(marker) is not dict
@@ -28793,7 +28798,7 @@ class SessionEngine:
             nonlocal renewed
             if checkpoint is None:
                 return None
-            copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
             marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
             if (
                 type(marker) is not dict
@@ -28831,7 +28836,7 @@ class SessionEngine:
         ) -> dict[str, Any] | None:
             if checkpoint is None:
                 return None
-            copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
             marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
             if (
                 type(marker) is not dict
@@ -28859,7 +28864,7 @@ class SessionEngine:
             nonlocal cleared_attempt_id
             if checkpoint is None:
                 return {}
-            copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
             marker = copied_checkpoint.pop(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, None)
             if marker is None:
                 return copied_checkpoint

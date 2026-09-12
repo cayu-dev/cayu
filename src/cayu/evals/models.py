@@ -27,6 +27,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     MAX_PORTABLE_JSON_INTEGER,
     copy_durable_json_object,
+    copy_durable_metadata,
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -314,7 +315,7 @@ class EvalAssertionResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value):
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("cost_summary")
     @classmethod
@@ -1073,7 +1074,7 @@ class EvalRun(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("run_contract", mode="before")
     @classmethod
@@ -1843,7 +1844,7 @@ class Trajectory(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value):
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @model_validator(mode="after")
     def validate_session_attribution(self) -> Trajectory:
@@ -2206,7 +2207,7 @@ class EvalContext:
         detached_trajectory = Trajectory.model_validate(
             _model_instance_python_input(self.trajectory)
         )
-        detached_metadata = copy_json_value(self.metadata, "metadata")
+        detached_metadata = copy_durable_metadata(self.metadata, "metadata")
         if type(detached_metadata) is not dict:
             raise ValueError("EvalContext metadata must be an object.")
         object.__setattr__(self, "trajectory", detached_trajectory)

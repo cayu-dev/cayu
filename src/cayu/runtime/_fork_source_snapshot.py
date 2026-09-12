@@ -5,7 +5,7 @@ from __future__ import annotations
 from hashlib import sha256
 from typing import Any
 
-from cayu._validation import canonical_durable_json_bytes, copy_json_value
+from cayu._validation import canonical_durable_json_bytes, copy_durable_record
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
 )
@@ -53,7 +53,7 @@ def fork_source_checkpoint_projection(
 ) -> dict[str, Any]:
     """Project child-relevant source state outside runtime authority records."""
 
-    projected = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    projected = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
     strip_source_owned_fork_checkpoint_state(projected)
     return projected
 

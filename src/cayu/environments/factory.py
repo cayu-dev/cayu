@@ -15,6 +15,7 @@ from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    copy_durable_metadata,
     copy_label_map,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -385,7 +386,7 @@ class EnvironmentAllocationIntent:
             raise TypeError("requested_operation must be an EnvironmentFactoryOperation.")
         if self.requested_operation is not EnvironmentFactoryOperation.CREATE:
             raise ValueError("Remote allocation intents may only authorize create operations.")
-        metadata = copy_durable_json_object(self.provider_metadata, "provider_metadata")
+        metadata = copy_durable_metadata(self.provider_metadata, "provider_metadata")
         if (
             len(
                 canonical_durable_json_bytes(
@@ -623,12 +624,12 @@ class EnvironmentFactoryRequest:
         object.__setattr__(
             self,
             "metadata",
-            copy_durable_json_object(self.metadata, "metadata"),
+            copy_durable_metadata(self.metadata),
         )
         object.__setattr__(
             self,
             "reconnect_metadata",
-            copy_durable_json_object(self.reconnect_metadata, "reconnect_metadata"),
+            copy_durable_metadata(self.reconnect_metadata, "reconnect_metadata"),
         )
         object.__setattr__(
             self,
@@ -669,12 +670,12 @@ class EnvironmentFactoryResult:
         object.__setattr__(
             self,
             "metadata",
-            copy_durable_json_object(self.metadata, "metadata"),
+            copy_durable_metadata(self.metadata, "metadata"),
         )
         object.__setattr__(
             self,
             "reconnect_metadata",
-            copy_durable_json_object(self.reconnect_metadata, "reconnect_metadata"),
+            copy_durable_metadata(self.reconnect_metadata, "reconnect_metadata"),
         )
 
 

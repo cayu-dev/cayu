@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
-    copy_durable_json_object,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_durable_text,
     require_nonblank,
@@ -107,7 +107,7 @@ class FileAttachment(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @model_validator(mode="after")
     def validate_kind_content_type(self) -> FileAttachment:
@@ -163,7 +163,7 @@ class ResolvedFileAttachment(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @model_validator(mode="after")
     def validate_kind_content_type(self) -> ResolvedFileAttachment:

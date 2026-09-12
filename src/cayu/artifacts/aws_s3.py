@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._validation import (
-    copy_durable_json_object,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_nonblank,
     require_unicode_scalar_text,
@@ -130,7 +130,7 @@ class S3ArtifactStore(ArtifactStore):
             session_id=session_id,
             agent_name=agent_name,
             environment_name=environment_name,
-            metadata=copy_durable_json_object(metadata or {}, "metadata"),
+            metadata=copy_durable_metadata({} if metadata is None else metadata, "metadata"),
         )
         return await _settle_artifact_write(
             registry=self._write_registry,

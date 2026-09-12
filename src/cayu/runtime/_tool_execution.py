@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING, Any, cast
 from cayu._exception_groups import exception_cause, exception_tree_contains
 from cayu._task_wait import restore_task_cancellation_requests
 from cayu._validation import (
+    DurableValueError,
     FrozenJsonDict,
     copy_durable_json_object,
-    copy_json_value,
+    copy_durable_metadata,
     freeze_json_value,
     thaw_json_value,
 )
@@ -296,6 +297,36 @@ def terminal_payload_limit_failure(
         redactor=redactor,
     )
     return _execution_outcome(result, controls)
+
+
+def durable_output_limit_failure(
+    *,
+    error: DurableValueError,
+    effect: ToolEffect,
+    result: ToolResult,
+    redactor: SecretRedactor,
+    projection_evidence: dict[str, Any] | None = None,
+) -> ToolExecutionOutcome:
+    """Use the existing effect-safe invalid-output disposition for size failures."""
+
+    diagnostic = tool_results.exception_diagnostic(
+        error,
+        empty_message="Tool output exceeded the durable record limit.",
+        nonportable_message="Tool output exceeded the durable record limit.",
+        redactor=redactor,
+    )
+    raw_evidence = tool_results.raw_tool_result_evidence(result)
+    if projection_evidence is not None:
+        raw_evidence = {"projection_evidence": projection_evidence, **raw_evidence}
+    failed, controls = tool_results.terminal_failure_result(
+        terminal_outcome="invalid_tool_output",
+        effect=effect,
+        message=diagnostic.message,
+        diagnostic=diagnostic,
+        raw_evidence=raw_evidence,
+        redactor=redactor,
+    )
+    return _execution_outcome(failed, controls)
 
 
 def _isolated_failure_outcome(
@@ -941,7 +972,7 @@ def context_metadata(
     tool_effect: ToolEffect | None = None,
     input_id: str | None = None,
 ) -> dict[str, Any]:
-    metadata = copy_json_value(request_metadata or {}, "request_metadata")
+    metadata = copy_durable_metadata(request_metadata or {}, "request_metadata")
     metadata["tool_call_id"] = tool_call_id
     if idempotency_key is not None:
         metadata["idempotency_key"] = idempotency_key
@@ -963,7 +994,7 @@ def validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
     return ToolPolicyResult(
         decision=result.decision,
         reason=result.reason,
-        metadata=copy_json_value(result.metadata, "metadata"),
+        metadata=copy_durable_metadata(result.metadata, "metadata"),
         command_denial_code=result.command_denial_code,
         approval_expires_in_seconds=result.approval_expires_in_seconds,
     )

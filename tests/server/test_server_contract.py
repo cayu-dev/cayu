@@ -882,8 +882,11 @@ def test_sse_event_frame_limit_rejects_before_serializing_durable_payload(
         id="event_large",
         type="custom.large",
         session_id="session_large",
-        payload={"value": "x" * SSE_EVENT_DATA_MAX_BYTES},
+        payload={"value": "small"},
     )
+    # Normal event admission now rejects this. Exercise a later mutation at
+    # the transport boundary without bypassing its allocation-free preflight.
+    event.payload["value"] = "x" * SSE_EVENT_DATA_MAX_BYTES
 
     def fail_if_serialized(*args: object, **kwargs: object) -> str:
         pytest.fail("oversized SSE payload reached json.dumps")
@@ -913,7 +916,7 @@ def test_sse_event_frame_preflight_matches_compact_utf8_encoding() -> None:
         event_to_sse_message(event, max_data_bytes=data_bytes - 1)
 
 
-def test_sse_event_frame_preflight_counts_ascii_del_escape() -> None:
+def test_sse_event_frame_preflight_counts_utf8_del() -> None:
     event = Event(
         id="event_del",
         type="custom.utf8",
@@ -923,7 +926,7 @@ def test_sse_event_frame_preflight_counts_ascii_del_escape() -> None:
     data = event_to_sse_data(event)
     data_bytes = len(data.encode("utf-8"))
 
-    assert "\\u007f" in data
+    assert "\x7f" in data
     assert event_to_sse_message(event, max_data_bytes=data_bytes)["data"] == data
     with pytest.raises(SseEventFrameTooLargeError) as captured:
         event_to_sse_message(event, max_data_bytes=data_bytes - 1)
@@ -931,19 +934,19 @@ def test_sse_event_frame_preflight_counts_ascii_del_escape() -> None:
     assert captured.value.actual_bytes is None
 
 
-def test_sse_event_frame_handles_legacy_lone_unicode_surrogates_safely() -> None:
-    # New Event construction rejects this value. Keep the transport defensive
-    # for legacy rows and validation-bypassed custom integrations.
-    event = Event.model_construct(
+def test_sse_event_frame_rejects_mutated_unicode_surrogates_safely() -> None:
+    from cayu._validation import DurableValueError
+
+    event = Event(
         id="event_surrogate",
         type="custom.utf8",
         session_id="session_surrogate",
-        payload={"value": "\ud800"},
+        payload={"value": "safe"},
     )
-
-    message = event_to_sse_message(event)
-
-    assert json.loads(message["data"])["payload"] == {"value": "\ud800"}
+    event.payload["value"] = "\ud800"
+    with pytest.raises(DurableValueError) as caught:
+        event_to_sse_message(event)
+    assert caught.value.code == "unicode_surrogate"
 
 
 def test_sse_error_frame_is_classified_and_utf8_bounded() -> None:

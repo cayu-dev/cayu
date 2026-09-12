@@ -34,6 +34,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    copy_durable_metadata,
     revalidate_model_input,
 )
 from cayu._validation import (
@@ -1519,6 +1520,8 @@ class Task(BaseModel):
     @field_validator("input", "metadata", mode="before")
     @classmethod
     def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_object(value, info.field_name)
 
     @field_validator("status_payload", "result", "error", mode="before")
@@ -1708,6 +1711,8 @@ class TaskCreate(BaseModel):
     @field_validator("input", "metadata", mode="before")
     @classmethod
     def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_object(value, info.field_name)
 
     @field_validator("type")
@@ -8405,7 +8410,7 @@ def copy_task(task: Task) -> Task:
         input=copy_durable_json_object(task.input, "input"),
         result=(None if task.result is None else copy_durable_json_object(task.result, "result")),
         error=None if task.error is None else copy_durable_json_object(task.error, "error"),
-        metadata=copy_durable_json_object(task.metadata, "metadata"),
+        metadata=copy_durable_metadata(task.metadata),
         created_at=task.created_at,
         updated_at=task.updated_at,
         started_at=task.started_at,
@@ -10748,7 +10753,7 @@ def _settled_task_retry_attempt(
             assigned_agent_name=task.assigned_agent_name,
             available_at=next_eligible_at,
             input=copy_durable_json_object(task.input, "input"),
-            metadata=copy_durable_json_object(task.metadata, "metadata"),
+            metadata=copy_durable_metadata(task.metadata),
             created_at=now,
             updated_at=now,
             invocation=copy_task_invocation(task.invocation),
@@ -11166,7 +11171,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         assigned_agent_name=request.assigned_agent_name,
         available_at=request.available_at,
         input=copy_durable_json_object(request.input, "input"),
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         retry_policy=(
             None
             if request.retry_policy is None
@@ -11567,7 +11572,7 @@ def _task_from_create(
         assigned_agent_name=request.assigned_agent_name,
         available_at=request.available_at,
         input=copy_durable_json_object(request.input, "input"),
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         created_at=now,
         updated_at=now,
         invocation=invocation,

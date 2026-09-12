@@ -414,9 +414,9 @@ def test_session_inspection_summary_conforms_to_native_event_and_usage_aggregate
                     session_id="sess_inspection_conformance",
                     labels={
                         "inspection": "conformance",
-                        **{f"label_{index:03d}": "value" for index in range(205)},
+                        **{f"label_{index:03d}": "value" for index in range(199)},
                     },
-                    metadata={"customer_payload": "x" * 1_000_000},
+                    metadata={"customer_payload": "x" * 100_000},
                     messages=[Message.text("user", "inspect")],
                 ),
                 identity=SessionIdentity(provider_name="fake", model="model"),
@@ -467,10 +467,10 @@ def test_session_inspection_summary_conforms_to_native_event_and_usage_aggregate
             )
 
             assert inspection.events.record_count == event_summary.total_events
-            assert inspection.session.label_count == 206
+            assert inspection.session.label_count == 200
             assert len(inspection.session.labels) == 200
             assert inspection.session.labels["inspection"] == "conformance"
-            assert inspection.session.labels_truncated is True
+            assert inspection.session.labels_truncated is False
             assert inspection.model_calls == usage.totals.model_steps
             assert inspection.tool_calls == usage.totals.tool_calls
             assert inspection.model_calls_with_usage == usage.totals.model_steps_with_usage

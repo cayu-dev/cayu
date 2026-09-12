@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_metadata, require_clean_nonblank
 from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
 from cayu.vaults import ResolvedSecret, SecretRef, Vault
 
@@ -171,7 +171,7 @@ def _validate_authorize_request_inputs(
     if action is not None:
         require_clean_nonblank(action, "action")
     if metadata is not None:
-        copy_json_value(metadata, "metadata")
+        copy_durable_metadata(metadata, "metadata")
 
 
 def _destination_host(destination: str) -> str:

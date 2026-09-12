@@ -36,11 +36,15 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    DurableValueError,
     JsonUtf8SizeCounter,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
+    copy_durable_record,
     copy_json_value,
+    extract_durable_value_error,
     require_clean_nonblank,
     require_durable_text,
     require_nonblank,
@@ -63,6 +67,7 @@ from cayu.core.events import (
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
+    validate_event_envelope,
 )
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
@@ -450,6 +455,33 @@ _WORKSPACE_OBSERVATION_MAX_TOTAL_PATHS = (1 << 63) - 1
 _WORKSPACE_OBSERVATION_TIMEOUT_SECONDS = 30.0
 _WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS = 30.0
 _MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS = 64
+
+
+def _bounded_tool_failure_event(
+    event: Event, failure: tool_execution.ToolExecutionOutcome
+) -> Event:
+    payload = dict(event.payload)
+    payload.pop("tool_result_projection", None)
+    payload["result"] = failure.result.model_dump(mode="json")
+    payload.update(failure.terminal_payload_fields())
+    failed = event.model_copy(update={"type": EventType.TOOL_CALL_FAILED, "payload": payload})
+    try:
+        copied = copy_event(failed)
+        validate_event_envelope(copied)
+        return copied
+    except Exception as exc:
+        limit_error = extract_durable_value_error(exc)
+        if limit_error is None or limit_error.dimension is None:
+            raise
+    # The effect intent retains argument authority. This terminal projection is
+    # explicitly unavailable, never a truncated or different invocation.
+    payload.pop("effective_arguments", None)
+    payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
+    payload.update(tool_argument_publication.unavailable_argument_projection().payload_fields())
+    payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
+    copied = copy_event(failed.model_copy(update={"payload": payload}))
+    validate_event_envelope(copied)
+    return copied
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1171,18 @@ class _ToolRoundPublicationCoordinator:
                     tool_round_id=self._tool_round_identity.tool_round_id,
                     tool_call_id=tool_call_id,
                 )
+                result_payload = projected.payload.get("result")
+                result_evidence = (
+                    result_payload.get("structured") if type(result_payload) is dict else None
+                )
+                unverified_output = (
+                    dict(result_evidence)
+                    if type(result_evidence) is dict
+                    and "portable_result_evidence" in result_evidence
+                    and result_evidence.get("durable_value_error_code")
+                    in {"json_value_too_large", "too_many_json_nodes", "nesting_too_deep"}
+                    else None
+                )
                 if (
                     effect_record is not None
                     and (
@@ -1149,6 +1193,7 @@ class _ToolRoundPublicationCoordinator:
                         session,
                         tool_round_id=self._tool_round_identity.tool_round_id,
                         tool_call_ids=(tool_call_id,),
+                        unverified_output=unverified_output,
                         failure_evidence=FailureEvidence(
                             classification=(
                                 "timeout"
@@ -2734,7 +2779,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -2790,9 +2835,8 @@ class ToolRoundExecutor:
             reason=(
                 None if policy_result.reason is None else redactor.redact_text(policy_result.reason)
             ),
-            metadata=copy_json_value(
+            metadata=copy_durable_metadata(
                 redactor.redact_json_values(policy_result.metadata),
-                "metadata",
             ),
             tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
@@ -2857,7 +2901,7 @@ class ToolRoundExecutor:
             current = (
                 {}
                 if current_checkpoint is None
-                else copy_json_value(current_checkpoint, "checkpoint")
+                else copy_durable_record(current_checkpoint, "checkpoint")
             )
             if (
                 current.get(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
@@ -3007,7 +3051,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -3063,7 +3107,7 @@ class ToolRoundExecutor:
             current = (
                 {}
                 if current_checkpoint is None
-                else copy_json_value(current_checkpoint, "checkpoint")
+                else copy_durable_record(current_checkpoint, "checkpoint")
             )
             if (
                 current.get(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
@@ -3108,7 +3152,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -3202,7 +3246,7 @@ class ToolRoundExecutor:
             checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
             "pending_tool_round",
         )
-        target_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        target_checkpoint = copy_durable_record(checkpoint, "checkpoint")
         target_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
         target_checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending_payload
         target_checkpoint = _require_secret_free_durable_object(
@@ -3365,7 +3409,7 @@ class ToolRoundExecutor:
         checkpoint = await self._session_store.load_checkpoint(session_id)
         if checkpoint is None:
             return
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
         pending_approval = approval_support.pending_approval_from_checkpoint(
             copied_checkpoint,
             redactor=self._secret_redactor,
@@ -5816,8 +5860,35 @@ class ToolRoundExecutor:
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     tool_name=tool_call.name,
-                    payload=payload,
+                    payload={},
                 )
+                result_event = result_event.model_copy(update={"payload": payload})
+                (
+                    result_event,
+                    result,
+                    size_failure,
+                    initial_projection_cancellation,
+                    initial_projection_requests,
+                ) = await _await_post_tool_operation(
+                    self._prepare_size_bounded_tool_terminal(
+                        event=result_event,
+                        result=result,
+                        registered_tool=registered_tool,
+                        session=session,
+                        registered_environment=registered_environment,
+                        tool_call=effective_tool_call,
+                        redactor=publication_snapshot.redactor,
+                    ),
+                    cancellation=post_tool_cancellation,
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                )
+                if size_failure is not None:
+                    execution_outcome = size_failure
+                if initial_projection_cancellation is not None:
+                    post_tool_cancellation_requests_consumed += initial_projection_requests
+                    post_tool_cancellation = await consume_post_tool_cancellation(
+                        initial_projection_cancellation
+                    )
                 result_event = _restore_targeted_tool_invocation_event_authority(
                     result_event,
                     effective_tool_call,
@@ -5839,7 +5910,9 @@ class ToolRoundExecutor:
                     (
                         result_event,
                         result,
+                        _projection_failure,
                         projection_cancellation,
+                        projection_requests,
                     ) = await _await_post_tool_operation(
                         self._project_terminal_tool_result(
                             event=result_event,
@@ -5847,6 +5920,8 @@ class ToolRoundExecutor:
                             session=session,
                             registered_environment=registered_environment,
                             tool_call=effective_tool_call,
+                            effect=registered_tool.effect,
+                            redactor=redactor,
                         ),
                         cancellation=post_tool_cancellation,
                         restore_cancellation_requests=post_tool_cancellation_requests_consumed,
@@ -5902,10 +5977,11 @@ class ToolRoundExecutor:
                 else:
                     proxy_events.append(event)
             if projection_cancellation is not None:
-                _raise_preserved_post_tool_cancellation(
-                    post_tool_cancellation,
-                    projection_cancellation,
-                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                _raise_restored_post_tool_cancellation(
+                    post_tool_cancellation or projection_cancellation,
+                    restore_cancellation_requests=(
+                        post_tool_cancellation_requests_consumed + projection_requests
+                    ),
                 )
             current_task = asyncio.current_task()
             tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
@@ -6776,6 +6852,65 @@ class ToolRoundExecutor:
                 if stop:
                     return
 
+    async def _prepare_size_bounded_tool_terminal(
+        self,
+        *,
+        event: Event,
+        result: ToolResult,
+        registered_tool: runtime_records.RegisteredTool,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        redactor: SecretRedactor,
+    ) -> tuple[
+        Event,
+        ToolResult,
+        tool_execution.ToolExecutionOutcome | None,
+        asyncio.CancelledError | None,
+        int,
+    ]:
+        """Admit a post-effect candidate only after projection or bounded failure.
+
+        The candidate is internal and has not entered an event writer or store.
+        Neither an oversized result nor its serializer error is durable evidence.
+        """
+        try:
+            candidate = copy_event(event)
+            if self._tool_result_projection_policy is None:
+                validate_event_envelope(candidate)
+            return candidate, result, None, None, 0
+        except Exception as exc:
+            limit_error = extract_durable_value_error(exc)
+            if limit_error is None or limit_error.dimension is None:
+                raise
+        cancellation: asyncio.CancelledError | None = None
+        if self._tool_result_projection_policy is not None:
+            # Artifact projection sees only redacted output, and only the small
+            # event scaffold crosses its await. The large body remains a result,
+            # not an admitted Event payload.
+            projected_input = tool_results.redact_tool_result(result, redactor)
+            scaffold_payload = dict(event.payload)
+            scaffold_payload.pop("result", None)
+            scaffold = copy_event(event.model_copy(update={"payload": scaffold_payload}))
+            return await self._project_terminal_tool_result(
+                event=scaffold,
+                result=projected_input,
+                session=session,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                effect=registered_tool.effect,
+                redactor=redactor,
+            )
+        assert isinstance(limit_error, DurableValueError)
+        failure = tool_execution.durable_output_limit_failure(
+            error=limit_error,
+            effect=registered_tool.effect,
+            result=result,
+            redactor=redactor,
+        )
+        failed = _bounded_tool_failure_event(event, failure)
+        return failed, failure.result, failure, cancellation, 0
+
     async def _enforce_terminal_result_payload_limit(
         self,
         *,
@@ -6999,8 +7134,13 @@ class ToolRoundExecutor:
             redactor=resolved_redactor,
         )
         pre_staging_projection_cancellation: asyncio.CancelledError | None = None
+        pre_staging_projection_requests = 0
         projection_policy = getattr(self, "_tool_result_projection_policy", None)
-        if deferred_terminal_stager is not None and projection_policy is not None:
+        if (
+            deferred_terminal_stager is not None
+            and projection_policy is not None
+            and not trusted_projection
+        ):
             runtime_hooks = (
                 self._runtime_hooks
                 if invocation_context is None
@@ -7021,14 +7161,21 @@ class ToolRoundExecutor:
                 (
                     event,
                     result,
+                    projection_size_failure,
                     pre_staging_projection_cancellation,
+                    pre_staging_projection_requests,
                 ) = await self._project_terminal_tool_result(
                     event=event,
                     result=result,
                     session=session,
                     registered_environment=registered_environment,
                     tool_call=tool_call,
+                    effect=ToolEffect.NONE if registered_tool is None else registered_tool.effect,
+                    redactor=resolved_redactor,
                 )
+                if projection_size_failure is not None:
+                    allow_modification = False
+                    publish_before_hooks = True
                 event = _restore_targeted_tool_invocation_event_authority(
                     event,
                     tool_call,
@@ -7063,7 +7210,10 @@ class ToolRoundExecutor:
                 ),
             )
             if pre_staging_projection_cancellation is not None:
-                raise pre_staging_projection_cancellation
+                _raise_restored_post_tool_cancellation(
+                    pre_staging_projection_cancellation,
+                    restore_cancellation_requests=pre_staging_projection_requests,
+                )
             return
         if hooks_already_completed:
             tool_event = await emit_terminal_event(event)
@@ -7078,13 +7228,22 @@ class ToolRoundExecutor:
         if publish_before_hooks:
             if "tool_result_projection" in event.payload:
                 projection_cancellation = None
+                projection_requests = 0
             else:
-                event, result, projection_cancellation = await self._project_terminal_tool_result(
+                (
+                    event,
+                    result,
+                    _projection_failure,
+                    projection_cancellation,
+                    projection_requests,
+                ) = await self._project_terminal_tool_result(
                     event=event,
                     result=result,
                     session=session,
                     registered_environment=registered_environment,
                     tool_call=hook_tool_call,
+                    effect=ToolEffect.NONE if registered_tool is None else registered_tool.effect,
+                    redactor=resolved_redactor,
                 )
             event = _restore_targeted_tool_invocation_event_authority(
                 event,
@@ -7111,7 +7270,10 @@ class ToolRoundExecutor:
                 ),
             )
             if projection_cancellation is not None:
-                raise projection_cancellation
+                _raise_restored_post_tool_cancellation(
+                    projection_cancellation,
+                    restore_cancellation_requests=projection_requests,
+                )
             async for hook_event, modified in self.run_tool_call_hooks(
                 session=session,
                 tool_event=tool_event,
@@ -7173,13 +7335,22 @@ class ToolRoundExecutor:
                 )
         if "tool_result_projection" in event.payload and final_result is result:
             projection_cancellation = None
+            projection_requests = 0
         else:
-            event, final_result, projection_cancellation = await self._project_terminal_tool_result(
+            (
+                event,
+                final_result,
+                _projection_failure,
+                projection_cancellation,
+                projection_requests,
+            ) = await self._project_terminal_tool_result(
                 event=event,
                 result=final_result,
                 session=session,
                 registered_environment=registered_environment,
                 tool_call=tool_call,
+                effect=ToolEffect.NONE if registered_tool is None else registered_tool.effect,
+                redactor=resolved_redactor,
             )
         (
             event,
@@ -7216,7 +7387,10 @@ class ToolRoundExecutor:
             ),
         )
         if projection_cancellation is not None:
-            raise projection_cancellation
+            _raise_restored_post_tool_cancellation(
+                projection_cancellation,
+                restore_cancellation_requests=projection_requests,
+            )
 
     async def _project_terminal_tool_result(
         self,
@@ -7226,10 +7400,38 @@ class ToolRoundExecutor:
         session: Session,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_call: runtime_records.ToolCallRequest,
-    ) -> tuple[Event, ToolResult, asyncio.CancelledError | None]:
+        effect: ToolEffect,
+        redactor: SecretRedactor,
+    ) -> tuple[
+        Event,
+        ToolResult,
+        tool_execution.ToolExecutionOutcome | None,
+        asyncio.CancelledError | None,
+        int,
+    ]:
         policy = self._tool_result_projection_policy
         if policy is None:
-            return event, result, None
+            try:
+                validate_event_envelope(event)
+            except Exception as exc:
+                limit_error = extract_durable_value_error(exc)
+                if limit_error is None or limit_error.dimension is None:
+                    raise
+                failure = tool_execution.durable_output_limit_failure(
+                    error=limit_error,
+                    effect=effect,
+                    result=result,
+                    redactor=redactor,
+                )
+                return _bounded_tool_failure_event(event, failure), failure.result, failure, None, 0
+            return event, result, None, None, 0
+        if event.payload.get("terminal_outcome") == "invalid_tool_output" and event.payload.get(
+            "durable_value_error_code"
+        ) in {"json_value_too_large", "too_many_json_nodes", "nesting_too_deep"}:
+            # This is the bounded runtime disposition, not another candidate
+            # for externalization. Re-running a policy here could create a
+            # second artifact after the original projection already settled.
+            return event, result, None, None, 0
         request = ToolResultProjectionRequest(
             result=result,
             session_id=session.id,
@@ -7315,10 +7517,31 @@ class ToolRoundExecutor:
         # The policy receives the final redacted result. Reapplying generic
         # redaction here would rewrite runtime-owned artifact identities when
         # a registered secret happens to overlap an id, hash, type, or status.
-        projected_event, projected_result = _validate_and_synchronize_tool_result_event(
-            event=projected_event,
-            result=projection.result,
-        )
+        try:
+            projected_event, projected_result = _validate_and_synchronize_tool_result_event(
+                event=projected_event,
+                result=projection.result,
+            )
+            validate_event_envelope(projected_event)
+        except Exception as exc:
+            limit_error = extract_durable_value_error(exc)
+            if limit_error is None or limit_error.dimension is None:
+                raise
+            failure = tool_execution.durable_output_limit_failure(
+                error=limit_error,
+                effect=effect,
+                result=projection.result,
+                redactor=redactor,
+                projection_evidence=projection.record.model_dump(mode="json", exclude_none=True),
+            )
+            failed_event = _bounded_tool_failure_event(event, failure)
+            return (
+                failed_event,
+                failure.result,
+                failure,
+                outcome.cancellation,
+                outcome.cancellation_requests_consumed,
+            )
         projected_event, projected_result = web_access_results.restore_attested_tool_result(
             projected_event,
             original=projected_result,
@@ -7333,7 +7556,13 @@ class ToolRoundExecutor:
             projected_event,
             _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
         )
-        return projected_event, projected_result, outcome.cancellation
+        return (
+            projected_event,
+            projected_result,
+            None,
+            outcome.cancellation,
+            outcome.cancellation_requests_consumed,
+        )
 
     async def run_tool_call_hooks(
         self,
@@ -7982,7 +8211,7 @@ class ToolRoundRun:
         ) -> Event:
             if publication_coordinator is None:
                 raise AssertionError("Terminal staging requires a publication coordinator.")
-            prepared_event = executor._event_writer.prepare(event)
+            prepared_event = executor._event_writer.prepare_candidate(event)
             interrupted_terminal = prepared_event.payload.get("interrupted") is True
             exposure_blocked = (
                 prepared_event.type is EventType.TOOL_CALL_BLOCKED
@@ -9444,7 +9673,7 @@ def _copy_agent_spec(spec: AgentSpec) -> AgentSpec:
         system_prompt=spec.system_prompt,
         workflow_tool_names=spec.workflow_tool_names,
         authoring_state=spec.authoring_state,
-        metadata=copy_json_value(spec.metadata, "metadata"),
+        metadata=copy_durable_metadata(spec.metadata),
         provider_options=copy_json_value(spec.provider_options, "provider_options"),
         thinking=spec.thinking,
     )
@@ -12065,7 +12294,7 @@ def policy_denial_payload_fields(
         "denied_by": require_clean_nonblank(denied_by, "denied_by"),
         "decision": require_clean_nonblank(decision, "decision"),
         "reason": require_nonblank(reason, "reason"),
-        "metadata": copy_json_value(metadata, "metadata"),
+        "metadata": copy_durable_metadata(metadata),
     }
 
 

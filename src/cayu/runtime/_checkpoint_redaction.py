@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_durable_record
 from cayu.runtime._shared_artifact_results import persisted_shared_artifact_control_paths
 from cayu.runtime._web_access_results import persisted_web_access_control_paths
 from cayu.runtime.checkpoints import (
@@ -652,7 +652,7 @@ def require_secret_free_durable_object(
 
     if schema_root is not None and schema_root not in _DURABLE_ROOT_STRUCTURE_KEYS:
         raise ValueError("schema_root must identify a runtime-owned checkpoint root.")
-    copied = copy_json_value(value, field_name)
+    copied = copy_durable_record(value, field_name)
     if type(copied) is not dict:
         raise AssertionError(f"{field_name} copy returned a non-object.")
     if durable_value_contains_secret(

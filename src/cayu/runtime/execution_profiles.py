@@ -23,6 +23,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_value,
+    copy_session_metadata,
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
@@ -1474,7 +1475,7 @@ def execution_profile_metadata_after_adoption(
 ) -> dict[str, Any]:
     """Advance the expected profile while retaining the immutable baseline."""
 
-    copied = copy_durable_json_value(dict(metadata), "session.metadata")
+    copied = copy_session_metadata(metadata)
     current = copied.get(EXECUTION_PROFILE_METADATA_KEY)
     if type(current) is not dict:
         raise ValueError("Session has no durable execution-profile identity.")
@@ -1482,7 +1483,7 @@ def execution_profile_metadata_after_adoption(
     execution_profile_from_session_metadata(copied)
     current["expected"] = profile.model_dump(mode="json")
     copied[EXECUTION_PROFILE_METADATA_KEY] = current
-    return copied
+    return copy_session_metadata(copied)
 
 
 def execution_profile_from_session_metadata(

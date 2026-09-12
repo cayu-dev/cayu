@@ -302,6 +302,40 @@ def test_emit_persists_forwards_cost_event_and_fans_out() -> None:
     assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
+def test_private_candidate_does_not_grant_publication_admission() -> None:
+    from cayu._validation import DurableValueError
+
+    async def scenario() -> None:
+        store = await _session_store("private-candidate")
+        budget_store = InMemoryBudgetStore()
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=budget_store, event_sinks=[sink]
+        )
+        candidate = writer.prepare_candidate(
+            Event(
+                type="custom.large",
+                session_id="private-candidate",
+                payload={"value": "x" * (3 * 1024 * 1024)},
+            )
+        )
+        for publish in (
+            lambda: writer.emit(candidate),
+            lambda: writer.emit_many("private-candidate", [candidate]),
+        ):
+            with pytest.raises(DurableValueError) as caught:
+                await publish()
+            assert caught.value.limit == 2 * 1024 * 1024
+            assert caught.value.field_name == "event"
+        assert not await store.load_events("private-candidate")
+        assert not sink.events
+        assert not await budget_store.load_events_for_budget(
+            scope="app", key=None, window=BudgetWindow.all_time()
+        )
+
+    asyncio.run(scenario())
+
+
 def test_emit_redacts_workload_secrets_before_durable_and_external_boundaries() -> None:
     secret = "writer-boundary-canary"
 

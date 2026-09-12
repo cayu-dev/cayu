@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cayu._validation import (
     copy_durable_json_object,
+    copy_durable_metadata,
     copy_json_value,
     require_durable_clean_nonblank,
     require_durable_nonblank,
@@ -112,7 +113,7 @@ class TextEmbeddingUsage(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
 
 class TextEmbeddingResult(BaseModel):
@@ -146,7 +147,7 @@ class TextEmbeddingResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @model_validator(mode="after")
     def validate_embeddings(self) -> TextEmbeddingResult:
@@ -187,7 +188,7 @@ def copy_text_embedding_usage(
     return TextEmbeddingUsage(
         input_tokens=usage.input_tokens,
         total_tokens=usage.total_tokens,
-        metadata=copy_json_value(usage.metadata, "usage.metadata"),
+        metadata=copy_durable_metadata(usage.metadata, "usage.metadata"),
     )
 
 
@@ -209,5 +210,5 @@ def copy_text_embedding_result(result: TextEmbeddingResult) -> TextEmbeddingResu
         model=result.model,
         embeddings=[copy_text_embedding(embedding) for embedding in result.embeddings],
         usage=copy_text_embedding_usage(result.usage),
-        metadata=copy_json_value(result.metadata, "metadata"),
+        metadata=copy_durable_metadata(result.metadata, "metadata"),
     )

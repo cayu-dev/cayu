@@ -3499,6 +3499,11 @@ def _task_failure_payload(app: CayuApp, exc: Exception) -> dict[str, Any]:
     if diagnostic.durable_value_error_code is not None:
         payload["durable_value_error_code"] = diagnostic.durable_value_error_code
         payload["durable_value_error_path"] = diagnostic.durable_value_error_path
+        if diagnostic.durable_value_error_limit is not None:
+            payload["durable_value_error_limit"] = diagnostic.durable_value_error_limit
+            payload["durable_value_error_observed_lower_bound"] = (
+                diagnostic.durable_value_error_observed_lower_bound
+            )
     diagnostic = None
     redacted_payload = app.redact_json(payload)
     payload.clear()

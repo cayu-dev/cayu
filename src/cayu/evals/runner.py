@@ -22,7 +22,7 @@ from cayu._exception_groups import exception_tree_contains
 from cayu._task_wait import capture_awaitable_outcome
 from cayu._validation import (
     MAX_PORTABLE_JSON_INTEGER,
-    copy_durable_json_object,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_durable_text,
 )
@@ -672,7 +672,7 @@ class EvalCase(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
 
 def _detach_eval_case(case: EvalCase) -> EvalCase:
@@ -730,7 +730,7 @@ class EvalSuite(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
 
 def _detach_eval_suite(suite: EvalSuite) -> EvalSuite:

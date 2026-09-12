@@ -15,7 +15,7 @@ from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancel
 from cayu._validation import (
     _RESERVED_LABEL_PREFIX,
     canonical_durable_json_bytes,
-    copy_durable_json_object,
+    copy_durable_metadata,
     copy_json_object,
     copy_json_value,
     require_clean_nonblank,
@@ -278,7 +278,7 @@ class SubagentSpec(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("limits")
     @classmethod
@@ -425,7 +425,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         )
         causal_budget_id = ctx.causal_budget_id or ctx.session_id
         child_metadata: dict[str, Any] = {
-            **copy_json_value(spec.metadata, "metadata"),
+            **copy_durable_metadata(spec.metadata),
             **metadata,
             "subagent": {
                 "agent": agent_alias,
@@ -855,7 +855,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         if spec is None or spec.context_mode is not SubagentContextMode.TASK_ONLY:
             return False
         child_metadata: dict[str, Any] = {
-            **copy_json_value(spec.metadata, "metadata"),
+            **copy_durable_metadata(spec.metadata),
             **metadata,
             "subagent": {
                 "agent": agent_alias,
@@ -940,7 +940,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         if spec is None or spec.mode is not SubagentExecutionMode.DURABLE:
             return False
         child_metadata: dict[str, Any] = {
-            **copy_json_value(spec.metadata, "metadata"),
+            **copy_durable_metadata(spec.metadata),
             **metadata,
             "subagent": {
                 "agent": agent_alias,

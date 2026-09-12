@@ -13,7 +13,7 @@ from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
-    copy_json_value,
+    copy_durable_record,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -386,7 +386,7 @@ class EnvironmentAllocationCoordinator:
         )
 
         def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
-            checkpoint = {} if current is None else copy_json_value(current, "checkpoint")
+            checkpoint = {} if current is None else copy_durable_record(current, "checkpoint")
             existing = allocation_record_from_checkpoint(
                 checkpoint,
                 environment_name=environment_name,
@@ -658,7 +658,7 @@ class EnvironmentAllocationCoordinator:
                 raise EnvironmentAllocationTransitionConflict(
                     "Abandoned allocation recovery lost its epoch."
                 )
-            checkpoint = {} if current is None else copy_json_value(current, "checkpoint")
+            checkpoint = {} if current is None else copy_durable_record(current, "checkpoint")
             existing = allocation_record_from_checkpoint(checkpoint, environment_name=name)
             if existing == desired:
                 return checkpoint
@@ -743,7 +743,7 @@ class EnvironmentAllocationCoordinator:
         )
 
         def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
-            checkpoint = {} if current is None else copy_json_value(current, "checkpoint")
+            checkpoint = {} if current is None else copy_durable_record(current, "checkpoint")
             existing_record = allocation_record_from_checkpoint(
                 checkpoint,
                 environment_name=environment_name,

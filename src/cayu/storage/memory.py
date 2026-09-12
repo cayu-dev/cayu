@@ -23,6 +23,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
     copy_json_value,
     copy_label_map,
     require_finite,
@@ -585,7 +586,7 @@ class KnowledgeEntry(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -854,7 +855,7 @@ class KnowledgeChunk(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("id")
     @classmethod
@@ -1633,7 +1634,7 @@ class KnowledgeRelation(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "metadata")
+        copied = copy_durable_metadata(value, "metadata")
         if len(canonical_durable_json_bytes(copied, "knowledge relation metadata")) > (
             MAX_KNOWLEDGE_RELATION_BYTES // 2
         ):
@@ -1830,7 +1831,7 @@ class KnowledgeMaintenanceProposal(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "metadata")
+        copied = copy_durable_metadata(value, "metadata")
         if len(canonical_durable_json_bytes(copied, "knowledge maintenance metadata")) > (
             MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES
         ):
@@ -1964,7 +1965,7 @@ class KnowledgeMaintenanceDecision(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "metadata")
+        copied = copy_durable_metadata(value, "metadata")
         if len(canonical_durable_json_bytes(copied, "knowledge decision metadata")) > (
             MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES
         ):
@@ -9153,7 +9154,7 @@ def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
         last_used_at=entry.last_used_at,
         expires_at=entry.expires_at,
         title=entry.title,
-        metadata=copy_durable_json_object(entry.metadata, "metadata"),
+        metadata=copy_durable_metadata(entry.metadata, "metadata"),
     )
 
 
@@ -9187,7 +9188,7 @@ def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:
         chunk_index=chunk.chunk_index,
         content_hash=chunk.content_hash,
         source_uri=chunk.source_uri,
-        metadata=copy_durable_json_object(chunk.metadata, "metadata"),
+        metadata=copy_durable_metadata(chunk.metadata, "metadata"),
     )
 
 
@@ -9208,7 +9209,7 @@ def copy_knowledge_evidence(evidence: KnowledgeEvidence) -> KnowledgeEvidence:
         locator=copy_durable_json_object(evidence.locator, "locator"),
         disposition=evidence.disposition,
         created_at=evidence.created_at,
-        metadata=copy_durable_json_object(evidence.metadata, "metadata"),
+        metadata=copy_durable_metadata(evidence.metadata, "metadata"),
     )
 
 
@@ -9237,7 +9238,7 @@ def copy_knowledge_relation(relation: KnowledgeRelation) -> KnowledgeRelation:
         created_by=relation.created_by,
         policy_id=relation.policy_id,
         created_at=relation.created_at,
-        metadata=copy_durable_json_object(relation.metadata, "metadata"),
+        metadata=copy_durable_metadata(relation.metadata, "metadata"),
     )
 
 

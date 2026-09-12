@@ -54,6 +54,24 @@ ceilings remain feature-owned contracts rather than application settings.
 
 Runtime boundary data should be portable across local processes, remote runners, hosted runtimes, event stores, dashboards, and replay tools.
 
+An unpublished `Event` candidate is bounded as a private JSON document (16 MiB,
+250,000 nodes, depth 64). This is not permission to publish that candidate: event
+store admission, the runtime event writer, and SSE enforce a 2 MiB complete
+event envelope, including identities, timestamp, names, and payload, with at most
+100,000 nodes and depth 64. Both byte limits use compact UTF-8 JSON with ordinary
+Unicode preserved, and accept values exactly at the ceiling. Private tool-result
+staging remains subject to the complete 16 MiB checkpoint ceiling. This separation
+lets modifying after-tool hooks receive the original redacted result before
+optional artifact projection, without publishing an oversized intermediate event.
+
+The shared write-time durable-record ceilings are: labels 128 KiB and 200
+entries; ordinary user/request metadata 256 KiB, 50,000 nodes, and depth 64;
+merged session metadata 1 MiB and 100,000 nodes; and checkpoints, transcripts,
+and other complete non-event durable documents 16 MiB, 250,000 nodes, and depth 64.
+Values are rejected before the owning store or external side effect is entered;
+the error reports only a bounded field, dimension, configured limit, and
+observed lower bound.
+
 Portable Evals process evidence is a separate closed projection over selected
 runtime event types. It retains only bounded typed lifecycle, tool, approval,
 structured-output, and budget-limit facts in root-session order; it never
@@ -61,7 +79,7 @@ publishes raw event payloads or invents ordering across parent and child
 sessions. Missing or bounded-prefix evidence is inconclusive, while child
 terminal outcomes use the child-tree completeness contract.
 
-The target contract for payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data is portable durable JSON. Portable values contain only objects, arrays, strings, signed 64-bit integers, finite floats, booleans, and null, with at most 128 nested object/array levels. Strings and object keys may contain ordinary Unicode but not NUL or lone UTF-16 surrogate code points. JSON has one number domain, so Cayu normalizes every finite integral float in the signed 64-bit range to an integer (including negative zero); non-integral floats retain their value. Tuples, arbitrary Python objects, non-string object keys, circular references, raw decimals, NaN, and Infinity are not portable; integral floats outside the signed 64-bit range are rejected, and larger exact numbers use a field-specific canonical string format. Task input, result, error, and metadata fields remain top-level JSON objects.
+The target contract for payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data is portable durable JSON. Portable values contain only objects, arrays, strings, signed 64-bit integers, finite floats, booleans, and null, with at most 64 nested object/array levels. Strings and object keys may contain ordinary Unicode but not NUL or lone UTF-16 surrogate code points. JSON has one number domain, so Cayu normalizes every finite integral float in the signed 64-bit range to an integer (including negative zero); non-integral floats retain their value. Tuples, arbitrary Python objects, non-string object keys, circular references, raw decimals, NaN, and Infinity are not portable; integral floats outside the signed 64-bit range are rejected, and larger exact numbers use a field-specific canonical string format. Task input, result, error, and metadata fields remain top-level JSON objects.
 
 Core message parts, tool results, events, model requests, session/task stores, checkpoints, durable message queues, and JSONL import/export apply portable-value validation while taking their defensive copy. The bundled in-memory, SQLite, and PostgreSQL session/task stores therefore accept, reject, and reload the same representations. Provider stream events remain ephemeral, untrusted observations so terminal accounting can be retained; the runtime validates them strictly before producing a durable event, transcript message, or checkpoint value. Direct validation failures raise the public `cayu.DurableValueError`, a `ValueError` subtype with stable `code`, `field_name`, and input-value-independent `path` fields. Model validators may wrap it in their ordinary validation error; `cayu.extract_durable_value_error(error)` safely recovers the typed failure from either form without rendering rejected input. Migrated producer models hide Pydantic input values, and the bounded ASCII durable-value diagnostic never includes the rejected value or an object key.
 

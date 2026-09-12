@@ -23,7 +23,7 @@ from uuid import uuid4
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._filesystem_lock import cooperative_path_lock
 from cayu._validation import (
-    copy_durable_json_object,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_nonblank,
     require_unicode_scalar_text,
@@ -175,7 +175,7 @@ class LocalArtifactStore(ArtifactStore):
         agent_name = _validate_optional_id(agent_name, "agent_name")
         environment_name = _validate_optional_id(environment_name, "environment_name")
         _validate_scope_owner(scope, session_id=session_id, environment_name=environment_name)
-        copied_metadata = copy_durable_json_object(metadata or {}, "metadata")
+        copied_metadata = copy_durable_metadata({} if metadata is None else metadata, "metadata")
 
         resolved_artifact_id = (
             _new_artifact_id() if artifact_id is None else _validate_artifact_id(artifact_id)

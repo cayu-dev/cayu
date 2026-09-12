@@ -29,6 +29,7 @@ from cayu._exception_groups import (
 from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
     copy_durable_json_object,
+    copy_durable_metadata,
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -126,7 +127,7 @@ class SyncBindingContext:
         object.__setattr__(
             self,
             "metadata",
-            copy_durable_json_object(self.metadata, "metadata"),
+            copy_durable_metadata(self.metadata),
         )
 
 
@@ -524,7 +525,7 @@ class WorkspaceSnapshot:
         object.__setattr__(
             self,
             "metadata",
-            copy_durable_json_object(self.metadata, "metadata"),
+            copy_durable_metadata(self.metadata),
         )
 
 
@@ -567,7 +568,7 @@ class BoundWorkspace:
         object.__setattr__(
             self,
             "metadata",
-            copy_durable_json_object(self.metadata, "metadata"),
+            copy_durable_metadata(self.metadata),
         )
         if self.snapshot is not None and type(self.snapshot) is not WorkspaceSnapshot:
             raise TypeError("BoundWorkspace snapshot must be a WorkspaceSnapshot or None.")
@@ -2617,7 +2618,7 @@ class SyncBinding(WorkspaceBinding):
         raw_metadata = state.get("metadata")
         if type(raw_metadata) is not dict:
             raise ValueError("SyncBinding recovery metadata must be an object.")
-        bound_metadata = copy_durable_json_object(raw_metadata, "SyncBinding recovery metadata")
+        bound_metadata = copy_durable_metadata(raw_metadata, "SyncBinding recovery metadata")
         durable_config = bound_metadata.get("sync_binding")
         if type(durable_config) is not dict:
             raise ValueError("SyncBinding recovery metadata lost its binding policy.")

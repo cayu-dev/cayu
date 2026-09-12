@@ -84,7 +84,9 @@ from cayu._validation import (
     compact_json_utf8_size,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
     copy_label_map,
+    copy_session_metadata,
     json_utf8_size_within_limit,
     require_durable_json_text,
 )
@@ -105,6 +107,7 @@ from cayu.core.events import (
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
+    validate_event_envelope,
 )
 from cayu.core.messages import (
     Message,
@@ -1416,12 +1419,10 @@ def is_runtime_owned_session_metadata_key(key: str) -> bool:
 def copy_session_user_metadata(replacement: dict[str, Any]) -> dict[str, Any]:
     """Validate and detach a complete user-authored metadata replacement."""
 
-    copied_replacement = copy_durable_json_object(replacement, "metadata")
+    copied_replacement = copy_durable_metadata(replacement)
     for key in copied_replacement:
         if is_runtime_owned_session_metadata_key(key):
-            raise ValueError(
-                f"Session metadata key {key!r} is runtime-owned and cannot be replaced."
-            )
+            raise ValueError("Session metadata contains a runtime-owned key.")
     return copied_replacement
 
 
@@ -1458,11 +1459,9 @@ def replace_session_user_metadata(
     if any(is_runtime_owned_session_metadata_key(key) for key in replacement):
         raise ValueError("Session user metadata replacement contains a runtime-owned key.")
     runtime_metadata = {
-        key: copy_durable_json_value(value, "current_metadata")
-        for key, value in current.items()
-        if is_runtime_owned_session_metadata_key(key)
+        key: value for key, value in current.items() if is_runtime_owned_session_metadata_key(key)
     }
-    return {**replacement, **runtime_metadata}
+    return copy_session_metadata({**replacement, **runtime_metadata})
 
 
 def session_model_projection_cursor(session: Session) -> int:
@@ -1712,7 +1711,7 @@ class RunRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "metadata")
+        copied = copy_durable_metadata(value)
         reserved_key = next(
             (
                 key
@@ -1979,7 +1978,7 @@ class ResumeRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "metadata")
+        copied = copy_durable_metadata(value)
         if EXECUTION_DEADLINE_METADATA_KEY in copied:
             raise ValueError("Session metadata contains runtime-owned deadline authority.")
         return copied
@@ -3087,7 +3086,7 @@ class _InvocationTerminalEventReceipt(BaseModel):
 
 
 class InterruptSessionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
     reason: str | None = None
@@ -3097,7 +3096,7 @@ class InterruptSessionRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value)
 
     @field_validator("session_id")
     @classmethod
@@ -3261,7 +3260,7 @@ class ForkSessionRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "metadata")
+        copied = copy_durable_metadata(value)
         reserved_authority_kinds = {
             EXECUTION_DEADLINE_METADATA_KEY: "execution-deadline authority",
             MODEL_TARGET_PROJECTION_METADATA_KEY: "model-target authority",
@@ -4095,7 +4094,7 @@ class Session(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_session_metadata(value)
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -4915,7 +4914,9 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
             # Retained authority therefore remains attached only to current-schema
             # ordinary state.
             assert updated[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
-    return updated
+    # Restored private authority counts toward the same complete document
+    # ceiling as the callback's ordinary state, before either side is written.
+    return copy_durable_json_object(updated, "checkpoint")
 
 
 def _copy_checkpoint_for_transform(
@@ -7773,7 +7774,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
 
 
 class IncompleteSessionRecoveryRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
     inactive_for_seconds: StrictInt | None = Field(
@@ -7792,13 +7793,13 @@ class IncompleteSessionRecoveryRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value)
 
 
 class IncompleteSessionsRecoveryRequest(BaseModel):
     """Select and bound one resumable incomplete-session recovery page."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     statuses: set[SessionStatus]
     limit: StrictInt = Field(default=100, ge=1, le=1000)
@@ -7864,7 +7865,7 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value)
 
 
 class IncompleteSessionRecoveryResult(BaseModel):
@@ -21381,7 +21382,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         tool_grants=validate_targeted_tool_grants(request.tool_grants),
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
@@ -22055,7 +22056,7 @@ def strip_runtime_session_create_claim_before_redaction(request: RunRequest) -> 
         or record.get("claim_id") != claim.claim_id
     ):
         raise ValueError("Session create claim metadata is runtime-owned.")
-    metadata = copy_durable_json_object(request.metadata, "metadata")
+    metadata = copy_durable_metadata(request.metadata)
     metadata.pop(SESSION_CREATE_CLAIM_METADATA_KEY)
     prepared = request.model_copy(update={"metadata": metadata})
     prepared._runtime_session_create_claim = claim
@@ -22079,7 +22080,7 @@ def apply_runtime_session_create_claim(request: RunRequest) -> RunRequest:
         copied._runtime_session_create_claim = None
         return copied
     copied = copy_run_request(request)
-    metadata = copy_durable_json_object(copied.metadata, "metadata")
+    metadata = copy_durable_metadata(copied.metadata)
     previous_record = metadata.pop(SESSION_CREATE_CLAIM_METADATA_KEY, None)
     request_without_claim = copied.model_copy(update={"metadata": metadata})
     request_sha256 = sha256(
@@ -22747,7 +22748,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
             if request.profile_adoption is None
             else copy_execution_profile_adoption_intent(request.profile_adoption)
         ),
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
@@ -22791,14 +22792,14 @@ def _with_runtime_resume_transport_metadata(
     """Detach and attest exact server-owned tracing metadata as transport-only input."""
 
     copied = copy_resume_request(request)
-    owned_metadata = copy_durable_json_object(metadata, "transport_metadata")
+    owned_metadata = copy_durable_metadata(metadata, "transport_metadata")
     if not owned_metadata:
         copied._runtime_transport_metadata_authority = None
         return copied
     if any(key not in _RUNTIME_RESUME_TRANSPORT_METADATA_KEYS for key in owned_metadata):
         raise ValueError("Runtime resume transport metadata contains an unsupported field.")
     values: list[tuple[str, str]] = []
-    semantic_metadata = copy_durable_json_object(copied.metadata, "metadata")
+    semantic_metadata = copy_durable_metadata(copied.metadata)
     for key in sorted(owned_metadata):
         value = owned_metadata[key]
         if type(value) is not str or semantic_metadata.get(key) != value:
@@ -22931,7 +22932,7 @@ def copy_interrupt_session_request(request: InterruptSessionRequest) -> Interrup
     return InterruptSessionRequest(
         session_id=request.session_id,
         reason=request.reason,
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         requested_by=copy_resolution_actor(request.requested_by),
     )
 
@@ -22945,7 +22946,7 @@ def copy_incomplete_session_recovery_request(
         session_id=request.session_id,
         inactive_for_seconds=request.inactive_for_seconds,
         reason=request.reason,
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
     )
 
 
@@ -22963,7 +22964,7 @@ def copy_incomplete_sessions_recovery_request(
         cursor=request.cursor,
         inactive_for_seconds=request.inactive_for_seconds,
         reason=request.reason,
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
     )
 
 
@@ -22999,7 +23000,7 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
             else copy_resume_request(request.initial_invocation)
         ),
         initial_dispatch_id=request.initial_dispatch_id,
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
     )
     return copied
 
@@ -23064,7 +23065,7 @@ def copy_session(session: Session) -> Session:
         run_epoch=session.run_epoch,
         invocation=copy_session_invocation(session.invocation),
         labels=copy_label_map(session.labels, "labels"),
-        metadata=copy_durable_json_object(session.metadata, "metadata"),
+        metadata=copy_session_metadata(session.metadata),
     )
 
 
@@ -23165,7 +23166,7 @@ def session_metadata_for_creation(
 ) -> dict[str, Any]:
     """Combine caller metadata with runtime-owned creation authority."""
 
-    copied = copy_durable_json_object(metadata, "metadata")
+    copied = copy_durable_metadata(metadata)
     if EXECUTION_DEADLINE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned deadline authority.")
     boundary = effective_deadline(
@@ -23222,7 +23223,7 @@ def session_metadata_for_creation(
             copied,
             tool_capability_ceiling,
         )
-    return copied
+    return copy_session_metadata(copied)
 
 
 def runtime_build_provenance_from_session_metadata(
@@ -29463,6 +29464,7 @@ def _copy_event_for_session_store(event: Event) -> Event:
     """Strip caller-authored durable authority before persistence."""
 
     copied = copy_event(event)
+    validate_event_envelope(copied)
     authority_fields = _persisted_event_authority_fields(copied.type)
     if not authority_fields:
         return copied

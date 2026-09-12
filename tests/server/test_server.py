@@ -13286,67 +13286,6 @@ def test_replay_streams_complete_history_in_bounded_pages() -> None:
     assert event_frames[-1]["data"]["id"] == public_event_id(event_count + 2)
 
 
-def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly() -> None:
-    app = CayuApp()
-
-    async def seed() -> None:
-        await app.session_store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="session_large_replay",
-                messages=[Message.text("user", "hello")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
-        await app.session_store.append_events(
-            "session_large_replay",
-            [
-                Event(
-                    id="event_seen",
-                    type=EventType.SESSION_STARTED,
-                    session_id="session_large_replay",
-                    agent_name="assistant",
-                ),
-                Event(
-                    id="event_large",
-                    type="custom.large",
-                    session_id="session_large_replay",
-                    agent_name="assistant",
-                    payload={"value": "x" * SSE_EVENT_DATA_MAX_BYTES},
-                ),
-            ],
-        )
-        await app.session_store.update_status("session_large_replay", SessionStatus.INTERRUPTED)
-
-    asyncio.run(seed())
-    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
-
-    with client.stream(
-        "POST",
-        "/api/run",
-        json={"prompt": "ignored during replay"},
-        headers={"Last-Event-ID": "session_large_replay:event_seen"},
-    ) as response:
-        assert response.status_code == 200
-        frames = _sse_frames(response)
-
-    assert len(frames) == 1
-    assert frames[0]["event"] == "error"
-    assert frames[0]["data"]["kind"] == "observer"
-    assert frames[0]["data"]["code"] == "event_frame_too_large"
-    assert frames[0]["data"]["retryable"] is False
-
-    async def load_large_event() -> Event:
-        records = await app.session_store.query_events(
-            EventQuery(session_id="session_large_replay", event_id="event_large", limit=1)
-        )
-        assert len(records) == 1
-        return records[0].event
-
-    durable_event = asyncio.run(load_large_event())
-    assert len(cast("str", durable_event.payload["value"])) == SSE_EVENT_DATA_MAX_BYTES
-
-
 @pytest.mark.parametrize(
     ("path", "body"),
     [

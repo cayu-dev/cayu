@@ -9,6 +9,7 @@ from pydantic import SecretStr
 
 from cayu._validation import (
     copy_durable_json_object,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_durable_clean_nonblank,
     require_nonblank,
@@ -76,7 +77,7 @@ class SecretsManagerVault(Vault):
                     raise ValueError(f"Metadata provided for unknown secret: {logical_name}")
                 if not isinstance(value, Mapping):
                     raise TypeError("SecretsManagerVault metadata values must be mappings.")
-                self._metadata[logical_name] = copy_durable_json_object(
+                self._metadata[logical_name] = copy_durable_metadata(
                     dict(value),
                     "metadata",
                 )
@@ -104,6 +105,7 @@ class SecretsManagerVault(Vault):
             raise VaultError(
                 f"Secret reference handle does not match configured target: {logical_name}"
             )
+        metadata = self._metadata_for(logical_name, scope)
         client = await self._get_client()
         try:
             response = await asyncio.to_thread(
@@ -127,7 +129,6 @@ class SecretsManagerVault(Vault):
         except ValueError as exc:
             raise SecretNotFound(f"Secret value is blank: {logical_name}") from exc
 
-        metadata = self._metadata_for(logical_name, scope)
         arn = response.get("ARN")
         if type(arn) is str and arn.strip():
             metadata["secret_arn"] = arn
@@ -155,11 +156,11 @@ class SecretsManagerVault(Vault):
         name: str,
         scope: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        metadata = copy_durable_json_object(self._metadata.get(name, {}), "metadata")
+        metadata = copy_durable_metadata(self._metadata.get(name, {}), "metadata")
         metadata["provider"] = "aws-secrets-manager"
         if scope:
             metadata["scope"] = copy_durable_json_object(scope, "scope")
-        return metadata
+        return copy_durable_metadata(metadata, "metadata")
 
     async def _get_client(self) -> Any:
         if self._client is not None:

@@ -442,6 +442,7 @@ def _run_tool_result(
     store: LocalArtifactStore | None = None,
     secret_redactor: SecretRedactor | None = None,
     structured: dict[str, Any] | None = None,
+    runtime_hooks: list[Any] | None = None,
 ) -> tuple[
     CayuApp,
     LocalArtifactStore,
@@ -480,6 +481,7 @@ def _run_tool_result(
         enable_logging=False,
         secret_redactor=secret_redactor,
         tool_result_projection_policy=policy,
+        runtime_hooks=runtime_hooks or [],
     )
     app.register_provider(provider, default=True)
     app.register_environment(
@@ -846,6 +848,181 @@ def test_cayu_app_keeps_below_threshold_result_durable_and_model_visible(tmp_pat
     ).content[0]
     assert transcript_result.content == provider_result.content == original
     assert asyncio.run(store.list(session_id="sess_runtime_projection")).artifacts == ()
+
+
+@pytest.mark.parametrize("externalize", [False, True])
+def test_runtime_large_tool_result_is_settled_before_durable_event_admission(
+    tmp_path, externalize: bool
+) -> None:
+    content = "x" * (3 * 1024 * 1024)
+    policy = ArtifactExternalizingToolResultPolicy(max_inline_bytes=256) if externalize else None
+    app, store, provider, tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content=content,
+        policy=policy,
+        structured={"receipt_id": "accepted-effect-receipt"},
+    )
+    assert tool.calls == 1
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    terminal = next(
+        event
+        for event in events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    )
+    if externalize:
+        projection = terminal.payload["tool_result_projection"]
+        assert projection["status"] == "externalized"
+        artifact = asyncio.run(store.read_bytes(projection["artifact_id"]))
+        assert artifact.content.decode() == content
+        assert terminal.payload["result"]["structured"]["receipt_id"] == "accepted-effect-receipt"
+    else:
+        assert terminal.type == EventType.TOOL_CALL_FAILED
+        assert terminal.payload["result"]["is_error"] is True
+        assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
+        assert "accepted-effect-receipt" in json.dumps(terminal.payload)
+    durable = asyncio.run(app.session_store.load_events("sess_runtime_projection"))
+    assert all(len(event.model_dump_json().encode()) <= 2 * 1024 * 1024 for event in durable)
+    assert len(provider.requests) == 2
+
+
+@pytest.mark.parametrize("content_bytes", [1024, 3 * 1024 * 1024])
+def test_modifying_hook_sees_original_result_before_projection(tmp_path, content_bytes) -> None:
+    from cayu import AfterToolCallDecision, RuntimeHook
+
+    content = "x" * content_bytes
+    observed: list[str] = []
+
+    class ShrinkingHook(RuntimeHook):
+        async def after_tool_call(self, context: Any) -> AfterToolCallDecision:
+            observed.append(context.result.content)
+            return AfterToolCallDecision(
+                action="modify", modified_result=ToolResult(content="hook summary")
+            )
+
+    app, store, provider, tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content=content,
+        policy=ArtifactExternalizingToolResultPolicy(max_inline_bytes=256),
+        runtime_hooks=[ShrinkingHook()],
+    )
+    assert observed == [content]
+    assert tool.calls == 1
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    terminal = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    assert terminal.payload["result"]["content"] == "hook summary"
+    assert terminal.payload["tool_result_projection"]["status"] == "unchanged"
+    assert not asyncio.run(store.list(session_id="sess_runtime_projection")).artifacts
+    durable = asyncio.run(app.session_store.load_events("sess_runtime_projection"))
+    assert all(len(event.model_dump_json().encode()) <= 2 * 1024 * 1024 for event in durable)
+    assert len(provider.requests) == 2
+
+
+def test_runtime_retains_artifact_evidence_when_projected_envelope_is_too_large(tmp_path) -> None:
+    content = "body" * 1000
+    app, store, provider, tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content=content,
+        policy=ArtifactExternalizingToolResultPolicy(max_inline_bytes=256),
+        structured={"receipt_id": "effect-receipt", "large": "x" * (3 * 1024 * 1024)},
+    )
+    assert tool.calls == 1
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
+    evidence = terminal.payload["result"]["structured"]["portable_result_evidence"]
+    projection = evidence["projection_evidence"]
+    assert projection["status"] == "externalized"
+    assert asyncio.run(store.read_bytes(projection["artifact_id"])).content.decode() == content
+    assert "effect-receipt" in json.dumps(evidence)
+    assert len(provider.requests) == 2
+    assert len(asyncio.run(app.session_store.load_events("sess_runtime_projection"))) > 0
+
+
+@pytest.mark.parametrize("cancellation_count", [1, 2])
+def test_cancellation_after_artifact_commit_preserves_oversize_projection_evidence(
+    tmp_path,
+    cancellation_count,
+) -> None:
+    async def run() -> None:
+        inner = ArtifactExternalizingToolResultPolicy(max_inline_bytes=256)
+        ready = asyncio.Event()
+        release = asyncio.Event()
+        projections: list[ToolResultProjection] = []
+
+        class PausedProjection(ToolResultProjectionPolicy):
+            @property
+            def identity(self) -> str:
+                return inner.identity
+
+            async def project(self, request):
+                projection = await inner.project(request)
+                projections.append(projection)
+                ready.set()
+                await release.wait()
+                return projection
+
+        store = LocalArtifactStore(
+            tmp_path / "cancelled-projection", store_id="cancelled-projection"
+        )
+        tool = _ResultTool(
+            ToolResult(
+                content="committed artifact body" * 100,
+                structured={"receipt_id": "effect-receipt", "large": "x" * (3 * 1024 * 1024)},
+            )
+        )
+        provider = _FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(id="call_result", name="result_tool", arguments={}),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        app = CayuApp(enable_logging=False, tool_result_projection_policy=PausedProjection())
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), artifact_store=store),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+        task = asyncio.create_task(
+            _collect(
+                app.run(
+                    RunRequest(
+                        session_id="cancelled-oversize-projection",
+                        agent_name="assistant",
+                        messages=[Message.text("user", "run")],
+                    )
+                )
+            )
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=15)
+            for _ in range(cancellation_count):
+                task.cancel()
+            assert task.cancelling() == cancellation_count
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+            assert task.cancelling() == cancellation_count
+            assert tool.calls == 1 and len(projections) == 1
+            artifact_id = projections[0].record.artifact_id
+            assert artifact_id is not None
+            assert (await store.read_bytes(artifact_id)).content.startswith(
+                b"committed artifact body"
+            )
+            events = await app.session_store.load_events("cancelled-oversize-projection")
+            checkpoint = await app.session_store.load_checkpoint("cancelled-oversize-projection")
+            assert artifact_id in repr((checkpoint, [event.payload for event in events]))
+            assert len(provider.requests) == 1
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_cayu_app_externalizes_after_redaction_before_terminal_publication(tmp_path) -> None:

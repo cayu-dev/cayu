@@ -114,6 +114,7 @@ from cayu.core import (
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import (
+    event_durable_envelope,
     event_payload_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
     event_with_runtime_payload_authority,
@@ -13398,6 +13399,216 @@ def test_durable_queue_and_compaction_validation_does_not_echo_rejected_input(fa
     assert durable_error is not None
     assert durable_error.code == "nul_character"
     assert "workload-secret-value" not in str(raised.value)
+
+
+@pytest.mark.parametrize("lose_acknowledgement", [False, True])
+def test_session_store_conformance_uncertain_output_evidence(
+    session_store_case, monkeypatch, lose_acknowledgement
+) -> None:
+    from tests.core.test_tool_effect_state import _intent
+
+    from cayu.runtime._tool_effect_state import ToolEffectConflict, ToolEffectStateOwner
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            intent = await _intent(store)
+            owner = ToolEffectStateOwner(store)
+            executing = await owner.begin(intent, run_epoch=0)
+            session = await store.load(intent.session_id)
+            assert session is not None
+            evidence = {"portable_result_evidence": {"receipt_id": "unverified-effect-receipt"}}
+            original_publish = store.publish_session_operation
+            armed = lose_acknowledgement
+
+            async def publish(*args, **kwargs):
+                nonlocal armed
+                result = await original_publish(*args, **kwargs)
+                if armed:
+                    armed = False
+                    raise OSError("publication acknowledgement lost")
+                return result
+
+            monkeypatch.setattr(store, "publish_session_operation", publish)
+            assert await owner.preserve_unresolved(
+                session,
+                tool_round_id=intent.tool_round_id,
+                tool_call_ids=(intent.tool_call_id,),
+                unverified_output=evidence,
+            )
+            evidence["portable_result_evidence"]["receipt_id"] = "caller mutation"
+            restored = await ToolEffectStateOwner(store).load(intent)
+            assert restored is not None
+            assert restored.state == "outcome_unknown"
+            assert restored.terminal is None and restored.observation is None
+            assert restored.unverified_output == {
+                "portable_result_evidence": {"receipt_id": "unverified-effect-receipt"}
+            }
+            events = await store.load_events(intent.session_id)
+            assert len(events) == 1
+            assert events[0].payload["unverified_output"] == restored.unverified_output
+            assert await owner.preserve_unresolved(
+                session,
+                tool_round_id=intent.tool_round_id,
+                tool_call_ids=(intent.tool_call_id,),
+                unverified_output=restored.unverified_output,
+            )
+            with pytest.raises(ToolEffectConflict):
+                await owner.preserve_unresolved(
+                    session,
+                    tool_round_id=intent.tool_round_id,
+                    tool_call_ids=(intent.tool_call_id,),
+                    unverified_output=evidence,
+                )
+            with pytest.raises(ToolEffectConflict):
+                await owner.begin(intent, run_epoch=0)
+            with pytest.raises(ToolEffectConflict):
+                await owner.transition(
+                    executing,
+                    state="outcome_unknown",
+                    run_epoch=0,
+                    unverified_output={"receipt_id": "conflicting receipt"},
+                )
+            assert await owner.load(intent) == restored
+            assert len(await store.load_events(intent.session_id)) == 1
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_oversize_checkpoint_preserves_transcript(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "checkpoint-size-contract"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create")],
+                ),
+                identity=_identity(),
+            )
+            stable = {"stable": True}
+            await store.checkpoint(session_id, stable)
+            before = await store.load(session_id)
+            oversized = {"value": "x" * (16 * 1024 * 1024)}
+            with pytest.raises(DurableValueError) as caught:
+                await store.append_transcript_messages_and_transform_checkpoint(
+                    session_id,
+                    [Message.text("assistant", "must not append")],
+                    lambda _session, _checkpoint: oversized,
+                )
+            assert caught.value.dimension == "bytes"
+            assert caught.value.limit == 16 * 1024 * 1024
+            assert await store.load_checkpoint(session_id) == stable
+            assert await store.load_transcript(session_id) == []
+            assert await store.load_events(session_id) == []
+            assert await store.load(session_id) == before
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_event_envelope_size_is_atomic(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "event-size-contract"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(type="custom.size", session_id=session_id, payload={"value": ""})
+            overhead = len(
+                json.dumps(
+                    event_durable_envelope(event), ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            remaining = 2 * 1024 * 1024 - overhead
+            event.payload["value"] = "€" * (remaining // 3) + "x" * (remaining % 3)
+            await store.append_event(session_id, event)
+            stored = await store.load_events(session_id)
+            assert len(stored) == 1
+            assert stored[0].payload == event.payload
+            from cayu.server.sse import event_to_sse_message
+
+            assert len(event_to_sse_message(stored[0])["data"].encode("utf-8")) <= 2 * 1024 * 1024
+            bad = event.model_copy(deep=True)
+            bad.payload["value"] += "x"
+            good = Event(type="custom.size", session_id=session_id)
+            with pytest.raises((DurableValueError, ValidationError)) as caught:
+                await store.append_events(session_id, [good, bad])
+            error = extract_durable_value_error(caught.value)
+            assert error is not None
+            assert error.field_name == "event"
+            assert error.dimension == "bytes"
+            assert error.limit == 2 * 1024 * 1024
+            assert error.observed_lower_bound == error.limit + 1
+            assert await store.load_events(session_id) == stored
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_annotation_size_limits_are_atomic(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "annotation-size-contract"
+            limit = 256 * 1024
+            overhead = len(json.dumps({"value": ""}, separators=(",", ":")).encode())
+            exact = {"value": "x" * (limit - overhead)}
+            labels = {f"label-{index}": "value" for index in range(200)}
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create")],
+                    metadata=exact,
+                    labels=labels,
+                ),
+                identity=_identity(),
+            )
+            before = await store.load(session_id)
+            assert before is not None
+            assert before.labels == labels
+            assert sessions_module.session_user_metadata(before.metadata) == exact
+            with pytest.raises(DurableValueError) as metadata_error:
+                await store.update_metadata(session_id, {"value": exact["value"] + "x"})
+            assert metadata_error.value.limit == limit
+            assert metadata_error.value.observed_lower_bound == limit + 1
+            with pytest.raises(DurableValueError) as labels_error:
+                await store.update_labels(session_id, {**labels, "extra": "value"})
+            assert labels_error.value.dimension == "entries"
+            assert labels_error.value.limit == 200
+            after = await store.load(session_id)
+            assert after == before
+            assert await store.load_events(session_id) == []
+
+            # Post-construction mutation must not bypass the direct store boundary.
+            invalid = RunRequest(
+                agent_name="assistant",
+                session_id="oversize-create",
+                messages=[Message.text("user", "create")],
+            )
+            invalid.metadata = {"value": exact["value"] + "x"}
+            with pytest.raises((DurableValueError, ValidationError)):
+                await store.create(invalid, identity=_identity())
+            assert await store.load("oversize-create") is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_revalidates_all_mutable_durable_inputs_atomically(

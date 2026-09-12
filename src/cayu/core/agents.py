@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cayu._validation import (
     copy_durable_json_object,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_durable_text,
 )
@@ -63,6 +64,8 @@ class AgentSpec(BaseModel):
     @field_validator("metadata", "provider_options", mode="before")
     @classmethod
     def copy_json_mapping(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value, "metadata")
         return copy_durable_json_object(value, info.field_name)
 
     @field_validator("name", "model")

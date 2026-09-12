@@ -98,7 +98,12 @@ def test_child_recovery_arguments_are_private_bound_and_reconstructed(
             arguments["task"] = "caller mutation"
             assert executing.child_recovery_arguments is not None
             assert executing.child_recovery_arguments["task"] == task
-            unknown = await owner.transition(executing, state="outcome_unknown", run_epoch=0)
+            unknown = await owner.transition(
+                executing,
+                state="outcome_unknown",
+                run_epoch=0,
+                unverified_output={"receipt_id": "observed-not-validated"},
+            )
             assert unknown.child_recovery_arguments == executing.child_recovery_arguments
             assert "private-child-task-canary" not in repr(
                 await store.load_events(intent.session_id)
@@ -123,6 +128,7 @@ def test_child_recovery_arguments_are_private_bound_and_reconstructed(
                 events=(event,),
             )
             assert completed.child_recovery_arguments == executing.child_recovery_arguments
+            assert completed.unverified_output == {"receipt_id": "observed-not-validated"}
             assert "private-child-task-canary" not in repr(
                 await store.load_events(intent.session_id)
             )

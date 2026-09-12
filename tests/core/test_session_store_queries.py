@@ -48,7 +48,6 @@ from cayu.runtime.pending_actions import (
 )
 from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
-    MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_SESSION_ID_BYTES,
     MAX_SESSION_LIST_CURSOR_BYTES,
     PendingActionKind,
@@ -292,71 +291,6 @@ def test_event_query_requires_attempt_scope_for_workflow_step() -> None:
             workflow_step_id="step",
             event_type=EventType.WORKFLOW_STEP_STARTED,
         )
-
-
-def test_pending_action_event_projection_rejects_oversized_selected_payload() -> None:
-    event = Event(
-        type=EventType.SESSION_INTERRUPTED,
-        session_id="oversized_pending_action_projection",
-        payload={
-            "approval_id": "oversized_approval",
-            "error": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
-        },
-    )
-
-    lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
-
-    assert lookup_key == pending_action_lookup_key("oversized_approval")
-    assert projection is not None
-    assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
-    projected_event = Event.model_validate_json(projection)
-    assert projected_event.payload == {
-        "__cayu_pending_action_projection_bytes__": (MAX_PENDING_ACTION_RESULT_BYTES + 1)
-    }
-
-    oversized_identifier = Event(
-        type=EventType.SESSION_INTERRUPTED,
-        session_id="oversized_pending_action_identifier",
-        payload={"approval_id": "x" * (MAX_PENDING_ACTION_RESULT_BYTES + 1)},
-    )
-
-    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
-        oversized_identifier
-    )
-
-    assert lookup_key == pending_action_lookup_key("x" * (MAX_PENDING_ACTION_RESULT_BYTES + 1))
-    assert len(lookup_key) == 64
-    assert projection is not None
-    assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
-    projected_identifier_event = Event.model_validate_json(projection)
-    assert projected_identifier_event.payload == {
-        "__cayu_pending_action_projection_bytes__": (MAX_PENDING_ACTION_RESULT_BYTES + 1)
-    }
-
-
-def test_oversized_pending_ledger_projection_retains_bounded_execution_identity() -> None:
-    identity = _tool_round_identity_payload()
-    event = Event(
-        type=EventType.TOOL_CALL_STARTED,
-        session_id="oversized_pending_ledger_projection",
-        payload={
-            **identity,
-            "tool_call_id": "oversized_pending_ledger_call",
-            "manual_recovery": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
-        },
-    )
-
-    lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
-
-    assert lookup_key == pending_action_lookup_key("oversized_pending_ledger_call")
-    assert projection is not None
-    assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
-    projected_event = Event.model_validate_json(projection)
-    assert projected_event.payload == {
-        **identity,
-        "__cayu_pending_action_projection_bytes__": (MAX_PENDING_ACTION_RESULT_BYTES + 1),
-    }
-    assert len(projection.encode("utf-8")) < 1024
 
 
 def test_pending_approval_projection_retains_direct_execution_identity() -> None:
@@ -1462,7 +1396,7 @@ def test_session_stores_preserve_and_filter_session_labels(
 
 
 def test_session_labels_are_strict_clean_string_maps():
-    with pytest.raises(ValidationError, match="labels.bad"):
+    with pytest.raises(ValidationError, match="labels.*values must be strings"):
         RunRequest(
             agent_name="assistant",
             session_id="sess_bad_label_value",

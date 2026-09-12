@@ -7,6 +7,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import (
     copy_durable_json_value,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
@@ -103,6 +104,8 @@ class ToolRoundRecoveryRequest(BaseModel):
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
@@ -149,7 +152,7 @@ def copy_tool_round_recovery_request(
         structured=copy_durable_json_value(request.structured, "structured"),
         artifacts=copy_durable_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
-        metadata=copy_durable_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,

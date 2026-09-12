@@ -1285,7 +1285,7 @@ def test_offline_recovery_context_is_bounded_before_stage_storage() -> None:
         ModelCompletionRecoveryContext.model_validate(
             {"budget_limits": [None] * (MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS + 1)}
         )
-    with pytest.raises(ValidationError, match="exceeds the durable byte limit"):
+    with pytest.raises(ValidationError, match="configured encoded JSON byte limit"):
         ModelCompletionRecoveryContext(
             request_metadata={"payload": "x" * MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES}
         )

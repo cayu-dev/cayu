@@ -31,6 +31,8 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
+    copy_durable_record,
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -795,7 +797,7 @@ class ContextRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("context_usage")
     @classmethod
@@ -1467,7 +1469,9 @@ class ContextBuildResult(BaseModel):
     def copy_optional_json_data(cls, value, info):
         if value is None:
             return None
-        return copy_json_value(value, info.field_name)
+        if info.field_name == "checkpoint":
+            return copy_durable_record(value, "checkpoint")
+        return copy_durable_record(value, info.field_name)
 
 
 def clear_context_build_result_payload(result: ContextBuildResult) -> None:
@@ -1577,7 +1581,9 @@ class ContextBuildError(RuntimeError):
             copy_context_recall_telemetry(item)
             for item in ([] if recall_telemetry is None else recall_telemetry)
         )
-        self.checkpoint = None if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        self.checkpoint = (
+            None if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+        )
         self.checkpoint_event_payload = (
             None
             if checkpoint_event_payload is None
@@ -1919,7 +1925,9 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
         *,
         checkpoint: dict[str, Any] | None,
     ) -> ContextBuildResult:
-        checkpoint_state = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint_state = (
+            {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+        )
         previous = _usage_triggered_checkpoint(checkpoint_state)
         already_triggered = self.sticky and previous is not None
         threshold_triggered = self._actual_usage_is_triggered(request)
@@ -1989,9 +1997,9 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
             return result
 
         checkpoint_update = (
-            copy_json_value(result.checkpoint, "checkpoint")
+            copy_durable_record(result.checkpoint, "checkpoint")
             if result.checkpoint is not None
-            else copy_json_value(checkpoint_state, "checkpoint")
+            else copy_durable_record(checkpoint_state, "checkpoint")
         )
         checkpoint_update[_USAGE_TRIGGERED_CHECKPOINT_KEY] = marker
         checkpoint_event_payload = result.checkpoint_event_payload
@@ -3043,7 +3051,7 @@ class ModelCompactor(ContextCompactor):
         if bounded_prompt is None:
             with _compaction_dispatch_counter_scope(max_hierarchy_calls) as dispatch_counter:
                 result = await self._compact_oversized_atomic_unit(request)
-            metadata = copy_json_value(result.metadata, "metadata")
+            metadata = copy_durable_metadata(result.metadata)
             metadata["hierarchy_dispatch_count"] = dispatch_counter.count
             return result.model_copy(
                 update={
@@ -4175,7 +4183,7 @@ class PromptCacheCompactor(ContextCompactor):
             model=model,
             identity=identity,
         )
-        bounded_metadata = copy_json_value(bounded_result.metadata, "bounded_metadata")
+        bounded_metadata = copy_durable_metadata(bounded_result.metadata, "bounded_metadata")
         bounded_metadata["prompt_cache_exact_attempt"] = exact_attempt
         return CompactionResult(
             summary=bounded_result.summary,
@@ -4246,7 +4254,7 @@ def _compaction_completion_observer(
     )
 
     def observe(completed_metadata: dict[str, Any]) -> dict[str, Any]:
-        observed_metadata = copy_json_value(completed_metadata, "completed_metadata")
+        observed_metadata = copy_durable_metadata(completed_metadata, "completed_metadata")
         # This correlation key is runtime-owned; provider metadata cannot select or
         # overwrite another compaction attempt's ledger entry.
         observed_metadata.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
@@ -5240,7 +5248,7 @@ def _provider_compaction_result(
             "compactor": compactor,
             "provider": provider_name,
             "model": model,
-            **copy_json_value(metadata, "metadata"),
+            **copy_durable_metadata(metadata),
             "completed": public_completed_metadata,
         },
         model_completed_payloads=[model_completed_payload],
@@ -5640,7 +5648,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         *,
         checkpoint: dict[str, Any] | None,
     ) -> ContextBuildResult:
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         previous = _compaction_checkpoint(checkpoint)
         previous_summary = previous.get("summary") if previous is not None else None
         previous_progress = (
@@ -5955,12 +5963,12 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 )
                 for payload in completed_payloads
             )
-            checkpoint_update = copy_json_value(checkpoint, "checkpoint")
+            checkpoint_update = copy_durable_record(checkpoint, "checkpoint")
             compaction_checkpoint = {
                 "version": _COMPACTION_CHECKPOINT_VERSION,
                 "summary": summary,
                 "compacted_transcript_cursor": represented_cursor,
-                "metadata": copy_json_value(result.metadata, "metadata"),
+                "metadata": copy_durable_metadata(result.metadata),
             }
             if result.progress_exhausted:
                 compaction_checkpoint[_COMPACTION_PROGRESS_STATE_KEY] = {
@@ -6567,7 +6575,7 @@ def _runtime_authored_user_message_checkpoint_transform(
         updated: dict[str, Any] = (
             {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
             if checkpoint is None
-            else copy_json_value(checkpoint, "checkpoint")
+            else copy_durable_record(checkpoint, "checkpoint")
         )
         updated[RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY] = {
             "anchor_transcript_index": anchor_index,
@@ -6813,7 +6821,7 @@ def project_runtime_managed_context_checkpoint(
 
     if checkpoint is None:
         return None
-    projected = copy_json_value(checkpoint, "checkpoint")
+    projected = copy_durable_record(checkpoint, "checkpoint")
     projected.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     projected.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
     projected.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)

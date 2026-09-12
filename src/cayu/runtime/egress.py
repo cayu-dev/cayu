@@ -39,6 +39,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
+    copy_durable_metadata,
     copy_json_value,
     require_clean_nonblank,
 )
@@ -371,7 +372,7 @@ def _parse_reconnect_metadata(
             "The application must explicitly rebuild the environment."
         )
     assert identity is not None
-    return copy_json_value(identity, "reconnect_metadata.identity")
+    return copy_durable_metadata(identity, "reconnect_metadata.identity")
 
 
 def _build_reconnect_metadata(
@@ -405,7 +406,7 @@ def _build_reconnect_metadata(
         raise InvalidEgressReconnectMetadataError(
             f"Runner {runner_kind!r} declared reconnect support without durable identity."
         )
-    copied_identity = copy_json_value(identity, "adapter reconnect metadata")
+    copied_identity = copy_durable_metadata(identity, "adapter reconnect metadata")
     _reject_replayable_authority(copied_identity)
     return {
         **common,

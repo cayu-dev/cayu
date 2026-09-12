@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_metadata, require_clean_nonblank
 from cayu.vaults import ResolvedSecret, SecretRef
 
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ class ProxyAuthorizationResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @model_validator(mode="after")
     def require_reason_for_denial(self) -> ProxyAuthorizationResult:
@@ -90,5 +90,5 @@ def copy_proxy_authorization_result(
     return ProxyAuthorizationResult(
         allowed=result.allowed,
         reason=result.reason,
-        metadata=copy_json_value(result.metadata, "metadata"),
+        metadata=copy_durable_metadata(result.metadata, "metadata"),
     )

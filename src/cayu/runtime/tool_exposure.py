@@ -23,6 +23,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    copy_session_metadata,
     freeze_json_value,
     require_durable_clean_nonblank,
     require_durable_text,
@@ -377,11 +378,11 @@ def session_metadata_with_tool_capability_ceiling(
 ) -> dict[str, Any]:
     """Copy metadata and set exact runtime-owned ceiling authority."""
 
-    copied = copy_durable_json_object(metadata, "session.metadata")
+    copied = copy_session_metadata(metadata)
     copied[TOOL_CAPABILITY_CEILING_METADATA_KEY] = copy_tool_capability_ceiling(ceiling).model_dump(
         mode="json"
     )
-    return copy_durable_json_object(copied, "session.metadata")
+    return copy_session_metadata(copied)
 
 
 def session_metadata_after_tool_capability_ceiling_narrowing(

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from cayu._validation import copy_durable_json_object, require_nonblank
+from cayu._validation import copy_durable_metadata, require_nonblank
 from cayu.artifacts.base import (
     ArtifactMetadata,
     ArtifactScope,
@@ -123,6 +123,7 @@ async def copy_workspace_file_to_artifact(
     if content_type is None:
         content_type = mimetypes.guess_type(artifact_filename)[0]
 
+    metadata = copy_durable_metadata({} if metadata is None else metadata, "metadata")
     result = await workspace.read_bytes(workspace_path, max_bytes=max_bytes)
     if result.truncated and not allow_truncated:
         raise ValueError(
@@ -163,14 +164,14 @@ def _workspace_artifact_metadata(
     truncated: bool,
     total_bytes: int,
 ) -> dict[str, Any]:
-    copied = copy_durable_json_object(metadata or {}, "metadata")
+    copied = copy_durable_metadata({} if metadata is None else metadata, "metadata")
     copied.setdefault("source", "workspace")
     copied["source_workspace_id"] = workspace_id
     copied["source_workspace_path"] = workspace_path
     copied["source_workspace_total_bytes"] = total_bytes
     copied["source_workspace_truncated"] = truncated
     copied["operation"] = "copy_workspace_file_to_artifact"
-    return copied
+    return copy_durable_metadata(copied, "metadata")
 
 
 def _artifact_filename(filename: str | None, workspace_path: str) -> str:

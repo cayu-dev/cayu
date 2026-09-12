@@ -6,6 +6,22 @@ from typing import Any
 import pytest
 
 from cayu import SecretNotFound, SecretRef, SecretsManagerVault, VaultError
+from cayu._validation import DURABLE_METADATA_LIMITS, DurableValueError
+
+
+def test_oversized_merged_metadata_rejects_before_secret_lookup() -> None:
+    client = _SecretsManagerClient({})
+    # Each contribution fits independently; the complete metadata must also fit.
+    half = DURABLE_METADATA_LIMITS.max_bytes // 2
+    vault = SecretsManagerVault(
+        {"token": "secret-id"},
+        client=client,
+        metadata={"token": {"owner": "x" * half}},
+    )
+    with pytest.raises(DurableValueError) as caught:
+        asyncio.run(vault.resolve(SecretRef(name="token"), scope={"request": "x" * half}))
+    assert caught.value.limit == DURABLE_METADATA_LIMITS.max_bytes
+    assert client.calls == []
 
 
 class _ClientError(RuntimeError):

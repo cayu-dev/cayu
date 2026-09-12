@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from cayu._validation import (
     copy_bounded_durable_json_value,
     copy_durable_json_object,
+    copy_durable_metadata,
     freeze_json_value,
     require_durable_clean_nonblank,
     require_durable_text,
@@ -238,7 +239,7 @@ class ProcessIsolatedToolContext(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: object) -> dict[str, Any]:
-        return copy_durable_json_object(value, "isolated_tool_context.metadata")
+        return copy_durable_metadata(value, "isolated_tool_context.metadata")
 
 
 @final

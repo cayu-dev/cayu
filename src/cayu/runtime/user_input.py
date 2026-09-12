@@ -11,6 +11,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_value,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
@@ -184,6 +185,8 @@ class UserInputResponse(BaseModel):
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
@@ -740,7 +743,7 @@ def copy_user_input_response(response: UserInputResponse) -> UserInputResponse:
         answer=response.answer,
         structured=copy_durable_json_value(response.structured, "structured"),
         artifacts=copy_durable_json_value(response.artifacts, "artifacts"),
-        metadata=copy_durable_json_value(response.metadata, "metadata"),
+        metadata=copy_durable_metadata(response.metadata),
         resolved_by=copy_resolution_actor(response.resolved_by),
         max_steps=response.max_steps,
         limits=copy_run_limits(response.limits) if response.limits is not None else None,
@@ -989,6 +992,8 @@ class UserInputRecoveryRequest(BaseModel):
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
+        if info.field_name == "metadata":
+            return copy_durable_metadata(value)
         return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output")
@@ -1046,7 +1051,7 @@ def copy_user_input_recovery_request(
         structured=copy_durable_json_value(request.structured, "structured"),
         artifacts=copy_durable_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
-        metadata=copy_durable_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_metadata(request.metadata),
         resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,

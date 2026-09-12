@@ -8866,7 +8866,7 @@ def test_stdio_invalid_initialize_text_does_not_retain_resolved_secret(
     async def run() -> McpProtocolError:
         with pytest.raises(
             McpProtocolError,
-            match="initialize result contained invalid data",
+            match="(?:initialize result contained invalid data|MCP response contained invalid portable JSON)",
         ) as excinfo:
             await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
         return excinfo.value

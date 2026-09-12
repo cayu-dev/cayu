@@ -16,7 +16,7 @@ from cayu._task_wait import (
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
 )
-from cayu._validation import copy_json_value
+from cayu._validation import copy_durable_metadata, copy_json_value
 from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_control import clear_current_task_cancellation
@@ -144,7 +144,7 @@ def _copy_interruption_cascade_retry_request(value: Any) -> dict[str, Any] | Non
     return {
         "retry_request_id": retry_request_id,
         "reason": reason,
-        "metadata": copy_json_value(metadata, "metadata"),
+        "metadata": copy_durable_metadata(metadata, "metadata"),
         "requested_by": resolution_actor_payload(requested_by),
     }
 
@@ -726,7 +726,7 @@ class BackgroundInterruptionCoordinator:
             claim_id=marker["claim_id"],
             claim_deadline_monotonic=claim_deadline_monotonic,
             reason=reason,
-            metadata=copy_json_value(metadata, "metadata"),
+            metadata=copy_durable_metadata(metadata, "metadata"),
             requested_by=requested_by,
             retry_request=_copy_interruption_cascade_retry_request(marker.get("retry_request")),
             cascade_session_ids={parent_session_id},

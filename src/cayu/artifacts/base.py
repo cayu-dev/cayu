@@ -18,7 +18,7 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
-    copy_durable_json_object,
+    copy_durable_metadata,
     freeze_json_value,
     require_clean_nonblank,
     require_durable_text,
@@ -64,7 +64,7 @@ class ArtifactMetadata(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: Mapping[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     @field_validator("metadata")
     @classmethod

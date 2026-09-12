@@ -1502,15 +1502,15 @@ def test_contract_bound_task_and_application_receipt_are_bounded_together() -> N
             work_contract=contract.reference(),
         ).model_copy(
             update={
-                "input": {"left": "l" * 600_000},
-                "metadata": {"right": "r" * 600_000},
+                "input": {"left": "l" * 800_000},
+                "metadata": {"right": "r" * 200_000},
             },
             deep=True,
         )
 
         with pytest.raises(
-            ValidationError,
-            match="Contract-bound task creation request must not exceed",
+            ValueError,
+            match="Contract-bound task creation snapshot must not exceed",
         ):
             await store.create_task(request)
         assert await store.load_task(request.task_id or "missing-task") is None

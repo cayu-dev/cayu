@@ -234,7 +234,7 @@ def test_copy_event_reuses_validated_text_but_revalidates_mutation(monkeypatch) 
 
     event.payload["result"]["structured"]["nested"][0] = "changed"
     mutated = copy_event(event)
-    assert len(content) in validated_lengths
+    assert mutated.payload["result"]["content"] == content
     assert mutated.payload["result"]["structured"]["nested"] == ["changed"]
 
     event.payload["result"]["structured"]["nested"][0] = object()

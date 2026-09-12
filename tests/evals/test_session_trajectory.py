@@ -38,7 +38,7 @@ from cayu import (
     trajectory_from_session,
     write_trajectory_json,
 )
-from cayu._validation import compact_json_utf8_size
+from cayu._validation import DURABLE_DOCUMENT_LIMITS, compact_json_utf8_size
 from cayu.core.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
@@ -590,7 +590,8 @@ def test_trajectory_from_session_enforces_the_tree_depth_bound():
 
 def test_session_trajectory_hard_depth_is_exportable_and_reloadable(tmp_path):
     trajectory = Trajectory()
-    for _ in range(SessionTrajectoryBounds().max_depth - 1):
+    durable_depth = min(SessionTrajectoryBounds().max_depth, DURABLE_DOCUMENT_LIMITS.max_nesting)
+    for _ in range(durable_depth - 2):
         trajectory = Trajectory().model_copy(update={"children": (trajectory,)})
 
     path = tmp_path / "max-depth-trajectory.json"

@@ -43,12 +43,16 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    DURABLE_DOCUMENT_LIMITS,
     DurableValueError,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
+    copy_durable_record,
     copy_json_value,
     extract_durable_value_error,
+    inspect_bounded_durable_json,
     require_clean_nonblank,
     require_durable_clean_nonblank,
     require_durable_text,
@@ -602,7 +606,7 @@ class ModelCompletionRecoveryContext(BaseModel):
     @field_validator("request_metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: object) -> dict[str, Any]:
-        copied = copy_durable_json_object(value, "request_metadata")
+        copied = copy_durable_metadata(value, "request_metadata")
         if len(copied) > MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES:
             raise ValueError(
                 "request_metadata cannot contain more than "
@@ -689,15 +693,13 @@ class ModelCompletionRecoveryContext(BaseModel):
                 )
             ):
                 raise ValueError("billing identity collections exceed recovery bounds.")
-        encoded = canonical_durable_json_bytes(
+        inspect_bounded_durable_json(
             self.model_dump(mode="json"),
             "model_completion_recovery_context",
+            max_bytes=MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
+            max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
+            max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
         )
-        if len(encoded) > MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES:
-            raise ValueError(
-                "model completion recovery context exceeds the durable byte limit of "
-                f"{MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES}."
-            )
         return self
 
 
@@ -7213,7 +7215,7 @@ class ModelStepExecutor:
                                     "Late provider-operation reconciliation requires an "
                                     "existing session checkpoint."
                                 )
-                            copied = copy_json_value(checkpoint, "checkpoint")
+                            copied = copy_durable_record(checkpoint, "checkpoint")
                             if type(copied) is not dict:
                                 raise TypeError("Session checkpoint must be an object.")
                             return copied
@@ -8920,7 +8922,7 @@ class ModelStepRun:
         self._thinking = thinking
         self._knowledge_store = knowledge_store
         self._knowledge_access_scope = knowledge_access_scope
-        self._request_metadata = copy_json_value(request_metadata, "metadata")
+        self._request_metadata = copy_durable_metadata(request_metadata, "metadata")
         self._retry_policy = copy_retry_policy(retry_policy)
         self._request_budget_limits = copy_request_budget_limits(request_budget_limits)
         self._limit_gate = limit_gate
@@ -13888,7 +13890,7 @@ def _session_agent_spec(
         model=session.model,
         provider_name=session.provider_name,
         system_prompt=registered_agent.spec.system_prompt,
-        metadata=copy_json_value(registered_agent.spec.metadata, "metadata"),
+        metadata=copy_durable_metadata(registered_agent.spec.metadata),
         provider_options=copy_json_value(
             registered_agent.spec.provider_options,
             "provider_options",
@@ -14439,7 +14441,7 @@ async def _build_context(
         session_store=session_store,
         knowledge_store=knowledge_store,
         knowledge_access_scope=knowledge_access_scope,
-        metadata=copy_json_value(request_metadata, "metadata"),
+        metadata=copy_durable_metadata(request_metadata, "metadata"),
         context_usage=context_usage,
         pressure_overhead=pressure_overhead,
         count_input_tokens=count_input_tokens,

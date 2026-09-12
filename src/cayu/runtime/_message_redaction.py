@@ -94,6 +94,8 @@ _TERMINAL_RESULT_STRUCTURE_KEYS = frozenset(
     {
         "durable_value_error_code",
         "durable_value_error_path",
+        "durable_value_error_limit",
+        "durable_value_error_observed_lower_bound",
         "isolated_tool_cleanup_failure_code",
         "isolated_tool_failure_code",
         "manual_reconciliation_required",

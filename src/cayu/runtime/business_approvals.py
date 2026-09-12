@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from cayu._validation import (
     copy_durable_json_value,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
@@ -165,7 +166,7 @@ class BusinessApprovalRouting(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: Any) -> dict[str, Any]:
-        return copy_durable_json_value(value, "metadata")
+        return copy_durable_metadata(value)
 
     @model_validator(mode="after")
     def validate_required_tier_in_chain(self) -> BusinessApprovalRouting:
@@ -377,7 +378,7 @@ async def resolve_business_approval(
 
     if metadata is not None and type(metadata) is not dict:
         raise TypeError("metadata must be a dict.")
-    resolution_metadata = copy_durable_json_value(metadata or {}, "metadata")
+    resolution_metadata = copy_durable_metadata(metadata or {})
     if BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY in resolution_metadata:
         raise ValueError(
             f"metadata must not contain the reserved key "

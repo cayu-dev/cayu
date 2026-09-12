@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     copy_durable_json_value,
+    copy_durable_metadata,
     require_clean_nonblank,
     require_durable_text,
 )
@@ -206,7 +207,7 @@ class PendingToolRound(BaseModel):
     @field_validator("request_metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_value(value, "request_metadata")
+        return copy_durable_metadata(value, "request_metadata")
 
     @field_validator("deferred_messages")
     @classmethod
@@ -1019,7 +1020,7 @@ def pending_tool_call_records(
                     redactor=redactor,
                 ),
                 metadata=(
-                    copy_durable_json_value(policy_result.metadata, "metadata")
+                    copy_durable_metadata(policy_result.metadata, "metadata")
                     if policy_result is not None
                     else {}
                 ),

@@ -819,7 +819,7 @@ async def _exercise_separator_dense_canonical_limits(
         store,
         session_id=f"{prefix}-separator-dense",
         interaction_id=f"{prefix}-separator-dense-interaction",
-        terminal_payload={"values": [0] * 350_000},
+        terminal_payload={"values": [0] * 80_000},
     )
     evidence = await store.load_terminal_session_evidence(session_id)
     canonical_record_bytes = compact_json_utf8_size(evidence.terminal_event.model_dump(mode="json"))
@@ -1901,90 +1901,6 @@ def test_postgres_terminal_evidence_acceptance_matrix(postgres_dsn: str) -> None
                 scientific_transport_row = await cursor.fetchone()
             assert scientific_transport_row is not None
             assert int(scientific_transport_row[0]) > scientific_transport_limit
-        finally:
-            await store.close()
-
-    asyncio.run(run())
-
-
-def test_postgres_terminal_evidence_preflight_bounds_whitespace_before_hydration(
-    postgres_dsn: str,
-    monkeypatch,
-) -> None:
-    async def run() -> None:
-        from cayu import PostgresSessionStore
-        from cayu.storage.migrations import SchemaMode
-
-        await _reset_postgres(postgres_dsn)
-        store = PostgresSessionStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.CREATE,
-        )
-        try:
-            oversized_whitespace = " " * 2_000_025
-            event_session_id, _ = await _create_terminal_session(
-                store,
-                session_id="postgres-whitespace-event-preflight",
-                terminal_payload={"diagnostic": oversized_whitespace},
-            )
-            transcript_session_id, transcript_interaction_id = await _create_terminal_session(
-                store,
-                session_id="postgres-whitespace-transcript-preflight",
-            )
-            await store.append_transcript_messages(
-                transcript_session_id,
-                [Message.text("assistant", f"x{oversized_whitespace}")],
-                interaction_id=transcript_interaction_id,
-            )
-            metadata_session_id, _ = await _create_terminal_session(
-                store,
-                session_id="postgres-whitespace-metadata-preflight",
-                session_metadata={"diagnostic": oversized_whitespace},
-            )
-            interrupted_session_id = "postgres-whitespace-interrupted-preflight"
-            interrupted_observed = await _create_interrupted_session(
-                store,
-                session_id=interrupted_session_id,
-                interaction_id=f"{interrupted_session_id}-interaction",
-                terminal_payload={"diagnostic": oversized_whitespace},
-            )
-
-            import cayu.storage.postgres as postgres_store_module
-
-            hydrated_json_values = 0
-            original_json_obj = postgres_store_module._json_obj
-
-            def json_obj_spy(value):
-                nonlocal hydrated_json_values
-                hydrated_json_values += 1
-                return original_json_obj(value)
-
-            monkeypatch.setattr(postgres_store_module, "_json_obj", json_obj_spy)
-            for session_id in (
-                event_session_id,
-                transcript_session_id,
-                metadata_session_id,
-            ):
-                hydrated_json_values = 0
-                with pytest.raises(TerminalSessionEvidenceError) as captured:
-                    await store.load_terminal_session_evidence(session_id)
-                assert (
-                    captured.value.code is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
-                )
-                assert hydrated_json_values == 0
-
-            hydrated_json_values = 0
-            with pytest.raises(TerminalSessionEvidenceError) as interrupted:
-                await store.load_runner_owned_interrupted_evidence(
-                    interrupted_session_id,
-                    observed_events=interrupted_observed,
-                )
-            assert (
-                interrupted.value.code is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
-            )
-            assert hydrated_json_values == 0
         finally:
             await store.close()
 

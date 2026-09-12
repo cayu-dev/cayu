@@ -12,7 +12,7 @@ from cayu._task_wait import (
     capture_awaitable_outcome,
     restore_task_cancellation_requests,
 )
-from cayu._validation import copy_json_value
+from cayu._validation import copy_durable_record
 from cayu.core.messages import Message, detach_message
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._diagnostics import (
@@ -272,7 +272,7 @@ def capture_work_attempt_checkpoint_result(
     def copy_checkpoint() -> dict[str, Any] | None:
         if value is None:
             return None
-        copied = copy_json_value(value, "checkpoint")
+        copied = copy_durable_record(value, "checkpoint")
         if type(copied) is not dict:
             raise TypeError("Work-attempt checkpoint must be a JSON object or None.")
         if durable_value_contains_secret(copied, redactor=redactor):

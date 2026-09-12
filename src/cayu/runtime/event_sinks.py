@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from cayu.core.events import Event, copy_event
+from cayu.core.events import Event, copy_event, validate_event_envelope
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +36,7 @@ class _EventSinkDelivery:
             if value is not None and (type(value) is not str or not value.strip()):
                 raise ValueError(f"{field_name} must be a non-empty string when provided.")
         object.__setattr__(self, "event", copy_event(self.event))
+        validate_event_envelope(self.event)
 
 
 class EventSink(ABC):
@@ -70,6 +71,7 @@ class InMemoryEventSink(EventSink):
         if type(event) is not Event:
             raise TypeError("Event sinks require Event instances.")
         copied = copy_event(event)
+        validate_event_envelope(copied)
         existing = self._events_by_id.get(identity)
         if existing is not None:
             if existing != copied:

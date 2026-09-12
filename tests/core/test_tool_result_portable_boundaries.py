@@ -116,6 +116,80 @@ class _HostileDurableValueError(DurableValueError):
         raise RuntimeError(_HOSTILE_DURABLE_ERROR_SECRET)
 
 
+def test_oversized_external_tool_output_is_not_redispatched_on_resume(capsys, caplog) -> None:
+    from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+
+    secret = "oversized-output-private-canary"
+
+    class LargeEffectTool(Tool):
+        spec = ToolSpec(name="large_effect", effect=ToolEffect.EXTERNAL)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx, args
+            self.calls += 1
+            return ToolResult(
+                content="x" * (3 * 1024 * 1024),
+                structured={"receipt_id": "effect-1", secret: secret},
+            )
+
+    tool = LargeEffectTool()
+    provider = _portable_tool_boundary_provider(tool.spec.name, "call_large_effect")
+    app = CayuApp(
+        session_store=InMemorySessionStore(),
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+    session_id = "sess_large_effect"
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "perform the effect")],
+            ),
+        )
+    )
+    assert tool.calls == 1
+    durable = _assert_unknown_external_call_retained(app, provider, session_id, events)
+    checkpoint = asyncio.run(app.session_store.load_checkpoint(session_id))
+    assert "effect-1" in repr((checkpoint, [event.payload for event in durable]))
+    unknown = next(
+        event for event in durable if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+    )
+
+    async def load_record():
+        session = await app.session_store.load(session_id)
+        assert session is not None
+        return await ToolEffectStateOwner(app.session_store).resolve_call(
+            session,
+            tool_round_id=unknown.payload["tool_round_id"],
+            tool_call_id=unknown.payload["tool_call_id"],
+        )
+
+    record = asyncio.run(load_record())
+    assert record is not None and record.terminal is None
+    assert "effect-1" in repr(record.unverified_output)
+    captured = capsys.readouterr()
+    assert secret not in repr(
+        (
+            checkpoint,
+            [event.payload for event in durable],
+            events,
+            record.model_dump(),
+            captured.out,
+            captured.err,
+            caplog.text,
+        )
+    )
+    assert tool.calls == 1
+
+
 def test_cayu_app_rejects_nonportable_proxy_result_before_tool_external_effect() -> None:
     class NonPortableResultProxy(CredentialProxy):
         async def resolve(
@@ -1296,6 +1370,24 @@ def test_portable_tool_result_evidence_caps_invalid_object_key_scans() -> None:
     assert evidence.included is True
     assert evidence.incomplete is True
     assert evidence.value == {}
+
+
+def test_portable_tool_result_evidence_preserves_nested_receipt_before_large_content() -> None:
+    result = ToolResult(
+        content="x" * (3 * 1024 * 1024),
+        structured={"receipt_id": "accepted-effect-receipt"},
+    )
+    evidence = tool_results_module.portable_result_evidence(
+        tool_results_module.raw_tool_result_evidence(result)
+    )
+
+    assert evidence.included is True
+    assert evidence.incomplete is True
+    assert evidence.value["structured"]["receipt_id"] == "accepted-effect-receipt"
+    # Repeated projection must retain the receipt even after key reordering.
+    reordered = dict(sorted(evidence.value.items()))
+    projected = tool_results_module.portable_result_evidence(reordered)
+    assert projected.value["structured"]["receipt_id"] == "accepted-effect-receipt"
 
 
 def test_portable_tool_result_evidence_omits_receipts_beyond_scan_limit() -> None:

@@ -41,6 +41,8 @@ from cayu._task_wait import (
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    copy_durable_metadata,
+    copy_durable_record,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
@@ -3349,7 +3351,7 @@ class EnvironmentLifecycle:
                     "Terminal allocation retirement lost its session generation."
                 )
             require_exact(current)
-            copied = copy_json_value(current or {}, "checkpoint")
+            copied = copy_durable_record(current or {}, "checkpoint")
             copied.setdefault(_ALLOCATION_GENERATIONS_KEY, {})[environment_name] = {
                 "session_instance_id": session.instance_id,
                 "reconnect_metadata": reconnect,
@@ -3382,7 +3384,7 @@ class EnvironmentLifecycle:
         def retire(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
             if session.instance_id != session_instance_id or session.run_epoch != run_epoch:
                 raise SessionRunFenced("Allocation disposal lost its session generation.")
-            copied = copy_json_value(current or {}, "checkpoint")
+            copied = copy_durable_record(current or {}, "checkpoint")
             retired = copied.get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})
             if retired.get(environment_name) == expected:
                 # Read back an exact retirement whose commit acknowledgement was lost.
@@ -3496,7 +3498,7 @@ class EnvironmentLifecycle:
                     )
                     if current_reconnect != reconnect or current_owner != session_id:
                         raise RuntimeError("Allocation disposal reconnect authority changed.")
-                    copied = copy_json_value(current or {}, "checkpoint")
+                    copied = copy_durable_record(current or {}, "checkpoint")
                     values = copied.setdefault(_PENDING_ALLOCATION_DISPOSAL_KEY, {})
                     if environment_name in values and values[environment_name] != pending:
                         raise RuntimeError("Allocation disposal marker changed.")
@@ -3535,7 +3537,7 @@ class EnvironmentLifecycle:
                 if existing is not None and existing != state:
                     raise RuntimeError("Completion disposal authority changed.")
                 marker["disposal_state"] = state
-                updated = copy_json_value(current, "checkpoint")
+                updated = copy_durable_record(current, "checkpoint")
                 updated[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
                 pending_completion_finalization_from_checkpoint(updated)
                 return updated
@@ -3705,7 +3707,7 @@ class EnvironmentLifecycle:
                 raise RuntimeError(
                     "Session changed before completion finalization was checkpointed."
                 )
-            copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            copied = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             existing = pending_completion_finalization_from_checkpoint(copied)
             if existing is not None:
                 for field_name in (
@@ -3825,7 +3827,7 @@ class EnvironmentLifecycle:
                 return checkpoint
             if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before cleanup.")
-            copied = copy_json_value(checkpoint, "checkpoint")
+            copied = copy_durable_record(checkpoint, "checkpoint")
             copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
             return copied or None
 
@@ -3857,7 +3859,7 @@ class EnvironmentLifecycle:
             current = pending_completion_finalization_from_checkpoint(checkpoint)
             if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before commit.")
-            copied = copy_json_value(checkpoint, "checkpoint")
+            copied = copy_durable_record(checkpoint, "checkpoint")
             copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
             return copied or None
 
@@ -3874,7 +3876,7 @@ class EnvironmentLifecycle:
     ) -> CheckpointTransform:
         """Build one atomic transform retaining environment-owned checkpoint state."""
 
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
         runtime_keys = (
             _PENDING_ALLOCATION_DISPOSAL_KEY,
             _RETIRED_ALLOCATION_DISPOSAL_KEY,
@@ -3887,7 +3889,7 @@ class EnvironmentLifecycle:
         )
 
         def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
-            replacement = copy_json_value(copied_checkpoint, "checkpoint")
+            replacement = copy_durable_record(copied_checkpoint, "checkpoint")
             if current is not None:
                 for key in runtime_keys:
                     if key in replacement:
@@ -4374,7 +4376,7 @@ class EnvironmentLifecycle:
                 or current_session.run_epoch != session.run_epoch
             ):
                 raise SessionRunFenced("Rejected environment cleanup lost its session generation.")
-            copied = copy_json_value(checkpoint or {}, "checkpoint")
+            copied = copy_durable_record(checkpoint or {}, "checkpoint")
             retired = copied.get(_RETIRED_ALLOCATION_DISPOSAL_KEY)
             if retired is None:
                 retired = {}
@@ -6635,15 +6637,17 @@ class EnvironmentLifecycle:
         reconnect_metadata: dict[str, Any],
     ) -> None:
         checkpoint = await self._session_store.load_checkpoint(session_id)
-        copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint = (
+            {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+        )
         state = copied_checkpoint.get(ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
         if state is None:
             state = {}
         elif type(state) is not dict:
             raise ValueError("Environment factory reconnect checkpoint must be an object.")
         else:
-            state = copy_json_value(state, "environment_factory_reconnect")
-        state[environment_name] = copy_json_value(reconnect_metadata, "reconnect_metadata")
+            state = copy_durable_record(state, "environment_factory_reconnect")
+        state[environment_name] = copy_durable_metadata(reconnect_metadata, "reconnect_metadata")
         copied_checkpoint[ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = state
         owners = copied_checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
         if owners is None:
@@ -6651,7 +6655,7 @@ class EnvironmentLifecycle:
         elif type(owners) is not dict:
             raise ValueError("Environment factory allocation owners must be an object.")
         else:
-            owners = copy_json_value(owners, "environment_factory_allocation_owner")
+            owners = copy_durable_record(owners, "environment_factory_allocation_owner")
         owners[environment_name] = session_id
         copied_checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY] = owners
         try:
@@ -7707,7 +7711,7 @@ def _bound_workspace_payload(
             public_authority_alias_codec=public_authority_alias_codec,
         ),
         "bound_path": bound.path,
-        "bound_metadata": copy_json_value(bound.metadata, "bound_metadata"),
+        "bound_metadata": copy_durable_metadata(bound.metadata, "bound_metadata"),
         "bound_snapshot": bound_snapshot,
         "has_bound_runner": bound.runner is not None,
     }
@@ -7721,7 +7725,7 @@ def _workspace_snapshot_payload(snapshot: WorkspaceSnapshot | None) -> dict[str,
         "workspace_id": snapshot.workspace_id,
         "version": snapshot.version,
         "source": snapshot.source,
-        "metadata": copy_json_value(snapshot.metadata, "metadata"),
+        "metadata": copy_durable_metadata(snapshot.metadata, "metadata"),
     }
 
 
@@ -7813,7 +7817,7 @@ def _factory_reconnect_state_from_checkpoint(
         elif type(candidate_metadata) is not dict:
             raise ValueError("Environment factory reconnect metadata must be an object.")
         else:
-            metadata = copy_json_value(candidate_metadata, "reconnect_metadata")
+            metadata = copy_durable_metadata(candidate_metadata, "reconnect_metadata")
     owners = checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
     if owners is None:
         return metadata, None

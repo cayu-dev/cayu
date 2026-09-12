@@ -46,6 +46,8 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
+    copy_durable_metadata,
+    copy_durable_record,
     copy_json_value,
     require_clean_nonblank,
 )
@@ -561,7 +563,7 @@ def _retain_abandoned_unreplayable_tool_round(
 ) -> dict[str, Any]:
     """Retain every opaque round while making repeated archival idempotent."""
 
-    copied = copy_json_value(checkpoint, "checkpoint")
+    copied = copy_durable_record(checkpoint, "checkpoint")
     abandoned = copied.get(_ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY)
     if abandoned is None:
         copied[_ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY] = {
@@ -870,7 +872,7 @@ def _checkpoint_with_legacy_approval_round(
     )
     if current_approval != approval:
         raise RuntimeError("Pending tool approval changed before legacy round migration.")
-    copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    copied = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
     copied[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
         approval_support.planned_tool_round_from_pending_approval(approval).model_dump(mode="json")
     )
@@ -2364,14 +2366,14 @@ class RecoveryCoordinator:
             marker = desired.get(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY)
             if type(marker) is not dict:
                 raise RuntimeError("Recovery reservation did not produce its claim marker.")
-            reserved = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            reserved = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             reserved[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
             reserved[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
                 marker,
                 "incomplete_session_recovery_claim",
             )
-            desired_checkpoint = copy_json_value(desired, "checkpoint")
-            reserved_checkpoint = copy_json_value(reserved, "checkpoint")
+            desired_checkpoint = copy_durable_record(desired, "checkpoint")
+            reserved_checkpoint = copy_durable_record(reserved, "checkpoint")
             reserved_session = current_session.model_copy(deep=True)
             return reserved
 
@@ -2401,7 +2403,7 @@ class RecoveryCoordinator:
                     # acknowledgement was lost. Leave reconciliation authority
                     # intact for the caller.
                     return None
-                updated = copy_json_value(checkpoint, "checkpoint")
+                updated = copy_durable_record(checkpoint, "checkpoint")
                 updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
                 return updated
 
@@ -2455,7 +2457,7 @@ class RecoveryCoordinator:
                 raise _IncompleteRecoveryClaimLost(
                     "Incomplete-session recovery reservation changed before fencing."
                 )
-            return copy_json_value(desired_checkpoint, "checkpoint")
+            return copy_durable_record(desired_checkpoint, "checkpoint")
 
         try:
             return await self._fence_or_rebind_active_invocation(
@@ -9792,7 +9794,7 @@ class RecoveryCoordinator:
                     tool_call_id=request.tool_call_id,
                     decision=ToolApprovalDecision.DENY,
                     reason=f"Tool approval expired at {expired_at_iso}.",
-                    metadata=copy_json_value(request.metadata, "metadata"),
+                    metadata=copy_durable_metadata(request.metadata),
                     resolved_by=expiry_resolution_actor(),
                     max_steps=request.max_steps,
                     limits=request.limits,
@@ -12484,7 +12486,7 @@ class RecoveryCoordinator:
             claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
             claim_run_epoch = current_session.run_epoch + 1
             session_before_fence = current_session.model_copy(deep=True)
-            updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            updated = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             updated = checkpoint_with_active_invocation_execution_profile(
                 updated,
                 session_id=current_session.id,
@@ -12634,7 +12636,7 @@ class RecoveryCoordinator:
                     claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
                     claim_run_epoch = _current_session.run_epoch + 1
                     updated = (
-                        {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+                        {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
                     )
                     current_profile = active_invocation_execution_profile_from_checkpoint(updated)
                     if (
@@ -13802,7 +13804,7 @@ class RecoveryCoordinator:
                             raise RuntimeError(
                                 "Manual recovery run operation changed before rollback."
                             )
-                        updated = copy_json_value(checkpoint, "checkpoint")
+                        updated = copy_durable_record(checkpoint, "checkpoint")
                         updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY)
                         return updated
 
@@ -14433,7 +14435,7 @@ class RecoveryCoordinator:
             retry_policy=invocation_semantics.retry_policy,
             structured_output=invocation_semantics.structured_output,
             thinking=invocation_semantics.thinking,
-            request_metadata=copy_json_value(request_metadata, "recovery.request_metadata"),
+            request_metadata=copy_durable_metadata(request_metadata, "recovery.request_metadata"),
             task_id=pending_round.task_id,
             task_worker_id=task_worker_id,
             task_handoff_id=task_handoff_id,
@@ -16622,7 +16624,7 @@ class RecoveryCoordinator:
             ) -> dict[str, Any] | None:
                 if checkpoint is None:
                     return None
-                updated = copy_json_value(checkpoint, "checkpoint")
+                updated = copy_durable_record(checkpoint, "checkpoint")
                 current = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
                 if current is None:
                     return updated
@@ -17587,7 +17589,7 @@ class RecoveryCoordinator:
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
-        metadata = copy_json_value(metadata, "metadata")
+        metadata = copy_durable_metadata(metadata)
         previous_status = session.status
 
         if self._session_control.has_active_tasks(session.id):
@@ -18760,7 +18762,7 @@ class RecoveryCoordinator:
                 raise _IncompleteRecoveryClaimLost(
                     "Terminal evidence recovery checkpoint disappeared."
                 )
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             claim = _incomplete_recovery_claim_from_checkpoint(updated)
             if claim is None or claim[0] != claim_id or claim[1] <= store_now:
                 raise _IncompleteRecoveryClaimLost(
@@ -19192,7 +19194,7 @@ class RecoveryCoordinator:
             if existing_claim is not None and existing_claim[1] > store_now:
                 return None
             assert checkpoint is not None
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             claim_expires_at = store_now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
                 {
@@ -19465,7 +19467,7 @@ class RecoveryCoordinator:
             if existing is None or existing[0] != claim_id or existing[1] <= store_now:
                 return None
             assert checkpoint is not None
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             marker = copy_json_value(
                 updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY],
                 "terminal_finalization_claim",
@@ -19713,7 +19715,7 @@ class RecoveryCoordinator:
             next_run_epoch = current_session.run_epoch + 1
             claim_run_epoch = next_run_epoch
             session_before_fence = current_session.model_copy(deep=True)
-            updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            updated = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
             current_profile = active_invocation_execution_profile_from_checkpoint(updated)
             if execution_profile_snapshot is not None and (
                 current_profile != execution_profile_snapshot
@@ -20214,7 +20216,7 @@ class RecoveryCoordinator:
             _require_aware_datetime(now, "recovery claim clock")
             if existing is None or existing[0] != claim_id or existing[1] <= now:
                 return None
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             marker = copy_json_value(
                 updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY],
                 "incomplete_session_recovery_claim",
@@ -20245,7 +20247,7 @@ class RecoveryCoordinator:
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
             if existing is None or existing[0] != claim_id:
                 return None
-            updated = copy_json_value(checkpoint, "checkpoint")
+            updated = copy_durable_record(checkpoint, "checkpoint")
             updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
             return updated
 
@@ -21661,7 +21663,7 @@ class RecoveryCoordinator:
                     raise SessionRunFenced(
                         "Completion finalization recovery lost its exact durable marker."
                     )
-                return copy_json_value(checkpoint, "checkpoint")
+                return copy_durable_record(checkpoint, "checkpoint")
 
             session = await self._session_store.transition_status_and_checkpoint(
                 session.id,
@@ -22964,7 +22966,7 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Pending tool round changed before its unreplayable state was abandoned."
                 )
-            copied = copy_json_value(checkpoint, "checkpoint")
+            copied = copy_durable_record(checkpoint, "checkpoint")
             durable_round = copied.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
             pointer = model_completion_publication.model_step_publication_from_checkpoint(copied)
             if pointer is not None:
@@ -23513,7 +23515,7 @@ def _checkpoint_without_active_incomplete_recovery_claim(
     _require_aware_datetime(now, "now")
     if checkpoint is None:
         return None
-    updated = copy_json_value(checkpoint, "checkpoint")
+    updated = copy_durable_record(checkpoint, "checkpoint")
     existing = _incomplete_recovery_claim_from_checkpoint(updated)
     if existing is None:
         return updated
@@ -23654,7 +23656,7 @@ def _checkpoint_with_rebased_session_run_operation(
         raise RuntimeError(
             "Session run operation belongs to a future run epoch and cannot be recovered."
         )
-    updated = copy_json_value(checkpoint, "checkpoint")
+    updated = copy_durable_record(checkpoint, "checkpoint")
     marker: dict[str, Any] = {
         "version": 1,
         "operation_id": operation.operation_id,

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_durable_json_object, require_clean_nonblank
+from cayu._validation import copy_durable_metadata, require_clean_nonblank
 from cayu.egress.credential_kinds import (
     credential_kind_descriptor,
     validate_presented_value,
@@ -72,7 +72,7 @@ class VirtualCredentialGrant(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        return copy_durable_metadata(value, "metadata")
 
     def is_expired(self, now: datetime) -> bool:
         return self.expires_at is not None and now >= self.expires_at
