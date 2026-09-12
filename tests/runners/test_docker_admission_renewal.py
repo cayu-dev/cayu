@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -45,6 +46,137 @@ def _completed_probe_result(
         stderr=f"\n{token}:{guest_exit_code}\n",
         exit_code=0,
     )
+
+
+@pytest.mark.parametrize("supervise_guest", [False, True], ids=["creation-owned", "supervised"])
+def test_admission_probe_preserves_empty_environment(monkeypatch, supervise_guest):
+    environment = {"PYTHONPATH": "", "PRIVATE_VALUE": "private-admission-value"}
+    original = dict(environment)
+    env_files = []
+
+    async def dispatch(command, **kwargs):
+        args = command.argv[1:]
+        assert args[0] == "exec"
+        env_file = Path(args[args.index("--env-file") + 1])
+        env_files.append(env_file)
+        assert env_file.read_bytes() == b"PYTHONPATH=\nPRIVATE_VALUE=private-admission-value\n"
+        assert kwargs.get("output_redactor") is None
+        assert kwargs["output_limit_bytes"] == 64 * 1024
+        diagnostic = "diagnostic: " + environment["PRIVATE_VALUE"]
+        assert diagnostic.startswith("diagnostic: ")
+        completed = _completed_probe_result(args, stdout="probe succeeded", guest_exit_code=73)
+        return ExecResult(
+            stdout=completed.stdout, stderr=diagnostic + completed.stderr, exit_code=0
+        )
+
+    monkeypatch.setattr(docker_module, "run_subprocess", dispatch)
+    result = asyncio.run(
+        docker_module._run_docker_admission_probe(
+            "/usr/bin/docker",
+            _CONTAINER_ID,
+            script="exit 73",
+            docker_cli_env_allowlist=(),
+            supervise_guest=supervise_guest,
+            environment=environment,
+        )
+    )
+    assert result.exit_code == 73
+    assert result.stdout == "probe succeeded"
+    assert result.stderr.startswith("diagnostic: ")
+    assert original["PRIVATE_VALUE"] not in result.stderr
+    assert "cayu-admission-probe-complete-" not in result.stderr
+    assert environment == original
+    assert len(env_files) == 1
+    assert not env_files[0].exists()
+
+
+@pytest.mark.parametrize("supervise_guest", [False, True])
+@pytest.mark.parametrize("status", [0, 1, 2, 127])
+def test_probe_completion_survives_environment_redaction(monkeypatch, status, supervise_guest):
+    environment = {"ONE": "1", "TWO": "2", "PRIVATE": "private-probe-value"}
+
+    async def dispatch(command, **kwargs):
+        result = _completed_probe_result(
+            command.argv, stdout=environment["PRIVATE"], guest_exit_code=status
+        )
+        result = result.model_copy(update={"stderr": environment["PRIVATE"] + result.stderr})
+        redactor = kwargs.get("output_redactor")
+        if redactor is not None:
+            result = result.model_copy(
+                update={
+                    "stdout": redactor.redact_text(result.stdout),
+                    "stderr": redactor.redact_text(result.stderr),
+                }
+            )
+        return result
+
+    monkeypatch.setattr(docker_module, "run_subprocess", dispatch)
+    monkeypatch.setattr(docker_module, "uuid4", lambda: type("Nonce", (), {"hex": "12" * 16})())
+    result = asyncio.run(
+        docker_module._run_docker_admission_probe(
+            "docker",
+            _CONTAINER_ID,
+            script=f"exit {status}",
+            docker_cli_env_allowlist=(),
+            supervise_guest=supervise_guest,
+            environment=environment,
+        )
+    )
+    assert result.exit_code == status
+    assert result.stdout == "[REDACTED_SECRET]"
+    assert result.stderr == "[REDACTED_SECRET]"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "wrong",
+        "duplicate",
+        "trailing",
+        "status",
+        "truncated",
+        "timeout",
+        "cancelled",
+        "host_exit",
+    ],
+)
+def test_probe_private_completion_rejects_invalid_frame(monkeypatch, fault):
+    from cayu.vaults import SecretRedactor
+
+    token = "cayu-admission-probe-complete-" + "12" * 16
+    frame = f"\n{token}:0\n"
+    stderr = {
+        "missing": "private-probe-value",
+        "wrong": frame.replace(token, token + "a"),
+        "duplicate": frame + frame,
+        "trailing": frame + "private-probe-value",
+        "status": frame.replace(":0", ":256"),
+    }.get(fault, frame)
+
+    async def dispatch(command, **kwargs):
+        assert kwargs["output_limit_bytes"] == 64 * 1024
+        assert kwargs.get("output_redactor") is None
+        return ExecResult(
+            stdout="private-probe-value",
+            stderr=stderr,
+            exit_code=1 if fault == "host_exit" else 0,
+            stderr_truncated=fault == "truncated",
+            timed_out=fault == "timeout",
+            cancelled=fault == "cancelled",
+        )
+
+    monkeypatch.setattr(docker_module, "run_subprocess", dispatch)
+    result = asyncio.run(
+        docker_module._run_docker(
+            "docker",
+            ["exec", _CONTAINER_ID],
+            output_redactor=SecretRedactor(["1", "2", "private-probe-value"]),
+            admission_completion_token=token,
+        )
+    )
+    assert "private-probe-value" not in result.stdout + result.stderr
+    assert docker_module._docker_admission_probe_completion(result, completion_token=token) is None
 
 
 @pytest.mark.parametrize(
@@ -496,5 +628,152 @@ def test_live_strict_container_renews_expired_admission():
             )
         finally:
             await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CAYU_DOCKER_ADMISSION_TEST_IMAGE"),
+    reason="requires an explicitly selected local immutable Python Docker image",
+)
+def test_live_admission_preserves_empty_environment():
+    from cayu.environments.admission import ExecutionRequirements
+
+    environment = {
+        "PYTHONPATH": "",
+        "PRIVATE_VALUE": "private-admission-value",
+        "ONE": "1",
+        "TWO": "2",
+    }
+    original = dict(environment)
+
+    async def scenario():
+        runner = await DockerRunner.create(
+            "cayu-empty-env-" + uuid4().hex,
+            image=os.environ["CAYU_DOCKER_ADMISSION_TEST_IMAGE"],
+            env_overlay=environment,
+            network="none",
+            replace=False,
+            close_action="remove",
+        )
+        try:
+            for supervise_guest in (False, True):
+                result = await docker_module._run_docker_admission_probe(
+                    runner.docker_path,
+                    runner.container_id,
+                    script=(
+                        'test "${PYTHONPATH+x}" = x && test -z "$PYTHONPATH" '
+                        '&& test "$PRIVATE_VALUE" = private-admission-value || exit 1; '
+                        'printf "%s" "$PRIVATE_VALUE" >&2'
+                    ),
+                    docker_cli_env_allowlist=(),
+                    supervise_guest=supervise_guest,
+                    environment=environment,
+                )
+                assert result.exit_code == 0
+                assert result.stderr == "[REDACTED_SECRET]"
+            observer = runner.execution_admission_observer(
+                ExecutionRequirements(required_executables=("python3",))
+            )
+            candidate = await observer.collect()
+            assert candidate is not None
+            assert candidate.evidence.tool_requirements.executables[0].state == "live_verified"
+            assert environment == original
+        finally:
+            await runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CAYU_DOCKER_ADMISSION_TEST_IMAGE"),
+    reason="requires an explicitly selected local immutable Python Docker image",
+)
+def test_live_native_admission_through_owned_container_wrapper():
+    from cayu import (
+        AgentSpec,
+        CayuApp,
+        Environment,
+        EnvironmentSpec,
+        EventType,
+        ExecCommandTool,
+        ExecutionRequirements,
+        Message,
+        ModelStreamEvent,
+        RunRequest,
+        ScriptedModelProvider,
+    )
+
+    class OwnedContainerWrapper(DockerRunner):
+        def __init__(self, owner):
+            super().__init__(
+                owner.name,
+                docker_path=owner.docker_path,
+                image=owner.image,
+                default_cwd=owner.default_cwd,
+                env_overlay=owner.env_overlay,
+                _container_id=owner.container_id,
+                close_action="none",
+            )
+
+    async def scenario():
+        owner = await DockerRunner.create(
+            "cayu-native-admission-" + uuid4().hex,
+            image=os.environ["CAYU_DOCKER_ADMISSION_TEST_IMAGE"],
+            env_overlay={"PYTHONPATH": "", "ONE": "1", "TWO": "2"},
+            network="none",
+            replace=False,
+            close_action="remove",
+        )
+        wrapper = OwnedContainerWrapper(owner)
+        try:
+            provider = ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="call_probe",
+                            name="exec_command",
+                            arguments={"argv": ["python3", "-c", "print('admitted')"]},
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            )
+            app = CayuApp(enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(EnvironmentSpec(name="docker"), runner=wrapper), default=True
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="scripted"),
+                tools=[ExecCommandTool()],
+                execution_requirements=ExecutionRequirements(required_executables=("python3",)),
+            )
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id="native-admission-" + uuid4().hex,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Run the scripted check.")],
+                    )
+                )
+            ]
+            assert wrapper.container_id == owner.container_id
+            assert wrapper.close_action == "none"
+            assert sum(event.type == EventType.TOOL_CALL_COMPLETED for event in events) == 1
+            assert any(event.type == EventType.SESSION_COMPLETED for event in events)
+            assert len(provider.requests) == 2
+            candidate = await wrapper.execution_admission_observer(
+                ExecutionRequirements(required_executables=("python3",))
+            ).collect()
+            assert candidate.evidence.tool_requirements.executables[0].state == "live_verified"
+        finally:
+            await wrapper.close()
+            await owner.close()
 
     asyncio.run(scenario())

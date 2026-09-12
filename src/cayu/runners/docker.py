@@ -901,6 +901,7 @@ async def _run_docker(
     docker_cli_env_allowlist: Sequence[str] = (),
     timeout_s: int | None = None,
     output_redactor: SecretRedactor | None = None,
+    admission_completion_token: str | None = None,
 ) -> ExecResult:
     host_env = docker_cli_env(docker_cli_env_allowlist)
     allowlisted_redactor = SecretRedactor(
@@ -908,6 +909,31 @@ async def _run_docker(
     )
     if output_redactor is not None:
         allowlisted_redactor = allowlisted_redactor.merged_with(output_redactor)
+    if admission_completion_token is not None:
+        # Admission owns this bounded control response. Authenticate its exact
+        # completion frame before redaction: ordinary environment values such
+        # as "1" must not erase bytes from the generated nonce or exit status.
+        result = await run_subprocess(
+            SubprocessCommand(argv=[docker_path, *args]),
+            env=host_env,
+            timeout_s=timeout_s,
+            output_limit_bytes=64 * 1024,
+        )
+        completed = _docker_admission_probe_completion(
+            result, completion_token=admission_completion_token
+        )
+        diagnostic = completed if completed is not None else result
+        stderr = allowlisted_redactor.redact_text(diagnostic.stderr)
+        if completed is not None:
+            # Reattach only Runtime-generated control data. Guest diagnostics
+            # remain redacted, and existing owners still validate the frame.
+            stderr += f"\n{admission_completion_token}:{completed.exit_code}\n"
+        return result.model_copy(
+            update={
+                "stdout": allowlisted_redactor.redact_text(diagnostic.stdout),
+                "stderr": stderr,
+            }
+        )
     return await run_subprocess(
         SubprocessCommand(argv=[docker_path, *args]),
         env=host_env,
@@ -1066,7 +1092,7 @@ def _docker_admission_probe_completion(
         rf"\n{re.escape(completion_token)}:([0-9]{{1,3}})\n\Z",
         result.stderr,
     )
-    if marker is None:
+    if marker is None or result.stderr.count(completion_token) != 1:
         return None
     guest_exit_code = int(marker.group(1))
     if guest_exit_code > 255:
@@ -1253,7 +1279,7 @@ async def _run_docker_admission_probe(
     command_environment = copy_runner_env(dict(environment or {}), inherit_env=False)
     environment = None
     validate_runner_env_file_environment(command_environment)
-    probe_redactor = SecretRedactor(tuple(command_environment.values()))
+    probe_redactor = _docker_lifecycle_redactor(command_environment, ())
     state = _DockerProbeSettlementState()
 
     async def dispatch(args: list[str]) -> ExecResult:
@@ -1271,6 +1297,7 @@ async def _run_docker_admission_probe(
                 docker_cli_env_allowlist=docker_cli_env_allowlist,
                 timeout_s=30,
                 output_redactor=probe_redactor,
+                admission_completion_token=completion_token,
             )
             if (
                 supervise_guest

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import warnings
 from collections.abc import AsyncIterator
@@ -2016,9 +2017,11 @@ def test_docker_final_probe_settles_guest_before_factory_release(
                 probe_env_files.append(path)
                 assert path.exists()
                 assert "private-probe-860" not in repr(command.argv)
-                assert "private-probe-860" not in kwargs["output_redactor"].redact_text(
-                    "private-probe-860"
-                )
+                # The private, bounded probe channel authenticates completion
+                # before redacting diagnostics; redaction must not erase its
+                # nonce or status. No environment values enter host argv/env.
+                assert kwargs.get("output_redactor") is None
+                assert kwargs["output_limit_bytes"] == 64 * 1024
                 assert "private-probe-860" not in repr(kwargs["env"])
             guest_active = True
             probe_dispatched.set()
@@ -2142,6 +2145,9 @@ def test_docker_final_probe_settles_guest_before_factory_release(
         else:
             events = await task
             assert any(event.type is EventType.SESSION_FAILED for event in events)
+            assert "private-probe-860" not in json.dumps(
+                [event.model_dump(mode="json") for event in events]
+            )
             assert task.cancelled() is False
         assert factory.release_actions
         assert set(factory.release_actions) == {
