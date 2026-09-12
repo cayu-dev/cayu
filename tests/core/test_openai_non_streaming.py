@@ -380,3 +380,39 @@ def test_response_transport_mode_requires_boolean(invalid):
 def test_background_operations_cannot_silently_ignore_final_response_mode():
     with pytest.raises(ValueError, match="background operations require streaming=True"):
         OpenAIProvider(api_key="synthetic-key", streaming=False, background=True)
+
+
+@pytest.mark.anyio
+async def test_response_mode_execution_identity_is_portable_across_app_instances():
+    async def inspect(streaming):
+        provider = OpenAIProvider(api_key="synthetic-key", streaming=streaming)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="gpt-5.6"))
+        try:
+            config = await app.inspect_effective_run_configuration(
+                RunRequest(agent_name="assistant", messages=[])
+            )
+            return config.execution_profile
+        finally:
+            await provider.aclose()
+
+    first = await inspect(False)
+    second = await inspect(False)
+    streamed = await inspect(True)
+    assert first == second
+    assert first.fingerprint != streamed.fingerprint
+    policy = next(
+        component
+        for component in first.components
+        if component.component_class.value == "provider_request_policy"
+    )
+    assert policy.strength.value != "process_local"
+
+
+@pytest.mark.parametrize("value", [True, False, "false", 0, {"private": "content"}, None])
+def test_stream_option_projection_accepts_only_boolean_controls(value):
+    from cayu.providers.base import privacy_safe_provider_option_projection
+
+    projected = privacy_safe_provider_option_projection({"stream": value})
+    assert projected == ({"stream": value} if type(value) is bool else {})

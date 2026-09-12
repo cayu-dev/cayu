@@ -76,6 +76,7 @@ _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS = frozenset(
         "service_tier",
         "stop",
         "stop_sequences",
+        "stream",
         "temperature",
         "thinking",
         "tool_choice",
@@ -141,6 +142,7 @@ def privacy_safe_provider_option_projection(value: object) -> dict[str, Any]:
         if type(key) is str
         and key in _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS
         and option is not None
+        and (key != "stream" or type(option) is bool)
     }
 
 
