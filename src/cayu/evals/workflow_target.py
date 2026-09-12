@@ -32,6 +32,7 @@ from cayu.core.messages import Message, detach_message
 from cayu.core.workflows import WorkflowSpec, copy_workflow_spec
 from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowAttemptAnchor
 from cayu.runtime.app import CayuApp
+from cayu.runtime.sessions import TerminalSessionEvidenceErrorCode
 from cayu.workflows import WorkflowBase
 
 WORKFLOW_EVAL_MAX_FINAL_OUTPUT_CHARS = 65_536
@@ -466,7 +467,18 @@ class WorkflowEvalFailureCode(StrEnum):
 class WorkflowEvalFailure(RuntimeError):
     """Fail-closed workflow driver error with a public-safe diagnostic."""
 
-    def __init__(self, code: WorkflowEvalFailureCode, message: str) -> None:
+    def __init__(
+        self,
+        code: WorkflowEvalFailureCode,
+        message: str,
+        *,
+        terminal_code: TerminalSessionEvidenceErrorCode | None = None,
+        limit: int | None = None,
+        observed: int | None = None,
+    ) -> None:
+        self.terminal_code = terminal_code
+        self.limit = limit
+        self.observed = observed
         self.code = WorkflowEvalFailureCode(code)
         super().__init__(require_durable_clean_nonblank(message, "message"))
 

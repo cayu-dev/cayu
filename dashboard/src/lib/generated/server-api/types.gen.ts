@@ -8217,6 +8217,10 @@ export type EvalTrialPresentationV1 = {
     diagnostic_code?: EvalTrialDiagnosticCode | null;
     dimensions: EvalResultOutcomeDimensionsV1;
     /**
+     * Execution Status
+     */
+    execution_status?: 'completed' | 'failed' | null;
+    /**
      * Score
      */
     score?: number | null;
@@ -8536,6 +8540,29 @@ export type EventOrder = 'sequence_asc' | 'sequence_desc';
 export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
 
 /**
+ * ExecutionDeadline
+ *
+ * Portable UTC expiry with a live, process-local monotonic upper bound.
+ *
+ * None is explicit absence of a deadline. Only UTC/source/scope are serialized;
+ * loading a durable value recomputes remaining time, never its original duration.
+ */
+export type ExecutionDeadline = {
+    /**
+     * Expires At
+     */
+    expires_at?: string | null;
+    /**
+     * Scope
+     */
+    scope?: string;
+    /**
+     * Source
+     */
+    source?: string;
+};
+
+/**
  * ExecutionEvidenceOverride
  *
  * A capability-specific minimum that overrides the workload default.
@@ -8824,6 +8851,55 @@ export type ExternalTrialIdentityV1 = {
      * Trial Number
      */
     trial_number: number;
+};
+
+/**
+ * FailureEvidence
+ *
+ * Portable evidence, never a certificate that external effects have stopped.
+ *
+ * ``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session
+ * events and the existing IncompleteSessionRecoveryResult contract. Missing
+ * evidence is unknown, including for old durable events.
+ */
+export type FailureEvidence = {
+    /**
+     * Classification
+     */
+    classification?: 'deadline' | 'timeout' | 'interruption' | 'failure' | 'unknown';
+    deadline?: ExecutionDeadline | null;
+    /**
+     * Deadline Phase
+     */
+    deadline_phase?: 'admission' | 'in_flight' | null;
+    /**
+     * Exception Types
+     */
+    exception_types?: Array<string>;
+    /**
+     * Run Epoch
+     */
+    run_epoch?: number | null;
+    /**
+     * Secondary Failures
+     */
+    secondary_failures?: boolean;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    /**
+     * Settlement
+     */
+    settlement?: 'unknown';
+    /**
+     * Terminal Event Id
+     */
+    terminal_event_id?: string | null;
+    /**
+     * Truncated
+     */
+    truncated?: boolean;
 };
 
 /**
@@ -12880,7 +12956,9 @@ export type PublishedEvalTrialResult = {
     /**
      * Execution Status
      */
-    execution_status?: 'completed' | null;
+    execution_status?: 'completed' | 'failed' | null;
+    failure_capture?: WorkflowFailureCapture | null;
+    failure_evidence?: FailureEvidence | null;
     memory_attribution: EvalMemoryAttributionEvidenceV1;
     /**
      * Message
@@ -17778,6 +17856,105 @@ export type WorkflowEvalTargetIdentityV1 = {
      * Workflow Spec Revision
      */
     workflow_spec_revision: string;
+};
+
+/**
+ * WorkflowFailureCapture
+ *
+ * Partial observations of failed execution; never successful scoring evidence.
+ *
+ * Counts cover only the validated record ranges listed here. Usage is a lower
+ * bound from observed usage-bearing model completions, not provider billing.
+ */
+export type WorkflowFailureCapture = {
+    /**
+     * Attempt Id
+     */
+    attempt_id?: string | null;
+    /**
+     * Diagnostics
+     */
+    diagnostics?: Array<WorkflowCaptureDiagnostic>;
+    /**
+     * Diagnostics Truncated
+     */
+    diagnostics_truncated?: boolean;
+    /**
+     * Events Count Basis
+     */
+    events_count_basis?: 'validated_durable_records';
+    /**
+     * Model Calls
+     */
+    model_calls?: number;
+    /**
+     * Model Calls With Usage
+     */
+    model_calls_with_usage?: number;
+    /**
+     * Records
+     */
+    records?: Array<WorkflowFailureRecordReference>;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Started Event Id
+     */
+    started_event_id?: string | null;
+    /**
+     * State
+     */
+    state?: 'partial' | 'unavailable';
+    /**
+     * Tool Calls
+     */
+    tool_calls?: number;
+    /**
+     * Usage Basis
+     */
+    usage_basis?: 'observed_usage_records' | 'unavailable';
+};
+
+/**
+ * WorkflowFailureRecordReference
+ *
+ * Exact retained-store record range, without copying its event payloads.
+ */
+export type WorkflowFailureRecordReference = {
+    /**
+     * First Event Id
+     */
+    first_event_id: string;
+    /**
+     * First Sequence
+     */
+    first_sequence: number;
+    /**
+     * Last Event Id
+     */
+    last_event_id: string;
+    /**
+     * Last Sequence
+     */
+    last_sequence: number;
+    /**
+     * Record Count
+     */
+    record_count: number;
+    /**
+     * Records Sha256
+     */
+    records_sha256: string;
+    /**
+     * Run Epoch
+     */
+    run_epoch: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
 };
 
 /**

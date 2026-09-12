@@ -40,6 +40,7 @@ from cayu.evals.capture_policy import (
     SessionTrajectoryBounds,
     WorkflowAttemptAnchor,
     WorkflowCaptureDiagnostic,
+    WorkflowFailureCapture,
 )
 from cayu.evals.memory_attribution import (
     EvalMemoryAttributionEvidenceV1,
@@ -49,6 +50,7 @@ from cayu.evals.memory_attribution import (
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, trajectory_operation_outcomes
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.evals.workflow_target import RetainedWorkflowEvalOutput, WorkflowEvalOutputEvidenceV1
+from cayu.failure_evidence import FailureEvidence
 from cayu.memory_attribution import MemoryAttribution
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.sessions import Session, SessionStatus
@@ -351,7 +353,13 @@ class EvalTrialResult(BaseModel):
     operation_outcomes: OperationOutcomeSummary | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    execution_status: Literal["completed"] | None = Field(
+    execution_status: Literal["completed", "failed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    failure_evidence: FailureEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    failure_capture: WorkflowFailureCapture | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     capture_bounds: SessionTrajectoryBounds | None = Field(
@@ -434,6 +442,32 @@ class EvalTrialResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_result_contract(self) -> EvalTrialResult:
+        if self.execution_status == "failed" and (
+            self.status is not EvalStatus.ERROR
+            or self.evidence_complete
+            or self.score is not None
+            or self.final_output
+            or self.structured_output is not None
+            or self.trajectory is not None
+            or any(
+                assertion.outcome not in {EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE}
+                for assertion in self.assertions
+            )
+        ):
+            raise ValueError("Failed execution cannot carry successful output or scoring.")
+        if self.failure_capture is not None and (
+            self.execution_status != "failed"
+            or self.failure_capture.session_id != self.session_id
+            or self.evidence_complete
+            or self.score is not None
+            or self.final_output
+            or self.structured_output is not None
+            or self.events_count != self.failure_capture.events_count
+            or ((self.failure_capture.usage_basis == "unavailable") != (self.usage_summary is None))
+        ):
+            raise ValueError(
+                "Failed-workflow observations cannot imply completed execution or scoring."
+            )
         if self.workflow_attempt is not None and (
             self.execution_status != "completed"
             or self.workflow_attempt.session_id != self.session_id
@@ -465,8 +499,16 @@ class EvalTrialResult(BaseModel):
         if self.status == EvalStatus.ERROR:
             if self.error is None:
                 raise ValueError("error trials require an error diagnostic.")
-            if self.assertions and not any(
-                assertion.outcome == EvalOutcome.ERROR for assertion in self.assertions
+            if (
+                self.assertions
+                and not any(assertion.outcome == EvalOutcome.ERROR for assertion in self.assertions)
+                and not (
+                    self.failure_capture is not None
+                    and all(
+                        assertion.outcome == EvalOutcome.UNAVAILABLE
+                        for assertion in self.assertions
+                    )
+                )
             ):
                 raise ValueError("error trials must retain an error assertion outcome.")
         elif self.error is not None:
@@ -627,7 +669,11 @@ class EvalTrialResult(BaseModel):
                 EvalMemoryEvidenceLimitation.SOURCE_LIMIT not in self.memory_attribution.limitations
             ):
                 raise ValueError("Omitted trajectory memory sources must retain their limit.")
-        expected_status = _status_from_assertions(self.assertions)
+        expected_status = (
+            EvalStatus.ERROR
+            if self.failure_capture is not None
+            else _status_from_assertions(self.assertions)
+        )
         # Execution/evidence can fail before assertions exist. Once assertion
         # outcomes do exist, however, their fail-closed precedence is exact:
         # an ERROR outcome can never be represented as merely UNAVAILABLE.

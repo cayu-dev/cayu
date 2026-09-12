@@ -16664,6 +16664,21 @@
           "dimensions": {
             "$ref": "#/components/schemas/EvalResultOutcomeDimensionsV1"
           },
+          "execution_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "completed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Status"
+          },
           "score": {
             "anyOf": [
               {
@@ -17496,6 +17511,36 @@
         "title": "EventType",
         "type": "string"
       },
+      "ExecutionDeadline": {
+        "additionalProperties": false,
+        "description": "Portable UTC expiry with a live, process-local monotonic upper bound.\n\nNone is explicit absence of a deadline. Only UTC/source/scope are serialized;\nloading a durable value recomputes remaining time, never its original duration.",
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "scope": {
+            "default": "execution",
+            "title": "Scope",
+            "type": "string"
+          },
+          "source": {
+            "default": "runtime",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "title": "ExecutionDeadline",
+        "type": "object"
+      },
       "ExecutionEvidenceOverride": {
         "additionalProperties": false,
         "description": "A capability-specific minimum that overrides the workload default.",
@@ -18000,6 +18045,114 @@
           "trial_number"
         ],
         "title": "ExternalTrialIdentityV1",
+        "type": "object"
+      },
+      "FailureEvidence": {
+        "additionalProperties": false,
+        "description": "Portable evidence, never a certificate that external effects have stopped.\n\n``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session\nevents and the existing IncompleteSessionRecoveryResult contract. Missing\nevidence is unknown, including for old durable events.",
+        "properties": {
+          "classification": {
+            "default": "unknown",
+            "enum": [
+              "deadline",
+              "timeout",
+              "interruption",
+              "failure",
+              "unknown"
+            ],
+            "title": "Classification",
+            "type": "string"
+          },
+          "deadline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionDeadline"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deadline_phase": {
+            "anyOf": [
+              {
+                "enum": [
+                  "admission",
+                  "in_flight"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deadline Phase"
+          },
+          "exception_types": {
+            "default": [],
+            "items": {
+              "maxLength": 128,
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Exception Types",
+            "type": "array"
+          },
+          "run_epoch": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Epoch"
+          },
+          "secondary_failures": {
+            "default": false,
+            "title": "Secondary Failures",
+            "type": "boolean"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "settlement": {
+            "const": "unknown",
+            "default": "unknown",
+            "title": "Settlement",
+            "type": "string"
+          },
+          "terminal_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Event Id"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "title": "FailureEvidence",
         "type": "object"
       },
       "FilePart": {
@@ -25845,7 +25998,10 @@
           "execution_status": {
             "anyOf": [
               {
-                "const": "completed",
+                "enum": [
+                  "completed",
+                  "failed"
+                ],
                 "type": "string"
               },
               {
@@ -25853,6 +26009,26 @@
               }
             ],
             "title": "Execution Status"
+          },
+          "failure_capture": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowFailureCapture"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure_evidence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "memory_attribution": {
             "$ref": "#/components/schemas/EvalMemoryAttributionEvidenceV1"
@@ -35164,6 +35340,174 @@
           "close_timeout_seconds"
         ],
         "title": "WorkflowEvalTargetIdentityV1",
+        "type": "object"
+      },
+      "WorkflowFailureCapture": {
+        "additionalProperties": false,
+        "description": "Partial observations of failed execution; never successful scoring evidence.\n\nCounts cover only the validated record ranges listed here. Usage is a lower\nbound from observed usage-bearing model completions, not provider billing.",
+        "properties": {
+          "attempt_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Id"
+          },
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkflowCaptureDiagnostic"
+            },
+            "maxItems": 16,
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "diagnostics_truncated": {
+            "default": false,
+            "title": "Diagnostics Truncated",
+            "type": "boolean"
+          },
+          "events_count_basis": {
+            "const": "validated_durable_records",
+            "default": "validated_durable_records",
+            "title": "Events Count Basis",
+            "type": "string"
+          },
+          "model_calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Model Calls",
+            "type": "integer"
+          },
+          "model_calls_with_usage": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Model Calls With Usage",
+            "type": "integer"
+          },
+          "records": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkflowFailureRecordReference"
+            },
+            "maxItems": 500,
+            "title": "Records",
+            "type": "array"
+          },
+          "session_id": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "started_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started Event Id"
+          },
+          "state": {
+            "default": "unavailable",
+            "enum": [
+              "partial",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "tool_calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Tool Calls",
+            "type": "integer"
+          },
+          "usage_basis": {
+            "default": "unavailable",
+            "enum": [
+              "observed_usage_records",
+              "unavailable"
+            ],
+            "title": "Usage Basis",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "WorkflowFailureCapture",
+        "type": "object"
+      },
+      "WorkflowFailureRecordReference": {
+        "additionalProperties": false,
+        "description": "Exact retained-store record range, without copying its event payloads.",
+        "properties": {
+          "first_event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "First Event Id",
+            "type": "string"
+          },
+          "first_sequence": {
+            "minimum": 1.0,
+            "title": "First Sequence",
+            "type": "integer"
+          },
+          "last_event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Last Event Id",
+            "type": "string"
+          },
+          "last_sequence": {
+            "minimum": 1.0,
+            "title": "Last Sequence",
+            "type": "integer"
+          },
+          "record_count": {
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Record Count",
+            "type": "integer"
+          },
+          "records_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Records Sha256",
+            "type": "string"
+          },
+          "run_epoch": {
+            "minimum": 0.0,
+            "title": "Run Epoch",
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "run_epoch",
+          "first_sequence",
+          "last_sequence",
+          "first_event_id",
+          "last_event_id",
+          "record_count",
+          "records_sha256"
+        ],
+        "title": "WorkflowFailureRecordReference",
         "type": "object"
       },
       "WorkspaceFileAssertionSpec": {

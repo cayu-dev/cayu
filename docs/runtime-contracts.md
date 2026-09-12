@@ -15281,6 +15281,14 @@ See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for
 policy identities, bounds, diagnostic semantics, immutable capture/score revisions,
 and the explicit historical limits of importing pre-anchor reports.
 
+Failed workflow execution remains an error with unavailable, unexecuted assertions.
+A bounded `failure_capture` may retain exact durable-record references, observed
+activity and partial usage before target closure, alongside existing `FailureEvidence`.
+It never creates successful output or completion evidence. Counts cover only the
+listed validated ranges; missing usage remains unknown. Root attempt and native
+lineage conflicts fail closed, capture limits cannot grant more execution work,
+and reopening reports performs no provider/tool dispatch.
+
 The optional incremental evidence capability on SQLite/PostgreSQL copies bounded
 pages under one terminal snapshot into owned authenticated JSON backing. Source
 transactions end before local validation/scoring. Exact attempt and parent boundaries,

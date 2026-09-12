@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import pairwise
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -50,6 +51,7 @@ from cayu.evals.capture_policy import (
     WorkflowAttemptAnchor,
     WorkflowCaptureDiagnostic,
     WorkflowCaptureStage,
+    WorkflowFailureCapture,
 )
 from cayu.evals.corpus import EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
 from cayu.evals.memory_attribution import (
@@ -117,6 +119,7 @@ from cayu.evals.trajectory import (
     final_output_text,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.evals.workflow_failure import capture_failed_workflow
 from cayu.evals.workflow_target import (
     RetainedWorkflowEvalOutput,
     WorkflowEvalExecution,
@@ -130,6 +133,7 @@ from cayu.evals.workflow_target import (
     workflow_eval_output_sha256,
     workflow_eval_trial_session_id,
 )
+from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.memory_attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -1702,7 +1706,7 @@ async def _load_workflow_eval_records(
     app: CayuApp,
     *,
     session_id: str,
-    workflow_name: str,
+    workflow_name: str | None,
     max_bytes: int | None = None,
     max_record_bytes: int | None = None,
     max_events: int = _WORKFLOW_EVAL_MAX_EVENTS,
@@ -1739,6 +1743,15 @@ async def _load_workflow_eval_records(
                     raise WorkflowEvalFailure(
                         WorkflowEvalFailureCode.COMPLETION_CONFLICT,
                         "Workflow root evidence exceeds its byte budget.",
+                        terminal_code=TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
+                        if max_record_bytes is not None and size > max_record_bytes
+                        else TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+                        limit=max_record_bytes
+                        if max_record_bytes is not None and size > max_record_bytes
+                        else max_bytes,
+                        observed=size
+                        if max_record_bytes is not None and size > max_record_bytes
+                        else consumed_bytes,
                     )
         if not page:
             break
@@ -1752,11 +1765,23 @@ async def _load_workflow_eval_records(
                 WorkflowEvalFailureCode.COMPLETION_CONFLICT,
                 "Workflow evidence contains a non-monotonic event sequence.",
             )
+        if any(
+            record.event.session_id != session_id
+            or (workflow_name is not None and record.event.workflow_name != workflow_name)
+            for record in page
+        ) or any(later.sequence <= earlier.sequence for earlier, later in pairwise(page)):
+            raise WorkflowEvalFailure(
+                WorkflowEvalFailureCode.COMPLETION_CONFLICT,
+                "Workflow evidence contains conflicting record identity or order.",
+            )
         records.extend(page)
         if len(records) > max_events:
             raise WorkflowEvalFailure(
                 WorkflowEvalFailureCode.COMPLETION_CONFLICT,
                 "Workflow evidence exceeds the bounded event limit.",
+                terminal_code=TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+                limit=max_events,
+                observed=len(records),
             )
         after_sequence = page[-1].sequence
         if len(page) < page_size:
@@ -1936,6 +1961,10 @@ async def _run_workflow_case_once_with_public_projection(
     workflow_output_retention = None
     execution_status = None
     case_timed_out = False
+    failure_started: Event | None = None
+    failure_evidence: FailureEvidence | None = None
+    failure_capture: WorkflowFailureCapture | None = None
+    failure_usage: SessionUsageSummary | None = None
     publication_attempt_id: str | None = None
     publication_completion_event_id: str | None = None
     publication_record_identity: tuple[tuple[int, str], ...] | None = None
@@ -1960,6 +1989,35 @@ async def _run_workflow_case_once_with_public_projection(
         effective_source_limit=selected_memory_source_limit,
         effective_max_bytes=selected_memory_max_bytes,
     )
+
+    async def observe_failure() -> None:
+        nonlocal failure_capture, failure_usage
+        try:
+            async with asyncio.timeout(target.close_timeout_seconds):
+                failure_capture, failure_usage = await capture_failed_workflow(
+                    runtime_app,
+                    session_id=root_session_id,
+                    workflow_name=target.workflow_spec.name,
+                    started=failure_started,
+                    bounds=target.capture_bounds,
+                    load_records=_load_workflow_eval_records,
+                )
+        except Exception as error:
+            failure_capture = WorkflowFailureCapture(
+                session_id=root_session_id,
+                diagnostics=(
+                    WorkflowCaptureDiagnostic(
+                        stage="execution",
+                        code=SessionTrajectoryErrorCode.DEADLINE_EXCEEDED
+                        if isinstance(error, TimeoutError)
+                        else SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED,
+                        session_id=root_session_id,
+                        bounds=target.capture_bounds,
+                    ),
+                ),
+            )
+            failure_usage = None
+
     try:
         async with execution_deadline_scope(
             ExecutionDeadline.after(timeout_seconds, source="evaluator", scope="case")
@@ -2038,7 +2096,10 @@ async def _run_workflow_case_once_with_public_projection(
                 async for emitted in execution.workflow.run(root_session_id):
                     if type(emitted) is not Event:
                         raise TypeError("workflow run yielded a non-Event value")
+                    if emitted.type == EventType.WORKFLOW_STARTED and failure_started is None:
+                        failure_started = emitted
             except Exception as exc:
+                failure_evidence = exception_evidence(exc)
                 if exception_tree_contains(exc, (WorkflowSupersededError,)):
                     raise WorkflowEvalFailure(
                         WorkflowEvalFailureCode.ATTEMPT_SUPERSEDED,
@@ -2305,8 +2366,12 @@ async def _run_workflow_case_once_with_public_projection(
             publication_record_identity = tuple(
                 (record.sequence, record.event.id) for record in final_records
             )
-    except TimeoutError:
+    except TimeoutError as exc:
         case_timed_out = True
+        if execution_status != "completed" and execution is not None:
+            execution_status = "failed"
+            failure_evidence = exception_evidence(exc)
+            await observe_failure()
         run_error = f"Eval case timed out after {timeout_seconds} seconds (phase={capture_stage})."
         if execution_status == "completed":
             capture_diagnostic = WorkflowCaptureDiagnostic(
@@ -2347,6 +2412,9 @@ async def _run_workflow_case_once_with_public_projection(
         final_output = ""
         structured_output = None
     except WorkflowEvalFailure as exc:
+        if exc.code is WorkflowEvalFailureCode.EXECUTION_FAILED:
+            execution_status = "failed"
+            await observe_failure()
         run_error = str(exc)
         diagnostic_code = _WORKFLOW_FAILURE_DIAGNOSTICS[exc.code]
         public_output = EvalTrialOutputPreviewV1.unavailable()
@@ -2470,6 +2538,7 @@ async def _run_workflow_case_once_with_public_projection(
                 case.assertions,
                 EvalOutcome.UNAVAILABLE
                 if diagnostic_code is EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
+                or failure_capture is not None
                 else EvalOutcome.ERROR,
                 run_error,
                 memory_attribution_evidence=memory_attribution,
@@ -2508,6 +2577,8 @@ async def _run_workflow_case_once_with_public_projection(
             execution_status=execution_status,
             capture_bounds=target.capture_bounds,
             capture_diagnostic=capture_diagnostic,
+            failure_evidence=failure_evidence,
+            failure_capture=failure_capture,
             workflow_attempt=workflow_attempt,
             retained_workflow_output=retained_workflow_output,
             workflow_output_retention=workflow_output_retention,
@@ -2521,9 +2592,17 @@ async def _run_workflow_case_once_with_public_projection(
             error=run_error,
             unavailable_reason=unavailable_reason,
             evidence_complete=trajectory is not None and not trajectory.children_incomplete,
-            events_count=0 if trajectory is None else _workflow_event_count(trajectory),
+            events_count=failure_capture.events_count
+            if failure_capture is not None
+            else 0
+            if trajectory is None
+            else _workflow_event_count(trajectory),
             usage_summary=(
-                None
+                session_usage_summary_payload(failure_usage)
+                if failure_usage is not None
+                else None
+                if failure_capture is not None
+                else None
                 if trajectory is None or trajectory.usage_summary is None
                 else session_usage_summary_payload(trajectory.usage_summary)
             ),

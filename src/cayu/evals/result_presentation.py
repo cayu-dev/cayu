@@ -362,6 +362,9 @@ class EvalAssertionPresentationV1(_PortableModel):
 
 
 class EvalTrialPresentationV1(_PortableModel):
+    execution_status: Literal["completed", "failed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     trial_number: StrictInt | None = Field(default=None, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
@@ -382,17 +385,27 @@ class EvalTrialPresentationV1(_PortableModel):
         assertion_ids = tuple(item.assertion_id for item in self.assertions)
         if len(assertion_ids) != len(set(assertion_ids)):
             raise ValueError("Presented trial assertion identities must be unique.")
-        expected_status = _published_status_from_outcomes(
-            assertion.outcome for assertion in self.assertions
+        if self.execution_status == "failed" and any(
+            assertion.outcome not in {"error", "unavailable"} for assertion in self.assertions
+        ):
+            raise ValueError("Failed execution cannot carry scored assertions.")
+        expected_status = (
+            "error"
+            if self.execution_status == "failed"
+            else _published_status_from_outcomes(assertion.outcome for assertion in self.assertions)
         )
         expected_score = _published_score(assertion.score for assertion in self.assertions)
         if self.status != expected_status or self.score != expected_score:
             raise ValueError("Presented trial aggregates contradict its assertions.")
         if self.trial_number is None:
-            if self.diagnostic_code is not None or self.dimensions.runtime != "not_executed":
+            if (
+                self.execution_status is not None
+                or self.diagnostic_code is not None
+                or self.dimensions.runtime != "not_executed"
+            ):
                 raise ValueError("Captured presentation cannot carry fresh runtime identity.")
-        elif self.diagnostic_code is None or self.dimensions.runtime != _fresh_runtime(
-            self.diagnostic_code
+        elif self.diagnostic_code is None or self.dimensions.runtime != (
+            self.execution_status or _fresh_runtime(self.diagnostic_code)
         ):
             raise ValueError("Fresh presentation runtime contradicts its diagnostic.")
         expected_dimensions = _presented_dimensions(
@@ -826,6 +839,7 @@ _SEMANTIC_DETAIL_TYPES = (PublishedModelJudgeDetail, PublishedStructuredModelJud
 _RUNTIME_FAILED_CODES = {
     EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED,
     EvalTrialDiagnosticCode.EXECUTION_FAILED,
+    EvalTrialDiagnosticCode.WORKFLOW_EXECUTION_FAILED,
     EvalTrialDiagnosticCode.SESSION_FAILED,
     EvalTrialDiagnosticCode.CASE_TIMEOUT,
 }
@@ -1053,6 +1067,7 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
         else "incomplete"
     )
     return EvalTrialPresentationV1(
+        execution_status=validated.execution_status,
         trial_number=validated.trial_number,
         status=validated.status,
         score=validated.score,

@@ -3,7 +3,7 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from cayu.memory_attribution import MemoryAttributionBounds
 from cayu.runtime.sessions import (
@@ -130,3 +130,65 @@ class WorkflowAttemptAnchor(BaseModel):
     root_sha256: str
     final_output_sha256: str
     structured_output_sha256: str
+
+
+class WorkflowFailureRecordReference(BaseModel):
+    """Exact retained-store record range, without copying its event payloads."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+    session_id: str = Field(min_length=1, max_length=2048)
+    run_epoch: StrictInt = Field(ge=0)
+    first_sequence: StrictInt = Field(ge=1)
+    last_sequence: StrictInt = Field(ge=1)
+    first_event_id: str = Field(min_length=1, max_length=512)
+    last_event_id: str = Field(min_length=1, max_length=512)
+    record_count: StrictInt = Field(ge=1, le=100_000)
+    records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.first_sequence > self.last_sequence:
+            raise ValueError("Failure evidence record range must be ordered.")
+        return self
+
+
+class WorkflowFailureCapture(BaseModel):
+    """Partial observations of failed execution; never successful scoring evidence.
+
+    Counts cover only the validated record ranges listed here. Usage is a lower
+    bound from observed usage-bearing model completions, not provider billing.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+    session_id: str = Field(min_length=1, max_length=2048)
+    attempt_id: str | None = Field(default=None, max_length=512)
+    started_event_id: str | None = Field(default=None, max_length=512)
+    state: Literal["partial", "unavailable"] = "unavailable"
+    events_count_basis: Literal["validated_durable_records"] = "validated_durable_records"
+    usage_basis: Literal["observed_usage_records", "unavailable"] = "unavailable"
+    records: tuple[WorkflowFailureRecordReference, ...] = Field(default=(), max_length=500)
+    model_calls: StrictInt = Field(default=0, ge=0)
+    tool_calls: StrictInt = Field(default=0, ge=0)
+    model_calls_with_usage: StrictInt = Field(default=0, ge=0)
+    diagnostics: tuple[WorkflowCaptureDiagnostic, ...] = Field(default=(), max_length=16)
+    diagnostics_truncated: bool = False
+
+    @property
+    def events_count(self) -> int:
+        return sum(reference.record_count for reference in self.records)
+
+    @model_validator(mode="after")
+    def validate_observations(self):
+        if self.state == "unavailable" and self.records:
+            raise ValueError("Unavailable failure capture cannot claim retained records.")
+        if self.state == "partial" and (
+            not self.records or self.attempt_id is None or self.started_event_id is None
+        ):
+            raise ValueError("Partial failure capture requires exact workflow-attempt identity.")
+        if self.records and self.records[0].session_id != self.session_id:
+            raise ValueError("Failed-workflow records must begin with the workflow root.")
+        if len({record.session_id for record in self.records}) != len(self.records):
+            raise ValueError("Failure capture cannot count a session twice.")
+        if (self.usage_basis == "observed_usage_records") != (self.model_calls_with_usage > 0):
+            raise ValueError("Failure usage basis must match observed usage records.")
+        return self

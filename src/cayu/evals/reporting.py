@@ -561,6 +561,23 @@ def _trial_section(trial: Any) -> str:
     )
     execution = getattr(trial, "execution_status", None)
     execution_html = f"<p>Workflow execution: {_escape(execution)}.</p>" if execution else ""
+    failure_capture = getattr(trial, "failure_capture", None)
+    failure_evidence = getattr(trial, "failure_evidence", None)
+    failure_evidence_html = (
+        "<h5>Execution failure evidence</h5><pre>"
+        + _escape(failure_evidence.model_dump_json(indent=2))
+        + "</pre>"
+        if failure_evidence is not None
+        else ""
+    )
+    failure_html = (
+        f"<h5>Failed-workflow observations</h5><p>{failure_capture.events_count} validated durable records; "
+        f"{failure_capture.model_calls} model calls; {failure_capture.tool_calls} tool calls. "
+        f"Usage basis: {_escape(failure_capture.usage_basis)}. Partial evidence; provider billing may differ.</p>"
+        f"<pre>{_escape(failure_capture.model_dump_json(indent=2))}</pre>"
+        if failure_capture is not None
+        else ""
+    )
     diagnostic = trial.error or trial.unavailable_reason
     diagnostic_html = f"<h5>Diagnostic</h5><pre>{_escape(diagnostic)}</pre>" if diagnostic else ""
     usage = (
@@ -579,7 +596,7 @@ def _trial_section(trial: Any) -> str:
         f"<p>Session <code>{_escape(trial.session_id or 'not created')}</code> · "
         f"score {_format_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'}</p>"
-        f"{execution_html}{diagnostic_html}{final_output}{usage}"
+        f"{execution_html}{diagnostic_html}{failure_evidence_html}{failure_html}{final_output}{usage}"
         f"<p>{_escape(operations)}</p>"
         f"<p>Memory attribution: {_escape(memory_summary)} · revision "
         f"<code>{_escape(memory.revision)}</code></p>"

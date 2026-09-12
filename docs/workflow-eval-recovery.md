@@ -77,6 +77,53 @@ execution/capture state remains unknown. Older strict readers can reject new
 fields or the new diagnostic code and must be upgraded to consume these reports.
 No old report is silently converted from error to successful capture.
 
+## Failed-workflow observations
+
+An exception from `workflow.run` retains `execution_status="failed"` and the existing
+`FailureEvidence` classification, bounded exception types and any native child
+terminal reference. The trial remains an execution error with no final output,
+workflow completion anchor, retained successful output or score. Its assertions are
+unavailable and are not executed, including model-backed assertions.
+
+`failure_capture` preserves observations from the original store before the target's
+close callback. It never invokes a workflow, projector, provider, tool, judge or
+recovery operation. Capture has its own bounded read interval using the target's
+existing close timeout; it grants no additional execution allowance.
+
+- `events_count` counts only the validated durable record ranges in
+  `failure_capture.records`, including the current workflow journal and admitted
+  descendants. Each reference binds the session/run epoch, first/last sequence and
+  event ID, record count and SHA-256 of that exact range. It is not the count of
+  events yielded by the failed workflow, nor an assertion that all activity was captured.
+- Direct children must have a step registration in the observed workflow attempt
+  and matching authoritative store lineage. Descendants must retain matching native
+  origin records. A changed root attempt invalidates the projection. Session history
+  within each listed range is counted once; reused history is not newly incurred spend.
+- `model_calls` and `tool_calls` count durable start events in those ranges.
+  `model_calls_with_usage` counts model completions with valid usage. `usage_summary`
+  contains their known accounting only when at least one usage record exists.
+  Missing usage stays `null`, even when activity is known. These observations do not
+  imply complete provider billing or settled external effects.
+- The target's event, session, depth, individual-record and aggregate-byte capture
+  bounds also apply here, including the root journal. No transcripts or payloads
+  are copied into the failure report. Rejected reads consume the available attempt
+  to capture that evidence; they cannot grant another child a fresh allowance.
+- Missing, conflicting, oversized or unavailable evidence has bounded typed capture
+  diagnostics. Previously validated sibling activity remains available. `partial`
+  means observed failed-execution records, never complete scoring evidence;
+  `unavailable` means no ranges could be safely attributed. A capture timeout may
+  leave only the failure classification and timeout diagnostic.
+
+Direct JSON/HTML, portable results and CLI reports retain these distinctions.
+Reopening a report only reads the saved data. Record references support inspection
+against the original store; they do not reconstruct deleted records or authorize
+re-execution. Saved successful-output recovery still rejects failed execution.
+
+These optional fields extend EvalRun v11, portable trial results and trial
+presentations. Updated readers accept older reports with unknown failure-capture
+state; older strict readers can reject the new fields or `execution_status="failed"`.
+Failure projection does not itself add selective retries or campaign resume.
+
 ## Recapture and score a saved attempt
 
 Use the original target configuration and an app connected to the **original

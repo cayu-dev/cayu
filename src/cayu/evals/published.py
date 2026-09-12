@@ -21,7 +21,11 @@ from cayu._validation import (
     json_utf8_size_within_limit,
 )
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
-from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowCaptureDiagnostic
+from cayu.evals.capture_policy import (
+    SessionTrajectoryBounds,
+    WorkflowCaptureDiagnostic,
+    WorkflowFailureCapture,
+)
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     _MODEL_JUDGE_RESULT_METADATA_KEY,
@@ -121,6 +125,7 @@ from cayu.evals.trial_policy import (
     EvalSuiteRunExposureV1,
     EvalSuiteTrialPolicyV1,
 )
+from cayu.failure_evidence import FailureEvidence
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
 PUBLISHED_EVAL_SCHEMA_VERSION = 10
@@ -1274,7 +1279,13 @@ class PublishedEvalTrialResult(_PortableModel):
     operation_outcomes: OperationOutcomeSummary | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    execution_status: Literal["completed"] | None = Field(
+    execution_status: Literal["completed", "failed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    failure_evidence: FailureEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    failure_capture: WorkflowFailureCapture | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     capture_bounds: SessionTrajectoryBounds | None = Field(
@@ -1336,8 +1347,22 @@ class PublishedEvalTrialResult(_PortableModel):
         assertion_ids = tuple(assertion.assertion_id for assertion in self.assertions)
         if len(assertion_ids) != len(set(assertion_ids)):
             raise ValueError("Published assertion IDs must be unique within a trial.")
-        expected_status = _published_status_from_outcomes(
-            assertion.outcome for assertion in self.assertions
+        if self.failure_capture is not None and (
+            self.execution_status != "failed"
+            or self.evidence_complete
+            or self.score is not None
+            or self.output.evidence_state != "unavailable"
+            or any(
+                assertion.outcome not in {"error", "unavailable"} for assertion in self.assertions
+            )
+        ):
+            raise ValueError(
+                "Failed-workflow observations cannot imply completed execution or scoring."
+            )
+        expected_status = (
+            "error"
+            if self.failure_capture is not None
+            else _published_status_from_outcomes(assertion.outcome for assertion in self.assertions)
         )
         expected_score = _published_score(assertion.score for assertion in self.assertions)
         if self.status != expected_status or self.score != expected_score:
@@ -2832,6 +2857,8 @@ def _published_case(
                 execution_status=trial.execution_status,
                 capture_bounds=trial.capture_bounds,
                 capture_diagnostic=trial.capture_diagnostic,
+                failure_evidence=trial.failure_evidence,
+                failure_capture=trial.failure_capture,
                 trial_number=trial.trial_number,
                 source_trial_revision=eval_trial_result_revision(
                     EvalTrialResult.model_validate(
