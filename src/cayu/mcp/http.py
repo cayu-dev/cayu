@@ -9,7 +9,8 @@ server to close the stream. The default legacy era performs `initialize`, owns a
 from POST streams or one session-owned GET/SSE listener. The explicit 2026-07-28 era
 is stateless: it uses `server/discover`, sends the required per-request metadata and
 routing headers, and does not create, listen on, or delete a protocol session. Modern
-catalogue changes remain manual until `subscriptions/listen` is implemented.
+refresh owners use one correlated `subscriptions/listen` POST stream for tool-list
+changes, fencing and reconciling the catalogue across acknowledgement and reconnect.
 
 Cayu incrementally enforces message/event and aggregate-response byte limits, an
 inbound idle timeout, and an absolute call deadline in both eras. The JSON<->model
@@ -96,6 +97,7 @@ from cayu.mcp._protocol import (
     modern_discover_result_from_payload,
     validate_modern_mcp_result,
 )
+from cayu.mcp._subscriptions import ModernToolSubscription, SubscriptionEvent
 from cayu.mcp._transport import (
     McpCallDeadlineExceededError,
     McpIdleTimeoutError,
@@ -587,8 +589,6 @@ class HttpMcpSession(McpSession):
         self,
         handler: Callable[[], None] | None,
     ) -> bool:
-        if handler is not None and not self._wire_protocol.supports_legacy_listener:
-            return False
         if handler is not None and self._closed:
             return False
         if handler is not None:
@@ -607,7 +607,7 @@ class HttpMcpSession(McpSession):
             return True
         # Installation happens synchronously during application registration.
         # Fence dispatch now, before the listener task can yield through its
-        # first GET, so a catalogue mutation between discovery and connection
+        # first listener request, so a catalogue mutation before acknowledgement
         # cannot leave the initial snapshot callable. The source has a narrow
         # registration-only allowance for this activation fence, preserving
         # consecutive synchronous registrations that share one source.
@@ -619,8 +619,6 @@ class HttpMcpSession(McpSession):
         self,
         handler: Callable[[bool], None] | None,
     ) -> bool:
-        if handler is not None and not self._wire_protocol.supports_legacy_listener:
-            return False
         if handler is not None and self._closed:
             return False
         self._tools_list_changed_continuity_handler = handler
@@ -762,25 +760,51 @@ class HttpMcpSession(McpSession):
         # one finite RPC exchange. Keep connection/body reads idle-bounded while
         # allowing a healthy stream to outlive total_call_timeout_s. Individual
         # SSE events remain bounded by max_message_bytes below.
-        budget = _HttpCallBudget(
-            self.transport_limits,
-            enforce_total_deadline=False,
-        )
-        headers = {
-            **self._protocol_headers(),
-            "accept": _SSE_CONTENT_TYPE,
-        }
+        modern = self._wire_protocol.validates_modern_results
+        budget = _HttpCallBudget(self.transport_limits, enforce_total_deadline=modern)
+        subscription: ModernToolSubscription | None = None
+        content: bytes | None = None
+        if modern:
+            request_id = self._next_id
+            self._next_id += 1
+            subscription = ModernToolSubscription(request_id)
+            params = self._wire_protocol.prepare_request_params(
+                "subscriptions/listen", {"notifications": {"toolsListChanged": True}}
+            )
+            payload = jsonrpc_request_payload(request_id, "subscriptions/listen", params)
+            params.clear()
+            try:
+                if not json_utf8_size_within_limit(
+                    payload, self.transport_limits.max_message_bytes, ensure_ascii=True
+                ):
+                    raise McpMessageTooLargeError(
+                        "MCP subscription request exceeded its byte limit."
+                    )
+                headers = self._wire_protocol.request_headers(
+                    payload,
+                    initialized_protocol_version=None,
+                    negotiated_protocol_version=None,
+                    session_id=None,
+                )
+                content = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            finally:
+                payload.clear()
+            # POST may report a JSON-RPC error as JSON before a stream exists.
+            headers["accept"] = f"{_JSON_CONTENT_TYPE}, {_SSE_CONTENT_TYPE}"
+        else:
+            headers = {**self._protocol_headers(), "accept": _SSE_CONTENT_TYPE}
         last_event_id = self._server_listener_last_event_id
         listener_redactor = _mcp_server_listener_redactor(
             self._secret_redactor,
             last_event_id,
         )
-        if last_event_id is not None:
+        if last_event_id is not None and not modern:
             headers[_LAST_EVENT_ID_HEADER] = last_event_id
         stream_context = self._http.stream(
-            "GET",
+            "POST" if modern else "GET",
             self._url,
             headers=headers,
+            content=content,
             follow_redirects=False,
         )
         exchange_owner = _HttpExchangeOwner(stream_context)
@@ -791,7 +815,7 @@ class HttpMcpSession(McpSession):
             response = await budget.wait(stream_context.__aenter__())
             exchange_owner.record_entered_response(response)
             budget.note_activity()
-            if response.status_code == 405:
+            if response.status_code == 405 and not modern:
                 return False
             self._record_response_ownership(response, initialize_request=False)
             _validate_http_response_headers(
@@ -804,6 +828,8 @@ class HttpMcpSession(McpSession):
                 budget=budget,
                 redactor=listener_redactor,
             )
+            if modern:
+                self._wire_protocol.response_session_id(response.headers)
             content_type = response.headers.get("content-type", "")
             media_type = content_type.split(";", 1)[0].strip().lower()
             content_type = ""
@@ -811,19 +837,27 @@ class HttpMcpSession(McpSession):
                 raise McpProtocolError(
                     "MCP HTTP server-message listener did not return text/event-stream."
                 )
-            self._server_listener_has_connected = True
-            self._server_listener_connection_epoch += 1
-            self._reconcile_server_listener_gap()
-            await _read_sse_server_messages(
+
+            def acknowledged() -> None:
+                budget.finish_establishment()
+                self._server_listener_has_connected = True
+                self._server_listener_connection_epoch += 1
+                self._reconcile_server_listener_gap()
+
+            if not modern:
+                acknowledged()
+            supported = await _read_sse_server_messages(
                 response,
                 redactor=listener_redactor,
                 limits=self.transport_limits,
                 budget=budget,
                 tools_list_changed_handler=self._tools_list_changed_handler,
-                event_id_handler=self._record_server_listener_event_id,
+                event_id_handler=None if modern else self._record_server_listener_event_id,
+                subscription=subscription,
+                acknowledged_handler=acknowledged if modern else None,
             )
             self._mark_server_listener_gap()
-            return True
+            return supported
         except asyncio.CancelledError:
             listener_cancelled = True
             self._mark_server_listener_gap()
@@ -887,6 +921,7 @@ class HttpMcpSession(McpSession):
             stream_context = None
             last_event_id = None
             headers.clear()
+            content = None
         if deferred_listener_error is not None:
             raise deferred_listener_error from None
         raise AssertionError("MCP HTTP server-message listener returned without an outcome.")
@@ -908,7 +943,11 @@ class HttpMcpSession(McpSession):
         self._tools_list_changed_continuity_handler = None
         self._server_listener_has_connected = False
         self._server_listener_last_event_id = None
-        if self._session_id is not None or self._cleanup_session_id is not None:
+        if (
+            self._session_id is not None
+            or self._cleanup_session_id is not None
+            or self._wire_protocol.validates_modern_results
+        ):
             self._begin_failed_session_close(
                 error,
                 terminate_fenced_session=True,
@@ -2443,7 +2482,11 @@ class HttpMcpSession(McpSession):
                         redactor=failure_redactor,
                         limits=self.transport_limits,
                         budget=budget,
-                        tools_list_changed_handler=self._tools_list_changed_handler,
+                        tools_list_changed_handler=(
+                            self._tools_list_changed_handler
+                            if self._wire_protocol.supports_legacy_listener
+                            else None
+                        ),
                     )
                 else:
                     message = await _read_json_response(
@@ -2984,6 +3027,12 @@ class _HttpCallBudget:
     def note_activity(self) -> None:
         self._last_activity = self._loop.time()
 
+    def finish_establishment(self) -> None:
+        """A validated listener acknowledgement starts its idle-bounded lifetime."""
+
+        self.check_total_deadline()
+        self._deadline = None
+
     def total_deadline_expired(self) -> bool:
         deadline = self._deadline
         return deadline is not None and self._loop.time() >= deadline
@@ -3451,8 +3500,10 @@ async def _read_sse_server_messages(
     budget: _HttpCallBudget,
     tools_list_changed_handler: Callable[[], None] | None,
     event_id_handler: Callable[[str | None], None] | None,
-) -> None:
-    """Consume one bounded GET/SSE listener stream without retaining payloads."""
+    subscription: ModernToolSubscription | None = None,
+    acknowledged_handler: Callable[[], None] | None = None,
+) -> bool:
+    """Consume a legacy GET or modern subscription without retaining payloads."""
 
     chunks = _iter_bounded_http_body(
         response,
@@ -3477,6 +3528,21 @@ async def _read_sse_server_messages(
                         message = _sse_event_message(data_lines)
                         data_lines = []
                         if message is not None:
+                            if subscription is not None:
+                                event = subscription.consume(message)
+                                message = {}
+                                if event is SubscriptionEvent.UNSUPPORTED:
+                                    return False
+                                if event is SubscriptionEvent.COMPLETE:
+                                    return True
+                                if event is SubscriptionEvent.ACKNOWLEDGED:
+                                    if acknowledged_handler is not None:
+                                        acknowledged_handler()
+                                elif tools_list_changed_handler is not None:
+                                    tools_list_changed_handler()
+                                event_id = None
+                                event_id_seen = False
+                                continue
                             event_redactor = (
                                 _mcp_server_listener_redactor(redactor, event_id)
                                 if event_id is not None and "method" in message and "id" in message
@@ -3516,6 +3582,9 @@ async def _read_sse_server_messages(
     finally:
         data_lines.clear()
         event_id = None
+    if subscription is not None and not subscription.acknowledged:
+        raise McpPeerClosedError("MCP subscription closed before acknowledgement.")
+    return True
 
 
 def _safe_sse_replay_event_id(value: str) -> str | None:

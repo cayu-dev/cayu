@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Refresh-owned modern HTTP MCP sources now use correlated tool-list
+  subscriptions. Acknowledgement and reconnect reconcile the catalogue through
+  the existing atomic refresh path; lost continuity fences stale dispatch.
+  Stdio subscriptions, resource/prompt filters, and response caching remain
+  deferred.
+
 - Add explicit pinned MCP `2026-07-28` stdio support through
   `StdioMcpClient(protocol_era=McpProtocolEra.MODERN_2026_07_28)`, with discovery,
   modern request metadata, validated results, and bounded process cleanup.

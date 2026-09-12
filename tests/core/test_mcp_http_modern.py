@@ -577,21 +577,19 @@ def test_modern_http_rejects_static_transport_owned_headers(header_name: str) ->
     assert server.calls == []
 
 
-def test_modern_http_does_not_install_the_legacy_list_changed_listener() -> None:
+def test_modern_http_does_not_start_a_listener_without_refresh_ownership() -> None:
     server = ModernMcpHttpServer(tools_list_changed=True)
 
-    async def run() -> tuple[bool, bool]:
+    async def run() -> None:
         session = await _client(server).connect(_server_spec())
         try:
-            continuity = session._set_tools_list_changed_continuity_handler(lambda _ready: None)
-            listener = session._set_tools_list_changed_handler(lambda: None)
             await asyncio.sleep(0)
-            return continuity, listener
         finally:
             await session.close()
 
-    assert asyncio.run(run()) == (False, False)
+    asyncio.run(run())
     assert server.get_calls == 0
+    assert server.requests_for("subscriptions/listen") == []
 
 
 def test_modern_http_404_is_a_request_error_not_an_expired_session() -> None:

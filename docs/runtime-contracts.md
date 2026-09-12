@@ -13035,7 +13035,9 @@ The first MCP implementation supports stdio servers:
   `protocol_era=McpProtocolEra.MODERN_2026_07_28` to speak the stateless pinned
   wire protocol. A modern transport does not install the legacy catalogue-change
   listener even when discovery advertises `tools.listChanged`;
-  `subscriptions/listen` remains a separate deferred capability.
+  modern HTTP instead owns an explicit `subscriptions/listen` POST when a
+  refresh owner attaches to a server advertising `tools.listChanged=true`.
+  Modern stdio subscriptions remain deferred.
 - Callers must close the toolset when the application or environment shuts down.
   Tool adapters intentionally reuse that established session instead of launching
   a fresh MCP process for every tool call.
@@ -13172,7 +13174,7 @@ every request's reserved `_meta`. Modern stdio carries that envelope over its
 existing newline-delimited JSON-RPC process boundary and stamps its bounded
 best-effort cancellation notification the same way. Every modern HTTP POST also
 carries matching `MCP-Protocol-Version` and `Mcp-Method` headers, plus a safely
-encoded `Mcp-Name` for tool calls and resource reads. Modern tool calls require a
+encoded `Mcp-Name` for tool calls and resource reads. Modern HTTP tool calls require a
 previously admitted `tools/list` snapshot. Primitive arguments whose admitted
 schema marks them with a valid `x-mcp-header` are mirrored into bounded
 `Mcp-Param-*` headers;
@@ -13192,8 +13194,38 @@ GET listener, replay cursor, or session DELETE; once discovery succeeds, its
 cancellation or timeout settles only the affected request stream. Modern stdio
 retains the existing conservative shared-process rule: an uncertain in-flight
 request sends bounded cancellation and then closes that process connection.
-Automatic negotiation, response caching, `subscriptions/listen`, and MRTR /
+Automatic negotiation, response caching, modern stdio subscriptions, and MRTR /
 `input_required` are not implemented.
+
+Modern HTTP tool-list subscriptions use one owned `subscriptions/listen` POST
+with `notifications: {toolsListChanged: true}` per refresh-owned session. An
+ordinary connection or static toolset does not start a listener. The first
+notification must acknowledge the exact request ID through
+`_meta["io.modelcontextprotocol/subscriptionId"]` and an honored subset of the
+requested filter. Connection establishment alone does not prove continuity:
+the source stays dirty until a valid acknowledgement permits atomic catalogue
+reconciliation. Only correlated `notifications/tools/list_changed` messages on
+that subscription stream trigger refresh; notices on ordinary POST responses
+cannot do so.
+
+A dropped, idle-timed-out, or gracefully completed stream fences dispatch before
+reconnect. The existing bounded backoff opens a fresh request ID only after the
+old exchange settles; the new acknowledgement triggers reconciliation, never
+replay of a tool call. No SSE replay cursor, GET listener, protocol-session ID,
+or DELETE is used. A server that acknowledges an empty filter or
+`toolsListChanged=false` stops automatic listening, reconciles once, and retains
+manual refresh. Malformed acknowledgements, mismatched IDs, unsupported result
+types, unrequested notifications, and oversized events fail closed with a
+bounded diagnostic and owned client cleanup.
+
+The initial acknowledgement is bounded by both idle and total call deadlines,
+so heartbeat-only streams cannot extend establishment forever. After a valid
+acknowledgement, the stream is idle-bounded and each event is byte-bounded;
+there is no lifetime aggregate-body or total-call ceiling. Closing the toolset
+closes and settles its subscription, including interrupted readers. Prompt and
+resource subscriptions are not part of this slice. See
+[`examples/mcp_http_subscriptions.py`](../examples/mcp_http_subscriptions.py)
+for a provider-free catalogue observer.
 
 Every MCP exchange also has a Cayu-owned transport envelope. Pass one immutable
 `McpTransportLimits` to `StdioMcpClient(transport_limits=...)` or

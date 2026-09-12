@@ -469,7 +469,7 @@ class McpSession(ABC):
 def _mcp_server_advertises_tools_list_changed(
     initialize_result: McpInitializeResult,
 ) -> bool:
-    """Return exact legacy ``tools.listChanged`` capability authority."""
+    """Return the exact ``tools.listChanged`` advertisement for either wire era."""
 
     capabilities = initialize_result.capabilities
     tools = capabilities.get("tools")

@@ -154,6 +154,13 @@ dependency. The interoperability test runs during normal CI and checks discovery
 tool/resource operations, exact request metadata, and clean shutdown. Its separate
 default-containment test requires supported Linux process enforcement.
 
+Modern HTTP subscriptions are covered by
+`uv run pytest tests/core/test_mcp_http_subscriptions.py -q`. This includes a
+real localhost HTTP server from the same pinned SDK, verifies catalogue
+reconciliation and server-side subscription cancellation, and requires local
+socket binding. The bounded client example is
+`uv run python examples/mcp_http_subscriptions.py <modern-http-url>`.
+
 For deterministic pre-commit, acknowledgement-loss, and ownership-handoff
 coverage around durable session operations, use the repository-private
 [Session operation publication fault harness](docs/session-operation-fault-harness.md).
