@@ -740,6 +740,20 @@ def test_native_retained_cleanup_is_uncertain_after_sqlite_replay(tmp_path, clea
             )
             assert reloaded.payload["provider_cancellation_failures"] == diagnostics
             assert provider.calls == calls == 2
+            release.set()
+            await asyncio.wait_for(closed.wait(), 10)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert all(task.done() for task in local_tasks)
+            # The terminal is an immutable interruption-time observation. A
+            # later local close cannot rewrite it into remote settlement proof.
+            after_close = next(
+                event
+                for event in await store.load_events(failure.session_id)
+                if event.id == terminal.id
+            )
+            assert after_close.payload["provider_cancellation_failures"] == diagnostics
+            assert provider.calls == calls
         finally:
             release.set()
             await asyncio.wait_for(closed.wait(), 10)

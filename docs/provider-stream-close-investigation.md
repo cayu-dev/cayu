@@ -74,3 +74,38 @@ The regression controls distinguish failed reads with successful closure,
 close-only failures, simultaneous failures, and suppressed read cancellation.
 They also exercise repeated cancellation while closure is pending. These reproduce
 the diagnostic ambiguity; they do not attribute the historical transport failure.
+
+## Native child-deadline ownership controls
+
+The current ownership chain separates protocol state from task ownership:
+
+| Boundary | Owner and observation |
+| --- | --- |
+| Protocol lifecycle | `_stream_lifecycle.py` validates transitions; it does not own tasks |
+| Pending provider read | The provider deadline controller and `_ProviderDeadlineAwaitOwnership` retain the dispatched read until its result is consumed |
+| Ordered read/close | `aclosing_provider_stream` starts `_close_after_provider_read`; an interrupted read is joined before the close hook is invoked |
+| Retained cleanup | A reserved cleanup owner or the existing deadline-read owner retains the close task and consumes its outcome; repeated caller cancellation does not transfer ownership to the caller |
+| Native terminal publication | The model/session execution boundary snapshots sanitized cancellation diagnostics into the exact session epoch and terminal event |
+| Tool stream closure | `ToolRoundRun.run` owns nested call and interruption streams with `aclosing`; the session boundary drains deadline cleanup without yielding new events to an expired caller |
+
+`tests/faults/test_native_child_deadline_cleanup.py` uses parsed loopback HTTP
+requests and drained first frames as dispatch barriers. It covers a child expiry
+before semantic output and during output, with either one successful sibling or
+two expiring children. It checks native deadline identity, the durable terminal,
+SQLite replay without dispatch, local socket EOF before provider-wide shutdown,
+and the loop exception handler after owned finalizers are drained.
+
+The tool-round closure control also cancels again while the nested interruption
+stream is finalizing. Cancellation remains authoritative, with exactly two
+cancellation requests and observed nested teardown. Retained-read/close controls
+inspect the saved terminal both before and after releasing local cleanup. The
+immutable pending diagnostic is unchanged; it is an interruption-time snapshot,
+not a live resource-state query or evidence of permanently leaked work.
+
+These controls do not reproduce the historical `async generator ignored
+GeneratorExit` / `no running event loop` chain. Resolving that incident still
+requires one correlated local observation containing the session/epoch and tool
+round identities, the owner driving each generator, the suspension point when
+close/cancellation arrives, cancellation counts, and the finalizer outcome before
+the owning loop exits. Keep these observations content-free and bounded; unrelated
+pending-cleanup records or a successful synthetic close cannot supply this chain.

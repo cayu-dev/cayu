@@ -1453,7 +1453,10 @@ def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:
 
 
 @pytest.mark.parametrize("grouped", [False, True])
-def test_closing_interrupted_round_observes_nested_stream_teardown(monkeypatch, grouped):
+@pytest.mark.parametrize("repeated_cancel", [False, True])
+def test_closing_interrupted_round_observes_nested_stream_teardown(
+    monkeypatch, grouped, repeated_cancel
+):
     app, store, _ = _app_with_completed_session("sess_owned_round_close")
 
     async def scenario():
@@ -1472,6 +1475,7 @@ def test_closing_interrupted_round_observes_nested_stream_teardown(monkeypatch, 
         )
         await store.checkpoint(session.id, checkpoint)
         started = asyncio.Event()
+        closing = asyncio.Event()
         closed = []
         loop_errors = []
         loop = asyncio.get_running_loop()
@@ -1497,8 +1501,13 @@ def test_closing_interrupted_round_observes_nested_stream_teardown(monkeypatch, 
             try:
                 yield Event(type=EventType.TOOL_CALL_FAILED, session_id=session.id)
             finally:
-                await asyncio.sleep(0)
-                closed.append("interruption")
+                try:
+                    closing.set()
+                    if repeated_cancel:
+                        await asyncio.Event().wait()
+                    await asyncio.sleep(0)
+                finally:
+                    closed.append("interruption")
 
         monkeypatch.setattr(runner, "_run_tool_calls_sequential", interrupted_calls)
         monkeypatch.setattr(runner, "close_after_interrupt", interruption_events)
@@ -1511,11 +1520,12 @@ def test_closing_interrupted_round_observes_nested_stream_teardown(monkeypatch, 
         async def consume():
             async for event in stream:
                 if event.type == EventType.TOOL_CALL_FAILED:
-                    with pytest.raises(BaseExceptionGroup) as failure:
+                    with pytest.raises((BaseExceptionGroup, asyncio.CancelledError)) as failure:
                         await stream.aclose()
                     leaves = list(iter_exception_tree(failure.value))
                     assert any(isinstance(e, asyncio.CancelledError) for e in leaves)
-                    assert any(isinstance(e, GeneratorExit) for e in leaves)
+                    if not repeated_cancel:
+                        assert any(isinstance(e, GeneratorExit) for e in leaves)
                     assert closed == ["calls", "interruption"]
                     return
             raise AssertionError("No interruption event was published.")
@@ -1523,7 +1533,15 @@ def test_closing_interrupted_round_observes_nested_stream_teardown(monkeypatch, 
         task = asyncio.create_task(consume())
         await asyncio.wait_for(started.wait(), timeout=5)
         task.cancel()
-        await asyncio.wait_for(task, timeout=5)
+        if repeated_cancel:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert task.cancelling() == 2
+        else:
+            await asyncio.wait_for(task, timeout=5)
+        assert closed == ["calls", "interruption"]
         await loop.shutdown_asyncgens()
         await asyncio.sleep(0)
         assert loop_errors == []
