@@ -2265,6 +2265,7 @@ def test_nondefault_checkpoint_summary_prefix_is_private_process_local_material(
         {"max_recent_context_tokens": 650},
         {"reserved_output_tokens": 150},
         {"reserved_summary_tokens": 100},
+        {"max_compaction_passes": 2},
     ],
 )
 def test_size_based_compaction_settings_change_selection_fingerprint(

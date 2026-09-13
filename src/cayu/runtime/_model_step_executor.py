@@ -294,6 +294,7 @@ from cayu.runtime.context import (
     _ContextCountAuthorityError,
     _defer_billing_identity_cancellation_scope,
     automatic_compaction_failure_disposition_payload,
+    context_build_termination_checkpoint_error,
     context_build_termination_compaction_telemetry,
     context_input_coverage,
     copy_context_messages,
@@ -2817,6 +2818,7 @@ class ModelStepFlowOutcome:
 
 
 _CONTEXT_TERMINATION_PERSIST_TIMEOUT_S = 5.0
+_COMPACTION_UNREPRESENTED_CALLS_KEY = "compaction_model_calls_unrepresented"
 _CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S = 5.0
 _AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S = 60.0
 _CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S = 5.0
@@ -11324,7 +11326,10 @@ class ModelStepRun:
                 event = record.event
                 if event.type is EventType.SESSION_CHECKPOINTED:
                     checkpointed_parent = event.payload.get("model_step_id")
-                    if type(checkpointed_parent) is str:
+                    if (
+                        type(checkpointed_parent) is str
+                        and event.payload.get(_COMPACTION_UNREPRESENTED_CALLS_KEY, False) is False
+                    ):
                         checkpointed_parent_model_step_ids.add(checkpointed_parent)
                     continue
                 if (
@@ -12435,6 +12440,7 @@ class ModelStepRun:
         compaction_start_event: Event | None,
         compaction_started_published: bool,
         checkpoint_invariant_cause: BaseException | None = None,
+        shield_persistence: bool = True,
     ) -> tuple[list[Event], BaseException | None]:
         """Persist one context outcome completely before exposing its first event."""
 
@@ -12477,7 +12483,21 @@ class ModelStepRun:
             for telemetry in recall_telemetry
             if telemetry.event_type != EventType.AUTOMATIC_RECALL_ADMITTED
         ]
+        unrepresented_compaction_calls = False
         for telemetry in compaction_telemetry:
+            # Completion telemetry is ordered by pass, including already
+            # published calls. Only a validated positive-coverage result can
+            # acknowledge the successful work preceding it. An older prefix
+            # checkpoint must not clear recovery for a later unfinished hierarchy.
+            if (
+                telemetry.event_type == EventType.MODEL_COMPLETED
+                and telemetry.payload.get("compaction_outcome") is None
+            ):
+                unrepresented_compaction_calls = True
+            elif telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED:
+                covered = telemetry.payload.get("newly_compacted_message_count")
+                if type(covered) is int and covered > 0:
+                    unrepresented_compaction_calls = False
             if (
                 telemetry.event_type == EventType.MODEL_COMPLETED
                 and telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
@@ -12558,6 +12578,16 @@ class ModelStepRun:
                     error.__cause__ = checkpoint_invariant_cause
                 return [], error
 
+            # This recovery flag is derived by the runtime, never accepted as
+            # policy-supplied authority. Omission retains the legacy full-step
+            # acknowledgement only when all successful calls are represented.
+            checkpoint_payload = {
+                key: value
+                for key, value in checkpoint_event_payload.items()
+                if key != _COMPACTION_UNREPRESENTED_CALLS_KEY
+            }
+            if unrepresented_compaction_calls:
+                checkpoint_payload[_COMPACTION_UNREPRESENTED_CALLS_KEY] = True
             checkpoint_event = event_with_execution_profile_authority(
                 Event(
                     type=EventType.SESSION_CHECKPOINTED,
@@ -12565,7 +12595,7 @@ class ModelStepRun:
                     agent_name=self._registered_agent.spec.name,
                     environment_name=self._environment_name,
                     payload={
-                        **checkpoint_event_payload,
+                        **checkpoint_payload,
                         **model_step_identity.payload(),
                     },
                 ),
@@ -12585,6 +12615,11 @@ class ModelStepRun:
                     events=atomic_events,
                 )
             except BaseException as publication_error:
+                if not shield_persistence and isinstance(publication_error, asyncio.CancelledError):
+                    # The outer termination owner has bounded and cancelled this
+                    # actual writer. Do not start unbounded reconciliation after
+                    # its deadline; atomic store evidence remains authoritative.
+                    raise
                 try:
                     event_commit_states = [
                         await self._executor._event_writer.is_persisted(event)
@@ -12623,6 +12658,10 @@ class ModelStepRun:
                 *(event.model_copy(deep=True) for event in atomic_events),
             ], None
 
+        if not shield_persistence:
+            # Termination cleanup already owns a bounded, shielded task. Nesting
+            # another shield would leave its writer alive after the outer timeout.
+            return await persist()
         persistence_task = asyncio.create_task(persist())
         outcome = await await_shielded_task_outcome(persistence_task)
         cancellation = outcome.cancellation
@@ -12706,6 +12745,11 @@ class ModelStepRun:
 
         model_step_identity = copy_model_step_identity(model_step_identity)
         telemetry = context_build_termination_compaction_telemetry(error)
+        progress_error = context_build_termination_checkpoint_error(error)
+        if progress_error is not None:
+            sanitize_context_build_error_checkpoint(
+                progress_error, redactor=self._executor._secret_redactor
+            )
         compaction_start_durable = compaction_started_published
         if not compaction_start_durable and compaction_start_event is not None:
             if isinstance(error, asyncio.CancelledError):
@@ -12754,10 +12798,27 @@ class ModelStepRun:
                 )
             )
         ]
-        if not unpublished_telemetry:
+        if not unpublished_telemetry and progress_error is None:
             return
 
         async def persist() -> None:
+            if progress_error is not None and progress_error.checkpoint is not None:
+                _, persistence_error = await self._persist_context_events(
+                    model_step_identity=model_step_identity,
+                    compaction_identity_ledger=compaction_identity_ledger,
+                    compaction_telemetry=list(telemetry),
+                    recall_telemetry=[],
+                    checkpoint_update=progress_error.checkpoint,
+                    checkpoint_event_payload=progress_error.checkpoint_event_payload,
+                    published_compaction_attempt_ids=published_compaction_attempt_ids,
+                    compaction_completion_events=compaction_completion_events,
+                    compaction_start_event=compaction_start_event,
+                    compaction_started_published=compaction_start_durable,
+                    shield_persistence=False,
+                )
+                if persistence_error is not None:
+                    raise persistence_error
+                return
             events: list[Event] = []
             for item in unpublished_telemetry:
                 compaction_attempt_id = item.payload.get(_COMPACTION_ATTEMPT_ID_KEY)

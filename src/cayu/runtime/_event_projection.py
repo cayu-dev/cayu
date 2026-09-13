@@ -3343,7 +3343,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_CHECKPOINTED] = _observed_policy(
         "actor approval_id attempt_id calls checkpoint cleared compacted_transcript_cursor "
-        "compactor estimated_context_input_tokens estimated_context_window_tokens "
+        "compaction_model_calls_unrepresented compactor estimated_context_input_tokens estimated_context_window_tokens "
         "estimated_delta_input_tokens execution_profile_fingerprint input_id instruction_digest instruction_present "
         "last_input_tokens last_total_tokens last_transcript_cursor min_input_tokens "
         "min_total_tokens mode model_attempt_id model_step_id "

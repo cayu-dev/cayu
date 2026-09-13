@@ -1488,6 +1488,8 @@ def _cayu_context_policy_material(
         if policy.reserved_summary_tokens:
             # Preserve the existing fingerprint when the opt-in headroom is zero.
             selection["reserved_summary_tokens"] = policy.reserved_summary_tokens
+        if policy.compact_after_estimated_context_tokens is not None:
+            selection["max_compaction_passes"] = policy.max_compaction_passes
         return _ContextComponentMaterials(
             selection=selection,
             recall={"kind": "none", "version": 1},

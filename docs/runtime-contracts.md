@@ -625,6 +625,50 @@ below the proactive trigger. The actual returned summary is remeasured before pr
 dispatch; an unexpectedly oversized projection fails closed while preserving the completed
 checkpoint and compactor accounting evidence.
 
+When a bounded compactor returns a valid partial prefix but that projection still
+does not fit, size-based automatic compaction continues within the **same selected
+source range**, up to `max_compaction_passes` (default `8`, a positive integer).
+Each pass must advance the validated coverage cursor and bind the exact previous
+summary. Each intermediate checkpoint, including its summary and metadata, must
+pass secret-free durable-state validation before another pass can consume it.
+Rejected owned result/checkpoint data is discarded before the safe exception
+propagates, including references visible through traceback locals. The
+compactor's original result and already validated prefix state are not mutated.
+The policy stops as soon as the actual projection fits; it does not wait
+to consume the whole selected range. It never expands into the retained suffix
+to chase an oversized summary. If the summary plus retained context alone cannot
+fit, no additional pass is attempted. Zero progress, invalid coverage, a provider
+error, cancellation, or exhausted runtime limits stop continuation. A pass limit
+of `1` restores the single-pass behavior. This setting enters the size-based
+context-selection fingerprint, including its default; turn-based identity is
+unchanged. Explicit `compact_session` requests remain single-pass operations.
+Size-fit failures report the estimated input/window tokens, retained target,
+whether that target was enforceable, trigger, requested/represented cursors,
+pass count and stopping condition without including source or summary text.
+
+Every continuation uses the existing automatic-compaction dispatch boundary:
+provider completions are published and counted before another dispatch is
+admitted. This is one context-build operation with one durable start event;
+per-prefix completion evidence and the final checkpoint are published atomically
+at its outcome. If a later pass fails or is cancelled, that outcome preserves
+the last validated summary and cursor along with all observed provider usage.
+If successful model calls in a later unfinished pass are not represented by that
+summary, its `session.checkpointed` event carries the runtime-derived
+`compaction_model_calls_unrepresented=true` flag. This preserves the earlier
+checkpoint without clearing the recovery guard for unrepresented model work;
+resume fails closed until that work is reconciled. A later failed call with no
+unrepresented successful completion does not invalidate earlier coverage.
+Cancellation cleanup owns one bounded persistence task, with no nested shield
+around the checkpoint writer: its deadline cancels a cooperative store operation
+whether it is waiting before commit or for acknowledgement after atomic commit.
+An already committed checkpoint and its events remain durable.
+An abrupt process loss before checkpoint publication still uses the existing
+uncheckpointed-compaction reconciliation guard; it does not authorize blind
+replay of paid work. `max_compaction_passes` limits compactor invocations, not
+provider calls: a `ModelCompactor` invocation can itself use bounded hierarchy
+work and retries. Run/request token and cost limits continue to apply across
+all of those calls and all continuation passes.
+
 Set `reserved_summary_tokens` to leave explicit summary-growth headroom during
 size-based suffix selection, for example `4_000` alongside a `20_000` retained-context
 target. The reserve is additional to the estimated existing summary, not generation

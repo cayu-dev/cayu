@@ -1707,9 +1707,22 @@ def _json_object_keys_contain_secret(
 class _ContextBuildTerminationDiagnostics:
     """Immutable context evidence carried by an unwrapped fatal signal."""
 
-    def __init__(self, compaction_telemetry: list[ContextCompactionTelemetry]) -> None:
+    def __init__(
+        self,
+        compaction_telemetry: list[ContextCompactionTelemetry],
+        checkpoint: dict[str, Any] | None = None,
+        checkpoint_event_payload: dict[str, Any] | None = None,
+    ) -> None:
         self.compaction_telemetry = tuple(
             copy_context_compaction_telemetry(item) for item in compaction_telemetry
+        )
+        self.checkpoint = (
+            None if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+        )
+        self.checkpoint_event_payload = (
+            None
+            if checkpoint_event_payload is None
+            else copy_json_value(checkpoint_event_payload, "checkpoint_event_payload")
         )
 
 
@@ -1720,6 +1733,9 @@ def _attach_context_build_termination_diagnostics(
     error: BaseException,
     *,
     compaction_telemetry: list[ContextCompactionTelemetry],
+    checkpoint: dict[str, Any] | None = None,
+    checkpoint_event_payload: dict[str, Any] | None = None,
+    prepend: bool = False,
 ) -> None:
     """Attach evidence without wrapping cancellation, abandonment, or fatal signals."""
 
@@ -1730,7 +1746,29 @@ def _attach_context_build_termination_diagnostics(
         else []
     )
     error.__dict__[_CONTEXT_BUILD_TERMINATION_DIAGNOSTICS_KEY] = (
-        _ContextBuildTerminationDiagnostics([*existing, *compaction_telemetry])
+        _ContextBuildTerminationDiagnostics(
+            [*compaction_telemetry, *existing] if prepend else [*existing, *compaction_telemetry],
+            checkpoint=checkpoint,
+            checkpoint_event_payload=checkpoint_event_payload,
+        )
+    )
+
+
+def context_build_termination_checkpoint_error(error: BaseException) -> ContextBuildError | None:
+    """Detach completed prefix state for runtime-owned, secret-checked publication."""
+
+    diagnostics = error.__dict__.get(_CONTEXT_BUILD_TERMINATION_DIAGNOSTICS_KEY)
+    if (
+        not isinstance(diagnostics, _ContextBuildTerminationDiagnostics)
+        or diagnostics.checkpoint is None
+    ):
+        return None
+    return ContextBuildError(
+        "Context build terminated after completed compaction prefixes.",
+        compaction_telemetry=list(diagnostics.compaction_telemetry),
+        checkpoint=diagnostics.checkpoint,
+        checkpoint_event_payload=diagnostics.checkpoint_event_payload,
+        cause=RuntimeError("Context build terminated."),
     )
 
 
@@ -5557,6 +5595,14 @@ def _context_overflow_compaction_payload(
     return payload
 
 
+@dataclass(frozen=True)
+class _CheckpointCompactionPass:
+    result: ContextBuildResult
+    size_failure: str | None
+    continuation_cursor: int | None
+    target_satisfied: bool
+
+
 class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
     """Checkpoint-backed context policy for long-running sessions.
 
@@ -5566,6 +5612,9 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
     growth headroom beyond the existing summary when selecting recent context.
     It is not a cap on generated summaries: the actual projection must still pass
     the original size checks. Zero preserves the previous selection behavior.
+    ``max_compaction_passes`` bounds automatic continuation of partially covered
+    prefixes in size-based mode. It does not retry failed provider calls or
+    expand the selected source range; explicit compaction remains one pass.
     """
 
     def __init__(
@@ -5578,6 +5627,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         max_recent_context_tokens: int | None = None,
         reserved_output_tokens: int = 0,
         reserved_summary_tokens: int = 0,
+        max_compaction_passes: int = 8,
         summary_prefix: str = _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         max_attachment_results: int = 1,
     ) -> None:
@@ -5639,6 +5689,9 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         self.max_recent_context_tokens = max_recent_context_tokens
         self.reserved_summary_tokens = reserved_summary_tokens
         self.reserved_output_tokens = reserved_output_tokens
+        self.max_compaction_passes = _validate_positive_int(
+            max_compaction_passes, "max_compaction_passes"
+        )
         self.summary_prefix = require_nonblank(summary_prefix, "summary_prefix")
         self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
 
@@ -5648,6 +5701,116 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         *,
         checkpoint: dict[str, Any] | None,
     ) -> ContextBuildResult:
+        # Continue the same selected range, rather than reselecting against the
+        # proactive trigger and accidentally accepting a still-over-target tail.
+        # Explicit compaction remains a single application-requested pass.
+        max_passes = 1 if request.force_compaction else self.max_compaction_passes
+        telemetry: list[ContextCompactionTelemetry] = []
+        checkpoint_update = None
+        checkpoint_event_payload = None
+        continuation_cursor = None
+        target_satisfied = True
+        for pass_index in range(max_passes):
+            try:
+                if pass_index:
+                    # Deterministic compactors may not yield internally. Give
+                    # cancellation a boundary before any additional work.
+                    await asyncio.sleep(0)
+                built = await self._build_compaction_pass(
+                    request,
+                    checkpoint=checkpoint if checkpoint_update is None else checkpoint_update,
+                    continuation_cursor=continuation_cursor,
+                    continuation_target_satisfied=target_satisfied,
+                )
+            except ContextBuildError as error:
+                if not telemetry and checkpoint_update is None:
+                    raise
+                # Enrich the existing carrier, retaining the exact authoritative
+                # cause chain used by admission and recovery classification.
+                error.compaction_telemetry = tuple(
+                    copy_context_compaction_telemetry(item)
+                    for item in [*telemetry, *error.compaction_telemetry]
+                )
+                if error.checkpoint is None and checkpoint_update is not None:
+                    error.checkpoint = copy_durable_record(checkpoint_update, "checkpoint")
+                    error.checkpoint_event_payload = (
+                        None
+                        if checkpoint_event_payload is None
+                        else copy_json_value(checkpoint_event_payload, "checkpoint_event_payload")
+                    )
+                raise
+            except BaseException as error:
+                _attach_context_build_termination_diagnostics(
+                    error,
+                    compaction_telemetry=telemetry,
+                    checkpoint=checkpoint_update,
+                    checkpoint_event_payload=checkpoint_event_payload,
+                    prepend=True,
+                )
+                raise
+            result = built.result
+            if pass_index == 0 and not built.size_failure:
+                # The overwhelmingly common no-compaction/single-pass path
+                # already owns detached output; do not copy the context again.
+                return result
+            telemetry.extend(result.compaction_telemetry)
+            if result.checkpoint is not None:
+                checkpoint_update = result.checkpoint
+                payload = result.checkpoint_event_payload
+                if checkpoint_event_payload is not None and payload is not None:
+                    start = checkpoint_event_payload["previous_compacted_transcript_cursor"]
+                    payload = {
+                        **payload,
+                        "previous_compacted_transcript_cursor": start,
+                        "newly_compacted_message_count": payload["compacted_transcript_cursor"]
+                        - start,
+                    }
+                checkpoint_event_payload = payload
+            if not built.size_failure:
+                return ContextBuildResult(
+                    messages=result.messages,
+                    checkpoint=checkpoint_update,
+                    checkpoint_event_payload=checkpoint_event_payload,
+                    compaction_telemetry=telemetry,
+                )
+            if built.continuation_cursor is None or pass_index + 1 == max_passes:
+                cause = ValueError(
+                    "Checkpoint compaction did not produce a model-facing context "
+                    "within the configured size bounds. "
+                    f"{built.size_failure}; passes={pass_index + 1}/{max_passes}; "
+                    + (
+                        "stop=pass_limit"
+                        if built.continuation_cursor is not None
+                        else "stop=no_safe_prefix_continuation"
+                    )
+                )
+                cause.add_note(
+                    f"Completed {pass_index + 1} of at most {max_passes} compaction passes; "
+                    + (
+                        "pass limit reached."
+                        if built.continuation_cursor is not None
+                        else "no safe prefix continuation."
+                    )
+                )
+                raise ContextBuildError(
+                    str(cause),
+                    compaction_telemetry=telemetry,
+                    checkpoint=checkpoint_update,
+                    checkpoint_event_payload=checkpoint_event_payload,
+                    cause=cause,
+                )
+            continuation_cursor = built.continuation_cursor
+            target_satisfied = built.target_satisfied
+        raise AssertionError("Compaction pass limit must be positive.")
+
+    async def _build_compaction_pass(
+        self,
+        request: ContextRequest,
+        *,
+        checkpoint: dict[str, Any] | None,
+        continuation_cursor: int | None,
+        continuation_target_satisfied: bool,
+    ) -> _CheckpointCompactionPass:
         checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         previous = _compaction_checkpoint(checkpoint)
         previous_summary = previous.get("summary") if previous is not None else None
@@ -5680,7 +5843,13 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             previous_summary = None
             previous_progress = {}
 
-        if self.compact_after_estimated_context_tokens is None:
+        if continuation_cursor is not None:
+            compactable_cursor = continuation_cursor
+            compactable_messages = request.messages[first_compactable_cursor:compactable_cursor]
+            recent_messages = request.messages[compactable_cursor:]
+            size_selection_triggered = True
+            size_selection_target_satisfied = continuation_target_satisfied
+        elif self.compact_after_estimated_context_tokens is None:
             (
                 system_prefix,
                 compactable_messages,
@@ -5901,6 +6070,35 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                             "represented_existing_summary_sha256 to the exact existing "
                             "summary."
                         )
+                    compaction_checkpoint = {
+                        "version": _COMPACTION_CHECKPOINT_VERSION,
+                        "summary": result.summary,
+                        "compacted_transcript_cursor": previous_cursor + covered_message_count,
+                        "metadata": copy_durable_metadata(result.metadata),
+                    }
+                    if result.progress_exhausted:
+                        compaction_checkpoint[_COMPACTION_PROGRESS_STATE_KEY] = {
+                            _COMPACTION_PROGRESS_EXHAUSTED_KEY: True,
+                            _COMPACTION_PROGRESS_KEY: result.progress_key,
+                        }
+                    # A subsequent pass consumes this state before the outer
+                    # runtime sees the final build result. Validate it here,
+                    # inside accounting/failure handling, without rewriting the
+                    # summary whose exact bytes establish source coverage.
+                    try:
+                        require_secret_free_durable_object(
+                            {_COMPACTION_CHECKPOINT_KEY: compaction_checkpoint},
+                            redactor=_active_context_secret_redactor(),
+                            field_name="CompactionResult.checkpoint",
+                        )
+                    except BaseException:
+                        # The validator's traceback also references this owned
+                        # candidate. Consume it before propagating the safe error
+                        # so locals capture cannot expose the rejected summary or
+                        # metadata. The extension's original result is detached.
+                        compaction_checkpoint.clear()
+                        result = None
+                        raise
                     summary = result.summary
                     represented_cursor = previous_cursor + covered_message_count
                 finally:
@@ -5964,17 +6162,6 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 for payload in completed_payloads
             )
             checkpoint_update = copy_durable_record(checkpoint, "checkpoint")
-            compaction_checkpoint = {
-                "version": _COMPACTION_CHECKPOINT_VERSION,
-                "summary": summary,
-                "compacted_transcript_cursor": represented_cursor,
-                "metadata": copy_durable_metadata(result.metadata),
-            }
-            if result.progress_exhausted:
-                compaction_checkpoint[_COMPACTION_PROGRESS_STATE_KEY] = {
-                    _COMPACTION_PROGRESS_EXHAUSTED_KEY: True,
-                    _COMPACTION_PROGRESS_KEY: result.progress_key,
-                }
             checkpoint_update[_COMPACTION_CHECKPOINT_KEY] = compaction_checkpoint
             checkpoint_event_payload = {
                 "checkpoint": _COMPACTION_CHECKPOINT_KEY,
@@ -6029,6 +6216,8 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             messages,
             max_attachment_results=self.max_attachment_results,
         )
+        size_failure = None
+        next_cursor = None
         if size_selection_triggered:
             assert self.compact_after_estimated_context_tokens is not None
             assert self.max_recent_context_tokens is not None
@@ -6047,22 +6236,51 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 >= self.compact_after_estimated_context_tokens
             )
             if projection_exceeds_target or projection_still_triggered:
-                cause = ValueError(
-                    "Checkpoint compaction did not produce a model-facing context "
-                    "within the configured size bounds."
+                size_failure = (
+                    f"estimated_input_tokens={effective_pressure.estimated_context_input_tokens}, "
+                    f"retained_target={self.max_recent_context_tokens}, "
+                    f"target_enforced={size_selection_target_satisfied}, "
+                    f"estimated_window_tokens={effective_pressure.estimated_context_window_tokens}, "
+                    f"trigger={self.compact_after_estimated_context_tokens}, "
+                    f"represented_cursor={represented_cursor}, requested_cursor={compactable_cursor}"
                 )
-                raise ContextBuildError(
-                    str(cause),
-                    compaction_telemetry=compaction_telemetry,
-                    checkpoint=checkpoint_update,
-                    checkpoint_event_payload=checkpoint_event_payload,
-                    cause=cause,
-                )
-        return ContextBuildResult(
-            messages=messages,
-            checkpoint=checkpoint_update,
-            checkpoint_event_payload=checkpoint_event_payload,
-            compaction_telemetry=compaction_telemetry,
+                if previous_cursor < represented_cursor < compactable_cursor:
+                    # Only an unfinished contiguous prefix can continue. Do not
+                    # chase a growing summary into the intentionally retained
+                    # suffix, or spend more when fixed context already cannot fit.
+                    minimum_messages = strip_old_file_attachments(
+                        [
+                            *system_prefix,
+                            Message.text(MessageRole.USER, f"{self.summary_prefix}\n{summary}"),
+                            *recent_messages,
+                        ],
+                        max_attachment_results=self.max_attachment_results,
+                    )
+                    minimum_pressure = _estimate_model_facing_context_pressure(
+                        request=request,
+                        messages=minimum_messages,
+                        reserved_output_tokens=self.reserved_output_tokens,
+                    )
+                    if (
+                        minimum_pressure.estimated_context_window_tokens
+                        < self.compact_after_estimated_context_tokens
+                        and (
+                            not size_selection_target_satisfied
+                            or minimum_pressure.estimated_context_input_tokens
+                            <= self.max_recent_context_tokens
+                        )
+                    ):
+                        next_cursor = compactable_cursor
+        return _CheckpointCompactionPass(
+            result=ContextBuildResult(
+                messages=messages,
+                checkpoint=checkpoint_update,
+                checkpoint_event_payload=checkpoint_event_payload,
+                compaction_telemetry=compaction_telemetry,
+            ),
+            size_failure=size_failure,
+            continuation_cursor=next_cursor,
+            target_satisfied=size_selection_target_satisfied,
         )
 
 
