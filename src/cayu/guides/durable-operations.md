@@ -23,6 +23,12 @@ processes. In-memory stores are for hermetic tests, never production ownership.
 The `CayuApp` object remains process-local; every replacement process rebuilds
 it against the same stores.
 
+Reconstruction also requires compatible identities for service-backed tools,
+custom policies, and environments. See `cayu guide durable-service-tools` for
+those declarations, explicit knowledge bindings, and a fresh-process example.
+The lifecycle skeleton below runs in one process with fake application stores;
+reopening its session database alone does not prove reconstructed tool behavior.
+
 If dispatch can commit before its success acknowledgement becomes durable, use
 the focused `cayu guide tool-effects#act-once-recovery` protocol within the Act
 once and Inspect/recover phases. It adds durable uncertainty and bounded

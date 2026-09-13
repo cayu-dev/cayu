@@ -6,6 +6,8 @@ authoritative only where a maintained guide points to the implementation or the
 
 ## Current user guides
 
+- [Durable service-backed tools](../src/cayu/guides/durable-service-tools.md) (`cayu guide durable-service-tools`)
+
 - [Advanced runtime examples](advanced-runtime-examples.md)
 - [Browser sessions](browser-session.md)
 - [Browser recordings](browser-recording.md)

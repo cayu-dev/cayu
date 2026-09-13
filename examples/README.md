@@ -20,6 +20,9 @@ corresponding credentials or service.
 
 ## Tools and providers
 
+- [`durable_service_tools/`](durable_service_tools/) — credential-free fresh-process
+  resume, stable service identities, scoped knowledge, and approval recovery.
+
 - [`openai_local_tools.py`](openai_local_tools.py) — OpenAI Responses with local tools.
 - [`anthropic_local_tools.py`](anthropic_local_tools.py) — Anthropic Messages with local tools.
 - [`vertex_local_tools.py`](vertex_local_tools.py) — Anthropic models through Vertex AI.

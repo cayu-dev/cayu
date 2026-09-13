@@ -40,6 +40,7 @@ only when the requested behavior requires it.
 | A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | `cayu guide references#domain-tool` |
 | Replay or mutation semantics | `ToolEffect`, idempotency keys | `cayu guide tool-effects` |
 | Durable operational changes | proposal, policy-bound approval, action receipt, verification, recovery | `cayu guide durable-operations` |
+| Rebuild service-backed tools after a restart | component behavior identities, injected or environment-bound knowledge | `cayu guide durable-service-tools` |
 | Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
 | Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |

@@ -11,6 +11,11 @@ agent to search before declaring that project information is unavailable. This
 uses existing tools; it does not lower automatic-admission thresholds or promote
 search results into trusted facts.
 
+For custom service-backed tools, constructor injection, or reconstruction over a
+saved session, use `cayu guide durable-service-tools`
+([source](../src/cayu/guides/durable-service-tools.md)). The configuration below
+uses the environment-backed knowledge path.
+
 ## Configuration
 
 The following assumes `provider`, `model`, `knowledge_store`, an evidence-capable

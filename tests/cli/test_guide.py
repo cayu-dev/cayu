@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -19,6 +20,42 @@ from cayu import (
 from cayu.cli import main
 
 
+def test_durable_service_guide_discovery_and_executable_injection(capsys) -> None:
+    from cayu import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+
+    assert main(["guide", "durable-service-tools", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["package_source"] == "cayu.guides/durable-service-tools.md"
+    guide = result["content"]
+    store = InMemoryKnowledgeStore(
+        [KnowledgeEntry(id="rule", namespace="handbook", text="shipping authorized-evidence")],
+        access_scope=KnowledgeAccessScope.for_namespace("handbook"),
+    )
+    namespace: dict[str, Any] = {"store": store}
+    for snippet in re.findall(r"```python\n(.*?)```", guide, re.DOTALL):
+        exec(compile(snippet, "durable-service-tools", "exec"), namespace)
+    reader = namespace["HandbookReader"](store)
+    output = asyncio.run(reader.run(ToolContext(session_id="guide-test"), {}))
+    assert "authorized-evidence" in output.content
+    environment = namespace["environment"]
+    assert environment.knowledge_store is store
+    assert environment.knowledge_access_scope == store.bound_access_scope()
+    with pytest.raises(ValueError, match="bound knowledge store"):
+        namespace["HandbookReader"](None)
+
+    assert main(["guide", "durable-service-tools#bind-through-an-environment"]) == 0
+    assert "ctx.knowledge_store.search" in capsys.readouterr().out
+    for topic in ["authoring", "references#domain-tool", "durable-operations"]:
+        assert main(["guide", topic]) == 0
+        assert "cayu guide durable-service-tools" in capsys.readouterr().out
+    root = Path(__file__).resolve().parents[2]
+    for index in ["README.md", "docs/README.md", "examples/README.md"]:
+        assert (
+            "durable_service_tools" in (root / index).read_text()
+            or "durable-service-tools" in (root / index).read_text()
+        )
+
+
 def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     assert main(["guide"]) == 0
     listing = capsys.readouterr().out
@@ -26,6 +63,7 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     assert "structured-output" in listing
     assert "Credential-free structured-output runtime proof." in listing
     assert "durable-operations" in listing
+    assert "durable-service-tools" in listing
     assert "evals-ai-quality" in listing
     assert "evals-first" in listing
     assert "evals-production" in listing

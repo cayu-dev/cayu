@@ -108,6 +108,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
         "cayu/guides/durable-operations.md",
+        "cayu/guides/durable-service-tools.md",
         "cayu/guides/evals-ai-quality.md",
         "cayu/guides/evals-first.md",
         "cayu/guides/evals-production.md",
@@ -309,13 +310,14 @@ def test_validate_wheel_requires_provider_compatibility_guide(tmp_path: Path) ->
         validate_wheel(wheel)
 
 
-def test_validate_wheel_requires_durable_operations_guide(tmp_path: Path) -> None:
+@pytest.mark.parametrize("topic", ["durable-operations", "durable-service-tools"])
+def test_validate_wheel_requires_durable_operations_guide(tmp_path: Path, topic: str) -> None:
     wheel = tmp_path / "cayu.whl"
     names = _valid_wheel_names()
-    names.remove("cayu/guides/durable-operations.md")
+    names.remove(f"cayu/guides/{topic}.md")
     _write_wheel(wheel, names)
 
-    with pytest.raises(ValueError, match=r"missing required wheel files: .*durable-operations"):
+    with pytest.raises(ValueError, match=rf"missing required wheel files: .*{topic}"):
         validate_wheel(wheel)
 
 

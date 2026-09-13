@@ -242,6 +242,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         assert "applications" in {item["topic"] for item in topics["topics"]}
+        assert "durable-service-tools" in {item["topic"] for item in topics["topics"]}
+        for topic in [
+            "durable-service-tools",
+            "durable-service-tools#bind-through-an-environment",
+            "authoring",
+        ]:
+            content = _run(
+                [str(cayu), "guide", topic],
+                cwd=root,
+                environment=environment,
+            )
+            assert "knowledge" in content
+            if topic == "authoring":
+                assert "cayu guide durable-service-tools" in content
         _run(
             [str(cayu), "guide", "applications#convention", "--json"],
             cwd=root,

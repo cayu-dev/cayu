@@ -11,6 +11,10 @@ approvals, tool effects, pending actions, verification, and recovery seams below
 A native Python tool subclasses `Tool`, declares one immutable `ToolSpec`, and
 implements `async def run(ctx: ToolContext, args: dict) -> ToolResult`.
 
+For a tool wrapping an application-owned service, use
+`cayu guide durable-service-tools` for stable component identities and explicit
+knowledge injection or environment binding across process reconstruction.
+
 `ToolSpec` is the registered declaration:
 
 - `name`: required durable tool identity.
