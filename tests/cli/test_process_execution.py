@@ -125,6 +125,50 @@ def _assert_dead(pids):
             os.kill(pid, 0)
 
 
+def _descendant_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # An orphan's zombie can await host PID 1 reaping in Linux containers.
+    # It cannot execute work; direct-child reaping is checked separately.
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except ProcessLookupError:
+        # Linux may report ESRCH during the read, after the liveness probe
+        # and even after opening the proc file. The process is already gone.
+        return False
+    except FileNotFoundError:
+        return sys.platform != "linux"
+
+
+@pytest.mark.parametrize("error_type", [ProcessLookupError, FileNotFoundError])
+def test_descendant_probe_accepts_process_exit_during_proc_read(monkeypatch, error_type):
+    monkeypatch.setattr(sys, "platform", "linux")
+    probes = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: probes.append((pid, sig)))
+
+    def vanished(path):
+        assert str(path) == "/proc/123/stat"
+        raise error_type("synthetic process exit")
+
+    monkeypatch.setattr(Path, "read_text", vanished)
+    assert _descendant_running(123) is False
+    assert probes == [(123, 0)]
+
+
+def test_descendant_probe_does_not_hide_unexpected_proc_errors(monkeypatch):
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    def denied(path):
+        raise PermissionError("synthetic permission failure")
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(PermissionError, match="synthetic permission failure"):
+        _descendant_running(123)
+
+
 def test_named_workers_construct_apps_in_distinct_child_processes(tmp_path):
     _project(tmp_path)
     process = _start(tmp_path, "worker", "once", "--processes", "2")
@@ -713,19 +757,6 @@ while True:
         + ("time.sleep(60)" if leader_crashes else "sys.exit(17)")
     )
 
-    def descendant_running(pid):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        # An orphan's zombie can await host PID 1 reaping in Linux containers.
-        # It cannot execute work; reaping our direct children is checked below.
-        stat = Path(f"/proc/{pid}/stat")
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-        except FileNotFoundError:
-            return sys.platform != "linux"
-
     async def scenario():
         children = []
 
@@ -756,9 +787,9 @@ while True:
                 assert outcome.forced_shutdown
             pid = int((tmp_path / "descendant").read_text())
             deadline = time.monotonic() + 5
-            while descendant_running(pid) and time.monotonic() < deadline:
+            while _descendant_running(pid) and time.monotonic() < deadline:
                 await asyncio.sleep(0.02)
-            assert not descendant_running(pid), "descendant survived supervisor cleanup"
+            assert not _descendant_running(pid), "descendant survived supervisor cleanup"
         finally:
             for child in children:
                 with contextlib.suppress(ProcessLookupError):
@@ -766,7 +797,7 @@ while True:
             marker = tmp_path / "descendant"
             if marker.exists():
                 pid = int(marker.read_text())
-                if descendant_running(pid):
+                if _descendant_running(pid):
                     os.kill(pid, signal.SIGKILL)
 
     asyncio.run(scenario())
