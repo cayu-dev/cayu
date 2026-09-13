@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, BinaryIO, Literal
+from uuid import uuid4
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners.base import Runner
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
         WorkspaceBranchLifecycleSummary,
         WorkspaceBranchRequest,
     )
+    from cayu.workspaces.references import WorkspaceReferenceBinding
 
 WorkspaceGitMode = Literal["100644", "100755"]
 WorkspaceGitEntryMode = Literal["100644", "100755", "120000"]
@@ -540,6 +542,26 @@ class Workspace(ABC):
     """Filesystem/artifact area an agent can work in."""
 
     id: str
+
+    def reference_binding(self) -> WorkspaceReferenceBinding:
+        """Bind application data to this workspace incarnation.
+
+        The default is object-lifetime scoped and fails closed after reopening.
+        Durable adapters may override this method only when they can preserve an
+        incarnation across recovery and rotate it on replacement. Never restore
+        a generation from the application reference being validated.
+        """
+        from cayu.workspaces.references import WorkspaceReferenceBinding
+        from cayu.workspaces.revisions import WorkspaceIdentity
+
+        generation = self.__dict__.setdefault("_reference_binding_generation", uuid4().hex)
+        return WorkspaceReferenceBinding(
+            identity=WorkspaceIdentity(
+                workspace_id=self.id,
+                observer=f"{type(self).__module__}.{type(self).__qualname__}",
+            ),
+            generation=generation,
+        )
 
     @abstractmethod
     async def read_bytes(

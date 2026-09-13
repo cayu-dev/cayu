@@ -43,6 +43,7 @@ only when the requested behavior requires it.
 | Rebuild service-backed tools after a restart | component behavior identities, injected or environment-bound knowledge | `cayu guide durable-service-tools` |
 | Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
 | Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
+| Application workspace references or inventories | `WorkspaceReferenceBinding`, `ToolContext.require_workspace_binding` | `cayu guide authoring#workspace-references-and-inventories` |
 | Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |
 | Secrets or restricted network access | vaults, virtual credentials, egress policies | `cayu guide references#secrets-egress` |
 | Tools exposed over MCP | MCP adapters and manifest policy | `cayu guide references#mcp` |
@@ -382,3 +383,72 @@ supported observer.
 Finish by rerunning inspection, checks, focused tests, the relevant eval, and
 any explicitly available process/live checks. Report limitations rather than
 substituting weaker evidence.
+
+## Workspace references and inventories
+
+Use `WorkspaceReferenceBinding` for application-owned references, inventories, or
+receipts. Obtain it from the actual registered workspace with
+`workspace.reference_binding()`, or from the admitted workspace inside a tool
+with `ctx.workspace_reference_binding()`. Do not reconstruct an ID from an
+environment name, path, or naming convention.
+
+```python
+from pydantic import BaseModel
+from cayu import WorkspaceReferenceBinding
+
+class Inventory(BaseModel):
+    binding: WorkspaceReferenceBinding
+    paths: tuple[str, ...]
+
+inventory = Inventory(binding=workspace.reference_binding(), paths=("note.txt",))
+# Store alongside your application data, including in durable JSON metadata.
+serialized = inventory.model_dump_json()
+restored = Inventory.model_validate_json(serialized)
+
+# Inside Tool.run(ctx, args), before using paths or inventory claims:
+ctx.require_workspace_binding(restored.binding)
+```
+
+`require_workspace_binding` checks the workspace actually admitted for that tool
+invocation, after factory materialization and workspace binding. A sync binding
+can select a target different from the registered source: create the inventory
+from that target or from the active context. Source ownership does not transfer
+merely because files were copied. Evaluation wrappers and alternate execution
+adapters use the same API on their actual workspace objects.
+
+A mismatch raises `WorkspaceReferenceBindingError` with
+`code == "workspace_binding_mismatch"`. A context without a live Runtime-bound
+workspace raises `workspace_binding_unavailable`; setting `ctx.workspace_id` or
+putting an ID in metadata cannot supply it. Catch the diagnostic and reject or
+rebuild the reference before consuming its claims. A deserialized `ToolContext`
+cannot validate a reference; validate in a new admitted invocation.
+
+The versioned JSON binding composes `WorkspaceIdentity` (ID and observing adapter)
+with an incarnation `generation`. It is distinct from `WorkspaceBinding`, which
+connects a workspace and runner, and from file or workspace revision observations.
+The default generation is scoped to the workspace object's lifetime. Reopening
+application JSON preserves the original binding exactly; it does **not** rebind
+it. Reconstructing even the same adapter at the same path with the same ID yields
+a mismatch. Rebuild the inventory from the newly selected workspace after
+recovery when using the default implementation.
+
+A durable workspace adapter may override `Workspace.reference_binding()` to
+return an adapter-owned binding that survives reconnect. It must independently
+persist and verify the workspace incarnation, preserve all binding fields for
+that incarnation, rotate the generation on replacement/reset, and fail explicitly
+when continuity cannot be established. Never recover a generation from the
+inventory being checked or derive it from names, paths, or file contents. An
+adapter wrapper may delegate to its underlying workspace only when it represents
+the same incarnation. Runtime does not infer such equivalence. Built-in adapters
+currently use the conservative object-lifetime default.
+
+This is an ownership assertion, not authentication of application data. It does
+not establish file existence, content integrity, freshness, read permission, or
+verified claims; an inventory binding neither certifies its claims nor grants
+access. Continue to use workspace reads, revision checks, policy enforcement, and
+application verification for those separate questions. Treat serialized bindings
+as application data subject to your normal integrity controls.
+
+Run `python examples/workspace_reference_binding.py` for a synthetic example
+requiring no model credentials. It accepts the original inventory and reports
+`workspace_binding_mismatch` for a replacement with the same ID, path, and bytes.

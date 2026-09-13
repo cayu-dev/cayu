@@ -45,6 +45,7 @@ from cayu.deadlines import ExecutionDeadline, current_execution_deadline
 
 if TYPE_CHECKING:
     from cayu.runners.base import ExecCommand, ExecResult
+    from cayu.workspaces.references import WorkspaceReferenceBinding
 
 
 class DurableToolOperationConflict(RuntimeError):
@@ -1116,6 +1117,24 @@ class ToolContext(BaseModel):
             raise RuntimeError("Runtime artifact-store authority is already bound.")
         self._runtime_workspace_authority = workspace
         self._runtime_artifact_store_authority = artifact_store
+
+    def workspace_reference_binding(self) -> WorkspaceReferenceBinding:
+        """Observe the admitted workspace after factory materialization and binding.
+
+        A detached/deserialized context has no live authority and fails closed.
+        Public workspace_id and application metadata cannot supply this authority.
+        """
+        from cayu.workspaces.base import Workspace
+        from cayu.workspaces.references import WorkspaceReferenceBindingError
+
+        workspace = self._runtime_workspace_authority
+        if self.workspace is None or not isinstance(workspace, Workspace):
+            raise WorkspaceReferenceBindingError("workspace_binding_unavailable")
+        return workspace.reference_binding()
+
+    def require_workspace_binding(self, binding: WorkspaceReferenceBinding) -> None:
+        """Reject a foreign or unavailable binding before consuming its claims."""
+        binding.require_match(self.workspace_reference_binding())
 
     def _bind_runtime_causal_budget_limits(self, limits: tuple[Any, ...]) -> None:
         """Bind request-owned causal limits for Cayu's child-session tools."""

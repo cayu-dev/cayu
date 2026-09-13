@@ -3116,6 +3116,10 @@ from cayu.workspaces.checkpoints import (
     release_workspace_checkpoint,
     restore_workspace_checkpoint,
 )
+from cayu.workspaces.references import (
+    WorkspaceReferenceBinding,
+    WorkspaceReferenceBindingError,
+)
 
 __all__ = [
     "AGENT_BUNDLE_CONTAINER_EXTENSION",
@@ -5774,6 +5778,8 @@ __all__ = [
     "WorkspacePreconditionUnsupportedError",
     "WorkspaceReadOffsetError",
     "WorkspaceReadResult",
+    "WorkspaceReferenceBinding",
+    "WorkspaceReferenceBindingError",
     "WorkspaceRevisionDelta",
     "WorkspaceRevisionDeltaStatus",
     "WorkspaceRevisionMismatchError",

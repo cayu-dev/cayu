@@ -81,6 +81,10 @@ from cayu.workspaces.microsandbox import (
     DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES,
     MicrosandboxWorkspace,
 )
+from cayu.workspaces.references import (
+    WorkspaceReferenceBinding,
+    WorkspaceReferenceBindingError,
+)
 from cayu.workspaces.revisions import (
     WorkspaceDirectMutationReconciliation,
     WorkspaceForkLineage,
@@ -186,6 +190,8 @@ __all__ = [
     "WorkspacePreconditionUnsupportedError",
     "WorkspaceReadOffsetError",
     "WorkspaceReadResult",
+    "WorkspaceReferenceBinding",
+    "WorkspaceReferenceBindingError",
     "WorkspaceRevisionDelta",
     "WorkspaceRevisionDeltaStatus",
     "WorkspaceRevisionMismatchError",
