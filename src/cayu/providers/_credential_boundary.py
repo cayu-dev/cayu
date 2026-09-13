@@ -614,6 +614,8 @@ async def aclosing_provider_stream(
     ``cancellation_grace_s`` optionally gives an owned close a bounded chance
     to settle after caller cancellation. Expiry retains the task; it never
     cancels it again. Provider stream clock expiry retains its immediate handoff.
+    A supplied ``retain_cleanup`` also owns deadline cleanup when expiry is
+    observed between reads and there is no pending read to join.
     """
 
     if type(cancellation_grace_s) not in {int, float} or not 0 <= cancellation_grace_s <= 1:
@@ -655,8 +657,16 @@ async def aclosing_provider_stream(
                 or type(operation_failure) is ModelStreamDeadlineError
             )
             read = None if pending_read is None else pending_read()
+            # Expiry can be observed before the next read starts. The dispatch
+            # still owns a slot; do not move its close into the smaller fallback
+            # registry and release that slot while cleanup remains pending.
+            use_retained_close = (
+                cleanup_ownership is not None
+                or read is not None
+                or (deadline_failure and retain_cleanup is not None)
+            )
             close = None
-            if deadline_failure and cleanup_ownership is None and read is None:
+            if deadline_failure and not use_retained_close:
                 cleanup_action = "unknown"
                 cleanup_unsettled = await close_provider_stream_after_deadline(source)
             else:
@@ -666,7 +676,7 @@ async def aclosing_provider_stream(
                 close_operation = (
                     cast("Callable[[], Awaitable[None]]", close) if callable(close) else None
                 )
-                if cleanup_ownership is None and read is None:
+                if not use_retained_close:
                     await _close_after_provider_read(close_operation, read, cleanup_evidence)
                 else:
 
