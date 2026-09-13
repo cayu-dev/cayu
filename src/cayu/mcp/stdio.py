@@ -68,6 +68,7 @@ from cayu.mcp._stdio_process import (
     validate_stdio_mcp_containment_timeout,
     validate_stdio_mcp_process_lifetime,
 )
+from cayu.mcp._stdio_subscription import StdioToolSubscription
 from cayu.mcp._transport import (
     McpCallDeadlineExceededError,
     McpIdleTimeoutError,
@@ -603,6 +604,9 @@ class StdioMcpSession(McpSession):
         self._tools_list_changed_continuity_handler: Callable[[bool], None] | None = None
         self._tools_list_changed_pending_before_owner = False
         self._tools_list_changed_activation_handle: asyncio.Handle | None = None
+        self._tool_subscription = (
+            StdioToolSubscription(self) if self._wire_protocol.validates_modern_results else None
+        )
 
     @property
     def protocol_era(self) -> McpProtocolEra:
@@ -620,10 +624,23 @@ class StdioMcpSession(McpSession):
         self,
         handler: Callable[[], None] | None,
     ) -> bool:
-        if handler is not None and not self._wire_protocol.supports_legacy_listener:
-            return False
         if handler is not None and self._closed:
             return False
+        if self._tool_subscription is not None:
+            if handler is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return False
+                if loop is not self._reader_task.get_loop():
+                    return False
+            self._tools_list_changed_handler = handler
+            if handler is None:
+                self._tool_subscription.stop()
+            else:
+                self._mark_tools_list_changed_continuity_lost()
+                self._tool_subscription.start()
+            return True
         if handler is None:
             activation_handle = self._tools_list_changed_activation_handle
             self._tools_list_changed_activation_handle = None
@@ -664,8 +681,6 @@ class StdioMcpSession(McpSession):
         self,
         handler: Callable[[bool], None] | None,
     ) -> bool:
-        if handler is not None and not self._wire_protocol.supports_legacy_listener:
-            return False
         if handler is not None and self._closed:
             return False
         self._tools_list_changed_continuity_handler = handler
@@ -688,6 +703,8 @@ class StdioMcpSession(McpSession):
         self._tools_list_changed_pending_before_owner = False
 
     def _disable_tools_list_changed_notifications(self) -> None:
+        if self._tool_subscription is not None:
+            self._tool_subscription.stop()
         activation_handle = self._tools_list_changed_activation_handle
         self._tools_list_changed_activation_handle = None
         if activation_handle is not None:
@@ -695,6 +712,9 @@ class StdioMcpSession(McpSession):
         self._tools_list_changed_handler = None
         self._tools_list_changed_continuity_handler = None
         self._tools_list_changed_pending_before_owner = False
+
+    def _tools_list_changed_listener_failure_message(self) -> str | None:
+        return self._tool_subscription.failure if self._tool_subscription is not None else None
 
     def _mark_tools_list_changed_continuity_lost(self) -> None:
         """Fence refresh-owned catalogue authority before stdio can go silent."""
@@ -1099,6 +1119,8 @@ class StdioMcpSession(McpSession):
             self._fail_pending(McpProtocolError("MCP stdio session closed."))
         except BaseException as error:
             failures.append(error)
+        if self._tool_subscription is not None:
+            await self._tool_subscription.close()
 
         async def settle_shutdown_task(
             task: asyncio.Task[Any],
@@ -2079,6 +2101,8 @@ class StdioMcpSession(McpSession):
                 self._schedule_close()
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
+        if self._tool_subscription is not None and self._tool_subscription.consume(message):
+            return
         message_id = message.get("id")
         if "method" in message:
             if message_id is not None:

@@ -161,6 +161,13 @@ reconciliation and server-side subscription cancellation, and requires local
 socket binding. The bounded client example is
 `uv run python examples/mcp_http_subscriptions.py <modern-http-url>`.
 
+Modern stdio subscriptions are covered by
+`uv run pytest tests/core/test_mcp_stdio_subscriptions.py -q`, including shared
+reply routing, cancellation, refresh fencing, and official SDK interoperability.
+Linux also exercises default process containment; other platforms exercise the
+explicit graceful-cleanup mode. The provider-free observer is
+`uv run python examples/mcp_stdio_subscriptions.py -- <server> [arguments ...]`.
+
 For deterministic pre-commit, acknowledgement-loss, and ownership-handoff
 coverage around durable session operations, use the repository-private
 [Session operation publication fault harness](docs/session-operation-fault-harness.md).

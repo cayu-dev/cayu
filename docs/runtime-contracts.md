@@ -13048,7 +13048,7 @@ The first MCP implementation supports stdio servers:
   listener even when discovery advertises `tools.listChanged`;
   modern HTTP instead owns an explicit `subscriptions/listen` POST when a
   refresh owner attaches to a server advertising `tools.listChanged=true`.
-  Modern stdio subscriptions remain deferred.
+  Modern stdio uses the same explicit subscription contract on its shared channel.
 - Callers must close the toolset when the application or environment shuts down.
   Tool adapters intentionally reuse that established session instead of launching
   a fresh MCP process for every tool call.
@@ -13205,7 +13205,7 @@ GET listener, replay cursor, or session DELETE; once discovery succeeds, its
 cancellation or timeout settles only the affected request stream. Modern stdio
 retains the existing conservative shared-process rule: an uncertain in-flight
 request sends bounded cancellation and then closes that process connection.
-Automatic negotiation, response caching, modern stdio subscriptions, and MRTR /
+Automatic negotiation, response caching, and MRTR /
 `input_required` are not implemented.
 
 Modern HTTP tool-list subscriptions use one owned `subscriptions/listen` POST
@@ -13237,6 +13237,31 @@ closes and settles its subscription, including interrupted readers. Prompt and
 resource subscriptions are not part of this slice. See
 [`examples/mcp_http_subscriptions.py`](../examples/mcp_http_subscriptions.py)
 for a provider-free catalogue observer.
+
+Modern stdio tool-list subscriptions use the same filter, correlation validator,
+refresh authority, and acknowledgement fence. The existing stdout reader routes
+subscription frames alongside ordinary replies; a subscription never installs a
+second reader or enters the finite-request pending-response map. Uncorrelated
+legacy notices cannot trigger modern refresh. An acknowledged subscription may
+remain quiet indefinitely without closing the process: stdio subscriptions have
+no heartbeat contract. Each frame remains byte-bounded. Idle and total deadlines
+bound initial acknowledgement, and ordinary RPCs retain their own independent
+idle/total budgets. Ordinary replies cannot extend the acknowledgement deadline;
+a late read cannot erase an idle gap that expired during establishment.
+
+Graceful completion fences dispatch immediately and opens a new subscription
+after a bounded delay, with a fresh request ID on the same process. Process
+loss, malformed subscription frames, establishment deadline expiry, or uncertain
+writes fail the shared connection closed; no connector restart or tool-call
+retry is attempted. Owner release sends bounded `notifications/cancelled`
+referencing the listen request, without closing an otherwise healthy process.
+The most recent 64 cancelled subscription IDs are retained without payloads so
+already-buffered frames cannot refresh a later owner; older unknown subscription
+identities fail closed. Unsupported filters cancel and reconcile once, retaining
+manual refresh. Shutdown joins subscription cancellation before process cleanup;
+interrupted writers retain the existing cleanup ownership and process fence.
+The provider-free stdio observer is
+[`examples/mcp_stdio_subscriptions.py`](../examples/mcp_stdio_subscriptions.py).
 
 Every MCP exchange also has a Cayu-owned transport envelope. Pass one immutable
 `McpTransportLimits` to `StdioMcpClient(transport_limits=...)` or

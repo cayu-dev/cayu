@@ -99,13 +99,11 @@ def test_modern_stdio_discovers_lists_calls_resources_and_closes(tmp_path: Path)
             tool_result = await session.call_tool("search", {"query": "cayu"})
             resources = await session.list_resources()
             resource = await session.read_resource("file://fixture")
-            continuity = session._set_tools_list_changed_continuity_handler(lambda _ready: None)
-            listener = session._set_tools_list_changed_handler(lambda: None)
-            return metadata, tools, tool_result, resources, resource, continuity, listener
+            return metadata, tools, tool_result, resources, resource
         finally:
             await session.close()
 
-    metadata, tools, tool_result, resources, resource, continuity, listener = asyncio.run(run())
+    metadata, tools, tool_result, resources, resource = asyncio.run(run())
 
     assert metadata.protocol_version == MCP_MODERN_PROTOCOL_VERSION
     assert metadata.server_name == "modern-stdio-fixture"
@@ -116,7 +114,6 @@ def test_modern_stdio_discovers_lists_calls_resources_and_closes(tmp_path: Path)
     assert tool_result.structured_content == ["one", 2]
     assert [resource.uri for resource in resources] == ["file://fixture"]
     assert resource.contents == [{"uri": "file://fixture", "text": "hello"}]
-    assert (continuity, listener) == (False, False)
 
     requests = _requests(request_log)
     assert [request["method"] for request in requests] == [
