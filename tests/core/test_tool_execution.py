@@ -505,6 +505,9 @@ def test_tool_timeout_consumes_only_its_owned_cancellation_request() -> None:
             raise AssertionError("unreachable")
 
     async def run() -> tuple[tool_execution.ToolExecutionOutcome, int]:
+        async def forbidden_reconciliation():
+            raise AssertionError("Child reconciliation cannot replace a runtime timeout")
+
         outcome = await tool_execution.run_tool(
             tool=SlowTool(),
             effect=ToolEffect.NONE,
@@ -512,6 +515,7 @@ def test_tool_timeout_consumes_only_its_owned_cancellation_request() -> None:
             arguments={},
             redactor=SecretRedactor,
             timeout_seconds=0.01,
+            reconcile_result=forbidden_reconciliation,
         )
         current_task = asyncio.current_task()
         assert current_task is not None
@@ -549,6 +553,10 @@ def test_tool_timeout_isolated_owner_preserves_later_caller_cancellation() -> No
 
     async def run() -> tuple[asyncio.CancelledError, int]:
         tool = CancellationResettingTool()
+
+        async def forbidden_reconciliation():
+            raise AssertionError("Child reconciliation cannot replace caller cancellation")
+
         execution = asyncio.create_task(
             tool_execution.run_tool(
                 tool=tool,
@@ -557,6 +565,7 @@ def test_tool_timeout_isolated_owner_preserves_later_caller_cancellation() -> No
                 arguments={},
                 redactor=SecretRedactor,
                 timeout_seconds=0.01,
+                reconcile_result=forbidden_reconciliation,
             )
         )
         await asyncio.wait_for(tool.deadline_consumed.wait(), timeout=1)

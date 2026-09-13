@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 
+import pytest
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 from cayu.core import AgentSpec, EventType, Message
@@ -64,3 +65,45 @@ def test_foreground_subagent_generated_lineage_survives_short_secret_collision()
     assert children[0].parent_session_id == root.id
     assert children[0].causal_budget_id == root.id
     assert children[0].status.value == "completed"
+
+
+@pytest.mark.parametrize("provenance", ["attested", "raw", "serialized", "mutated"])
+def test_subagent_lineage_redaction_requires_exact_private_provenance(provenance):
+    from cayu.runtime._child_session_identity import run_request_with_subagent_lineage
+    from cayu.runtime._session_request_boundary import prepare_run_request
+    from cayu.runtime.sessions import run_request_with_runtime_generated_authority
+
+    request = RunRequest(
+        session_id="child",
+        parent_session_id="parent-generated",
+        causal_budget_id="budget",
+        agent_name="reviewer",
+        messages=[Message.text("user", "review")],
+        metadata={
+            "subagent": {
+                "parent_session_id": "parent-generated",
+                "idempotency_key": "runtime-generated",
+                "spawn_fingerprint": "sha256:1234",
+                "tool_call_id": "provider-controlled",
+            },
+            "note": "caller-controlled",
+        },
+    )
+    if provenance != "raw":
+        request = run_request_with_subagent_lineage(request)
+    if provenance == "serialized":
+        request = RunRequest.model_validate(request.model_dump())
+    if provenance == "mutated":
+        request.metadata["subagent"]["idempotency_key"] = "replacement-generated"
+    # Top-level identity authority is independent of nested lineage authority.
+    request = run_request_with_runtime_generated_authority(request, "parent_session_id")
+    prepared = prepare_run_request(request, redactor=SecretRedactor("-"))
+    lineage = prepared.metadata["subagent"]
+    if provenance == "attested":
+        assert lineage["parent_session_id"] == "parent-generated"
+        assert lineage["idempotency_key"] == "runtime-generated"
+    else:
+        assert "[REDACTED_SECRET]" in lineage["parent_session_id"]
+        assert "[REDACTED_SECRET]" in lineage["idempotency_key"]
+    assert "[REDACTED_SECRET]" in lineage["tool_call_id"]
+    assert "[REDACTED_SECRET]" in prepared.metadata["note"]

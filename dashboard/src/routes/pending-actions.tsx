@@ -30,7 +30,7 @@ import {
 import { formatDateTime } from "../lib/format"
 import { cn } from "../lib/utils"
 
-type PendingActionKind = "all" | "tool_approval" | "user_input" | "manual_recovery"
+type PendingActionKind = "all" | PendingAction["kind"]
 
 const PAGE_LIMIT_OPTIONS = [1, 5, 10, 25, 50, 100] as const
 const DEFAULT_PAGE_LIMIT = 100
@@ -53,19 +53,21 @@ function optionalFilter(value: string) {
 
 function actionIcon(kind: PendingAction["kind"]) {
   if (kind === "tool_approval") return ShieldCheck
-  if (kind === "user_input") return UserRound
+  if (kind === "user_input" || kind === "delegated_action") return UserRound
   return AlertTriangle
 }
 
 function actionTone(kind: PendingAction["kind"]) {
   if (kind === "tool_approval") return "text-chart-1 border-chart-1/30 bg-chart-1/10"
-  if (kind === "user_input") return "text-chart-3 border-chart-3/30 bg-chart-3/10"
+  if (kind === "user_input" || kind === "delegated_action")
+    return "text-chart-3 border-chart-3/30 bg-chart-3/10"
   return "text-destructive border-destructive/30 bg-destructive/10"
 }
 
 function actionLabel(kind: PendingAction["kind"]) {
   if (kind === "tool_approval") return "Approval"
   if (kind === "user_input") return "User input"
+  if (kind === "delegated_action") return "Child action"
   return "Manual recovery"
 }
 
@@ -87,6 +89,7 @@ function ActionBadge({ action }: { action: PendingAction }) {
 }
 
 function idLine(action: PendingAction) {
+  if (action.delegated_action) return `child: ${action.delegated_action.child_session_id}`
   if (action.approval_id) return `approval_id: ${action.approval_id}`
   if (action.input_id) return `input_id: ${action.input_id}`
   if (action.round_id) return `round_id: ${action.round_id}`
@@ -136,11 +139,15 @@ function PendingActionRow({ action }: { action: PendingAction }) {
       <TableCell>
         <Link
           to="/sessions/$sessionId"
-          params={{ sessionId: action.session.id }}
+          params={{ sessionId: action.delegated_action?.child_session_id ?? action.session.id }}
           className={buttonVariants({ variant: "outline", size: "sm" })}
         >
           <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
-          {action.kind === "manual_recovery" ? "Recover" : "Open"}
+          {action.kind === "delegated_action"
+            ? "Open child"
+            : action.kind === "manual_recovery"
+              ? "Recover"
+              : "Open"}
         </Link>
       </TableCell>
     </TableRow>
@@ -265,6 +272,7 @@ export function PendingActionsPage() {
             <option value="all">All action types</option>
             <option value="tool_approval">Approvals</option>
             <option value="user_input">User input</option>
+            <option value="delegated_action">Child actions</option>
             <option value="manual_recovery">Manual recovery</option>
           </select>
           <label className="flex items-center gap-2 text-sm text-muted-foreground">

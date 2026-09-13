@@ -417,6 +417,7 @@ async def run_tool(
     finalize_publication: Callable[[], InvocationPublicationSnapshot] | None = None,
     timeout_seconds: float | None = None,
     before_dispatch: Callable[[], Awaitable[None]] | None = None,
+    reconcile_result: Callable[[], Awaitable[ToolResult | None]] | None = None,
 ) -> ToolExecutionOutcome:
     """Execute one tool and seal its evolving secret scope before publication."""
 
@@ -424,6 +425,8 @@ async def run_tool(
         raise TypeError("finalize_publication must be callable or None.")
     if before_dispatch is not None and not callable(before_dispatch):
         raise TypeError("before_dispatch must be callable or None.")
+    if reconcile_result is not None and not callable(reconcile_result):
+        raise TypeError("reconcile_result must be callable or None.")
     try:
         outcome = await _run_tool(
             tool=tool,
@@ -436,6 +439,13 @@ async def run_tool(
             timeout_seconds=timeout_seconds,
             before_dispatch=before_dispatch,
         )
+        # Runtime-owned reconciliation cannot erase timeout, policy, invalid-output,
+        # or uncertain-effect controls. Its replacement follows normal validation
+        # before the evolving secret scope is sealed below.
+        if reconcile_result is not None and not outcome.terminal_payload_fields():
+            replacement = await reconcile_result()
+            if replacement is not None:
+                outcome = _execution_outcome(replacement)
     except BaseException:
         if finalize_publication is not None:
             finalize_publication()

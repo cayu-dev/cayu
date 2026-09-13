@@ -113,6 +113,7 @@ from cayu.runtime.sessions import (
     SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS,
     SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     SESSION_TOPOLOGY_MAX_NODES,
+    DelegatedActionReference,
     SessionAggregateFilter,
     SessionOperationalSnapshot,
 )
@@ -2252,7 +2253,7 @@ class SessionsSummaryResponse(ApiBaseModel):
 
 class ApiPendingAction(ApiBaseModel):
     id: str
-    kind: Literal["tool_approval", "user_input", "manual_recovery"]
+    kind: Literal["tool_approval", "user_input", "manual_recovery", "delegated_action"]
     session: ApiSessionBase
     event: ApiEventRecord
     title: str
@@ -2274,6 +2275,7 @@ class ApiPendingAction(ApiBaseModel):
     question: str | None = None
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None
+    delegated_action: DelegatedActionReference | None = None
 
 
 class ApiPendingActionIssue(ApiBaseModel):

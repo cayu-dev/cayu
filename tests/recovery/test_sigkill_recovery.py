@@ -129,13 +129,16 @@ def test_sigkill_after_coding_session_settlement_recovers_product_without_redisp
     controls = tmp_path / "controls"
     controls.mkdir()
     session_id = "coding-product-process-loss"
+    # Terminalization receipts intentionally outlive task-row cleanup. Give
+    # each case a distinct task identity in the module-shared Postgres store.
+    task_id = f"coding-process-task-{uuid4().hex}"
     values = {
         "product_run_id": "coding-product-process-loss",
         "source_path": str(source),
         "artifact_path": str(artifacts),
         "publication_phase": publication_phase,
         "managed_task": managed_task,
-        "task_id": "coding-process-task",
+        "task_id": task_id,
     }
     with RecoveryHarness(controls, recovery_backend) as harness:
         original = harness.launch(
@@ -152,7 +155,7 @@ def test_sigkill_after_coding_session_settlement_recovers_product_without_redisp
         marker = harness.read_marker()
         assert marker == [{"session_id": session_id, "operation": "provider_dispatch"}]
         if managed_task:
-            claimed = asyncio.run(harness.load_task("coding-process-task"))
+            claimed = asyncio.run(harness.load_task(task_id))
             assert claimed is not None and claimed.status is TaskStatus.CLAIMED
             assert claimed.worker_id == "coding-start" and claimed.session_id is None
         original.sigkill()
@@ -170,7 +173,7 @@ def test_sigkill_after_coding_session_settlement_recovers_product_without_redisp
         assert result["session_id"] == session_id
         assert result["initial_revision"] == result["final_revision"]
         if managed_task:
-            terminal = asyncio.run(harness.load_task("coding-process-task"))
+            terminal = asyncio.run(harness.load_task(task_id))
             assert terminal is not None and terminal.status is TaskStatus.CANCELLED
             assert terminal.worker_id is None and terminal.lease_expires_at is None
             assert terminal.error == {"code": "task_worker_lease_expired_after_dispatch"}

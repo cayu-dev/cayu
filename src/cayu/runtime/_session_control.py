@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
@@ -273,6 +273,22 @@ class SessionControl(Generic[UsageTrackerT]):
         session_id = require_clean_nonblank(session_id, "session_id")
         self._active_control_tasks.setdefault(session_id, set()).add(task)
 
+    @contextlib.contextmanager
+    def active_control_ownership(self, session_id: str) -> Iterator[None]:
+        """Retain a control stream's task through its finalizers, including nesting."""
+        session_id = require_clean_nonblank(session_id, "session_id")
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Control ownership requires a current task.")
+        already_owned = task in self._active_control_tasks.get(session_id, ())
+        if not already_owned:
+            self.register_active_control_task(session_id, task)
+        try:
+            yield
+        finally:
+            if not already_owned:
+                self.unregister_active_control_task(session_id, task)
+
     def unregister_active_control_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
         control_tasks = self._active_control_tasks.get(session_id)
         if control_tasks is None:
@@ -281,12 +297,16 @@ class SessionControl(Generic[UsageTrackerT]):
         if not control_tasks:
             self._active_control_tasks.pop(session_id, None)
 
-    def has_active_tasks(self, session_id: str) -> bool:
+    def has_active_tasks(
+        self, session_id: str, *, exclude_current_control_task: bool = False
+    ) -> bool:
         active_run_exists = any(
             not active_run.runtime_task.done() for active_run in self.active_runs(session_id)
         )
+        current = asyncio.current_task() if exclude_current_control_task else None
         return active_run_exists or any(
-            not task.done() for task in self._active_control_tasks.get(session_id, ())
+            task is not current and not task.done()
+            for task in self._active_control_tasks.get(session_id, ())
         )
 
     def _interrupt_targets(self, session_id: str) -> frozenset[asyncio.Task[Any]]:

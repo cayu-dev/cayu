@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
@@ -46,6 +47,7 @@ _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS = 3
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
 _MAX_AGGREGATED_FAILURES = 16
 _MAX_EXCEPTION_NOTES = 16
+_PERSISTED_SIDE_EFFECT_RECOVERY_CLAIM_TIMEOUT_SECONDS = 1.0
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +84,8 @@ class RuntimeEventWriter:
         event_sinks: Iterable[EventSink],
         secret_redactor: SecretRedactor | None = None,
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+        continue_foreground_parent: Callable[[PersistedEventSideEffectClaim], Awaitable[bool]]
+        | None = None,
     ) -> None:
         if secret_redactor is not None and not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("secret_redactor must be a SecretRedactor.")
@@ -105,6 +109,7 @@ class RuntimeEventWriter:
             )
         self._public_authority_alias_codec = store_alias_codec
         self._prepared_event_owner = object()
+        self._continue_foreground_parent = continue_foreground_parent
         if self._secret_redactor.has_values and (
             self._public_authority_alias_codec is None
             or not session_store.supports_public_authority_aliases
@@ -337,10 +342,20 @@ class RuntimeEventWriter:
         )
         recovered: list[Event] = []
         for candidate in candidates:
-            claim = await self._session_store.claim_persisted_event_side_effect(
-                session_id=candidate.session_id,
-                event_id=candidate.event_id,
-            )
+            try:
+                async with asyncio.timeout(_PERSISTED_SIDE_EFFECT_RECOVERY_CLAIM_TIMEOUT_SECONDS):
+                    claim = await self._session_store.claim_persisted_event_side_effect(
+                        session_id=candidate.session_id,
+                        event_id=candidate.event_id,
+                    )
+            except TimeoutError:
+                logger.warning(
+                    "Persisted event side-effect recovery claim timed out: "
+                    "session_id=%s event_id=%s",
+                    candidate.session_id,
+                    candidate.event_id,
+                )
+                continue
             if claim is None:
                 continue
             try:
@@ -382,6 +397,18 @@ class RuntimeEventWriter:
             # private authority decisions have completed.
             private_event = claim.event.model_copy(deep=True)
             await self._forward_budget_event_if_required(private_event)
+            if (
+                self._continue_foreground_parent is not None
+                and private_event.type
+                in {
+                    EventType.SESSION_COMPLETED,
+                    EventType.SESSION_FAILED,
+                    EventType.SESSION_INTERRUPTED,
+                }
+                and not await self._continue_foreground_parent(claim)
+            ):
+                await self._session_store.defer_persisted_event_side_effect(claim)
+                return event_with_durable_sequence(private_event, claim.event_sequence), False
             public_event = project_persisted_runtime_event(
                 private_event,
                 sequence=claim.event_sequence,

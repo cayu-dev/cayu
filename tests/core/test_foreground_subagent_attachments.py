@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from base64 import b64decode
+from hashlib import sha256
 
 import pytest
 from tests.core.test_builtin_tools import TINY_PNG_BYTES, AttachmentTool
@@ -10,6 +12,7 @@ from cayu import (
     ArtifactScope,
     Environment,
     EnvironmentSpec,
+    ExecutionProfileMismatchError,
     InMemorySessionStore,
     LocalArtifactStore,
     Message,
@@ -20,7 +23,22 @@ from cayu import (
     SubagentTool,
 )
 from cayu.core import ToolResultPart
-from cayu.providers import ModelStreamEvent
+from cayu.providers import ModelRequest, ModelStreamEvent
+from cayu.runtime import UserInputResponse
+from cayu.tools.user_input import UserInputTool
+
+
+def _assert_child_attachment(request: ModelRequest, artifact_id: str) -> None:
+    resolved = request.options["cayu_file_attachments"]
+    assert set(resolved) == {artifact_id}
+    attachment = resolved[artifact_id]
+    assert attachment["artifact_id"] == artifact_id
+    assert attachment["kind"] == "image"
+    assert attachment["filename"] == "invoice.png"
+    assert attachment["content_type"] == "image/png"
+    assert attachment["metadata"] == {}
+    assert b64decode(attachment["data_base64"], validate=True) == TINY_PNG_BYTES
+    assert attachment["content_sha256"] == sha256(TINY_PNG_BYTES).hexdigest()
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -113,7 +131,7 @@ def test_foreground_recovery_does_not_promote_child_attachments(backend, tmp_pat
             ]
             assert len(child_results) == 1
             assert child_results[0].artifacts[0]["artifact_id"] == artifact.id
-            assert "cayu_file_attachments" in provider.requests[2].options
+            _assert_child_attachment(provider.requests[2], artifact.id)
             if isinstance(sessions, SQLiteSessionStore):
                 await sessions.close()
                 sessions = SQLiteSessionStore(database)
@@ -143,6 +161,139 @@ def test_foreground_recovery_does_not_promote_child_attachments(backend, tmp_pat
             assert not provider.requests[-1].options.get("cayu_file_attachments")
         finally:
             if isinstance(sessions, SQLiteSessionStore):
+                await sessions.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_nested_input_reconstruction_preserves_environment_and_attachment_scope(tmp_path, backend):
+    async def scenario():
+        database = tmp_path / "paused-attachments.sqlite"
+        sessions = InMemorySessionStore() if backend == "memory" else SQLiteSessionStore(database)
+        artifacts = LocalArtifactStore(tmp_path / "artifacts", store_id="paused-child-artifacts")
+        artifact = await artifacts.put_bytes(
+            TINY_PNG_BYTES,
+            filename="invoice.png",
+            content_type="image/png",
+            scope=ArtifactScope.ENVIRONMENT,
+            environment_name="local",
+        )
+        opening = _Provider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="spawn", name="subagent", arguments={"agent": "child", "task": "inspect"}
+                    ),
+                    ModelStreamEvent.completed(),
+                ],
+                [
+                    ModelStreamEvent.tool_call(
+                        id="ask", name="ask_user", arguments={"question": "Continue?"}
+                    ),
+                    ModelStreamEvent.completed(),
+                ],
+            ]
+        )
+
+        def build(provider, *, changed=False):
+            tool = AttachmentTool(artifact.id, artifact.size_bytes)
+            tool.spec = tool.spec.model_copy(
+                update={"execution_profile_identity": _identity("paused-attachment")}
+            )
+            app = _app(sessions, provider, child_tools=[tool, UserInputTool()])
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="local",
+                        execution_profile_identity=_identity(
+                            "changed-env" if changed else "paused-env"
+                        ),
+                    ),
+                    artifact_store=LocalArtifactStore(
+                        tmp_path / "artifacts", store_id="paused-child-artifacts"
+                    ),
+                ),
+                default=True,
+            )
+            return app
+
+        try:
+            app = build(opening)
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id="parent",
+                        agent_name="parent",
+                        messages=[Message.text("user", "go")],
+                    )
+                )
+            ]
+            child = (
+                await sessions.list_sessions(SessionQuery(parent_session_id="parent"))
+            ).sessions[0]
+            pending = next(
+                event
+                for event in await sessions.load_events(child.id)
+                if event.type == "session.awaiting_user_input"
+            )
+            response = UserInputResponse(
+                session_id=child.id, input_id=pending.payload["input_id"], answer="yes"
+            )
+            assert await app.drain_background_interruptions(timeout_s=10)
+            if backend == "sqlite":
+                await sessions.close()
+                sessions = SQLiteSessionStore(database)
+            checkpoint = await sessions.load_checkpoint(child.id)
+            transcript = await sessions.load_transcript(child.id)
+            rejected_provider = _Provider([])
+            with pytest.raises(ExecutionProfileMismatchError):
+                _ = [
+                    event
+                    async for event in build(rejected_provider, changed=True).resolve_user_input(
+                        response
+                    )
+                ]
+            assert rejected_provider.requests == []
+            assert await sessions.load_checkpoint(child.id) == checkpoint
+            assert await sessions.load_transcript(child.id) == transcript
+            provider = _Provider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="attach", name="attach_file", arguments={}),
+                        ModelStreamEvent.completed(),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("image reviewed 雪"),
+                        ModelStreamEvent.completed(),
+                    ],
+                    [ModelStreamEvent.text_delta("parent complete"), ModelStreamEvent.completed()],
+                ]
+            )
+            app = build(provider)
+            _ = [event async for event in app.resolve_user_input(response)]
+            assert await app.drain_background_interruptions(timeout_s=10)
+            child_results = [
+                part
+                for message in await sessions.load_transcript(child.id)
+                for part in message.content
+                if isinstance(part, ToolResultPart)
+            ]
+            attached = [part for part in child_results if part.artifacts]
+            assert len(attached) == 1 and attached[0].artifacts[0]["artifact_id"] == artifact.id
+            _assert_child_attachment(provider.requests[1], artifact.id)
+            parent_results = [
+                part
+                for message in await sessions.load_transcript("parent")
+                for part in message.content
+                if isinstance(part, ToolResultPart)
+            ]
+            assert len(parent_results) == 1 and not parent_results[0].artifacts
+            assert not provider.requests[-1].options.get("cayu_file_attachments")
+            assert len(provider.requests) == 3
+        finally:
+            if backend == "sqlite":
                 await sessions.close()
 
     asyncio.run(scenario())

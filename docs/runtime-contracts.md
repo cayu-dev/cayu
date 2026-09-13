@@ -3918,6 +3918,77 @@ event; the parent receives only a bounded `ToolResult` containing the child sess
 status, and model-facing result. `SubagentSpec.result_max_chars` caps the child
 text copied into the parent transcript.
 
+An approval or user-input pause is not a terminal foreground child result.
+The parent persists `waiting_on_child_action` against the original tool execution
+and interaction, releases its run ownership, and may end the original stream.
+The child remains the sole owner of the action. Resolve approval with
+`CayuApp.resolve_tool_approval` or input with `CayuApp.resolve_user_input`, using
+the child's session and action identities. Denial feeds the normal denied-tool
+result back to the child; the parent still waits for the child's eventual outcome.
+Resolution does not grant the parent additional tools or replace either
+invocation's execution profile.
+
+Pending-action inspection of the parent returns `kind="delegated_action"` with
+only the child session, action kind, action identity, and wait status. It does not
+create a second resolvable action or copy the child's question, arguments, or
+answer. Repeated child pauses revise that reference through
+`session.delegated_action.updated`, a non-terminal discovery event. The parent's
+original `session.interrupted` remains the sole terminal event for its paused
+run; discovery updates do not fabricate a new parent interaction.
+
+Sequential foreground delegation can nest: when A calls B and B waits on C,
+A retains a wait on B rather than projecting B's pause as an error result.
+A's reference has `action_kind="delegated_action"`; its action identity names
+B's original delegated execution, not C's approval/input. Follow each immediate
+child reference to discover the human action's sole owner. Terminal delivery
+continues each original parent call once, from the leaf upward. A stopped ancestor
+remains stopped even if its descendants subsequently complete.
+
+Delegation may also begin while an already accepted approval or user-input
+resolution is executing its tool round. If that child pauses, the parent exposes
+the delegated action rather than asking for the accepted decision or answer
+again. The original gate remains internal closure evidence until its round is
+complete. Child terminal delivery returns to that resolution owner, preserving
+the original request digests and redacted continuation metadata; ordinary
+session resume does not bypass an unresolved gate. Gate closure atomically
+retains the parent's remaining continuation so process loss after closure does
+not require another resolution or replay the child.
+
+Successive non-parallel delegations in one accepted round transfer the wait only
+after the preceding call has a durable terminal effect. Its terminal evidence
+remains available for duplicate delivery and recovery. Request-scoped loop-policy
+objects remain owned across both ordinary foreground waits and accepted
+resolution waits, bound to the original session incarnation, interaction, and
+execution profile. Automatic continuation, including recovery of an attached
+child result, still validates their original execution identity. Terminal
+interaction completion or stop releases the live objects. A serialized
+request or identity digest cannot reconstruct executable policy objects. If that
+live owner is unavailable after process loss, continuation refuses rather than
+dropping the policies; applications needing restart-independent behavior should
+use registered application/agent policies.
+An exact public resolution retry can explicitly supply application-versioned
+request policies matching the accepted execution profile, restoring their live
+ownership before retrying durable child-terminal delivery. This does not select
+the child outcome or permit a changed policy identity; terminal selection remains
+owned by authenticated delivery.
+The same restoration is available after gate closure when its exact receipt
+authenticates an unfinished parent continuation. It validates the original
+resolution controls and execution profile without reopening the gate, selecting
+another outcome, or dispatching work. Completed or stopped interactions retain
+receipt-only replay and do not acquire policy ownership.
+Accepted gate projections are immutable per resolution digest. An authenticated
+manual input-recovery claim retains a separate projection with the same original
+answer identity; it does not overwrite the answer's record. If subsequent
+delegation pauses, child delivery preserves that recovery stage and its exact
+closure digest without asking for another answer or repeating the recovered tool.
+
+Child terminal-event delivery automatically makes the exact parent continuation
+eligible through durable, fenced state. Retrying delivery after a lost
+acknowledgement does not append another parent tool result. A stopped parent
+cannot be revived by late child delivery. Cancelling a delivery caller does not
+prove an already-dispatched store write stopped: the runtime retains its cleanup
+owner until settlement, and `drain_background_interruptions` drains that work.
+
 Foreground recovery does not restart the child. When a parent loses its process
 before recording the tool outcome, pending-round recovery resolves the original
 child using the complete parent-scoped tool-execution identity (including the
@@ -3943,11 +4014,24 @@ model-completion fence still requires an explicit operator settlement (for
 example, a `MODEL_MARK_INTERRUPTED` decision from the registered recovery plan);
 foreground recovery does not infer that a killed process stopped a remote call.
 Stored nonterminal status alone does not prove that a worker is alive.
+After a child approval or user-input close commits, its durable continuation
+retains the completed round, original execution limits, and the accepted
+resolution request metadata (under the normal durable redaction rules). The
+close receipt binds the complete continuation; recovery rejects changed
+continuation content rather than substituting pre-pause metadata. The marker
+uses the child-owned closed action identity independently of the parent's
+discovery reference, which may still name an earlier pause. Closing a child action
+does not refresh or revive a stopped parent. Recovery planning
+only inspects this evidence. Admitted recovery validates the close receipt and
+claims the child epoch atomically, then continues from the committed transcript
+without rerunning the closed tools. The marker survives process loss before the
+next model dispatch; later durable model work takes precedence over that marker
+and remains subject to the normal model-completion recovery rules.
 General interruption evidence contains child
-identities and recovery reasons, not the child's assistant answer. Foreground
-execution is still process-bound: this reconciliation capability restores a
-durable outcome, not ongoing execution, scheduling, or automatic replay after
-process loss. Task-backed execution remains the separate durable mode below.
+identities and recovery reasons, not the child's assistant answer. Active
+foreground execution remains process-bound; a durable human-action wait does not
+keep that process alive or authorize replay of uncertain child work after process
+loss. Task-backed execution remains the separate durable mode below.
 
 `SubagentExecutionMode.BACKGROUND`
 subagents return after the child emits its first runtime event, so the parent receives the child session id

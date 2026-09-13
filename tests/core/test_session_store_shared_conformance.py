@@ -8645,15 +8645,16 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
             )
 
             owner_started = asyncio.Event()
-            original_terminal_stream = app._session_engine._emit_terminal_event_with_hooks
+            original_terminal_preparation = (
+                app._session_engine._prepare_terminal_event_for_atomic_transition
+            )
 
             async def hold_owner_before_terminal_event(*args, **kwargs):
                 owner_started.set()
                 await owner_release.wait()
-                async for event in original_terminal_stream(*args, **kwargs):
-                    yield event
+                return await original_terminal_preparation(*args, **kwargs)
 
-            app._session_engine._emit_terminal_event_with_hooks = (  # type: ignore[method-assign]
+            app._session_engine._prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
                 hold_owner_before_terminal_event
             )
             request = InterruptSessionRequest(
@@ -8781,8 +8782,8 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
 @pytest.mark.parametrize(
     "loss_boundary",
     [
-        pytest.param("terminal-status", id="after-terminal-status"),
-        pytest.param("terminal-event", id="after-terminal-event"),
+        pytest.param("before-publication", id="before-publication"),
+        pytest.param("after-publication", id="after-publication"),
     ],
 )
 @pytest.mark.parametrize(
@@ -8827,31 +8828,26 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
             )
 
             process_loss_injected = False
-            if loss_boundary == "terminal-status":
+            if loss_boundary == "before-publication":
                 engine = app._session_engine
-                original_claimed_status_transition = (
-                    engine._transition_status_under_terminal_finalization_claim
-                )
+                original_terminal_preparation = engine._prepare_terminal_event_for_atomic_transition
 
-                async def commit_terminal_status_then_lose_process(*args, **kwargs):
+                async def prepare_terminal_then_lose_process(*args, **kwargs):
                     nonlocal process_loss_injected
-                    transitioned = await original_claimed_status_transition(*args, **kwargs)
-                    if (
-                        kwargs.get("to_status") is SessionStatus.INTERRUPTED
-                        and not process_loss_injected
-                    ):
+                    transitioned = await original_terminal_preparation(*args, **kwargs)
+                    if not process_loss_injected:
                         process_loss_injected = True
                         raise _SimulatedProcessLoss(
-                            "process stopped after terminal status committed"
+                            "process stopped after terminal preparation before publication"
                         )
                     return transitioned
 
-                engine._transition_status_under_terminal_finalization_claim = (  # type: ignore[method-assign]
-                    commit_terminal_status_then_lose_process
+                engine._prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
+                    prepare_terminal_then_lose_process
                 )
             else:
                 engine = app._session_engine
-                original_publish_terminal = engine._publish_terminal_event_under_finalization_claim
+                original_publish_terminal = engine._publish_interaction_transition
 
                 async def commit_terminal_event_then_lose_process(*args, **kwargs):
                     nonlocal process_loss_injected
@@ -8863,7 +8859,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                         )
                     return published
 
-                engine._publish_terminal_event_under_finalization_claim = (  # type: ignore[method-assign]
+                engine._publish_interaction_transition = (  # type: ignore[method-assign]
                     commit_terminal_event_then_lose_process
                 )
 
@@ -8881,7 +8877,11 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
             interrupted = await store.load(session_id)
             checkpoint = await store.load_checkpoint(session_id)
             assert interrupted is not None
-            assert interrupted.status is SessionStatus.INTERRUPTED
+            assert interrupted.status is (
+                SessionStatus.INTERRUPTING
+                if loss_boundary == "before-publication"
+                else SessionStatus.INTERRUPTED
+            )
             assert checkpoint is not None
             assert "pending_user_input" not in checkpoint
             assert "user_input_resolution_intent" not in checkpoint
@@ -8895,8 +8895,8 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 )
                 if record.event.payload.get("interruption_type") == "operator_requested"
             ]
-            assert len(before_replay) == (0 if loss_boundary == "terminal-status" else 1)
-            if loss_boundary == "terminal-status":
+            assert len(before_replay) == (0 if loss_boundary == "before-publication" else 1)
+            if loss_boundary == "before-publication":
                 assert (
                     checkpoint["pending_session_interrupt"]["user_input_supersession_intent"][
                         "state"
@@ -8904,20 +8904,21 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                     == "active"
                 )
             else:
-                assert "pending_session_interrupt" not in checkpoint
+                assert "pending_session_interrupt" in checkpoint
+                assert settled_invocation_terminal_decision_from_checkpoint(checkpoint) is not None
 
-            if loss_boundary == "terminal-status":
-                engine._transition_status_under_terminal_finalization_claim = (  # type: ignore[method-assign]
-                    original_claimed_status_transition
+            if loss_boundary == "before-publication":
+                engine._prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
+                    original_terminal_preparation
                 )
             else:
-                engine._publish_terminal_event_under_finalization_claim = (  # type: ignore[method-assign]
+                engine._publish_interaction_transition = (  # type: ignore[method-assign]
                     original_publish_terminal
                 )
             store = await _reopen_store(session_store_case, store)
             supersession = (
                 checkpoint["pending_session_interrupt"]["user_input_supersession_intent"]
-                if loss_boundary == "terminal-status"
+                if loss_boundary == "before-publication"
                 else before_replay[0].event.payload["user_input_supersession_intent"]
             )
             replay_app = CayuApp(
@@ -8925,8 +8926,12 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 enable_logging=False,
                 secret_redactor=SecretRedactor(supersession["input_id"][4:12]),
             )
+            replay_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()]
+            )
 
-            if replay_entrance == "incomplete-recovery" and loss_boundary == "terminal-status":
+            if replay_entrance == "incomplete-recovery" and loss_boundary == "before-publication":
                 original_receipt_loader = store.load_runtime_publication_receipt
 
                 async def hide_open_receipt(*args, **kwargs):
@@ -8953,37 +8958,35 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 assert (
                     retained["pending_session_interrupt"] == checkpoint["pending_session_interrupt"]
                 )
-            if replay_entrance == "interrupt" and loss_boundary == "terminal-status":
+            if replay_entrance == "interrupt" and loss_boundary == "before-publication":
                 peer_store = await _open_peer_store(session_store_case, store)
                 peer_app = CayuApp(
                     session_store=peer_store,
                     enable_logging=False,
                     secret_redactor=SecretRedactor(supersession["input_id"][4:12]),
                 )
+                peer_app.register_provider(_UserInputRecoveryProvider(), default=True)
+                peer_app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()]
+                )
                 repair_clear_started = asyncio.Event()
                 release_repair_clear = asyncio.Event()
                 retry_release = release_repair_clear
-                peer_claim_finished = asyncio.Event()
-                recovery = replay_app._session_engine._recovery_coordinator
-                peer_recovery = peer_app._session_engine._recovery_coordinator
-                original_repair_clear = recovery._clear_repaired_pending_interrupt
-                original_peer_claim = peer_recovery._claim_incomplete_recovery
+                peer_retry_started = asyncio.Event()
+                replay_engine = replay_app._session_engine
+                original_repair_clear = replay_engine._clear_pending_session_interrupt
 
                 async def hold_repair_before_marker_clear(*args, **kwargs):
                     repair_clear_started.set()
                     await release_repair_clear.wait()
                     return await original_repair_clear(*args, **kwargs)
 
-                async def observe_competing_claim(*args, **kwargs):
-                    result = await original_peer_claim(*args, **kwargs)
-                    peer_claim_finished.set()
-                    return result
+                async def run_competing_retry():
+                    peer_retry_started.set()
+                    return await _collect_events(peer_app.interrupt_session(request))
 
-                recovery._clear_repaired_pending_interrupt = (  # type: ignore[method-assign]
+                replay_engine._clear_pending_session_interrupt = (  # type: ignore[method-assign]
                     hold_repair_before_marker_clear
-                )
-                peer_recovery._claim_incomplete_recovery = (  # type: ignore[method-assign]
-                    observe_competing_claim
                 )
                 with session_engine_module.suppress_interruption_cascade():
                     first_retry = asyncio.create_task(
@@ -8996,33 +8999,32 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                         if first_retry.done():
                             await first_retry
                         await asyncio.sleep(0.01)
-                    assert repair_clear_started.is_set(), "terminal repair did not reach cleanup"
-                    second_retry = asyncio.create_task(
-                        _collect_events(peer_app.interrupt_session(request))
+                    assert repair_clear_started.is_set(), (
+                        "terminal repair did not reach cleanup",
+                        [event.type for event in first_retry.result()]
+                        if first_retry.done()
+                        else [frame.f_code.co_name for frame in first_retry.get_stack()],
                     )
+                    second_retry = asyncio.create_task(run_competing_retry())
                     retry_tasks.append(second_retry)
-                    await asyncio.wait_for(peer_claim_finished.wait(), timeout=5)
-                    assert not second_retry.done()
+                    await asyncio.wait_for(peer_retry_started.wait(), timeout=5)
+                    # The event is already committed: a peer may acknowledge
+                    # that exact winner while the first caller clears metadata.
                     release_repair_clear.set()
                     first_replayed, second_replayed = await asyncio.wait_for(
                         asyncio.gather(first_retry, second_retry),
                         timeout=10,
                     )
-                recovery._clear_repaired_pending_interrupt = (  # type: ignore[method-assign]
+                replay_engine._clear_pending_session_interrupt = (  # type: ignore[method-assign]
                     original_repair_clear
-                )
-                peer_recovery._claim_incomplete_recovery = (  # type: ignore[method-assign]
-                    original_peer_claim
                 )
                 assert first_replayed[-1].id == second_replayed[-1].id
                 replayed = first_replayed
-            elif replay_entrance == "incomplete-recovery" and loss_boundary == "terminal-status":
+            elif replay_entrance == "incomplete-recovery" and loss_boundary == "before-publication":
                 recovered = await replay_app.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(session_id=session_id)
                 )
-                assert recovered.actions == (
-                    IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
-                )
+                assert recovered.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
                 replayed = [
                     event
                     for event in recovered.events
@@ -9035,12 +9037,17 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                         IncompleteSessionRecoveryRequest(session_id=session_id)
                     )
                     assert recovered.actions == (
-                        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,
+                        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
                     )
-                    assert all(
-                        event.type is not EventType.SESSION_INTERRUPTED
+                    returned_terminals = [
+                        event
                         for event in recovered.events
-                    )
+                        if event.type is EventType.SESSION_INTERRUPTED
+                    ]
+                    assert len(returned_terminals) == 1
+                    assert (
+                        await _private_event_for_public_event(store, returned_terminals[0])
+                    ).id == before_replay[0].event.id
                 with session_engine_module.suppress_interruption_cascade():
                     replayed = await _collect_events(replay_app.interrupt_session(request))
             assert replayed[-1].type is EventType.SESSION_INTERRUPTED
@@ -10628,9 +10635,11 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("with_diagnostics", [False, True])
 def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_loss(
     session_store_case,
     monkeypatch,
+    with_diagnostics,
 ) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)
@@ -10697,6 +10706,10 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 ):
                     handler_entered.set()
                     await release_handler.wait()
+                if with_diagnostics:
+                    kwargs["interaction_transition_failures"] = (
+                        {"error_type": "RuntimeError", "message": "transition cleanup failed"},
+                    )
                 async for event in original_handler(*args, **kwargs):
                     yield event
 
@@ -10769,18 +10782,56 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 tasks.append(peer)
                 peer_events = await asyncio.wait_for(peer, timeout=10)
                 assert peer_events[-1].type is EventType.SESSION_INTERRUPTED
+                peer_checkpoint = await store.load_checkpoint(session_id)
+                peer_session = await store.load(session_id)
+                peer_records = await store.load_events(session_id)
 
                 release_handler.set()
                 run_outcome, interrupt_events = await asyncio.wait_for(
                     asyncio.gather(running, interrupting, return_exceptions=True),
                     timeout=10,
                 )
-            assert isinstance(run_outcome, BaseException)
+            assert isinstance(run_outcome, BaseException), repr(
+                [(event.id, event.type, event.payload) for event in run_outcome[-2:]]
+            )
             assert isinstance(
                 interrupt_events, recovery_coordinator_module._IncompleteRecoveryClaimLost
             )
+            settled_session = await store.load(session_id)
+            assert peer_session is not None and settled_session is not None
+            # The original execution lease is released when its run unwinds;
+            # that fence increment must be the only session mutation.
+            assert settled_session.run_epoch == peer_session.run_epoch + 1
+            assert settled_session.model_copy(update={"run_epoch": peer_session.run_epoch}) == (
+                peer_session
+            )
+            assert await store.load_events(session_id) == peer_records
             final_checkpoint = await store.load_checkpoint(session_id)
             assert final_checkpoint is not None
+            assert peer_checkpoint is not None
+            assert {
+                key: value
+                for key, value in final_checkpoint.items()
+                if key != "invocation_lifecycle_receipt"
+            } == {
+                key: value
+                for key, value in peer_checkpoint.items()
+                if key != "invocation_lifecycle_receipt"
+            }
+            prior_receipts = peer_checkpoint["invocation_lifecycle_receipt"]["receipts"]
+            final_receipts = final_checkpoint["invocation_lifecycle_receipt"]["receipts"]
+            assert all(receipt in final_receipts for receipt in prior_receipts)
+            [release_receipt] = [
+                receipt for receipt in final_receipts if receipt not in prior_receipts
+            ]
+            assert release_receipt["kind"] == "release"
+            assert release_receipt["session_id"] == session_id
+            assert release_receipt["session_instance_id"] == peer_session.instance_id
+            assert (
+                release_receipt["active_profile"]
+                == peer_checkpoint["active_invocation_execution_profile"]
+            )
+            assert release_receipt["result_session"] == settled_session.model_dump(mode="json")
             assert "pending_session_interrupt" not in final_checkpoint
             assert "incomplete_session_recovery_claim" not in final_checkpoint
             assert (
@@ -21304,6 +21355,133 @@ def test_session_store_conformance_runtime_publication_empty_checkpoint_mutation
             assert replayed.replayed is True
             assert replayed.receipt == published.receipt
             assert await store.load_checkpoint(session_id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_side_effect_deferral_retains_delivery_and_fences_old_claim(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="deferred-child-wakeup",
+                    messages=[Message.text("user", "go")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(type=EventType.SESSION_COMPLETED, session_id=session.id)
+            await store.append_event(session.id, event)
+            previous_claim = None
+            for _ in range(4):
+                claim = await store.claim_persisted_event_side_effect(
+                    session_id=session.id, event_id=event.id
+                )
+                assert claim is not None and claim.attempt == 1
+                if previous_claim is not None:
+                    assert claim.claim_id != previous_claim.claim_id
+                    with pytest.raises(PersistedEventSideEffectClaimLost):
+                        await store.mark_persisted_event_side_effect_delivered(previous_claim)
+                    with pytest.raises(PersistedEventSideEffectClaimLost):
+                        await store.defer_persisted_event_side_effect(previous_claim)
+                deferred = await store.defer_persisted_event_side_effect(claim)
+                assert deferred.status is PersistedEventSideEffectStatus.PENDING
+                assert deferred.attempts == 0
+                assert deferred.claim_id is None
+                assert deferred.lease_expires_at is None
+                previous_claim = claim
+                store = await _reopen_store(session_store_case, store)
+            candidates = await store.list_persisted_event_side_effect_deliveries(
+                claimable_only=True, limit=1
+            )
+            assert len(candidates) == 1 and candidates[0].event_id == event.id
+            claim = await store.claim_persisted_event_side_effect(
+                session_id=session.id, event_id=event.id
+            )
+            assert claim is not None
+            delivered = await store.mark_persisted_event_side_effect_delivered(claim)
+            assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_side_effect_renewal_requires_live_exact_claim(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="renewed-child-wakeup",
+                    messages=[Message.text("user", "go")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(type=EventType.SESSION_COMPLETED, session_id=session.id)
+            await store.append_event(session.id, event)
+            claim = await store.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=event.id,
+                lease_seconds=3,
+            )
+            assert claim is not None
+            renewed = await store.renew_persisted_event_side_effect(claim, lease_seconds=30)
+            assert renewed.claim_id == claim.claim_id
+            assert renewed.attempts == claim.attempt
+            assert renewed.lease_expires_at is not None
+            assert renewed.lease_expires_at > claim.lease_expires_at
+            for invalid in (True, 0, -1, float("nan"), float("inf"), 86_401):
+                with pytest.raises(ValueError, match="lease_seconds"):
+                    await store.renew_persisted_event_side_effect(claim, lease_seconds=invalid)
+            assert (
+                await store.get_persisted_event_side_effect_delivery(
+                    session_id=session.id, event_id=event.id
+                )
+                == renewed
+            )
+            # A shorter renewal cannot shorten an already-owned interval.
+            shorter = await store.renew_persisted_event_side_effect(claim, lease_seconds=1)
+            assert shorter.lease_expires_at == renewed.lease_expires_at
+            store = await _reopen_store(session_store_case, store)
+            await asyncio.sleep(3.1)
+            assert (
+                await store.claim_persisted_event_side_effect(
+                    session_id=session.id, event_id=event.id
+                )
+                is None
+            )
+            await store.defer_persisted_event_side_effect(claim)
+            expired = await store.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=event.id,
+                lease_seconds=0.05,
+            )
+            assert expired is not None
+            await asyncio.sleep(0.1)
+            # Expiry alone revokes renewal; no competing claimant is needed.
+            with pytest.raises(PersistedEventSideEffectClaimLost):
+                await store.renew_persisted_event_side_effect(expired)
+            replacement = await store.claim_persisted_event_side_effect(
+                session_id=session.id, event_id=event.id
+            )
+            assert replacement is not None
+            assert replacement.claim_id not in {claim.claim_id, expired.claim_id}
+            for stale in (claim, expired):
+                with pytest.raises(PersistedEventSideEffectClaimLost):
+                    await store.renew_persisted_event_side_effect(stale)
+            delivered = await store.mark_persisted_event_side_effect_delivered(replacement)
+            assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
+            with pytest.raises(PersistedEventSideEffectClaimLost):
+                await store.renew_persisted_event_side_effect(replacement)
         finally:
             await _close_store(store)
 

@@ -89,7 +89,7 @@ async def run_coding_product(config: dict[str, Any]) -> dict[str, Any]:
     if not config.get("managed_task", False):
         return await _run_coding_product(config)
     task_store = _task_store(BackendConfig.from_json(config["backend"]))
-    task_id = "coding-process-task"
+    task_id = config["task_id"]
     task_type = "coding-product-recovery"
     try:
         if config["action"] == "start":

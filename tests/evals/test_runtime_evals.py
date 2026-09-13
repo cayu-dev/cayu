@@ -4900,18 +4900,23 @@ def test_fresh_eval_deadline_abandons_and_observes_opaque_memory_read(blocked_re
             run_eval_suite(
                 app,
                 EvalSuite(id="opaque-memory-read", cases=[_case("deadline")]),
-                case_timeout_seconds=2.0,
+                # The deadline must land in the opaque read, not in runtime
+                # setup or the preceding evidence reads on a loaded worker.
+                case_timeout_seconds=30.0,
             )
         )
         try:
-            result = await asyncio.wait_for(task, timeout=5)
-            assert store.read_started.is_set()
+            await asyncio.wait_for(store.read_started.wait(), timeout=20)
+            result = await asyncio.wait_for(task, timeout=45)
             assert not store.read_cancelled.is_set()
             assert not store.read_finished.is_set()
             assert task.cancelling() == 0
             assert task.cancelled() is False
         finally:
             store.release_read.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
             if store.read_started.is_set():
                 await asyncio.wait_for(store.read_finished.wait(), timeout=1)
             await asyncio.sleep(0)

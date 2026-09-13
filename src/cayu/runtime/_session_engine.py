@@ -200,6 +200,18 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._foreground_child_wait import (
+    FOREGROUND_CHILD_TERMINAL_KEY,
+    FOREGROUND_CHILD_WAIT_KEY,
+    FOREGROUND_PARENT_CONTINUATION_KEY,
+    ForegroundChildActionRequired,
+    ForegroundChildResumeRequest,
+    ForegroundChildTerminal,
+    ForegroundChildWait,
+    ForegroundParentContinuation,
+    event_with_foreground_child_wait_authority,
+    foreground_child_state_from_checkpoint,
+)
 from cayu.runtime._foreground_subagent_recovery import ForegroundSubagentRecoveryRequired
 from cayu.runtime._fork_source_snapshot import (
     fork_source_checkpoint_sha256,
@@ -655,6 +667,7 @@ from cayu.runtime.sessions import (
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _invocation_lifecycle_authority_mutation_scope,
+    _invocation_lifecycle_authority_read_scope,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
     _mark_session_invocation_terminal_event,
@@ -952,6 +965,7 @@ def _validate_fork_source_checkpoint_state(
         redactor=redactor,
         consume_on_rejection=True,
         current_run_epoch=current_source.run_epoch,
+        runtime_session=current_source,
     )
     if pending_user_input is not None:
         raise RuntimeError(
@@ -2772,6 +2786,7 @@ def _reject_unresumable_session_checkpoint(
         redactor=redactor,
         consume_on_rejection=True,
         current_run_epoch=session.run_epoch,
+        runtime_session=session,
     )
     if pending_user_input is not None:
         raise RuntimeError("Session is awaiting user input.")
@@ -2780,6 +2795,7 @@ def _reject_unresumable_session_checkpoint(
             checkpoint,
             redactor=redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         is not None
     ):
@@ -3971,7 +3987,10 @@ def _checkpoint_with_pending_session_interrupt(
     cascade_created_at: datetime | None = None,
     expected_interrupted_user_input: PendingUserInput | None = None,
     expected_ambiguous_user_input: AmbiguousPendingUserInput | None = None,
+    expected_foreground_child_wait: ForegroundChildWait | None = None,
+    expected_interrupted_approval: PendingToolApproval | None = None,
     terminal_decision: InvocationTerminalDecision | None = None,
+    redactor: SecretRedactor | None = None,
 ):
     copied_payload = copy_json_value(payload, "interrupt_payload")
     if (
@@ -3997,7 +4016,77 @@ def _checkpoint_with_pending_session_interrupt(
         copied_checkpoint = (
             {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
         )
+        foreground_wait, _ = foreground_child_state_from_checkpoint(copied_checkpoint)
+        if (
+            foreground_wait is not None
+            and transition_payload.get("interruption_type") == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+        ):
+            intent = foreground_wait.parent_effect
+            if intent.session_id != session.id or intent.session_instance_id != session.instance_id:
+                raise SessionRunFenced(
+                    "Operator interruption has foreign foreground wait evidence."
+                )
+            # Index the stop against the same original call as the human pause,
+            # so bounded pending-action queries cannot keep showing that pause.
+            transition_payload.update(
+                model_step_id=intent.model_step_id,
+                model_attempt_id=intent.model_attempt_id,
+                tool_round_id=intent.tool_round_id,
+                tool_call_id=intent.tool_call_id,
+            )
+            if terminal_decision is not None and any(
+                terminal_decision.terminal_payload.get(key) != transition_payload[key]
+                for key in ("model_step_id", "model_attempt_id", "tool_round_id", "tool_call_id")
+            ):
+                raise SessionRunFenced("Foreground stop evidence changed after terminal election.")
+        if expected_foreground_child_wait is not None:
+            current_wait, _ = foreground_child_state_from_checkpoint(copied_checkpoint)
+            if (
+                current_wait is None
+                or current_wait != expected_foreground_child_wait
+                or current_wait.parent_effect.session_id != session.id
+                or current_wait.parent_effect.session_instance_id != session.instance_id
+                or terminal_decision is None
+                or terminal_decision.interaction_id != current_wait.parent_effect.interaction_id
+            ):
+                raise SessionRunFenced("Foreground parent interruption lost its exact wait.")
         active_profile = active_invocation_execution_profile_from_checkpoint(copied_checkpoint)
+        if expected_interrupted_approval is not None:
+            if redactor is None:
+                raise TypeError("Approval stop requires its runtime redactor.")
+            current_approval = approval_support.pending_approval_from_checkpoint(copied_checkpoint)
+            approval_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                copied_checkpoint
+            )
+            if (
+                current_approval != expected_interrupted_approval
+                or approval_round is None
+                or approval_round.assistant_message_state != "quarantined"
+                or terminal_decision is None
+                or approval_support.approval_resolution_intent_from_checkpoint(copied_checkpoint)
+                is not None
+            ):
+                raise SessionRunFenced("Approval stop lost its exact unclaimed pause.")
+            close_intent = approval_support.approval_interrupt_close_intent(
+                expected_interrupted_approval
+            )
+            if (
+                terminal_decision.terminal_payload.get(
+                    approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY
+                )
+                != close_intent
+            ):
+                raise SessionRunFenced("Approval stop lost its exact terminal close intent.")
+            # This unclaimed gate has never exposed its assistant/tool round.
+            # Retire both together; retaining the planned round after closing
+            # the interaction would incorrectly request new execution authority.
+            copied_checkpoint = approval_support.checkpoint_without_exact_pending_approval_round(
+                copied_checkpoint,
+                approval=expected_interrupted_approval,
+                redactor=redactor,
+                runtime_session=session,
+            )
+            transition_payload[approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY] = close_intent
         existing_terminal_decision = invocation_terminal_decision_from_checkpoint(copied_checkpoint)
         if active_profile is not None:
             if not active_invocation_execution_profile_matches_session_epoch(
@@ -4046,6 +4135,7 @@ def _checkpoint_with_pending_session_interrupt(
             pending_user_input, resolution_intent = user_input_lifecycle_authority_from_checkpoint(
                 copied_checkpoint,
                 current_run_epoch=session.run_epoch,
+                runtime_session=session,
             )
         else:
             pending_user_input = None
@@ -4070,8 +4160,25 @@ def _checkpoint_with_pending_session_interrupt(
             raise SessionRuntimePublicationConflict(
                 "Interrupted user-input pause changed before supersession."
             )
+        delegated_input_stop = (
+            expected_foreground_child_wait is not None
+            and terminal_decision is not None
+            and pending_user_input is not None
+            and resolution_intent is not None
+            and resolution_intent.execution_state == "executing"
+            and pending_user_input.session_id == session.id
+            and pending_user_input.session_instance_id == session.instance_id
+            and pending_user_input.input_id == expected_foreground_child_wait.parent_effect.pause_id
+            and pending_user_input.source_interaction_id == terminal_decision.interaction_id
+            and pending_user_input.execution_profile_fingerprint
+            == expected_foreground_child_wait.parent_effect.execution_profile_fingerprint
+        )
+        # The exact wait was compared above under this transaction. Stopping
+        # that delegated interaction retains its already accepted answer; it is
+        # not authority to supersede an executing user-input resolution.
         if (
             pending_user_input is not None
+            and not delegated_input_stop
             and transition_payload.get("interruption_type") == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
         ):
             stored_profile = execution_profile_from_session_metadata(session.metadata)
@@ -4154,7 +4261,10 @@ def _store_time_checkpoint_with_claimed_pending_session_interrupt(
     cascade_created_at: datetime | None = None,
     expected_interrupted_user_input: PendingUserInput | None = None,
     expected_ambiguous_user_input: AmbiguousPendingUserInput | None = None,
+    expected_foreground_child_wait: ForegroundChildWait | None = None,
+    expected_interrupted_approval: PendingToolApproval | None = None,
     terminal_decision: InvocationTerminalDecision | None = None,
+    redactor: SecretRedactor | None = None,
 ):
     """Install a supersession claim using the transition transaction's clock."""
 
@@ -4164,7 +4274,10 @@ def _store_time_checkpoint_with_claimed_pending_session_interrupt(
         cascade_created_at=cascade_created_at,
         expected_interrupted_user_input=expected_interrupted_user_input,
         expected_ambiguous_user_input=expected_ambiguous_user_input,
+        expected_foreground_child_wait=expected_foreground_child_wait,
+        expected_interrupted_approval=expected_interrupted_approval,
         terminal_decision=terminal_decision,
+        redactor=redactor,
     )
 
     def transform(
@@ -4863,6 +4976,13 @@ def _pending_interaction_action_kind(
     checkpoint: dict[str, Any] | None, *, run_epoch: int
 ) -> str | None:
     """Use the same durable gate classification for pause and terminal election."""
+
+    from cayu.runtime._foreground_child_wait import (
+        foreground_child_state_from_checkpoint,
+    )
+
+    if foreground_child_state_from_checkpoint(checkpoint)[0] is not None:
+        return "waiting_on_child_action"
 
     if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
         return "tool_approval"
@@ -8834,7 +8954,7 @@ class SessionEngine:
             return transitioned, None, True
 
         pending_action_kind: str | None = None
-        if to_status is not SessionStatus.COMPLETED:
+        if to_status is not SessionStatus.COMPLETED and terminal_decision is None:
             checkpoint = await self.session_store.load_checkpoint(session.id)
             pending_action_kind = _pending_interaction_action_kind(
                 checkpoint, run_epoch=session.run_epoch
@@ -9158,6 +9278,9 @@ class SessionEngine:
         )
         if result.event.type in INTERACTION_TERMINAL_EVENT_TYPES:
             _close_session_interaction(session.id)
+            self._recovery_coordinator.release_foreground_gate_interaction(
+                result.session, result.event.interaction_id
+            )
         if pending_cancellation is not None:
             # The atomic store publication already owns a durable side-effect
             # handoff. Redeliver cancellation at this settled boundary instead
@@ -13334,6 +13457,194 @@ class SessionEngine:
 
         if propagated_cancellation_group is not None:
             raise propagated_cancellation_group
+
+    async def settle_foreground_child_terminal(
+        self,
+        wait: ForegroundChildWait,
+        event: Event,
+        *,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> None:
+        from cayu.runtime._foreground_child_terminal_settlement import (
+            settle_foreground_child_terminal,
+        )
+
+        tool = self._get_registered_agent(wait.parent_effect.agent_name).tools.get(
+            wait.parent_effect.tool_name
+        )
+        if tool is None or tool.child_session_recovery is None:
+            raise SessionRunFenced(
+                "Foreground terminal cleanup lacks its registered child matcher."
+            )
+        await settle_foreground_child_terminal(
+            wait,
+            event,
+            store=self.session_store,
+            matcher=tool.child_session_recovery,
+            recover=self._recovery_coordinator.recover_incomplete_session,
+            before_mutation=before_mutation,
+        )
+
+    async def refresh_foreground_child_action(
+        self,
+        wait: ForegroundChildWait,
+        event: Event,
+        *,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> None:
+        from cayu.runtime._foreground_child_action_refresh import refresh_foreground_child_action
+
+        agent = self._get_registered_agent(wait.parent_effect.agent_name)
+        tool = agent.tools.get(wait.parent_effect.tool_name)
+        if tool is None or tool.child_session_recovery is None:
+            raise SessionRunFenced("Foreground action refresh lacks its registered child matcher.")
+        await refresh_foreground_child_action(
+            wait,
+            event,
+            store=self.session_store,
+            writer=self._event_writer,
+            matcher=tool.child_session_recovery,
+            before_mutation=before_mutation,
+        )
+
+    async def resume_foreground_child(
+        self,
+        terminal: ForegroundChildTerminal,
+        *,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Continue the original pending round using its persisted run configuration."""
+        await before_mutation()
+        wait = terminal.wait
+        from cayu.runtime._foreground_child_continuation import (
+            load_attached_foreground_continuation,
+        )
+
+        parent = await self.session_store.load(wait.parent_effect.session_id)
+        if parent is None:
+            raise SessionRunFenced("Foreground continuation parent disappeared.")
+        if await self._recovery_coordinator.resume_foreground_gate(
+            parent, terminal, before_mutation=before_mutation
+        ):
+            return
+        attached = await load_attached_foreground_continuation(parent, store=self.session_store)
+        if attached is not None and attached.terminal == terminal:
+            retained_profile = active_invocation_execution_profile_from_checkpoint(
+                await self.session_store.load_checkpoint(parent.id)
+            )
+            if (
+                retained_profile is None
+                or retained_profile.interaction_id != wait.parent_effect.interaction_id
+                or retained_profile.profile.fingerprint
+                != wait.parent_effect.execution_profile_fingerprint
+            ):
+                raise SessionRunFenced(
+                    "Attached foreground continuation lost its original profile."
+                )
+
+            async def require_attached_ownership() -> None:
+                await before_mutation()
+                current = await self.session_store.load(parent.id)
+                if (
+                    current is None
+                    or await load_attached_foreground_continuation(
+                        current, store=self.session_store
+                    )
+                    != attached
+                ):
+                    raise SessionRunFenced(
+                        "Attached foreground continuation changed during recovery."
+                    )
+
+            if parent.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+                _deactivate_session_interaction(parent.id)
+                _deactivate_session_run_fence(parent.id)
+                try:
+                    await self._recovery_coordinator.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(
+                            session_id=parent.id,
+                            inactive_for_seconds=0,
+                            reason="Recovering the owned foreground child continuation.",
+                        ),
+                        before_mutation=require_attached_ownership,
+                        preserve_interaction_id=wait.parent_effect.interaction_id,
+                    )
+                finally:
+                    _deactivate_session_interaction(parent.id)
+                    _deactivate_session_run_fence(parent.id)
+            stream = self._resume_session(
+                request=attached.request.model_copy(
+                    update={
+                        "loop_policies": await self._recovery_coordinator.foreground_gate_continuation_policies(
+                            parent, attached
+                        ),
+                    }
+                ),
+                task_id=attached.task_id,
+                start_event_payload_extra={},
+                start_task_on_enter=False,
+                required_foreground_wait=wait,
+                required_foreground_terminal=terminal,
+                required_foreground_continuation=attached,
+                foreground_before_mutation=require_attached_ownership,
+            )
+            async with _close_delegated_event_stream(stream) as owned_stream:
+                async for _ in owned_stream:
+                    pass
+            self._recovery_coordinator.release_foreground_gate_continuation_policies(
+                parent, attached
+            )
+            return
+        checkpoint = await self.session_store.load_checkpoint(wait.parent_effect.session_id)
+        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending is None or pending.max_steps is None:
+            raise RuntimeError("Foreground continuation lacks its original pending round.")
+        if pending.tool_round_id != wait.parent_effect.tool_round_id:
+            raise RuntimeError("Foreground continuation conflicts with its original tool round.")
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            active_profile is None
+            or active_profile.interaction_id != wait.parent_effect.interaction_id
+            or (
+                pending.interaction_id is not None
+                and pending.interaction_id != active_profile.interaction_id
+            )
+        ):
+            raise RuntimeError("Foreground continuation conflicts with its original interaction.")
+        if (
+            active_profile.profile.fingerprint != wait.parent_effect.execution_profile_fingerprint
+            or (
+                pending.execution_profile_fingerprint is not None
+                and pending.execution_profile_fingerprint != active_profile.profile.fingerprint
+            )
+        ):
+            raise RuntimeError("Foreground continuation conflicts with its original profile.")
+        if pending.limits is None or pending.budget_limits is None:
+            raise RuntimeError("Foreground continuation lacks its original limits.")
+        request = ForegroundChildResumeRequest(
+            session_id=wait.parent_effect.session_id,
+            loop_policies=self._recovery_coordinator.foreground_wait_policies(parent, wait),
+            messages=[],
+            metadata=pending.request_metadata,
+            max_steps=pending.max_steps,
+            limits=pending.limits,
+            budget_limits=pending.budget_limits,
+            retry_policy=pending.retry_policy,
+            structured_output=pending.structured_output,
+            thinking=pending.thinking,
+        )
+        stream = self._resume_session(
+            request=request,
+            task_id=pending.task_id,
+            start_event_payload_extra={},
+            start_task_on_enter=False,
+            required_foreground_wait=wait,
+            required_foreground_terminal=terminal,
+            foreground_before_mutation=before_mutation,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for _ in owned_stream:
+                pass
 
     async def resume(
         self,
@@ -17647,8 +17958,43 @@ class SessionEngine:
             )
         interrupted_pending_user_input = None
         interrupted_ambiguous_user_input = None
+        interrupted_foreground_wait = None
+        interrupted_pending_approval = None
+        accepted_delegated_gate_kind: str | None = None
         if loaded_session.status == SessionStatus.INTERRUPTED:
             interrupted_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+            interrupted_pending_approval = approval_support.pending_approval_from_checkpoint(
+                interrupted_checkpoint
+            )
+            interrupted_foreground_wait, _ = foreground_child_state_from_checkpoint(
+                interrupted_checkpoint
+            )
+            if interrupted_foreground_wait is not None:
+                from cayu.runtime._foreground_gate_continuation import load_gate_request
+
+                accepted_gate = await load_gate_request(
+                    self.session_store,
+                    parent=loaded_session,
+                    wait=interrupted_foreground_wait,
+                )
+                if accepted_gate is not None:
+                    accepted_delegated_gate_kind = accepted_gate["kind"]
+                if accepted_delegated_gate_kind == "approval":
+                    # This is an accepted execution waiting on a child, not an
+                    # unclaimed approval that can be closed as a denied call.
+                    # The exact wait/interaction stop fences late completion;
+                    # retain the accepted gate as non-executable closure evidence.
+                    interrupted_pending_approval = None
+                closed_interaction = await self.session_store.query_events(
+                    EventQuery(
+                        session_id=loaded_session.id,
+                        interaction_id=interrupted_foreground_wait.parent_effect.interaction_id,
+                        event_types=tuple(INTERACTION_TERMINAL_EVENT_TYPES),
+                        limit=1,
+                    )
+                )
+                if closed_interaction:
+                    interrupted_foreground_wait = None
             interrupted_ambiguous_user_input = ambiguous_pending_user_input_from_checkpoint(
                 interrupted_checkpoint
             )
@@ -17659,8 +18005,13 @@ class SessionEngine:
                         redactor=self._secret_redactor,
                         consume_on_rejection=True,
                         current_run_epoch=loaded_session.run_epoch,
+                        runtime_session=loaded_session,
                     )
                 )
+            if accepted_delegated_gate_kind == "input":
+                # The answer is already accepted and executing. Stop its exact
+                # delegated interaction; do not supersede or re-answer the gate.
+                interrupted_pending_user_input = None
             if interrupted_pending_user_input is not None:
                 await self._recovery_coordinator._require_exact_user_input_open_receipt(
                     session=loaded_session,
@@ -17707,6 +18058,8 @@ class SessionEngine:
             loaded_session.status == SessionStatus.INTERRUPTED
             and interrupted_pending_user_input is None
             and interrupted_ambiguous_user_input is None
+            and interrupted_foreground_wait is None
+            and interrupted_pending_approval is None
         ):
             existing_interrupt_event = (
                 await self._session_control.wait_for_active_interrupted_event(loaded_session.id)
@@ -17821,6 +18174,8 @@ class SessionEngine:
             if (
                 interrupted_pending_user_input is not None
                 or interrupted_ambiguous_user_input is not None
+                or interrupted_foreground_wait is not None
+                or interrupted_pending_approval is not None
             )
             else _INTERRUPTIBLE_SESSION_STATUSES
         )
@@ -17888,12 +18243,78 @@ class SessionEngine:
             InvocationTerminalDecision | None,
             str | None,
         ]:
-            if (
-                not terminal_interaction_publication_supported
-                or loaded_session.status is not SessionStatus.RUNNING
+            if not terminal_interaction_publication_supported or (
+                loaded_session.status is not SessionStatus.RUNNING
+                and interrupted_foreground_wait is None
+                and interrupted_pending_user_input is None
+                and interrupted_pending_approval is None
             ):
                 return None, None
             interrupt_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+            if invocation_terminal_decision_from_checkpoint(interrupt_checkpoint) is None:
+                active_model = await self._recovery_coordinator.load_model_completion_boundary(
+                    loaded_session
+                )
+                if active_model is not None and (
+                    await self._recovery_coordinator.has_recoverable_provider_operation(
+                        active_model.stage
+                    )
+                ):
+                    return None, None
+            if interrupted_pending_approval is not None:
+                if (
+                    approval_support.pending_approval_from_checkpoint(interrupt_checkpoint)
+                    != interrupted_pending_approval
+                    or approval_support.approval_resolution_intent_from_checkpoint(
+                        interrupt_checkpoint
+                    )
+                    is not None
+                ):
+                    raise SessionRunFenced("Approval stop lost its exact unclaimed pause.")
+                interrupt_payload[approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY] = (
+                    approval_support.approval_interrupt_close_intent(interrupted_pending_approval)
+                )
+            if interrupted_pending_user_input is not None:
+                decision_input, decision_resolution = (
+                    user_input_lifecycle_authority_from_checkpoint(
+                        interrupt_checkpoint, current_run_epoch=loaded_session.run_epoch
+                    )
+                )
+                if decision_input is None or decision_input != interrupted_pending_user_input:
+                    raise SessionRunFenced("User-input stop lost its exact pending action.")
+                interrupt_payload[USER_INPUT_SUPERSESSION_INTENT_KEY] = (
+                    user_input_supersession_intent_for(
+                        decision_input, resolution_intent=decision_resolution
+                    ).model_dump(mode="json", exclude_none=True)
+                )
+            decision_wait, _ = foreground_child_state_from_checkpoint(interrupt_checkpoint)
+            if (
+                decision_wait is None
+                and interrupted_pending_approval is None
+                and interrupted_pending_user_input is None
+                and tool_round_recovery.pending_tool_round_from_checkpoint(interrupt_checkpoint)
+                is not None
+                and invocation_terminal_decision_from_checkpoint(interrupt_checkpoint) is None
+            ):
+                # A running tool may leave an uncertain external effect when
+                # interrupted. Let its owner settle the round before electing
+                # terminal closure; unresolved rounds retain their interaction.
+                return None, None
+            if decision_wait is not None:
+                intent = decision_wait.parent_effect
+                if (
+                    intent.session_id != loaded_session.id
+                    or intent.session_instance_id != loaded_session.instance_id
+                ):
+                    raise SessionRunFenced(
+                        "Interruption decision has foreign foreground wait evidence."
+                    )
+                interrupt_payload.update(
+                    model_step_id=intent.model_step_id,
+                    model_attempt_id=intent.model_attempt_id,
+                    tool_round_id=intent.tool_round_id,
+                    tool_call_id=intent.tool_call_id,
+                )
             interrupt_active_profile = active_invocation_execution_profile_from_checkpoint(
                 interrupt_checkpoint
             )
@@ -18182,6 +18603,9 @@ class SessionEngine:
                                             interrupted_ambiguous_user_input
                                         ),
                                         terminal_decision=interrupt_terminal_decision,
+                                        expected_foreground_child_wait=interrupted_foreground_wait,
+                                        expected_interrupted_approval=interrupted_pending_approval,
+                                        redactor=self._secret_redactor,
                                     )
                                 ),
                                 **transition_kwargs,
@@ -18213,6 +18637,11 @@ class SessionEngine:
                                                 interrupted_ambiguous_user_input
                                             ),
                                             terminal_decision=None,
+                                            expected_foreground_child_wait=(
+                                                interrupted_foreground_wait
+                                            ),
+                                            expected_interrupted_approval=interrupted_pending_approval,
+                                            redactor=self._secret_redactor,
                                         )
                                     ),
                                     expected_latest_interaction_event_id=(
@@ -18396,19 +18825,10 @@ class SessionEngine:
                 operation_name="Offline provider interruption preparation",
             )
             provider_operation_addressed = provider_operation_profile is not None
-            if (
-                terminal_interaction_publication_supported
-                and provider_operation_profile is not None
-                and interrupt_terminal_decision is None
-            ):
-                interrupt_terminal_decision = await await_terminal_finalization_operation(
-                    lambda: self._ensure_interruption_terminal_decision(
-                        session=session,
-                        terminal_payload=interrupt_payload,
-                        interruption_request_id=interruption_request_id,
-                    ),
-                    operation_name="Post-dispatch interruption terminal-decision election",
-                )
+            # Offline provider settlement retains the original interaction for
+            # explicit provider recovery. Do not elect an interaction close just
+            # because cancellation was attempted; a prior durable decision still
+            # wins when terminal finalization reads it below.
             if loaded_session.status == SessionStatus.RUNNING and not provider_operation_addressed:
                 existing_interrupt_event = await await_terminal_finalization_operation(
                     lambda: self._session_control.wait_for_active_interrupted_event(
@@ -18512,6 +18932,7 @@ class SessionEngine:
                                 redactor=self._secret_redactor,
                                 consume_on_rejection=True,
                                 current_run_epoch=reloaded_session.run_epoch,
+                                runtime_session=reloaded_session,
                             )
                         )
                         if current_pending_user_input is not None:
@@ -18596,7 +19017,11 @@ class SessionEngine:
             else None
         )
         offline_terminal_decision: InvocationTerminalDecision | None = None
-        if provider_operation_profile is not None:
+        if (
+            provider_operation_profile is not None
+            or interrupt_terminal_decision is not None
+            or adopted_user_input_interrupt_payload is not None
+        ):
             offline_decision_checkpoint = await await_terminal_finalization_operation(
                 lambda: self.session_store.load_checkpoint(session.id),
                 operation_name="Offline interruption terminal-decision read",
@@ -18606,6 +19031,12 @@ class SessionEngine:
             )
         try:
             if offline_terminal_decision is None:
+                if invocation_context is not None:
+                    restored_interaction = await self._activate_latest_open_interaction(session.id)
+                    if restored_interaction != invocation_context.active_profile.interaction_id:
+                        raise SessionRunFenced(
+                            "Offline interruption lost its original open interaction."
+                        )
                 (
                     session,
                     _interaction_event,
@@ -18628,6 +19059,8 @@ class SessionEngine:
                     ),
                     operation_name="Offline interruption interaction transition",
                 )
+                if _interaction_event is not None:
+                    yield _interaction_event
         except BaseException as transition_failure:
             try:
                 await release_offline_provider_interruption(
@@ -18675,13 +19108,24 @@ class SessionEngine:
             owned_terminal_stream: AsyncIterator[Event] | None = None
             try:
                 if offline_terminal_decision is not None:
-                    assert provider_operation_profile is not None
+                    offline_active_profile = active_invocation_execution_profile_from_checkpoint(
+                        offline_decision_checkpoint
+                    )
+                    if offline_active_profile is None:
+                        raise SessionRunFenced("Offline interruption lost its invocation profile.")
+                    terminal_profile = offline_active_profile.profile
+                    if invocation_context is not None:
+                        if terminal_profile != invocation_context.profile:
+                            raise SessionRunFenced(
+                                "Offline interruption changed its frozen execution profile."
+                            )
+                        terminal_profile = invocation_context.profile
                     async for decided_event in self._handle_session_interrupted(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
-                        execution_profile=provider_operation_profile.active_profile.profile,
+                        execution_profile=terminal_profile,
                         invocation_context=invocation_context,
                     ):
                         # ``interrupt_session`` historically exposes the
@@ -18870,12 +19314,18 @@ class SessionEngine:
                     await stop_local_terminal_finalization_heartbeat(
                         superseded_by_exact_renewal=True,
                     )
-                    owned_finalization = self._recovery_coordinator._stream_preclaimed_terminal_evidence_finalization(
-                        session=session,
-                        claim_id=terminal_finalization_claim_id,
-                        expected_payload=payload,
-                        finalization=finalize_terminal_interruption(),
-                    )
+                    if offline_terminal_decision is not None:
+                        # The terminal-decision handler renews, monitors, and
+                        # releases this exact claim itself. A second monitor
+                        # would misclassify its successful release as lease loss.
+                        owned_finalization = finalize_terminal_interruption()
+                    else:
+                        owned_finalization = self._recovery_coordinator._stream_preclaimed_terminal_evidence_finalization(
+                            session=session,
+                            claim_id=terminal_finalization_claim_id,
+                            expected_payload=payload,
+                            finalization=finalize_terminal_interruption(),
+                        )
                     if terminal_finalization_transfer_cancellation is not None:
 
                         async def settle_cancelled_finalization() -> bool:
@@ -18991,10 +19441,58 @@ class SessionEngine:
         terminal_event_id: str | None = None,
         queue_task_id: str | None = None,
         queued_dispatch_id: str | None = None,
+        required_foreground_wait: ForegroundChildWait | None = None,
+        required_foreground_terminal: ForegroundChildTerminal | None = None,
+        required_foreground_continuation: ForegroundParentContinuation | None = None,
+        foreground_before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[Event, None]:
         # Resume profile admission and the resumed dispatch must observe one
         # application-budget snapshot even if the app configuration is changed
         # while the interaction-start event is being consumed.
+        if (type(request) is ForegroundChildResumeRequest) != (
+            required_foreground_wait is not None
+        ):
+            raise TypeError("Foreground continuation requires its private request and exact wait.")
+        if (required_foreground_terminal is None) != (required_foreground_wait is None) or (
+            required_foreground_terminal is not None
+            and required_foreground_terminal.wait != required_foreground_wait
+        ):
+            raise TypeError("Foreground continuation requires the exact selected child terminal.")
+        if (foreground_before_mutation is None) != (required_foreground_wait is None):
+            raise TypeError("Foreground continuation requires its delivery ownership guard.")
+        if required_foreground_continuation is not None and (
+            required_foreground_continuation.terminal != required_foreground_terminal
+            or required_foreground_continuation.request
+            != request.model_copy(update={"loop_policies": ()})
+        ):
+            raise TypeError("Attached foreground continuation conflicts with its original request.")
+
+        def require_foreground_checkpoint(
+            session: Session, checkpoint: dict[str, Any] | None
+        ) -> None:
+            if required_foreground_wait is None:
+                return
+            key = (
+                FOREGROUND_CHILD_WAIT_KEY
+                if required_foreground_continuation is None
+                else FOREGROUND_PARENT_CONTINUATION_KEY
+            )
+            expected = (
+                required_foreground_wait.model_dump(mode="json")
+                if required_foreground_continuation is None
+                else required_foreground_continuation.model_dump(mode="json")
+            )
+            if (
+                session.id != required_foreground_wait.parent_effect.session_id
+                or session.instance_id != required_foreground_wait.parent_effect.session_instance_id
+                or checkpoint is None
+                or canonical_durable_json_bytes(checkpoint.get(key), key)
+                != canonical_durable_json_bytes(expected, key)
+            ):
+                raise SessionRunFenced(
+                    "Foreground continuation lost its exact retained checkpoint."
+                )
+
         budget_policy = copy_budget_policy(self._get_budget_policy())
         if (source_execution_profile is None) != (required_execution_profile is None):
             raise ValueError(
@@ -19374,6 +19872,7 @@ class SessionEngine:
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
                 current_run_epoch=current_session.run_epoch,
+                runtime_session=current_session,
             )
             if pending_user_input is not None:
                 raise RuntimeError(
@@ -19385,6 +19884,7 @@ class SessionEngine:
                     updated_checkpoint,
                     redactor=self._secret_redactor,
                     consume_on_rejection=True,
+                    runtime_session=current_session,
                 )
             else:
                 checkpoint_pending_round = None
@@ -19535,8 +20035,13 @@ class SessionEngine:
         )
         validate_resumable_checkpoint(loaded_session, checkpoint)
 
+        require_foreground_checkpoint(loaded_session, checkpoint)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
-        continuing_recovery_boundary = pending_round is not None or pending_model_completion
+        continuing_recovery_boundary = (
+            pending_round is not None
+            or pending_model_completion
+            or required_foreground_continuation is not None
+        )
         if continuing_recovery_boundary and tool_capability_ceiling_narrowed:
             raise RuntimeError(
                 "A tool capability ceiling cannot be narrowed while model or tool recovery "
@@ -19925,6 +20430,10 @@ class SessionEngine:
                     "Pending model or tool recovery state has no open interaction. "
                     "Pre-interaction prerelease recovery state is unsupported."
                 )
+            if required_foreground_wait is not None and (
+                interaction_id != required_foreground_wait.parent_effect.interaction_id
+            ):
+                raise SessionRunFenced("Foreground continuation cannot replace its interaction.")
             interaction_started_event = None
         else:
             interaction_id = str(uuid4())
@@ -20084,7 +20593,16 @@ class SessionEngine:
         admission_source_active_profile = active_invocation_execution_profile_from_checkpoint(
             checkpoint
         )
+        require_foreground_checkpoint(loaded_session, checkpoint)
         claimed_checkpoint = claim_resumable_checkpoint(loaded_session, checkpoint)
+        if required_foreground_terminal is not None and required_foreground_continuation is None:
+            existing_terminal = claimed_checkpoint.get(FOREGROUND_CHILD_TERMINAL_KEY)
+            selected_terminal = required_foreground_terminal.model_dump(mode="json")
+            if existing_terminal is not None and existing_terminal != selected_terminal:
+                raise SessionRunFenced(
+                    "Foreground continuation selected a different child outcome."
+                )
+            claimed_checkpoint[FOREGROUND_CHILD_TERMINAL_KEY] = selected_terminal
         target_active_profile = ActiveInvocationExecutionProfile(
             session_id=loaded_session.id,
             interaction_id=interaction_id,
@@ -20148,6 +20666,8 @@ class SessionEngine:
             targeted_tool_grants=prepared_targeted_tool_grants,
         )
         try:
+            if foreground_before_mutation is not None:
+                await foreground_before_mutation()
             admission_result = await self.session_store.apply_invocation_lifecycle_command(
                 AdmitInvocationCommand(
                     session_id=loaded_session.id,
@@ -20465,6 +20985,7 @@ class SessionEngine:
                                     failure_checkpoint,
                                     redactor=self._secret_redactor,
                                     consume_on_rejection=True,
+                                    runtime_session=session,
                                 )
                             )
                             materialization_is_safe = pending_failure_round is None
@@ -20579,8 +21100,11 @@ class SessionEngine:
             thinking=request.thinking,
             request_metadata=request.metadata,
             request_trace_metadata=(
-                _runtime_resume_transport_metadata(request) or request.metadata
+                request.metadata
+                if required_foreground_wait is not None
+                else _runtime_resume_transport_metadata(request) or request.metadata
             ),
+            foreground_wait=required_foreground_wait,
             targeted_tool_grants=targeted_tool_grant_footprint(
                 targeted_tool_grant_records,
                 projection=targeted_tool_projection,
@@ -20621,6 +21145,13 @@ class SessionEngine:
                 None
                 if reconciled_pending_round is None
                 else reconciled_pending_round.source_transcript_cursor
+            ),
+            run_limit_accounting=(
+                required_foreground_continuation.run_limit_accounting
+                if required_foreground_continuation is not None
+                else pending_round.run_limit_accounting
+                if required_foreground_wait is not None and pending_round is not None
+                else None
             ),
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
             egress_environment_handoff=egress_environment_handoff,
@@ -22278,6 +22809,7 @@ class SessionEngine:
                     structured_output_attempt=structured_output_attempt,
                     structured_output_retries=structured_output_retries,
                     structured_output_validation=(publication.structured_output_validation),
+                    runtime_session=session,
                 )
             )
             if (
@@ -22446,6 +22978,7 @@ class SessionEngine:
             run_limit_accounting=request.run_limit_accounting,
             initial_model_step_identity=request.initial_model_step_identity,
             initial_model_step_number=request.initial_model_step_number,
+            completed_tool_round_model_step=request.completed_tool_round_model_step,
             initial_model_step_tool_exposure=initial_tool_exposure,
             previous_tool_exposure_profile_id=(request.previous_tool_exposure_profile_id),
             preserve_failure_until_initial_provider_dispatch=(
@@ -22481,6 +23014,7 @@ class SessionEngine:
         run_limit_accounting: RunLimitAccountingContext | None = None,
         initial_model_step_identity: ModelStepIdentity | None = None,
         initial_model_step_number: int | None = None,
+        completed_tool_round_model_step: int | None = None,
         initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
         previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
@@ -22543,6 +23077,7 @@ class SessionEngine:
             run_limit_accounting=run_limit_accounting,
             initial_model_step_identity=initial_model_step_identity,
             initial_model_step_number=initial_model_step_number,
+            completed_tool_round_model_step=completed_tool_round_model_step,
             initial_model_step_tool_exposure=initial_model_step_tool_exposure,
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
             preserve_failure_until_initial_provider_dispatch=(
@@ -22603,12 +23138,14 @@ class SessionEngine:
         run_limit_accounting: RunLimitAccountingContext | None = None,
         initial_model_step_identity: ModelStepIdentity | None = None,
         initial_model_step_number: int | None = None,
+        completed_tool_round_model_step: int | None = None,
         initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
         previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
         egress_environment_handoff: EgressAuthorityAdoptionResult | None = None,
         parked_egress_factory_result: EnvironmentFactoryResult | None = None,
         new_terminal_invocation: bool = False,
+        foreground_wait: ForegroundChildWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -22664,6 +23201,12 @@ class SessionEngine:
             raise ValueError(
                 "Initial model-step identity and step number must be supplied together."
             )
+        if completed_tool_round_model_step is not None and (
+            type(completed_tool_round_model_step) is not int
+            or not 1 <= completed_tool_round_model_step <= max_steps
+            or initial_model_step_identity is not None
+        ):
+            raise ValueError("Completed tool-round step conflicts with continuation bounds.")
         if initial_model_step_number is not None and (
             type(initial_model_step_number) is not int
             or not 1 <= initial_model_step_number <= max_steps
@@ -22748,6 +23291,7 @@ class SessionEngine:
                     checkpoint,
                     redactor=self._secret_redactor,
                     consume_on_rejection=True,
+                    runtime_session=session,
                 )
                 is not None
             ):
@@ -23900,6 +24444,32 @@ class SessionEngine:
                 tool_round_runner.rebind_queued_interaction(rebound)
                 invocation_context = rebound
 
+            if foreground_wait is not None:
+                from cayu.runtime._foreground_child_continuation import (
+                    load_attached_foreground_continuation,
+                )
+
+                attached = await load_attached_foreground_continuation(
+                    session, store=self.session_store
+                )
+                if (
+                    attached is None
+                    or attached.terminal.wait != foreground_wait
+                    or (
+                        foreground_wait.parent_effect.interaction_id
+                        != invocation_context.binding.interaction_id
+                    )
+                ):
+                    raise SessionRunFenced(
+                        "Foreground model continuation lost its attached result."
+                    )
+                initial_model_step_number = max(
+                    initial_model_step_number or 1, attached.completed_model_step + 1
+                )
+            if completed_tool_round_model_step is not None:
+                initial_model_step_number = max(
+                    initial_model_step_number or 1, completed_tool_round_model_step + 1
+                )
             first_model_step = (
                 recovered_assistant_step.step
                 if recovered_assistant_step is not None
@@ -23907,6 +24477,10 @@ class SessionEngine:
             )
             await self._stop_at_requested_tool_round_boundary(session)
             model_steps = () if skip_model_steps else range(first_model_step, max_steps + 1)
+            # A resumed round can have consumed the final allowed step already.
+            # The empty-loop limit path must report that consumed step, not an
+            # uninitialized loop variable or a newly granted model request.
+            step = first_model_step - 1
             for step in model_steps:
                 replayed_step = recovered_assistant_step if step == first_model_step else None
                 model_step_identity = (
@@ -24948,6 +25522,56 @@ class SessionEngine:
                         },
                     ),
                     exc.pending,
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+            ):
+                yield event
+        except ForegroundChildActionRequired as exc:
+            self._recovery_coordinator.retain_foreground_wait_policies(
+                session, exc.wait, request_loop_policies
+            )
+            await materialize_deferred_messages_after_failure()
+            (
+                session,
+                interaction_paused_event,
+                _,
+            ) = await self._publish_sibling_interaction_transition(
+                session=session,
+                invocation_context=invocation_context,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+                execution_profile=execution_profile,
+            )
+            if interaction_paused_event is not None:
+                yield interaction_paused_event
+            for event in await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+                invocation_context=invocation_context,
+            ):
+                yield event
+            async for event in self._emit_terminal_event_with_hooks(
+                event=event_with_foreground_child_wait_authority(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=exc.interruption_evidence(),
+                    ),
+                    exc.wait,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=session,
@@ -28041,6 +28665,7 @@ class SessionEngine:
                         checkpoint,
                         approval=pending_approval_to_clear,
                         redactor=self._secret_redactor,
+                        runtime_session=_current_session,
                     )
 
                 await self.session_store.transform_checkpoint(
@@ -28259,6 +28884,7 @@ class SessionEngine:
             source_checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         if (
             pending_round is None
@@ -28289,6 +28915,7 @@ class SessionEngine:
             source_checkpoint,
             approval=pending_approval_to_clear,
             redactor=self._secret_redactor,
+            runtime_session=session,
         )
         clear_event = approval_support.cleared_event(
             session=session,
@@ -29346,6 +29973,7 @@ class SessionEngine:
             exact_interrupt_marker_retained = (
                 bool(provider_cancellation_failures) or user_input_supersession_retained
             )
+            expected_diagnostic_payload = copy_json_value(payload, "interrupt_payload")
             if interaction_transition_failures:
                 copied_failures = copy_durable_json_value(
                     list(interaction_transition_failures),
@@ -29364,27 +29992,62 @@ class SessionEngine:
                     dict(item) for item in copied_provider_failures
                 ]
             if interaction_transition_failures or provider_cancellation_failures:
+
+                def retain_interruption_diagnostics(
+                    _session: Session, checkpoint: dict[str, Any] | None
+                ) -> dict[str, Any]:
+                    current = (
+                        {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+                    )
+                    marker = current.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+                    if (
+                        settled_invocation_terminal_decision_from_checkpoint(current) is not None
+                        and marker is None
+                    ):
+                        raise SessionRunFenced(
+                            "Interrupted invocation has already been terminalized."
+                        )
+                    if marker is not None and marker != expected_diagnostic_payload:
+                        raise SessionRunFenced(
+                            "Interruption changed before diagnostic publication."
+                        )
+                    current[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY] = copy_json_value(
+                        payload, "interrupt_payload"
+                    )
+                    return current
+
                 # Persist exact repair authority before the status or sibling
                 # interaction changes. A process loss after either mutation
                 # must not leave terminal state with no diagnostic evidence.
-                await await_handoff_operation(
-                    lambda: self.session_store.publish_checkpoint_and_events(
-                        session.id,
-                        checkpoint_transform=_checkpoint_with_pending_session_interrupt(
-                            payload,
-                            include_interruption_cascade=False,
+                # Inspect the store-owned winner inside the atomic transform;
+                # ordinary callbacks cannot see private lifecycle authority.
+                # Read access does not authorize changing that winner.
+                with _invocation_lifecycle_authority_read_scope():
+                    await await_handoff_operation(
+                        lambda: self.session_store.publish_checkpoint_and_events(
+                            session.id,
+                            checkpoint_transform=retain_interruption_diagnostics,
+                            events=[],
+                            expected_statuses={loaded_interrupted.status},
+                            expected_run_epoch=loaded_interrupted.run_epoch,
                         ),
-                        events=[],
-                        expected_statuses={loaded_interrupted.status},
-                        expected_run_epoch=loaded_interrupted.run_epoch,
-                    ),
-                    operation_name="Live interruption diagnostic checkpoint publication",
-                )
+                        operation_name="Live interruption diagnostic checkpoint publication",
+                    )
             decision_checkpoint = await await_handoff_operation(
                 lambda: self.session_store.load_checkpoint(session.id),
                 operation_name="Live interruption terminal-decision read",
             )
             terminal_decision = invocation_terminal_decision_from_checkpoint(decision_checkpoint)
+            if (
+                terminal_decision is None
+                and settled_invocation_terminal_decision_from_checkpoint(decision_checkpoint)
+                is not None
+                and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY not in (decision_checkpoint or {})
+            ):
+                # Another finalizer already published and acknowledged this
+                # invocation's exact terminal winner. A late execution owner
+                # must not invent a fresh interruption from an empty marker.
+                raise SessionRunFenced("Interrupted invocation has already been terminalized.")
             if preserve_interaction_id is not None:
                 active_profile = active_invocation_execution_profile_from_checkpoint(
                     decision_checkpoint

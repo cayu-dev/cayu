@@ -11,7 +11,51 @@ from cayu._validation import canonical_durable_json_bytes, require_durable_clean
 if TYPE_CHECKING:
     from cayu.core.tools import ToolResult
     from cayu.runtime.invocation import SessionInvocation
-    from cayu.runtime.sessions import Session
+    from cayu.runtime.sessions import RunRequest, Session
+
+
+def _subagent_lineage_digest(request: RunRequest) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "session_id": request.session_id,
+                "parent_session_id": request.parent_session_id,
+                "causal_budget_id": request.causal_budget_id,
+                "lineage": request.metadata.get("subagent"),
+            },
+            "subagent_lineage",
+        )
+    ).hexdigest()
+
+
+def run_request_with_subagent_lineage(request: RunRequest) -> RunRequest:
+    """Attest built-in spawn linkage before generic request redaction.
+
+    This private entrance is called only after SubagentTool constructs linkage
+    from its runtime-owned ToolContext. Public metadata never supplies this seal.
+    """
+    from cayu.runtime.sessions import copy_run_request
+
+    copied = copy_run_request(request)
+    copied._runtime_generated_authority = copied._runtime_generated_authority | {
+        ("subagent_lineage", _subagent_lineage_digest(copied))
+    }
+    return copied
+
+
+def runtime_subagent_lineage_fields(request: RunRequest) -> dict[str, str]:
+    """Restore only exact attested runtime fields, never caller tool IDs or text."""
+    if ("subagent_lineage", _subagent_lineage_digest(request)) not in (
+        request._runtime_generated_authority
+    ):
+        return {}
+    lineage = request.metadata.get("subagent")
+    if type(lineage) is not dict:
+        return {}
+    fields = ("parent_session_id", "idempotency_key", "spawn_fingerprint")
+    if any(type(lineage.get(name)) is not str for name in fields):
+        return {}
+    return {name: lineage[name] for name in fields}
 
 
 class ChildSessionRecoveryMatcher(ABC):

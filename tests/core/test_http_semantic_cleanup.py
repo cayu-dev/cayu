@@ -195,14 +195,18 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
             # preparation/schema/profile work on a loaded CI host. Setup has a
             # separate deadlock guard; an early step failure must be observed.
             done, _ = await asyncio.wait(
-                (running, opening), timeout=30, return_when=asyncio.FIRST_COMPLETED
+                (running, opening), timeout=60, return_when=asyncio.FIRST_COMPLETED
             )
             assert done, "Workflow did not reach HTTP dispatch within the setup guard."
             if opening not in done:
                 await running
                 pytest.fail("Workflow finished without opening its HTTP stream.")
             with pytest.raises(StepError) as raised:
-                await asyncio.wait_for(running, 3)
+                # This joins SQLite diagnostics and workflow failure projection
+                # as well as the HTTP deadline. Keep a separate deadlock guard:
+                # the 200 ms semantic deadline is asserted from durable evidence
+                # below, and receipt settlement remains blocked until release.
+                await asyncio.wait_for(running, 30)
             sid = raised.value.session_id
             assert sid is not None
 

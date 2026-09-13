@@ -29486,7 +29486,7 @@ class _CountSplitInterruptionCheckpointReadsStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
         self._children_queried = False
-        self.checkpoint_reads_after_child_query = 0
+        self.checkpoint_reads_after_child_query: list[str] = []
 
     async def list_sessions(self, query=None):
         page = await super().list_sessions(query)
@@ -29496,7 +29496,7 @@ class _CountSplitInterruptionCheckpointReadsStore(InMemorySessionStore):
 
     async def load_checkpoint(self, session_id):
         if self._children_queried:
-            self.checkpoint_reads_after_child_query += 1
+            self.checkpoint_reads_after_child_query.append(session_id)
         return await super().load_checkpoint(session_id)
 
 
@@ -29655,9 +29655,9 @@ def test_interrupt_close_reuses_validated_checkpoint_for_subagent_reattachment()
 
     assert len(spawn_events) == 1
     assert spawn_events[0].payload["result"]["structured"]["child_session_id"] == "child"
-    # Assistant publication and final recovery publication each read once;
-    # child reattachment reuses the checkpoint supplied by the coordinator.
-    assert store.checkpoint_reads_after_child_query == 2
+    # Assistant and final recovery publication each read the parent once;
+    # background child reattachment reuses the supplied parent checkpoint.
+    assert store.checkpoint_reads_after_child_query == ["parent", "parent"]
 
 
 def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id():
@@ -31223,6 +31223,41 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation(
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
 
+        finalization_entered = asyncio.Event()
+        release_finalization = asyncio.Event()
+        watcher_rechecked = asyncio.Event()
+        finalization_cancelled = asyncio.Event()
+        original_load = app._session_engine.session_store.load
+        original_require = app._recovery_coordinator._require_session
+        watcher_checks = 0
+
+        async def hold_terminal_publication(candidate_id):
+            if (
+                deferred_response
+                and candidate_id == session_id
+                and app._session_control.is_emitting_interrupted(session_id)
+                and not finalization_entered.is_set()
+            ):
+                finalization_entered.set()
+                try:
+                    await release_finalization.wait()
+                except asyncio.CancelledError:
+                    finalization_cancelled.set()
+                    raise
+            return await original_load(candidate_id)
+
+        async def observe_watcher(candidate_id):
+            nonlocal watcher_checks
+            current = await original_require(candidate_id)
+            if finalization_entered.is_set() and not release_finalization.is_set():
+                watcher_checks += 1
+                if watcher_checks >= 2:
+                    watcher_rechecked.set()
+            return current
+
+        monkeypatch.setattr(app._session_engine.session_store, "load", hold_terminal_publication)
+        monkeypatch.setattr(app._recovery_coordinator, "_require_session", observe_watcher)
+
         initial_events = await collect_events(
             app,
             RunRequest(
@@ -31254,10 +31289,19 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation(
             metadata={"source": "blocked-continuation-regression"},
         )
         interruption_events = None
+        interrupt_task = asyncio.create_task(collect_interrupt_events(app, interrupt_request))
         try:
-            interruption_events = await asyncio.wait_for(
-                collect_interrupt_events(app, interrupt_request), timeout=15
-            )
+            if deferred_response:
+                try:
+                    await asyncio.wait_for(finalization_entered.wait(), timeout=10)
+                    # The run has unregistered, but its terminal publisher still
+                    # owns cleanup. Let the durable watcher inspect it twice.
+                    await asyncio.wait_for(watcher_rechecked.wait(), timeout=5)
+                    assert not finalization_cancelled.is_set()
+                    assert not recovery_task.done()
+                finally:
+                    release_finalization.set()
+            interruption_events = await asyncio.wait_for(interrupt_task, timeout=15)
         except TimeoutError as error:
             # The request can return while the active run is still finalizing.
             # Completion and replay below must still prove one exact terminal.
@@ -31268,7 +31312,12 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation(
                 "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
                 active_wait_attempts,
             )
+            if not interrupt_task.done():
+                interrupt_task.cancel()
+            await asyncio.gather(interrupt_task, return_exceptions=True)
         recovery_events = await asyncio.wait_for(recovery_task, timeout=15)
+        assert recovery_task.cancelling() == 0
+        assert not recovery_task.cancelled()
         if interruption_events is None:
             interruption_events = await asyncio.wait_for(
                 collect_interrupt_events(app, interrupt_request), timeout=15
@@ -38232,9 +38281,9 @@ def _approval_pause_app(
     return app, provider
 
 
-def test_tool_approval_resolution_atomically_migrates_legacy_approval_only_checkpoint():
+def test_tool_approval_resolution_retains_round_authority_for_unknown_secret_scope():
     async def run() -> tuple[list[Event], list[dict[str, str]], dict[str, Any] | None]:
-        session_id = "sess_legacy_approval_only"
+        session_id = "sess_approval_unknown_secret_scope"
         store = InMemorySessionStore()
         tool = SideEffectTool()
         app, _provider = _approval_pause_app(
@@ -38255,20 +38304,15 @@ def test_tool_approval_resolution_atomically_migrates_legacy_approval_only_check
         )
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        await store.append_transcript_messages(
-            session_id,
-            [
-                Message.model_validate(
-                    checkpoint["pending_tool_round"]["quarantined_assistant_message"]
-                )
-            ],
-        )
-        legacy_checkpoint = dict(checkpoint)
-        legacy_checkpoint.pop("pending_tool_round")
-        legacy_approval = dict(legacy_checkpoint["pending_tool_approval"])
-        legacy_approval.pop("secret_resolution_scope")
-        legacy_checkpoint["pending_tool_approval"] = legacy_approval
-        await store.checkpoint(session_id, legacy_checkpoint)
+        # Unknown secret scope is supported, but the paired round is still
+        # authoritative for the consumed model step and executable call plan.
+        # Do not simulate an obsolete approval-only format by deleting it.
+        assert checkpoint["pending_tool_round"]["model_step"] == 1
+        unknown_scope_checkpoint = dict(checkpoint)
+        unknown_scope_approval = dict(checkpoint["pending_tool_approval"])
+        unknown_scope_approval.pop("secret_resolution_scope")
+        unknown_scope_checkpoint["pending_tool_approval"] = unknown_scope_approval
+        await store.checkpoint(session_id, unknown_scope_checkpoint)
 
         resumed = await collect_tool_approval_events(
             app,
@@ -62274,9 +62318,11 @@ def test_interrupt_session_suppresses_late_tool_events_while_finalizing(monkeypa
     assert EventType.TOOL_CALL_COMPLETED not in event_types_after_release
     assert EventType.TOOL_CALL_FAILED not in event_types_after_release
     assert event_types_after_release.count(EventType.TOOL_EFFECT_OUTCOME_UNKNOWN) == 1
+    # The interruption owner settles the interaction's recovery pause before
+    # publishing the invocation summary and final session event.
     assert event_types_after_release[-3:] == [
-        EventType.TURN_COMPLETED,
         EventType.INTERACTION_PAUSED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     validate_context_messages(transcript)

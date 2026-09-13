@@ -2427,6 +2427,13 @@ def _serialize_pending_action(
         untrusted_container_fields={"arguments"},
     )
     payload["id"] = f"{public_event_id(action.event.sequence)}:{action.kind.value}"
+    if action.delegated_action is not None:
+        # This is navigation to the child-owned action, not a copied resolution
+        # authority. Use the same session alias as the child inspection routes;
+        # generic text redaction can turn a generated ID into an unusable link.
+        payload["delegated_action"]["child_session_id"] = cayu_app.project_session_id_for_exposure(
+            action.delegated_action.child_session_id
+        )
     for response_field, event_field in (
         ("approval_id", "approval_id"),
         ("input_id", "input_id"),

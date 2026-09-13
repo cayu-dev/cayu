@@ -105,7 +105,6 @@ from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
@@ -7340,14 +7339,12 @@ def test_interruption_claim_acknowledgement_loss_reconciles_committed_epoch() ->
         assert interrupted.status is SessionStatus.INTERRUPTED
         assert interrupted_profile is not None
         assert interrupted_profile.run_epoch == interrupted.run_epoch - 1
-        assert settled_decision is not None
-        assert settled_decision.outcome is InvocationTerminalOutcome.INTERRUPTED
-        assert settled_decision.run_epoch == interrupted_profile.run_epoch - 1
-        assert settled_decision.interaction_id == interrupted_profile.interaction_id
-        assert (
-            settled_decision.execution_profile_fingerprint
-            == interrupted_profile.profile.fingerprint
-        )
+        # A lost acknowledgement must retain the same recoverable pause, not
+        # commit a terminal decision for the still-open provider interaction.
+        assert settled_decision is None
+        assert events[0].interaction_id == interrupted_profile.interaction_id
+        durable_events = await store.load_events(session_id)
+        assert not any(event.type is EventType.INTERACTION_INTERRUPTED for event in durable_events)
 
     asyncio.run(scenario())
 

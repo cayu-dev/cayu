@@ -711,6 +711,7 @@ def test_cayu_app_terminal_evidence_repair_rejects_future_run_operation() -> Non
             session_id,
             {"session_run_operation": future_marker},
         )
+        checkpoint_before_recovery = await store.load_checkpoint(session_id)
 
         with pytest.raises(RuntimeError, match="future run epoch"):
             await app.recover_incomplete_session(
@@ -721,10 +722,8 @@ def test_cayu_app_terminal_evidence_repair_rejects_future_run_operation() -> Non
         assert session is not None
         assert session.status == SessionStatus.COMPLETED
         assert session.run_epoch == 0
-        assert await store.load_checkpoint(session_id) == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-            "session_run_operation": future_marker,
-        }
+        # Rejected recovery must not even migrate the untrusted checkpoint.
+        assert await store.load_checkpoint(session_id) == checkpoint_before_recovery
         assert await store.query_events(EventQuery(session_id=session_id)) == []
 
     asyncio.run(scenario())

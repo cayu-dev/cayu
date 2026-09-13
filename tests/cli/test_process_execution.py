@@ -798,7 +798,8 @@ while True:
             if marker.exists():
                 pid = int(marker.read_text())
                 if _descendant_running(pid):
-                    os.kill(pid, signal.SIGKILL)
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
 
     asyncio.run(scenario())
 

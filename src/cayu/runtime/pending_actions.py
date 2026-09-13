@@ -29,6 +29,7 @@ from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PENDING_ACTION_EVENT_TYPE_VALUES,
+    DelegatedActionReference,
     EventRecord,
     PendingActionKind,
     PendingActionRecord,
@@ -50,7 +51,9 @@ _PENDING_ACTION_TOOL_STATE_KEYS = (
     "pending_user_input",
     "pending_tool_round",
 )
-PENDING_ACTION_CHECKPOINT_KEYS = frozenset(_PENDING_ACTION_TOOL_STATE_KEYS)
+PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
+    (*_PENDING_ACTION_TOOL_STATE_KEYS, "foreground_child_wait")
+)
 _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS = frozenset(
     {"model_step_id", "model_attempt_id", "tool_round_id"}
 )
@@ -67,6 +70,10 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "session.interrupted": frozenset(
         {
             "interruption_type",
+            "child_session_id",
+            "action_kind",
+            "action_id",
+            "status",
             "manual_recovery_required",
             "approval_id",
             "tool_call_id",
@@ -77,6 +84,17 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "approval",
             "user_input",
             resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
+        }
+    )
+    | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "session.delegated_action.updated": frozenset(
+        {
+            "interruption_type",
+            "child_session_id",
+            "action_kind",
+            "action_id",
+            "status",
+            "tool_call_id",
         }
     )
     | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
@@ -315,6 +333,7 @@ def pending_action_checkpoint_metrics(
         (1 if checkpoint.get("pending_tool_approval") is not None else 0)
         | (2 if checkpoint.get("pending_user_input") is not None else 0)
         | (4 if checkpoint.get("pending_tool_round") is not None else 0)
+        | (8 if checkpoint.get("foreground_child_wait") is not None else 0)
     )
     projected = {
         key: checkpoint[key]
@@ -751,6 +770,7 @@ def _action_from_record(
     question: str | None = None,
     options: list[str] | None = None,
     arguments: dict[str, Any] | None = None,
+    delegated_action: DelegatedActionReference | None = None,
 ) -> PendingActionRecord:
     # Pending actions are public control-plane projections. Their private
     # checkpoints retain executable arguments, but no invocation has yet
@@ -774,6 +794,7 @@ def _action_from_record(
         question=question,
         options=options or [],
         arguments=arguments,
+        delegated_action=delegated_action,
     )
 
 
@@ -1007,6 +1028,9 @@ def pending_action_from_records(
     checkpoint: dict[str, Any] | None,
 ) -> PendingActionRecord | None:
     """Project one current action from bounded action-specific event records."""
+    delegated = _delegated_action_from_records(session, records_desc, checkpoint)
+    if delegated is not None:
+        return delegated
     if session.status == SessionStatus.INTERRUPTED:
         for record in records_desc:
             event = record.event
@@ -1223,6 +1247,56 @@ def pending_action_from_records(
     return _tool_round_manual_recovery_action(session, records_desc, checkpoint)
 
 
+def _delegated_action_from_records(
+    session: PendingActionSession,
+    records_desc: list[EventRecord],
+    checkpoint: dict[str, Any] | None,
+) -> PendingActionRecord | None:
+    from cayu.runtime._foreground_child_wait import ForegroundChildWait
+
+    if session.status is not SessionStatus.INTERRUPTED or checkpoint is None:
+        return None
+    raw = checkpoint.get("foreground_child_wait")
+    if raw is None:
+        return None
+    try:
+        wait = ForegroundChildWait.model_validate(raw)
+        pending = pending_action_evidence_round_from_checkpoint(checkpoint)
+        if (
+            pending is None
+            or wait.parent_effect.session_id != session.id
+            or wait.parent_effect.tool_round_id != pending.tool_round_id
+            or wait.parent_effect.model_step_id != pending.model_step_id
+            or wait.parent_effect.model_attempt_id != pending.model_attempt_id
+            or not any(
+                call.tool_call_id == wait.parent_effect.tool_call_id for call in pending.tool_calls
+            )
+        ):
+            return None
+        reference = DelegatedActionReference.model_validate(wait.delegated_action_reference())
+    except (TypeError, ValueError):
+        return None
+    for record in records_desc:
+        event = record.event
+        if event.type in {"session.resumed", "session.completed", "session.failed"}:
+            return None
+        if event.type not in {"session.interrupted", "session.delegated_action.updated"}:
+            continue
+        if event.payload.get("interruption_type") != "waiting_on_child_action":
+            return None
+        if any(event.payload.get(key) != value for key, value in reference.model_dump().items()):
+            return None
+        return _action_from_record(
+            session=session,
+            record=record,
+            action_kind=PendingActionKind.DELEGATED_ACTION,
+            title="Child action required",
+            detail="Resolve the pending action on the child session.",
+            delegated_action=reference,
+        )
+    return None
+
+
 def pending_action_source_is_invalid(
     session: PendingActionSession,
     checkpoint: dict[str, Any] | None,
@@ -1245,6 +1319,22 @@ def pending_action_source_is_invalid(
         return True
     if session.status == SessionStatus.COMPLETED:
         return True
+    latest_interruption = next(
+        (
+            record.event
+            for record in records_desc
+            if record.event.type in {"session.interrupted", "session.delegated_action.updated"}
+        ),
+        None,
+    )
+    if (
+        latest_interruption is not None
+        and latest_interruption.payload.get("interruption_type") == "waiting_on_child_action"
+        and (action is None or action.kind is not PendingActionKind.DELEGATED_ACTION)
+    ):
+        # A contradictory/missing child link is not evidence that an ordinary
+        # manual tool replay is appropriate. Keep it diagnostically fail-closed.
+        return True
     try:
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
@@ -1257,7 +1347,10 @@ def pending_action_source_is_invalid(
         if evidence.scope_conflicting:
             return True
         if evidence.started_without_terminal_ids:
-            return action is None or action.kind != PendingActionKind.MANUAL_RECOVERY
+            return action is None or action.kind not in {
+                PendingActionKind.MANUAL_RECOVERY,
+                PendingActionKind.DELEGATED_ACTION,
+            }
     if action is not None:
         return False
     if pending_approval is not None or pending_input is not None:

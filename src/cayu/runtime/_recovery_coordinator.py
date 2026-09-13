@@ -143,6 +143,13 @@ from cayu.runtime._event_writer import (
     _reconcile_exact_persisted_event,
     prepare_runtime_event,
 )
+from cayu.runtime._foreground_child_wait import (
+    ForegroundChildActionRequired,
+    ForegroundChildTerminal,
+    ForegroundChildWait,
+    event_with_foreground_child_wait_authority,
+)
+from cayu.runtime._foreground_gate_continuation import ForegroundGatePolicyOwner, GateReplay
 from cayu.runtime._foreground_subagent_recovery import ForegroundSubagentRecoveryRequired
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
@@ -164,6 +171,7 @@ from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
     invocation_terminal_decision_matches_recovery_profile,
+    settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.runtime._isolated_tool_process import (
     isolated_tool_dispatch_authority_digests,
@@ -756,6 +764,7 @@ def _pending_approval_and_round_for_atomic_claim(
     gating_tool_call_id: str | None = None,
     recovery_tool_call_id: str | None = None,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> tuple[PendingToolApproval, tool_round_recovery.PendingToolRound]:
     if (gating_tool_call_id is None) == (recovery_tool_call_id is None):
         raise TypeError("Exactly one approval gating or recovery tool-call identity is required.")
@@ -770,6 +779,7 @@ def _pending_approval_and_round_for_atomic_claim(
     pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
         checkpoint,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     reconstructed_approval_only_round = pending_round is None
     if reconstructed_approval_only_round:
@@ -840,6 +850,7 @@ def _pending_approval_for_atomic_claim(
     gating_tool_call_id: str | None = None,
     recovery_tool_call_id: str | None = None,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> PendingToolApproval:
     approval, _pending_round = _pending_approval_and_round_for_atomic_claim(
         checkpoint,
@@ -848,6 +859,7 @@ def _pending_approval_for_atomic_claim(
         gating_tool_call_id=gating_tool_call_id,
         recovery_tool_call_id=recovery_tool_call_id,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     return approval
 
@@ -857,12 +869,14 @@ def _checkpoint_with_legacy_approval_round(
     *,
     approval: PendingToolApproval,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> dict[str, Any] | None:
     """Atomically upgrade an approval-only checkpoint at its exact claim."""
 
     pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
         checkpoint,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     if pending_round is not None:
         return checkpoint
@@ -1286,6 +1300,7 @@ class RecoverySessionRunRequest:
     run_limit_accounting: RunLimitAccountingContext | None = None
     initial_model_step_identity: ModelStepIdentity | None = None
     initial_model_step_number: int | None = None
+    completed_tool_round_model_step: int | None = None
     initial_model_step_tool_exposure: ResolvedToolExposureAuthority | None = None
     previous_tool_exposure_profile_id: str | None = None
     preserve_failure_until_initial_provider_dispatch: bool = False
@@ -1295,6 +1310,13 @@ class RecoverySessionRunRequest:
             raise TypeError("Recovery requires an authenticated InvocationContext.")
         self.invocation_context._validate()
         self.invocation_context.with_admitted_session(self.session)
+
+
+def _completed_tool_round_model_step(step: int | None, *, max_steps: int) -> int:
+    """Retain consumed allowance from the authenticated pending round."""
+    if type(step) is not int or not 1 <= step <= max_steps:
+        raise RuntimeError("Tool-round continuation has no valid consumed model-step evidence.")
+    return step
 
 
 def _rebound_active_invocation_profile(
@@ -1964,6 +1986,7 @@ class RecoveryCoordinator:
     ) -> None:
         self._human_review_policy = human_review_policy
         self._session_store = session_store
+        self._foreground_gate_policy_owner = ForegroundGatePolicyOwner()
         self._task_store = task_store
         self._event_writer = event_writer
         self._session_control = session_control
@@ -2026,6 +2049,7 @@ class RecoveryCoordinator:
                 tool_round_id=approval.tool_round_id,
                 gating_tool_call_id=approval.tool_call_id,
                 redactor=self._secret_redactor,
+                runtime_session=session,
             )
             pending = approval
             kind = "tool_approval"
@@ -2042,6 +2066,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 current_run_epoch=session.run_epoch,
+                runtime_session=session,
             )
             if (
                 pending is None
@@ -2150,6 +2175,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 current_run_epoch=session.run_epoch,
+                runtime_session=session,
             )
             if (
                 session.status is SessionStatus.FAILED
@@ -2765,9 +2791,8 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Provider-operation interruption profile changed before recovery claimed it."
                 )
-            if (
-                terminal_decision is None
-                or terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+            if terminal_decision is not None and (
+                terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
                 or terminal_decision.interruption_request_id != interruption_request_id
                 or not invocation_terminal_decision_matches_active_profile(
                     terminal_decision,
@@ -2966,16 +2991,20 @@ class RecoveryCoordinator:
             or type(pending_interrupt) is not dict
             or interruption_request_id_from_payload(pending_interrupt) != interruption_request_id
             or _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None
-            or terminal_decision is None
-            or terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
-            or terminal_decision.interruption_request_id != interruption_request_id
-            or not invocation_terminal_decision_matches_recovery_profile(
-                terminal_decision,
-                session_id=current.id,
-                session_instance_id=current.instance_id,
-                current_run_epoch=current.run_epoch,
-                interaction_id=current_profile.interaction_id,
-                execution_profile_fingerprint=current_profile.profile.fingerprint,
+            or (
+                terminal_decision is not None
+                and (
+                    terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+                    or terminal_decision.interruption_request_id != interruption_request_id
+                    or not invocation_terminal_decision_matches_recovery_profile(
+                        terminal_decision,
+                        session_id=current.id,
+                        session_instance_id=current.instance_id,
+                        current_run_epoch=current.run_epoch,
+                        interaction_id=current_profile.interaction_id,
+                        execution_profile_fingerprint=current_profile.profile.fingerprint,
+                    )
+                )
             )
         ):
             return None
@@ -3306,6 +3335,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         if pending_approval is not None and pending_user_input is not None:
             raise RuntimeError(
@@ -3322,6 +3352,7 @@ class RecoveryCoordinator:
                 tool_round_id=pending_approval.tool_round_id,
                 gating_tool_call_id=pending_approval.tool_call_id,
                 redactor=self._secret_redactor,
+                runtime_session=session,
             )
         if pointer is None:
             if active is not None:
@@ -3397,7 +3428,22 @@ class RecoveryCoordinator:
             assistant_calls = tuple(
                 (part.tool_call_id, part.tool_name, part.arguments) for part in assistant_call_parts
             )
-            if transcript_window.cursor == pointer.transcript_end_cursor:
+            retired_pause = (
+                pending_pause is None
+                and pointer.assistant_message_deferred
+                and transcript_window.cursor == pointer.transcript_end_cursor
+                and await self._model_pause_retired_by_terminal_decision(
+                    session=session,
+                    checkpoint=checkpoint,
+                    pointer=pointer,
+                    completed_stage=completed_stage,
+                )
+            )
+            if retired_pause:
+                # The elected stop atomically retired an unpublished human gate.
+                # Preserve model accounting, but never recreate executable work.
+                pass
+            elif transcript_window.cursor == pointer.transcript_end_cursor:
                 if pending_pause is None:
                     raise RuntimeError(
                         "The latest model completion requires a pending tool round, but its "
@@ -3567,6 +3613,94 @@ class RecoveryCoordinator:
             recovery_events=recovery_events,
             completed_stage=completed_stage.model_copy(deep=True),
             structured_output_events=structured_events,
+        )
+
+    async def _model_pause_retired_by_terminal_decision(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        pointer: model_completion_publication.ModelStepPublicationCheckpoint,
+        completed_stage: ModelCompletionStage,
+    ) -> bool:
+        """Recognize only an exact elected stop of this unpublished model round."""
+        if session.status is not SessionStatus.INTERRUPTING or checkpoint is None:
+            return False
+        decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        payload = checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+        if (
+            decision is None
+            or profile is None
+            or decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+            or type(payload) is not dict
+            or payload != decision.terminal_payload
+            or payload.get("interruption_type") != _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+            or not invocation_terminal_decision_matches_recovery_profile(
+                decision,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                current_run_epoch=session.run_epoch,
+                interaction_id=profile.interaction_id,
+                execution_profile_fingerprint=profile.profile.fingerprint,
+            )
+        ):
+            return False
+        approval_intent = payload.get(approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY)
+        input_intent = payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+        if (approval_intent is None) == (input_intent is None):
+            return False
+        if input_intent is not None:
+            if (
+                await self._validated_user_input_supersession_interrupt_payload(
+                    session=session, pending_interrupt_payload=payload
+                )
+                is None
+            ):
+                return False
+            intent = input_intent
+        else:
+            intent = approval_intent
+            if (
+                type(intent) is not dict
+                or set(intent)
+                != {
+                    "approval_id",
+                    "tool_call_id",
+                    "tool_round_id",
+                    "model_step_id",
+                    "model_attempt_id",
+                }
+                or any(type(value) is not str or not value.strip() for value in intent.values())
+            ):
+                return False
+        publication = completed_stage.publication
+        if publication is None:
+            return False
+        source_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            {
+                operation.key: operation.value
+                for operation in publication.mutation.operations
+                if operation.key == tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY
+                and operation.action == "set"
+            }
+        )
+        return (
+            type(intent) is dict
+            and source_round is not None
+            and source_round.assistant_message_state == "quarantined"
+            and source_round.source_run_epoch == completed_stage.source_run_epoch
+            and source_round.source_model_step_id == pointer.logical_step_id
+            and source_round.source_transcript_cursor == pointer.source_transcript_cursor
+            and source_round.tool_round_id == pointer.tool_round_id
+            and sum(
+                call.tool_call_id == intent.get("tool_call_id") for call in source_round.tool_calls
+            )
+            == 1
+            and intent.get("tool_round_id") == pointer.tool_round_id
+            and intent.get("model_step_id") == pointer.logical_step_id
+            and intent.get("model_attempt_id") == completed_stage.intent.get("model_attempt_id")
+            and publication.interaction_id == decision.interaction_id
         )
 
     async def _reconcile_published_model_budget(
@@ -5025,6 +5159,17 @@ class RecoveryCoordinator:
             "event_ids",
             "referenced_event_ids",
         }
+        if "post_action_continuation_digest" in intent:
+            required_fields.add("post_action_continuation_digest")
+            digest = intent["post_action_continuation_digest"]
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise SessionRuntimePublicationConflict("Invalid action-close continuation digest.")
+        if "foreground_parent_continuation" in intent:
+            required_fields.add("foreground_parent_continuation")
         if (
             receipt.session_id != session.id
             or receipt.publication_id != f"user-input-close:{input_id}"
@@ -5193,6 +5338,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 current_run_epoch=session.run_epoch,
+                runtime_session=session,
             )
         except (TypeError, ValueError, RuntimeError):
             return UserInputPauseState.AMBIGUOUS
@@ -5336,6 +5482,183 @@ class RecoveryCoordinator:
             return UserInputPauseState.AMBIGUOUS
         return UserInputPauseState.SUPERSEDED
 
+    async def _pause_gate_on_child(
+        self,
+        failure,
+        *,
+        session,
+        registered_agent,
+        registered_environment,
+        execution_profile,
+        invocation_context,
+    ):
+        session = await self._session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+        async for event in self._emit_terminal_event_with_hooks(
+            RecoveryTerminalEventRequest(
+                event=event_with_foreground_child_wait_authority(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload=failure.interruption_evidence(),
+                    ),
+                    failure.wait,
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+            )
+        ):
+            yield event
+
+    async def resume_foreground_gate(
+        self,
+        parent: Session,
+        terminal: ForegroundChildTerminal,
+        *,
+        before_mutation: RecoveryMutationHook,
+    ) -> bool:
+        from cayu.runtime._foreground_gate_continuation import load_gate_replay
+
+        replay = await load_gate_replay(self._session_store, parent=parent, terminal=terminal)
+        if replay is None:
+            return False
+        policies = self._foreground_gate_policy_owner.resolve(replay.record)
+        await before_mutation()
+        if replay.record["kind"] == "approval":
+            request = ToolApprovalRequest.model_validate(replay.record["request"]).model_copy(
+                update={"loop_policies": policies}
+            )
+            checkpoint = await self._session_store.load_checkpoint(parent.id)
+            approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+            if approval is None:
+                raise SessionRunFenced("Foreground approval disappeared before continuation.")
+            stream = self._resolve_tool_approval_owned(
+                request,
+                task_id=approval.task_id,
+                before_mutation=before_mutation,
+                foreground_gate=replay,
+            )
+        else:
+            stream = self._resolve_user_input_owned(
+                UserInputResponse.model_validate(replay.record["request"]).model_copy(
+                    update={"loop_policies": policies}
+                ),
+                before_mutation=before_mutation,
+                foreground_gate=replay,
+            )
+        with self._session_control.active_control_ownership(parent.id):
+            async with _close_delegated_event_stream(stream) as owned:
+                async for _ in owned:
+                    pass
+        return True
+
+    async def foreground_gate_continuation_policies(self, parent, continuation):
+        return await self._foreground_gate_policy_owner.for_attached(
+            self._session_store, parent=parent, continuation=continuation
+        )
+
+    def retain_foreground_wait_policies(
+        self, parent: Session, wait: ForegroundChildWait, policies: tuple[LoopPolicy, ...]
+    ) -> None:
+        self._foreground_gate_policy_owner.retain_wait(parent, wait, policies)
+
+    def foreground_wait_policies(
+        self, parent: Session, wait: ForegroundChildWait
+    ) -> tuple[LoopPolicy, ...]:
+        return self._foreground_gate_policy_owner.for_wait(parent, wait)
+
+    def release_foreground_gate_continuation_policies(self, parent, continuation):
+        prefix, action_id = continuation.publication_id.split(":", 1)
+        if prefix in {"approval-close", "user-input-close"}:
+            self._foreground_gate_policy_owner.release(
+                session=parent,
+                kind="approval" if prefix == "approval-close" else "input",
+                action_id=action_id,
+            )
+
+    def release_foreground_gate_interaction(self, session: Session, interaction_id: str) -> None:
+        self._foreground_gate_policy_owner.release_interaction(
+            session=session, interaction_id=interaction_id
+        )
+
+    async def _restore_closed_foreground_gate_policies(
+        self,
+        session: Session,
+        request: ToolApprovalRequest | UserInputResponse | UserInputRecoveryRequest,
+        receipt: RuntimePublicationReceipt,
+    ) -> None:
+        """Restore executable inputs, not execution authority, on exact receipt replay."""
+        from cayu.runtime._foreground_child_continuation import (
+            load_attached_foreground_continuation,
+        )
+        from cayu.runtime._foreground_gate_continuation import validate_gate_restoration_request
+
+        if not request.loop_policies:
+            return
+        attached = await load_attached_foreground_continuation(session, store=self._session_store)
+        if attached is None or attached.publication_id != receipt.publication_id:
+            return
+        effect = attached.terminal.wait.parent_effect
+
+        async def interaction_finished() -> bool:
+            return bool(
+                await self._session_store.query_events(
+                    EventQuery(
+                        session_id=session.id,
+                        interaction_id=effect.interaction_id,
+                        event_types=tuple(INTERACTION_TERMINAL_EVENT_TYPES),
+                        limit=1,
+                    )
+                )
+            )
+
+        # Completed/stopped work keeps its ordinary receipt-only replay contract.
+        if await interaction_finished():
+            return
+        record = await self._foreground_gate_policy_owner.attached_record(
+            self._session_store, parent=session, continuation=attached
+        )
+        validate_gate_restoration_request(record, request, redactor=self._secret_redactor)
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        semantics = attached.request
+        snapshot = await self._validate_execution_profile_continuation(
+            session,
+            checkpoint,
+            self._resolve_registered_agent(session.agent_name),
+            self._resolve_registered_provider(session.provider_name),
+            request.loop_policies,
+            budget_policy=copy_budget_policy(self._resolve_budget_policy()),
+            request_budget_limits=semantics.budget_limits,
+            structured_output=semantics.structured_output,
+            thinking=semantics.thinking,
+            max_steps=semantics.max_steps,
+            limits=semantics.limits,
+            retry_policy=semantics.retry_policy,
+            invocation_semantics_available=True,
+            record_rejection=False,
+        )
+        if (
+            snapshot.interaction_id != effect.interaction_id
+            or snapshot.profile.fingerprint != effect.execution_profile_fingerprint
+        ):
+            raise SessionRunFenced("Policy restoration changed the original invocation authority.")
+        current = await self._session_store.load(session.id)
+        if (
+            current is None
+            or current.instance_id != session.instance_id
+            or current.run_epoch != session.run_epoch
+            or await load_attached_foreground_continuation(current, store=self._session_store)
+            != attached
+        ):
+            raise SessionRunFenced("Attached continuation changed during policy restoration.")
+        if not await interaction_finished():
+            self._foreground_gate_policy_owner.retain(record, request.loop_policies)
+
     async def resolve_user_input(
         self,
         response: UserInputResponse | UserInputRecoveryRequest,
@@ -5343,6 +5666,27 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        with self._session_control.active_control_ownership(response.session_id):
+            async with _close_delegated_event_stream(
+                self._resolve_user_input_owned(
+                    response,
+                    before_mutation=before_mutation,
+                    after_admission=after_admission,
+                    effect_reconciliation=effect_reconciliation,
+                )
+            ) as stream:
+                async for event in stream:
+                    yield event
+
+    async def _resolve_user_input_owned(
+        self,
+        response: UserInputResponse | UserInputRecoveryRequest,
+        *,
+        before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
+        effect_reconciliation: ToolEffectReconciliationRequest | None = None,
+        foreground_gate: GateReplay | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -5353,8 +5697,19 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {response.session_id}")
 
-        answer_request_digest = user_input_answer_request_digest(response)
-        resolution_request_digest = user_input_resolution_request_digest(response)
+        answer_request_digest = (
+            user_input_answer_request_digest(response)
+            if foreground_gate is None
+            else foreground_gate.answer_digest
+        )
+        resolution_request_digest = (
+            user_input_resolution_request_digest(response)
+            if foreground_gate is None
+            else foreground_gate.resolution_digest
+        )
+        resolution_stage = (
+            "answer" if foreground_gate is None else foreground_gate.input_resolution_stage
+        )
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
         close_receipt = await self._session_store.load_runtime_publication_receipt(
             loaded_session.id,
@@ -5380,6 +5735,9 @@ class RecoveryCoordinator:
             )
             if before_mutation is not None:
                 await before_mutation()
+            await self._restore_closed_foreground_gate_policies(
+                loaded_session, response, close_receipt
+            )
             yield closure_event
             return
 
@@ -5388,6 +5746,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=loaded_session.run_epoch,
+            runtime_session=loaded_session,
         )
         if pending is None:
             pause_state = await self._classify_user_input_pause(
@@ -5526,6 +5885,7 @@ class RecoveryCoordinator:
                 current_checkpoint,
                 redactor=self._secret_redactor,
                 current_run_epoch=current_session.run_epoch,
+                runtime_session=current_session,
             )
             if current_pending != pending or current_intent != candidate_intent:
                 raise SessionRuntimePublicationConflict(
@@ -5550,12 +5910,17 @@ class RecoveryCoordinator:
                 current_checkpoint,
                 pending=pending,
                 answer_request_digest=answer_request_digest,
-                resolution_stage="answer",
+                resolution_stage=resolution_stage,
                 resolution_request_digest=resolution_request_digest,
                 claim_run_epoch=current_session.run_epoch + 1,
                 redactor=self._secret_redactor,
-                allow_manual_recovery_to_answer=resume_after_manual_recovery,
+                runtime_session=current_session,
+                allow_manual_recovery_to_answer=(
+                    resume_after_manual_recovery and foreground_gate is None
+                ),
             )
+            if foreground_gate is not None:
+                claimed_checkpoint = foreground_gate.select(current_session, claimed_checkpoint)
             return claimed_checkpoint
 
         async def admit_exact_user_input_execution(claimed_session: Session) -> bool:
@@ -5600,7 +5965,7 @@ class RecoveryCoordinator:
             session=session,
             pending=pending,
             resolution_intent=claimed_intent,
-            resolution_stage="answer",
+            resolution_stage=resolution_stage,
             closure_request_digest=resolution_request_digest,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
@@ -5609,6 +5974,7 @@ class RecoveryCoordinator:
             budget_policy=budget_policy_snapshot,
             invocation_context=invocation_context,
             effect_reconciliation=effect_reconciliation,
+            foreground_gate=foreground_gate,
         )
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -5678,6 +6044,9 @@ class RecoveryCoordinator:
             )
             if before_mutation is not None:
                 await before_mutation()
+            await self._restore_closed_foreground_gate_policies(
+                loaded_session, request, close_receipt
+            )
             yield closure_event
             return
 
@@ -5686,6 +6055,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=loaded_session.run_epoch,
+            runtime_session=loaded_session,
         )
         if pending is None:
             pause_state = await self._classify_user_input_pause(
@@ -5819,6 +6189,7 @@ class RecoveryCoordinator:
                 current_checkpoint,
                 redactor=self._secret_redactor,
                 current_run_epoch=current_session.run_epoch,
+                runtime_session=current_session,
             )
             if current_pending != pending or current_intent != candidate_intent:
                 raise SessionRuntimePublicationConflict(
@@ -5843,6 +6214,7 @@ class RecoveryCoordinator:
                 resolution_request_digest=resolution_request_digest,
                 claim_run_epoch=current_session.run_epoch + 1,
                 redactor=self._secret_redactor,
+                runtime_session=current_session,
                 allow_answer_to_manual_recovery=(
                     current_session.status is SessionStatus.INTERRUPTED
                 ),
@@ -5929,6 +6301,27 @@ class RecoveryCoordinator:
         task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        with self._session_control.active_control_ownership(request.session_id):
+            async with _close_delegated_event_stream(
+                self._resolve_tool_approval_owned(
+                    request,
+                    task_id=task_id,
+                    before_mutation=before_mutation,
+                    after_admission=after_admission,
+                )
+            ) as stream:
+                async for event in stream:
+                    yield event
+
+    async def _resolve_tool_approval_owned(
+        self,
+        request: ToolApprovalRequest,
+        *,
+        task_id: str | None = None,
+        before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
+        foreground_gate: GateReplay | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -6047,6 +6440,9 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
+            await self._restore_closed_foreground_gate_policies(
+                current_session, request, close_receipt
+            )
             await self.materialize_deferred_input_for_receipt(close_receipt)
             yield closure_event
             return
@@ -6058,12 +6454,17 @@ class RecoveryCoordinator:
             tool_round_id=request.tool_round_id,
             gating_tool_call_id=request.tool_call_id,
             redactor=self._secret_redactor,
+            runtime_session=loaded_session,
         )
         candidate_intent = approval_support.approval_resolution_intent_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
         )
-        resolution_request_digest = approval_support.approval_resolution_request_digest(request)
+        resolution_request_digest = (
+            approval_support.approval_resolution_request_digest(request)
+            if foreground_gate is None
+            else foreground_gate.resolution_digest
+        )
         can_create_resolution_intent = True
         try:
             candidate_events = await self._session_store.load_events(loaded_session.id)
@@ -6166,6 +6567,7 @@ class RecoveryCoordinator:
                 tool_round_id=request.tool_round_id,
                 gating_tool_call_id=request.tool_call_id,
                 redactor=self._secret_redactor,
+                runtime_session=_current_session,
             )
             if pending_approval != candidate_approval or pending_round != candidate_round:
                 raise RuntimeError("Pending tool approval changed before it was claimed.")
@@ -6202,9 +6604,14 @@ class RecoveryCoordinator:
                 checkpoint,
                 approval=pending_approval,
                 redactor=self._secret_redactor,
+                runtime_session=_current_session,
             )
             if current_intent is not None:
                 claimed_intent = current_intent
+                if foreground_gate is not None:
+                    claimed_checkpoint = foreground_gate.select(
+                        _current_session, claimed_checkpoint
+                    )
                 return claimed_checkpoint
             intent_decision = request.decision if can_create_resolution_intent else None
             if intent_decision is None:
@@ -6223,6 +6630,7 @@ class RecoveryCoordinator:
                         pending_approval.model_dump(mode="json")
                     )
                 ),
+                runtime_session=_current_session,
             )
             claimed_intent = approval_support.approval_resolution_intent_from_checkpoint(
                 claimed_checkpoint,
@@ -6254,6 +6662,7 @@ class RecoveryCoordinator:
                 tool_round_id=request.tool_round_id,
                 gating_tool_call_id=request.tool_call_id,
                 redactor=self._secret_redactor,
+                runtime_session=loaded_session,
             )
             raise SessionStatusConflict(
                 "Tool approval was claimed by another invocation."
@@ -6282,6 +6691,7 @@ class RecoveryCoordinator:
             deferred_messages=pending_round.deferred_messages,
             claimed_resolution_intent=claimed_intent,
             invocation_context=invocation_context,
+            foreground_gate=foreground_gate,
         )
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -7427,6 +7837,7 @@ class RecoveryCoordinator:
             tool_round_id=request.tool_round_id,
             recovery_tool_call_id=request.tool_call_id,
             redactor=self._secret_redactor,
+            runtime_session=loaded_session,
         )
         candidate_intent = approval_support.approval_resolution_intent_from_checkpoint(
             checkpoint,
@@ -7503,6 +7914,7 @@ class RecoveryCoordinator:
                 tool_round_id=request.tool_round_id,
                 recovery_tool_call_id=request.tool_call_id,
                 redactor=self._secret_redactor,
+                runtime_session=_current_session,
             )
             if pending_approval != candidate_approval or pending_round != candidate_round:
                 raise RuntimeError("Pending tool approval changed before it was claimed.")
@@ -7527,6 +7939,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 approval=pending_approval,
                 redactor=self._secret_redactor,
+                runtime_session=_current_session,
             )
 
         session, resumed_event = await self._transition_recovery_session_to_running(
@@ -7878,6 +8291,7 @@ class RecoveryCoordinator:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=loaded_session,
         )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round.")
@@ -7984,6 +8398,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=loaded_session,
             )
             if pending_round is None or pending_round != original_pending_round:
                 raise RuntimeError(
@@ -8156,6 +8571,7 @@ class RecoveryCoordinator:
                 updated, admitted = checkpoint_with_executing_user_input_resolution_intent(
                     checkpoint,
                     current_run_epoch=current_session.run_epoch,
+                    runtime_session=current_session,
                     pending=pending,
                     intent=resolution_intent,
                     redactor=self._secret_redactor,
@@ -8215,6 +8631,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 current_run_epoch=current_session.run_epoch,
+                runtime_session=current_session,
             )
             if current_pending == pending and current_intent == expected:
                 reconciled = current_intent
@@ -8288,6 +8705,7 @@ class RecoveryCoordinator:
         invocation_context: InvocationContext | None = None,
         emit_resume_event: bool = True,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
+        foreground_gate: GateReplay | None = None,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -8298,7 +8716,11 @@ class RecoveryCoordinator:
             or invocation_context.budget_policy is not budget_policy
         ):
             raise RuntimeError("User-input recovery lost frozen invocation authority.")
-        answer_request_digest = user_input_answer_request_digest(response)
+        answer_request_digest = (
+            user_input_answer_request_digest(response)
+            if foreground_gate is None
+            else foreground_gate.answer_digest
+        )
         if closure_request_digest != resolution_intent.resolution_request_digest:
             raise RuntimeError("User-input continuation closure digest conflicts with its request.")
         require_resolution_intent_matches_pending(
@@ -8346,6 +8768,20 @@ class RecoveryCoordinator:
                 pending=pending,
                 resolution_intent=resolution_intent,
             )
+            if foreground_gate is None and any(
+                (tool := registered_agent.tools.get(call.tool_name)) is not None
+                and tool.child_session_recovery is not None
+                for call in pending.tool_calls
+            ):
+                from cayu.runtime._foreground_gate_continuation import retain_gate_request
+
+                await retain_gate_request(
+                    self._session_store,
+                    session=session,
+                    request=response,
+                    redactor=self._secret_redactor,
+                    policy_owner=self._foreground_gate_policy_owner,
+                )
             transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
             try:
                 transcript = [
@@ -8701,6 +9137,9 @@ class RecoveryCoordinator:
                     pause_payload={"input_id": pending.input_id},
                     idempotency_options={"pause_id": pending.input_id},
                     execution_profile=execution_profile_snapshot.profile,
+                    resume_undispatched_siblings=(
+                        foreground_gate is not None and pause_secret_resolution_scope == "static"
+                    ),
                 )
                 if publication_coordinator is not None
                 else set()
@@ -9038,6 +9477,7 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
                 current_run_epoch=session.run_epoch,
+                runtime_session=session,
             )
             if (
                 current_pending is None
@@ -9091,7 +9531,41 @@ class RecoveryCoordinator:
                 pending=current_pending,
                 intent=resolution_intent,
                 redactor=self._secret_redactor,
+                runtime_session=session,
             )
+            from cayu.runtime._foreground_gate_continuation import gate_close_continuation
+
+            gate_continuation = gate_close_continuation(
+                source_checkpoint,
+                pending=durable_round,
+                publication_id=f"user-input-close:{pending.input_id}",
+                metadata=self._secret_redactor.redact_json_values(response.metadata),
+            )
+            if gate_continuation is not None:
+                target_checkpoint.pop("foreground_child_wait", None)
+                target_checkpoint.pop("foreground_child_terminal", None)
+                target_checkpoint["foreground_parent_continuation"] = gate_continuation
+            from cayu.runtime._foreground_child_wait import (
+                FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+                post_action_continuation_for_close,
+            )
+
+            marker = post_action_continuation_for_close(
+                source_checkpoint,
+                session=session,
+                wait_checkpoint=(
+                    await self._session_store.load_checkpoint(session.parent_session_id)
+                    if session.parent_session_id is not None
+                    else None
+                ),
+                close_publication_id=f"user-input-close:{pending.input_id}",
+                request_metadata=self._secret_redactor.redact_json_values(response.metadata),
+                completed_model_step=_completed_tool_round_model_step(
+                    pending.model_step, max_steps=effective_max_steps
+                ),
+            )
+            if marker is not None:
+                target_checkpoint[FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY] = marker
             close_event = event_with_pending_user_input_authority(
                 event_with_execution_profile_authority(
                     event_with_runtime_payload_authority(
@@ -9134,6 +9608,20 @@ class RecoveryCoordinator:
                     "answer_request_digest": resolution_intent.answer_request_digest,
                     "execution_state": resolution_intent.execution_state,
                     "resolution_request_digest": closure_request_digest,
+                    **(
+                        {"foreground_parent_continuation": gate_continuation}
+                        if gate_continuation is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "post_action_continuation_digest": runtime_publication_checkpoint_value_digest(
+                                marker
+                            )
+                        }
+                        if marker is not None
+                        else {}
+                    ),
                     "tool_call_ids": [call.tool_call_id for call in current_pending.tool_calls],
                     "event_ids": [close_event.id],
                     "referenced_event_ids": [event.id for event in lifecycle_events],
@@ -9186,6 +9674,9 @@ class RecoveryCoordinator:
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
                     run_limit_accounting=continued_run_limit_accounting,
+                    completed_tool_round_model_step=_completed_tool_round_model_step(
+                        pending.model_step, max_steps=effective_max_steps
+                    ),
                     previous_tool_exposure_profile_id=(
                         _continued_tool_exposure_profile_id(pending.tool_exposure)
                     ),
@@ -9214,8 +9705,21 @@ class RecoveryCoordinator:
             except GeneratorExit:
                 await forwarded_stream.aclose()
                 raise
+            self._foreground_gate_policy_owner.release(
+                session=session, kind="input", action_id=pending.input_id
+            )
         except _FinalizedToolEffectRejection:
             raise
+        except ForegroundChildActionRequired as exc:
+            async for event in self._pause_gate_on_child(
+                exc,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            ):
+                yield event
         except Exception as exc:
             if not pending_cleared:
                 # The pending_user_input checkpoint is still present, so restore the resumable
@@ -9454,6 +9958,7 @@ class RecoveryCoordinator:
         pause_payload: dict[str, str],
         idempotency_options: dict[str, str],
         execution_profile: ExecutionProfileIdentity,
+        resume_undispatched_siblings: bool = False,
     ) -> set[str]:
         """Close a partially staged continuation without re-executing siblings."""
 
@@ -9468,6 +9973,15 @@ class RecoveryCoordinator:
         for staged in stages:
             if staged.tool_call_id in recorded_ids or staged.hooks_state == "completed":
                 continue
+            if (
+                resume_undispatched_siblings
+                and staged.staged_at is not None
+                and staged.publication_started_at is None
+            ):
+                # The owned stage was never published or exposed to terminal
+                # hooks. With static scope, normal publication can still run
+                # those hooks once without replacing the accepted input result.
+                continue
             unavailable = tool_round_recovery.hook_scope_unavailable_recovery_event(staged.event)
             await self._session_store.transform_checkpoint(
                 session.id,
@@ -9476,6 +9990,13 @@ class RecoveryCoordinator:
                     event=unavailable,
                 ),
             )
+
+        if resume_undispatched_siblings:
+            # The exact delegated gate has a positively static secret scope.
+            # Existing stages still receive the conservative hook projection
+            # above; remaining calls re-enter their normal effect/dispatch owners.
+            # Dynamic or unknown scopes never take this continuation entrance.
+            return staged_ids
 
         for tool_call in tool_calls:
             if tool_call.id in recorded_ids or tool_call.id in staged_ids:
@@ -9694,6 +10215,7 @@ class RecoveryCoordinator:
         claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None = None,
         recovery_closure_only: bool = False,
         invocation_context: InvocationContext | None = None,
+        foreground_gate: GateReplay | None = None,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -9716,7 +10238,11 @@ class RecoveryCoordinator:
         publication_coordinator: _ToolRoundPublicationCoordinator | None = None
         expired = False
         original_resolution_decision = request.decision
-        resolution_request_digest = approval_support.approval_resolution_request_digest(request)
+        resolution_request_digest = (
+            approval_support.approval_resolution_request_digest(request)
+            if foreground_gate is None
+            else foreground_gate.resolution_digest
+        )
         deferred_messages = (
             []
             if deferred_messages is None
@@ -9815,6 +10341,7 @@ class RecoveryCoordinator:
                 current_checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=session,
             )
             if (
                 publication_round is None
@@ -9874,6 +10401,29 @@ class RecoveryCoordinator:
             ):
                 raise RuntimeError(
                     "Tool approval was already claimed with a different resolution request."
+                )
+            if (
+                not recovery_closure_only
+                and foreground_gate is None
+                and any(
+                    (tool := registered_agent.tools.get(call.tool_name)) is not None
+                    and tool.child_session_recovery is not None
+                    for call in approval_support.pending_round_tool_calls(pending_approval)
+                )
+            ):
+                from cayu.runtime._foreground_gate_continuation import retain_gate_request
+
+                # An exact public retry may restore application-versioned live
+                # policies after restart. Retain them before native reattachment
+                # can defer to terminal delivery, which requires this owner to
+                # select the child outcome. Profile and request identity have
+                # already been validated; selection remains delivery-owned.
+                await retain_gate_request(
+                    self._session_store,
+                    session=session,
+                    request=request,
+                    redactor=self._secret_redactor,
+                    policy_owner=self._foreground_gate_policy_owner,
                 )
             native_events = await self._recover_terminal_foreground_effects_at_human_gate(
                 session=session,
@@ -10277,6 +10827,9 @@ class RecoveryCoordinator:
                     pause_payload={"approval_id": pending_approval.approval_id},
                     idempotency_options={"approval_id": pending_approval.approval_id},
                     execution_profile=execution_profile_snapshot.profile,
+                    resume_undispatched_siblings=(
+                        foreground_gate is not None and pause_secret_resolution_scope == "static"
+                    ),
                 )
                 if publication_coordinator is not None
                 else set()
@@ -10625,6 +11178,7 @@ class RecoveryCoordinator:
                 source_checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=session,
             )
             if durable_round is None or (
                 durable_round.tool_round_id,
@@ -10675,7 +11229,39 @@ class RecoveryCoordinator:
                 source_checkpoint,
                 approval=pending_approval,
                 redactor=self._secret_redactor,
+                runtime_session=session,
             )
+            from cayu.runtime._foreground_gate_continuation import gate_close_continuation
+
+            gate_continuation = gate_close_continuation(
+                source_checkpoint,
+                pending=durable_round,
+                publication_id=f"approval-close:{pending_approval.approval_id}",
+                metadata=self._secret_redactor.redact_json_values(request.metadata),
+            )
+            if gate_continuation is not None:
+                target_checkpoint["foreground_parent_continuation"] = gate_continuation
+            from cayu.runtime._foreground_child_wait import (
+                FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+                post_action_continuation_for_close,
+            )
+
+            marker = post_action_continuation_for_close(
+                source_checkpoint,
+                session=session,
+                wait_checkpoint=(
+                    await self._session_store.load_checkpoint(session.parent_session_id)
+                    if session.parent_session_id is not None
+                    else None
+                ),
+                close_publication_id=f"approval-close:{pending_approval.approval_id}",
+                request_metadata=self._secret_redactor.redact_json_values(request.metadata),
+                completed_model_step=_completed_tool_round_model_step(
+                    durable_round.model_step, max_steps=effective_max_steps
+                ),
+            )
+            if marker is not None:
+                target_checkpoint[FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY] = marker
             clear_event = approval_support.cleared_event(
                 session=session,
                 agent_name=registered_agent.spec.name,
@@ -10694,6 +11280,20 @@ class RecoveryCoordinator:
                     "decision": request.decision.value,
                     "requested_decision": original_resolution_decision.value,
                     "resolution_request_digest": resolution_request_digest,
+                    **(
+                        {"foreground_parent_continuation": gate_continuation}
+                        if gate_continuation is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "post_action_continuation_digest": runtime_publication_checkpoint_value_digest(
+                                marker
+                            )
+                        }
+                        if marker is not None
+                        else {}
+                    ),
                     "tool_call_ids": [call.tool_call_id for call in durable_round.tool_calls],
                     "approval_digest": runtime_publication_checkpoint_value_digest(
                         pending_approval.model_dump(mode="json")
@@ -10756,6 +11356,9 @@ class RecoveryCoordinator:
                     start_task_on_enter=False,
                     release_run_fence_on_exit=False,
                     run_limit_accounting=continued_run_limit_accounting,
+                    completed_tool_round_model_step=_completed_tool_round_model_step(
+                        durable_round.model_step, max_steps=effective_max_steps
+                    ),
                     previous_tool_exposure_profile_id=(
                         _continued_tool_exposure_profile_id(durable_round.tool_exposure)
                     ),
@@ -10784,6 +11387,9 @@ class RecoveryCoordinator:
             except GeneratorExit:
                 await forwarded_stream.aclose()
                 raise
+            self._foreground_gate_policy_owner.release(
+                session=session, kind="approval", action_id=pending_approval.approval_id
+            )
         except GeneratorExit:
             await self.finalize_abandoned_session_by_id(
                 session.id,
@@ -10793,6 +11399,16 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
             )
             raise
+        except ForegroundChildActionRequired as exc:
+            async for event in self._pause_gate_on_child(
+                exc,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+            ):
+                yield event
         except Exception as exc:
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self._session_store.update_status(
@@ -11823,24 +12439,9 @@ class RecoveryCoordinator:
         authoritative_failure = None
         abandoned = False
         try:
-            response = UserInputResponse(
-                review_reference=request.answer_review_reference or request.review_reference,
-                session_id=request.session_id,
-                task_worker_id=request.task_worker_id,
-                input_id=request.input_id,
-                answer=request.answer,
-                structured=request.structured,
-                artifacts=request.artifacts,
-                metadata=request.metadata,
-                resolved_by=request.resolved_by,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=request.retry_policy,
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                loop_policies=request.loop_policies,
-            )
+            from cayu.runtime._foreground_gate_continuation import gate_input_response_from_recovery
+
+            response = gate_input_response_from_recovery(request)
             continuation_stream = self.continue_user_input_resolution(
                 response=response,
                 session=session,
@@ -12431,6 +13032,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=session,
             )
             if current_round is None:
                 raise RuntimeError("Session has no pending tool round.")
@@ -14394,6 +14996,7 @@ class RecoveryCoordinator:
         request_metadata: dict[str, Any],
         task_worker_id: str | None,
         task_handoff_id: str | None,
+        completed_model_step: int | None = None,
     ) -> RecoverySessionRunRequest:
         """Restore a claimed round without deciding its outcome or acquiring a new owner.
 
@@ -14444,6 +15047,10 @@ class RecoveryCoordinator:
             start_task_on_enter=False,
             release_run_fence_on_exit=False,
             run_limit_accounting=continued_run_limit_accounting,
+            completed_tool_round_model_step=_completed_tool_round_model_step(
+                pending_round.model_step if completed_model_step is None else completed_model_step,
+                max_steps=invocation_semantics.max_steps,
+            ),
             previous_tool_exposure_profile_id=(
                 _continued_tool_exposure_profile_id(pending_round.tool_exposure)
             ),
@@ -15470,6 +16077,7 @@ class RecoveryCoordinator:
                 result = await self._reattached_subagent_result(
                     children,
                     idempotency_key,
+                    parent_checkpoint=source_checkpoint,
                     tool_call_id=outcome.call.id,
                     tool_name=outcome.call.name,
                     tool_round_id=tool_round_id,
@@ -15544,6 +16152,7 @@ class RecoveryCoordinator:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         if pending_round is None:
             return
@@ -15568,7 +16177,10 @@ class RecoveryCoordinator:
                 yield event
             checkpoint = await self._session_store.load_checkpoint(session.id)
             recovered_pending = tool_round_recovery.pending_tool_round_from_checkpoint(
-                checkpoint, redactor=self._secret_redactor, consume_on_rejection=True
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+                runtime_session=session,
             )
             if recovered_pending is None or (
                 tool_round_recovery.pending_tool_round_identity(recovered_pending)
@@ -16122,6 +16734,7 @@ class RecoveryCoordinator:
                 result = await self._reattached_subagent_result(
                     subagent_children,
                     expected_idempotency_key,
+                    parent_checkpoint=subagent_recovery_checkpoint,
                     tool_call_id=pending_tool_call.tool_call_id,
                     tool_name=pending_tool_call.tool_name,
                     tool_round_id=pending_round.tool_round_id,
@@ -16967,7 +17580,12 @@ class RecoveryCoordinator:
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> IncompleteSessionRecoveryResult:
-        """Repair one incomplete session without executing providers or tools."""
+        """Repair incomplete state, including an exact post-close child continuation.
+
+        Closed tools are never replayed. A retained foreground action-close
+        marker can authorize the next model step only after profile admission
+        and a fenced recovery claim; uncertain model work retains its own gate.
+        """
         if _work_attempt is not None:
             if type(_work_attempt) is not WorkAttemptInvocationAuthority:
                 raise TypeError("Governed recovery requires authenticated work-attempt authority.")
@@ -17764,12 +18382,133 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
+        from cayu.runtime._foreground_child_wait import (
+            FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+            post_action_continuation_from_checkpoint,
+        )
+
+        post_action_transfer: CheckpointTransform | None = None
+        post_action_round: tool_round_recovery.PendingToolRound | None = None
+        post_action = post_action_continuation_from_checkpoint(checkpoint)
+        if post_action is not None:
+            latest_model = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_type=EventType.MODEL_STARTED,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            # Once a later model attempt is durable, its normal recovery owner
+            # takes over. A retained close marker must never rewind that work.
+            if (
+                session.status is not SessionStatus.RUNNING
+                or await self._session_store.load_active_model_completion_stage(session.id)
+                is not None
+                or (
+                    latest_model
+                    and latest_model[0].event.payload.get("model_step_id")
+                    != post_action.pending_tool_round.get("model_step_id")
+                )
+            ):
+                post_action = None
+        if post_action is not None:
+            if (
+                post_action.wait.child_session_id != session.id
+                or post_action.wait.child_session_instance_id != session.instance_id
+            ):
+                raise RuntimeError("Post-action continuation targets another child session.")
+            parent = await self._session_store.load(post_action.wait.parent_effect.session_id)
+            if (
+                parent is None
+                or parent.id != session.parent_session_id
+                or parent.instance_id != post_action.wait.parent_effect.session_instance_id
+            ):
+                raise RuntimeError("Post-action continuation lost its parent incarnation.")
+            parent_effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                parent,
+                tool_round_id=post_action.wait.parent_effect.tool_round_id,
+                tool_call_id=post_action.wait.parent_effect.tool_call_id,
+            )
+            if parent_effect is None or parent_effect.intent != post_action.wait.parent_effect:
+                raise RuntimeError("Post-action continuation lost its exact parent effect.")
+            close_receipt = await self._session_store.load_runtime_publication_receipt(
+                session.id, post_action.close_publication_id
+            )
+            expected_kind = (
+                "approval-close"
+                if post_action.action_kind == "tool_approval"
+                else "user-input-close"
+            )
+            if (
+                close_receipt is None
+                or close_receipt.kind != expected_kind
+                or close_receipt.session_id != session.id
+                or close_receipt.publication_id != post_action.close_publication_id
+                or close_receipt.intent.get("post_action_continuation_digest")
+                != runtime_publication_checkpoint_value_digest(post_action.model_dump(mode="json"))
+                or close_receipt.interaction_id != post_action.wait.child_interaction_id
+                or any(
+                    close_receipt.intent.get(field) != post_action.pending_tool_round.get(field)
+                    for field in ("tool_round_id", "model_step_id", "model_attempt_id")
+                )
+                or post_action.continuation_revision != post_action.wait.revision
+                or close_receipt.intent.get(
+                    "approval_id" if expected_kind == "approval-close" else "input_id"
+                )
+                != post_action.action_id
+            ):
+                raise RuntimeError("Post-action continuation lacks exact close authority.")
+            if pending_tool_round is not None:
+                raise RuntimeError("Post-action continuation conflicts with a live tool round.")
+            marker_value = post_action.model_dump(mode="json")
+            restored = copy_json_value(post_action.pending_tool_round, "post_action.pending_round")
+
+            def claim_post_action(
+                current_session: Session, current: dict[str, Any] | None
+            ) -> dict[str, Any] | None:
+                if (
+                    current_session.instance_id != session.instance_id
+                    or current_session.run_epoch != session.run_epoch
+                    or current is None
+                    or current.get(FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY) != marker_value
+                    or tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY in current
+                ):
+                    raise _IncompleteRecoveryClaimLost(
+                        "Post-action continuation was already claimed or changed."
+                    )
+                updated = copy_json_value(current, "post_action.claimed_checkpoint")
+                # Keep the marker across claim acknowledgement loss or process
+                # death before the next model dispatch. The closed round is not
+                # pending work and must never be republished or replayed.
+                return updated
+
+            # Inspect the completed round without publishing pending work.
+            # Its exact marker is checked inside the admitted epoch claim below;
+            # recovery planning must remain entirely read-only.
+            post_action_transfer = claim_post_action
+            post_action_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                {tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY: restored},
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+                runtime_session=session,
+            )
+            if (
+                post_action_round is None
+                or active_invocation_profile is None
+                or post_action_round.execution_profile_fingerprint
+                != active_invocation_profile.profile.fingerprint
+                or post_action.wait.child_interaction_id != active_invocation_profile.interaction_id
+            ):
+                raise RuntimeError("Post-action continuation conflicts with its invocation.")
         workspace_observations = workspace_observations_from_checkpoint(checkpoint)
         self._validate_workspace_observation_recovery_authority(
             session=session,
@@ -18039,13 +18778,27 @@ class RecoveryCoordinator:
                 )
 
             provider_execution_transfer = transfer_provider_execution
+
+        def transfer_recovery_checkpoint(
+            current_session: Session, current: dict[str, Any] | None
+        ) -> dict[str, Any] | None:
+            if post_action_transfer is not None:
+                current = post_action_transfer(current_session, current)
+            if provider_execution_transfer is not None:
+                current = provider_execution_transfer(current_session, current)
+            return current
+
         try:
             await admit_before_mutation()
             claim = await self._claim_incomplete_recovery(
                 session=session,
                 inactive_for_seconds=inactive_for_seconds,
                 execution_profile_snapshot=execution_profile_snapshot,
-                checkpoint_transform=provider_execution_transfer,
+                checkpoint_transform=(
+                    transfer_recovery_checkpoint
+                    if post_action_transfer is not None or provider_execution_transfer is not None
+                    else None
+                ),
             )
             if claim is None:
                 current = await self._require_session(session.id)
@@ -18072,6 +18825,57 @@ class RecoveryCoordinator:
                 await provider_disposition_after_admission()
 
             async def recover_claimed_session() -> IncompleteSessionRecoveryResult:
+                if post_action_round is not None and post_action is not None:
+                    if invocation_context is None:
+                        raise RuntimeError("Post-action continuation lost invocation authority.")
+                    if post_action_round.limits is None or post_action_round.budget_limits is None:
+                        raise RuntimeError("Post-action continuation lost its original limits.")
+                    continuation = await self._prepare_recovered_tool_round_continuation(
+                        session=claim.session,
+                        pending_round=post_action_round,
+                        invocation_semantics=_RecoveryInvocationSemantics(
+                            max_steps=_require_recovery_max_steps(post_action_round.max_steps),
+                            limits=post_action_round.limits,
+                            budget_limits=post_action_round.budget_limits,
+                            retry_policy=self._effective_retry_policy(
+                                post_action_round.retry_policy
+                            ),
+                            structured_output=post_action_round.structured_output,
+                            thinking=post_action_round.thinking,
+                        ),
+                        invocation_context=invocation_context,
+                        request_metadata=post_action.request_metadata,
+                        task_worker_id=None,
+                        task_handoff_id=None,
+                        completed_model_step=post_action.completed_model_step,
+                    )
+                    stream = self._run_session(continuation)
+                    async with _close_delegated_event_stream(stream) as owned_stream:
+                        events = [event async for event in owned_stream]
+
+                    def retire_close_marker(
+                        _session: Session, current: dict[str, Any] | None
+                    ) -> dict[str, Any] | None:
+                        if (
+                            current is None
+                            or current.get(FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY)
+                            != marker_value
+                        ):
+                            return current
+                        updated = copy_json_value(current, "post_action.completed_checkpoint")
+                        updated.pop(FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY)
+                        return updated
+
+                    await self._session_store.transform_checkpoint(session.id, retire_close_marker)
+                    current_session = await self._require_session(session.id)
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=current_session.status,
+                        actions=(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,),
+                        events=tuple(events),
+                        message="Continued the foreground child after its committed action close.",
+                    )
                 if pending_allocations:
                     if (
                         registered_environment is None
@@ -18273,7 +19077,7 @@ class RecoveryCoordinator:
             checkpoint=checkpoint,
         ):
             return session, checkpoint
-        if self._session_control.has_active_tasks(session.id):
+        if self._session_control.has_active_tasks(session.id, exclude_current_control_task=True):
             raise RuntimeError(
                 f"Session has active work while terminal evidence is incomplete: {session.id}"
             )
@@ -18345,11 +19149,13 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         approval_owns_tool_round = False
         if pending_approval is not None and pending_tool_round is not None:
@@ -18359,6 +19165,7 @@ class RecoveryCoordinator:
                 tool_round_id=pending_approval.tool_round_id,
                 gating_tool_call_id=pending_approval.tool_call_id,
                 redactor=self._secret_redactor,
+                runtime_session=session,
             )
             approval_owns_tool_round = True
         pending_actions = tuple(
@@ -20170,13 +20977,21 @@ class RecoveryCoordinator:
         """Observe another worker's durable stop request while delivery is paused."""
         while not stop.is_set():
             session = await self._require_session(session_id)
-            local_run_handles_interrupt = bool(self._session_control.active_runs(session_id)) and (
-                self._session_control.is_interruption_request_active(session_id)
-                or self._session_control.interrupt_signalled(session_id)
+            local_run_handles_interrupt = self._session_control.is_emitting_interrupted(
+                session_id
+            ) or (
+                bool(self._session_control.active_runs(session_id))
+                and (
+                    self._session_control.is_interruption_request_active(session_id)
+                    or self._session_control.interrupt_signalled(session_id)
+                )
             )
             # Local operator dispatch owns cancellation of the active run. The
             # durable watcher must not race it with a second cancellation while
             # that run is publishing its terminal evidence.
+            # Publication unregisters the execution task before its first await;
+            # the local emission owner remains authoritative until publication
+            # and its cleanup finish.
             if session.status == SessionStatus.INTERRUPTING and not local_run_handles_interrupt:
                 return True
             if session.status == SessionStatus.INTERRUPTED and not local_run_handles_interrupt:
@@ -20238,20 +21053,28 @@ class RecoveryCoordinator:
         session_id: str,
         claim_id: str,
     ) -> None:
+        no_owned_claim = _IncompleteRecoveryClaimLost("Recovery claim is no longer retained.")
+
         def release_claim(
             _session: Session,
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
             if checkpoint is None:
-                return None
+                raise no_owned_claim
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
             if existing is None or existing[0] != claim_id:
-                return None
+                raise no_owned_claim
             updated = copy_durable_record(checkpoint, "checkpoint")
             updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
             return updated
 
-        await self._session_store.transform_checkpoint(session_id, release_claim)
+        try:
+            await self._session_store.transform_checkpoint(session_id, release_claim)
+        except _IncompleteRecoveryClaimLost as failure:
+            if failure is not no_owned_claim:
+                raise
+            # Returning an unchanged checkpoint can still update last_activity_at.
+            # A stale owner must abort the transaction, not touch its successor.
 
     async def _recover_workspace_observations(
         self,
@@ -20281,6 +21104,7 @@ class RecoveryCoordinator:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         # Revalidate the complete aggregate after the recovery claim. Otherwise
         # a valid record ordered before a foreign record could be terminalized
@@ -20718,6 +21542,7 @@ class RecoveryCoordinator:
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
+            runtime_session=session,
         )
         if pending_round is None:
             return None
@@ -20783,6 +21608,7 @@ class RecoveryCoordinator:
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
+            runtime_session=session,
         )
         matching_raw_stages = []
         matching_safe_stages = []
@@ -21015,6 +21841,7 @@ class RecoveryCoordinator:
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
+            runtime_session=session,
         )
         matching_raw_stages = (
             []
@@ -21888,11 +22715,13 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         environment_name = _environment_name(registered_environment)
 
@@ -22259,6 +23088,19 @@ class RecoveryCoordinator:
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
 
+            if settled_invocation_terminal_decision_from_checkpoint(checkpoint) is not None:
+                # Terminal repair already authenticated and published the exact
+                # winner. Its retired human gate is not missing executable work:
+                # do not re-enter model reconciliation after repairing closure.
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=tuple(actions),
+                    events=tuple(events),
+                    message="Recovered the committed terminal decision without redispatch.",
+                )
+
         if inactive_for_seconds is not None:
             events.append(
                 await self._event_writer.emit(
@@ -22417,6 +23259,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         if pending_user_input is not None:
@@ -22579,6 +23422,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=session,
             )
 
         workspace_recovery_events = await self._recover_workspace_observations(
@@ -22598,6 +23442,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=session,
             )
 
         if pending_tool_round is not None and pending_approval is None:
@@ -22814,6 +23659,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         if pending_user_input is not None:
             pause_state = await self._classify_user_input_pause(
@@ -22958,6 +23804,7 @@ class RecoveryCoordinator:
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
+                runtime_session=current_session,
             )
             if (
                 current is None
@@ -23180,6 +24027,7 @@ class RecoveryCoordinator:
             result = await self._reattached_subagent_result(
                 children,
                 key,
+                parent_checkpoint=checkpoint,
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 tool_round_id=pending.tool_round_id,
@@ -23417,11 +24265,12 @@ class RecoveryCoordinator:
                 children[idempotency_key] = reconciled
         return None
 
-    @staticmethod
     async def _reattached_subagent_result(
+        self,
         children: dict[str, Session | None],
         idempotency_key: str,
         *,
+        parent_checkpoint: dict[str, Any] | None,
         tool_call_id: str,
         tool_name: str,
         tool_round_id: str,
@@ -23443,29 +24292,122 @@ class RecoveryCoordinator:
         matcher = registered_agent.tools[tool_name].child_session_recovery
         assert matcher is not None
         subagent_metadata = child.metadata.get("subagent")
+        child_action_pending = False
+        from cayu.runtime._foreground_child_wait import owned_delegated_wait
+
         if (
             type(subagent_metadata) is dict
             and subagent_metadata.get("mode") == "foreground"
-            and child.status
-            in {
-                SessionStatus.PENDING,
-                SessionStatus.RUNNING,
-                SessionStatus.INTERRUPTING,
-            }
+            and child.status == SessionStatus.INTERRUPTED
+        ):
+            from cayu.runtime.pending_actions import pending_action_evidence_round_from_checkpoint
+
+            child_checkpoint = await self._session_store.load_checkpoint(child.id)
+            child_action_pending = (
+                await owned_delegated_wait(
+                    self._session_store, child=child, checkpoint=child_checkpoint
+                )
+                is not None
+            )
+            # Validate the entire topology before deciding that an interrupted
+            # child is terminal. Approval/input pauses remain child-owned and
+            # cannot be converted into a recovered parent tool result.
+            pending_action_evidence_round_from_checkpoint(child_checkpoint)
+            child_action_pending = (
+                child_action_pending
+                or approval_support.pending_approval_from_checkpoint(child_checkpoint) is not None
+                or user_input_lifecycle_authority_from_checkpoint(
+                    child_checkpoint, current_run_epoch=child.run_epoch
+                )[0]
+                is not None
+            )
+        if type(subagent_metadata) is dict and subagent_metadata.get("mode") == "foreground":
+            from cayu.runtime._foreground_child_wait import (
+                ForegroundChildActionRequired,
+                observe_foreground_child_wait,
+                retain_foreground_child_wait,
+            )
+
+            effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                parent_session, tool_round_id=tool_round_id, tool_call_id=tool_call_id
+            )
+            if effect is not None:
+                recovered_wait = await observe_foreground_child_wait(
+                    self._session_store,
+                    parent=parent_session,
+                    intent=effect.intent,
+                    matcher=matcher,
+                    arguments=arguments,
+                )
+                if recovered_wait is not None:
+                    await retain_foreground_child_wait(
+                        self._session_store,
+                        parent=parent_session,
+                        effect=effect,
+                        wait=recovered_wait,
+                    )
+                    raise ForegroundChildActionRequired(recovered_wait)
+        if (
+            type(subagent_metadata) is dict
+            and subagent_metadata.get("mode") == "foreground"
+            and (
+                child_action_pending
+                or child.status
+                in {
+                    SessionStatus.PENDING,
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                }
+            )
         ):
             raise ForegroundSubagentRecoveryRequired(
                 child_session_id=child.id, tool_round_id=tool_round_id, tool_call_id=tool_call_id
             )
-        projected = await matcher.project_recoverable_child(child.model_copy(deep=True))
-        if projected is not None:
-            if type(projected) is not ToolResult:
-                raise TypeError("Child result projection must return a ToolResult or None.")
-            return projected.model_copy(deep=True)
-        return tool_round_recovery.recovered_subagent_tool_result(
+        from cayu.runtime._foreground_child_wait import (
+            foreground_child_state_from_checkpoint,
+        )
+
+        wait, selected = foreground_child_state_from_checkpoint(parent_checkpoint)
+        if wait is not None and wait.parent_effect.idempotency_key == idempotency_key:
+            if selected is None:
+                raise ForegroundSubagentRecoveryRequired(
+                    child_session_id=child.id,
+                    tool_round_id=tool_round_id,
+                    tool_call_id=tool_call_id,
+                )
+            effect = await ToolEffectStateOwner(self._session_store).resolve_call(
+                parent_session, tool_round_id=tool_round_id, tool_call_id=tool_call_id
+            )
+            outcome = await self._session_store.summarize_outcome(child.id)
+            terminal_event = (
+                None if outcome.terminal_event is None else outcome.terminal_event.event
+            )
+            if (
+                selected.wait != wait
+                or effect is None
+                or effect.intent != wait.parent_effect
+                or child.id != wait.child_session_id
+                or child.instance_id != wait.child_session_instance_id
+                or child.run_epoch != selected.child_released_run_epoch
+                or terminal_event is None
+                or terminal_event.id != selected.event_id
+                or terminal_event.type != selected.event_type
+                or sha256(
+                    canonical_durable_json_bytes(
+                        terminal_event.model_dump(mode="json"), "foreground_child_terminal"
+                    )
+                ).hexdigest()
+                != selected.event_digest
+            ):
+                raise RuntimeError("Foreground recovery conflicts with its selected child outcome.")
+        from cayu.runtime._foreground_subagent_recovery import project_authenticated_child_result
+
+        return await project_authenticated_child_result(
+            matcher,
+            child,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             tool_round_id=tool_round_id,
-            child=child,
         )
 
 

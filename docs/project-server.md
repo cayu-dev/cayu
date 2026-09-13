@@ -6,6 +6,27 @@ project. The command follows the
 one synchronous, zero-argument factory call creates one process-scoped
 `CayuApp`. Durable stores coordinate separate processes.
 
+## Resolve a foreground child's pending action
+
+Query `GET /api/pending-actions?session_id=<parent>&kind=delegated_action` to
+discover the exact child action holding a foreground parent. The bounded
+`delegated_action` reference contains `child_session_id`, `action_kind`,
+`action_id`, and `status`; it contains no child question, arguments, or answer.
+The dashboard's **Open child** link leads to the action's owning session.
+For a nested foreground chain, `action_kind="delegated_action"` means the
+immediate child is also waiting on a child. Follow its pending-action reference
+until reaching the approval/input owner; ancestor references cannot resolve it.
+
+Inspect the child, then use `POST /api/tool-approvals/resolve` or
+`POST /api/user-input/resolve` with the child's identifiers and the normal
+resolution request. The parent reference is discovery, not bearer authority:
+the same authentication, policy, actor, and exact-action checks apply as for a
+direct child resolution. There is no independently resolvable parent copy.
+After the child eventually finishes, durable delivery continues the original
+parent call automatically; do not submit unrelated input to wake the parent.
+If the child asks again, `session.delegated_action.updated` refreshes parent
+discovery without ending another parent run or interaction.
+
 ## Serve the control plane
 
 For trusted local development, open access requires an explicit opt-in:

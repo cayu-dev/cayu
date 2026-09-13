@@ -1813,7 +1813,7 @@ async def test_whitespace_stream_has_chunk_independent_semantic_bound(
     assert accepted == ([initial_text] if initial_text else []) + expected
     evidence = captured.value.deadline_evidence
     assert evidence.deadline_kind is ProviderDeadlineKind.SEMANTIC_IDLE
-    assert evidence.elapsed_s == 4
+    assert evidence.elapsed_s == pytest.approx(4, rel=0, abs=1e-9)
     assert evidence.last_progress_kind is (ProviderProgressKind.CONTENT if initial_text else None)
     assert evidence.last_progress_elapsed_s == (0 if initial_text else None)
     assert evidence.whitespace_since_progress is True
@@ -1882,11 +1882,13 @@ def test_text_whitespace_policy_does_not_apply_to_structured_progress(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("clock_start", [None, 511.99999999999994])
 async def test_meaningful_stream_still_reaches_absolute_fake_clock_bound(
     monkeypatch: pytest.MonkeyPatch,
+    clock_start: float | None,
 ) -> None:
     loop = asyncio.get_running_loop()
-    now = loop.time()
+    now = loop.time() if clock_start is None else clock_start
     monkeypatch.setattr(loop, "time", lambda: now)
 
     async def events() -> AsyncIterator[ModelStreamEvent]:
@@ -1904,8 +1906,10 @@ async def test_meaningful_stream_still_reaches_absolute_fake_clock_bound(
             pass
     evidence = captured.value.deadline_evidence
     assert evidence.deadline_kind is ProviderDeadlineKind.ABSOLUTE
-    assert evidence.elapsed_s == 5
-    assert evidence.last_progress_elapsed_s == 4
+    # Subtraction across a floating-point exponent boundary need not produce
+    # an exact integer, even when every fake-clock increment is one second.
+    assert evidence.elapsed_s == pytest.approx(5, rel=0, abs=1e-9)
+    assert evidence.last_progress_elapsed_s == pytest.approx(4, rel=0, abs=1e-9)
     assert evidence.whitespace_since_progress is False
 
 

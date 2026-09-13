@@ -1384,6 +1384,7 @@ _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
         'tool.call.approval_requested',
         'session.awaiting_user_input',
         'session.interrupted',
+        'session.delegated_action.updated',
         'tool.call.started',
         'tool.call.completed',
         'tool.call.failed',
@@ -6702,6 +6703,25 @@ class SQLiteSessionStore(SessionStore):
 
         return await self._run_read(statement)
 
+    async def _load_historical_interaction_settlement_record(
+        self, session_id: str, event_id: str
+    ) -> dict[str, Any] | None:
+        key = _interaction_transition_storage_key(event_id)
+
+        def statement(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT record_json FROM cayu_session_operations "
+                "WHERE session_id = ? AND idempotency_key = ?",
+                (session_id, key),
+            ).fetchone()
+            return (
+                None
+                if row is None
+                else copy_durable_json_object(json.loads(row["record_json"]), "settlement")
+            )
+
+        return await self._run_read(statement)
+
     async def _load_interaction_transition_receipt_by_event_id(
         self,
         session_id: str,
@@ -7490,6 +7510,70 @@ class SQLiteSessionStore(SessionStore):
             retry_delay_seconds=(None if dead_lettered else float(retry_delay_seconds)),
         )
 
+    async def defer_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        return await self._finish_persisted_event_side_effect_claim(
+            claim,
+            status=PersistedEventSideEffectStatus.PENDING,
+            error=None,
+            retry_delay_seconds=None,
+            deferred=True,
+        )
+
+    async def renew_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        if type(lease_seconds) not in {int, float} or not 0 < lease_seconds <= 86_400:
+            raise ValueError("lease_seconds must be positive and at most 86400.")
+
+        def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectDelivery:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = self._ownership_clock()
+                cursor = connection.execute(
+                    "UPDATE cayu_persisted_event_side_effects "
+                    "SET lease_expires_at = MAX(lease_expires_at, ?), updated_at = ? "
+                    "WHERE session_id = ? AND event_id = ? AND status = 'leased' "
+                    "AND claim_id = ? AND attempts = ? AND lease_expires_at > ?",
+                    (
+                        sqlite_support.format_datetime(
+                            now + timedelta(seconds=float(lease_seconds))
+                        ),
+                        sqlite_support.format_datetime(now),
+                        claim.session_id,
+                        claim.event_id,
+                        claim.claim_id,
+                        claim.attempt,
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise PersistedEventSideEffectClaimLost(
+                        "Persisted event side-effect claim is no longer active."
+                    )
+                row = connection.execute(
+                    "SELECT * FROM cayu_persisted_event_side_effects "
+                    "WHERE session_id = ? AND event_id = ?",
+                    (claim.session_id, claim.event_id),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("Persisted event side-effect delivery disappeared.")
+                delivery = _persisted_event_side_effect_delivery_from_row(row)
+                connection.commit()
+                return delivery
+            except Exception:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
+
     async def _finish_persisted_event_side_effect_claim(
         self,
         claim: PersistedEventSideEffectClaim,
@@ -7497,6 +7581,7 @@ class SQLiteSessionStore(SessionStore):
         status: PersistedEventSideEffectStatus,
         error: str | None,
         retry_delay_seconds: float | None,
+        deferred: bool = False,
     ) -> PersistedEventSideEffectDelivery:
         def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectDelivery:
             try:
@@ -7510,7 +7595,7 @@ class SQLiteSessionStore(SessionStore):
                 cursor = connection.execute(
                     "UPDATE cayu_persisted_event_side_effects "
                     "SET status = ?, claim_id = NULL, lease_expires_at = NULL, "
-                    "next_attempt_at = ?, last_error = ?, updated_at = ? "
+                    "next_attempt_at = ?, last_error = ?, updated_at = ?, attempts = attempts - ? "
                     "WHERE session_id = ? AND event_id = ? AND status = 'leased' "
                     "AND claim_id = ? AND attempts = ?",
                     (
@@ -7522,6 +7607,7 @@ class SQLiteSessionStore(SessionStore):
                         ),
                         error,
                         sqlite_support.format_datetime(now),
+                        int(deferred),
                         claim.session_id,
                         claim.event_id,
                         claim.claim_id,
@@ -13109,6 +13195,8 @@ class SQLiteSessionStore(SessionStore):
             filters.append("(cayu_checkpoints.pending_action_flags & 1) <> 0")
         elif query.kind == PendingActionKind.USER_INPUT:
             filters.append("(cayu_checkpoints.pending_action_flags & 2) <> 0")
+        elif query.kind == PendingActionKind.DELEGATED_ACTION:
+            filters.append("(cayu_checkpoints.pending_action_flags & 8) <> 0")
         if query.cursor is not None:
             cursor_dt, cursor_id = decode_session_cursor(query.cursor)
             cursor_value = sqlite_support.format_datetime(cursor_dt)
@@ -13166,6 +13254,11 @@ class SQLiteSessionStore(SessionStore):
                     json_extract(
                         cayu_checkpoints.state_json,
                         '$.pending_tool_round'
+                    ),
+                    'foreground_child_wait',
+                    json_extract(
+                        cayu_checkpoints.state_json,
+                        '$.foreground_child_wait'
                     )
                 ) AS pending_state_json
             FROM cayu_checkpoints
@@ -13304,7 +13397,8 @@ class SQLiteSessionStore(SessionStore):
                 VALUES
                     ('tool.call.approval_requested'),
                     ('session.awaiting_user_input'),
-                    ('session.interrupted')
+                    ('session.interrupted'),
+                    ('session.delegated_action.updated')
             ),
             latest_barriers AS (
                 SELECT candidates.id AS session_id,
@@ -13334,6 +13428,7 @@ class SQLiteSessionStore(SessionStore):
                               'tool.call.approval_requested',
                               'session.awaiting_user_input',
                               'session.interrupted',
+                              'session.delegated_action.updated',
                               'tool.call.started',
                               'tool.call.completed',
                               'tool.call.failed',
@@ -13367,6 +13462,7 @@ class SQLiteSessionStore(SessionStore):
                               'tool.call.approval_requested',
                               'session.awaiting_user_input',
                               'session.interrupted',
+                              'session.delegated_action.updated',
                               'tool.call.started',
                               'tool.call.completed',
                               'tool.call.failed',

@@ -3434,10 +3434,19 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
 
 @pytest.mark.parametrize(
     ("decision_epoch", "wrong_identity", "accepted"),
-    [(1, False, False), (2, False, True), (3, False, True), (4, False, False), (2, True, False)],
+    [
+        (1, None, True),
+        (2, None, True),
+        (3, None, True),
+        (4, None, False),
+        (2, "session_id", False),
+        (2, "session_instance_id", False),
+        (2, "interaction_id", False),
+        (2, "execution_profile_fingerprint", False),
+    ],
 )
-def test_settled_predecessor_is_authenticated_against_its_profile_epoch(
-    decision_epoch: int, wrong_identity: bool, accepted: bool
+def test_settled_predecessor_retains_identity_across_repeated_recovery_epochs(
+    decision_epoch: int, wrong_identity: str | None, accepted: bool
 ) -> None:
     from cayu.runtime._invocation_terminal_decision import (
         InvocationTerminalOutcome,
@@ -3455,8 +3464,9 @@ def test_settled_predecessor_is_authenticated_against_its_profile_epoch(
                 profile=_profile(),
             )
         )
-        # Recovery rebound the predecessor profile to epoch 3; release advanced
-        # the session to 4. A decision from epoch 4 is not this predecessor's.
+        # Repeated recovery can rebind the same predecessor to epoch 3 without
+        # replacing its original decision. Release advanced the session to 4;
+        # a decision from epoch 4 is not this predecessor's.
         session = created.session.model_copy(
             update={"run_epoch": 4, "status": SessionStatus.INTERRUPTED}
         )
@@ -3464,19 +3474,25 @@ def test_settled_predecessor_is_authenticated_against_its_profile_epoch(
         event_identity = {
             "outcome": InvocationTerminalOutcome.INTERRUPTED,
             "session_id": session.id,
-            "session_instance_id": "other-instance" if wrong_identity else session.instance_id,
+            "session_instance_id": session.instance_id,
             "run_epoch": decision_epoch,
             "interaction_id": predecessor.interaction_id,
             "source_id": "predecessor-interruption",
         }
+        if wrong_identity in {"session_id", "session_instance_id", "interaction_id"}:
+            event_identity[wrong_identity] = "another-predecessor"
         decision = build_invocation_terminal_decision(
             outcome=InvocationTerminalOutcome.INTERRUPTED,
-            session_id=session.id,
+            session_id=event_identity["session_id"],
             session_instance_id=event_identity["session_instance_id"],
             run_epoch=decision_epoch,
-            profile_interaction_id=predecessor.interaction_id,
-            interaction_id=predecessor.interaction_id,
-            execution_profile_fingerprint=predecessor.profile.fingerprint,
+            profile_interaction_id=event_identity["interaction_id"],
+            interaction_id=event_identity["interaction_id"],
+            execution_profile_fingerprint=(
+                "0" * 64
+                if wrong_identity == "execution_profile_fingerprint"
+                else predecessor.profile.fingerprint
+            ),
             interaction_event_id=invocation_terminal_event_id(
                 **event_identity, event_kind="interaction"
             ),

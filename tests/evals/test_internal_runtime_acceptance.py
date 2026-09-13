@@ -161,7 +161,10 @@ def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(
         result = await run_eval_plan(
             plan,
             max_concurrency=max_concurrency,
-            case_timeout_seconds=20,
+            # This checks hermetic execution and case isolation, not latency.
+            # Include setup, nested runs, and evidence collection on loaded CI
+            # workers while retaining a finite guard against a stalled case.
+            case_timeout_seconds=60,
             retain_trajectory=True,
         )
         _assert_acceptance_passed(result)

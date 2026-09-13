@@ -4891,7 +4891,13 @@ def test_worker_settles_quiescent_non_success_without_a_proposal(
                 if failure == "handler_timeout":
                     await asyncio.Event().wait()
                 if failure == "elapsed":
-                    await asyncio.sleep(2.1)
+                    admission = await tasks.load_latest_work_attempt_admission(context.task.id)
+                    assert admission is not None
+                    deadline = admission.run_semantics.deadline_expires_at
+                    assert deadline is not None
+                    await asyncio.sleep(
+                        max(0, (deadline - datetime.now(UTC)).total_seconds()) + 0.05
+                    )
                     return VerifiedTaskHandlerReport(
                         proposal=CompletionProposalCreate(
                             proposal_id=context.proposal_id,
@@ -4926,10 +4932,12 @@ def test_worker_settles_quiescent_non_success_without_a_proposal(
                 app,
                 handler,
                 worker_id="non-success-worker",
-                lease_seconds=10,
-                callback_timeout_seconds=0.05 if failure == "handler_timeout" else 3.0,
+                lease_seconds=120,
+                callback_timeout_seconds=0.05 if failure == "handler_timeout" else 60.0,
                 max_elapsed_seconds=(
-                    2 if failure == "elapsed" else 3 if failure == "source_elapsed" else 3600
+                    # Reach the intended execution phase before expiring the
+                    # real deadline, including durable setup on loaded CI.
+                    30 if failure in {"elapsed", "source_elapsed"} else 3600
                 ),
             ) as worker:
                 assert await worker.run(max_tasks=1) == 1
@@ -4953,6 +4961,8 @@ def test_worker_settles_quiescent_non_success_without_a_proposal(
             assert admission.attempt.ordinal == 1
             assert not verifier.requests
             assert calls
+            if failure == "elapsed":
+                assert len(handler.proposals) == 1
             if failure in {"provider", "source_elapsed"}:
                 assert not handler.proposals
             for context in handler.proposals:

@@ -23,6 +23,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.sessions import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    Session,
     runtime_build_provenance_from_session_metadata,
 )
 from cayu.runtime.structured_output import json_schema_contains_secret
@@ -647,6 +648,7 @@ def require_secret_free_durable_object(
     redactor: SecretRedactor,
     field_name: str,
     schema_root: str | None = None,
+    runtime_session: Session | None = None,
 ) -> dict[str, Any]:
     """Copy one checkpoint payload and reject secrets in values or data-owned keys."""
 
@@ -659,6 +661,7 @@ def require_secret_free_durable_object(
         copied,
         redactor=redactor,
         path=(() if schema_root is None else (schema_root,)),
+        runtime_session=runtime_session,
     ):
         copied.clear()
         raise ValueError(
@@ -673,6 +676,8 @@ def durable_value_contains_secret(
     *,
     redactor: SecretRedactor,
     path: tuple[str, ...] = (),
+    runtime_session: Session | None = None,
+    _trusted_runtime_session_values: frozenset[tuple[tuple[str, ...], str]] | None = None,
     _trusted_web_control_paths: frozenset[tuple[str, ...]] = frozenset(),
     _trusted_targeted_tool_references: frozenset[tuple[tuple[str, ...], str]] | None = None,
     _trusted_lifecycle_receipt_values: frozenset[tuple[tuple[str, ...], str]] | None = None,
@@ -681,6 +686,10 @@ def durable_value_contains_secret(
 ) -> bool:
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
+    if _trusted_runtime_session_values is None:
+        _trusted_runtime_session_values = _runtime_session_checkpoint_values(
+            value, path=path, runtime_session=runtime_session
+        )
     if _trusted_targeted_tool_references is None:
         _trusted_targeted_tool_references = _targeted_tool_reference_authority(value, path=path)
     if _trusted_lifecycle_receipt_values is None or _trusted_lifecycle_receipt_keys is None:
@@ -694,6 +703,8 @@ def durable_value_contains_secret(
             path=path,
         )
     if type(value) is str:
+        if (path, value) in _trusted_runtime_session_values:
+            return False
         if (
             (path, value) in _trusted_targeted_tool_references
             or (
@@ -776,6 +787,7 @@ def durable_value_contains_secret(
                 redactor=redactor,
                 path=path,
                 _trusted_web_control_paths=_trusted_web_control_paths,
+                _trusted_runtime_session_values=_trusted_runtime_session_values,
                 _trusted_targeted_tool_references=_trusted_targeted_tool_references,
                 _trusted_lifecycle_receipt_values=_trusted_lifecycle_receipt_values,
                 _trusted_lifecycle_receipt_keys=_trusted_lifecycle_receipt_keys,
@@ -840,6 +852,7 @@ def durable_value_contains_secret(
                 redactor=redactor,
                 path=(*path, key),
                 _trusted_web_control_paths=trusted_web_control_paths,
+                _trusted_runtime_session_values=_trusted_runtime_session_values,
                 _trusted_targeted_tool_references=_trusted_targeted_tool_references,
                 _trusted_lifecycle_receipt_values=_trusted_lifecycle_receipt_values,
                 _trusted_lifecycle_receipt_keys=_trusted_lifecycle_receipt_keys,
@@ -848,6 +861,54 @@ def durable_value_contains_secret(
                 return True
         return False
     raise AssertionError("Durable checkpoint contains non-JSON-compatible data.")
+
+
+def _runtime_session_checkpoint_values(
+    value: Any,
+    *,
+    path: tuple[str, ...],
+    runtime_session: Session | None,
+) -> frozenset[tuple[tuple[str, ...], str]]:
+    """Preserve only the session ID supplied by the runtime's session owner.
+
+    A checkpoint, even one with identical identity fields, does not supply this
+    provenance. Public/raw checkpoint readers omit runtime_session and retain
+    ordinary secret rejection. Runtime callers pass their admitted or store-
+    resolved session, never a session reconstructed from the candidate payload.
+    """
+    if runtime_session is None:
+        return frozenset()
+    if type(runtime_session) is not Session:
+        raise TypeError("runtime_session must be a Session.")
+    roots = ("pending_tool_round", "pending_user_input", "user_input_resolution_intent")
+    candidates = (
+        [(root, value.get(root)) for root in roots]
+        if not path and type(value) is dict
+        else [(path[0], value)]
+        if len(path) == 1 and path[0] in roots
+        else []
+    )
+    trusted: set[tuple[tuple[str, ...], str]] = set()
+    for root, candidate in candidates:
+        if type(candidate) is dict and root == "pending_tool_round":
+            # This root has no duplicated session/incarnation fields. Its
+            # owning runtime supplies the session independently of the round;
+            # only an exact matching staged envelope can be retained here.
+            trusted.add(((root, "staged_terminals", "event", "session_id"), runtime_session.id))
+            continue
+        if (
+            type(candidate) is not dict
+            or candidate.get("session_id") != runtime_session.id
+            or candidate.get("session_instance_id") != runtime_session.instance_id
+        ):
+            continue
+        trusted.add(((root, "session_id"), runtime_session.id))
+        if root == "pending_user_input":
+            # Staged terminal envelopes duplicate the same runtime session.
+            # Their payloads, results and all other identities stay subject to
+            # their own validation; this grants no tool-publication authority.
+            trusted.add(((root, "staged_terminals", "event", "session_id"), runtime_session.id))
+    return frozenset(trusted)
 
 
 def _targeted_tool_reference_authority(

@@ -773,6 +773,7 @@ def prepare_execution_profile_continuation(
         redactor=redactor,
         consume_on_rejection=True,
         current_run_epoch=session.run_epoch,
+        runtime_session=session,
     )
     pending_profile_fingerprints = {
         pending.execution_profile_fingerprint
@@ -781,6 +782,7 @@ def prepare_execution_profile_continuation(
                 checkpoint,
                 redactor=redactor,
                 consume_on_rejection=True,
+                runtime_session=session,
             ),
             approval_support.pending_approval_from_checkpoint(
                 checkpoint,

@@ -519,7 +519,46 @@ def _build_tool_round_publication_request(
         pending_round=copied_pending_round,
         durable_events=durable_events,
     )
+    from cayu.runtime._foreground_child_wait import (
+        FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+        FOREGROUND_CHILD_TERMINAL_KEY,
+        FOREGROUND_PARENT_CONTINUATION_KEY,
+        ForegroundChildResumeRequest,
+        ForegroundChildTerminal,
+        ForegroundParentContinuation,
+    )
+
     checkpoint = checkpoint_without_pending_tool_round(copied_source_checkpoint)
+    if FOREGROUND_CHILD_TERMINAL_KEY in copied_source_checkpoint:
+        selected = ForegroundChildTerminal.model_validate(
+            copied_source_checkpoint[FOREGROUND_CHILD_TERMINAL_KEY]
+        )
+        if (
+            copied_pending_round.max_steps is None
+            or copied_pending_round.limits is None
+            or copied_pending_round.budget_limits is None
+            or copied_pending_round.model_step is None
+        ):
+            raise ValueError("Foreground result publication lacks its original run configuration.")
+        continuation = ForegroundParentContinuation(
+            terminal=selected,
+            publication_id=f"tool-round:{copied_pending_round.tool_round_id}",
+            completed_model_step=copied_pending_round.model_step,
+            run_limit_accounting=copied_pending_round.run_limit_accounting,
+            task_id=copied_pending_round.task_id,
+            request=ForegroundChildResumeRequest(
+                session_id=session_id,
+                messages=[],
+                metadata=copied_pending_round.request_metadata,
+                max_steps=copied_pending_round.max_steps,
+                limits=copied_pending_round.limits,
+                budget_limits=copied_pending_round.budget_limits,
+                retry_policy=copied_pending_round.retry_policy,
+                structured_output=copied_pending_round.structured_output,
+                thinking=copied_pending_round.thinking,
+            ),
+        )
+        checkpoint[FOREGROUND_PARENT_CONTINUATION_KEY] = continuation.model_dump(mode="json")
     checkpoint = checkpoint_with_compacted_durable_subagent_submissions(
         checkpoint,
         tool_round_id=copied_pending_round.tool_round_id,
@@ -534,9 +573,18 @@ def _build_tool_round_publication_request(
         for operation in mutation.operations
         if operation.key == PENDING_TOOL_ROUND_CHECKPOINT_KEY
     ]
+    from cayu.runtime._foreground_child_wait import (
+        FOREGROUND_CHILD_TERMINAL_KEY,
+        FOREGROUND_CHILD_WAIT_KEY,
+    )
+
     allowed_compaction_keys = {
         DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
         DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
+        FOREGROUND_CHILD_WAIT_KEY,
+        FOREGROUND_CHILD_TERMINAL_KEY,
+        FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+        FOREGROUND_PARENT_CONTINUATION_KEY,
     }
     unexpected_operations = [
         operation
@@ -548,6 +596,11 @@ def _build_tool_round_publication_request(
         len(marker_operations) != 1
         or marker_operations[0].action != "delete"
         or unexpected_operations
+        or any(
+            operation.key in {FOREGROUND_CHILD_WAIT_KEY, FOREGROUND_CHILD_TERMINAL_KEY}
+            and operation.action != "delete"
+            for operation in mutation.operations
+        )
     ):
         raise AssertionError("Tool-round publication contains an unexpected checkpoint mutation.")
 
@@ -586,6 +639,18 @@ def _build_tool_round_publication_request(
             **tool_round_identity.payload(),
             "tool_call_ids": tool_call_ids,
             "pending_round_digest": pending_round_digest,
+            **(
+                {
+                    "foreground_child_terminal": ForegroundChildTerminal.model_validate(
+                        copied_source_checkpoint[FOREGROUND_CHILD_TERMINAL_KEY]
+                    ).model_dump(mode="json"),
+                    FOREGROUND_PARENT_CONTINUATION_KEY: checkpoint[
+                        FOREGROUND_PARENT_CONTINUATION_KEY
+                    ],
+                }
+                if FOREGROUND_CHILD_TERMINAL_KEY in copied_source_checkpoint
+                else {}
+            ),
         },
         mutation=mutation,
         transcript_messages=transcript_messages,

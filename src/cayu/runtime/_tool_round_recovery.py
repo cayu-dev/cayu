@@ -741,6 +741,7 @@ def pending_tool_round_from_checkpoint(
     *,
     redactor: SecretRedactor | None = None,
     consume_on_rejection: bool = False,
+    runtime_session: Session | None = None,
 ) -> PendingToolRound | None:
     if type(consume_on_rejection) is not bool:
         raise TypeError("consume_on_rejection must be a bool.")
@@ -754,6 +755,7 @@ def pending_tool_round_from_checkpoint(
         value,
         redactor=redactor,
         path=(PENDING_TOOL_ROUND_CHECKPOINT_KEY,),
+        runtime_session=runtime_session,
     ):
         # Public callers retain their input by default. Runtime callers opt in
         # to consuming their private checkpoint copy so no outer traceback
@@ -820,6 +822,7 @@ def checkpoint_with_pending_tool_round(
     retry_policy: RetryPolicy | None = None,
     tool_round_identity: ToolRoundIdentity,
     redactor: SecretRedactor | None = None,
+    runtime_session: Session | None = None,
     source_model_step_id: str | None = None,
     source_transcript_cursor: int | None = None,
     model_step: int | None = None,
@@ -836,6 +839,7 @@ def checkpoint_with_pending_tool_round(
             copied_checkpoint,
             redactor=resolved_redactor,
             consume_on_rejection=True,
+            runtime_session=runtime_session,
         )
         is not None
     ):
@@ -944,12 +948,14 @@ def checkpoint_with_pending_tool_round(
         redactor=resolved_redactor,
         field_name="pending_tool_round",
         schema_root=PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+        runtime_session=runtime_session,
     )
     copied_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY] = pending_payload
     copied_checkpoint = require_secret_free_durable_object(
         copied_checkpoint,
         redactor=resolved_redactor,
         field_name="checkpoint",
+        runtime_session=runtime_session,
     )
     return copied_checkpoint, pending_round
 
@@ -978,6 +984,20 @@ def checkpoint_without_pending_tool_round(
     # A completed tool event alone does not authorize retiring that owner.
     if copied_checkpoint.get(WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY):
         raise RuntimeError("Cannot retire a tool round with unsettled workspace observations.")
+    from cayu.runtime._foreground_child_wait import (
+        FOREGROUND_CHILD_TERMINAL_KEY,
+        FOREGROUND_CHILD_WAIT_KEY,
+        foreground_child_state_from_checkpoint,
+    )
+
+    wait, selected = foreground_child_state_from_checkpoint(copied_checkpoint)
+    if wait is not None:
+        pending = pending_tool_round_from_checkpoint(copied_checkpoint)
+        if pending is None or pending.tool_round_id != wait.parent_effect.tool_round_id:
+            raise RuntimeError("Cannot retire a foreground wait belonging to another round.")
+        copied_checkpoint.pop(FOREGROUND_CHILD_WAIT_KEY)
+        if selected is not None:
+            copied_checkpoint.pop(FOREGROUND_CHILD_TERMINAL_KEY)
     copied_checkpoint.pop(PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
     return copied_checkpoint
 

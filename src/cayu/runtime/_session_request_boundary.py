@@ -220,6 +220,11 @@ def prepare_run_request(
         original != redacted
         for original, redacted in zip(request.messages, redacted_messages, strict=True)
     )
+    from cayu.runtime._child_session_identity import runtime_subagent_lineage_fields
+
+    lineage = runtime_subagent_lineage_fields(request)
+    if lineage:
+        prepared.metadata["subagent"].update(lineage)
     return apply_runtime_session_create_claim(prepared)
 
 

@@ -281,7 +281,13 @@ def invocation_terminal_decision_matches_recovery_profile(
     interaction_id: str,
     execution_profile_fingerprint: str,
 ) -> bool:
-    """Match a decision owned by this epoch or its exact recovery successor."""
+    """Match a retained decision across recovery epochs of the same invocation.
+
+    Callers authenticate this decision against the current durable checkpoint
+    and separately fence the worker's current epoch. Recovery can fail more than
+    once without changing the elected winner. A new invocation consumes the
+    settled decision at admission; it cannot inherit this recovery authority.
+    """
 
     if type(decision) is not InvocationTerminalDecision:
         raise TypeError("decision must be an InvocationTerminalDecision.")
@@ -290,7 +296,7 @@ def invocation_terminal_decision_matches_recovery_profile(
     return bool(
         decision.session_id == session_id
         and decision.session_instance_id == session_instance_id
-        and decision.run_epoch in {current_run_epoch, current_run_epoch - 1}
+        and decision.run_epoch <= current_run_epoch
         and decision.profile_interaction_id == interaction_id
         and decision.execution_profile_fingerprint == execution_profile_fingerprint
     )

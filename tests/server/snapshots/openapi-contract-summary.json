@@ -1411,6 +1411,12 @@
           ],
           "title": "Arguments"
         },
+        "delegated_action": {
+          "anyOf": [
+            {"$ref": "#/components/schemas/DelegatedActionReference"},
+            {"type": "null"}
+          ]
+        },
         "detail": {
           "anyOf": [
             {
@@ -1444,7 +1450,8 @@
           "enum": [
             "tool_approval",
             "user_input",
-            "manual_recovery"
+            "manual_recovery",
+            "delegated_action"
           ],
           "title": "Kind",
           "type": "string"
@@ -4774,12 +4781,8 @@
         },
         "browser_recordings": {
           "anyOf": [
-            {
-              "$ref": "#/components/schemas/OptionalSurfaceCapability"
-            },
-            {
-              "type": "null"
-            }
+            {"$ref": "#/components/schemas/OptionalSurfaceCapability"},
+            {"type": "null"}
           ]
         },
         "dashboard": {
@@ -5164,6 +5167,19 @@
       "title": "EnqueueSessionMessageBody",
       "type": "object"
     },
+    "DelegatedActionReference": {
+      "additionalProperties": false,
+      "description": "Bounded discovery of a child-owned action; not resolution authority.",
+      "properties": {
+        "action_id": {"title": "Action Id", "type": "string"},
+        "action_kind": {"enum": ["tool_approval", "user_input", "delegated_action"], "title": "Action Kind", "type": "string"},
+        "child_session_id": {"title": "Child Session Id", "type": "string"},
+        "status": {"const": "waiting_on_child_action", "default": "waiting_on_child_action", "title": "Status", "type": "string"}
+      },
+      "required": ["child_session_id", "action_kind", "action_id"],
+      "title": "DelegatedActionReference",
+      "type": "object"
+    },
     "EnvironmentLifecyclePhase": {
       "description": "Content-free phases shared by factories, bindings, and cleanup.",
       "enum": [
@@ -5447,6 +5463,7 @@
         "session.completed",
         "session.failed",
         "session.interrupted",
+        "session.delegated_action.updated",
         "session.interruption_cascade_retry_requested",
         "session.interruption_cascade_completed",
         "session.interruption_cascade_failed",
@@ -6475,6 +6492,7 @@
         "tool_approval",
         "user_input",
         "manual_recovery"
+        ,"delegated_action"
       ],
       "title": "PendingActionKind",
       "type": "string"

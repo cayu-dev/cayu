@@ -2784,6 +2784,7 @@ class ToolRoundExecutor:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round for its approval.")
@@ -3056,6 +3057,7 @@ class ToolRoundExecutor:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round for its policy plan.")
@@ -3157,6 +3159,7 @@ class ToolRoundExecutor:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round for its user-input pause.")
@@ -3179,6 +3182,7 @@ class ToolRoundExecutor:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             current_run_epoch=session.run_epoch,
+            runtime_session=session,
         )
         if pending_user_input is not None:
             raise RuntimeError("Session already has a pending user input.")
@@ -3241,6 +3245,7 @@ class ToolRoundExecutor:
             redactor=redactor,
             field_name="pending_user_input",
             schema_root=PENDING_USER_INPUT_CHECKPOINT_KEY,
+            runtime_session=session,
         )
         source_round_payload = copy_json_value(
             checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
@@ -3253,6 +3258,7 @@ class ToolRoundExecutor:
             target_checkpoint,
             redactor=redactor,
             field_name="checkpoint",
+            runtime_session=session,
         )
         pause_digest = pending_user_input_digest(pending)
         checkpoint_event = _redact_event_for_invocation(
@@ -3375,6 +3381,7 @@ class ToolRoundExecutor:
             structured_output=structured_output,
             tool_round_identity=tool_round_identity,
             redactor=redactor,
+            runtime_session=session,
         )
 
     def redactor_for_tool_calls(
@@ -3445,6 +3452,7 @@ class ToolRoundExecutor:
             checkpoint,
             approval=approval,
             redactor=self._secret_redactor,
+            runtime_session=current_session,
         )
         interrupt_payload = copied.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
         if (
@@ -3460,13 +3468,9 @@ class ToolRoundExecutor:
             interrupt_payload,
             "pending_session_interrupt",
         )
-        interrupt_payload[approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY] = {
-            "approval_id": approval.approval_id,
-            "tool_call_id": approval.tool_call_id,
-            "tool_round_id": approval.tool_round_id,
-            "model_step_id": approval.model_step_id,
-            "model_attempt_id": approval.model_attempt_id,
-        }
+        interrupt_payload[approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY] = (
+            approval_support.approval_interrupt_close_intent(approval)
+        )
         copied[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY] = interrupt_payload
         return copied
 
@@ -5557,6 +5561,42 @@ class ToolRoundExecutor:
                         else None
                     ),
                 )
+
+            async def reconcile_child_result() -> ToolResult | None:
+                if effect_dispatch is None or registered_tool.child_session_recovery is None:
+                    return None
+                from cayu.runtime._foreground_child_wait import (
+                    ForegroundChildActionRequired,
+                    observe_foreground_child_wait,
+                    project_current_foreground_child_result,
+                    retain_foreground_child_wait,
+                )
+
+                child_wait = await observe_foreground_child_wait(
+                    self._session_store,
+                    parent=session,
+                    intent=effect_dispatch.intent,
+                    matcher=registered_tool.child_session_recovery,
+                    arguments=effective_tool_call.arguments,
+                )
+                if child_wait is not None:
+                    if workspace_window_id is not None:
+                        await close_workspace_mutation_window()
+                    await retain_foreground_child_wait(
+                        self._session_store,
+                        parent=session,
+                        effect=effect_dispatch,
+                        wait=child_wait,
+                    )
+                    raise ForegroundChildActionRequired(child_wait)
+                return await project_current_foreground_child_result(
+                    self._session_store,
+                    parent=session,
+                    intent=effect_dispatch.intent,
+                    matcher=registered_tool.child_session_recovery,
+                    arguments=effective_tool_call.arguments,
+                )
+
             execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,
                 effect=registered_tool.effect,
@@ -5568,6 +5608,7 @@ class ToolRoundExecutor:
                 finalize_publication=invocation_secret_scope.seal_for_publication,
                 timeout_seconds=self._tool_timeout_seconds,
                 before_dispatch=require_live_environment_exposure,
+                reconcile_result=reconcile_child_result,
             )
         except tool_execution.ToolDispatchAdmissionRefusal as refused:
             refusal = refused.refusal
@@ -7898,6 +7939,7 @@ class ToolRoundRun:
             source_checkpoint,
             redactor=executor._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         if source_pending_round is None:
             raise RuntimeError("Tool round has no durable pending exposure authority.")

@@ -491,6 +491,9 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             request,
             source=SessionExecutionSource.SUBAGENT,
         )
+        from cayu.runtime._child_session_identity import run_request_with_subagent_lineage
+
+        request = run_request_with_subagent_lineage(request)
         structured = _subagent_result_payload(
             agent_alias=agent_alias,
             spec=spec,

@@ -279,6 +279,7 @@ _INTERRUPTION_TYPES = frozenset(
         "runtime_interrupted",
         "tool_approval_required",
         "user_input_required",
+        "waiting_on_child_action",
     }
 )
 _POLICY_DENIAL_DECISIONS = {
@@ -3258,7 +3259,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         | terminal_finalization_containers,
     )
     policies[EventType.SESSION_INTERRUPTED] = _observed_policy(
-        "abandoned actual approval approval_close_intent approval_id "
+        "abandoned actual action_id action_kind child_session_id status approval approval_close_intent approval_id "
         "approval_metadata_truncated cost_summary durable_value_error_code "
         "durable_value_error_path error error_type execution_profile_fingerprint input_id interruption_request_id "
         "interaction_transition_failures interruption_type limit manual_recovery_persisted "
@@ -3278,6 +3279,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         | _USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS
         | _AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS,
         aliased_authority_keys={
+            "child_session_id",
+            "action_id",
             "approval_id",
             "input_id",
             "tool_call_id",
@@ -3303,6 +3306,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "user_input",
         }
         | terminal_finalization_containers,
+    )
+    policies[EventType.SESSION_DELEGATED_ACTION_UPDATED] = _observed_policy(
+        "action_id action_kind child_session_id status interruption_type "
+        "model_attempt_id model_step_id tool_call_id tool_round_id",
+        aliased_authority_keys={"child_session_id", "action_id", "tool_call_id", "tool_round_id"},
     )
     policies[EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED] = _observed_policy(
         "attempt_id interruption_type previous_generation retry_metadata retry_reason "

@@ -77,6 +77,7 @@ class EventType(StrEnum):
     SESSION_COMPLETED = "session.completed"
     SESSION_FAILED = "session.failed"
     SESSION_INTERRUPTED = "session.interrupted"
+    SESSION_DELEGATED_ACTION_UPDATED = "session.delegated_action.updated"
     SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED = "session.interruption_cascade_retry_requested"
     SESSION_INTERRUPTION_CASCADE_COMPLETED = "session.interruption_cascade_completed"
     SESSION_INTERRUPTION_CASCADE_FAILED = "session.interruption_cascade_failed"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
@@ -57,6 +57,9 @@ from cayu.runtime.tool_exposure import (
     copy_resolved_tool_exposure_authority,
 )
 from cayu.vaults import SecretRedactor, contains_redacted_secret
+
+if TYPE_CHECKING:
+    from cayu.runtime.sessions import Session
 
 PENDING_USER_INPUT_CHECKPOINT_KEY = "pending_user_input"
 USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY = "user_input_resolution_intent"
@@ -840,6 +843,7 @@ def pending_user_input_from_checkpoint(
     *,
     redactor: SecretRedactor | None = None,
     consume_on_rejection: bool = False,
+    runtime_session: Session | None = None,
 ) -> PendingUserInput | None:
     if type(consume_on_rejection) is not bool:
         raise TypeError("consume_on_rejection must be a bool.")
@@ -856,6 +860,7 @@ def pending_user_input_from_checkpoint(
         value,
         redactor=redactor,
         path=(PENDING_USER_INPUT_CHECKPOINT_KEY,),
+        runtime_session=runtime_session,
     ):
         # Public callers retain their input by default. Runtime callers opt in
         # to consuming their private checkpoint copy so no outer traceback
@@ -1332,6 +1337,7 @@ def user_input_resolution_intent_from_checkpoint(
     checkpoint: dict[str, Any] | None,
     *,
     redactor: SecretRedactor | None = None,
+    runtime_session: Session | None = None,
 ) -> UserInputResolutionIntent | None:
     if checkpoint is None:
         return None
@@ -1343,6 +1349,7 @@ def user_input_resolution_intent_from_checkpoint(
         value,
         redactor=redactor,
         path=(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,),
+        runtime_session=runtime_session,
     ):
         raise ValueError(
             "User-input resolution intent contains a workload secret and cannot be executed."
@@ -1395,6 +1402,7 @@ def user_input_lifecycle_authority_from_checkpoint(
     redactor: SecretRedactor | None = None,
     consume_on_rejection: bool = False,
     current_run_epoch: int | None = None,
+    runtime_session: Session | None = None,
 ) -> tuple[PendingUserInput | None, UserInputResolutionIntent | None]:
     """Load one coherent pause/answer-claim topology from a checkpoint.
 
@@ -1408,10 +1416,12 @@ def user_input_lifecycle_authority_from_checkpoint(
         checkpoint,
         redactor=redactor,
         consume_on_rejection=consume_on_rejection,
+        runtime_session=runtime_session,
     )
     intent = user_input_resolution_intent_from_checkpoint(
         checkpoint,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     if intent is not None:
         if pending is None:
@@ -1442,6 +1452,7 @@ def checkpoint_with_user_input_resolution_intent(
     resolution_request_digest: str,
     claim_run_epoch: int,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
     allow_answer_to_manual_recovery: bool = False,
     allow_manual_recovery_to_answer: bool = False,
 ) -> tuple[dict[str, Any], UserInputResolutionIntent]:
@@ -1452,10 +1463,14 @@ def checkpoint_with_user_input_resolution_intent(
     if type(allow_manual_recovery_to_answer) is not bool:
         raise TypeError("allow_manual_recovery_to_answer must be a boolean.")
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
-    current_pending = pending_user_input_from_checkpoint(copied, redactor=redactor)
+    current_pending = pending_user_input_from_checkpoint(
+        copied, redactor=redactor, runtime_session=runtime_session
+    )
     if current_pending != pending:
         raise RuntimeError("Pending user input changed before the answer was claimed.")
-    current_intent = user_input_resolution_intent_from_checkpoint(copied, redactor=redactor)
+    current_intent = user_input_resolution_intent_from_checkpoint(
+        copied, redactor=redactor, runtime_session=runtime_session
+    )
     if current_intent is not None:
         require_resolution_intent_matches_pending(current_intent, pending=pending)
         if current_intent.answer_request_digest != answer_request_digest:
@@ -1516,6 +1531,7 @@ def checkpoint_with_executing_user_input_resolution_intent(
     pending: PendingUserInput,
     intent: UserInputResolutionIntent,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> tuple[dict[str, Any], UserInputResolutionIntent]:
     """Atomically admit governed continuation work for one exact resolution claim."""
 
@@ -1528,6 +1544,7 @@ def checkpoint_with_executing_user_input_resolution_intent(
         copied,
         redactor=redactor,
         current_run_epoch=current_run_epoch,
+        runtime_session=runtime_session,
     )
     if current_pending != pending or current_intent is None or current_intent != intent:
         raise RuntimeError("User-input resolution authority changed before execution admission.")
@@ -1544,12 +1561,17 @@ def checkpoint_without_exact_pending_user_input(
     pending: PendingUserInput,
     intent: UserInputResolutionIntent,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> dict[str, Any]:
     """Clear only the exact pause and answer claim that own a close publication."""
 
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
-    current_pending = pending_user_input_from_checkpoint(copied, redactor=redactor)
-    current_intent = user_input_resolution_intent_from_checkpoint(copied, redactor=redactor)
+    current_pending = pending_user_input_from_checkpoint(
+        copied, redactor=redactor, runtime_session=runtime_session
+    )
+    current_intent = user_input_resolution_intent_from_checkpoint(
+        copied, redactor=redactor, runtime_session=runtime_session
+    )
     if (
         current_pending is None
         or current_intent is None

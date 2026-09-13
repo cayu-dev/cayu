@@ -140,6 +140,8 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
+from cayu.runtime._foreground_child_wait import ForegroundChildTerminal, ForegroundChildWait
 from cayu.runtime._fork_source_snapshot import (
     fork_source_checkpoint_projection,
     fork_source_checkpoint_sha256,
@@ -449,6 +451,7 @@ from cayu.runtime.sessions import (
     ModelTarget,
     PendingActionQuery,
     PendingActionResultTooLarge,
+    PersistedEventSideEffectClaim,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     ResumeRequest,
@@ -1112,12 +1115,16 @@ class CayuApp:
         self._context_counting = context_counting_config
         self._request_footprint = request_footprint_config
         self._event_sinks = tuple(sinks)
+        self._foreground_child_delivery_owner = ForegroundChildDeliveryOwner(
+            self._runtime_session_store
+        )
         self._event_writer = RuntimeEventWriter(
             session_store=self._runtime_session_store,
             budget_store=self.budget_store,
             event_sinks=self._event_sinks,
             secret_redactor=self._secret_redactor,
             public_authority_alias_codec=self._public_authority_alias_codec,
+            continue_foreground_parent=self._continue_foreground_parent,
         )
         self._completion_result_resolver_coordinator = CompletionResultResolverCoordinator(
             application_coordinator=self._completion_decision_application_coordinator,
@@ -1971,7 +1978,11 @@ class CayuApp:
         return describe_app(self, project_root=project_root)
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
-        return await self._session_engine.drain_background_interruptions(timeout_s=timeout_s)
+        settled = await asyncio.gather(
+            self._session_engine.drain_background_interruptions(timeout_s=timeout_s),
+            self._foreground_child_delivery_owner.drain(timeout_s=timeout_s),
+        )
+        return all(settled)
 
     def provider_operation_cancellation_status(
         self,
@@ -3524,6 +3535,7 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
+        await self._event_writer.recover_persisted_side_effects()
 
     async def _run_with_public_projection(
         self,
@@ -5223,6 +5235,57 @@ class CayuApp:
         del request
         return await recovery
 
+    async def _continue_foreground_parent(self, claim: PersistedEventSideEffectClaim) -> bool:
+        from cayu.runtime._foreground_child_continuation import deliver_foreground_child_terminal
+
+        async def resume(terminal: ForegroundChildTerminal) -> None:
+            await self._foreground_child_delivery_owner.run(
+                claim,
+                lambda before_mutation: self._session_engine.resume_foreground_child(
+                    terminal, before_mutation=before_mutation
+                ),
+            )
+            # The resumed parent may itself be a foreground child. Its terminal
+            # fan-out was deferred while that run was still active. Deliver only
+            # this exact session's latest outcome after its owner has settled,
+            # so each completed hop can wake its own parent without an unrelated
+            # resume or an unbounded scan of other sessions.
+            outcome = await self._runtime_session_store.summarize_outcome(
+                terminal.wait.parent_effect.session_id
+            )
+            if outcome.terminal_event is not None:
+                await self._event_writer.fan_out_persisted([outcome.terminal_event.event])
+
+        async def refresh(wait: ForegroundChildWait, event: Event) -> None:
+            await self._foreground_child_delivery_owner.run(
+                claim,
+                lambda before_mutation: self._session_engine.refresh_foreground_child_action(
+                    wait, event, before_mutation=before_mutation
+                ),
+            )
+
+        async def settle(wait: ForegroundChildWait, event: Event) -> None:
+            await self._foreground_child_delivery_owner.run(
+                claim,
+                lambda before_mutation: self._session_engine.settle_foreground_child_terminal(
+                    wait, event, before_mutation=before_mutation
+                ),
+            )
+
+        return await deliver_foreground_child_terminal(
+            claim.event,
+            store=self._runtime_session_store,
+            has_active_tasks=lambda session_id: (
+                self._session_control.has_active_tasks(session_id)
+                or self._session_control.is_interruption_request_active(session_id)
+                or self._session_control.is_emitting_interrupted(session_id)
+                or self._foreground_child_delivery_owner.active(session_id)
+            ),
+            resume=resume,
+            refresh=refresh,
+            settle=settle,
+        )
+
     async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
         """Retry committed event fan-out that was not acknowledged before a crash.
 
@@ -5489,6 +5552,7 @@ class CayuApp:
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            runtime_session=session,
         )
         pending_model_completion = await self._recovery_coordinator.load_model_completion_boundary(
             session
@@ -7581,6 +7645,7 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
+        await self._event_writer.recover_persisted_side_effects()
 
     async def recover_user_input(
         self,
@@ -7834,6 +7899,7 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
+        await self._event_writer.recover_persisted_side_effects()
 
     async def recover_tool_approval(
         self,

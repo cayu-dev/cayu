@@ -6748,6 +6748,7 @@ class PendingActionKind(StrEnum):
     TOOL_APPROVAL = "tool_approval"
     USER_INPUT = "user_input"
     MANUAL_RECOVERY = "manual_recovery"
+    DELEGATED_ACTION = "delegated_action"
 
 
 class PendingActionIssueCode(StrEnum):
@@ -6786,6 +6787,7 @@ PENDING_ACTION_EVENT_TYPE_VALUES = frozenset(
         "tool.call.approval_requested",
         "session.awaiting_user_input",
         "session.interrupted",
+        "session.delegated_action.updated",
         "session.resumed",
         "session.completed",
         "session.failed",
@@ -7374,6 +7376,25 @@ class PendingActionSession(BaseModel):
         return copy_label_map(value, "labels")
 
 
+class DelegatedActionReference(BaseModel):
+    """Bounded discovery of a child-owned action; not resolution authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    child_session_id: StrictStr
+    action_kind: Literal["tool_approval", "user_input", "delegated_action"]
+    action_id: StrictStr
+    status: Literal["waiting_on_child_action"] = "waiting_on_child_action"
+
+    @field_validator("child_session_id", "action_id")
+    @classmethod
+    def bounded_identity(cls, value: str, info) -> str:
+        value = _require_bounded_session_id(value, info.field_name)
+        if info.field_name == "action_id" and len(value.encode("utf-8")) > 256:
+            raise ValueError("Delegated action identity exceeds its byte bound.")
+        return value
+
+
 class PendingActionRecord(BaseModel):
     """One current action derived from a session checkpoint and its source event."""
 
@@ -7395,6 +7416,21 @@ class PendingActionRecord(BaseModel):
     question: str | None = None
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None
+    delegated_action: DelegatedActionReference | None = None
+
+    @model_validator(mode="after")
+    def delegated_action_is_discovery_only(self) -> Self:
+        if (self.kind is PendingActionKind.DELEGATED_ACTION) != (self.delegated_action is not None):
+            raise ValueError("Delegated pending actions require exactly one child reference.")
+        if self.delegated_action is not None and (
+            self.approval_id is not None
+            or self.input_id is not None
+            or self.question is not None
+            or self.arguments is not None
+            or self.options
+        ):
+            raise ValueError("Delegated pending actions cannot duplicate child action content.")
+        return self
 
     @field_validator("id", "title")
     @classmethod
@@ -10551,6 +10587,60 @@ class SessionStore(ABC):
             "This session store does not support interaction-transition receipt lookup."
         )
 
+    async def load_historical_interaction_settlement(
+        self,
+        session_id: str,
+        *,
+        expected_session_instance_id: str,
+        expected_event: Event,
+        expected_profile: ExecutionProfileIdentity,
+    ) -> InteractionTransitionReceiptResult:
+        """Read exact prior settlement evidence without granting run authority.
+
+        Unlike invocation release lookup, this permits a later current epoch.
+        It cannot release a fence or authorize a historical invocation: callers
+        must separately acquire their own execution or mutation authority.
+        """
+        session_id = require_clean_nonblank(session_id, "session_id")
+        expected_session_instance_id = SessionInvocationBinding.validate_session_instance_id(
+            expected_session_instance_id
+        )
+        event = copy_event(expected_event)
+        profile = ExecutionProfileIdentity.model_validate(expected_profile.model_dump(mode="json"))
+        if event.session_id != session_id or event.interaction_id is None:
+            raise ValueError("Historical settlement requires an exact session interaction.")
+        record = await self._load_historical_interaction_settlement_record(session_id, event.id)
+        if record is None:
+            raise RuntimeError("Historical interaction settlement has no immutable receipt.")
+        receipt = _load_interaction_transition_receipt(record)
+        current = await self.load(session_id)
+        active = receipt.invocation_active_profile
+        if (
+            current is None
+            or current.instance_id != expected_session_instance_id
+            or receipt.session.id != session_id
+            or receipt.session.instance_id != expected_session_instance_id
+            or receipt.invocation_session_instance_id != expected_session_instance_id
+            or receipt.event != event
+            or active is None
+            or active.session_id != session_id
+            or active.interaction_id != event.interaction_id
+            or active.profile != profile
+            or active.run_epoch != receipt.session.run_epoch
+            or active.run_epoch >= current.run_epoch
+        ):
+            raise SessionRunFenced("Historical interaction settlement has conflicting lineage.")
+        return InteractionTransitionReceiptResult(
+            session=receipt.session,
+            transition=_interaction_transition_spec_from_receipt(receipt),
+            status_changed=receipt.status_changed,
+        )
+
+    async def _load_historical_interaction_settlement_record(
+        self, session_id: str, event_id: str
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError("This store does not support historical settlement lookup.")
+
     async def load_invocation_settlement_transition(
         self,
         session_id: str,
@@ -10833,6 +10923,31 @@ class SessionStore(ABC):
 
         ``claimable_only`` excludes terminal deliveries and live leases.
         """
+
+    async def defer_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        """Release an exact claim without delivery or spending a failure attempt.
+
+        Used when an internal continuation cannot yet acquire execution ownership.
+        The persisted event remains eligible for bounded recovery; its old claim
+        must no longer be capable of acknowledging a replacement delivery.
+        """
+        raise NotImplementedError("This SessionStore does not support side-effect deferral.")
+
+    async def renew_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectDelivery:
+        """Extend an exact, still-live claim using the store's ownership clock.
+
+        Expired ownership cannot be revived, even before another worker claims
+        the event. Renewal preserves the claim identity and attempt count.
+        """
+        raise NotImplementedError("This SessionStore does not support side-effect renewal.")
 
     @abstractmethod
     async def enqueue_session_message(
@@ -16826,6 +16941,30 @@ class InMemorySessionStore(SessionStore):
             )
             return updated.model_copy(deep=True)
 
+    async def defer_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        async with self._lock:
+            delivery = self._matching_persisted_event_side_effect_claim_unlocked(claim)
+            updated = delivery.model_copy(
+                update={
+                    "status": PersistedEventSideEffectStatus.PENDING,
+                    "attempts": delivery.attempts - 1,
+                    "claim_id": None,
+                    "lease_expires_at": None,
+                    "next_attempt_at": None,
+                    "last_error": None,
+                    "updated_at": self._ownership_clock(),
+                },
+                deep=True,
+            )
+            self._persisted_event_side_effect_deliveries[(claim.session_id, claim.event_id)] = (
+                updated
+            )
+            return updated.model_copy(deep=True)
+
     async def list_persisted_event_side_effect_deliveries(
         self,
         *,
@@ -16875,6 +17014,43 @@ class InMemorySessionStore(SessionStore):
                     and delivery.lease_expires_at <= now
                 )
             ][:limit]
+
+    async def renew_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        if type(lease_seconds) not in {int, float} or not 0 < lease_seconds <= 86_400:
+            raise ValueError("lease_seconds must be positive and at most 86400.")
+        async with self._lock:
+            if (
+                claim.session_id,
+                claim.event_id,
+            ) not in self._persisted_event_side_effect_deliveries:
+                raise PersistedEventSideEffectClaimLost(
+                    "Persisted event side-effect claim is no longer active."
+                )
+            delivery = self._matching_persisted_event_side_effect_claim_unlocked(claim)
+            now = self._ownership_clock()
+            if delivery.lease_expires_at is None or delivery.lease_expires_at <= now:
+                raise PersistedEventSideEffectClaimLost(
+                    "Persisted event side-effect claim is no longer active."
+                )
+            renewed = delivery.model_copy(
+                update={
+                    "lease_expires_at": max(
+                        delivery.lease_expires_at, now + timedelta(seconds=float(lease_seconds))
+                    ),
+                    "updated_at": now,
+                },
+                deep=True,
+            )
+            self._persisted_event_side_effect_deliveries[(claim.session_id, claim.event_id)] = (
+                renewed
+            )
+            return renewed.model_copy(deep=True)
 
     def _matching_persisted_event_side_effect_claim_unlocked(
         self,
@@ -17868,6 +18044,14 @@ class InMemorySessionStore(SessionStore):
                 )
             record = self._session_operation_records.get(session_id, {}).get(idempotency_key)
             return None if record is None else copy_durable_json_object(record, "session_operation")
+
+    async def _load_historical_interaction_settlement_record(
+        self, session_id: str, event_id: str
+    ) -> dict[str, Any] | None:
+        key = _interaction_transition_storage_key(event_id)
+        async with self._lock:
+            record = self._session_operation_records.get(session_id, {}).get(key)
+            return None if record is None else copy_durable_json_object(record, "settlement")
 
     async def _load_runtime_publication_receipt_record(
         self,
@@ -28269,6 +28453,43 @@ def _prepare_runtime_publication(
         raise ValueError("Runtime publication request is malformed.") from exc
 
     _validate_workspace_observation_publication(copied_request, session_id=session_id)
+    if copied_request.kind in {"approval-close", "user-input-close"}:
+        from cayu.runtime._foreground_child_wait import (
+            FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+        )
+
+        continuation = next(
+            (
+                operation
+                for operation in copied_request.mutation.operations
+                if operation.key == FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY
+            ),
+            None,
+        )
+        expected_digest = copied_request.intent.get("post_action_continuation_digest")
+        if continuation is not None:
+            if (
+                continuation.action != "set"
+                or expected_digest
+                != runtime_publication_checkpoint_value_digest(continuation.value)
+            ):
+                raise ValueError("Action-close continuation conflicts with its publication intent.")
+        elif expected_digest is not None:
+            raise ValueError("Action-close continuation digest requires a continuation.")
+        parent_continuation = next(
+            (
+                op
+                for op in copied_request.mutation.operations
+                if op.key == "foreground_parent_continuation"
+            ),
+            None,
+        )
+        expected_parent = copied_request.intent.get("foreground_parent_continuation")
+        if parent_continuation is not None:
+            if parent_continuation.action != "set" or parent_continuation.value != expected_parent:
+                raise ValueError("Gate parent continuation conflicts with its close receipt.")
+        elif expected_parent is not None:
+            raise ValueError("Gate close receipt requires its parent continuation mutation.")
     if copied_request.argument_continuity is not None and copied_request.kind != "tool-round":
         raise ValueError("Private argument continuity requires a tool-round publication.")
     _validate_session_operation_record_keys(
@@ -28414,6 +28635,10 @@ def _validate_user_input_checkpoint_mutation(
         }
     )
     intent = request.intent
+    if request.kind == "user-input-close" and "post_action_continuation_digest" in intent:
+        extra_fields.add("post_action_continuation_digest")
+    if request.kind == "user-input-close" and "foreground_parent_continuation" in intent:
+        extra_fields.add("foreground_parent_continuation")
     if set(intent) != identity_fields | extra_fields or intent.get("schema_version") != 1:
         raise ValueError("User-input publication intent is malformed.")
     if (
@@ -28546,6 +28771,59 @@ def _validate_user_input_checkpoint_mutation(
             PENDING_USER_INPUT_CHECKPOINT_KEY,
             USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
         }
+        from cayu.runtime._foreground_child_wait import (
+            FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
+            ForegroundChildPostActionContinuation,
+            post_action_continuation_round_from_checkpoint,
+        )
+
+        close_continuation = operations.get(FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY)
+        if close_continuation is not None:
+            marker = ForegroundChildPostActionContinuation.model_validate(close_continuation.value)
+            round_evidence = post_action_continuation_round_from_checkpoint(current)
+            if (
+                close_continuation.action != "set"
+                or marker.close_publication_id != request.publication_id
+                or marker.wait.child_session_id != session_id
+                or marker.wait.child_session_instance_id != session_instance_id
+                or marker.wait.child_interaction_id != request.interaction_id
+                or marker.action_kind != "user_input"
+                or marker.action_id != intent.get("input_id")
+                or round_evidence is None
+                or marker.pending_tool_round != round_evidence.model_dump(mode="json")
+                or marker.completed_model_step
+                != current[PENDING_USER_INPUT_CHECKPOINT_KEY].get("model_step")
+                or marker.continuation_revision != marker.wait.revision
+            ):
+                raise ValueError("User-input close continuation conflicts with its durable round.")
+            closing_keys.add(FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY)
+        if "foreground_parent_continuation" in operations:
+            from cayu.runtime._foreground_gate_continuation import gate_close_continuation
+
+            parent_marker = operations["foreground_parent_continuation"]
+            round_evidence = post_action_continuation_round_from_checkpoint(current)
+            if round_evidence is None or parent_marker.action != "set":
+                raise ValueError("User-input gate closure lacks its original round.")
+            expected_parent = gate_close_continuation(
+                current,
+                pending=round_evidence,
+                publication_id=request.publication_id,
+                metadata=parent_marker.value["request"]["metadata"],
+            )
+            if expected_parent != parent_marker.value:
+                raise ValueError("User-input gate closure has conflicting continuation semantics.")
+            for key in ("foreground_child_wait", "foreground_child_terminal"):
+                if key not in operations or operations[key].action != "delete":
+                    raise ValueError(
+                        "User-input gate closure must retire its exact delegated wait."
+                    )
+            closing_keys.update(
+                {
+                    "foreground_parent_continuation",
+                    "foreground_child_wait",
+                    "foreground_child_terminal",
+                }
+            )
         if set(operations) not in {
             frozenset(closing_keys),
             frozenset(closing_keys | {CHECKPOINT_SCHEMA_VERSION_KEY}),

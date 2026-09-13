@@ -50,6 +50,19 @@ from cayu.vaults import SecretRedactor, contains_redacted_secret
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY = "approval_resolution_intent"
 APPROVAL_INTERRUPT_CLOSE_INTENT_KEY = "approval_close_intent"
+
+
+def approval_interrupt_close_intent(approval: PendingToolApproval) -> dict[str, str]:
+    """Bind interruption closure to the exact approval and model/tool round."""
+    return {
+        "approval_id": approval.approval_id,
+        "tool_call_id": approval.tool_call_id,
+        "tool_round_id": approval.tool_round_id,
+        "model_step_id": approval.model_step_id,
+        "model_attempt_id": approval.model_attempt_id,
+    }
+
+
 BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY = "cayu:business_approval"
 _BUSINESS_APPROVAL_STAMP_PRIORITY_FIELDS = (
     "kind",
@@ -276,6 +289,7 @@ def checkpoint_with_approval_resolution_intent(
     decision: ToolApprovalDecision,
     resolution_request_digest: str,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
     reviewed_approval_digest: str | None = None,
 ) -> dict[str, Any]:
     """Set or validate one immutable decision inside an approval claim."""
@@ -284,6 +298,7 @@ def checkpoint_with_approval_resolution_intent(
         checkpoint,
         approval=approval,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     expected = approval_resolution_intent_for(
         approval,
@@ -545,6 +560,7 @@ def _checkpoint_with_exact_pending_approval_round(
     *,
     approval: PendingToolApproval,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> dict[str, Any]:
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     current_approval = pending_approval_from_checkpoint(copied, redactor=redactor)
@@ -553,6 +569,7 @@ def _checkpoint_with_exact_pending_approval_round(
     current_round = tool_round_recovery.pending_tool_round_from_checkpoint(
         copied,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     if current_round is None or current_round.policy_state != "planned":
         raise RuntimeError("Pending tool approval has no policy-planned round to clear.")
@@ -575,6 +592,7 @@ def checkpoint_without_exact_pending_approval(
     *,
     approval: PendingToolApproval,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> dict[str, Any]:
     """Clear only the exact approval while retaining its planned round."""
 
@@ -582,6 +600,7 @@ def checkpoint_without_exact_pending_approval(
         checkpoint,
         approval=approval,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
@@ -593,6 +612,7 @@ def checkpoint_without_exact_pending_approval_round(
     *,
     approval: PendingToolApproval,
     redactor: SecretRedactor,
+    runtime_session: Session | None = None,
 ) -> dict[str, Any]:
     """Clear only the exact paired approval and policy-planned round."""
 
@@ -600,6 +620,7 @@ def checkpoint_without_exact_pending_approval_round(
         checkpoint,
         approval=approval,
         redactor=redactor,
+        runtime_session=runtime_session,
     )
     copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)

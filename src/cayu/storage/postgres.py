@@ -1115,6 +1115,7 @@ _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
         'tool.call.approval_requested',
         'session.awaiting_user_input',
         'session.interrupted',
+        'session.delegated_action.updated',
         'tool.call.started',
         'tool.call.completed',
         'tool.call.failed',
@@ -4470,6 +4471,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    86: (),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4577,6 +4579,7 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
               'tool.call.approval_requested',
               'session.awaiting_user_input',
               'session.interrupted',
+              'session.delegated_action.updated',
               'session.resumed',
               'session.completed',
               'session.failed',
@@ -4654,6 +4657,10 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
                     WHEN event_type = 'session.interrupted' THEN
                         jsonb_strip_nulls(jsonb_build_object(
                             'interruption_type', payload -> 'interruption_type',
+                            'child_session_id', payload -> 'child_session_id',
+                            'action_kind', payload -> 'action_kind',
+                            'action_id', payload -> 'action_id',
+                            'status', payload -> 'status',
                             'manual_recovery_required', payload -> 'manual_recovery_required',
                             'approval_id', payload -> 'approval_id',
                             'tool_call_id', payload -> 'tool_call_id',
@@ -4679,6 +4686,18 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
                                 ))
                                 ELSE NULL
                             END
+                        ))
+                    WHEN event_type = 'session.delegated_action.updated' THEN
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'interruption_type', payload -> 'interruption_type',
+                            'child_session_id', payload -> 'child_session_id',
+                            'action_kind', payload -> 'action_kind',
+                            'action_id', payload -> 'action_id',
+                            'status', payload -> 'status',
+                            'tool_call_id', payload -> 'tool_call_id',
+                            'model_step_id', payload -> 'model_step_id',
+                            'model_attempt_id', payload -> 'model_attempt_id',
+                            'tool_round_id', payload -> 'tool_round_id'
                         ))
                     WHEN event_type IN (
                         'tool.call.started',
@@ -4841,6 +4860,7 @@ def _revision_17_event_backfill_remaining_sql(source_predicate: str) -> str:
                   'tool.call.approval_requested',
                   'session.awaiting_user_input',
                   'session.interrupted',
+                  'session.delegated_action.updated',
                   'session.resumed',
                   'session.completed',
                   'session.failed',
@@ -5450,6 +5470,35 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             drop_statement=(
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_tasks_interrupted_handoff_generation"
             ),
+        ),
+    ),
+    86: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_pending_action_lookup",
+            table_name="cayu_events",
+            key_definitions=("session_id", "pending_action_lookup_key", "event_type", "sequence"),
+            predicate_definition="""
+                event_type = ANY (ARRAY[
+                    'tool.call.approval_requested', 'session.awaiting_user_input',
+                    'session.interrupted', 'session.delegated_action.updated',
+                    'tool.call.started', 'tool.call.completed', 'tool.call.failed',
+                    'tool.call.blocked', 'tool.call.approval_denied'
+                ]) AND pending_action_lookup_key IS NOT NULL
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cayu_events_pending_action_lookup
+                ON cayu_events(session_id, pending_action_lookup_key, event_type, sequence)
+                WHERE event_type IN (
+                    'tool.call.approval_requested', 'session.awaiting_user_input',
+                    'session.interrupted', 'session.delegated_action.updated',
+                    'tool.call.started', 'tool.call.completed', 'tool.call.failed',
+                    'tool.call.blocked', 'tool.call.approval_denied'
+                ) AND pending_action_lookup_key IS NOT NULL
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_lookup"
+            ),
+            replace_existing=True,
         ),
     ),
 }
@@ -29230,6 +29279,20 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 status_changed=receipt.status_changed,
             )
 
+    async def _load_historical_interaction_settlement_record(
+        self, session_id: str, event_id: str
+    ) -> dict[str, Any] | None:
+        key = _interaction_transition_storage_key(event_id)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s",
+                (session_id, key),
+            )
+            row = await cur.fetchone()
+            return None if row is None else _json_obj(row[0])
+
     async def _load_interaction_transition_receipt_by_event_id(
         self,
         session_id: str,
@@ -30637,6 +30700,80 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             retry_delay_seconds=(None if dead_lettered else float(retry_delay_seconds)),
         )
 
+    async def defer_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        return await self._finish_persisted_event_side_effect_claim(
+            claim,
+            status=PersistedEventSideEffectStatus.PENDING,
+            error=None,
+            retry_delay_seconds=None,
+            deferred=True,
+        )
+
+    async def renew_persisted_event_side_effect(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        if type(lease_seconds) not in {int, float} or not 0 < lease_seconds <= 86_400:
+            raise ValueError("lease_seconds must be positive and at most 86400.")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    # Sample ownership time only after acquiring the row lock:
+                    # lock contention must not turn a pre-wait timestamp into
+                    # permission to revive a lease that expired while waiting.
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_persisted_event_side_effects "
+                        "WHERE session_id = %s AND event_id = %s FOR UPDATE",
+                        (claim.session_id, claim.event_id),
+                    )
+                    if await cur.fetchone() is None:
+                        raise PersistedEventSideEffectClaimLost(
+                            "Persisted event side-effect claim is no longer active."
+                        )
+                    await cur.execute(
+                        """
+                        WITH timing AS MATERIALIZED (
+                            SELECT clock_timestamp() AS now
+                        )
+                        UPDATE cayu_persisted_event_side_effects
+                        SET lease_expires_at = GREATEST(
+                                lease_expires_at, timing.now + (%s * INTERVAL '1 second')
+                            ), updated_at = timing.now
+                        FROM timing
+                        WHERE session_id = %s AND event_id = %s AND status = 'leased'
+                          AND claim_id = %s AND attempts = %s
+                          AND lease_expires_at > timing.now
+                        RETURNING session_id, event_id, event_sequence, status,
+                                  attempts, claim_id, lease_expires_at, next_attempt_at,
+                                  last_error, updated_at
+                        """,
+                        (
+                            float(lease_seconds),
+                            claim.session_id,
+                            claim.event_id,
+                            claim.claim_id,
+                            claim.attempt,
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise PersistedEventSideEffectClaimLost(
+                            "Persisted event side-effect claim is no longer active."
+                        )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return _persisted_event_side_effect_delivery_from_row(row)
+
     async def _finish_persisted_event_side_effect_claim(
         self,
         claim: PersistedEventSideEffectClaim,
@@ -30644,6 +30781,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         status: PersistedEventSideEffectStatus,
         error: str | None,
         retry_delay_seconds: float | None,
+        deferred: bool = False,
     ) -> PersistedEventSideEffectDelivery:
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -30660,7 +30798,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 WHEN %s::double precision IS NULL THEN NULL
                                 ELSE timing.now + (%s * INTERVAL '1 second')
                             END,
-                            last_error = %s, updated_at = timing.now
+                            last_error = %s, updated_at = timing.now,
+                            attempts = attempts - %s
                         FROM timing
                         WHERE session_id = %s AND event_id = %s AND status = 'leased'
                           AND claim_id = %s AND attempts = %s
@@ -30673,6 +30812,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             retry_delay_seconds,
                             retry_delay_seconds,
                             error,
+                            int(deferred),
                             claim.session_id,
                             claim.event_id,
                             claim.claim_id,
@@ -36255,6 +36395,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             filters.append("(cayu_checkpoints.pending_action_flags & 1) <> 0")
         elif query.kind == PendingActionKind.USER_INPUT:
             filters.append("(cayu_checkpoints.pending_action_flags & 2) <> 0")
+        elif query.kind == PendingActionKind.DELEGATED_ACTION:
+            filters.append("(cayu_checkpoints.pending_action_flags & 8) <> 0")
         if query.cursor is not None:
             cursor_dt, cursor_id = decode_session_cursor(query.cursor)
             filters.append(
@@ -36295,7 +36437,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     'pending_user_input',
                     cayu_checkpoints.state -> 'pending_user_input',
                     'pending_tool_round',
-                    cayu_checkpoints.state -> 'pending_tool_round'
+                    cayu_checkpoints.state -> 'pending_tool_round',
+                    'foreground_child_wait',
+                    cayu_checkpoints.state -> 'foreground_child_wait'
                 )) AS pending_state
             FROM cayu_checkpoints
             WHERE cayu_checkpoints.session_id = ANY(%s)
@@ -36397,7 +36541,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 VALUES
                     ('tool.call.approval_requested'),
                     ('session.awaiting_user_input'),
-                    ('session.interrupted')
+                    ('session.interrupted'),
+                    ('session.delegated_action.updated')
             ),
             latest_barriers AS (
                 SELECT candidates.id AS session_id,
@@ -36428,6 +36573,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                           'tool.call.approval_requested',
                           'session.awaiting_user_input',
                           'session.interrupted',
+                          'session.delegated_action.updated',
                           'tool.call.started',
                           'tool.call.completed',
                           'tool.call.failed',
@@ -36459,6 +36605,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                           'tool.call.approval_requested',
                           'session.awaiting_user_input',
                           'session.interrupted',
+                          'session.delegated_action.updated',
                           'tool.call.started',
                           'tool.call.completed',
                           'tool.call.failed',
