@@ -1,0 +1,52 @@
+name: MCP client conformance subset
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/cayu/mcp/**'
+      - 'src/cayu/_mcp*'
+      - 'src/cayu/__init__.py'
+      - 'tests/core/test_mcp*'
+      - 'tests/fixtures/*mcp*'
+      - 'tests/conftest.py'
+      - 'scripts/*mcp*'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'docs/mcp-conformance.md'
+      - '.github/workflows/mcp-conformance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance-subset:
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-ancillary"]' || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build pinned verification image
+        run: docker build -f scripts/mcp-conformance.Dockerfile -t cayu-mcp-conformance:${{ github.run_id }}-${{ github.run_attempt }} .
+      - name: Run official subset and separate SDK interoperability tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/mcp-conformance-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker run --rm --init --network none \
+            --name "cayu-mcp-conformance-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -v "$RUNNER_TEMP/mcp-conformance-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT:/results" \
+            cayu-mcp-conformance:${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Retain evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mcp-client-conformance
+          path: ${{ runner.temp }}/mcp-conformance-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+      - name: Remove task-owned container and image
+        if: always()
+        run: |
+          docker rm --force "cayu-mcp-conformance-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>/dev/null || true
+          docker image rm cayu-mcp-conformance:${{ github.run_id }}-${{ github.run_attempt }} || true

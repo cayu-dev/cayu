@@ -1,0 +1,9 @@
+**
+!pyproject.toml
+!uv.lock
+!src/**
+!tests/**
+!scripts/mcp_conformance_client.py
+!scripts/run_mcp_conformance.py
+**/__pycache__
+**/.pytest_cache

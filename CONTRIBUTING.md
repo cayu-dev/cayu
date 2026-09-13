@@ -140,6 +140,10 @@ uv sync --extra dev --extra server
 
 ### Tests
 
+The [MCP client coverage matrix and Docker conformance gate](docs/mcp-conformance.md)
+separate official HTTP scenario evidence from pinned SDK interoperability and
+make unsupported or upstream-blocked scenarios explicit.
+
 ```bash
 uv run pytest                                  # full suite, serial
 uv run pytest -n 3 --dist loadfile             # full suite, conservative parallelism

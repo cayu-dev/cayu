@@ -53,6 +53,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Private provider-error diagnostics](provider-error-diagnostics.md)
 - [Provider stream-close diagnostics](provider-stream-close-investigation.md)
 - [Runtime stability qualification](runtime-qualification.md)
+- [MCP client conformance coverage](mcp-conformance.md)
 - [Release notes](release-notes.md)
 - [Releasing](releasing.md)
 - [Session-operation fault harness](session-operation-fault-harness.md)
