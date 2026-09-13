@@ -77,14 +77,27 @@ async def run(url: str, scenario: str, version: str, context: dict) -> None:
         await session.close()
 
 
-if __name__ == "__main__":
+def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("Expected one conformance server URL.")
+    token = os.environ["CAYU_MCP_CONFORMANCE_TOKEN"]
+    if not token:
+        raise ValueError("The gate must provide a fresh completion token.")
+    scenario = os.environ["MCP_CONFORMANCE_SCENARIO"]
+    version = os.environ["MCP_CONFORMANCE_PROTOCOL_VERSION"]
     asyncio.run(
         run(
             sys.argv[1],
-            os.environ["MCP_CONFORMANCE_SCENARIO"],
-            os.environ["MCP_CONFORMANCE_PROTOCOL_VERSION"],
+            scenario,
+            version,
             json.loads(os.environ.get("MCP_CONFORMANCE_CONTEXT", "{}")),
         )
     )
+    # Emit only after operations, session.close(), and event-loop shutdown.
+    print(
+        json.dumps({"cayu_completion": token, "scenario": scenario, "version": version}), flush=True
+    )
+
+
+if __name__ == "__main__":
+    main()

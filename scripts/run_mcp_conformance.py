@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import shlex
 import signal
 import subprocess
@@ -19,7 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-UPSTREAM_REVISION = "7169291ec0b68eb370fddcd9947313ab0d5e4156"
+from mcp_conformance_build import UPSTREAM_REVISION, verify_build
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -66,14 +68,21 @@ SDK_TESTS = (
 )
 
 
-def run_bounded(command: list[str], directory: Path, *, timeout: float) -> int:
+def run_bounded(
+    command: list[str], directory: Path, *, timeout: float, token: str | None = None
+) -> int:
     """Keep logs off memory and reap the runner's shell/client process group."""
     with (
         (directory / "runner.stdout.txt").open("w") as stdout,
         (directory / "runner.stderr.txt").open("w") as stderr,
     ):
         process = subprocess.Popen(
-            command, cwd=ROOT, stdout=stdout, stderr=stderr, start_new_session=True
+            command,
+            cwd=ROOT,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+            env={**os.environ, "CAYU_MCP_CONFORMANCE_TOKEN": token or ""},
         )
         try:
             return process.wait(timeout=timeout)
@@ -113,17 +122,18 @@ def validate_sdk_report(path: Path) -> None:
         raise ValueError("SDK interoperability tests failed or skipped.")
 
 
-def verify_upstream(upstream: Path) -> None:
-    revision = subprocess.check_output(
-        ["git", "-C", str(upstream), "rev-parse", "HEAD"], text=True, timeout=10
-    ).strip()
-    if revision != UPSTREAM_REVISION:
-        raise ValueError("Official conformance checkout does not match the pinned revision.")
-    subprocess.run(
-        ["git", "-C", str(upstream), "diff", "--exit-code", "HEAD"], check=True, timeout=10
-    )
-    if not (upstream / "dist/index.js").is_file():
-        raise ValueError("Build the official conformance checkout before running.")
+def validate_completion(path: Path, scenario: Scenario, token: str) -> None:
+    expected = {"cayu_completion": token, "scenario": scenario.name, "version": scenario.version}
+    receipts = []
+    for line in path.read_text().splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "cayu_completion" in value:
+            receipts.append(value)
+    if receipts != [expected]:
+        raise ValueError("Missing or mismatched adapter completion receipt after session cleanup.")
 
 
 def main() -> int:
@@ -144,7 +154,7 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=False)
     upstream = args.upstream.resolve()
     records = []
-    report = {
+    report: dict[str, Any] = {
         "upstream_revision": UPSTREAM_REVISION,
         "full_conformance": False,
         "coverage_document": "docs/mcp-conformance.md",
@@ -152,7 +162,7 @@ def main() -> int:
         "results": records,
     }
     try:
-        verify_upstream(upstream)
+        report["referee_build"] = verify_build(upstream)
         scenarios = list(SCENARIOS)
         if args.include_blocked:
             scenarios.extend(
@@ -169,6 +179,7 @@ def main() -> int:
             }
             records.append(record)
             try:
+                token = secrets.token_hex(32)
                 code = run_bounded(
                     [
                         "node",
@@ -189,6 +200,7 @@ def main() -> int:
                     ],
                     directory,
                     timeout=45,
+                    token=token,
                 )
                 record["exit_code"] = code
                 artifacts = list(directory.glob("*/checks.json"))
@@ -199,6 +211,7 @@ def main() -> int:
                 if code != 0:
                     raise ValueError(f"Official runner exited {code}; see retained logs.")
                 validate_checks(checks, scenario.required_checks)
+                validate_completion(artifacts[0].with_name("stdout.txt"), scenario, token)
                 if scenario.name in BLOCKED_SCENARIOS:
                     raise ValueError(
                         "Previously blocked scenario changed; review the coverage matrix before admitting it."

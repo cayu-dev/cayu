@@ -23,6 +23,7 @@ def _load(name):
     return module
 
 
+build = _load("mcp_conformance_build")
 runner = _load("run_mcp_conformance")
 client = _load("mcp_conformance_client")
 
@@ -165,7 +166,7 @@ def test_covered_scenarios_have_nonempty_evidence_and_adapter_support(scenario):
 def test_docker_build_pins_the_same_official_revision():
     dockerfile = (ROOT / "scripts/mcp-conformance.Dockerfile").read_text()
     assert f"git fetch --depth 1 origin {runner.UPSTREAM_REVISION}" in dockerfile
-    assert "npm ci --ignore-scripts" in dockerfile
+    assert "python3 /tmp/mcp_conformance_build.py --upstream /opt/conformance" in dockerfile
     assert "uv sync --frozen" in dockerfile
 
 
@@ -173,7 +174,7 @@ def test_docker_build_pins_the_same_official_revision():
 def test_nonzero_exit_or_missing_artifacts_fail_with_report(tmp_path, monkeypatch, return_code):
     output = tmp_path / "evidence"
     monkeypatch.setattr(sys, "argv", ["run", "--upstream", str(tmp_path), "--output", str(output)])
-    monkeypatch.setattr(runner, "verify_upstream", lambda path: None)
+    monkeypatch.setattr(runner, "verify_build", lambda path: {})
     monkeypatch.setattr(runner, "run_bounded", lambda *args, **kwargs: return_code)
     assert runner.main() == 1
     report = json.loads((output / "summary.json").read_text())
@@ -191,7 +192,7 @@ def test_output_directory_cannot_reuse_stale_evidence(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode", ["pass", "exit", "skip", "empty", "missing", "duplicate", "blocked"]
+    "mode", ["pass", "exit", "skip", "empty", "missing", "duplicate", "blocked", "crash"]
 )
 def test_complete_gate_keeps_official_and_sdk_evidence_separate(tmp_path, monkeypatch, mode):
     output = tmp_path / "evidence"
@@ -199,7 +200,7 @@ def test_complete_gate_keeps_official_and_sdk_evidence_separate(tmp_path, monkey
     if mode == "blocked":
         args.append("--include-blocked")
     monkeypatch.setattr(sys, "argv", args)
-    monkeypatch.setattr(runner, "verify_upstream", lambda path: None)
+    monkeypatch.setattr(runner, "verify_build", lambda path: {})
 
     def execute(command, directory, **kwargs):
         if "--scenario" in command:
@@ -222,6 +223,17 @@ def test_complete_gate_keeps_official_and_sdk_evidence_separate(tmp_path, monkey
             artifact = directory / "fresh"
             artifact.mkdir()
             (artifact / "checks.json").write_text(json.dumps(checks))
+            (artifact / "stdout.txt").write_text(
+                ""
+                if mode == "crash"
+                else json.dumps(
+                    {
+                        "cayu_completion": kwargs["token"],
+                        "scenario": name,
+                        "version": version,
+                    }
+                )
+            )
             if mode == "duplicate":
                 duplicate = directory / "another"
                 duplicate.mkdir()
@@ -247,7 +259,7 @@ def test_complete_gate_keeps_official_and_sdk_evidence_separate(tmp_path, monkey
 def test_wrong_upstream_revision_fails_before_execution(monkeypatch, tmp_path):
     monkeypatch.setattr(runner.subprocess, "check_output", lambda *args, **kwargs: "wrong\n")
     with pytest.raises(ValueError, match="pinned revision"):
-        runner.verify_upstream(tmp_path)
+        build.verify_source(tmp_path)
 
 
 def test_timeout_reaps_child_process(tmp_path):
@@ -258,3 +270,115 @@ def test_timeout_reaps_child_process(tmp_path):
             [sys.executable, "-c", "import time; time.sleep(30)"], tmp_path, timeout=0.1
         )
     assert (tmp_path / "runner.stderr.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "mode", ["missing", "stale", "duplicate", "wrong-scenario", "wrong-version"]
+)
+def test_completion_requires_one_current_receipt(tmp_path, mode):
+    scenario = runner.SCENARIOS[0]
+    receipt = {"cayu_completion": "current", "scenario": scenario.name, "version": scenario.version}
+    if mode == "stale":
+        receipt["cayu_completion"] = "previous"
+    elif mode == "wrong-scenario":
+        receipt["scenario"] = "other"
+    elif mode == "wrong-version":
+        receipt["version"] = "other"
+    contents = json.dumps(receipt) + "\n"
+    if mode == "missing":
+        contents = "unrelated output\n"
+    elif mode == "duplicate":
+        contents *= 2
+    path = tmp_path / "stdout.txt"
+    path.write_text(contents)
+    with pytest.raises(ValueError, match="completion receipt"):
+        runner.validate_completion(path, scenario, "current")
+
+
+@pytest.mark.parametrize("failure", [None, "operation", "cleanup"])
+def test_adapter_emits_receipt_only_after_successful_cleanup(monkeypatch, capsys, failure):
+    session = SimpleNamespace(
+        list_tools=AsyncMock(
+            side_effect=ValueError("operation") if failure == "operation" else None
+        ),
+        close=AsyncMock(side_effect=ValueError("cleanup") if failure == "cleanup" else None),
+    )
+    monkeypatch.setattr(
+        client,
+        "HttpMcpClient",
+        lambda **kwargs: SimpleNamespace(connect=AsyncMock(return_value=session)),
+    )
+    monkeypatch.setattr(sys, "argv", ["adapter", "http://localhost"])
+    monkeypatch.setenv("CAYU_MCP_CONFORMANCE_TOKEN", "current")
+    monkeypatch.setenv("MCP_CONFORMANCE_SCENARIO", "initialize")
+    monkeypatch.setenv("MCP_CONFORMANCE_PROTOCOL_VERSION", "2025-06-18")
+    monkeypatch.delenv("MCP_CONFORMANCE_CONTEXT", raising=False)
+    if failure:
+        with pytest.raises(ValueError, match=failure):
+            client.main()
+        assert not capsys.readouterr().out
+    else:
+        client.main()
+        assert json.loads(capsys.readouterr().out) == {
+            "cayu_completion": "current",
+            "scenario": "initialize",
+            "version": "2025-06-18",
+        }
+    session.close.assert_awaited_once()
+
+
+def _fake_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(build, "verify_source", lambda path: None)
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "dist/index.js").write_text("bundle")
+    (tmp_path / "node_modules/dependency.js").write_text("dependency")
+    (tmp_path / "package-lock.json").write_text("lock")
+    return build.build_identity(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    ["dist/index.js", "node_modules/dependency.js", "package-lock.json", "node_modules/extra.js"],
+)
+def test_modified_build_or_dependencies_require_rebuild(tmp_path, monkeypatch, changed):
+    identity = _fake_build(tmp_path, monkeypatch)
+    (tmp_path / build.RECEIPT).write_text(json.dumps(identity))
+    assert build.verify_build(tmp_path) == identity
+    (tmp_path / changed).write_text("different")
+    with pytest.raises(ValueError, match="rebuild"):
+        build.verify_build(tmp_path)
+
+
+def test_unattested_bundle_is_rejected(tmp_path, monkeypatch):
+    _fake_build(tmp_path, monkeypatch)
+    with pytest.raises(FileNotFoundError):
+        build.verify_build(tmp_path)
+
+
+@pytest.mark.parametrize("fail_at", [None, "ci", "run", "prune"])
+def test_receipt_only_follows_successful_locked_build(tmp_path, monkeypatch, fail_at):
+    identity = _fake_build(tmp_path, monkeypatch)
+    receipt = tmp_path / build.RECEIPT
+    receipt.write_text(json.dumps(identity))
+    commands = []
+
+    def execute(command, **kwargs):
+        assert not receipt.exists()
+        commands.append(command)
+        if command[1] == fail_at:
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(build.subprocess, "run", execute)
+    if fail_at:
+        with pytest.raises(subprocess.CalledProcessError):
+            build.prepare(tmp_path)
+        assert not receipt.exists()
+    else:
+        build.prepare(tmp_path)
+        assert json.loads(receipt.read_text()) == identity
+        assert commands == [
+            ["npm", "ci", "--ignore-scripts"],
+            ["npm", "run", "build"],
+            ["npm", "prune", "--omit=dev", "--ignore-scripts"],
+        ]

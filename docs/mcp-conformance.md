@@ -74,6 +74,12 @@ only (`--network none`); no providers, credentials, host Docker socket, or
 privileged mode are needed. Python dependencies are frozen by `uv.lock`, the
 upstream source by commit and npm lockfile. Base OS image tags remain updateable;
 this is a pinned protocol/dependency baseline, not a bit-for-bit image promise.
+The build helper installs the locked dependencies, rebuilds and prunes the
+referee, and only then records hashes of the lockfile, bundle, and installed
+dependency tree. Each run verifies this receipt and includes it in the summary.
+Missing receipts and changed artifacts require a rebuild; a clean source checkout
+alone does not attest the executable. This detects stale or modified builds, not
+malicious replacement of both artifacts and their local receipt.
 The upstream npm lockfile currently has reported dependency advisories. This is
 isolated verification tooling, not a deployable Cayu image. Do not inject secrets
 or use `npm audit fix` to silently replace the referee's dependency baseline.
@@ -84,7 +90,10 @@ rejected to prevent stale checks from satisfying a new run. Each official run
 has a 30-second inner timeout and 45-second outer process-group deadline. SDK
 verification has a 180-second deadline. Failures retain evidence. A missing
 required check, any failure/warning/skip, a nonzero exit, or skipped SDK test
-fails the gate. `full_conformance` is always false; `covered_subset_passed`
+fails the gate. Each client must also emit a fresh run-specific completion
+receipt after session cleanup and event-loop shutdown. This prevents the
+upstream runner's signal-exit handling from admitting incomplete client runs.
+`full_conformance` is always false; `covered_subset_passed`
 describes only the five rows above plus the separate SDK test group.
 
 The SDK group requires four concrete test cases: modern stdio operations, HTTP
@@ -106,10 +115,11 @@ scenario pass; coverage changes require review. The normal CI job runs only the
 covered subset and uploads evidence even after failure. Run it manually through
 the **MCP client conformance subset** workflow or on relevant pull requests.
 
-For direct development on Linux, build the pinned upstream checkout with
-`npm ci --ignore-scripts && npm run build`, then run:
+For direct development on Linux, prepare the pinned upstream checkout using the
+same build helper as Docker (requires Node/npm and network access), then run:
 
 ```bash
+python3 scripts/mcp_conformance_build.py --upstream /absolute/path/to/conformance
 uv run --frozen --extra dev --extra server python scripts/run_mcp_conformance.py \
   --upstream /absolute/path/to/conformance --output /absolute/new/evidence
 ```
