@@ -467,3 +467,89 @@ async def test_cancel_during_create_reconciliation(tmp_path, monkeypatch, sqlite
     assert not provider.requests
     if sqlite:
         await store.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sqlite", [False, True])
+@pytest.mark.parametrize("view", ["normal", "missing_terminal", "newer_run", "read_failure"])
+async def test_deadline_after_native_completion_retains_terminal(
+    tmp_path, monkeypatch, sqlite, view
+):
+    store = SQLiteSessionStore(tmp_path / "completed.db") if sqlite else InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    provider = ScriptedModelProvider(
+        [[ModelStreamEvent.text_delta("settled"), ModelStreamEvent.completed({})]]
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker", model="test"))
+    ctx = Verifiers(app).context("parent")
+    await ctx.start()
+    completed = asyncio.Event()
+    original_run = app.run
+    child_id = None
+
+    async def pause_after_completion(request):
+        nonlocal child_id
+        child_id = request.session_id
+        async with contextlib.aclosing(original_run(request)) as stream:
+            async for event in stream:
+                if event.type == EventType.SESSION_COMPLETED:
+                    completed.set()
+                    await asyncio.Event().wait()
+                yield event
+
+    monkeypatch.setattr(app, "run", pause_after_completion)
+    import cayu.workflows.workflow as workflow_module
+
+    original_state = workflow_module._child_failure_state
+
+    async def state_view(context, session_id):
+        if view == "read_failure":
+            raise OSError("synthetic diagnostic failure")
+        state = await original_state(context, session_id)
+        if view == "missing_terminal":
+            state.evidence = state.evidence.model_copy(update={"terminal_event_id": None})
+        elif view == "newer_run":
+            state.run_epoch += 1
+            state.evidence = state.evidence.model_copy(update={"run_epoch": state.run_epoch})
+        return state
+
+    monkeypatch.setattr(workflow_module, "_child_failure_state", state_view)
+    timer = None
+
+    async def invoke():
+        nonlocal timer
+        async with execution_deadline_scope(ExecutionDeadline.after(60)) as timer:
+            await step(ctx, agent="worker", step_id="check", prompt="go")
+
+    task = asyncio.create_task(invoke())
+    await asyncio.wait_for(completed.wait(), 10)
+    timer.reschedule(asyncio.get_running_loop().time())
+    with pytest.raises(TimeoutError) as caught:
+        await asyncio.wait_for(task, 10)
+    evidence = exception_evidence(caught.value)
+    events = await store.load_events(child_id)
+    terminal = next(e for e in events if e.type == EventType.SESSION_COMPLETED)
+    started = next(e for e in events if e.type == EventType.SESSION_STARTED)
+    assert evidence.session_id == child_id
+    assert evidence.run_epoch == started.payload["run_epoch"]
+    assert evidence.terminal_event_id == (terminal.id if view == "normal" else None)
+    assert evidence.classification == "deadline"
+    assert evidence.settlement == "unknown"
+    assert not evidence.secondary_failures
+    assert not any(
+        e.type == EventType.WORKFLOW_STEP_COMPLETED for e in await store.load_events("parent")
+    )
+    # Durable replay recovers the existing native output without model work.
+    monkeypatch.setattr(app, "run", original_run)
+    replay_ctx = Verifiers(app).context("parent")
+    await replay_ctx.start()
+    result = await step(replay_ctx, agent="worker", step_id="check", prompt="go")
+    assert result.session_id == child_id
+    assert result.text == "settled"
+    assert len(provider.requests) == 1
+    if sqlite:
+        await store.close()
+        reopened = SQLiteSessionStore(tmp_path / "completed.db")
+        assert terminal.id in {e.id for e in await reopened.load_events(child_id)}
+        await reopened.close()

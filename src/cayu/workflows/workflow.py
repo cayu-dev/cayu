@@ -271,6 +271,15 @@ class _StepRunEventState:
                 event_id=event.id,
                 interrupted=event_type == EventType.SESSION_INTERRUPTED,
             )
+        elif event_type == EventType.SESSION_COMPLETED and self.run_epoch is not None:
+            # Cancellation can arrive after native completion but before the
+            # workflow receives the result. Preserve the exact terminal of the
+            # executing epoch; completion alone is not settlement authority.
+            self.evidence = FailureEvidence(
+                session_id=event.session_id,
+                run_epoch=self.run_epoch,
+                terminal_event_id=event.id,
+            )
         if event_type == EventType.MODEL_STARTED:
             self.text_buffer = []
         elif event_type == EventType.MODEL_TEXT_DELTA:

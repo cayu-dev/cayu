@@ -11,6 +11,7 @@ from cayu import (
     AgentSpec,
     CayuApp,
     EventType,
+    InMemorySessionStore,
     Message,
     OpenAIProvider,
     OpenAIWebSearch,
@@ -354,6 +355,96 @@ async def test_final_response_wait_keeps_runtime_deadlines_and_joins_cancellatio
     )
 
 
+@pytest.mark.anyio
+async def test_final_response_default_wait_allows_silence_until_absolute_deadline(monkeypatch):
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: now)
+    requests = []
+
+    async def handler(request):
+        nonlocal now
+        requests.append(request)
+        # A final-JSON request cannot report intermediate semantic progress.
+        # Advance only after real HTTP dispatch, without a wall-clock sleep.
+        now += 301
+        return httpx.Response(200, json=response(message()))
+
+    transport = HttpxOpenAITransport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport._client._client = client
+        provider = OpenAIProvider(api_key="synthetic-key", transport=transport, streaming=False)
+        request = ModelRequest(model="gpt-5.6", messages=[Message.text("user", "go")])
+        events = [event async for event in provider.runtime_stream(request)]
+    assert events[-1].type.value == "completed"
+    assert len(requests) == 1
+    assert requests[0].extensions["timeout"]["read"] == 600
+    assert provider.stream_deadlines.absolute_stream_timeout_s == 600
+
+
+def test_final_response_explicit_timeout_and_deadlines_remain_authoritative():
+    deadlines = ProviderStreamDeadlines(
+        semantic_progress_timeout_s=17, absolute_stream_timeout_s=23
+    )
+    provider = OpenAIProvider(
+        api_key="synthetic-key", streaming=False, timeout_s=11, stream_deadlines=deadlines
+    )
+    assert provider.timeout_s == 11
+    assert provider.stream_deadlines is deadlines
+
+
+@pytest.mark.anyio
+async def test_final_response_deadline_records_unknown_outcome_without_retry():
+    started, stopped = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    class WaitingTransport:
+        async def create_response(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+    store = InMemorySessionStore()
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        transport=WaitingTransport(),
+        streaming=False,
+        stream_deadlines=ProviderStreamDeadlines(absolute_stream_timeout_s=0.1),
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.6"))
+    with pytest.raises(ModelStreamDeadlineError):
+        _events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="final-deadline",
+                    messages=[Message.text("user", "go")],
+                    retry_policy=RetryPolicy(
+                        max_attempts=5, max_unknown_attempts=2, initial_delay_s=0
+                    ),
+                )
+            )
+        ]
+    assert started.is_set() and stopped.is_set() and calls == 1
+    errors = [
+        e.payload
+        for e in await store.load_events("final-deadline")
+        if e.type == EventType.MODEL_ERROR
+    ]
+    assert len(errors) == 1
+    assert errors[0]["provider_deadline_kind"] == "absolute"
+    assert errors[0]["provider_effect_outcome"] == "unknown"
+    assert errors[0]["provider_recovery_disposition"] == "manual_settlement_required"
+    assert errors[0]["retry"] is False
+
+
 def test_response_transport_mode_has_distinct_request_identity():
     from cayu.providers.openai import _execution_profile_material
 
@@ -368,7 +459,17 @@ def test_response_transport_mode_has_distinct_request_identity():
     final_material = _execution_profile_material(final)
     assert current_material is not None and final_material is not None
     assert "streaming" not in current_material
-    assert final_material == {**current_material, "streaming": False}
+    assert final_material == {
+        **current_material,
+        "streaming": False,
+        "timeout_s": 600.0,
+        "stream_deadlines": {
+            **current_material["stream_deadlines"],
+            "transport_idle_timeout_s": 600.0,
+            "protocol_idle_timeout_s": 600.0,
+            "semantic_progress_timeout_s": 600.0,
+        },
+    }
 
 
 @pytest.mark.parametrize("invalid", [None, 0, 1, "false"])

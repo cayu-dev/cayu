@@ -8946,10 +8946,15 @@ Once a provider has completed a request, structurally invalid `provider_state` c
 The adapter validates that response before yielding normalized text, reasoning,
 hosted-search, function-call and completion events through the same Runtime
 path. This mode avoids intermediate SSE ordering and supplies no incremental
-progress before the response arrives. The HTTP request timeout and Runtime's
-semantic-progress, absolute and execution deadlines still apply; a slow final
-response can therefore expire at the existing semantic-progress limit. No
-timeout, retry allowance or token budget is increased. The mode participates
+progress before the response arrives. With no explicit timeout configuration,
+the HTTP request and idle clocks use the existing 600-second absolute limit,
+so expected silence does not expire at the streaming 300-second idle limit.
+Streaming keeps its existing defaults. Explicit `timeout_s` and
+`stream_deadlines` remain authoritative; an explicitly shorter semantic limit
+can still expire a final-response wait. Absolute and execution deadlines,
+retry allowances and token budgets remain in force. A cancelled request has
+an unknown upstream outcome unless terminal evidence proves otherwise; local
+HTTP cleanup does not authorize replay. The mode participates
 in request footprints and fingerprints and cannot be combined with
 `background=True`. It is not an automatic fallback for a failed streamed
 attempt and does not change the streaming parser's identity checks. Compatible
@@ -10361,6 +10366,12 @@ workflow cancellation retains that diagnostic identity through timeout wrapping
 and repeated cancellation, including when terminal publication or lookup fails.
 A missing terminal does not erase the observed run. Only matching stored terminal
 evidence supplies `terminal_event_id`; a newer run's terminal is never borrowed.
+If the child completes before cancellation interrupts result handoff, this
+reference can identify its stored `session.completed` event. The preceding
+native start/resume event binds that terminal to the executing epoch; the current
+session epoch can have advanced during terminal fencing. The original timeout
+or cancellation still propagates, and `settlement` stays `unknown`. Consumers
+must inspect recovery/effect state before depending on that completed child.
 Before child creation, requested/generated IDs remain non-authoritative and these
 evidence fields stay absent. Pre-start recovery records that lack an executing
 epoch do not establish a run-to-terminal reference, even if their status is terminal.

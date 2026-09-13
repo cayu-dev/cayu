@@ -1202,7 +1202,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         api_key: str | None = None,
         name: str = "openai",
         base_url: str = DEFAULT_OPENAI_BASE_URL,
-        timeout_s: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
+        timeout_s: float | None = None,
         stream_deadlines: ProviderStreamDeadlines | None = None,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
@@ -1259,9 +1259,30 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             )
         self.background = background
         self.streaming = streaming
-        self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
         self._stream_deadlines = _resolve_provider_stream_deadlines(
             stream_deadlines=stream_deadlines,
+        )
+        if not streaming and stream_deadlines is None:
+            # Final JSON cannot expose intermediate progress. Default to the
+            # existing absolute bound instead of expiring an otherwise active
+            # response at the streaming idle limit. Explicit policies remain
+            # authoritative, including deliberately shorter semantic limits.
+            absolute = self._stream_deadlines.absolute_stream_timeout_s
+            self._stream_deadlines = replace(
+                self._stream_deadlines,
+                transport_idle_timeout_s=absolute,
+                protocol_idle_timeout_s=absolute,
+                semantic_progress_timeout_s=absolute,
+            )
+        self.timeout_s = positive_finite_seconds(
+            (
+                DEFAULT_OPENAI_TIMEOUT_SECONDS
+                if streaming
+                else self._stream_deadlines.absolute_stream_timeout_s
+            )
+            if timeout_s is None
+            else timeout_s,
+            "timeout_s",
         )
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         if self.background:
