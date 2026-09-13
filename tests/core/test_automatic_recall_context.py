@@ -1003,6 +1003,7 @@ def test_memory_delta_appends_new_revision_once_without_changing_base_focus() ->
         "cayu.query_concepts.v2",
         "cayu.query_concepts.v3",
         "cayu.query_concepts.v4",
+        "cayu.query_concepts.v5",
     ],
 )
 def test_reanchor_policy_requires_validated_independent_relevance(relevance: str) -> None:

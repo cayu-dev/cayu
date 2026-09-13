@@ -20,6 +20,10 @@ PHRASE_RELEVANCE_VERSION = "cayu.query_concepts.v3"
 PHRASE_RELEVANCE_TEXT_VERSION = f"{PHRASE_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
 TOPIC_RELEVANCE_VERSION = "cayu.query_concepts.v4"
 TOPIC_RELEVANCE_TEXT_VERSION = f"{TOPIC_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
+APOSTROPHE_RELEVANCE_VERSION = "cayu.query_concepts.v5"
+APOSTROPHE_RELEVANCE_TEXT_VERSION = (
+    f"{APOSTROPHE_RELEVANCE_VERSION}+unicode-{unicodedata.unidata_version}"
+)
 # Fixed calibration vocabulary; changing it requires a new version.
 _STOP = frozenset(
     [
@@ -152,6 +156,9 @@ _TOPIC_BOILERPLATE = _PHRASE_BOILERPLATE - _FACTUAL_SCHEMA_WORDS
 _SERIALIZATION_FORMATS = frozenset({"json", "yaml", "xml", "markdown"})
 _SCHEMA_STATUS_VALUES = frozenset({"known", "unknown", "null", "true", "false"})
 _TERM = re.compile(r"[^\W_]+(?:[-./][^\W_]+)*")
+# Keep internal apostrophes within a lexical unit, including contractions. Do
+# not turn their suffixes into independent evidence or join across whitespace.
+_APOSTROPHE_TERM = re.compile(r"[^\W_]+(?:[-./'\u2019][^\W_]+)*")
 _PHRASE_BREAK = re.compile(
     r"[,.!?;\n\r\v\f\x1c-\x1e\x85\u2028\u2029\u3002\uff0c\uff01\uff1f\uff1b]"
 )
@@ -342,7 +349,16 @@ def _topic_clause(terms: list[str], *, topic: bool = False) -> list[str]:
     return terms
 
 
-def _clauses(text: str) -> Iterator[tuple[list[str], bool]]:
+def _normalized_term(term: str) -> str:
+    term = term.replace("\u2019", "'")
+    # Alphabetic 's is treated uniformly, without guessing whether it denotes
+    # possession or a contraction. Compound identifiers are not stemmed.
+    if term.endswith("'s") and term[:-2].isalpha():
+        return term[:-2]
+    return term
+
+
+def _clauses(text: str, *, apostrophes: bool = False) -> Iterator[tuple[list[str], bool]]:
     """Yield terms and whether their preceding boundary resets delivery context.
 
     Commas break phrase windows but not an ongoing delivery instruction. Token
@@ -352,7 +368,7 @@ def _clauses(text: str) -> Iterator[tuple[list[str], bool]]:
     previous_end = 0
     reset_delivery = True
     text = text.casefold()
-    for match in _TERM.finditer(text):
+    for match in (_APOSTROPHE_TERM if apostrophes else _TERM).finditer(text):
         boundaries = _PHRASE_BREAK.findall(text[previous_end : match.start()])
         if boundaries:
             if terms:
@@ -360,19 +376,19 @@ def _clauses(text: str) -> Iterator[tuple[list[str], bool]]:
             terms = []
             reset_delivery = any(boundary not in {",", "\uff0c"} for boundary in boundaries)
         previous_end = match.end()
-        terms.append(match.group())
+        terms.append(_normalized_term(match.group()) if apostrophes else match.group())
     if terms:
         yield terms, reset_delivery
 
 
 def _phrases(
-    text: str, *, query: bool = False, topic: bool = False
+    text: str, *, query: bool = False, topic: bool = False, apostrophes: bool = False
 ) -> Iterator[tuple[str, str, str]]:
     """Linear scan; three distinct concepts in one uninterrupted topic phrase."""
     window: deque[str] = deque(maxlen=3)
     delivery = False
     boilerplate = _TOPIC_BOILERPLATE if topic else _PHRASE_BOILERPLATE
-    for clause, reset_delivery in _clauses(text):
+    for clause, reset_delivery in _clauses(text, apostrophes=apostrophes):
         window.clear()
         if query:
             if reset_delivery:
@@ -424,11 +440,11 @@ class RecallCandidateDecision(BaseModel):
 
 def _concepts(text: str, *, version: str = RELEVANCE_VERSION) -> set[str]:
     vocabulary = _CONCEPTS if version == RELEVANCE_VERSION else _V2_CONCEPTS
-    return {
-        vocabulary.get(term, term)
-        for term in re.findall(r"[^\W_]+(?:[-./][^\W_]+)*", text.casefold())
-        if term not in _STOP
-    }
+    apostrophes = version == APOSTROPHE_RELEVANCE_VERSION
+    terms = (_APOSTROPHE_TERM if apostrophes else _TERM).findall(text.casefold())
+    if apostrophes:
+        terms = [_normalized_term(term) for term in terms]
+    return {vocabulary.get(term, term) for term in terms if term not in _STOP}
 
 
 def query_concept_eligibility(
@@ -444,6 +460,7 @@ def query_concept_eligibility(
         TITLE_RELEVANCE_VERSION,
         PHRASE_RELEVANCE_VERSION,
         TOPIC_RELEVANCE_VERSION,
+        APOSTROPHE_RELEVANCE_VERSION,
     }:
         raise ValueError("Unsupported query concept version.")
     if query is None:
@@ -459,9 +476,13 @@ def query_concept_eligibility(
     # and a majority of its evidence. Repetition/volume cannot change the result.
     if len(supported) >= min(2, len(terms)) and len(supported) / len(terms) >= 0.6:
         return "eligible", "query_concept_support"
-    if version in {PHRASE_RELEVANCE_VERSION, TOPIC_RELEVANCE_VERSION} and len(supported) >= 3:
-        topic = version == TOPIC_RELEVANCE_VERSION
-        query_phrases = set(_phrases(query, query=True, topic=topic))
+    if (
+        version in {PHRASE_RELEVANCE_VERSION, TOPIC_RELEVANCE_VERSION, APOSTROPHE_RELEVANCE_VERSION}
+        and len(supported) >= 3
+    ):
+        topic = version in {TOPIC_RELEVANCE_VERSION, APOSTROPHE_RELEVANCE_VERSION}
+        apostrophes = version == APOSTROPHE_RELEVANCE_VERSION
+        query_phrases = set(_phrases(query, query=True, topic=topic, apostrophes=apostrophes))
         if topic:
             # A phrase cannot match if any constituent concept is absent from
             # both body and title. Avoid a second full candidate scan in that
@@ -470,10 +491,16 @@ def query_concept_eligibility(
                 phrase for phrase in query_phrases if all(word in supported for word in phrase)
             }
         if query_phrases and (
-            any(phrase in query_phrases for phrase in _phrases(text, topic=topic))
+            any(
+                phrase in query_phrases
+                for phrase in _phrases(text, topic=topic, apostrophes=apostrophes)
+            )
             or (
                 title is not None
-                and any(phrase in query_phrases for phrase in _phrases(title, topic=topic))
+                and any(
+                    phrase in query_phrases
+                    for phrase in _phrases(title, topic=topic, apostrophes=apostrophes)
+                )
             )
         ):
             return "eligible", "query_phrase_support"

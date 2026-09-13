@@ -165,6 +165,7 @@ def test_embedded_schema_questions_preserve_factual_topics(question):
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("version", [TOPIC_RELEVANCE_VERSION, "cayu.query_concepts.v5"])
 @pytest.mark.parametrize(
     "query,text,focused",
     [
@@ -195,7 +196,9 @@ def test_embedded_schema_questions_preserve_factual_topics(question):
         ),
     ],
 )
-def test_factual_schema_terms_reach_real_backend_admission(tmp_path, backend, query, text, focused):
+def test_factual_schema_terms_reach_real_backend_admission(
+    tmp_path, backend, version, query, text, focused
+):
     import asyncio
 
     from test_memory_admission import _policy
@@ -220,7 +223,7 @@ def test_factual_schema_terms_reach_real_backend_admission(tmp_path, backend, qu
         try:
             await store.create_entry(KnowledgeEntry(id="signing", text=text))
             policy = _policy(
-                relevance_policy=TOPIC_RELEVANCE_VERSION,
+                relevance_policy=version,
                 minimum_inject_score=0.01,
                 minimum_offer_score=0.005,
             )

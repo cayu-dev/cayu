@@ -300,6 +300,11 @@ def test_phrase_policy_identity_is_distinct_and_round_trips():
             "What is the artifact signing key alias? Return only JSON with keys value and status. Do not guess.",
             "Artifact signing key alias: production-signer.",
         ),
+        (
+            "cayu.query_concepts.v5",
+            "What is the artifact signing key alias? Return only JSON with keys value and status. Do not guess.",
+            "Artifact signing key alias: production-signer.",
+        ),
     ],
 )
 def test_runtime_delivers_phrase_supported_record_and_persists_its_reason(version, query, text):

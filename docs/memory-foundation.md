@@ -1772,8 +1772,8 @@ explicit `work_context` remains supported. Scope and admission are independent.
 
 ### Shipped relevance eligibility
 
-Generated projects select `cayu.query_concepts.v4` with calibration
-`standard-local-recall-query-concepts-v5`. Rank fusion still orders candidates;
+Generated projects select `cayu.query_concepts.v5` with calibration
+`standard-local-recall-query-concepts-v6`. Rank fusion still orders candidates;
 rank, list population, ties, repeated words, and channel agreement cannot establish
 eligibility. The gate compares unique normalized current-query concepts against
 bounded authorized candidate text and its revision-exact knowledge title (up to
@@ -1783,6 +1783,19 @@ concepts covering 60% of a multi-concept query. The versioned vocabulary include
 limited release/rollback, authentication, and timeout paraphrases, plus cache,
 retry, and bucket inflections. Exact path and hyphenated identifiers are not
 stemmed.
+
+V5 keeps internal ASCII and curly apostrophes within one lexical unit, so
+`project's` cannot manufacture a separate `s` concept to complete a phrase.
+Alphabetic possessives normalize to their base word (`project's` → `project`);
+other contractions remain single units rather than expanding into independent
+evidence. Alphabetic `'s` is stripped uniformly, without distinguishing possession
+from contractions such as `server's` meaning "server is".
+Standalone `S` remains a concept. Compound identifiers and paths are not stemmed.
+The same tokenization applies to query, body, and title, for both coverage and
+phrase support. Sentence/line and delivery boundaries remain unchanged.
+This is a lexical correction, not a stale-knowledge or project-applicability
+classifier. Existing v1–v4 policies retain their behavior and text identities;
+select v5 explicitly to upgrade an existing application and recalibrate it.
 
 V3 also accepts an exact contiguous phrase of three **distinct** normalized
 concepts shared with the candidate body or title. This allows a specific topic

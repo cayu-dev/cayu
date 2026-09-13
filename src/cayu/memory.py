@@ -32,6 +32,7 @@ from cayu.recall import (
     RecallSourceDiagnostic,
 )
 from cayu.recall_relevance import (
+    APOSTROPHE_RELEVANCE_TEXT_VERSION,
     PHRASE_RELEVANCE_TEXT_VERSION,
     RELEVANCE_TEXT_VERSION,
     TITLE_RELEVANCE_TEXT_VERSION,
@@ -120,6 +121,7 @@ class AutomaticRecallPolicy(BaseModel):
         "cayu.query_concepts.v2",
         "cayu.query_concepts.v3",
         "cayu.query_concepts.v4",
+        "cayu.query_concepts.v5",
     ] = Field(default="rank_only.v1", exclude_if=lambda value: value == "rank_only.v1")
     relevance_text_version: str | None = Field(default=None, exclude_if=lambda value: value is None)
     mode: AutomaticRecallMode = AutomaticRecallMode.OFFER_AND_STRONG_MATCHES
@@ -201,6 +203,7 @@ class AutomaticRecallPolicy(BaseModel):
                 "cayu.query_concepts.v2": TITLE_RELEVANCE_TEXT_VERSION,
                 "cayu.query_concepts.v3": PHRASE_RELEVANCE_TEXT_VERSION,
                 "cayu.query_concepts.v4": TOPIC_RELEVANCE_TEXT_VERSION,
+                "cayu.query_concepts.v5": APOSTROPHE_RELEVANCE_TEXT_VERSION,
             }[self.relevance_policy]
             if self.relevance_text_version is None:
                 object.__setattr__(self, "relevance_text_version", text_version)
@@ -1594,6 +1597,7 @@ def admit_recall(
             "cayu.query_concepts.v2",
             "cayu.query_concepts.v3",
             "cayu.query_concepts.v4",
+            "cayu.query_concepts.v5",
         }:
             evidence_bytes += len((candidate.record.title or "").encode("utf-8"))
         if evidence_bytes > policy.max_candidate_text_bytes:
