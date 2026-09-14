@@ -97,7 +97,7 @@ from cayu.core.messages import (
     detach_message,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
-from cayu.deadlines import current_execution_deadline
+from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
 from cayu.memory_evidence import (
     ContextExposure,
@@ -142,9 +142,12 @@ from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     credential_safe_provider_cancellation,
     detach_credential_safe_provider_cancellation,
+    native_model_admission_deadline,
+    provider_cancellation_admission_deadline,
     provider_cancellation_failures,
     release_provider_stream_cleanup,
     reserve_provider_stream_cleanup,
+    retain_native_model_admission_expiry,
     stream_cleanup_cancelled_after_provider_failure,
 )
 from cayu.providers._openai_protocol import protocol_exception_fields
@@ -2419,6 +2422,7 @@ def _raise_model_provider_stream_boundary_failure(
     cancellation_baseline: int,
 ) -> Never:
     task = asyncio.current_task()
+    native_expiry = native_model_admission_deadline(failure)
     if task is not None and task.cancelling() > cancellation_baseline:
         inherited_diagnostics = (
             provider_cancellation_failures(failure)
@@ -2427,7 +2431,7 @@ def _raise_model_provider_stream_boundary_failure(
         )
         diagnostics = inherited_diagnostics or (
             ()
-            if isinstance(failure, asyncio.CancelledError)
+            if isinstance(failure, asyncio.CancelledError) or native_expiry is not None
             else (
                 {
                     "phase": "model_stream",
@@ -2444,7 +2448,14 @@ def _raise_model_provider_stream_boundary_failure(
                 and stream_cleanup_cancelled_after_provider_failure(failure)
             ),
             provider_cancellation_failures=diagnostics,
+            native_admission_deadline=(
+                native_expiry
+                if native_expiry is not None
+                else provider_cancellation_admission_deadline(failure)
+            ),
         ) from None
+    if native_expiry is not None:
+        raise failure
     if isinstance(failure, asyncio.CancelledError):
         raise _ProviderStreamSelfCancellation() from None
     if isinstance(failure, BaseExceptionGroup) and exception_tree_contains(
@@ -2465,7 +2476,14 @@ async def _admitted_model_provider_events(
     """Transfer one pre-dispatch deadline admission into the provider stream."""
 
     await refresh_live_model_semantics()
-    current_execution_deadline().require_admission("model")
+    deadline = current_execution_deadline()
+    try:
+        deadline.require_admission("model")
+    except ExecutionDeadlineExceeded as failure:
+        # Only this check authenticates zero-dispatch admission provenance.
+        # Provider-raised deadline exceptions still cross the ordinary boundary.
+        retain_native_model_admission_expiry(failure, deadline)
+        raise
     events = provider.runtime_stream(request)
     iterator = aiter(events)
     try:
@@ -8207,6 +8225,7 @@ class ModelStepExecutor:
                     stream_cleanup_cancelled_after_failure=(
                         stream_cleanup_cancelled_after_provider_failure(exc)
                     ),
+                    native_admission_deadline=provider_cancellation_admission_deadline(exc),
                     provider_cancellation_failures=tuple(
                         {**failure, **model_attempt_identity.payload()}
                         if "cleanup_diagnostic_version" in failure

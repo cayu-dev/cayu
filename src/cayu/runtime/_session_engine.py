@@ -118,6 +118,7 @@ from cayu.providers import (
 from cayu.providers._credential_boundary import (
     copy_provider_cancellation_failures,
     detach_credential_safe_provider_cancellation,
+    provider_cancellation_admission_deadline,
     provider_cancellation_failures,
 )
 from cayu.providers.base import (
@@ -25896,6 +25897,9 @@ class SessionEngine:
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
                             provider_cancellation_failures=(provider_cancellation_diagnostics),
+                            native_admission_deadline=provider_cancellation_admission_deadline(
+                                cancellation
+                            ),
                             execution_profile=execution_profile,
                             invocation_context=invocation_context,
                         )

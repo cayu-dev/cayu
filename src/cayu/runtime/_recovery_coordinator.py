@@ -71,6 +71,7 @@ from cayu.core.tools import (
     ToolResult,
 )
 from cayu.deadlines import (
+    ExecutionDeadline,
     current_execution_deadline,
     effective_deadline,
     expired_execution_deadline,
@@ -1482,6 +1483,7 @@ class RecoveryAbandonedSessionRequest:
     interaction_transition: InteractionTransitionSpec | None = None
     interaction_transition_recovery_claim_id: str | None = None
     provider_cancellation_failures: tuple[dict[str, Any], ...] = ()
+    native_admission_deadline: ExecutionDeadline | None = None
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
     run_terminal_hooks: bool = True
@@ -17182,11 +17184,17 @@ class RecoveryCoordinator:
         )
         if deadline.expires_at is not None:
             payload["execution_deadline"] = deadline.inspection()
-        expired_boundary = expired_execution_deadline()
+        expired_boundary = request.native_admission_deadline or expired_execution_deadline()
         payload["failure_evidence"] = FailureEvidence(
             classification="deadline" if expired_boundary is not None else "interruption",
             deadline=expired_boundary,
-            deadline_phase="in_flight" if expired_boundary is not None else None,
+            deadline_phase=(
+                "admission"
+                if request.native_admission_deadline is not None
+                else "in_flight"
+                if expired_boundary is not None
+                else None
+            ),
             session_id=request.session.id,
             run_epoch=request.session.run_epoch,
             secondary_failures=bool(

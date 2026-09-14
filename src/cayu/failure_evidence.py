@@ -89,6 +89,16 @@ def exception_evidence(exc: BaseException) -> FailureEvidence:
                 )
         interrupted |= isinstance(item, asyncio.CancelledError)
         timeout |= isinstance(item, TimeoutError)
+        if isinstance(item, asyncio.CancelledError):
+            from cayu.providers._credential_boundary import (
+                provider_cancellation_admission_deadline,
+                provider_cancellation_failures,
+            )
+
+            secondary |= bool(provider_cancellation_failures(item))
+            native_admission = provider_cancellation_admission_deadline(item)
+            if deadline is None and native_admission is not None:
+                deadline, phase = native_admission, "admission"
         raw = getattr(item, "execution_deadline", None)
         item_phase = "in_flight"
         if raw is None and isinstance(item, ExecutionDeadlineExceeded):

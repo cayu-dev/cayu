@@ -22,6 +22,7 @@ from cayu._exception_state import (
     set_exception_state,
 )
 from cayu._validation import require_durable_nonblank
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
 from cayu.providers._cleanup_diagnostics import (
     MAX_CLEANUP_DIAGNOSTIC_FIELDS,
     cleanup_diagnostics,
@@ -37,6 +38,8 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _CREDENTIAL_SAFE_CANCELLATION_STATE = "_cayu_credential_safe_provider_cancellation"
 _CREDENTIAL_SAFE_CANCELLATION_TOKEN = object()
+_NATIVE_MODEL_ADMISSION_STATE = "_cayu_native_model_admission"
+_NATIVE_MODEL_ADMISSION_TOKEN = object()
 _STREAM_CLEANUP_CANCELLATION_STATE = "_cayu_provider_stream_cleanup_cancellation"
 _STREAM_CLEANUP_CANCELLATION_TOKEN = object()
 _STREAM_CLEANUP_CANCELLATION_NOTE = (
@@ -76,6 +79,37 @@ class _CredentialSafeCancellationHandoff:
     stream_cleanup_cancelled_after_failure: bool
     provider_cancellation_failures: tuple[dict[str, Any], ...]
     token: object
+    native_admission_deadline: ExecutionDeadline | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeModelAdmissionHandoff:
+    deadline: ExecutionDeadline
+    token: object
+
+
+def retain_native_model_admission_expiry(
+    failure: ExecutionDeadlineExceeded, deadline: ExecutionDeadline
+) -> None:
+    """Mark only the Runtime's pre-dispatch admission check, before cleanup."""
+    if not set_exception_state(
+        failure,
+        _NATIVE_MODEL_ADMISSION_STATE,
+        _NativeModelAdmissionHandoff(deadline, _NATIVE_MODEL_ADMISSION_TOKEN),
+    ):
+        raise RuntimeError("Could not retain native model admission provenance.")
+
+
+def native_model_admission_deadline(failure: BaseException | None) -> ExecutionDeadline | None:
+    if type(failure) is not ExecutionDeadlineExceeded:
+        return None
+    handoff = exception_state(failure, _NATIVE_MODEL_ADMISSION_STATE)
+    if (
+        type(handoff) is not _NativeModelAdmissionHandoff
+        or handoff.token is not _NATIVE_MODEL_ADMISSION_TOKEN
+    ):
+        return None
+    return handoff.deadline
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +224,7 @@ def credential_safe_provider_cancellation(
     preserve_empty_artifacts: bool,
     stream_cleanup_cancelled_after_failure: bool = False,
     provider_cancellation_failures: tuple[dict[str, Any], ...] = (),
+    native_admission_deadline: ExecutionDeadline | None = None,
 ) -> asyncio.CancelledError:
     """Create a cancellation whose safe projection survives the outer boundary."""
 
@@ -204,6 +239,7 @@ def credential_safe_provider_cancellation(
         stream_cleanup_cancelled_after_failure=(stream_cleanup_cancelled_after_failure is True),
         provider_cancellation_failures=failures,
         token=_CREDENTIAL_SAFE_CANCELLATION_TOKEN,
+        native_admission_deadline=native_admission_deadline,
     )
     if not set_exception_state(
         cancellation,
@@ -313,6 +349,16 @@ def provider_cancellation_failures(
     if handoff is None:
         return ()
     return _copy_provider_cancellation_failures(handoff.provider_cancellation_failures)
+
+
+def provider_cancellation_admission_deadline(
+    failure: BaseException,
+) -> ExecutionDeadline | None:
+    """Read only admission provenance carried by the authenticated handoff."""
+    if not isinstance(failure, asyncio.CancelledError):
+        return None
+    handoff = _credential_safe_cancellation_handoff(failure)
+    return None if handoff is None else handoff.native_admission_deadline
 
 
 def detach_credential_safe_provider_cancellation(
@@ -772,10 +818,12 @@ async def aclosing_provider_stream(
                 if cancellation_during_cleanup
                 else "Provider operation cancelled"
             )
+        native_admission = native_model_admission_deadline(operation_failure)
         diagnostics: list[dict[str, Any]] = []
-        if operation_failure is not None and not isinstance(
-            operation_failure,
-            asyncio.CancelledError,
+        if (
+            operation_failure is not None
+            and not isinstance(operation_failure, asyncio.CancelledError)
+            and native_admission is None
         ):
             diagnostics.append(
                 {
@@ -803,6 +851,11 @@ async def aclosing_provider_stream(
             preserve_empty_artifacts=False,
             stream_cleanup_cancelled_after_failure=(
                 operation_failure is not None and (cleanup_failure is not None or cleanup_unsettled)
+            ),
+            native_admission_deadline=(
+                native_admission
+                if inherited_handoff is None
+                else inherited_handoff.native_admission_deadline
             ),
             provider_cancellation_failures=_merge_provider_cancellation_failures(
                 ()
@@ -875,6 +928,7 @@ def _detached_provider_failure(failure: BaseException) -> BaseException:
             preserve_empty_artifacts=exception_state_contains(failure, "artifacts"),
             stream_cleanup_cancelled_after_failure=(handoff.stream_cleanup_cancelled_after_failure),
             provider_cancellation_failures=handoff.provider_cancellation_failures,
+            native_admission_deadline=handoff.native_admission_deadline,
         )
         if handoff is not None and handoff.stream_cleanup_cancelled_after_failure:
             add_exception_note_safely(cancellation, _STREAM_CLEANUP_CANCELLATION_NOTE)
