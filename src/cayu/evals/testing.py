@@ -196,6 +196,16 @@ class ScriptedModelProvider(ModelProvider):
     name = "scripted"
     supports_native_structured_output = False
 
+    def prepare_auxiliary_request(
+        self, request: ModelRequest, *, max_output_tokens: int
+    ) -> ModelRequest:
+        # Scripted usage remains the supplied observation, never clipped to the cap.
+        return self._prepare_auxiliary_request(
+            request,
+            max_output_tokens=max_output_tokens,
+            output_option_path=(self.name, "max_output_tokens"),
+        )
+
     def preflight_portable_messages(
         self,
         *,

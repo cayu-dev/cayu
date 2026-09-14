@@ -25,11 +25,13 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileComponentClass,
+    ExecutionProfileComponentIdentity,
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_matches_session_epoch,
     build_execution_profile_identity,
     changed_execution_profile_components,
+    execution_profile_provider_adapter_component,
     execution_profile_with_component,
 )
 from cayu.runtime.retry_policy import RetryPolicy
@@ -459,42 +461,15 @@ def resolve_execution_profile_identity(
         process_identity=process_identity,
         redactor=redactor,
     )
-    provider_entry: dict[str, Any]
-    provider_process_local = False
-    provider_application_versioned = False
-    if registered_provider is None:
-        provider_entry = {
-            "kind": "structural_target_only",
-            "provider_name": provider_name,
-        }
-    else:
-        profile_provider = runtime_replay_profile_source(registered_provider.provider)
-        provider_material = _cayu_provider_material(profile_provider)
-        safe_provider_material = _secret_safe_cayu_owned_material(
-            provider_material,
+    provider_entry, provider_process_local, provider_application_versioned = (
+        _provider_adapter_material(
+            registered_provider=registered_provider,
+            provider_name=provider_name,
+            runtime_version=runtime_version,
+            process_identity=process_identity,
             redactor=redactor,
         )
-        if provider_material is not None and safe_provider_material is None:
-            provider_entry = _process_local_private_material(
-                provider_material,
-                value=profile_provider,
-                process_identity=process_identity,
-                slot=f"model-provider:{registered_provider.name}",
-            )
-            provider_process_local = True
-        else:
-            provider_entry, provider_process_local = _behavior_identity_material(
-                identity=registered_provider.execution_profile_identity,
-                value=profile_provider,
-                runtime_version=runtime_version,
-                process_identity=process_identity,
-                slot=f"model-provider:{registered_provider.name}",
-                cayu_owned_material=safe_provider_material,
-            )
-        provider_entry["stream_deadlines"] = _provider_deadline_material(
-            registered_provider.provider.stream_deadlines
-        )
-        provider_application_versioned = registered_provider.execution_profile_identity is not None
+    )
     provider_request_process_local = provider_options_process_local
     if provider_options_process_local:
         safe_provider_options = _validated_private_provider_options_material(
@@ -1703,6 +1678,62 @@ def _cayu_compactor_material(
             }
         return material
     return None
+
+
+def _provider_adapter_material(
+    *,
+    registered_provider: runtime_records.RegisteredProvider | None,
+    provider_name: str,
+    runtime_version: str | None,
+    process_identity: str,
+    redactor: SecretRedactor,
+) -> tuple[dict[str, Any], bool, bool]:
+    if registered_provider is None:
+        return {"kind": "structural_target_only", "provider_name": provider_name}, False, False
+    profile_provider = runtime_replay_profile_source(registered_provider.provider)
+    provider_material = _cayu_provider_material(profile_provider)
+    safe_provider_material = _secret_safe_cayu_owned_material(provider_material, redactor=redactor)
+    if provider_material is not None and safe_provider_material is None:
+        entry = _process_local_private_material(
+            provider_material,
+            value=profile_provider,
+            process_identity=process_identity,
+            slot=f"model-provider:{registered_provider.name}",
+        )
+        process_local = True
+    else:
+        entry, process_local = _behavior_identity_material(
+            identity=registered_provider.execution_profile_identity,
+            value=profile_provider,
+            runtime_version=runtime_version,
+            process_identity=process_identity,
+            slot=f"model-provider:{registered_provider.name}",
+            cayu_owned_material=safe_provider_material,
+        )
+    entry["stream_deadlines"] = _provider_deadline_material(
+        registered_provider.provider.stream_deadlines
+    )
+    return entry, process_local, registered_provider.execution_profile_identity is not None
+
+
+def resolve_provider_adapter_component(
+    *,
+    registered_provider: runtime_records.RegisteredProvider,
+    runtime_version: str | None,
+    process_identity: str,
+    redactor: SecretRedactor,
+) -> ExecutionProfileComponentIdentity:
+    """Resolve live provider semantics using the ordinary admission owner."""
+    material, process_local, application_versioned = _provider_adapter_material(
+        registered_provider=registered_provider,
+        provider_name=registered_provider.name,
+        runtime_version=runtime_version,
+        process_identity=process_identity,
+        redactor=redactor,
+    )
+    return execution_profile_provider_adapter_component(
+        material, process_local=process_local, application_versioned=application_versioned
+    )
 
 
 def _nested_provider_material(

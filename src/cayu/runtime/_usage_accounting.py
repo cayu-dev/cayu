@@ -114,7 +114,10 @@ class UsageAccountingReducer:
                 )
         if self._by_identity:
             for event in events:
-                if event.type != EventType.MODEL_COMPLETED:
+                if event.type not in {
+                    EventType.MODEL_COMPLETED,
+                    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                }:
                     continue
                 try:
                     metrics = summary_usage_metrics_from_event_payload(event.payload)
@@ -131,7 +134,8 @@ class UsageAccountingReducer:
                         provider_name=key[1],
                         model=key[2],
                         session_ids=(),
-                        model_steps=1 if prior is None else prior.model_steps + 1,
+                        model_steps=(0 if prior is None else prior.model_steps)
+                        + int(event.type == EventType.MODEL_COMPLETED),
                         usage=add_aggregate_usage(
                             build_aggregate_usage_metrics() if prior is None else prior.usage,
                             metrics,
@@ -170,6 +174,7 @@ def causal_usage_summary(
         session_ids=session_ids,
         session_count=len(session_ids),
         model_steps=total.model_steps,
+        unmeasured_model_attempts=total.unmeasured_model_attempts,
         tool_calls=total.tool_calls,
         provider_names=total.provider_names,
         models=total.models,

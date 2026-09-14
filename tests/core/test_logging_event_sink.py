@@ -86,6 +86,60 @@ def test_logging_event_sink_routes_token_deltas_to_trace(caplog: pytest.LogCaptu
     assert "model.text.delta" in caplog.records[0].message
 
 
+def test_auxiliary_settlement_logging_preserves_outcome_and_redacts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("cayu.test.auxiliary")
+    secret = "auxiliary-credential-canary"
+    sink = LoggingEventSink(logger=logger, redactor=SecretRedactor(secret))
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    async def scenario() -> None:
+        for outcome in ("completed", "failed", "cancelled", "timed_out", "outcome_unknown"):
+            await sink.emit(
+                Event(
+                    type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                    session_id="session",
+                    payload={
+                        "provider_name": "execution-provider",
+                        "requested_model": "model",
+                        "model_attempt_id": "attempt-id",
+                        "attempt": 2,
+                        "auxiliary_outcome": outcome,
+                        "usage_status": "observed",
+                        "auxiliary_inference": {
+                            "operation_id": "operation",
+                            "purpose": "tool.summary",
+                            "tool_call_id": f"parent-{secret}",
+                        },
+                        "usage_metrics": {"input_tokens": 3, "output_tokens": 2},
+                        "provider_error": {"error": f"failure {secret}"},
+                        "raw_provider_response": "unexported-response-canary",
+                    },
+                )
+            )
+
+    asyncio.run(scenario())
+    assert [record.levelno for record in caplog.records] == [
+        logging.INFO,
+        logging.WARNING,
+        logging.WARNING,
+        logging.WARNING,
+        logging.WARNING,
+    ]
+    for record in caplog.records:
+        assert "purpose=tool.summary" in record.message
+        assert "operation_id=operation" in record.message
+        assert "model_attempt_id=attempt-id" in record.message
+        assert "attempt=2" in record.message
+        assert "provider_name=execution-provider" in record.message
+        assert "input_tokens=3" in record.message
+        assert "output_tokens=2" in record.message
+        assert REDACTED_SECRET in record.message
+        assert secret not in record.message
+        assert "unexported-response-canary" not in record.message
+
+
 def test_level_for_routes_events_to_expected_levels() -> None:
     assert _level_for(EventType.MODEL_TEXT_DELTA) == TRACE_LEVEL
     assert _level_for(EventType.HOOK_STARTED) == logging.DEBUG

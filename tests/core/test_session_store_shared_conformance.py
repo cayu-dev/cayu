@@ -17197,6 +17197,677 @@ def test_session_store_conformance_round_lookup_retains_ambiguous_reused_id_evid
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "interruption", [None, "prepare_error", "prepare_cancel", "dispatch_cancel"]
+)
+def test_auxiliary_owner_dispatch_fences_survive_interruption(
+    session_store_case, monkeypatch, interruption
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_auxiliary_dispatch"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id, from_statuses={SessionStatus.PENDING}, to_status=SessionStatus.RUNNING
+            )
+            await store.checkpoint(session_id, {"parent": "unchanged"})
+            app = CayuApp(session_store=store, enable_logging=False)
+            owner = app._tool_round_executor._auxiliary_inference
+            request = ModelCompletionStageRequest(
+                stage_id="aux_dispatch_attempt",
+                logical_step_id="aux_dispatch_attempt",
+                dispatch_ordinal=1,
+                purpose="auxiliary-inference",
+                intent={
+                    "model_step_id": "mstep_" + "1" * 32,
+                    "model_attempt_id": "matt_" + "2" * 32,
+                    "interaction_id": "interaction_auxiliary",
+                    "request_fingerprint": "3" * 64,
+                },
+            )
+            entered = []
+            failure = RuntimeError("preparation acknowledgement lost")
+
+            async def dispatch():
+                stage = await owner.prepare_dispatch(
+                    session_id=session_id,
+                    request=request,
+                    reservations=(),
+                    expected_run_epoch=running.run_epoch,
+                    expected_transcript_cursor=0,
+                )
+                entered.append(stage.stage_id)
+                return stage
+
+            boundary = (
+                "mark_model_completion_stage_dispatched"
+                if interruption == "dispatch_cancel"
+                else "prepare_model_completion_stage"
+            )
+            original = getattr(app._runtime_session_store, boundary)
+
+            async def interrupt_after_commit(*args, **kwargs):
+                result = await original(*args, **kwargs)
+                if interruption == "prepare_error":
+                    raise failure
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+                assert task.cancelling() == 1
+                await asyncio.sleep(0)
+                return result
+
+            with monkeypatch.context() as patch:
+                if interruption is not None:
+                    patch.setattr(app._runtime_session_store, boundary, interrupt_after_commit)
+                task = asyncio.create_task(dispatch())
+                if interruption == "prepare_error":
+                    with pytest.raises(RuntimeError) as caught:
+                        await task
+                    assert caught.value is failure
+                elif interruption is not None:
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    assert task.cancelled()
+                    assert task.cancelling() == 1
+                else:
+                    stage = await task
+                    assert stage.dispatch_ordinal == 1
+                    assert not task.cancelled()
+            assert entered == ([] if interruption else [request.stage_id])
+            store = await _reopen_store(session_store_case, store)
+            active = await store.load_active_model_completion_stage(session_id)
+            assert active is not None
+            assert active.stage.stage_id == request.stage_id
+            assert active.stage.state == "in_flight"
+            receipt = await store.load_model_completion_stage_dispatch(session_id, request.stage_id)
+            assert (receipt is not None) == (interruption in (None, "dispatch_cancel"))
+            app = CayuApp(session_store=store, enable_logging=False)
+            owner = app._tool_round_executor._auxiliary_inference
+            # Readback after restart is evidence, never another dispatch grant.
+            with pytest.raises(SessionModelCompletionStageConflict, match="replay"):
+                await dispatch()
+            assert entered == ([] if interruption else [request.stage_id])
+            assert await store.load_checkpoint(session_id) == {"parent": "unchanged"}
+            assert await store.load_transcript(session_id) == []
+            assert await store.load_events(session_id) == []
+            if interruption in {"prepare_error", "prepare_cancel"}:
+                coordinator = app._session_engine._recovery_coordinator
+                recovered = await coordinator.reconcile_model_completion_boundary(running)
+                assert recovered.state == "prepared_abandoned"
+                assert await store.load_active_model_completion_stage(session_id) is None
+                replay = await coordinator.reconcile_model_completion_boundary(running)
+                assert replay.state == "none"
+                assert entered == []
+                assert await store.load_checkpoint(session_id) == {"parent": "unchanged"}
+                assert await store.load_transcript(session_id) == []
+                assert await store.load_events(session_id) == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "outcome", ["completed", "failed", "cancelled", "timed_out", "outcome_unknown"]
+)
+@pytest.mark.parametrize("through_owner", [False, True])
+@pytest.mark.parametrize(
+    "promotion_status", [None, SessionStatus.COMPLETED, SessionStatus.INTERRUPTED]
+)
+def test_session_store_conformance_auxiliary_stage_preserves_parent_and_replays(
+    session_store_case, outcome, through_owner, monkeypatch, promotion_status
+) -> None:
+    from cayu.runtime._run_limits import _model_completion_with_budget_settlement_evidence
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_auxiliary_stage"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id, from_statuses={SessionStatus.PENDING}, to_status=SessionStatus.RUNNING
+            )
+            parent_checkpoint = {"parent_tool_round_sentinel": {"state": "pending"}}
+            await store.checkpoint(session_id, parent_checkpoint)
+            intent = {
+                "model_step_id": "mstep_" + "4" * 32,
+                "model_attempt_id": "matt_" + "5" * 32,
+                "interaction_id": "interaction_auxiliary",
+                "request_fingerprint": "1" * 64,
+                "provider_name": "fake",
+                "requested_model": "fake-model",
+                "model": "fake-model",
+                "execution_profile_fingerprint": "0" * 64,
+                "auxiliary_inference": {
+                    "operation_id": "aux_operation",
+                    "purpose": "tool.summary",
+                    "parent": {
+                        "model_step_id": "mstep_" + "1" * 32,
+                        "model_attempt_id": "matt_" + "2" * 32,
+                        "tool_round_id": "tround_" + "3" * 32,
+                    },
+                    "tool_call_id": "call_parent",
+                },
+            }
+            prepared = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id="aux_attempt_1",
+                    logical_step_id="aux_publication_1",
+                    dispatch_ordinal=0,
+                    purpose="auxiliary-inference",
+                    intent=intent,
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            assert prepared.dispatch_authorized
+            await store.mark_model_completion_stage_dispatched(session_id, stage=prepared.stage)
+            event = Event(
+                type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                session_id=session_id,
+                payload={
+                    **intent,
+                    "auxiliary_outcome": outcome,
+                    "attempt": 1,
+                    "usage_status": "observed",
+                    "usage": {"input_tokens": 4, "output_tokens": 2},
+                },
+            )
+            event = _model_completion_with_budget_settlement_evidence(
+                event,
+                (),
+                prepare_event=lambda value: value.model_copy(deep=True),
+                settled_at=event.timestamp,
+            )
+            assert event.payload["budget_settlements"] == []
+            publication = RuntimePublicationRequest(
+                publication_id=prepared.stage.logical_step_id,
+                kind="auxiliary-inference",
+                intent=intent,
+                mutation=RuntimePublicationMutation(),
+                transcript_messages=(),
+                events=(event,),
+            )
+            # None of these invalid terminals may partially publish or settle.
+            invalid_payloads = [
+                {**event.payload, "attempt": True},
+                {**event.payload, "attempt": 2},
+                {key: value for key, value in event.payload.items() if key != "attempt"},
+                {**event.payload, "provider_name": "other"},
+                {**event.payload, "model_attempt_id": "matt_other"},
+                {**event.payload, "auxiliary_outcome": "future"},
+                {**event.payload, "usage_status": "future"},
+                {**event.payload, "auxiliary_outcome": {}},
+                {**event.payload, "usage_status": True},
+                {**event.payload, "budget_settlements": ["not-a-settlement"]},
+                {**event.payload, "transcript_cursor": 0},
+                {
+                    **event.payload,
+                    "auxiliary_inference": {
+                        **intent["auxiliary_inference"],
+                        "tool_call_id": "other",
+                    },
+                },
+            ]
+            for payload in invalid_payloads:
+                invalid = publication.model_copy(
+                    update={"events": (event.model_copy(update={"payload": payload}),)}
+                )
+                with pytest.raises(ValueError):
+                    await store.complete_model_completion_stage(
+                        session_id, stage_id=prepared.stage.stage_id, publication=invalid
+                    )
+                assert await store.load_events(session_id) == []
+                assert (
+                    await store.load_model_completion_stage(session_id, prepared.stage.stage_id)
+                ).state == "in_flight"
+            for update in (
+                {"transcript_messages": (Message.text("assistant", "not a turn"),)},
+                {"events": (event, event.model_copy(update={"id": "extra-settlement"}))},
+                {
+                    "mutation": RuntimePublicationMutation(
+                        operations=(
+                            RuntimePublicationCheckpointOperation(
+                                key="unexpected", action="set", value=1, expected_value_digest=None
+                            ),
+                        )
+                    )
+                },
+            ):
+                with pytest.raises(ValueError):
+                    await store.complete_model_completion_stage(
+                        session_id,
+                        stage_id=prepared.stage.stage_id,
+                        publication=publication.model_copy(update=update),
+                    )
+                assert await store.load_checkpoint(session_id) == parent_checkpoint
+                assert await store.load_transcript(session_id) == []
+                assert await store.load_events(session_id) == []
+            completion_store = store
+            if through_owner:
+                from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
+
+                app = CayuApp(session_store=store, enable_logging=False)
+                completion_store = app._runtime_session_store
+                owner = AuxiliaryInferenceOwner(
+                    session_store=completion_store,
+                    event_writer=app._event_writer,
+                    run_limit_controller=app._run_limit_controller,
+                    clock=app._clock,
+                )
+                without_settlements = event.model_copy(deep=True)
+                without_settlements.payload.pop("budget_settlements")
+                # Production terminal producers attest the profile before the
+                # writer prepares the event. Raw payload text is not authority.
+                with pytest.raises(ValueError, match="target/profile conflicts"):
+                    owner.prepare_terminal(
+                        stage=prepared.stage, event=without_settlements, reservations=()
+                    )
+                from cayu.events import event_with_runtime_payload_authority
+
+                without_settlements = event_with_runtime_payload_authority(
+                    without_settlements, "execution_profile_fingerprint"
+                )
+                publication = owner.prepare_terminal(
+                    stage=prepared.stage, event=without_settlements, reservations=()
+                )
+            await completion_store.complete_model_completion_stage(
+                session_id, stage_id=prepared.stage.stage_id, publication=publication
+            )
+            expected_transcript = []
+            if promotion_status is not None:
+                expected_transcript = [Message.text("assistant", "Parent advanced after inference")]
+                await store.append_transcript_messages(session_id, expected_transcript)
+                await store.transition_status(
+                    session_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=promotion_status,
+                )
+            store = await _reopen_store(session_store_case, store)
+            if through_owner:
+                from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
+
+                app = CayuApp(session_store=store, enable_logging=False)
+                owner = AuxiliaryInferenceOwner(
+                    session_store=app._runtime_session_store,
+                    event_writer=app._event_writer,
+                    run_limit_controller=app._run_limit_controller,
+                    clock=app._clock,
+                )
+
+                async def fail_settlement(*args, **kwargs):
+                    raise RuntimeError("injected settlement failure")
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(
+                        app._run_limit_controller,
+                        "reconcile_model_completion_settlements",
+                        fail_settlement,
+                    )
+                    with pytest.raises(RuntimeError, match="injected settlement failure"):
+                        await owner.publish_terminal(
+                            stage=prepared.stage,
+                            publication=publication,
+                            expected_run_epoch=running.run_epoch,
+                        )
+                active = await store.load_active_model_completion_stage(session_id)
+                assert active is not None
+                assert active.stage.stage_id == prepared.stage.stage_id
+                assert active.stage.state == "completed"
+                assert await store.load_events(session_id) == []
+                first_events = await owner.publish_terminal(
+                    stage=prepared.stage,
+                    publication=publication,
+                    expected_run_epoch=running.run_epoch,
+                )
+                replay_events = await owner.publish_terminal(
+                    stage=prepared.stage,
+                    publication=publication,
+                    expected_run_epoch=running.run_epoch,
+                )
+                assert [item.id for item in first_events] == [event.id]
+                assert [item.id for item in replay_events] == [event.id]
+            else:
+                first = await store.promote_model_completion_stage(
+                    session_id,
+                    stage_id=prepared.stage.stage_id,
+                    expected_run_epoch=running.run_epoch,
+                )
+                assert not first.replayed
+            replay = await store.promote_model_completion_stage(
+                session_id, stage_id=prepared.stage.stage_id, expected_run_epoch=running.run_epoch
+            )
+            assert replay.replayed
+            assert await store.load_checkpoint(session_id) == parent_checkpoint
+            assert await store.load_transcript(session_id) == expected_transcript
+            assert (await store.load(session_id)).status == (
+                promotion_status or SessionStatus.RUNNING
+            )
+            assert [item.id for item in await store.load_events(session_id)] == [event.id]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("dispatched", [False, True])
+@pytest.mark.parametrize("with_plan", [False, True])
+def test_auxiliary_recovery_terminal_requires_live_exact_owner(
+    session_store_case, monkeypatch, dispatched, with_plan
+) -> None:
+    from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
+    from cayu.sessions.base import ModelCompletionStageRecoveryFence
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        claim = None
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            provider = ScriptedModelProvider([])
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+            admitted = await create_admitted_session(
+                store,
+                request=RunRequest(agent_name="assistant", session_id="aux_recovery", messages=[]),
+                provider_name=provider.name,
+                model="scripted-model",
+                provider=provider,
+                app=app,
+            )
+            session = admitted.session
+            intent = {
+                "model_step_id": "mstep_" + "4" * 32,
+                "model_attempt_id": "matt_" + "5" * 32,
+                "interaction_id": admitted.active_invocation_profile.interaction_id,
+                "request_fingerprint": "1" * 64,
+                "provider_name": provider.name,
+                "requested_model": "scripted-model",
+                "execution_profile_fingerprint": admitted.active_invocation_profile.profile.fingerprint,
+                "auxiliary_inference": {
+                    "operation_id": "aux_operation",
+                    "purpose": "tool.summary",
+                    "parent": {
+                        "model_step_id": "mstep_" + "1" * 32,
+                        "model_attempt_id": "matt_" + "2" * 32,
+                        "tool_round_id": "tround_" + "3" * 32,
+                    },
+                    "tool_call_id": "call_parent",
+                },
+            }
+            prepared = await store.prepare_model_completion_stage(
+                session.id,
+                request=ModelCompletionStageRequest(
+                    stage_id="aux_recovery_stage",
+                    logical_step_id="aux_recovery_publication",
+                    dispatch_ordinal=0,
+                    purpose="auxiliary-inference",
+                    intent=intent,
+                ),
+                expected_statuses={session.status},
+                expected_run_epoch=session.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            if dispatched:
+                await store.mark_model_completion_stage_dispatched(session.id, stage=prepared.stage)
+            claim = await app._session_engine._recovery_coordinator._claim_incomplete_recovery(
+                session=session,
+                inactive_for_seconds=None,
+                execution_profile_snapshot=admitted.active_invocation_profile,
+            )
+            assert claim is not None
+            checkpoint = await store.load_checkpoint(session.id)
+            profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            assert profile is not None
+            plan_owner = None
+            if with_plan:
+                now = datetime.now(UTC)
+                plan_owner = DurableOperationOwnership(
+                    operation_id="auxiliary-recovery-plan",
+                    claim_id="plan-claim",
+                    owner_id="plan-worker",
+                    generation=1,
+                    acquired_at=now,
+                    renewed_at=now,
+                    lease_expires_at=now + timedelta(minutes=5),
+                )
+                checkpoint = copy.deepcopy(checkpoint)
+                checkpoint["recovery_plan_execution"] = {
+                    "ownership": plan_owner.model_dump(mode="json")
+                }
+                await store.transform_checkpoint(session.id, lambda _session, _current: checkpoint)
+            fence = ModelCompletionStageRecoveryFence(
+                expected_session_instance_id=session.instance_id,
+                expected_run_epoch=claim.session.run_epoch,
+                expected_active_profile=profile,
+                recovery_claim_id=claim.claim_id,
+                preparation_digest=prepared.stage.preparation_digest,
+                recovery_plan_ownership=plan_owner,
+            )
+            publication = RuntimePublicationRequest(
+                publication_id=prepared.stage.logical_step_id,
+                kind="auxiliary-inference",
+                intent=intent,
+                mutation=RuntimePublicationMutation(),
+                transcript_messages=(),
+                events=(
+                    Event(
+                        type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                        session_id=session.id,
+                        payload={
+                            **intent,
+                            "auxiliary_outcome": "outcome_unknown",
+                            "attempt": 1,
+                            "usage_status": "missing",
+                            "budget_settlements": [],
+                        },
+                    ),
+                ),
+            )
+            initial_events = await store.load_events(session.id)
+            if not dispatched:
+                with pytest.raises(SessionModelCompletionStageConflict, match="dispatch receipt"):
+                    await store.complete_recovered_model_completion_stage(
+                        session.id,
+                        stage_id=prepared.stage.stage_id,
+                        publication=publication,
+                        recovery_fence=fence,
+                    )
+                assert (
+                    await store.load_model_completion_stage(session.id, prepared.stage.stage_id)
+                    == prepared.stage
+                )
+                assert await store.load_checkpoint(session.id) == checkpoint
+                assert await store.load_events(session.id) == initial_events
+                return
+            if plan_owner is not None:
+                wrong_owners = [None] + [
+                    plan_owner.model_copy(update={field: value})
+                    for field, value in (
+                        ("claim_id", "different-claim"),
+                        ("owner_id", "different-worker"),
+                        ("operation_id", "different-operation"),
+                        ("generation", 2),
+                    )
+                ]
+                for wrong_owner in wrong_owners:
+                    with pytest.raises(SessionRunFenced):
+                        await app._runtime_session_store.complete_recovered_model_completion_stage(
+                            session.id,
+                            stage_id=prepared.stage.stage_id,
+                            publication=publication,
+                            recovery_fence=fence.model_copy(
+                                update={"recovery_plan_ownership": wrong_owner}
+                            ),
+                        )
+                    assert await store.load_checkpoint(session.id) == checkpoint
+                    assert await store.load_events(session.id) == initial_events
+                    assert (
+                        await store.load_model_completion_stage(session.id, prepared.stage.stage_id)
+                        == prepared.stage
+                    )
+                for marker_present in (False, True):
+                    unavailable = copy.deepcopy(checkpoint)
+                    if marker_present:
+                        expired_owner = plan_owner.model_copy(
+                            update={
+                                "acquired_at": now - timedelta(minutes=3),
+                                "renewed_at": now - timedelta(minutes=2),
+                                "lease_expires_at": now - timedelta(minutes=1),
+                            }
+                        )
+                        unavailable["recovery_plan_execution"]["ownership"] = (
+                            expired_owner.model_dump(mode="json")
+                        )
+                    else:
+                        unavailable.pop("recovery_plan_execution")
+                    await store.transform_checkpoint(
+                        session.id, lambda _session, _current, candidate=unavailable: candidate
+                    )
+                    with pytest.raises(SessionRunFenced):
+                        await store.complete_recovered_model_completion_stage(
+                            session.id,
+                            stage_id=prepared.stage.stage_id,
+                            publication=publication,
+                            recovery_fence=fence,
+                        )
+                    assert await store.load_checkpoint(session.id) == unavailable
+                    assert await store.load_events(session.id) == initial_events
+                    assert (
+                        await store.load_model_completion_stage(session.id, prepared.stage.stage_id)
+                        == prepared.stage
+                    )
+                await store.transform_checkpoint(session.id, lambda _session, _current: checkpoint)
+            for updates in (
+                {"expected_session_instance_id": "wrong-instance"},
+                {"recovery_claim_id": "wrong-claim"},
+                {"preparation_digest": "f" * 64},
+                {
+                    "expected_run_epoch": fence.expected_run_epoch + 1,
+                    "expected_active_profile": profile.model_copy(
+                        update={"run_epoch": fence.expected_run_epoch + 1}
+                    ),
+                },
+                {"expected_active_profile": profile.model_copy(update={"interaction_id": "wrong"})},
+            ):
+                with pytest.raises((SessionRunFenced, SessionModelCompletionStageConflict)):
+                    await app._runtime_session_store.complete_recovered_model_completion_stage(
+                        session.id,
+                        stage_id=prepared.stage.stage_id,
+                        publication=publication,
+                        recovery_fence=fence.model_copy(update=updates),
+                    )
+                assert (
+                    await store.load_model_completion_stage(session.id, prepared.stage.stage_id)
+                    == prepared.stage
+                )
+                assert await store.load_events(session.id) == initial_events
+                assert await store.load_checkpoint(session.id) == checkpoint
+
+            def expire(_session, current):
+                updated = copy.deepcopy(current)
+                marker = updated["incomplete_session_recovery_claim"]
+                marker["claimed_at"] = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+                marker["claim_expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+                return updated
+
+            await store.transform_checkpoint(session.id, expire)
+            with pytest.raises(SessionRunFenced):
+                await store.complete_recovered_model_completion_stage(
+                    session.id,
+                    stage_id=prepared.stage.stage_id,
+                    publication=publication,
+                    recovery_fence=fence,
+                )
+            assert (
+                await store.load_model_completion_stage(session.id, prepared.stage.stage_id)
+                == prepared.stage
+            )
+            await store.transform_checkpoint(session.id, lambda _session, _current: checkpoint)
+
+            entered = asyncio.Event()
+            proceed = asyncio.Event()
+            original = store._complete_model_completion_stage_atomic
+
+            async def delayed(preparation):
+                entered.set()
+                await proceed.wait()
+                return await original(preparation)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(store, "_complete_model_completion_stage_atomic", delayed)
+                pending = asyncio.create_task(
+                    store.complete_recovered_model_completion_stage(
+                        session.id,
+                        stage_id=prepared.stage.stage_id,
+                        publication=publication,
+                        recovery_fence=fence,
+                    )
+                )
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                try:
+
+                    def replace_claim(_session, current):
+                        updated = copy.deepcopy(current)
+                        if with_plan:
+                            updated["recovery_plan_execution"]["ownership"]["generation"] += 1
+                        else:
+                            updated["incomplete_session_recovery_claim"]["claim_id"] = "new-owner"
+                        return updated
+
+                    await store.transform_checkpoint(session.id, replace_claim)
+                finally:
+                    proceed.set()
+                with pytest.raises(SessionRunFenced):
+                    await pending
+            assert (
+                await store.load_model_completion_stage(session.id, prepared.stage.stage_id)
+                == prepared.stage
+            )
+            assert await store.load_events(session.id) == initial_events
+            await store.transform_checkpoint(session.id, lambda _session, _current: checkpoint)
+            first = await app._runtime_session_store.complete_recovered_model_completion_stage(
+                session.id,
+                stage_id=prepared.stage.stage_id,
+                publication=publication,
+                recovery_fence=fence,
+            )
+            assert not first.replayed
+            await store.transform_checkpoint(session.id, expire)
+            store = await _reopen_store(session_store_case, store)
+            replay = await store.complete_recovered_model_completion_stage(
+                session.id,
+                stage_id=prepared.stage.stage_id,
+                publication=publication,
+                recovery_fence=fence,
+            )
+            assert replay.replayed
+            assert replay.stage == first.stage
+            with pytest.raises(SessionModelCompletionStageConflict):
+                await store.complete_recovered_model_completion_stage(
+                    session.id,
+                    stage_id=prepared.stage.stage_id,
+                    publication=publication,
+                    recovery_fence=fence.model_copy(update={"preparation_digest": "f" * 64}),
+                )
+            assert await store.load_events(session.id) == initial_events
+        finally:
+            if claim is not None:
+                claim.require_authority().retire()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_model_completion_stage_reopens_and_promotes_exactly_once(
     session_store_case,
 ) -> None:

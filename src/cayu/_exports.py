@@ -1,6 +1,14 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "AuxiliaryInferencePolicy": ("cayu.tools.inference", "AuxiliaryInferencePolicy"),
+    "InferenceInvoker": ("cayu.tools.inference", "InferenceInvoker"),
+    "InferenceLimits": ("cayu.tools.inference", "InferenceLimits"),
+    "ModelResponse": ("cayu.providers.response", "ModelResponse"),
+    "RuntimeEvidenceAuxiliaryInference": (
+        "cayu.runtime.evidence",
+        "RuntimeEvidenceAuxiliaryInference",
+    ),
     "PersistedEventSideEffectHealth": (
         "cayu.runtime.event_side_effect_health",
         "PersistedEventSideEffectHealth",
@@ -5700,6 +5708,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "AuxiliaryInferencePolicy",
+    "InferenceInvoker",
+    "InferenceLimits",
+    "ModelResponse",
+    "RuntimeEvidenceAuxiliaryInference",
     "PersistedEventSideEffectHealth",
     "PersistedEventSideEffectInspection",
     "PersistedEventSideEffectPage",

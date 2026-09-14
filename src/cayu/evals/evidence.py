@@ -1380,6 +1380,11 @@ def _build_assertion_evidence_view(
                 pricing=pricing_snapshot.price_book,
                 currency=currency,
             )
+            # Absence means unavailable to the portable cost evaluator. Do not
+            # project a known subtotal as complete when auxiliary cost is unknown,
+            # or count auxiliary attempts as ordinary conversational steps.
+            if summary.unpriced_auxiliary_attempts:
+                continue
 
             costs.append(
                 AssertionCostEvidenceV1(

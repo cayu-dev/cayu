@@ -1174,6 +1174,91 @@ state only. Docker reconnect reattaches only the exact retained container after
 re-verifying its immutable mounts and root write refusal; persistence of a
 materialization alone is not evidence that a prior container can be reattached.
 
+## Managed auxiliary inference inside tools
+
+Trusted Python tools can opt into `ToolSpec.auxiliary_inference` with an
+`AuxiliaryInferencePolicy`. The runtime then supplies `ToolContext.inference`:
+a narrow, invocation-bound `InferenceInvoker`, not a provider client. Ordinary
+tools receive `None`. The declaration is frozen during registration and is part
+of the execution profile; process-isolated tools cannot receive this in-process
+capability.
+
+The runnable, network-free example
+[`runtime_auxiliary_inference.py`](../examples/runtime_auxiliary_inference.py)
+demonstrates the complete `app.run` → tool → managed request path:
+
+```python
+limits = InferenceLimits(
+    max_input_tokens=100, max_output_tokens=50, timeout_seconds=10,
+)
+# On the application's ToolSpec:
+auxiliary_inference = AuxiliaryInferencePolicy(
+    limits=limits, purposes=("tool.summary",),
+)
+
+# Inside Tool.run, with the same model as the enclosing invocation:
+response = await ctx.inference.invoke(
+    ModelRequest(model="demo-model", messages=[Message.text("user", text)]),
+    purpose="tool.summary",
+    limits=limits,
+)
+return ToolResult(content=response.text)
+```
+
+Each handle permits one logical request during the tool's lifetime. Runtime
+retries are separate admitted and accounted attempts of that request. Request
+limits may narrow, never widen, the registered declaration. The selected model
+must match the inherited execution profile. Requests cannot provide raw provider
+options, tools, credentials, billing identity, or runtime operation/parent IDs.
+Providers implement the optional side-effect-free `prepare_auxiliary_request`
+hook; unsupported providers and background-operation modes fail before dispatch.
+
+The runtime uses its existing token/cost admission, reservation, provider,
+deadline, cleanup, settlement, and event owners. Token envelopes are declared
+bounds, not proof from an exact tokenizer; observed usage is never clipped to
+make an overrun disappear. Applicable hard cost budgets need a reservable
+envelope. Missing usage and unpriced cost remain explicit, not zero evidence.
+
+Auxiliary attempts add usage/cost without appending their messages to the main
+conversation, creating a context anchor, or adding an ordinary agent step.
+The example reports three provider calls, two ordinary model steps, and thirteen
+total tokens, including seven consumed by the auxiliary request. Returned
+`ModelResponse` is detached provider-neutral data, with no invocation authority.
+
+An enclosing tool failure does not erase already recorded inference. An interrupted
+attempt without a conclusive provider outcome retains a recovery fence; catching
+cancellation in tool code does not authorize another provider dispatch. Recovery preserves
+known accounting or records uncertainty, but does not automatically rerun the
+request or manufacture a missing tool result. Provider cleanup uses the existing
+bounded stream-cleanup owner; cancellation is not proof of remote abortion.
+
+A validated terminal completion is settled before a later cleanup failure is
+reported. Invalid terminal content does not authorize completion or release the
+recovery fence, even when its usage can be recorded. After a tool returns an
+error result, the parent model may continue; that is a separate request, not a
+replay of the auxiliary dispatch.
+
+Parent task cancellation and the tool timeout signal the active auxiliary task;
+the provider deadline controller cancels its outstanding read before awaiting
+cleanup. There is no wait for the request's remaining timeout before sending
+that cancellation. The shared normalized-stream boundary uses zero cleanup grace
+for opaque adapters and at most 0.1 seconds per terminal-preservation/read-cleanup
+grace for bundled adapters. Work still running after the grace remains owned and
+fenced. These are provider cancellation/cleanup bounds, not a wall-clock promise
+for event-loop scheduling, durable accounting writes, or termination of remote
+work. The auxiliary request's `timeout_seconds` covers waiting for the session's
+inference slot and its retry delays, not a fresh allowance for each retry.
+Caller cancellation remains a plain `CancelledError`. A provider failure observed
+before that cancellation is retained in the durable auxiliary settlement's
+`provider_error` evidence; it need not be a member of a public exception group.
+
+Calling `AsyncOpenAI`, another SDK, or an arbitrary model-backed service directly
+inside `Tool.run` is **outside Cayu's accounting guarantee**. Cayu does not sandbox
+trusted Python imports or automatically intercept those calls. Use the managed
+handle for one bounded auxiliary request. Use an explicit bounded child session
+for work requiring its own transcript, tools, approvals, authority, recursive
+inference, or recovery lifecycle. Do not hide an agent loop inside the handle.
+
 ## ToolPolicy
 
 Authorizes registered tool calls immediately before execution.
@@ -2461,8 +2546,12 @@ Registration derives one frozen `ToolDescriptor` without retaining the live
 application objects. Its version binds the canonical tool id, registered name,
 description, exact input schema, effect and concurrency declarations,
 workspace-mutation and argument-publication behavior, and provenance. Typed
-execution requirements are also part of descriptor schema version 3 and its
-version fingerprint; changing a dependency changes the registered contract. Native
+execution requirements and optional `ToolSpec.auxiliary_inference` declarations
+are part of descriptor schema version 4 and its version fingerprint; changing a
+dependency, inference limit, or allowed inference purpose changes the registered
+contract. Registration copies the inference declaration into the frozen tool
+contract. Omitting it declares no managed inference capability; process-isolated
+tools cannot request this in-process capability. Native
 ids are scoped `cayu:` identities. MCP ids combine the authoritative manifest
 identity with a fixed-size fingerprint of the original MCP name; descriptors do
 not retain potentially sensitive or unbounded source names and reuse the
@@ -7477,7 +7566,26 @@ report = await runtime_evidence(
 ```
 
 `RuntimeEvidenceReport.schema_version` is
-`RUNTIME_EVIDENCE_SCHEMA_VERSION == 5`. Version 5 adds an optional typed
+`RUNTIME_EVIDENCE_SCHEMA_VERSION == 6`. Version 6 adds typed
+`auxiliary_inference` attempts with a bounded purpose and parent operation envelope,
+exact retry ordinals, and explicit cancelled, timed-out and outcome-unknown statuses.
+Auxiliary usage and cost contribute to attempt, lineage and causal totals without
+increasing conversational model-step counts. Only the auxiliary runtime event family
+supplies this attribution; ordinary event or session labels cannot claim it.
+Malformed or conflicting auxiliary terminal records produce a fixed
+`malformed_auxiliary_inference` warning and cannot replace an accepted terminal.
+
+Auxiliary attempts emit `model.auxiliary.attempt_started` after durable dispatch
+admission and before entering the provider. This event carries no usage and does
+not increment conversational model-step counts. With `OpenTelemetryEventSink`,
+each observed start opens a separate client span under its active parent tool;
+the matching `model.auxiliary.attempt_settled` supplies outcome and normalized
+usage. Retries have distinct attempt spans. Private runtime identities route spans
+independently of redacted exported identifiers. Session termination closes an
+unsettled span as incomplete. A recovery-only settlement without an observed start
+does not fabricate a provider-duration span or close an unrelated model span.
+
+The report retains the optional typed
 `receipt_evidence` envelope to receipt summaries: validated receipt schema and
 identity, outcome, source, observation time, digest, and bounded allowlisted
 integrity/resource versions. It excludes receipt messages, structured tool results

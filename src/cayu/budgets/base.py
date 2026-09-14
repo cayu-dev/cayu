@@ -108,6 +108,7 @@ _BUDGET_INSPECTION_EVENT_TYPES = frozenset(
 _MODEL_ATTEMPT_TERMINAL_EVENT_TYPES = frozenset(
     {
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
         EventType.MODEL_ERROR,
     }
 )
@@ -615,6 +616,7 @@ def _inspection_latest_check_cost(
         descriptor = _inspection_budget_limit_descriptor(event.payload)
         actual = _inspection_decimal(event.payload.get("actual"))
         unpriced_steps = event.payload.get("unpriced_model_steps")
+        unpriced_auxiliary = event.payload.get("unpriced_auxiliary_attempts", 0)
         cost_summary = event.payload.get("cost_summary")
         if (
             budget_limit_id is None
@@ -622,6 +624,8 @@ def _inspection_latest_check_cost(
             or actual is None
             or type(unpriced_steps) is not int
             or unpriced_steps < 0
+            or type(unpriced_auxiliary) is not int
+            or unpriced_auxiliary < 0
             or type(cost_summary) is not dict
         ):
             invalid_check = True
@@ -629,7 +633,7 @@ def _inspection_latest_check_cost(
         latest_checks[budget_limit_id] = (
             actual,
             descriptor[5],
-            unpriced_steps,
+            unpriced_steps + unpriced_auxiliary,
         )
 
     if invalid_check:
@@ -870,7 +874,7 @@ def project_budget_model_attempt_inspection_event(event: Event) -> Event:
         if value is not None:
             payload[field_name] = value
     if (
-        event.type == EventType.MODEL_COMPLETED
+        event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}
         and MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY in event.payload
     ):
         try:
@@ -914,6 +918,7 @@ def project_budget_inspection_event(event: Event) -> Event:
             "actual",
             "action",
             "unpriced_model_steps",
+            "unpriced_auxiliary_attempts",
         )
     elif event.type == EventType.BUDGET_RESERVED:
         retained_keys = (
@@ -1262,6 +1267,7 @@ class BudgetCheck(BaseModel):
     action: BudgetAction = "interrupt"
     model_steps: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     unpriced_model_steps: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    unpriced_auxiliary_attempts: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     limit_reached: StrictBool
     message: str
     cost_summary: SessionCostTotals
@@ -2166,6 +2172,7 @@ class InMemoryBudgetStore(BudgetStore):
     ) -> CostAccountingSnapshot:
         from cayu.runtime._cost_accounting import (
             COST_ACCOUNTING_PAGE_SIZE,
+            COST_EVENT_TYPES,
             cost_accounting_query,
             cost_pending_events,
         )
@@ -2180,7 +2187,7 @@ class InMemoryBudgetStore(BudgetStore):
             _budget_cost_query(scope=scope, key=key, window=window, now=now)
         )
         pending = cost_pending_events(query, additional_events)
-        kinds = frozenset({str(EventType.MODEL_COMPLETED), str(EventType.MODEL_HOSTED_TOOL_CALL)})
+        kinds = frozenset(str(kind) for kind in COST_EVENT_TYPES)
         async with self._lock:
             pending = tuple(
                 event
@@ -2199,13 +2206,15 @@ class InMemoryBudgetStore(BudgetStore):
             )
             scanned = 0
             for _group_key, records in self._cost_event_index.groups(reducer):
-                for kind in (EventType.MODEL_HOSTED_TOOL_CALL, EventType.MODEL_COMPLETED):
+                for hosted_phase in (True, False):
                     for record in records:
                         sequence, event = record.sequence, record.event
                         scanned += 1
                         if scanned % COST_ACCOUNTING_PAGE_SIZE == 0:
                             await asyncio.sleep(0)
-                        if event.type == kind and _event_record_matches(
+                        if (
+                            event.type == EventType.MODEL_HOSTED_TOOL_CALL
+                        ) == hosted_phase and _event_record_matches(
                             record,
                             reducer.source_query,
                             kinds,
@@ -2254,7 +2263,10 @@ class SessionBudgetStore(BudgetStore):
         while True:
             page = await self._session_store.query_events(
                 EventQuery(
-                    event_type=EventType.MODEL_COMPLETED,
+                    event_types=(
+                        EventType.MODEL_COMPLETED,
+                        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                    ),
                     causal_budget_id=causal_budget_id,
                     agent_name=agent_name,
                     since=since,
@@ -3034,7 +3046,9 @@ def budget_check_from_totals(
         raise ValueError("Cost accounting currency does not match the budget limit.")
     summary.session_id = _budget_summary_id(limit)
     limit_reached = False
-    if summary.unpriced_model_steps > 0 and not limit.allow_unpriced:
+    if (
+        summary.unpriced_model_steps + summary.unpriced_auxiliary_attempts
+    ) > 0 and not limit.allow_unpriced:
         limit_reached = True
         reasons = []
         for count, description in (
@@ -3051,6 +3065,10 @@ def budget_check_from_totals(
         )
         if unknown:
             reasons.append(f"{unknown} model step(s) have unavailable cost evidence")
+        if summary.unpriced_auxiliary_attempts:
+            reasons.append(
+                f"{summary.unpriced_auxiliary_attempts} auxiliary attempt(s) have unavailable cost evidence"
+            )
         message = "Budget cannot be verified because " + "; ".join(reasons) + "."
 
     elif summary.total_cost >= limit.max_estimated_cost:
@@ -3088,6 +3106,7 @@ def budget_check_from_totals(
         action=limit.action,
         model_steps=summary.model_steps,
         unpriced_model_steps=summary.unpriced_model_steps,
+        unpriced_auxiliary_attempts=summary.unpriced_auxiliary_attempts,
         limit_reached=limit_reached,
         message=message,
         cost_summary=summary,
@@ -3109,6 +3128,7 @@ def budget_check_payload(check: BudgetCheck) -> dict[str, Any]:
         "action": check.action,
         "model_steps": check.model_steps,
         "unpriced_model_steps": check.unpriced_model_steps,
+        "unpriced_auxiliary_attempts": check.unpriced_auxiliary_attempts,
         "limit_reached": check.limit_reached,
         "message": check.message,
         "cost_summary": check.cost_summary.model_dump(mode="json"),
@@ -3645,8 +3665,11 @@ def model_completion_budget_settlements(
 ) -> tuple[BudgetReconciliation, ...]:
     """Parse and bind one model completion's exact reservation settlements."""
 
-    if type(event) is not Event or event.type != EventType.MODEL_COMPLETED:
-        raise ValueError("Budget settlement recovery requires one model.completed event.")
+    if type(event) is not Event or event.type not in {
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+    }:
+        raise ValueError("Budget settlement recovery requires one model accounting terminal event.")
     expected_ids = tuple(
         require_clean_nonblank(reservation_id, "reservation_id")
         for reservation_id in reservation_ids
@@ -3772,7 +3795,7 @@ def budget_actual_cost_for_event(*, limit: BudgetLimit, event: Event) -> _Budget
         pricing=limit.pricing,
         currency=limit.currency,
     )
-    if summary.unpriced_model_steps > 0:
+    if summary.unpriced_model_steps + summary.unpriced_auxiliary_attempts > 0:
         raise ValueError("Cannot reconcile budget reservation from unpriced model usage.")
     if len(summary.line_items) != 1:
         raise ValueError("Budget reconciliation requires exactly one priced model step.")

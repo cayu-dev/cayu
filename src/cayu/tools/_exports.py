@@ -1,6 +1,9 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "AuxiliaryInferencePolicy": ("cayu.tools.inference", "AuxiliaryInferencePolicy"),
+    "InferenceInvoker": ("cayu.tools.inference", "InferenceInvoker"),
+    "InferenceLimits": ("cayu.tools.inference", "InferenceLimits"),
     "ALL_REGISTERED_TOOLS_PROFILE_ID": ("cayu.tools.exposure", "ALL_REGISTERED_TOOLS_PROFILE_ID"),
     "ANY_TAINT_LABEL": ("cayu.tools.policy", "ANY_TAINT_LABEL"),
     "ARTIFACT_EXTERNALIZING_TOOL_RESULT_POLICY_ID": (
@@ -431,6 +434,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "AuxiliaryInferencePolicy",
+    "InferenceInvoker",
+    "InferenceLimits",
     "ALL_REGISTERED_TOOLS_PROFILE_ID",
     "ANY_TAINT_LABEL",
     "ARTIFACT_EXTERNALIZING_TOOL_RESULT_POLICY_ID",

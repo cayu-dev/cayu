@@ -269,6 +269,107 @@ def test_aggregate_filters_cover_current_session_and_task_dimensions() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_auxiliary_rollups_preserve_separate_counts_and_billing_remainders(backend, tmp_path):
+    async def run():
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "aux.sqlite")
+        )
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        try:
+            await store.create(_request("aux"), identity=_identity())
+            events = []
+            for index in range(3):
+                identity = BillingIdentity(provider_name="gateway", resource_id=f"m{index}")
+                metrics = UsageMetrics(
+                    provider_name="gateway",
+                    model=f"m{index}",
+                    billing_identity=identity,
+                    input_tokens=7,
+                    total_tokens=7,
+                )
+                events.append(
+                    Event(
+                        type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                        session_id="aux",
+                        timestamp=start,
+                        payload={
+                            "usage_metrics": metrics.model_dump(mode="json"),
+                            "billing_identity": identity.model_dump(mode="json"),
+                        },
+                    )
+                )
+            events.append(
+                Event(
+                    type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                    session_id="aux",
+                    timestamp=start,
+                )
+            )
+            events.append(
+                _model_event(
+                    event_id="ordinary",
+                    session_id="aux",
+                    timestamp=start,
+                    provider_name="gateway",
+                    model="m0",
+                    input_tokens=5,
+                    output_tokens=0,
+                )
+            )
+            await store.append_events("aux", events)
+            if backend == "sqlite":
+                await store.close()
+                store = SQLiteSessionStore(tmp_path / "aux.sqlite")
+            result = await store.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=start,
+                    end_at=start + timedelta(days=1),
+                    include_pricing_inputs=True,
+                    session_group_limit=1,
+                )
+            )
+            assert result.totals.model_steps == result.totals.model_steps_with_usage == 1
+            assert result.totals.usage.total_tokens == 26
+            pricing = PriceBook(
+                prices=tuple(
+                    ModelPrice.fixed(
+                        provider_name="gateway",
+                        model=f"m{index}",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                    )
+                    for index in range(2)
+                )
+            )
+            cost = estimate_usage_rollup_cost(result, pricing, billing_group_limit=1)
+            assert cost.evaluated_model_steps == cost.priced_model_steps == 1
+            assert cost.evaluated_auxiliary_attempts == 4
+            assert cost.priced_auxiliary_attempts == cost.unpriced_auxiliary_attempts == 2
+            assert cost.currencies[0].total_cost == Decimal("0.000019")
+            assert cost.currencies[0].model_steps == 1
+            assert cost.currencies[0].auxiliary_attempts == 2
+            assert sum(reason.auxiliary_attempts for reason in cost.unpriced_reasons) == 2
+            assert all(reason.model_steps == 0 for reason in cost.unpriced_reasons)
+            billing = cost.billing_breakdown
+            assert billing.identified_model_steps == 0
+            assert billing.identified_auxiliary_attempts == 3
+            assert len(billing.groups) == 1
+            assert billing.groups[0].model_steps == 0
+            assert billing.groups[0].auxiliary_attempts == 1
+            assert billing.remainder.auxiliary_attempts == 2
+            sessions = estimate_usage_session_cost_breakdown(result, pricing)
+            assert sessions.groups[0].cost.evaluated_auxiliary_attempts == 4
+            assert sessions.groups[0].cost.unpriced_auxiliary_attempts == 2
+        finally:
+            if hasattr(store, "close"):
+                await store.close()
+
+    asyncio.run(run())
+
+
 def test_in_memory_usage_rollup_uses_half_open_utc_window_and_exact_remainder() -> None:
     async def run() -> None:
         store = InMemorySessionStore()
@@ -2613,7 +2714,7 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
             and "timestamp>?" in detail
             and "timestamp<?" in detail
             for detail in projection_details
-        )
+        ), "\n".join(projection_details)
 
 
 def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_path) -> None:
@@ -3420,7 +3521,7 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                     )
                     or node.get("Index Name") == "idx_cayu_events_cost_attempt"
                     for node in indexed_event_access
-                ), indexed_event_access
+                ), json.dumps(indexed_event_access, indent=2, sort_keys=True)
 
             plan_predicates = " ".join(
                 str(node.get(field, ""))

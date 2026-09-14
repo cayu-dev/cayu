@@ -502,6 +502,7 @@ from cayu.sessions.base import (
     _validate_model_completion_stage_for_settlement,
     _validate_model_completion_stage_preparation_replay,
     _validate_model_completion_stage_publication,
+    _validate_model_completion_stage_recovery_fence,
     _validate_model_completion_stage_release,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
@@ -3154,6 +3155,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
     80: ("ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS failure_diagnostic_json TEXT",),
     82: pg_support.POSTGRES_ACCOUNTING_DDL,
+    89: pg_support.POSTGRES_AUXILIARY_ACCOUNTING_DDL,
     83: (
         pg_support.SESSION_MESSAGE_ACCEPTANCE_INDEX_DDL,
         "ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS conditions_json JSONB",
@@ -5578,7 +5580,7 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
         ),
     ),
     # This pending-action index change is not registered in REVISIONS yet.
-    89: (
+    90: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -25113,6 +25115,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -33678,6 +33681,39 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             stage=stage,
                             replayed=True,
                             dispatch_authorized=False,
+                        )
+                    if prepared.recovery_fence is not None:
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                        )
+                        active_row = await cur.fetchone()
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (
+                                session_id,
+                                _model_completion_stage_dispatch_storage_key(stage.stage_id),
+                            ),
+                        )
+                        dispatch_row = await cur.fetchone()
+                        _validate_model_completion_stage_recovery_fence(
+                            prepared.recovery_fence,
+                            session=loaded,
+                            checkpoint=await self._load_checkpoint(cur, session_id),
+                            stage=stage,
+                            active_record=(
+                                None
+                                if active_row is None
+                                else _decode_model_completion_stage_record(active_row[0])
+                            ),
+                            dispatch_record=(
+                                None
+                                if dispatch_row is None
+                                else _decode_model_completion_stage_record(dispatch_row[0])
+                            ),
+                            now=await self._session_store_now(cur),
                         )
                     _validate_model_completion_stage_publication(
                         prepared.publication,

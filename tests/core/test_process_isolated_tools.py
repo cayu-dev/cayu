@@ -80,6 +80,7 @@ from cayu.tools.base import (
     _bind_runtime_tool_invocation_authority,
 )
 from cayu.tools.catalogue import ToolExecutionContract
+from cayu.tools.inference import AuxiliaryInferencePolicy, InferenceLimits
 from cayu.tools.isolated import (
     ProcessIsolatedTool,
     ProcessIsolatedToolContext,
@@ -297,6 +298,24 @@ def test_isolated_tool_contract_is_explicit_callable_free_and_not_a_sandbox() ->
             protocol="foreign-protocol",
             protocol_version=1,
         )
+
+
+def test_registration_rejects_in_process_inference_for_isolated_tool() -> None:
+    tool = _tool()
+    tool.spec = tool.spec.model_copy(
+        update={
+            "auxiliary_inference": AuxiliaryInferencePolicy(
+                limits=InferenceLimits(
+                    max_input_tokens=100, max_output_tokens=50, timeout_seconds=10
+                ),
+                purposes=("tool.summary",),
+            )
+        }
+    )
+    app = CayuApp(enable_logging=False)
+    with pytest.raises(ValueError, match="in-process auxiliary inference"):
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=(tool,))
+    assert app.list_agents() == ()
 
 
 def test_isolated_tool_rejects_nonportable_or_interpreter_affecting_configuration() -> None:

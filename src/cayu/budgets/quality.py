@@ -436,7 +436,7 @@ class PairedCostAttempt(BaseModel):
     def copy_cost(cls, value: object) -> object:
         if isinstance(value, CostLineItem):
             return ComparisonCostLineItem.from_cost_line_item(value)
-        if type(value) is dict and "billing_identity" in value:
+        if type(value) is dict and ("billing_identity" in value or "auxiliary_attempt" in value):
             return ComparisonCostLineItem.from_cost_line_item(CostLineItem.model_validate(value))
         return revalidate_model_input(value, ComparisonCostLineItem)
 

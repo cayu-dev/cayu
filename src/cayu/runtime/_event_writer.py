@@ -445,6 +445,16 @@ class RuntimeEventWriter:
                     private_event.payload,
                     "parent_session_id",
                 ),
+                private_model_attempt_id=_private_payload_string(
+                    private_event.payload, "model_attempt_id"
+                ),
+                private_auxiliary_tool_call_id=(
+                    _private_payload_string(
+                        private_event.payload["auxiliary_inference"], "tool_call_id"
+                    )
+                    if type(private_event.payload.get("auxiliary_inference")) is dict
+                    else None
+                ),
             )
         )
         delivered_event = event_with_durable_sequence(private_event, claim.event_sequence)
@@ -496,7 +506,11 @@ class RuntimeEventWriter:
         return delivered_event, True
 
     async def _forward_budget_event_if_required(self, event: Event) -> None:
-        if event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_HOSTED_TOOL_CALL}:
+        if event.type in {
+            EventType.MODEL_COMPLETED,
+            EventType.MODEL_HOSTED_TOOL_CALL,
+            EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+        }:
             await self._budget_store.append_event(event.model_copy(deep=True))
 
     async def _handle_unclaimed_persisted_side_effect(self, event: Event) -> int:
@@ -560,7 +574,12 @@ class RuntimeEventWriter:
                 public.id,
                 public.type,
                 delivery.attempts,
-                claim.event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_HOSTED_TOOL_CALL},
+                claim.event.type
+                in {
+                    EventType.MODEL_COMPLETED,
+                    EventType.MODEL_HOSTED_TOOL_CALL,
+                    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                },
             )
         return delivery
 

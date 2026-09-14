@@ -41,6 +41,7 @@ from cayu.deadlines import (
 )
 from cayu.runtime import event_side_effect_health as side_effect_health
 from cayu.runtime._argument_continuity import ArgumentContinuity
+from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectHealth,
     PersistedEventSideEffectPage,
@@ -95,6 +96,7 @@ from cayu._validation import (
     copy_label_map,
     copy_session_metadata,
     json_utf8_size_within_limit,
+    require_durable_clean_nonblank,
     require_durable_json_text,
 )
 from cayu._validation import (
@@ -5403,6 +5405,7 @@ _STRUCTURED_OUTPUT_AUXILIARY_INTENT_KEYS = frozenset(
 RuntimePublicationKind = Literal[
     "model-step",
     "context-compaction",
+    "auxiliary-inference",
     "tool-round",
     "approval-open",
     "approval-close",
@@ -5953,7 +5956,7 @@ _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "i
 _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
     "continue"
 }
-ModelCompletionPurpose = Literal["assistant-turn", "context-compaction"]
+ModelCompletionPurpose = Literal["assistant-turn", "context-compaction", "auxiliary-inference"]
 
 
 class ModelCompletionStageRequest(BaseModel):
@@ -6325,6 +6328,40 @@ class _ModelCompletionStageTerminalRecord(BaseModel):
     record_digest: str
 
 
+class ModelCompletionStageRecoveryFence(BaseModel):
+    """Expected live owner for inserting recovery-generated terminal material.
+
+    This is an admission fence, not evidence that a provider completed. Exact
+    terminal replay is checked before this transient lease is required again.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    expected_session_instance_id: str
+    expected_run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    expected_active_profile: ActiveInvocationExecutionProfile
+    recovery_claim_id: str
+    preparation_digest: str
+    recovery_plan_ownership: DurableOperationOwnership | None = None
+
+    @field_validator("expected_session_instance_id", "recovery_claim_id", "preparation_digest")
+    @classmethod
+    def validate_identifiers(cls, value: str, info) -> str:
+        value = require_durable_clean_nonblank(value, info.field_name)
+        if info.field_name == "preparation_digest" and (
+            len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ValueError("preparation_digest must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("expected_active_profile", mode="before")
+    @classmethod
+    def copy_profile(cls, value: object) -> ActiveInvocationExecutionProfile:
+        if type(value) is ActiveInvocationExecutionProfile:
+            value = value.model_dump(mode="python")
+        return ActiveInvocationExecutionProfile.model_validate(value)
+
+
 class _ActiveModelCompletionStageRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -6406,6 +6443,7 @@ class _PreparedModelCompletionStageTerminal:
     settlement_storage_key: str
     publication: RuntimePublicationRequest
     publication_material_digest: str
+    recovery_fence: ModelCompletionStageRecoveryFence | None = None
 
 
 @dataclass(frozen=True)
@@ -9829,6 +9867,7 @@ class SessionStore(ABC):
     supports_session_closure_detachment: ClassVar[bool] = False
     supports_session_closure_recursive_deletion: ClassVar[bool] = False
     supports_session_closure_progress: ClassVar[bool] = False
+    model_completion_recovery_fence_version: ClassVar[int] = 0
     supports_completion_result_event_publication_reservations: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
     supports_recall_evidence: ClassVar[bool] = False
@@ -11568,6 +11607,63 @@ class SessionStore(ABC):
         )
         return await self._prepare_model_completion_stage_atomic(prepared)
 
+    def _supports_model_completion_recovery_fence_protocol(self) -> bool:
+        """Require an explicit attestation from the concrete atomic-hook owner."""
+        mro = type(self).__mro__
+        capability_owner = next(
+            index
+            for index, owner in enumerate(mro)
+            if "model_completion_recovery_fence_version" in owner.__dict__
+        )
+        mutation_owner = next(
+            index
+            for index, owner in enumerate(mro)
+            if "_complete_model_completion_stage_atomic" in owner.__dict__
+        )
+        return (
+            type(self.model_completion_recovery_fence_version) is int
+            and self.model_completion_recovery_fence_version == 1
+            and capability_owner <= mutation_owner
+        )
+
+    async def complete_recovered_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        stage_id: str,
+        publication: RuntimePublicationRequest,
+        recovery_fence: ModelCompletionStageRecoveryFence,
+    ) -> ModelCompletionStageResult:
+        """Insert synthetic auxiliary terminal evidence under an atomic recovery fence.
+
+        Backends overriding the atomic hook must explicitly attest this protocol.
+        Ordinary provider completion continues through complete_model_completion_stage.
+        """
+        if not self._supports_model_completion_recovery_fence_protocol():
+            raise NotImplementedError("Store does not attest atomic model recovery fences.")
+        if type(recovery_fence) is not ModelCompletionStageRecoveryFence:
+            raise TypeError("Recovery completion requires a ModelCompletionStageRecoveryFence.")
+        fence = ModelCompletionStageRecoveryFence.model_validate(
+            {
+                name: getattr(recovery_fence, name)
+                for name in ModelCompletionStageRecoveryFence.model_fields
+            }
+        )
+        if (
+            fence.expected_active_profile.session_id != session_id
+            or fence.expected_active_profile.run_epoch != fence.expected_run_epoch
+        ):
+            raise ValueError("Recovery fence conflicts with its session or epoch.")
+        prepared = _prepare_model_completion_stage_terminal(
+            session_id,
+            stage_id=stage_id,
+            publication=publication,
+            recovery_fence=fence,
+        )
+        if prepared.publication.kind != "auxiliary-inference":
+            raise ValueError("Recovery-generated completion requires auxiliary publication.")
+        return await self._complete_model_completion_stage_atomic(prepared)
+
     async def complete_model_completion_stage(
         self,
         session_id: str,
@@ -11575,7 +11671,11 @@ class SessionStore(ABC):
         stage_id: str,
         publication: RuntimePublicationRequest,
     ) -> ModelCompletionStageResult:
-        """Append or exactly replay immutable terminal provider-response material."""
+        """Append or exactly replay immutable terminal provider-attempt material.
+
+        For auxiliary inference, terminal material records the explicit attempt
+        outcome and accounting; it does not imply a successful model response.
+        """
 
         prepared = _prepare_model_completion_stage_terminal(
             session_id,
@@ -13163,6 +13263,7 @@ class InMemorySessionStore(SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -19337,6 +19438,18 @@ class InMemorySessionStore(SessionStore):
                     replayed=True,
                     dispatch_authorized=False,
                 )
+            if prepared.recovery_fence is not None:
+                _validate_model_completion_stage_recovery_fence(
+                    prepared.recovery_fence,
+                    session=session,
+                    checkpoint=self._checkpoints.get(session_id),
+                    stage=stage,
+                    active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    dispatch_record=records.get(
+                        _model_completion_stage_dispatch_storage_key(stage.stage_id)
+                    ),
+                    now=self._ownership_clock(),
+                )
             _validate_model_completion_stage_publication(
                 prepared.publication,
                 session_id=session_id,
@@ -20060,12 +20173,12 @@ class InMemorySessionStore(SessionStore):
                     and self._sessions[key[0]].causal_budget_id != query.causal_budget_id
                 ):
                     continue
-                for kind in (EventType.MODEL_HOSTED_TOOL_CALL, EventType.MODEL_COMPLETED):
+                for hosted_phase in (True, False):
                     for record in records:
                         scanned += 1
                         if scanned % COST_ACCOUNTING_PAGE_SIZE == 0:
                             await asyncio.sleep(0)
-                        if record.event.type != kind:
+                        if (record.event.type == EventType.MODEL_HOSTED_TOOL_CALL) != hosted_phase:
                             continue
                         if _event_record_matches(
                             record, reducer.source_query, event_types, frozenset()
@@ -26882,6 +26995,7 @@ def _prepare_model_completion_stage_terminal(
     *,
     stage_id: str,
     publication: RuntimePublicationRequest,
+    recovery_fence: ModelCompletionStageRecoveryFence | None = None,
 ) -> _PreparedModelCompletionStageTerminal:
     session_id, stage_id, preparation_key, terminal_key = _model_completion_stage_storage_identity(
         session_id, stage_id
@@ -26911,7 +27025,52 @@ def _prepare_model_completion_stage_terminal(
         settlement_storage_key=_model_completion_stage_settlement_storage_key(stage_id),
         publication=copied_publication,
         publication_material_digest=_canonical_runtime_publication_digest(publication_payload),
+        recovery_fence=recovery_fence,
     )
+
+
+def _validate_model_completion_stage_recovery_fence(
+    fence: ModelCompletionStageRecoveryFence,
+    *,
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    stage: ModelCompletionStage,
+    active_record: dict[str, Any] | None,
+    dispatch_record: dict[str, Any] | None,
+    now: datetime,
+) -> None:
+    """Admit a new synthetic terminal inside the store's existing transaction."""
+    from cayu.runtime._durable_model_terminalization import require_terminalization_plan_owner
+
+    if (
+        session.instance_id != fence.expected_session_instance_id
+        or session.run_epoch != fence.expected_run_epoch
+        or active_invocation_execution_profile_from_checkpoint(checkpoint)
+        != fence.expected_active_profile
+        or _active_unexpired_incomplete_recovery_claim_id(checkpoint, now=now)
+        != fence.recovery_claim_id
+    ):
+        raise SessionRunFenced("Auxiliary recovery lost its invocation or recovery claim.")
+    require_terminalization_plan_owner(checkpoint, fence.recovery_plan_ownership, now)
+    if active_record is None:
+        raise SessionModelCompletionStageConflict("Auxiliary recovery lost its active stage.")
+    active = _reconstruct_active_model_completion_stage_record(active_record, session_id=session.id)
+    if (
+        stage.purpose != "auxiliary-inference"
+        or stage.preparation_digest != fence.preparation_digest
+        or active.stage_id != stage.stage_id
+        or active.preparation_digest != stage.preparation_digest
+    ):
+        raise SessionModelCompletionStageConflict("Auxiliary recovery stage authority changed.")
+    if dispatch_record is None:
+        raise SessionModelCompletionStageConflict("Auxiliary recovery requires a dispatch receipt.")
+    dispatch = _reconstruct_model_completion_stage_dispatch(
+        dispatch_record,
+        session_id=session.id,
+        stage_id=stage.stage_id,
+        storage_key=_model_completion_stage_dispatch_storage_key(stage.stage_id),
+    )
+    _validate_model_completion_stage_dispatch(dispatch, stage)
 
 
 def _validate_model_completion_stage_publication(
@@ -26926,6 +27085,11 @@ def _validate_model_completion_stage_publication(
         raise SessionModelCompletionStageConflict(
             "The terminal model completion intent conflicts with its preparation."
         )
+    if stage.purpose == "auxiliary-inference":
+        from cayu.runtime._auxiliary_inference_contract import validate_auxiliary_publication
+
+        validate_auxiliary_publication(publication, session_id=session_id, stage=stage)
+        return
     if stage.purpose == "assistant-turn":
         if publication.kind != "model-step":
             raise ValueError("Assistant-turn publication kind must be 'model-step'.")
@@ -29001,6 +29165,10 @@ def _validate_model_completion_stage_terminal_replay(
     if (
         stage.state != "completed"
         or stage.publication_material_digest != prepared.publication_material_digest
+        or (
+            prepared.recovery_fence is not None
+            and stage.preparation_digest != prepared.recovery_fence.preparation_digest
+        )
     ):
         raise SessionModelCompletionStageConflict(
             "The model-completion stage already has different terminal material."
@@ -29028,6 +29196,15 @@ def _reject_settled_model_completion_stage(
     )
 
 
+def _model_completion_stage_promotion_statuses(stage: ModelCompletionStage) -> set[SessionStatus]:
+    statuses = {stage.source_status, SessionStatus.INTERRUPTING, SessionStatus.FAILED}
+    if stage.purpose == "auxiliary-inference":
+        # Auxiliary publications are accounting only: they cannot reopen the
+        # conversation or alter the parent transcript/checkpoint.
+        statuses.update({SessionStatus.COMPLETED, SessionStatus.INTERRUPTED})
+    return statuses
+
+
 def _prepare_model_completion_stage_promotion(
     stage: ModelCompletionStage,
     *,
@@ -29040,13 +29217,11 @@ def _prepare_model_completion_stage_promotion(
     return _prepare_runtime_publication(
         stage.session_id,
         stage.publication,
-        expected_statuses={
-            stage.source_status,
-            SessionStatus.INTERRUPTING,
-            SessionStatus.FAILED,
-        },
+        expected_statuses=_model_completion_stage_promotion_statuses(stage),
         expected_run_epoch=expected_run_epoch,
-        expected_transcript_cursor=stage.source_transcript_cursor,
+        expected_transcript_cursor=(
+            None if stage.purpose == "auxiliary-inference" else stage.source_transcript_cursor
+        ),
     )
 
 
@@ -29068,14 +29243,9 @@ def _replay_promoted_model_completion_stage(
         session_id=stage.session_id,
         publication_id=stage.logical_step_id,
     )
-    if (
-        receipt.source_status
-        not in {
-            stage.source_status,
-            SessionStatus.INTERRUPTING,
-            SessionStatus.FAILED,
-        }
-        or receipt.transcript_start_cursor != stage.source_transcript_cursor
+    if receipt.source_status not in _model_completion_stage_promotion_statuses(stage) or (
+        stage.purpose != "auxiliary-inference"
+        and receipt.transcript_start_cursor != stage.source_transcript_cursor
     ):
         raise SessionModelCompletionStageConflict(
             "The runtime publication receipt conflicts with its model-completion stage."
@@ -29091,7 +29261,9 @@ def _replay_promoted_model_completion_stage(
         stage.publication,
         expected_statuses={stage.source_status},
         expected_run_epoch=receipt.source_run_epoch,
-        expected_transcript_cursor=stage.source_transcript_cursor,
+        expected_transcript_cursor=(
+            None if stage.purpose == "auxiliary-inference" else stage.source_transcript_cursor
+        ),
     )
     receipt = _reconstruct_runtime_publication_receipt(
         receipt_record,
@@ -31862,7 +32034,10 @@ class _SessionInspectionUsageAccumulator:
         if event_type == EventType.TOOL_CALL_STARTED:
             self.tool_calls += 1
             return
-        if event_type == EventType.MODEL_HOSTED_TOOL_CALL:
+        if event_type in {
+            EventType.MODEL_HOSTED_TOOL_CALL,
+            EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+        }:
             if metrics is None:
                 return
             self.totals.add_usage_only(metrics)
@@ -31918,6 +32093,12 @@ class _SessionUsageAccumulator:
     has_activity: bool = False
 
     def add_event(self, event: Event) -> None:
+        if event.type == EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED:
+            self.has_activity = True
+            metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+            if metrics is not None:
+                self.usage.add_usage_only(metrics)
+            return
         if event.type == EventType.TOOL_CALL_STARTED:
             self.tool_calls += 1
             self.has_activity = True
@@ -32137,25 +32318,36 @@ def _usage_rollup_from_session_records(
                         payload=event.payload,
                     )
                 continue
-            if event.type != EventType.MODEL_COMPLETED:
+            if event.type not in {
+                EventType.MODEL_COMPLETED,
+                EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+            }:
                 continue
 
             session_has_activity = True
             metrics = aggregate_usage_metrics_from_event_payload(event.payload)
-            totals.add(metrics)
+            model_step = event.type == EventType.MODEL_COMPLETED
+            if model_step:
+                totals.add(metrics)
+            elif metrics is not None:
+                totals.add_usage_only(metrics)
             provider_candidates.observe(
                 _usage_group_key(metrics, dimension="provider"),
                 metrics,
+                model_step=model_step,
             )
             model_candidates.observe(
                 _usage_group_key(metrics, dimension="model"),
                 metrics,
+                model_step=model_step,
             )
 
             if not query.include_pricing_inputs or pricing.truncated:
                 continue
             pricing.add_payload(
-                event_type=EventType.MODEL_COMPLETED,
+                event_type=EventType.MODEL_COMPLETED
+                if model_step
+                else EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
                 effective_on=event_timestamp.date(),
                 occurrences=1,
                 payload=event.payload,
@@ -32187,11 +32379,7 @@ def _usage_rollup_from_session_records(
                 if not _aggregate_model_event_is_in_window(event, query):
                     continue
                 session_pricing.add_payload(
-                    event_type=(
-                        EventType.MODEL_HOSTED_TOOL_CALL
-                        if event.type == EventType.MODEL_HOSTED_TOOL_CALL
-                        else EventType.MODEL_COMPLETED
-                    ),
+                    event_type=EventType(event.type),
                     session_id=session_id,
                     effective_on=normalize_aggregate_event_timestamp(event.timestamp).date(),
                     occurrences=1,
@@ -32427,7 +32615,7 @@ def _aggregate_model_event_is_in_window(event: Event, query: UsageRollupQuery) -
     if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
         if aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload) is None:
             return False
-    elif event.type != EventType.MODEL_COMPLETED:
+    elif event.type not in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
         return False
     timestamp = normalize_aggregate_event_timestamp(event.timestamp)
     return query.start_at <= timestamp < query.end_at
@@ -32442,6 +32630,8 @@ def _aggregate_usage_event_in_window(
         return None
     if event.type == EventType.MODEL_COMPLETED:
         return aggregate_usage_metrics_from_event_payload(event.payload), True
+    if event.type == EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED:
+        return aggregate_usage_metrics_from_event_payload(event.payload), False
     if event.type == EventType.MODEL_HOSTED_TOOL_CALL:
         metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
         if metrics is not None:

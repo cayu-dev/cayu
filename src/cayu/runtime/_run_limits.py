@@ -117,6 +117,7 @@ from cayu.runtime.stop_policy import (
     RunLimits,
     StopDecision,
     StopLimit,
+    auxiliary_token_admission,
     first_reached_limit,
     has_run_limits,
 )
@@ -129,6 +130,7 @@ from cayu.sessions.base import (
     SessionStatus,
     SessionStore,
 )
+from cayu.tools.inference import InferenceLimits
 
 
 def _event_with_budget_authority(
@@ -1026,6 +1028,11 @@ def _model_completion_reconciliation(
     *,
     settled_at: datetime,
 ) -> BudgetReconciliation:
+    terminal_description = (
+        "auxiliary attempt settled"
+        if event.type is EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED
+        else "model completed"
+    )
     raw_identity = event.payload.get("billing_identity")
     completed_billing_identity = (
         BillingIdentity.model_validate(raw_identity) if type(raw_identity) is dict else None
@@ -1039,11 +1046,11 @@ def _model_completion_reconciliation(
     except ValueError:
         actual_amount = reservation.record.reserved_amount
         settlement_kind: Literal["completed", "conservative"] = "conservative"
-        reason = "model completed without priced usage; charged reserved amount"
+        reason = f"{terminal_description} without priced usage; charged reserved amount"
     else:
         actual_amount = priced_actual.amount
         settlement_kind = "completed"
-        reason = "model completed"
+        reason = terminal_description
         completed_billing_identity = (
             priced_actual.line_item.billing_identity or completed_billing_identity
         )
@@ -1089,14 +1096,17 @@ def _model_completion_with_budget_settlement_evidence(
     prepare_event: Callable[[Event], Event],
     settled_at: datetime,
 ) -> Event:
-    if type(event) is not Event or event.type != EventType.MODEL_COMPLETED:
-        raise ValueError("Budget settlement evidence requires one model.completed event.")
+    if type(event) is not Event or event.type not in {
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+    }:
+        raise ValueError("Budget settlement evidence requires one model accounting terminal event.")
     if MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY in event.payload:
         raise ValueError("Model completion already contains budget settlement evidence.")
     prepared_event = prepare_event(event)
     if type(prepared_event) is not Event:
         raise TypeError("Model completion preparation must return an Event.")
-    if not reservations:
+    if not reservations and event.type == EventType.MODEL_COMPLETED:
         return prepared_event
 
     reconciliations: list[BudgetReconciliation] = []
@@ -2049,6 +2059,7 @@ class RunLimitController:
             if (
                 (effective_provider_name is None or effective_model is None)
                 and summary.unpriced_model_steps == 0
+                and summary.unpriced_auxiliary_attempts == 0
                 and summary.total_cost < limit.max_estimated_cost
             ):
                 continue
@@ -2084,6 +2095,7 @@ class RunLimitController:
         additional_usage_events: list[Event] | None = None,
         execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
         execution_profile_fingerprint: str | None = None,
+        auxiliary_request_limits: InferenceLimits | None = None,
     ) -> LimitEvaluation:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -2115,6 +2127,11 @@ class RunLimitController:
             usage_for_limits = SessionUsageSummary(
                 session_id=session.id,
                 tool_calls=max(0, usage_summary.tool_calls - run_baseline.tool_calls),
+                unmeasured_model_attempts=max(
+                    0,
+                    usage_summary.unmeasured_model_attempts
+                    - run_baseline.unmeasured_model_attempts,
+                ),
                 usage=build_aggregate_usage_metrics(
                     input_tokens=max(0, current.input_tokens - baseline.input_tokens),
                     output_tokens=max(0, current.output_tokens - baseline.output_tokens),
@@ -2137,6 +2154,10 @@ class RunLimitController:
             elapsed_seconds=elapsed_seconds,
             pending_tool_calls=pending_tool_calls,
         )
+        if decision is None and auxiliary_request_limits is not None:
+            decision = auxiliary_token_admission(
+                limits=limits, usage=usage_for_limits, request_limits=auxiliary_request_limits
+            )
         if decision is not None:
             return LimitEvaluation(
                 decision=decision,
@@ -3554,11 +3575,13 @@ class RunLimitController:
     ) -> Event:
         """Attach the original reservation pricing to one recovered completion."""
 
-        if (
-            type(completion_event) is not Event
-            or completion_event.type is not EventType.MODEL_COMPLETED
-        ):
-            raise ValueError("Recovered budget evidence requires one model.completed event.")
+        if type(completion_event) is not Event or completion_event.type not in {
+            EventType.MODEL_COMPLETED,
+            EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+        }:
+            raise ValueError(
+                "Recovered budget evidence requires one model accounting terminal event."
+            )
         reservations = await self._reconstruct_provider_operation_reservations(
             reservation_ids=reservation_ids,
             recovery_contexts=recovery_contexts,
@@ -5059,7 +5082,7 @@ class RunLimitGate:
 
 def _latest_model_event_identity(events: list[Event]) -> tuple[str | None, str | None]:
     for event in reversed(events):
-        if event.type != EventType.MODEL_COMPLETED:
+        if event.type not in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
             continue
         provider_name = event.payload.get("provider_name")
         model = event.payload.get("model") or event.payload.get("requested_model")
@@ -5146,6 +5169,7 @@ def _first_budget_limit_outcome(
 
     actual_cost = cost_summary.total_cost
     unpriced_model_steps = cost_summary.unpriced_model_steps
+    unpriced_auxiliary_attempts = cost_summary.unpriced_auxiliary_attempts
     if limit.scope == "run" and cost_baseline is not None:
         actual_cost = max(
             cost_summary.total_cost - cost_baseline.total_cost,
@@ -5155,15 +5179,19 @@ def _first_budget_limit_outcome(
             unpriced_model_steps - cost_baseline.unpriced_model_steps,
             0,
         )
+        unpriced_auxiliary_attempts = max(
+            unpriced_auxiliary_attempts - cost_baseline.unpriced_auxiliary_attempts, 0
+        )
 
-    if unpriced_model_steps > 0 and not limit.allow_unpriced:
+    if unpriced_model_steps + unpriced_auxiliary_attempts > 0 and not limit.allow_unpriced:
         decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
             maximum=limit.max_estimated_cost,
             actual=actual_cost,
             message=(
                 "Estimated cost budget cannot be verified because "
-                f"{unpriced_model_steps} model step(s) have no matching pricing."
+                f"{unpriced_model_steps} model step(s) and {unpriced_auxiliary_attempts} "
+                "auxiliary attempt(s) have no matching pricing."
             ),
         )
         return _BudgetLimitOutcome(
@@ -5173,6 +5201,7 @@ def _first_budget_limit_outcome(
                 decision=decision,
                 cost_summary=cost_summary,
                 unpriced_model_steps=unpriced_model_steps,
+                unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
             ),
         )
     preflight_error = _budget_limit_preflight_error(
@@ -5197,6 +5226,7 @@ def _first_budget_limit_outcome(
                 decision=decision,
                 cost_summary=cost_summary,
                 unpriced_model_steps=unpriced_model_steps,
+                unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
             ),
         )
     if actual_cost >= limit.max_estimated_cost:
@@ -5216,6 +5246,7 @@ def _first_budget_limit_outcome(
                 decision=decision,
                 cost_summary=cost_summary,
                 unpriced_model_steps=unpriced_model_steps,
+                unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
             ),
         )
     return None
@@ -5227,6 +5258,7 @@ def _budget_check_from_stop_decision(
     decision: StopDecision,
     cost_summary: SessionCostTotals,
     unpriced_model_steps: int,
+    unpriced_auxiliary_attempts: int = 0,
 ) -> BudgetCheck:
     if decision.limit != StopLimit.ESTIMATED_COST:
         raise ValueError("Budget checks can only be created for estimated-cost decisions.")
@@ -5243,6 +5275,7 @@ def _budget_check_from_stop_decision(
         action=limit.action,
         model_steps=cost_summary.model_steps,
         unpriced_model_steps=unpriced_model_steps,
+        unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
         limit_reached=True,
         message=decision.message,
         cost_summary=cost_summary,

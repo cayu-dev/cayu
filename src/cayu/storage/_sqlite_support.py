@@ -44,7 +44,7 @@ from cayu.sessions.base import (
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
-from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL
+from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL, SQLITE_AUXILIARY_ACCOUNTING_DDL
 from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
@@ -4106,6 +4106,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     """,
     80: "ALTER TABLE cayu_eval_runs ADD COLUMN failure_diagnostic_json TEXT;",
     82: SQLITE_ACCOUNTING_DDL,
+    89: SQLITE_AUXILIARY_ACCOUNTING_DDL,
     83: """
         CREATE INDEX IF NOT EXISTS idx_cayu_events_queue_acceptance
         ON cayu_events(session_id, json_extract(payload_json, '$.queue_id'))

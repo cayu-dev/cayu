@@ -844,6 +844,7 @@ class CostLineItem(BaseModel):
     # Zero identifies terminal hosted-resource evidence with no matching
     # model.completed event; completed model steps remain one-based.
     model_step: StrictInt = Field(ge=0)
+    auxiliary_attempt: StrictBool = False
     execution_profile_fingerprint: str | None = Field(
         default=None,
         max_length=64,
@@ -1001,6 +1002,8 @@ class SessionCostTotals(BaseModel):
     model_steps: StrictInt = Field(ge=0)
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
+    auxiliary_attempts: StrictInt = Field(default=0, ge=0)
+    unpriced_auxiliary_attempts: StrictInt = Field(default=0, ge=0)
     missing_usage_model_steps: StrictInt = Field(default=0, ge=0)
     missing_pricing_model_steps: StrictInt = Field(default=0, ge=0)
     unsupported_pricing_model_steps: StrictInt = Field(default=0, ge=0)
@@ -1014,6 +1017,8 @@ class SessionCostTotals(BaseModel):
 
     @model_validator(mode="after")
     def validate_step_totals(self) -> SessionCostTotals:
+        if self.unpriced_auxiliary_attempts > self.auxiliary_attempts:
+            raise ValueError("Unpriced auxiliary attempts cannot exceed auxiliary_attempts.")
         if self.priced_model_steps + self.unpriced_model_steps != self.model_steps:
             raise ValueError("Priced and unpriced steps must sum to model_steps.")
         if (
@@ -1040,6 +1045,15 @@ class SessionCostSummary(SessionCostTotals):
 
     @model_validator(mode="after")
     def validate_step_accounting(self) -> SessionCostSummary:
+        auxiliary = [item for item in self.line_items if item.auxiliary_attempt]
+        if (
+            len(auxiliary) != self.auxiliary_attempts
+            or sum(not item.priced for item in auxiliary) != self.unpriced_auxiliary_attempts
+            or any(item.model_step != 0 for item in auxiliary)
+        ):
+            raise ValueError(
+                "Auxiliary cost line items must match their separate attempt counters."
+            )
         completed_steps = [item.model_step for item in self.line_items if item.model_step > 0]
         if completed_steps != list(range(1, self.model_steps + 1)):
             raise ValueError("Completion cost line items must cover each model step exactly once.")
@@ -1067,6 +1081,8 @@ class CausalBudgetCostSummary(BaseModel):
     model_steps: StrictInt = Field(ge=0)
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
+    auxiliary_attempts: StrictInt = Field(default=0, ge=0)
+    unpriced_auxiliary_attempts: StrictInt = Field(default=0, ge=0)
     missing_usage_model_steps: StrictInt = Field(default=0, ge=0)
     missing_pricing_model_steps: StrictInt = Field(default=0, ge=0)
     unsupported_pricing_model_steps: StrictInt = Field(default=0, ge=0)
@@ -1178,9 +1194,11 @@ def _estimate_session_cost(
 
     model_step = 0
     for event in events:
-        if event.type != EventType.MODEL_COMPLETED:
+        if event.type not in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
             continue
-        model_step += 1
+        auxiliary = event.type == EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED
+        model_step += int(not auxiliary)
+        line_step = 0 if auxiliary else model_step
         metrics = _cost_usage_metrics_from_event_payload(event.payload)
         execution_profile_fingerprint = _optional_execution_profile_fingerprint(
             event.payload.get("execution_profile_fingerprint")
@@ -1196,7 +1214,7 @@ def _estimate_session_cost(
         if metrics is None:
             line_items.append(
                 _unpriced_line_item(
-                    model_step=model_step,
+                    model_step=line_step,
                     provider_name=_optional_nonblank(event.payload.get("provider_name")),
                     requested_model=_optional_nonblank(event.payload.get("requested_model")),
                     model=_optional_nonblank(event.payload.get("model")),
@@ -1206,18 +1224,18 @@ def _estimate_session_cost(
                     billing_identity=_optional_billing_identity(
                         event.payload.get("billing_identity")
                     ),
-                )
+                ).model_copy(update={"auxiliary_attempt": auxiliary})
             )
             continue
         line_items.append(
             _cost_line_item(
-                model_step=model_step,
+                model_step=line_step,
                 metrics=metrics,
                 pricing=pricing,
                 currency=currency,
                 effective_on=_effective_date(event.timestamp),
                 execution_profile_fingerprint=execution_profile_fingerprint,
-            )
+            ).model_copy(update={"auxiliary_attempt": auxiliary})
         )
 
     remaining_hosted = [
@@ -1247,6 +1265,10 @@ def _estimate_session_cost(
         model_steps=model_step,
         priced_model_steps=priced_model_steps,
         unpriced_model_steps=unpriced_model_steps,
+        auxiliary_attempts=sum(item.auxiliary_attempt for item in line_items),
+        unpriced_auxiliary_attempts=sum(
+            item.auxiliary_attempt and not item.priced for item in line_items
+        ),
         missing_usage_model_steps=sum(
             1
             for item in line_items
@@ -1315,6 +1337,8 @@ def estimate_causal_budget_cost(
         model_steps=summary.model_steps,
         priced_model_steps=summary.priced_model_steps,
         unpriced_model_steps=summary.unpriced_model_steps,
+        auxiliary_attempts=summary.auxiliary_attempts,
+        unpriced_auxiliary_attempts=summary.unpriced_auxiliary_attempts,
         missing_usage_model_steps=summary.missing_usage_model_steps,
         missing_pricing_model_steps=summary.missing_pricing_model_steps,
         unsupported_pricing_model_steps=summary.unsupported_pricing_model_steps,

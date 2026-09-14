@@ -446,6 +446,7 @@ class SessionUsageSummary(BaseModel):
 
     session_id: str
     model_steps: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    unmeasured_model_attempts: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
@@ -486,6 +487,7 @@ class CausalBudgetUsageSummary(BaseModel):
     session_ids: list[str] = Field(default_factory=list)
     session_count: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     model_steps: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    unmeasured_model_attempts: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
@@ -949,6 +951,7 @@ def strip_provider_billing_identity(payload: dict[str, Any]) -> None:
 # `session_usage_summary` below.
 USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.MODEL_COMPLETED,
+    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
     EventType.MODEL_HOSTED_TOOL_CALL,
     EventType.TOOL_CALL_STARTED,
 )
@@ -965,6 +968,7 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
     usage = build_aggregate_usage_metrics()
     model_steps = 0
     tool_calls = 0
+    unmeasured_model_attempts = 0
 
     def record_identity(metrics: UsageMetrics) -> None:
         if metrics.provider_name is not None and metrics.provider_name not in provider_names:
@@ -982,14 +986,15 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
                 usage = add_aggregate_usage(usage, metrics)
                 record_identity(metrics)
             continue
-        if event.type != EventType.MODEL_COMPLETED:
+        if event.type not in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
             continue
-        model_steps += 1
+        model_steps += int(event.type == EventType.MODEL_COMPLETED)
         try:
             metrics = summary_usage_metrics_from_event_payload(event.payload)
         except (TypeError, ValueError):
             metrics = None
         if metrics is None:
+            unmeasured_model_attempts += 1
             continue
         usage = add_aggregate_usage(usage, metrics)
         record_identity(metrics)
@@ -997,6 +1002,7 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
     return SessionUsageSummary(
         session_id=session_id,
         model_steps=model_steps,
+        unmeasured_model_attempts=unmeasured_model_attempts,
         tool_calls=tool_calls,
         provider_names=provider_names,
         models=models,
@@ -1015,8 +1021,10 @@ def combine_session_usage_summaries(
     usage = build_aggregate_usage_metrics()
     model_steps = 0
     tool_calls = 0
+    unmeasured_model_attempts = 0
     for summary in summaries:
         model_steps += summary.model_steps
+        unmeasured_model_attempts += summary.unmeasured_model_attempts
         tool_calls += summary.tool_calls
         usage = add_aggregate_usage(usage, summary.usage)
         for provider_name in summary.provider_names:
@@ -1028,6 +1036,7 @@ def combine_session_usage_summaries(
     return SessionUsageSummary(
         session_id=session_id,
         model_steps=model_steps,
+        unmeasured_model_attempts=unmeasured_model_attempts,
         tool_calls=tool_calls,
         provider_names=provider_names,
         models=models,
@@ -1068,6 +1077,7 @@ def causal_budget_usage_summary(
         session_ids=session_ids,
         session_count=len(session_ids),
         model_steps=summary.model_steps,
+        unmeasured_model_attempts=summary.unmeasured_model_attempts,
         tool_calls=summary.tool_calls,
         provider_names=summary.provider_names,
         models=summary.models,

@@ -21,25 +21,225 @@ from opentelemetry.trace import SpanKind, StatusCode
 
 from cayu import (
     AgentSpec,
+    AuxiliaryInferencePolicy,
     CayuApp,
+    InferenceLimits,
     Message,
     OpenTelemetryEventSink,
     RunRequest,
     SubagentSpec,
     SubagentTool,
+    Tool,
+    ToolResult,
+    ToolSpec,
 )
 from cayu.budgets.base import InMemoryBudgetStore
+from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import Event, EventType, event_with_durable_sequence
 from cayu.observability import otel
 from cayu.observability.events import EventSink, _EventSinkDelivery
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter, _emit_event_sink
+from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, SessionIdentity
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 REMOTE_TRACE_ID = "11111111111111111111111111111111"
 REMOTE_TRACEPARENT = f"00-{REMOTE_TRACE_ID}-2222222222222222-01"
+
+
+@pytest.mark.parametrize("mode", ["retry", "cancel"])
+def test_real_runtime_auxiliary_spans_are_children_of_the_tool(mode) -> None:
+    exporter, sink = _make_sink()
+    limits = InferenceLimits(max_input_tokens=10, max_output_tokens=10, timeout_seconds=10)
+    entered = asyncio.Event()
+
+    class Summarize(Tool):
+        spec = ToolSpec(
+            name="summarize",
+            description="Managed inference",
+            input_schema={"type": "object", "properties": {}},
+            auxiliary_inference=AuxiliaryInferencePolicy(limits=limits, purposes=("tool.summary",)),
+        )
+
+        async def run(self, ctx, args):
+            invocation = ctx.inference.invoke(
+                ModelRequest(model="fake-model", messages=[Message.text("user", "nested")]),
+                purpose="tool.summary",
+                limits=limits,
+            )
+            if mode == "cancel":
+                task = asyncio.create_task(invocation)
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert task.cancelled()
+                assert task.cancelling() == 1
+                return ToolResult(content="Nested request cancelled")
+            response = await invocation
+            return ToolResult(content=response.text)
+
+    class Provider(ScriptedModelProvider):
+        def __init__(self):
+            super().__init__([], name="fake")
+            self.nested = 0
+            self.outer = 0
+
+        async def stream(self, request):
+            if request.options.get("fake", {}).get("max_output_tokens") == 10:
+                self.nested += 1
+                if mode == "cancel":
+                    entered.set()
+                    await asyncio.Event().wait()
+                if self.nested == 1:
+                    error = ModelStreamEvent.error("retry")
+                    error.payload.update(
+                        {
+                            "status_code": 503,
+                            "retryable": True,
+                            "usage": {"input_tokens": 3, "output_tokens": 2},
+                        }
+                    )
+                    yield error
+                else:
+                    yield ModelStreamEvent.text_delta("summary")
+                    yield ModelStreamEvent.completed(
+                        {"usage": {"input_tokens": 7, "output_tokens": 4}}
+                    )
+            else:
+                self.outer += 1
+                if self.outer == 1:
+                    yield ModelStreamEvent.tool_call(name="summarize", arguments={}, id="parent")
+                else:
+                    yield ModelStreamEvent.text_delta("done")
+                yield ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    async def scenario():
+        app = CayuApp(enable_logging=False, event_sinks=[sink])
+        provider = Provider()
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[Summarize()])
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="auxiliary-trace",
+                    messages=[Message.text("user", "go")],
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0, jitter_s=0),
+                )
+            )
+        ]
+        assert provider.nested == (2 if mode == "retry" else 1), [
+            (e.type, e.payload) for e in events[-3:]
+        ]
+        assert provider.outer == (2 if mode == "retry" else 1)
+        if mode == "cancel":
+            # Tool code caught the cancellation and returned. Its attempted
+            # continuation fails at the retained stage fence, not a new cancel.
+            assert any(event.type == EventType.SESSION_FAILED for event in events)
+            active = await app.session_store.load_active_model_completion_stage("auxiliary-trace")
+            assert active is not None
+            assert active.stage.publication.events[0].payload["auxiliary_outcome"] == "cancelled"
+
+    asyncio.run(scenario())
+    spans = exporter.get_finished_spans()
+    auxiliary = [
+        s for s in spans if s.attributes.get("cayu.model.operation") == "auxiliary_inference"
+    ]
+    tool = next(s for s in spans if s.attributes.get(otel.GEN_AI_TOOL_NAME) == "summarize")
+    assert len(auxiliary) == (2 if mode == "retry" else 1)
+    for span in auxiliary:
+        assert span.parent.span_id == tool.context.span_id
+        assert span.attributes["cayu.auxiliary.purpose"] == "tool.summary"
+        assert span.start_time <= span.end_time
+    assert not sink._sessions
+    if mode == "cancel":
+        # The ambiguous stage remains fenced. Its later recovery publication
+        # must not be fabricated here merely to complete a trace.
+        assert auxiliary[0].attributes[otel.CAYU_INCOMPLETE] is True
+        assert "cayu.auxiliary.outcome" not in auxiliary[0].attributes
+        return
+    assert [s.attributes["cayu.auxiliary.outcome"] for s in auxiliary] == ["failed", "completed"]
+    assert [s.attributes[otel.GEN_AI_USAGE_INPUT_TOKENS] for s in auxiliary] == [3, 7]
+    assert [s.attributes["cayu.model.attempt"] for s in auxiliary] == [1, 2]
+    assert len({s.context.span_id for s in auxiliary}) == 2
+    assert len({s.attributes["cayu.event.id"] for s in auxiliary}) == 2
+    assert auxiliary[0].status.status_code == StatusCode.ERROR
+    assert auxiliary[1].status.status_code == StatusCode.UNSET
+
+
+def test_auxiliary_private_routing_survives_redaction_and_ignores_unmatched_terminal() -> None:
+    exporter, sink = _make_sink()
+
+    async def scenario():
+        sequence = 0
+
+        async def deliver(event_type, *, attempt=None, tool=None, outcome=None):
+            nonlocal sequence
+            sequence += 1
+            event = Event(
+                id=public_event_id(sequence),
+                type=event_type,
+                session_id="public-session",
+                tool_name="summarize",
+                payload={
+                    "model_attempt_id": REDACTED_SECRET,
+                    "tool_call_id": REDACTED_SECRET,
+                    "requested_model": "model",
+                    "auxiliary_outcome": outcome,
+                    "auxiliary_inference": {"tool_call_id": REDACTED_SECRET},
+                },
+            )
+            delivery = _EventSinkDelivery(
+                event=event,
+                event_sequence=sequence,
+                private_session_id="private-session",
+                private_event_id=f"private-{sequence}",
+                private_tool_call_id=tool,
+                private_model_attempt_id=attempt,
+                private_auxiliary_tool_call_id=tool,
+            )
+            await otel._emit_opentelemetry_delivery(sink, delivery)
+            await otel._emit_opentelemetry_delivery(sink, delivery)
+
+        await deliver(EventType.SESSION_STARTED)
+        await deliver(EventType.MODEL_STARTED)
+        for attempt in ("a", "b"):
+            await deliver(EventType.TOOL_CALL_STARTED, tool=attempt)
+            await deliver(EventType.MODEL_AUXILIARY_ATTEMPT_STARTED, tool=attempt, attempt=attempt)
+            await deliver(
+                EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED, attempt="unrelated", outcome="failed"
+            )
+            if attempt == "a":
+                await deliver(
+                    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED, attempt=attempt, outcome="completed"
+                )
+                await deliver(EventType.TOOL_CALL_COMPLETED, tool=attempt)
+        # The unmatched recovery evidence did not consume the ordinary slot.
+        await deliver(EventType.MODEL_COMPLETED)
+        await deliver(EventType.SESSION_INTERRUPTED)
+
+    asyncio.run(scenario())
+    spans = exporter.get_finished_spans()
+    auxiliary = [
+        s for s in spans if s.attributes.get("cayu.model.operation") == "auxiliary_inference"
+    ]
+    tools = [s for s in spans if s.attributes.get(otel.GEN_AI_TOOL_NAME) == "summarize"]
+    assert len(auxiliary) == len(tools) == 2
+    assert {s.parent.span_id for s in auxiliary} == {s.context.span_id for s in tools}
+    assert auxiliary[0].attributes["cayu.auxiliary.outcome"] == "completed"
+    assert auxiliary[1].attributes[otel.CAYU_INCOMPLETE] is True
+    ordinary = [
+        s
+        for s in spans
+        if s.attributes.get(otel.GEN_AI_OPERATION_NAME) == "chat" and s not in auxiliary
+    ]
+    assert len(ordinary) == 1
+    assert otel.CAYU_INCOMPLETE not in ordinary[0].attributes
+    assert not sink._sessions
 
 
 class _FailModelStartOnceSink(EventSink):

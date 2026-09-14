@@ -125,6 +125,12 @@
     "AggregateCostSummary": {
       "additionalProperties": false,
       "properties": {
+        "auxiliary_attempts": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Auxiliary Attempts",
+          "type": "integer"
+        },
         "currency": {
           "title": "Currency",
           "type": "string"
@@ -181,6 +187,12 @@
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
+        },
+        "unpriced_auxiliary_attempts": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unpriced Auxiliary Attempts",
+          "type": "integer"
         },
         "unpriced_model_steps": {
           "minimum": 0.0,
@@ -313,6 +325,13 @@
         "tool_calls": {
           "minimum": 0.0,
           "title": "Tool Calls",
+          "type": "integer"
+        },
+        "unmeasured_model_attempts": {
+          "default": 0,
+          "maximum": 9.223372036854776e+18,
+          "minimum": 0.0,
+          "title": "Unmeasured Model Attempts",
           "type": "integer"
         },
         "usage": {
@@ -4185,6 +4204,12 @@
       "additionalProperties": false,
       "description": "Estimated cost for all sessions sharing one causal budget id.",
       "properties": {
+        "auxiliary_attempts": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Auxiliary Attempts",
+          "type": "integer"
+        },
         "causal_budget_id": {
           "title": "Causal Budget Id",
           "type": "string"
@@ -4246,6 +4271,12 @@
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
+        },
+        "unpriced_auxiliary_attempts": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unpriced Auxiliary Attempts",
+          "type": "integer"
         },
         "unpriced_model_steps": {
           "minimum": 0.0,
@@ -4361,6 +4392,13 @@
           "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Tool Calls",
+          "type": "integer"
+        },
+        "unmeasured_model_attempts": {
+          "default": 0,
+          "maximum": 9.223372036854776e+18,
+          "minimum": 0.0,
+          "title": "Unmeasured Model Attempts",
           "type": "integer"
         },
         "usage": {
@@ -4853,6 +4891,11 @@
       "additionalProperties": false,
       "description": "Estimated cost for one model attempt or standalone hosted resource evidence.",
       "properties": {
+        "auxiliary_attempt": {
+          "default": false,
+          "title": "Auxiliary Attempt",
+          "type": "boolean"
+        },
         "billing_identity": {
           "anyOf": [
             {
@@ -5747,6 +5790,8 @@
         "model.hosted_tool_call",
         "model.citation",
         "model.completed",
+        "model.auxiliary.attempt_started",
+        "model.auxiliary.attempt_settled",
         "model.error",
         "model.http_cleanup",
         "model.retry",
@@ -8506,6 +8551,12 @@
       "additionalProperties": false,
       "description": "Detailed cost inspection, retaining one line item per completed step.",
       "properties": {
+        "auxiliary_attempts": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Auxiliary Attempts",
+          "type": "integer"
+        },
         "currency": {
           "title": "Currency",
           "type": "string"
@@ -8547,6 +8598,12 @@
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
+        },
+        "unpriced_auxiliary_attempts": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Unpriced Auxiliary Attempts",
+          "type": "integer"
         },
         "unpriced_model_steps": {
           "minimum": 0.0,
@@ -9563,6 +9620,13 @@
           "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Tool Calls",
+          "type": "integer"
+        },
+        "unmeasured_model_attempts": {
+          "default": 0,
+          "maximum": 9.223372036854776e+18,
+          "minimum": 0.0,
+          "title": "Unmeasured Model Attempts",
           "type": "integer"
         },
         "usage": {
@@ -11550,6 +11614,12 @@
           "title": "Groups",
           "type": "array"
         },
+        "identified_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Identified Auxiliary Attempts",
+          "type": "string"
+        },
         "identified_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Identified Model Steps",
@@ -11579,6 +11649,12 @@
       "additionalProperties": false,
       "description": "One bounded, identity-bearing group of equivalent pricing outcomes.",
       "properties": {
+        "auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Auxiliary Attempts",
+          "type": "string"
+        },
         "billing_identity": {
           "$ref": "#/components/schemas/UsageBillingIdentity"
         },
@@ -11605,7 +11681,7 @@
           "title": "Missing Pricing Reason"
         },
         "model_steps": {
-          "pattern": "^[1-9]\\d*$",
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Model Steps",
           "type": "string"
         },
@@ -11654,19 +11730,37 @@
       "additionalProperties": false,
       "description": "Exact counts for identity-bearing pricing groups omitted from bounded detail.",
       "properties": {
+        "auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Auxiliary Attempts",
+          "type": "string"
+        },
         "group_count": {
           "pattern": "^[1-9]\\d*$",
           "title": "Group Count",
           "type": "string"
         },
         "model_steps": {
-          "pattern": "^[1-9]\\d*$",
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Model Steps",
+          "type": "string"
+        },
+        "priced_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Priced Auxiliary Attempts",
           "type": "string"
         },
         "priced_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Priced Model Steps",
+          "type": "string"
+        },
+        "unpriced_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Unpriced Auxiliary Attempts",
           "type": "string"
         },
         "unpriced_model_steps": {
@@ -11787,6 +11881,12 @@
           "title": "Currencies",
           "type": "array"
         },
+        "evaluated_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Evaluated Auxiliary Attempts",
+          "type": "string"
+        },
         "evaluated_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Evaluated Model Steps",
@@ -11800,6 +11900,12 @@
           "title": "Price Book Version",
           "type": "string"
         },
+        "priced_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Priced Auxiliary Attempts",
+          "type": "string"
+        },
         "priced_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Priced Model Steps",
@@ -11808,6 +11914,12 @@
         "unevaluated_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Unevaluated Model Steps",
+          "type": "string"
+        },
+        "unpriced_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Unpriced Auxiliary Attempts",
           "type": "string"
         },
         "unpriced_model_steps": {
@@ -11843,6 +11955,12 @@
       "additionalProperties": false,
       "description": "Exact estimated model-step and hosted-resource cost for one currency.",
       "properties": {
+        "auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Auxiliary Attempts",
+          "type": "string"
+        },
         "currency": {
           "title": "Currency",
           "type": "string"
@@ -12241,9 +12359,21 @@
           "title": "Currencies",
           "type": "array"
         },
+        "evaluated_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Evaluated Auxiliary Attempts",
+          "type": "string"
+        },
         "evaluated_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Evaluated Model Steps",
+          "type": "string"
+        },
+        "priced_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Priced Auxiliary Attempts",
           "type": "string"
         },
         "priced_model_steps": {
@@ -12254,6 +12384,12 @@
         "unevaluated_model_steps": {
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Unevaluated Model Steps",
+          "type": "string"
+        },
+        "unpriced_auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Unpriced Auxiliary Attempts",
           "type": "string"
         },
         "unpriced_model_steps": {
@@ -12286,6 +12422,12 @@
       "additionalProperties": false,
       "description": "Model-step and hosted-resource counts unpriced for one explicit reason.",
       "properties": {
+        "auxiliary_attempts": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Auxiliary Attempts",
+          "type": "string"
+        },
         "hosted_resources": {
           "default": "0",
           "pattern": "^(0|[1-9]\\d*)$",

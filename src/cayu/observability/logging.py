@@ -96,6 +96,13 @@ class LoggingEventSink(EventSink):
         if type(event) is not Event:
             raise TypeError("LoggingEventSink requires Event instances.")
         level = _level_for(event.type)
+        if event.type == EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED:
+            # Settlement is accounting evidence, not necessarily successful inference.
+            level = (
+                logging.INFO
+                if event.payload.get("auxiliary_outcome") == "completed"
+                else logging.WARNING
+            )
         if not self.logger.isEnabledFor(level):
             return
         self.logger.log(
@@ -144,6 +151,28 @@ def _summarize_event(
             payload.get("usage_metrics") or payload.get("usage"),
             redactor=redactor,
         )
+    elif event_type in {
+        EventType.MODEL_AUXILIARY_ATTEMPT_STARTED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+    }:
+        for key in (
+            "provider_name",
+            "requested_model",
+            "model_attempt_id",
+            "attempt",
+            "auxiliary_outcome",
+            "usage_status",
+        ):
+            _append(parts, key, payload.get(key), redactor=redactor)
+        attribution = payload.get("auxiliary_inference")
+        if type(attribution) is dict:
+            for key in ("operation_id", "purpose", "tool_call_id"):
+                _append(parts, key, attribution.get(key), redactor=redactor)
+        # Never fall back to arbitrary raw provider data or tool result metadata.
+        _append_usage(parts, payload.get("usage_metrics"), redactor=redactor)
+        provider_error = payload.get("provider_error")
+        if type(provider_error) is dict:
+            _append_error(parts, provider_error, limit=error_summary_limit, redactor=redactor)
     elif event_type == EventType.MODEL_RETRY:
         _append(parts, "provider", payload.get("provider"), redactor=redactor)
         _append(parts, "model", payload.get("model"), redactor=redactor)

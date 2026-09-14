@@ -295,6 +295,10 @@ export type AggregateCacheUsageMetrics = {
  */
 export type AggregateCostSummary = {
     /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: number;
+    /**
      * Currency
      */
     currency: string;
@@ -334,6 +338,10 @@ export type AggregateCostSummary = {
      * Total Cost
      */
     total_cost: string;
+    /**
+     * Unpriced Auxiliary Attempts
+     */
+    unpriced_auxiliary_attempts?: number;
     /**
      * Unpriced Model Steps
      */
@@ -418,6 +426,10 @@ export type AggregateUsageSummary = {
      * Tool Calls
      */
     tool_calls: number;
+    /**
+     * Unmeasured Model Attempts
+     */
+    unmeasured_model_attempts?: number;
     usage: AggregateUsageMetrics;
 };
 
@@ -2977,6 +2989,10 @@ export type CapturedRunScoreV1 = {
  */
 export type CausalBudgetCostSummary = {
     /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: number;
+    /**
      * Causal Budget Id
      */
     causal_budget_id: string;
@@ -3020,6 +3036,10 @@ export type CausalBudgetCostSummary = {
      * Total Cost
      */
     total_cost: string;
+    /**
+     * Unpriced Auxiliary Attempts
+     */
+    unpriced_auxiliary_attempts?: number;
     /**
      * Unpriced Model Steps
      */
@@ -3088,6 +3108,10 @@ export type CausalBudgetUsageSummary = {
      * Tool Calls
      */
     tool_calls?: number;
+    /**
+     * Unmeasured Model Attempts
+     */
+    unmeasured_model_attempts?: number;
     usage?: AggregateUsageMetrics;
 };
 
@@ -4133,6 +4157,10 @@ export type CostDirection = 'savings' | 'break_even' | 'increased_cost' | 'unava
  * Estimated cost for one model attempt or standalone hosted resource evidence.
  */
 export type CostLineItem = {
+    /**
+     * Auxiliary Attempt
+     */
+    auxiliary_attempt?: boolean;
     billing_identity?: BillingIdentity | null;
     /**
      * Cache Read Input Cost
@@ -8656,7 +8684,7 @@ export type EventSideEffectRecoveryLoop = {
 /**
  * EventType
  */
-export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
+export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.auxiliary.attempt_started' | 'model.auxiliary.attempt_settled' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
 
 /**
  * ExecutionDeadline
@@ -15102,6 +15130,10 @@ export type SessionCostBody = {
  */
 export type SessionCostSummary = {
     /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: number;
+    /**
      * Currency
      */
     currency: string;
@@ -15133,6 +15165,10 @@ export type SessionCostSummary = {
      * Total Cost
      */
     total_cost: string;
+    /**
+     * Unpriced Auxiliary Attempts
+     */
+    unpriced_auxiliary_attempts?: number;
     /**
      * Unpriced Model Steps
      */
@@ -15719,6 +15755,10 @@ export type SessionUsageSummary = {
      * Tool Calls
      */
     tool_calls?: number;
+    /**
+     * Unmeasured Model Attempts
+     */
+    unmeasured_model_attempts?: number;
     usage?: AggregateUsageMetrics;
 };
 
@@ -17340,6 +17380,10 @@ export type UsageBillingCostBreakdown = {
      */
     groups: Array<UsageBillingCostGroup>;
     /**
+     * Identified Auxiliary Attempts
+     */
+    identified_auxiliary_attempts?: string;
+    /**
      * Identified Model Steps
      */
     identified_model_steps: string;
@@ -17352,6 +17396,10 @@ export type UsageBillingCostBreakdown = {
  * One bounded, identity-bearing group of equivalent pricing outcomes.
  */
 export type UsageBillingCostGroup = {
+    /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: string;
     billing_identity: UsageBillingIdentity;
     /**
      * Currency
@@ -17390,6 +17438,10 @@ export type UsageBillingCostGroup = {
  */
 export type UsageBillingCostRemainder = {
     /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: string;
+    /**
      * Group Count
      */
     group_count: string;
@@ -17398,9 +17450,17 @@ export type UsageBillingCostRemainder = {
      */
     model_steps: string;
     /**
+     * Priced Auxiliary Attempts
+     */
+    priced_auxiliary_attempts?: string;
+    /**
      * Priced Model Steps
      */
     priced_model_steps: string;
+    /**
+     * Unpriced Auxiliary Attempts
+     */
+    unpriced_auxiliary_attempts?: string;
     /**
      * Unpriced Model Steps
      */
@@ -17471,6 +17531,10 @@ export type UsageCostRollup = {
      */
     currencies: Array<UsageCurrencyCost>;
     /**
+     * Evaluated Auxiliary Attempts
+     */
+    evaluated_auxiliary_attempts?: string;
+    /**
      * Evaluated Model Steps
      */
     evaluated_model_steps: string;
@@ -17483,6 +17547,10 @@ export type UsageCostRollup = {
      */
     price_book_version: string;
     /**
+     * Priced Auxiliary Attempts
+     */
+    priced_auxiliary_attempts?: string;
+    /**
      * Priced Model Steps
      */
     priced_model_steps: string;
@@ -17490,6 +17558,10 @@ export type UsageCostRollup = {
      * Unevaluated Model Steps
      */
     unevaluated_model_steps: string;
+    /**
+     * Unpriced Auxiliary Attempts
+     */
+    unpriced_auxiliary_attempts?: string;
     /**
      * Unpriced Model Steps
      */
@@ -17506,6 +17578,10 @@ export type UsageCostRollup = {
  * Exact estimated model-step and hosted-resource cost for one currency.
  */
 export type UsageCurrencyCost = {
+    /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: string;
     /**
      * Currency
      */
@@ -17744,9 +17820,17 @@ export type UsageSessionCostSummary = {
      */
     currencies: Array<UsageCurrencyCost>;
     /**
+     * Evaluated Auxiliary Attempts
+     */
+    evaluated_auxiliary_attempts?: string;
+    /**
      * Evaluated Model Steps
      */
     evaluated_model_steps: string;
+    /**
+     * Priced Auxiliary Attempts
+     */
+    priced_auxiliary_attempts?: string;
     /**
      * Priced Model Steps
      */
@@ -17755,6 +17839,10 @@ export type UsageSessionCostSummary = {
      * Unevaluated Model Steps
      */
     unevaluated_model_steps: string;
+    /**
+     * Unpriced Auxiliary Attempts
+     */
+    unpriced_auxiliary_attempts?: string;
     /**
      * Unpriced Model Steps
      */
@@ -17771,6 +17859,10 @@ export type UsageSessionCostSummary = {
  * Model-step and hosted-resource counts unpriced for one explicit reason.
  */
 export type UsageUnpricedReason = {
+    /**
+     * Auxiliary Attempts
+     */
+    auxiliary_attempts?: string;
     /**
      * Hosted Resources
      */

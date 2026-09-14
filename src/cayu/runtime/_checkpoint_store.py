@@ -26,6 +26,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     CheckpointTransform,
+    ModelCompletionStageRecoveryFence,
     ProfiledSessionForkResult,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
@@ -899,6 +900,12 @@ class _RuntimeCheckpointSessionStore:
         self,
         request: RuntimePublicationRequest,
     ) -> RuntimePublicationRequest:
+        if request.kind == "auxiliary-inference":
+            if request.mutation.operations:
+                raise ValueError("Auxiliary publications cannot mutate the parent checkpoint.")
+            # Auxiliary accounting has no checkpoint ownership. Even an otherwise
+            # harmless schema stamp changes its exact no-mutation publication.
+            return request
         schema_operations = tuple(
             operation
             for operation in request.mutation.operations
@@ -1160,6 +1167,21 @@ class _RuntimeCheckpointSessionStore:
             session_id,
             stage_id=stage_id,
             publication=self._versioned_publication_request(publication),
+        )
+
+    async def complete_recovered_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        stage_id: str,
+        publication: RuntimePublicationRequest,
+        recovery_fence: ModelCompletionStageRecoveryFence,
+    ) -> Any:
+        return await self._store.complete_recovered_model_completion_stage(
+            session_id,
+            stage_id=stage_id,
+            publication=self._versioned_publication_request(publication),
+            recovery_fence=recovery_fence,
         )
 
     async def promote_model_completion_stage(

@@ -89,6 +89,11 @@ class RecordingProvider(ModelProvider):
     def stream_deadlines(self):
         return self.delegate.stream_deadlines
 
+    def prepare_auxiliary_request(
+        self, request: ModelRequest, *, max_output_tokens: int
+    ) -> ModelRequest:
+        return self.delegate.prepare_auxiliary_request(request, max_output_tokens=max_output_tokens)
+
     def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
         return self.delegate.request_cache_policy(request)
 

@@ -429,6 +429,7 @@ from cayu.sessions.base import (
     _validate_model_completion_stage_for_settlement,
     _validate_model_completion_stage_preparation_replay,
     _validate_model_completion_stage_publication,
+    _validate_model_completion_stage_recovery_fence,
     _validate_model_completion_stage_release,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
@@ -1955,6 +1956,7 @@ class SQLiteSessionStore(SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -10067,6 +10069,34 @@ class SQLiteSessionStore(SessionStore):
                         stage=stage,
                         replayed=True,
                         dispatch_authorized=False,
+                    )
+                if prepared.recovery_fence is not None:
+                    active_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    ).fetchone()
+                    dispatch_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, _model_completion_stage_dispatch_storage_key(stage.stage_id)),
+                    ).fetchone()
+                    _validate_model_completion_stage_recovery_fence(
+                        prepared.recovery_fence,
+                        session=loaded,
+                        checkpoint=self._load_checkpoint_unlocked(session_id),
+                        stage=stage,
+                        active_record=(
+                            None
+                            if active_row is None
+                            else _decode_model_completion_stage_record(active_row["record_json"])
+                        ),
+                        dispatch_record=(
+                            None
+                            if dispatch_row is None
+                            else _decode_model_completion_stage_record(dispatch_row["record_json"])
+                        ),
+                        now=self._ownership_clock(),
                     )
                 _validate_model_completion_stage_publication(
                     prepared.publication,

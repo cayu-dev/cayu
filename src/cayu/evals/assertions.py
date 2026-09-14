@@ -682,7 +682,13 @@ class MaxEstimatedCost(EvalAssertion):
             name=self.name,
             maximum=self.maximum,
             currency=summary.currency,
-            cost=AssertionCostEvidenceV1(
+            # Auxiliary attempts are not conversational model steps. The
+            # portable step partition cannot express their unknown cost; use
+            # its existing unavailable boundary, retaining the full diagnostic
+            # summary below rather than presenting the known subtotal as total.
+            cost=None
+            if summary.unpriced_auxiliary_attempts
+            else AssertionCostEvidenceV1(
                 currency=summary.currency,
                 total_cost=_canonical_decimal(summary.total_cost),
                 model_steps=summary.model_steps,

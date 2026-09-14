@@ -82,6 +82,8 @@ corresponding credentials or service.
 ## Operations and advanced strategies
 
 - [`usage_cost_summary.py`](usage_cost_summary.py) — session usage and cost reporting.
+- [`runtime_auxiliary_inference.py`](runtime_auxiliary_inference.py) — network-free
+  managed inference inside a tool, with auxiliary usage and unchanged agent-step counts.
 - [`cost_quality_comparison.py`](cost_quality_comparison.py) — deterministic paired
   accounting with `verified`, `measured_unmatched`, `unpriced`, and `unavailable`
   proof statuses.

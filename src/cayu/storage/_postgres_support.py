@@ -18,6 +18,9 @@ from cayu.sessions.base import (
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
+from cayu.storage._accounting_schema import (
+    POSTGRES_AUXILIARY_ACCOUNTING_DDL as POSTGRES_AUXILIARY_ACCOUNTING_DDL,
+)
 from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,

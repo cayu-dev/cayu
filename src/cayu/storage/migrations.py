@@ -451,6 +451,8 @@ REVISIONS: tuple[Revision, ...] = (
     # Closure claims fence session and dependent-task admission. Every writer
     # must participate before destructive closure is admitted.
     Revision(revision=88, kind=RevisionKind.BREAKING, compatible_from=88),
+    # Auxiliary usage is required by every accounting reader and writer.
+    Revision(revision=89, kind=RevisionKind.BREAKING, compatible_from=89),
 )
 
 #: The revision an empty database is initialized to.

@@ -826,6 +826,28 @@ class RecoveryPlanCoordinator:
                     provider_reattachment = False
                     provider_operation_ref = None
             context = model_completion_recovery_context_from_stage(active.stage)
+            auxiliary = active.stage.purpose == "auxiliary-inference"
+            reservation_count = 0 if context is None else len(context.budget_reservations)
+            if auxiliary:
+                from cayu.runtime._auxiliary_inference_contract import (
+                    auxiliary_budget_recovery_contexts,
+                )
+
+                if (
+                    active.stage.state == "in_flight"
+                    and not self._session_store._supports_model_completion_recovery_fence_protocol()
+                ):
+                    registration_status = RecoveryRegistrationStatus.INCOMPATIBLE
+                    registration_reason = "atomic_auxiliary_recovery_unavailable"
+                    blockers.append(
+                        RecoveryPlanBlocker(code=RecoveryBlockerCode.REGISTRATION_INCOMPATIBLE)
+                    )
+                try:
+                    reservation_count = len(auxiliary_budget_recovery_contexts(active.stage))
+                except (TypeError, ValueError):
+                    blockers.append(
+                        RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE)
+                    )
             local_http_cleanup = "unknown"
             cleanup_records = await self._session_store.query_events(
                 EventQuery(
@@ -860,12 +882,13 @@ class RecoveryPlanCoordinator:
                 dispatched=dispatch is not None,
                 provider_reattachment_supported=provider_reattachment,
                 provider_operation_ref=provider_operation_ref,
-                reservation_count=(0 if context is None else len(context.budget_reservations)),
+                reservation_count=reservation_count,
             )
             if (
                 active.stage.state == "in_flight"
                 and dispatch is not None
                 and not provider_reattachment
+                and not auxiliary
             ):
                 blockers.append(
                     RecoveryPlanBlocker(
@@ -2063,18 +2086,19 @@ class RecoveryPlanCoordinator:
                         "Zero-work evidence changed before terminalization."
                     )
             else:
-                result = await self._recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(
-                        session_id=private_session_id,
-                        # This plan's exact checkpoint claim refreshed activity
-                        # only after atomically matching the planned snapshot. A
-                        # second inactivity check would compare against our own
-                        # lease write instead of the operator-inspected state.
-                        inactive_for_seconds=None,
-                        reason="operator_executed_recovery_plan",
-                        metadata={"plan_item_id": item.item_id},
+                from cayu.runtime._durable_model_terminalization import terminalization_plan_scope
+
+                with terminalization_plan_scope(recovery_ownership):
+                    result = await self._recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(
+                            session_id=private_session_id,
+                            # This exact plan claim refreshed activity after
+                            # matching the operator-inspected snapshot.
+                            inactive_for_seconds=None,
+                            reason="operator_executed_recovery_plan",
+                            metadata={"plan_item_id": item.item_id},
+                        )
                     )
-                )
             if (
                 item.interruption_cascade is not None
                 and decision.action is not RecoveryPlanAction.TERMINALIZE_ZERO_WORK

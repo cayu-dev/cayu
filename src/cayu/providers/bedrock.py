@@ -338,6 +338,15 @@ class BedrockProvider(ModelProvider):
     billing_provider_name = "bedrock"
     usage_dialect = UsageDialect.ANTHROPIC
 
+    def prepare_auxiliary_request(
+        self, request: ModelRequest, *, max_output_tokens: int
+    ) -> ModelRequest:
+        return self._prepare_auxiliary_request(
+            request,
+            max_output_tokens=max_output_tokens,
+            output_option_path=("bedrock", "inferenceConfig", "maxTokens"),
+        )
+
     @property
     def stream_deadlines(self) -> ProviderStreamDeadlines:
         return self._stream_deadlines

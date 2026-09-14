@@ -3194,6 +3194,87 @@ def test_sqlite_transcript_tokenizer_identity_mismatch_fails_closed(tmp_path) ->
     assert marker == ("incompatible-tokenizer",)
 
 
+def test_sqlite_auxiliary_accounting_migration_rebuilds_indexes_and_invalidates(tmp_path):
+    from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL
+
+    db_path = tmp_path / "auxiliary-accounting.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(agent_name="assistant", session_id="accounting-migration", messages=[]),
+            identity=_identity(),
+        )
+        await store.append_event(
+            "accounting-migration",
+            Event(type=EventType.MODEL_COMPLETED, session_id="accounting-migration", payload={}),
+        )
+        await _close(store)
+
+    asyncio.run(seed())
+    # Reconstruct the immediately preceding accounting definitions and revision
+    # marker. The populated database must survive the public migration entrance.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP INDEX idx_cayu_events_cost_attempt")
+        connection.execute("DROP INDEX idx_cayu_events_cost_sequence")
+        connection.execute("DROP TRIGGER cayu_accounting_delete_generation")
+        connection.executescript(
+            SQLITE_ACCOUNTING_DDL.replace("'model.auxiliary.attempt_settled', ", "").replace(
+                "CASE WHEN event_type = 'model.hosted_tool_call' THEN 0 ELSE 1 END",
+                "event_type DESC",
+            )
+        )
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 89")
+        connection.execute("PRAGMA user_version = 88")
+        generation = connection.execute("SELECT generation FROM cayu_accounting_state").fetchone()[
+            0
+        ]
+
+    store = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def use_migrated() -> None:
+        assert await store.load("accounting-migration") is not None
+        event = Event(
+            type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+            session_id="accounting-migration",
+            payload={},
+        )
+        await store.append_event("accounting-migration", event)
+        claim = await store.claim_persisted_event_side_effect(
+            session_id="accounting-migration", event_id=event.id
+        )
+        assert claim is not None
+        await store.mark_persisted_event_side_effect_delivered(claim)
+        await _close(store)
+
+    asyncio.run(use_migrated())
+    with sqlite3.connect(db_path) as connection:
+        assert (
+            connection.execute("SELECT generation FROM cayu_accounting_state").fetchone()[0]
+            == generation + 1
+        )
+        definitions = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name IN "
+            "('idx_cayu_events_cost_attempt', 'idx_cayu_events_cost_sequence', "
+            "'cayu_accounting_delete_generation')"
+        ).fetchall()
+        assert len(definitions) == 3
+        assert all("model.auxiliary.attempt_settled" in row[0] for row in definitions)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM cayu_events WHERE event_type = 'model.completed'"
+            ).fetchone()[0]
+            == 1
+        )
+        connection.execute(
+            "DELETE FROM cayu_events WHERE event_type = 'model.auxiliary.attempt_settled'"
+        )
+        assert (
+            connection.execute("SELECT generation FROM cayu_accounting_state").fetchone()[0]
+            == generation + 2
+        )
+
+
 def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     connection = sqlite3.connect(db_path)
@@ -3366,6 +3447,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (86, 85),
         (87, 87),
         (88, 88),
+        (89, 89),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

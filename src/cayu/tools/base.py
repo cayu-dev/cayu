@@ -42,6 +42,11 @@ from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
+from cayu.tools.inference import (
+    AuxiliaryInferencePolicy,
+    InferenceInvoker,
+    validate_optional_auxiliary_inference_policy,
+)
 
 if TYPE_CHECKING:
     from cayu.runners.base import ExecCommand, ExecResult
@@ -366,6 +371,7 @@ class _ToolSpecInput(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
+    auxiliary_inference: AuxiliaryInferencePolicy | None = None
     execution_requirements: tuple[ToolExecutionRequirement, ...] = Field(
         default_factory=tuple,
         max_length=MAX_TOOL_EXECUTION_REQUIREMENTS,
@@ -375,6 +381,11 @@ class _ToolSpecInput(BaseModel):
     @classmethod
     def copy_execution_requirements(cls, value: object) -> tuple[ToolExecutionRequirement, ...]:
         return copy_tool_execution_requirements(value)
+
+    @field_validator("auxiliary_inference", mode="before")
+    @classmethod
+    def copy_auxiliary_inference(cls, value: object) -> AuxiliaryInferencePolicy | None:
+        return validate_optional_auxiliary_inference_policy(value)
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -421,6 +432,7 @@ class ToolSpec(BaseModel):
         le=MAX_DURABLE_JSON_INTEGER,
     )
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None
+    auxiliary_inference: AuxiliaryInferencePolicy | None = None
     execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
@@ -435,6 +447,7 @@ class ToolSpec(BaseModel):
         workspace_mutation: bool = False,
         max_terminal_payload_bytes: int | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        auxiliary_inference: AuxiliaryInferencePolicy | None = None,
         execution_requirements: Iterable[ToolExecutionRequirement] = (),
         **data: Any,
     ) -> None:
@@ -448,6 +461,7 @@ class ToolSpec(BaseModel):
                 "workspace_mutation": workspace_mutation,
                 "max_terminal_payload_bytes": max_terminal_payload_bytes,
                 "execution_profile_identity": execution_profile_identity,
+                "auxiliary_inference": auxiliary_inference,
                 "execution_requirements": execution_requirements,
                 **data,
             }
@@ -463,6 +477,7 @@ class ToolSpec(BaseModel):
                 parsed.execution_profile_identity
             ),
             execution_requirements=copy_tool_execution_requirements(parsed.execution_requirements),
+            auxiliary_inference=parsed.auxiliary_inference,
         )
         object.__setattr__(self, "_input_schema", _freeze_value(parsed.input_schema))
 
@@ -486,7 +501,9 @@ class ToolSpec(BaseModel):
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
     ) -> ToolSpec:
-        data = self.model_dump()
+        # Revalidate declarations before serialization can render mutated values.
+        data = {name: getattr(self, name) for name in ToolSpec.model_fields}
+        data["input_schema"] = self.input_schema
         if update:
             data.update(update)
         return type(self)(**data)
@@ -1102,6 +1119,18 @@ class ToolContext(BaseModel):
     _runtime_workspace_authority: Any = PrivateAttr(default=None)
     _runtime_artifact_store_authority: Any = PrivateAttr(default=None)
     _runtime_causal_budget_limits: tuple[Any, ...] = PrivateAttr(default=())
+    _runtime_inference: InferenceInvoker | None = PrivateAttr(default=None)
+
+    @property
+    def inference(self) -> InferenceInvoker | None:
+        """Optional runtime-owned inference handle, valid only during this tool call."""
+
+        return self._runtime_inference
+
+    def _bind_runtime_inference(self, inference: InferenceInvoker) -> None:
+        if self._runtime_inference is not None:
+            raise RuntimeError("Runtime inference handle is already bound.")
+        self._runtime_inference = inference
 
     def _bind_runtime_resource_authorities(
         self,

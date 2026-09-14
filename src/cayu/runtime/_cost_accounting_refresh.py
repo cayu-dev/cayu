@@ -81,6 +81,12 @@ def _apply_delta(
         unpriced_model_steps=total.unpriced_model_steps
         + new.unpriced_model_steps
         - old.unpriced_model_steps,
+        auxiliary_attempts=total.auxiliary_attempts
+        + new.auxiliary_attempts
+        - old.auxiliary_attempts,
+        unpriced_auxiliary_attempts=total.unpriced_auxiliary_attempts
+        + new.unpriced_auxiliary_attempts
+        - old.unpriced_auxiliary_attempts,
         missing_usage_model_steps=total.missing_usage_model_steps
         + new.missing_usage_model_steps
         - old.missing_usage_model_steps,

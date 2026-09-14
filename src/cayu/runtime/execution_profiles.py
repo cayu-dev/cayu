@@ -1181,15 +1181,10 @@ def build_execution_profile_identity(
             if live_state_projection is None
             else live_state_projection,
         ),
-        _available_component(
-            ExecutionProfileComponentClass.PROVIDER_ADAPTER,
-            _aggregate_identity_strength(
-                process_local=provider_adapter_process_local,
-                application_versioned=provider_adapter_application_versioned,
-            ),
-            {"kind": "provider-defaults", "version": 1}
-            if provider_adapter is None
-            else provider_adapter,
+        execution_profile_provider_adapter_component(
+            provider_adapter,
+            process_local=provider_adapter_process_local,
+            application_versioned=provider_adapter_application_versioned,
         ),
         _available_component(
             ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
@@ -1251,6 +1246,23 @@ def build_execution_profile_identity(
             if runtime_build_provenance is None
             else runtime_build_provenance
         ),
+    )
+
+
+def execution_profile_provider_adapter_component(
+    material: Mapping[str, Any] | None,
+    *,
+    process_local: bool,
+    application_versioned: bool,
+) -> ExecutionProfileComponentIdentity:
+    """Build the same provider component for admission and live dispatch checks."""
+
+    return _available_component(
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        _aggregate_identity_strength(
+            process_local=process_local, application_versioned=application_versioned
+        ),
+        {"kind": "provider-defaults", "version": 1} if material is None else material,
     )
 
 

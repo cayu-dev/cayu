@@ -48,6 +48,7 @@ from cayu.runtime._model_errors import (
     copy_provider_exception_control,
     model_provider_error_from_payload,
 )
+from cayu.runtime._provider_stream import _owned_model_provider_events
 from cayu.tools.discovery import search_tools_spec
 from cayu.tools.gateway import call_tool_spec
 
@@ -134,6 +135,50 @@ async def test_default_clock_survives_old_idle_bound_and_expires_at_new_bound(
         assert captured.value.evidence.elapsed_s == timeout
     finally:
         controller.close()
+
+
+def test_owned_provider_stream_active_read_completion_survives_cancellation():
+    async def run():
+        active = asyncio.Event()
+        events = []
+
+        class Stream:
+            done = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.done:
+                    raise StopAsyncIteration
+                active.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.done = True
+                    return ModelStreamEvent.completed(
+                        {"usage": {"input_tokens": 1, "output_tokens": 1}}
+                    )
+
+            async def aclose(self):
+                return None
+
+        async def owner():
+            async for event in _owned_model_provider_events(
+                lambda: Stream(), cancellation_baseline=0, max_concurrent_streams=4
+            ):
+                events.append(event)
+            return events
+
+        task = asyncio.create_task(owner())
+        await active.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(events) == 1
+        assert events[0].type is ModelStreamEventType.COMPLETED
+
+    asyncio.run(run())
 
 
 @pytest.mark.anyio

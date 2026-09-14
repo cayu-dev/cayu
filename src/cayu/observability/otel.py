@@ -100,6 +100,8 @@ _TRACED_EVENT_TYPES = frozenset(
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.MODEL_ERROR,
+        EventType.MODEL_AUXILIARY_ATTEMPT_STARTED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
     }
@@ -125,8 +127,9 @@ def _import_otel(module_name: str) -> ModuleType | Any:
 class _SessionSpans:
     """Open spans for one session: the root, the in-flight model step, and tools.
 
-    Model calls and tool calls run sequentially within a session, so a single
-    ``model`` slot plus a ``tools`` dict keyed by ``tool_call_id`` is sufficient.
+    Ordinary model calls use ``model``; nested auxiliary calls have a separate
+    exact-attempt slot, since runtime admission serializes them within a session.
+    Concurrent tool spans are keyed by private ``tool_call_id``.
     Keeping spans per-session (rather than in one flat dict keyed by formatted
     strings) avoids cross-session key collisions and bounds session-end cleanup to
     that session's own spans.
@@ -140,6 +143,7 @@ class _SessionSpans:
     def __init__(self, root: Any, last_activity_ns: int) -> None:
         self.root = root
         self.model: Any | None = None
+        self.auxiliary: tuple[str, Any] | None = None
         self.tools: dict[str, Any] = {}
         self.last_activity_ns = last_activity_ns
 
@@ -152,6 +156,8 @@ class _OtelCorrelation:
     public_session_id: str
     private_tool_call_id: str | None = None
     private_parent_session_id: str | None = None
+    private_model_attempt_id: str | None = None
+    private_auxiliary_tool_call_id: str | None = None
 
 
 class OpenTelemetryEventSink(EventSink):
@@ -248,6 +254,8 @@ class OpenTelemetryEventSink(EventSink):
             public_session_id=public_event.session_id,
             private_tool_call_id=_payload_string(event, "tool_call_id"),
             private_parent_session_id=_payload_string(event, "parent_session_id"),
+            private_model_attempt_id=_payload_string(event, "model_attempt_id"),
+            private_auxiliary_tool_call_id=_auxiliary_tool_call_id(event),
         )
         await self._emit_correlated(
             public_event,
@@ -282,6 +290,11 @@ class OpenTelemetryEventSink(EventSink):
             applied = self._end_model_span(event, correlation=correlation, error=None)
         elif event_type == EventType.MODEL_ERROR:
             applied = self._end_model_span(event, correlation=correlation, error=_error_text(event))
+        elif event_type in {
+            EventType.MODEL_AUXILIARY_ATTEMPT_STARTED,
+            EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+        }:
+            applied = self._auxiliary_span(event, correlation=correlation)
         elif event_type == EventType.TOOL_CALL_STARTED:
             applied = self._start_tool_span(event, correlation=correlation)
         elif event_type == EventType.TOOL_CALL_COMPLETED:
@@ -370,6 +383,8 @@ class OpenTelemetryEventSink(EventSink):
         # time, or the orphan's last activity) so a slow/buffered sink can't skew them.
         if state.model is not None:
             self._finish(state.model, error=None, incomplete=True, end_time=end_time)
+        if state.auxiliary is not None:
+            self._finish(state.auxiliary[1], error=None, incomplete=True, end_time=end_time)
         for tool_span in state.tools.values():
             self._finish(tool_span, error=None, incomplete=True, end_time=end_time)
         self._finish(state.root, error=error, incomplete=root_incomplete, end_time=end_time)
@@ -418,6 +433,60 @@ class OpenTelemetryEventSink(EventSink):
         state.last_activity_ns = event_ns
         span = state.model
         state.model = None
+        self._set_model_result_attributes(span, event)
+        self._finish(span, error=error, end_time=event_ns)
+        return True
+
+    def _auxiliary_span(self, event: Event, *, correlation: _OtelCorrelation) -> bool:
+        state = self._sessions.get(correlation.private_session_id)
+        attempt_id = correlation.private_model_attempt_id
+        if state is None or attempt_id is None:
+            return False
+        event_ns = _event_time_ns(event)
+        if event.type == EventType.MODEL_AUXILIARY_ATTEMPT_STARTED:
+            if state.auxiliary is not None:
+                if state.auxiliary[0] == attempt_id:
+                    return True
+                self._finish(state.auxiliary[1], error=None, incomplete=True, end_time=event_ns)
+            parent = state.tools.get(correlation.private_auxiliary_tool_call_id or "", state.root)
+            span = self._tracer.start_span(
+                _span_name(_OPERATION_CHAT, event.payload.get("requested_model")),
+                context=self._trace.set_span_in_context(parent),
+                kind=self._trace.SpanKind.CLIENT,
+                start_time=event_ns,
+            )
+            span.set_attribute(GEN_AI_OPERATION_NAME, _OPERATION_CHAT)
+            span.set_attribute("cayu.model.operation", "auxiliary_inference")
+            _set_str(span, GEN_AI_PROVIDER_NAME, event.payload.get("provider_name"))
+            _set_str(span, GEN_AI_REQUEST_MODEL, event.payload.get("requested_model"))
+            _set_str(span, "cayu.model.attempt_id", event.payload.get("model_attempt_id"))
+            _set_str(span, "cayu.event.id", event.id)
+            _set_int(span, "cayu.model.attempt", event.payload.get("attempt"))
+            attribution = event.payload.get("auxiliary_inference")
+            if type(attribution) is dict:
+                for key in ("operation_id", "purpose", "tool_call_id"):
+                    _set_str(span, f"cayu.auxiliary.{key}", attribution.get(key))
+            state.auxiliary = (attempt_id, span)
+        else:
+            if state.auxiliary is None or state.auxiliary[0] != attempt_id:
+                # Recovery-only or delayed evidence cannot close a different call
+                # or manufacture the latency of work this sink never observed.
+                return False
+            span = state.auxiliary[1]
+            state.auxiliary = None
+            outcome = event.payload.get("auxiliary_outcome")
+            _set_str(span, "cayu.auxiliary.outcome", outcome)
+            _set_str(span, "cayu.auxiliary.usage_status", event.payload.get("usage_status"))
+            self._set_model_result_attributes(span, event)
+            self._finish(
+                span,
+                error=None if outcome == "completed" else "Auxiliary inference did not complete",
+                end_time=event_ns,
+            )
+        state.last_activity_ns = event_ns
+        return True
+
+    def _set_model_result_attributes(self, span: Any, event: Event) -> None:
         payload = event.payload
         # The normalized finish reason lives under "completion"; a top-level
         # "finish_reason" exists only for providers that happen to emit one.
@@ -440,8 +509,6 @@ class OpenTelemetryEventSink(EventSink):
                 _set_int(span, GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS, cache.get("write_tokens"))
         else:
             _set_str(span, GEN_AI_RESPONSE_MODEL, payload.get("model"))
-        self._finish(span, error=error, end_time=event_ns)
-        return True
 
     def _start_tool_span(self, event: Event, *, correlation: _OtelCorrelation) -> bool:
         state = self._sessions.get(correlation.private_session_id)
@@ -580,6 +647,8 @@ async def _emit_opentelemetry_delivery(
         public_session_id=public_event.session_id,
         private_tool_call_id=delivery.private_tool_call_id,
         private_parent_session_id=delivery.private_parent_session_id,
+        private_model_attempt_id=delivery.private_model_attempt_id,
+        private_auxiliary_tool_call_id=delivery.private_auxiliary_tool_call_id,
     )
     await sink._emit_correlated(
         public_event,
@@ -642,6 +711,14 @@ def _span_name(base: str, suffix: Any) -> str:
 
 def _payload_string(event: Event, key: str) -> str | None:
     value = event.payload.get(key)
+    return value if type(value) is str and value else None
+
+
+def _auxiliary_tool_call_id(event: Event) -> str | None:
+    attribution = event.payload.get("auxiliary_inference")
+    if type(attribution) is not dict:
+        return None
+    value = attribution.get("tool_call_id")
     return value if type(value) is str and value else None
 
 

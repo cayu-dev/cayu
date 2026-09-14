@@ -5,7 +5,9 @@ from decimal import Decimal
 
 import pytest
 
+from cayu.budgets.base import BudgetLimit, budget_check_from_totals, budget_check_payload
 from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost, session_cost_totals
+from cayu.budgets.usage import session_usage_summary
 from cayu.events import Event, EventType
 from cayu.runtime._cost_accounting import CostAccountingReducer, cost_group_key
 from cayu.sessions.base import EventQuery
@@ -95,12 +97,88 @@ def test_grouped_cost_reducer_matches_chronological_reference(seed, pending):
     assert totals_only.totals == actual.totals
 
 
+@pytest.mark.parametrize(
+    "outcome", ["completed", "failed", "cancelled", "timed_out", "outcome_unknown"]
+)
+@pytest.mark.parametrize("priced", [True, False])
+def test_auxiliary_accounting_preserves_usage_cost_and_separate_step_counts(outcome, priced):
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session",
+            payload={
+                "model_attempt_id": "ordinary",
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-test",
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                },
+            },
+        ),
+        Event(
+            type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+            session_id="session",
+            payload={
+                "auxiliary_outcome": outcome,
+                "model_attempt_id": "auxiliary",
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-test" if priced else "unpriced",
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "total_tokens": 10,
+                },
+            },
+        ),
+    ]
+    usage = session_usage_summary("session", events)
+    assert usage.model_steps == 1
+    assert usage.usage.total_tokens == 13
+    expected = estimate_session_cost(session_id="session", events=events, pricing=_pricing())
+    for durable, pending in ((events, []), (events[:1], events[1:]), (events, events[1:])):
+        actual = _reduce(durable, additional_events=pending)
+        assert actual.details == expected
+        assert actual.totals == session_cost_totals(expected)
+    assert expected.model_steps == 1
+    assert expected.auxiliary_attempts == 1
+    assert expected.unpriced_auxiliary_attempts == int(not priced)
+    assert [item.model_step for item in expected.line_items] == [1, 0]
+    assert [item.auxiliary_attempt for item in expected.line_items] == [False, True]
+    expected_cost = Decimal("0.00000625") + (Decimal("0.00002") if priced else Decimal(0))
+    assert expected.total_cost == expected_cost
+    check = budget_check_from_totals(
+        limit=BudgetLimit(max_estimated_cost=Decimal("1"), pricing=_pricing(), scope="session"),
+        summary=session_cost_totals(expected),
+        provider_name="openai",
+        model="gpt-test",
+    )
+    assert check.limit_reached is (not priced)
+    assert check.unpriced_model_steps == 0
+    assert check.unpriced_auxiliary_attempts == int(not priced)
+    assert budget_check_payload(check)["unpriced_auxiliary_attempts"] == int(not priced)
+
+
+def test_auxiliary_missing_usage_remains_unpriced_even_without_model_steps():
+    event = Event(type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED, session_id="session", payload={})
+    summary = estimate_session_cost(session_id="session", events=[event], pricing=_pricing())
+    assert summary.model_steps == 0
+    assert summary.auxiliary_attempts == summary.unpriced_auxiliary_attempts == 1
+    assert budget_check_from_totals(
+        limit=BudgetLimit(max_estimated_cost=Decimal("1"), pricing=_pricing()),
+        summary=summary,
+    ).limit_reached
+
+
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-def test_native_cost_snapshot_matches_reference(backend, tmp_path, request, monkeypatch):
+@pytest.mark.parametrize("auxiliary", [False, True])
+def test_native_cost_snapshot_matches_reference(backend, auxiliary, tmp_path, request, monkeypatch):
     import asyncio
     from uuid import uuid4
 
     from cayu.messages import Message
+    from cayu.runtime import CayuApp
     from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.migrations import SchemaMode
@@ -130,11 +208,29 @@ def test_native_cost_snapshot_matches_reference(backend, tmp_path, request, monk
                 events = [
                     event.model_copy(update={"session_id": session_id}) for event in _events(index)
                 ]
+                if auxiliary:
+                    events = [
+                        event.model_copy(update={"type": EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED})
+                        if event.type == EventType.MODEL_COMPLETED and position % 2 == 0
+                        else event
+                        for position, event in enumerate(events)
+                    ]
                 await store.append_events(session_id, events)
                 stored_events[session_id] = events
                 expected.append(
                     estimate_session_cost(session_id=session_id, events=events, pricing=_pricing())
                 )
+
+            app = CayuApp(session_store=store, enable_logging=False)
+            for session_id, summary in zip(sessions, expected, strict=True):
+                public_cost = await app.get_session_cost(session_id, _pricing())
+                assert public_cost.model_dump(exclude={"session_id"}) == summary.model_dump(
+                    exclude={"session_id"}
+                )
+                public_usage = await app.get_session_usage(session_id)
+                reference_usage = session_usage_summary(session_id, stored_events[session_id])
+                assert public_usage.model_steps == reference_usage.model_steps
+                assert public_usage.usage == reference_usage.usage
 
             async def forbidden(*args, **kwargs):
                 raise AssertionError("Cost snapshot must not load/query complete histories.")

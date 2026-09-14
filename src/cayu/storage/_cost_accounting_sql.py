@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from cayu.runtime._cost_accounting import CostGroupKey
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
 
-COST_EVENT_PREDICATE = "cayu_events.event_type IN ('model.completed', 'model.hosted_tool_call')"
+COST_EVENT_PREDICATE = "cayu_events.event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call')"
 COST_ATTEMPT_INDEX_PREFIX = 128
 
 
@@ -46,7 +46,7 @@ def cost_group_statement(
         "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
         f"{where_sql} AND {COST_EVENT_PREDICATE}) AS cost_rows ORDER BY session_id COLLATE {collation}, "
         f"(cost_attempt IS NOT NULL), COALESCE(cost_attempt, event_id) COLLATE {collation}, "
-        "event_type DESC, sequence",
+        "CASE WHEN event_type = 'model.hosted_tool_call' THEN 0 ELSE 1 END, sequence",
         params,
     )
 
@@ -90,7 +90,7 @@ def cost_group_lookup_statement(
         f"SELECT {columns} FROM {source} "
         "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
         f"{plan.where_sql} AND {COST_EVENT_PREDICATE} AND {predicate} "
-        "ORDER BY cayu_events.event_type DESC, cayu_events.sequence",
+        "ORDER BY CASE WHEN cayu_events.event_type = 'model.hosted_tool_call' THEN 0 ELSE 1 END, cayu_events.sequence",
         params,
     )
 

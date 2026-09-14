@@ -26,6 +26,7 @@ from cayu import (
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime.execution_profiles import ExecutionProfileComponentClass
 from cayu.tools.catalogue import mcp_source_tool_fingerprint
+from cayu.tools.inference import AuxiliaryInferencePolicy, InferenceLimits
 
 
 def _descriptor(
@@ -93,6 +94,47 @@ def _profile(app: CayuApp):
     )
 
 
+@pytest.mark.parametrize(
+    "change",
+    [None, "purposes", *InferenceLimits.model_fields],
+)
+def test_registered_inference_policy_changes_catalogue_and_profile(change):
+    limits = InferenceLimits(max_input_tokens=100, max_output_tokens=50, timeout_seconds=10)
+    original = AuxiliaryInferencePolicy(limits=limits, purposes=("tool.summary",))
+    if change is None:
+        replacement = None
+    elif change == "purposes":
+        replacement = AuxiliaryInferencePolicy(limits=limits, purposes=("tool.extract",))
+    else:
+        replacement = AuxiliaryInferencePolicy(
+            limits=InferenceLimits(**{**limits.model_dump(), change: getattr(limits, change) + 1}),
+            purposes=original.purposes,
+        )
+    apps = []
+    for policy in (original, replacement):
+        tool = _DeclaredTool("summarize")
+        tool.spec = tool.spec.model_copy(update={"auxiliary_inference": policy})
+        app = CayuApp(enable_logging=False)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=(tool,))
+        apps.append(app)
+    first, second = apps
+    assert (
+        first._agents["assistant"].tool_catalogue.revision
+        != second._agents["assistant"].tool_catalogue.revision
+    )
+    assert _profile(first).component(ExecutionProfileComponentClass.DIRECT_TOOLS) != _profile(
+        second
+    ).component(ExecutionProfileComponentClass.DIRECT_TOOLS)
+    registered = first._agents["assistant"].tools["summarize"]
+    assert registered.auxiliary_inference == original
+    assert registered.auxiliary_inference is not original
+    profile_before = _profile(first)
+    object.__setattr__(original.limits, "max_output_tokens", 999)
+    registered.tool.spec = ToolSpec(name="summarize")
+    assert registered.auxiliary_inference.limits.max_output_tokens == 50
+    assert _profile(first) == profile_before
+
+
 def test_descriptor_owns_schema_and_revalidates_derived_identity() -> None:
     schema = {
         "type": "object",
@@ -158,6 +200,30 @@ def test_descriptor_version_covers_callable_contract_but_not_implementation_iden
     assert _profile(first).component(
         ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS
     ) != _profile(second).component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS)
+
+
+def test_descriptor_inference_policy_reconstructs_and_cannot_change_under_same_version():
+    policy = AuxiliaryInferencePolicy(
+        limits=InferenceLimits(max_input_tokens=100, max_output_tokens=50, timeout_seconds=10),
+        purposes=("tool.summary",),
+    )
+    descriptor = build_tool_descriptor(
+        name="summarize",
+        description="Summarize using managed inference.",
+        input_schema={},
+        parallel_safe=True,
+        effect=ToolEffect.NONE,
+        publishes_arguments=True,
+        workspace_mutation=False,
+        auxiliary_inference=policy,
+    )
+    reconstructed = ToolDescriptor.model_validate_json(descriptor.model_dump_json())
+    assert reconstructed == descriptor
+    assert reconstructed.auxiliary_inference is not descriptor.auxiliary_inference
+    changed = descriptor.model_dump(mode="json")
+    changed["auxiliary_inference"]["limits"]["max_output_tokens"] += 1
+    with pytest.raises(ValueError, match="version does not match"):
+        ToolDescriptor.model_validate(changed)
 
 
 def test_mcp_descriptor_identity_is_bounded_and_does_not_retain_source_name() -> None:

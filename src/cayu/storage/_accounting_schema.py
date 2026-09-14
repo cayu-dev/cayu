@@ -3,10 +3,11 @@
 SQLITE_ACCOUNTING_DDL = """
 CREATE INDEX IF NOT EXISTS idx_cayu_events_cost_attempt
 ON cayu_events(session_id COLLATE BINARY,
-    substr(json_extract(payload_json, '$.model_attempt_id'), 1, 128), event_type DESC, sequence)
-WHERE event_type IN ('model.completed', 'model.hosted_tool_call');
+    substr(json_extract(payload_json, '$.model_attempt_id'), 1, 128),
+    CASE WHEN event_type = 'model.hosted_tool_call' THEN 0 ELSE 1 END, sequence)
+WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call');
 CREATE INDEX IF NOT EXISTS idx_cayu_events_cost_sequence ON cayu_events(sequence)
-WHERE event_type IN ('model.completed', 'model.hosted_tool_call');
+WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call');
 CREATE TABLE IF NOT EXISTS cayu_accounting_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     generation INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9007199254740991)
@@ -14,7 +15,7 @@ CREATE TABLE IF NOT EXISTS cayu_accounting_state (
 INSERT OR IGNORE INTO cayu_accounting_state(singleton, generation) VALUES (1, 0);
 CREATE TRIGGER IF NOT EXISTS cayu_accounting_delete_generation
 AFTER DELETE ON cayu_events
-WHEN OLD.event_type IN ('model.completed', 'model.hosted_tool_call', 'tool.call.started')
+WHEN OLD.event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call', 'tool.call.started')
 BEGIN
     UPDATE cayu_accounting_state SET generation = generation + 1 WHERE singleton = 1;
 END;
@@ -23,10 +24,11 @@ END;
 POSTGRES_ACCOUNTING_DDL: tuple[str, ...] = (
     """CREATE INDEX IF NOT EXISTS idx_cayu_events_cost_attempt
     ON cayu_events(session_id COLLATE "C",
-        (left(event -> 'payload' ->> 'model_attempt_id', 128)) COLLATE "C", event_type DESC, sequence)
-    WHERE event_type IN ('model.completed', 'model.hosted_tool_call')""",
+        (left(event -> 'payload' ->> 'model_attempt_id', 128)) COLLATE "C",
+        (CASE WHEN event_type = 'model.hosted_tool_call' THEN 0 ELSE 1 END), sequence)
+    WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call')""",
     """CREATE INDEX IF NOT EXISTS idx_cayu_events_cost_sequence ON cayu_events(sequence)
-    WHERE event_type IN ('model.completed', 'model.hosted_tool_call')""",
+    WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call')""",
     """CREATE TABLE IF NOT EXISTS cayu_accounting_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         generation BIGINT NOT NULL CHECK (generation BETWEEN 0 AND 9007199254740991)
@@ -36,7 +38,7 @@ POSTGRES_ACCOUNTING_DDL: tuple[str, ...] = (
     RETURNS TRIGGER LANGUAGE plpgsql AS $cayu_accounting$
     BEGIN
         IF EXISTS (SELECT 1 FROM cayu_removed_accounting_events
-                   WHERE event_type IN ('model.completed', 'model.hosted_tool_call', 'tool.call.started')) THEN
+                   WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call', 'tool.call.started')) THEN
             UPDATE cayu_accounting_state SET generation = generation + 1 WHERE singleton = 1;
         END IF;
         RETURN NULL;
@@ -46,4 +48,19 @@ POSTGRES_ACCOUNTING_DDL: tuple[str, ...] = (
     """CREATE TRIGGER cayu_accounting_delete_generation AFTER DELETE ON cayu_events
     REFERENCING OLD TABLE AS cayu_removed_accounting_events
     FOR EACH STATEMENT EXECUTE FUNCTION cayu_advance_accounting_generation()""",
+)
+
+# Rebuild filtered indexes and deletion invalidation before admitting new writers.
+SQLITE_AUXILIARY_ACCOUNTING_DDL = (
+    "DROP INDEX IF EXISTS idx_cayu_events_cost_attempt;\n"
+    "DROP INDEX IF EXISTS idx_cayu_events_cost_sequence;\n"
+    "DROP TRIGGER IF EXISTS cayu_accounting_delete_generation;\n"
+    + SQLITE_ACCOUNTING_DDL
+    + "UPDATE cayu_accounting_state SET generation = generation + 1 WHERE singleton = 1;"
+)
+POSTGRES_AUXILIARY_ACCOUNTING_DDL = (
+    "DROP INDEX IF EXISTS idx_cayu_events_cost_attempt",
+    "DROP INDEX IF EXISTS idx_cayu_events_cost_sequence",
+    *POSTGRES_ACCOUNTING_DDL,
+    "UPDATE cayu_accounting_state SET generation = generation + 1 WHERE singleton = 1",
 )

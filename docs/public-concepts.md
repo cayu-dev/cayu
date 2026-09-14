@@ -74,6 +74,11 @@ For example, `sessions/base.py` owns `RunRequest` and `SessionStore`,
 More specific modules own the rest: `tasks/worker.py`, `budgets/pricing.py`,
 `approvals/review.py`, `memory/relevance.py`, and `delivery/github.py`.
 
+`tools/inference.py` owns the optional tool inference capability contracts:
+`AuxiliaryInferencePolicy`, `InferenceLimits`, and `InferenceInvoker`. Import them
+from `cayu.tools` (or the root API). `providers/response.py` owns the detached
+`ModelResponse`; private runtime modules coordinate invocation and accounting.
+
 The workspace branch/checkpoint contracts retain `workspaces/branches.py` and
 `workspaces/checkpoints.py`. Their application lifecycle implementations live
 separately in `workspaces/branch_lifecycle.py` and `workspaces/checkpoint_lifecycle.py`.

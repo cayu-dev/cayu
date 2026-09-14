@@ -2754,6 +2754,7 @@ def test_server_exposes_session_usage_summary() -> None:
         "session_id": "usage_1",
         "model_steps": 1,
         "tool_calls": 0,
+        "unmeasured_model_attempts": 0,
         "provider_names": ["fake"],
         "models": ["fake-model"],
         "usage": _aggregate_usage_json(
@@ -3454,10 +3455,11 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
     assert body["provider_breakdown"]["groups"][0]["provider_name"] == "fake"
     assert body["cost"]["accuracy"]["kind"] == "exact"
     assert body["cost"]["currencies"] == [
-        {"currency": "USD", "model_steps": "1", "total_cost": "1"}
+        {"currency": "USD", "model_steps": "1", "auxiliary_attempts": "0", "total_cost": "1"}
     ]
     assert body["cost"]["billing_breakdown"] == {
         "identified_model_steps": "0",
+        "identified_auxiliary_attempts": "0",
         "groups": [],
         "remainder": None,
         "accuracy": {"kind": "exact", "limit": None, "reason": None},
@@ -3486,7 +3488,17 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
                     "priced_model_steps": "1",
                     "unpriced_model_steps": "0",
                     "unevaluated_model_steps": "0",
-                    "currencies": [{"currency": "USD", "model_steps": "1", "total_cost": "1"}],
+                    "evaluated_auxiliary_attempts": "0",
+                    "priced_auxiliary_attempts": "0",
+                    "unpriced_auxiliary_attempts": "0",
+                    "currencies": [
+                        {
+                            "currency": "USD",
+                            "model_steps": "1",
+                            "auxiliary_attempts": "0",
+                            "total_cost": "1",
+                        }
+                    ],
                     "unpriced_reasons": [],
                 },
             }
@@ -5889,6 +5901,8 @@ def test_server_exposes_session_cost_estimate() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "session_id": "cost_1",
+        "auxiliary_attempts": 0,
+        "unpriced_auxiliary_attempts": 0,
         "currency": "USD",
         "model_steps": 1,
         "priced_model_steps": 1,
@@ -5900,6 +5914,7 @@ def test_server_exposes_session_cost_estimate() -> None:
         "line_items": [
             {
                 "model_step": 1,
+                "auxiliary_attempt": False,
                 "execution_profile_fingerprint": completed.payload["execution_profile_fingerprint"],
                 "provider_name": "fake",
                 "model": "fake-model",
@@ -6142,6 +6157,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
         "session_count": 2,
         "model_steps": 2,
         "tool_calls": 0,
+        "unmeasured_model_attempts": 0,
         "provider_names": ["fake"],
         "models": ["fake-model"],
         "usage": _aggregate_usage_json(
@@ -6157,6 +6173,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
                 "session_id": "causal_parent",
                 "model_steps": 1,
                 "tool_calls": 0,
+                "unmeasured_model_attempts": 0,
                 "provider_names": ["fake"],
                 "models": ["fake-model"],
                 "usage": _aggregate_usage_json(
@@ -6172,6 +6189,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
                 "session_id": "causal_child",
                 "model_steps": 1,
                 "tool_calls": 0,
+                "unmeasured_model_attempts": 0,
                 "provider_names": ["fake"],
                 "models": ["fake-model"],
                 "usage": _aggregate_usage_json(
@@ -6433,6 +6451,7 @@ def test_server_exposes_session_summary() -> None:
         "session_id": "summary_1",
         "model_steps": 1,
         "tool_calls": 0,
+        "unmeasured_model_attempts": 0,
         "provider_names": ["fake"],
         "models": ["fake-model"],
         "usage": _aggregate_usage_json(

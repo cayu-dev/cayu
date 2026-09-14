@@ -114,7 +114,7 @@ usage_events AS MATERIALIZED (
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
       AND event.event_type IN (
-          'model.completed', 'tool.call.started', 'model.hosted_tool_call'
+          'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
 ),
 overall AS (
@@ -125,27 +125,27 @@ overall AS (
             WHERE event_type = 'model.completed' AND has_usage = 1
         ) AS model_steps_with_usage,
         COUNT(*) FILTER (WHERE event_type = 'tool.call.started') AS tool_calls,
-        COALESCE(SUM(input_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(input_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS input_tokens,
-        COALESCE(SUM(output_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(output_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS output_tokens,
-        COALESCE(SUM(total_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(total_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS total_tokens,
-        COALESCE(SUM(reasoning_output_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(reasoning_output_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS reasoning_output_tokens,
-        COALESCE(SUM(cache_read_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(cache_read_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS cache_read_tokens,
-        COALESCE(SUM(cache_write_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(cache_write_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS cache_write_tokens,
-        COALESCE(SUM(cache_write_5m_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(cache_write_5m_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS cache_write_5m_tokens,
-        COALESCE(SUM(cache_write_1h_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(cache_write_1h_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS cache_write_1h_tokens,
-        COALESCE(SUM(cache_write_unknown_ttl_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(cache_write_unknown_ttl_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS cache_write_unknown_ttl_tokens,
-        COALESCE(SUM(cached_input_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(cached_input_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS cached_input_tokens,
-        COALESCE(SUM(uncached_input_tokens) FILTER (WHERE event_type = 'model.completed'), 0)
+        COALESCE(SUM(uncached_input_tokens) FILTER (WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')), 0)
             AS uncached_input_tokens,
         COALESCE(SUM(web_search_calls), 0) AS web_search_calls,
         COALESCE(SUM(web_search_outcome_unknown), 0) AS web_search_outcome_unknown
@@ -173,7 +173,7 @@ provider_grouped AS (
         SUM(web_search_calls) AS web_search_calls,
         SUM(web_search_outcome_unknown) AS web_search_outcome_unknown
     FROM usage_events
-    WHERE event_type = 'model.completed'
+    WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
        OR web_search_calls > 0
        OR web_search_outcome_unknown > 0
     GROUP BY provider_name
@@ -212,7 +212,7 @@ provider_remainder AS (
     FROM usage_events AS event
     JOIN provider_ranked AS ranked
       ON event.provider_name IS NOT DISTINCT FROM ranked.provider_name
-    WHERE (event.event_type = 'model.completed'
+    WHERE (event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
            OR event.web_search_calls > 0
            OR event.web_search_outcome_unknown > 0)
       AND ranked.group_rank > (SELECT group_limit FROM scope)
@@ -241,7 +241,7 @@ model_grouped AS (
         SUM(web_search_calls) AS web_search_calls,
         SUM(web_search_outcome_unknown) AS web_search_outcome_unknown
     FROM usage_events
-    WHERE event_type = 'model.completed'
+    WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
        OR web_search_calls > 0
        OR web_search_outcome_unknown > 0
     GROUP BY provider_name, model
@@ -281,7 +281,7 @@ model_remainder AS (
     JOIN model_ranked AS ranked
       ON event.provider_name IS NOT DISTINCT FROM ranked.provider_name
      AND event.model IS NOT DISTINCT FROM ranked.model
-    WHERE (event.event_type = 'model.completed'
+    WHERE (event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
            OR event.web_search_calls > 0
            OR event.web_search_outcome_unknown > 0)
       AND ranked.group_rank > (SELECT group_limit FROM scope)
@@ -380,8 +380,11 @@ pricing_candidates AS (
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
+      AND event.event_type IN (
+          'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
+      )
       AND (
-          event.event_type = 'model.completed'
+          event.event_type != 'model.hosted_tool_call'
           OR (
               event.event_type = 'model.hosted_tool_call'
               AND event.payload ->> 'tool_type' = 'web_search'
@@ -462,8 +465,11 @@ pricing_candidates AS (
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
+      AND event.event_type IN (
+          'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
+      )
       AND (
-          event.event_type = 'model.completed'
+          event.event_type != 'model.hosted_tool_call'
           OR (
               event.event_type = 'model.hosted_tool_call'
               AND event.payload ->> 'tool_type' = 'web_search'
@@ -567,7 +573,7 @@ usage_events AS MATERIALIZED (
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
       AND event.event_type IN (
-          'model.completed', 'tool.call.started', 'model.hosted_tool_call'
+          'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
 ),
 session_grouped AS (
@@ -582,37 +588,37 @@ session_grouped AS (
         ) AS model_steps_with_usage,
         COUNT(*) FILTER (WHERE event.event_type = 'tool.call.started') AS tool_calls,
         COALESCE(SUM(input_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS input_tokens,
         COALESCE(SUM(output_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS output_tokens,
         COALESCE(SUM(total_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS total_tokens,
         COALESCE(SUM(reasoning_output_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS reasoning_output_tokens,
         COALESCE(SUM(cache_read_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS cache_read_tokens,
         COALESCE(SUM(cache_write_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS cache_write_tokens,
         COALESCE(SUM(cache_write_5m_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS cache_write_5m_tokens,
         COALESCE(SUM(cache_write_1h_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS cache_write_1h_tokens,
         COALESCE(SUM(cache_write_unknown_ttl_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS cache_write_unknown_ttl_tokens,
         COALESCE(SUM(cached_input_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS cached_input_tokens,
         COALESCE(SUM(uncached_input_tokens) FILTER (
-            WHERE event.event_type = 'model.completed'
+            WHERE event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
         ), 0) AS uncached_input_tokens,
         COALESCE(SUM(web_search_calls), 0) AS web_search_calls,
         COALESCE(SUM(web_search_outcome_unknown), 0) AS web_search_outcome_unknown
@@ -1010,7 +1016,7 @@ def _postgres_usage_metrics_projection() -> str:
                         THEN 1 ELSE 0 END
                 )
             )
-            WHEN event.event_type = 'model.completed'
+            WHEN event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
              AND event.payload -> 'usage_normalization_failed'
                      IS DISTINCT FROM 'true'::jsonb
              AND jsonb_typeof({metrics}) = 'object'

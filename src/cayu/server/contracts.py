@@ -23,7 +23,11 @@ from pydantic import (
 )
 
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
-from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar_text
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    json_utf8_size_within_limit,
+    require_unicode_scalar_text,
+)
 from cayu.budgets.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -2210,6 +2214,7 @@ class AggregateUsageSummary(ApiBaseModel):
     session_ids: list[str]
     session_count: StrictInt = Field(ge=0)
     model_steps: StrictInt = Field(ge=0)
+    unmeasured_model_attempts: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     tool_calls: StrictInt = Field(ge=0)
     provider_names: list[str]
     models: list[str]
@@ -2232,6 +2237,8 @@ class AggregateCostSummary(ApiBaseModel):
     model_steps: StrictInt = Field(ge=0)
     priced_model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
+    auxiliary_attempts: StrictInt = Field(default=0, ge=0)
+    unpriced_auxiliary_attempts: StrictInt = Field(default=0, ge=0)
     missing_usage_model_steps: StrictInt = Field(default=0, ge=0)
     missing_pricing_model_steps: StrictInt = Field(default=0, ge=0)
     unsupported_pricing_model_steps: StrictInt = Field(default=0, ge=0)

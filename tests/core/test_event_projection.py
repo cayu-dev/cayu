@@ -265,6 +265,115 @@ class _RecordingSink(EventSink):
         self.events.append(event.model_copy(deep=True))
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.MODEL_AUXILIARY_ATTEMPT_STARTED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+    ],
+)
+def test_auxiliary_event_attribution_requires_private_provenance(event_type) -> None:
+    from cayu.runtime._auxiliary_inference_contract import AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS
+
+    secret = "auxiliary-parent-canary"
+    redactor = SecretRedactor(secret)
+    event = Event(
+        type=event_type,
+        session_id="session",
+        payload={
+            "attempt": 1,
+            "auxiliary_inference": {
+                "operation_id": f"operation-{secret}",
+                "purpose": "tool.summary",
+                "tool_call_id": f"tool-{secret}",
+                "parent": {
+                    "model_step_id": f"step-{secret}",
+                    "model_attempt_id": f"attempt-{secret}",
+                    "tool_round_id": f"round-{secret}",
+                },
+            },
+        },
+    )
+    policy = EVENT_PAYLOAD_POLICIES[event_type]
+    assert set(AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS) <= policy.nested_authority_paths
+    with pytest.raises(ValueError):
+        prepare_new_runtime_event(event, redactor=redactor)
+    trusted = event_with_runtime_nested_payload_authority(
+        event, *AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS
+    )
+    prepared = prepare_new_runtime_event(trusted, redactor=redactor)
+    assert prepared.payload == event.payload
+    # Serialization does not authenticate identical caller-controlled values.
+    reconstructed_raw = Event.model_validate_json(trusted.model_dump_json())
+    with pytest.raises(ValueError):
+        prepare_new_runtime_event(reconstructed_raw, redactor=redactor)
+    public = project_runtime_event(prepared, sequence=1, redactor=redactor)
+    assert secret not in public.model_dump_json()
+    assert public.payload["auxiliary_inference"]["purpose"] == "tool.summary"
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.BUDGET_RESERVATION_FAILED,
+        EventType.BUDGET_RESERVED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ],
+)
+def test_budget_auxiliary_counter_is_owned_schema(event_type) -> None:
+    payload = {"cost_summary": {"auxiliary_attempts": 2, "unpriced_auxiliary_attempts": 1}}
+    if "unpriced_auxiliary_attempts" in EVENT_PAYLOAD_POLICIES[event_type].owned_keys:
+        payload["unpriced_auxiliary_attempts"] = 1
+    if "usage_summary" in EVENT_PAYLOAD_POLICIES[event_type].owned_keys:
+        payload["usage_summary"] = {"unmeasured_model_attempts": 1}
+    event = Event(
+        type=event_type,
+        session_id="session",
+        payload=payload,
+    )
+    redactor = SecretRedactor(
+        ("auxiliary_attempts", "unpriced_auxiliary_attempts", "unmeasured_model_attempts")
+    )
+    prepared = prepare_new_runtime_event(event, redactor=redactor)
+    public = project_runtime_event(prepared, sequence=1, redactor=redactor)
+    assert public.payload == payload
+    unsafe = event.model_copy(deep=True)
+    unsafe.payload["cost_summary"]["caller-unpriced_auxiliary_attempts"] = 1
+    with pytest.raises(ValueError, match="object key"):
+        prepare_new_runtime_event(unsafe, redactor=redactor)
+
+
+def test_auxiliary_fixed_outcomes_and_usage_schema_survive_secret_key_collisions() -> None:
+    from typing import get_args
+
+    from cayu.runtime._auxiliary_inference_contract import (
+        AuxiliaryInferenceOutcome,
+        AuxiliaryInferenceUsageStatus,
+    )
+    from cayu.runtime.retry_policy import RetryDecision
+
+    for outcome in get_args(AuxiliaryInferenceOutcome):
+        for status in get_args(AuxiliaryInferenceUsageStatus):
+            event = Event(
+                type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                session_id="session",
+                payload={
+                    "auxiliary_outcome": outcome,
+                    "usage_status": status,
+                    "usage_metrics": {"input_tokens": 2, "output_tokens": 1},
+                    "retry_decision": RetryDecision(
+                        retry=False, attempt=1, max_attempts=1, effective_max_attempts=1
+                    ).model_dump(mode="json"),
+                },
+            )
+            redactor = SecretRedactor((outcome, status, "usage_metrics", "input_tokens"))
+            prepared = prepare_new_runtime_event(event, redactor=redactor)
+            assert prepared.payload == event.payload
+
+
 def test_event_payload_policies_cover_every_exact_builtin_type() -> None:
     assert set(EVENT_PAYLOAD_POLICIES) == set(EventType)
     assert "step" in EVENT_PAYLOAD_POLICIES[EventType.MODEL_STARTED].owned_keys

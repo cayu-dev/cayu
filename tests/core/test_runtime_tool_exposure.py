@@ -86,6 +86,7 @@ from cayu.tools.exposure import (
     ToolExposurePolicy,
     ToolExposurePolicyRequest,
 )
+from cayu.tools.inference import AuxiliaryInferencePolicy, InferenceLimits
 from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,
@@ -98,7 +99,9 @@ from cayu.vaults.static import StaticVault
 
 
 class _RecordingTool(Tool):
-    def __init__(self, name: str, *, workspace_mutation: bool = False) -> None:
+    def __init__(
+        self, name: str, *, workspace_mutation: bool = False, auxiliary_inference: bool = False
+    ) -> None:
         self.spec = ToolSpec(
             name=name,
             description=f"Run {name}.",
@@ -108,6 +111,16 @@ class _RecordingTool(Tool):
             },
             parallel_safe=not workspace_mutation,
             workspace_mutation=workspace_mutation,
+            auxiliary_inference=(
+                AuxiliaryInferencePolicy(
+                    limits=InferenceLimits(
+                        max_input_tokens=10, max_output_tokens=10, timeout_seconds=10
+                    ),
+                    purposes=("tool.summary",),
+                )
+                if auxiliary_inference
+                else None
+            ),
         )
         super().__init__()
         self.calls: list[dict] = []
@@ -1177,7 +1190,8 @@ def test_unexposed_registered_call_is_blocked_before_policy_hooks_and_tool(
     assert public_blocked.payload["exposure_fingerprint"] == blocked.payload["exposure_fingerprint"]
 
 
-def test_unexposed_sibling_stays_blocked_across_approval_pause() -> None:
+@pytest.mark.parametrize("auxiliary_inference", [False, True])
+def test_unexposed_sibling_stays_blocked_across_approval_pause(auxiliary_inference: bool) -> None:
     provider = _ScriptedProvider(
         [
             [
@@ -1200,7 +1214,7 @@ def test_unexposed_sibling_stays_blocked_across_approval_pause() -> None:
         ]
     )
     visible = _RecordingTool("visible")
-    hidden = _RecordingTool("hidden")
+    hidden = _RecordingTool("hidden", auxiliary_inference=auxiliary_inference)
     policy = _RecordingApprovalPolicy()
     exposure_policy = _PreviousProfileExposurePolicy(
         first_profile_id="visible-only",
@@ -1279,6 +1293,11 @@ def test_unexposed_sibling_stays_blocked_across_approval_pause() -> None:
     session = asyncio.run(app.session_store.load("unexposed-approval-sibling"))
     assert session is not None
     assert session.tool_capability_ceiling == ceiling
+    assert not any(
+        event.type
+        in {EventType.MODEL_AUXILIARY_ATTEMPT_STARTED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}
+        for event in pause_events + resume_events
+    )
 
 
 async def _collect_approval(
@@ -1295,7 +1314,8 @@ async def _collect_user_input(
     return [event async for event in app.resolve_user_input(response)]
 
 
-def test_unexposed_sibling_stays_blocked_across_user_input_pause() -> None:
+@pytest.mark.parametrize("auxiliary_inference", [False, True])
+def test_unexposed_sibling_stays_blocked_across_user_input_pause(auxiliary_inference: bool) -> None:
     provider = _ScriptedProvider(
         [
             [
@@ -1317,7 +1337,7 @@ def test_unexposed_sibling_stays_blocked_across_user_input_pause() -> None:
             ],
         ]
     )
-    hidden = _RecordingTool("hidden")
+    hidden = _RecordingTool("hidden", auxiliary_inference=auxiliary_inference)
     exposure_policy = _PreviousProfileExposurePolicy(
         first_profile_id="input-only",
         first_tools=("ask_user",),
@@ -1372,6 +1392,11 @@ def test_unexposed_sibling_stays_blocked_across_user_input_pause() -> None:
     session = asyncio.run(app.session_store.load("unexposed-input-sibling"))
     assert session is not None
     assert session.tool_capability_ceiling == ceiling
+    assert not any(
+        event.type
+        in {EventType.MODEL_AUXILIARY_ATTEMPT_STARTED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}
+        for event in pause_events + resume_events
+    )
 
 
 def test_unexposed_call_stays_blocked_during_ordinary_tool_round_recovery() -> None:

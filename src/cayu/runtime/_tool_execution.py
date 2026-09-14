@@ -19,6 +19,7 @@ from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
 from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope
 from cayu.runtime._durable_subagents import (
     durable_subagent_committed_cancellation_outcome,
     durable_subagent_unsettled_cancellation_outcome,
@@ -418,6 +419,7 @@ async def run_tool(
     timeout_seconds: float | None = None,
     before_dispatch: Callable[[], Awaitable[None]] | None = None,
     reconcile_result: Callable[[], Awaitable[ToolResult | None]] | None = None,
+    inference_scope: AuxiliaryInferenceScope | None = None,
 ) -> ToolExecutionOutcome:
     """Execute one tool and seal its evolving secret scope before publication."""
 
@@ -438,6 +440,7 @@ async def run_tool(
             registered_execution_contract=registered_execution_contract,
             timeout_seconds=timeout_seconds,
             before_dispatch=before_dispatch,
+            inference_scope=inference_scope,
         )
         # Runtime-owned reconciliation cannot erase timeout, policy, invalid-output,
         # or uncertain-effect controls. Its replacement follows normal validation
@@ -479,6 +482,7 @@ async def _run_tool(
     registered_execution_contract: dict[str, Any] | None,
     timeout_seconds: float | None,
     before_dispatch: Callable[[], Awaitable[None]] | None,
+    inference_scope: AuxiliaryInferenceScope | None,
 ) -> ToolExecutionOutcome:
     timer: _ToolTimeoutOwner | None = None
     grouped_failure: BaseExceptionGroup | None = None
@@ -499,6 +503,9 @@ async def _run_tool(
                     raise ToolDispatchAdmissionRefusal(refusal, owner=dispatch_owner) from None
             current_execution_deadline().require_admission("tool")
             if type(tool) is not ProcessIsolatedTool:
+                if inference_scope is not None:
+                    async with inference_scope.lifetime():
+                        return await tool.run(ctx, arguments)
                 return await tool.run(ctx, arguments)
             if registered_schema is None:
                 raise IsolatedToolPreDispatchFailure("registered_schema_missing")

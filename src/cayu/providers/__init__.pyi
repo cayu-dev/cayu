@@ -10,6 +10,9 @@ from cayu.providers.anthropic import HttpxAnthropicTransport as HttpxAnthropicTr
 from cayu.providers.anthropic import anthropic_response_events as anthropic_response_events
 from cayu.providers.anthropic import anthropic_stream_events as anthropic_stream_events
 from cayu.providers.anthropic import build_anthropic_payload as build_anthropic_payload
+from cayu.providers.base import (
+    AuxiliaryInferenceUnsupportedError as AuxiliaryInferenceUnsupportedError,
+)
 from cayu.providers.base import InputTokenCountConfidence as InputTokenCountConfidence
 from cayu.providers.base import InputTokenCountMethod as InputTokenCountMethod
 from cayu.providers.base import InputTokenCountResult as InputTokenCountResult
@@ -152,6 +155,7 @@ from cayu.providers.operations import (
     copy_provider_operation_snapshot as copy_provider_operation_snapshot,
 )
 from cayu.providers.operations import copy_provider_operation_state as copy_provider_operation_state
+from cayu.providers.response import ModelResponse as ModelResponse
 from cayu.providers.vertex import HttpxVertexTransport as HttpxVertexTransport
 from cayu.providers.vertex import VertexAPIError as VertexAPIError
 from cayu.providers.vertex import VertexContextOverflowError as VertexContextOverflowError

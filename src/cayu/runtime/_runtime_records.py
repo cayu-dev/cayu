@@ -35,6 +35,7 @@ from cayu.tools.grants import (
     ResolvedTargetedToolInvocation,
     validate_targeted_tool_digest,
 )
+from cayu.tools.inference import AuxiliaryInferencePolicy
 from cayu.tools.policy import ToolPolicy, ToolPolicyResult
 from cayu.tools.targeted_projection import TargetedToolMode
 
@@ -116,6 +117,7 @@ class RegisteredTool:
     command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool
     execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
+    auxiliary_inference: AuxiliaryInferencePolicy | None = None
     retain_arguments_for_model: bool = False
     child_session_recovery: ChildSessionRecoveryMatcher | None = None
     durable_tool_recovery: DurableToolRecovery | None = None

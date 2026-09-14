@@ -402,6 +402,18 @@ EXACT_MODEL_STREAM_RECOVERY_DISPOSITION = "reattach_exact_operation"
 ModelStreamRecoveryDisposition = Literal["manual_settlement_required", "reattach_exact_operation"]
 
 
+class AuxiliaryInferenceUnsupportedError(ModelProviderError):
+    """The registered adapter cannot safely prepare managed auxiliary inference."""
+
+    def __init__(self, *, provider: str) -> None:
+        super().__init__(
+            "Provider does not support this managed auxiliary inference request.",
+            provider=provider,
+            error_type="auxiliary_inference_unsupported",
+            retryable=False,
+        )
+
+
 class ModelStreamDeadlineError(ModelProviderError):
     """Typed content-free expiry of one dispatched model stream."""
 
@@ -1288,6 +1300,23 @@ def _optional_payload_boolean(payload: dict[str, Any], key: str) -> bool | None:
     return value
 
 
+def _copy_auxiliary_request(request: ModelRequest) -> ModelRequest:
+    """Reject tool authority before any nested projection serializer can run."""
+
+    if type(request) is not ModelRequest:
+        raise TypeError("Auxiliary inference requires a ModelRequest.")
+    if (
+        type(request.tools) is not list
+        or len(request.tools) != 0
+        or type(request.hosted_tools) is not tuple
+        or len(request.hosted_tools) != 0
+        or request.targeted_tool_projection is not None
+        or request.tool_discovery_projection is not None
+    ):
+        raise ValueError("Auxiliary requests cannot supply tools or projections.")
+    return ModelRequest(**{name: getattr(request, name) for name in ModelRequest.model_fields})
+
+
 class ModelProvider(ABC):
     """Normalizes provider-specific model streams."""
 
@@ -1307,6 +1336,48 @@ class ModelProvider(ABC):
     ``json_schema`` response format). The runtime rejects ``NATIVE`` specs
     before running when the resolved provider does not set this.
     """
+
+    def prepare_auxiliary_request(
+        self, request: ModelRequest, *, max_output_tokens: int
+    ) -> ModelRequest:
+        """Prepare one bounded request without dispatch, credentials, or I/O.
+
+        Supporting adapters return a detached request with their native output
+        token cap. They must preserve model/messages, reject tools and raw
+        options, and must not hide additional provider dispatches. Transparent
+        wrappers delegate this hook. Default unsupported keeps ordinary custom
+        providers usable without granting them managed inference capability.
+        """
+
+        raise AuxiliaryInferenceUnsupportedError(provider=self.name)
+
+    def _prepare_auxiliary_request(
+        self,
+        request: ModelRequest,
+        *,
+        max_output_tokens: int,
+        output_option_path: tuple[str, ...],
+    ) -> ModelRequest:
+        """Shared preparation for bundled synchronous, one-dispatch adapters."""
+
+        if self.provider_operation_mode is not ProviderOperationMode.SYNCHRONOUS:
+            raise AuxiliaryInferenceUnsupportedError(provider=self.name)
+        if (
+            type(max_output_tokens) is not int
+            or not 0 < max_output_tokens <= MAX_DURABLE_JSON_INTEGER
+        ):
+            raise ValueError("Auxiliary output token limit must be a positive durable integer.")
+        copied = _copy_auxiliary_request(request)
+        if copied.options:
+            raise ValueError("Auxiliary requests cannot supply tools, projections, or raw options.")
+        options: dict[str, Any] = {}
+        target = options
+        for key in output_option_path[:-1]:
+            nested: dict[str, Any] = {}
+            target[key] = nested
+            target = nested
+        target[output_option_path[-1]] = max_output_tokens
+        return ModelRequest(model=copied.model, messages=copied.messages, options=options)
 
     @property
     def stream_deadlines(self) -> ProviderStreamDeadlines:

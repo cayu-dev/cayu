@@ -211,6 +211,55 @@ async def assert_recovery_plan_store_conformance(store) -> None:
     assert len(receipt_events) == 1
 
 
+def test_automatic_recovery_carries_exact_plan_owner_to_model_boundary(monkeypatch):
+    from cayu.runtime._durable_model_terminalization import terminalization_plan_owner
+
+    async def run():
+        store = InMemorySessionStore()
+        app = _app(store)
+        await _create_running_session(store, app, "plan-model-owner")
+        original = app._session_engine._recovery_coordinator.reconcile_model_completion_boundary
+        observed = []
+
+        async def observe(session, **kwargs):
+            owner = terminalization_plan_owner()
+            assert owner is not None
+            checkpoint = await store.load_checkpoint(session.id)
+            marker = checkpoint["recovery_plan_execution"]["ownership"]
+            assert marker["claim_id"] == owner.claim_id
+            assert marker["generation"] == owner.generation
+            assert marker["owner_id"] == owner.owner_id
+            assert marker["operation_id"] == owner.operation_id
+            observed.append(owner)
+            return await original(session, **kwargs)
+
+        monkeypatch.setattr(
+            app._session_engine._recovery_coordinator,
+            "reconcile_model_completion_boundary",
+            observe,
+        )
+        plan = await app.plan_recovery(
+            RecoveryPlanRequest(
+                selection=RecoveryPlanSelection(
+                    session_ids=("plan-model-owner",),
+                    inactive_for_seconds=0,
+                )
+            )
+        )
+        assert observed == []
+        result = await app.execute_recovery(
+            RecoveryExecutionRequest(
+                plan=plan,
+                execution_id="model-owner-execution",
+            )
+        )
+        assert result.items[0].status is RecoveryItemExecutionStatus.EXECUTED, result
+        assert len(observed) == 1
+        assert terminalization_plan_owner() is None
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_recovery_plan_is_read_only_and_execution_receipt_replays(
     backend: str,

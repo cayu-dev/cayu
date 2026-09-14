@@ -3129,6 +3129,71 @@ def test_revision_sixteen_rejects_conflicting_schema_objects(
     asyncio.run(runner())
 
 
+def test_auxiliary_accounting_migration_preserves_pending_action_index(postgres_dsn: str) -> None:
+    import psycopg
+
+    from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
+
+    async def runner() -> None:
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            session = await creator.create(_request("auxiliary-migration"), identity=_identity())
+            session_id = session.id
+            await creator.append_event(
+                session_id,
+                Event(type=EventType.MODEL_COMPLETED, session_id=session_id),
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            # Reconstruct revision88's accounting definitions. The new revision
+            # must not activate main's unrelated, unregistered index migration.
+            await conn.execute("DROP INDEX idx_cayu_events_cost_attempt")
+            await conn.execute("DROP INDEX idx_cayu_events_cost_sequence")
+            for statement in POSTGRES_ACCOUNTING_DDL:
+                await conn.execute(statement.replace("'model.auxiliary.attempt_settled', ", ""))
+            await conn.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 89")
+            cursor = await conn.execute("SELECT generation FROM cayu_accounting_state")
+            generation = (await cursor.fetchone())[0]
+            cursor = await conn.execute(
+                "SELECT pg_get_indexdef('idx_cayu_events_pending_action_lookup'::regclass)"
+            )
+            pending_index = (await cursor.fetchone())[0]
+            assert "session.delegated_action.updated" not in pending_index
+
+        for mode in (SchemaMode.MIGRATE, SchemaMode.VALIDATE):
+            store = PostgresSessionStore(postgres_dsn, schema_mode=mode)
+            try:
+                assert await store.load(session_id) is not None
+                events = await store.load_events(session_id)
+                assert len(events) == 1 and events[0].type is EventType.MODEL_COMPLETED
+            finally:
+                await store.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            cursor = await conn.execute("SELECT generation FROM cayu_accounting_state")
+            assert (await cursor.fetchone())[0] == generation + 1
+            cursor = await conn.execute(
+                "SELECT pg_get_indexdef('idx_cayu_events_pending_action_lookup'::regclass)"
+            )
+            assert (await cursor.fetchone())[0] == pending_index
+            cursor = await conn.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() "
+                "AND indexname IN ('idx_cayu_events_cost_attempt', 'idx_cayu_events_cost_sequence')"
+            )
+            definitions = await cursor.fetchall()
+            assert len(definitions) == 2
+            assert all("model.auxiliary.attempt_settled" in row[0] for row in definitions)
+            cursor = await conn.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 89"
+            )
+            assert await cursor.fetchone() == ("breaking", 89)
+
+    asyncio.run(runner())
+
+
 def test_migrate_mode_initializes_baseline_idempotently(postgres_dsn: str) -> None:
     async def runner() -> None:
         await _drop_all(postgres_dsn)

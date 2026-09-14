@@ -136,6 +136,8 @@ from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._assistant_tool_round_publication import (
     validate_tool_exposure_terminal_event,
 )
+from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
+from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
 from cayu.runtime._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
@@ -161,6 +163,7 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
+from cayu.runtime._run_limit_accounting import RunLimitAccountingContext
 from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitGate,
@@ -1469,6 +1472,7 @@ class ToolRoundExecutor:
         *,
         session_store: SessionStore,
         event_writer: RuntimeEventWriter,
+        auxiliary_inference: AuxiliaryInferenceOwner,
         session_control: SessionControl[SessionUsageTracker],
         hook_runtime: RuntimeHookRuntime,
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
@@ -1485,6 +1489,7 @@ class ToolRoundExecutor:
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
+        self._auxiliary_inference = auxiliary_inference
         self._session_control = session_control
         self._hook_runtime = hook_runtime
         self._runtime_hooks = runtime_hooks
@@ -1550,6 +1555,7 @@ class ToolRoundExecutor:
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
+        run_limit_accounting: RunLimitAccountingContext | None = None,
     ) -> ToolRoundRun:
         return ToolRoundRun(
             self,
@@ -1571,6 +1577,7 @@ class ToolRoundExecutor:
             active_run=active_run,
             execution_profile=execution_profile,
             invocation_context=invocation_context,
+            run_limit_accounting=run_limit_accounting,
         )
 
     def _targeted_tool_use_request(
@@ -3486,6 +3493,7 @@ class ToolRoundExecutor:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         check_policy: bool = True,
+        auxiliary_invocation_policy: AuxiliaryInvocationPolicy | None = None,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
         policy_evidence: ToolPolicyEvidence = ToolPolicyEvidence.AUTHORITATIVE,
@@ -5475,6 +5483,7 @@ class ToolRoundExecutor:
                 set_exception_cause(interrupt, failure)
 
         effect_dispatch: ToolEffectRecord | None = None
+        auxiliary_events: list[Event] = []
         try:
 
             async def require_live_environment_exposure() -> None:
@@ -5495,6 +5504,24 @@ class ToolRoundExecutor:
             # protected effect. The exact dispatch seam below still performs
             # main's independent freshness check after durable preparation.
             await require_live_environment_exposure()
+            inference_scope = None
+            if registered_tool.auxiliary_inference is not None:
+                if invocation_context is None or auxiliary_invocation_policy is None:
+                    raise RuntimeError("Auxiliary inference requires frozen invocation authority.")
+                inference_scope = self._auxiliary_inference.create_scope(
+                    session=session,
+                    invocation=invocation_context,
+                    policy=auxiliary_invocation_policy,
+                    registered_tool=registered_tool,
+                    parent=tool_round_identity,
+                    tool_call_id=effective_tool_call.id,
+                    idempotency_key=idempotency_key,
+                    budget_limits=budget_limits,
+                    redactor=lambda: invocation_secret_scope.redactor,
+                    refresh=require_live_environment_exposure,
+                    observe_event=auxiliary_events.append,
+                )
+                tool_context._bind_runtime_inference(inference_scope)
             if registered_tool.effect is ToolEffect.EXTERNAL:
                 if invocation_context is None or execution_profile is None:
                     raise RuntimeError(
@@ -5607,7 +5634,10 @@ class ToolRoundExecutor:
                 timeout_seconds=self._tool_timeout_seconds,
                 before_dispatch=require_live_environment_exposure,
                 reconcile_result=reconcile_child_result,
+                inference_scope=inference_scope,
             )
+            for auxiliary_event in auxiliary_events:
+                yield auxiliary_event, None
         except tool_execution.ToolDispatchAdmissionRefusal as refused:
             refusal = refused.refusal
             if effect_dispatch is not None:
@@ -7885,6 +7915,7 @@ class ToolRoundRun:
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None,
+        run_limit_accounting: RunLimitAccountingContext | None = None,
     ) -> None:
         self._executor = executor
         self._session = session
@@ -7900,6 +7931,9 @@ class ToolRoundRun:
         self._limits = limits
         self._budget_limits = budget_limits
         self._retry_policy = retry_policy
+        self._auxiliary_invocation_policy = AuxiliaryInvocationPolicy(
+            limits=limits, retry_policy=retry_policy, accounting=run_limit_accounting
+        )
         self._run_started_at = run_started_at
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
@@ -8973,6 +9007,7 @@ class ToolRoundRun:
                 budget_limits=self._budget_limits,
                 task_id=self._task_id,
                 model_step=model_step,
+                auxiliary_invocation_policy=self._auxiliary_invocation_policy,
                 execution_profile=self._execution_profile,
                 invocation_context=self._invocation_context,
                 policy_result=policy_results_by_id.get(tool_call.id),
@@ -9040,6 +9075,7 @@ class ToolRoundRun:
                         budget_limits=self._budget_limits,
                         task_id=self._task_id,
                         model_step=model_step,
+                        auxiliary_invocation_policy=self._auxiliary_invocation_policy,
                         execution_profile=self._execution_profile,
                         invocation_context=self._invocation_context,
                         policy_result=policy_results_by_id.get(tool_call.id),

@@ -85,6 +85,7 @@ class RunLimitAccountingContext(BaseModel):
         return SessionUsageSummary(
             session_id=copied.session_id,
             tool_calls=copied.tool_calls,
+            unmeasured_model_attempts=copied.unmeasured_model_attempts,
             usage=copied.usage,
         )
 

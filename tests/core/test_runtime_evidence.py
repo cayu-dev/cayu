@@ -89,6 +89,266 @@ async def _create_session(
     )
 
 
+def _auxiliary_payload() -> dict:
+    return {
+        "model_step_id": "mstep_" + "1" * 32,
+        "model_attempt_id": "matt_" + "2" * 32,
+        "attempt": 1,
+        "provider_name": "execution",
+        "requested_model": "model",
+        "model": "model",
+        "execution_profile_fingerprint": "f" * 64,
+        "auxiliary_inference": {
+            "operation_id": "aux_operation",
+            "purpose": "tool.summary",
+            "parent": {
+                "model_step_id": "mstep_" + "3" * 32,
+                "model_attempt_id": "matt_" + "4" * 32,
+                "tool_round_id": "tround_" + "5" * 32,
+            },
+            "tool_call_id": "parent_call",
+        },
+        "auxiliary_outcome": "completed",
+        "usage_status": "observed",
+        "provider_error": {"error": "secret auxiliary response canary"},
+        "usage_metrics": {
+            "provider_name": "billing",
+            "requested_model": "model",
+            "model": "model",
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "total_tokens": 5,
+            "reasoning_output_tokens": 0,
+            "cache": {
+                "read_tokens": 0,
+                "write_tokens": 0,
+                "cached_input_tokens": 0,
+                "uncached_input_tokens": 3,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_runtime_evidence_auxiliary_outcomes_and_exact_duplicates(
+    sqlite_resources, request, backend
+):
+    async def scenario(resources):
+        postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+
+        def open_store():
+            if backend == "memory":
+                return InMemorySessionStore()
+            if backend == "sqlite":
+                return resources.own(SQLiteSessionStore(resources.path("aux.sqlite")))
+            return resources.own(PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE))
+
+        store = open_store()
+        await _create_session(store, "root", labels={"runtime_evidence_operation": "repair"})
+        outcomes = ["completed", "failed", "cancelled", "timed_out", "outcome_unknown"]
+        events = [
+            Event(
+                id=f"aux-{index}",
+                type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+                session_id="root",
+                payload={
+                    **_auxiliary_payload(),
+                    "model_attempt_id": f"attempt-{index}",
+                    "attempt": index + 1,
+                    "auxiliary_outcome": outcome,
+                    "operation": "repair",
+                },
+            )
+            for index, outcome in enumerate(outcomes)
+        ]
+        duplicate = events[0].model_copy(deep=True, update={"id": "duplicate"})
+        conflict = events[0].model_copy(deep=True, update={"id": "conflict"})
+        conflict.payload["auxiliary_outcome"] = "failed"
+        conflict.payload["usage_metrics"]["total_tokens"] = 999
+        ordinary = events[0].model_copy(
+            deep=True, update={"id": "ordinary", "type": EventType.MODEL_COMPLETED}
+        )
+        await store.append_events("root", [*events, duplicate, conflict, ordinary])
+        evidence_request = RuntimeEvidenceRequest(
+            root_session_id="root",
+            max_sessions=10,
+            max_events=100,
+            include_causal_budget=True,
+            pricing=PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="billing",
+                        model="model",
+                        input_per_million=1,
+                        output_per_million=1,
+                    ),
+                )
+            ),
+        )
+        report = await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            evidence_request,
+        )
+        attempts = report.sessions[0].attempts
+        assert [attempt.status.value for attempt in attempts] == outcomes
+        assert [attempt.attempt_ordinal for attempt in attempts] == [1, 2, 3, 4, 5]
+        assert all(
+            attempt.operation is RuntimeEvidenceOperation.AUXILIARY_INFERENCE
+            for attempt in attempts
+        )
+        assert all(attempt.provider_name == "execution" for attempt in attempts)
+        assert all(attempt.usage.total_tokens == 5 for attempt in attempts)
+        assert all(attempt.cost.total_cost == Decimal("0.000005") for attempt in attempts)
+        assert attempts[0].auxiliary_inference.parent_tool_call_id == "parent_call"
+        assert len(attempts[0].source_refs) == 2
+        assert report.lineage_totals.model_step_count == 0
+        assert report.lineage_totals.attempt_count == 5
+        assert report.lineage_totals.provider_retry_attempt_count == 4
+        assert report.lineage_totals.usage.total_tokens == 25
+        assert report.lineage_totals == report.causal_budget_totals
+        assert "secret auxiliary response canary" not in report.model_dump_json()
+        assert (
+            sum(
+                warning.code is RuntimeEvidenceWarningCode.MALFORMED_AUXILIARY_INFERENCE
+                for warning in report.warnings
+            )
+            == 2
+        )
+        original_events = await store.load_events("root")
+        if backend != "memory":
+            await store.close()
+            store = open_store()
+        reconstructed = await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False), evidence_request
+        )
+        assert reconstructed == report
+        assert await store.load_events("root") == original_events
+
+    async def run():
+        async with sqlite_resources as resources:
+            await scenario(resources)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("order", ["valid_invalid", "invalid_valid", "invalid_only"])
+@pytest.mark.parametrize("invalid", ["ordinal", "parent", "outcome", "usage_status", "identity"])
+def test_runtime_evidence_malformed_auxiliary_cannot_replace_valid(order, invalid):
+    async def run():
+        store = InMemorySessionStore()
+        await _create_session(store, "root")
+        valid = Event(
+            id="valid",
+            type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+            session_id="root",
+            payload=_auxiliary_payload(),
+        )
+        bad = valid.model_copy(deep=True, update={"id": "invalid"})
+        if invalid == "ordinal":
+            bad.payload["attempt"] = True
+        elif invalid == "parent":
+            bad.payload["auxiliary_inference"]["parent"] = {}
+        elif invalid == "outcome":
+            bad.payload["auxiliary_outcome"] = "future"
+        elif invalid == "usage_status":
+            bad.payload["usage_status"] = "future"
+        else:
+            bad.payload.pop("model_attempt_id")
+        selected = (
+            [valid, bad]
+            if order == "valid_invalid"
+            else [bad, valid]
+            if order == "invalid_valid"
+            else [bad]
+        )
+        await store.append_events("root", selected)
+        report = await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(root_session_id="root", max_sessions=10, max_events=100),
+        )
+        attempts = report.sessions[0].attempts
+        assert len(attempts) == (0 if order == "invalid_only" else 1)
+        if attempts:
+            assert attempts[0].status.value == "completed"
+            assert attempts[0].usage.total_tokens == 5
+            assert attempts[0].source_refs[0].event_id == "valid"
+        assert any(
+            warning.code is RuntimeEvidenceWarningCode.MALFORMED_AUXILIARY_INFERENCE
+            for warning in report.warnings
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("location", ["event", "session", "tool"])
+def test_runtime_evidence_auxiliary_requires_typed_event_not_metadata(location):
+    async def run():
+        store = InMemorySessionStore()
+        await _create_session(
+            store,
+            "root",
+            labels={"runtime_evidence_operation": "auxiliary_inference"}
+            if location == "session"
+            else None,
+        )
+        payload = _auxiliary_payload()
+        if location == "event":
+            payload["operation"] = "auxiliary_inference"
+        if location == "tool":
+            event = Event(
+                id="tool",
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="root",
+                payload={"tool_call_id": "call", "result": {"auxiliary_inference": payload}},
+            )
+        else:
+            event = Event(
+                id="ordinary", type=EventType.MODEL_COMPLETED, session_id="root", payload=payload
+            )
+        await store.append_event("root", event)
+        report = await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(root_session_id="root", max_sessions=10, max_events=100),
+        )
+        assert all(
+            attempt.operation is not RuntimeEvidenceOperation.AUXILIARY_INFERENCE
+            and attempt.auxiliary_inference is None
+            for attempt in report.sessions[0].attempts
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("usage_status", ["missing", "malformed", "observed"])
+def test_runtime_evidence_auxiliary_unavailable_usage_is_not_zero_evidence(usage_status):
+    async def run():
+        store = InMemorySessionStore()
+        await _create_session(store, "root")
+        payload = _auxiliary_payload()
+        payload["usage_status"] = usage_status
+        payload["usage_metrics"] = None
+        await store.append_event(
+            "root",
+            Event(
+                type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED, session_id="root", payload=payload
+            ),
+        )
+        report = await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(root_session_id="root", max_sessions=10, max_events=100),
+        )
+        attempt = report.sessions[0].attempts[0]
+        assert attempt.usage is None
+        assert attempt.usage_status.value == (
+            "missing" if usage_status == "missing" else "malformed"
+        )
+        assert report.lineage_totals.missing_usage_attempt_count == 1
+        assert report.lineage_totals.attempt_count == 1
+        assert report.lineage_totals.model_step_count == 0
+
+    asyncio.run(run())
+
+
 def test_runtime_evidence_request_requires_explicit_scope_bounds() -> None:
     with pytest.raises(ValidationError):
         RuntimeEvidenceRequest.model_validate({"root_session_id": "root"})
@@ -654,7 +914,7 @@ def test_runtime_evidence_projects_safe_workspace_mutation_and_finalization() ->
     report = asyncio.run(scenario())
     session = report.sessions[0]
 
-    assert report.schema_version == 5
+    assert report.schema_version == 6
     assert len(session.workspace_mutations) == 1
     mutation = session.workspace_mutations[0]
     assert mutation.window_id == "window-1"
@@ -1720,7 +1980,7 @@ def test_runtime_evidence_projects_bounded_lineage_attempts_and_safe_totals() ->
 
     report = asyncio.run(scenario())
 
-    assert report.schema_version == 5
+    assert report.schema_version == 6
     assert report.scope.descendant_session_ids == ("root", "child")
     assert [session.session_id for session in report.sessions] == ["root", "child"]
     assert report.sessions[1].parent_session_id == "root"
@@ -2711,7 +2971,7 @@ async def _minimal_golden_report(
     )
 
 
-def test_runtime_evidence_sqlite_restart_and_v5_golden_are_exact(tmp_path: Path) -> None:
+def test_runtime_evidence_sqlite_restart_and_v6_golden_are_exact(tmp_path: Path) -> None:
     async def scenario():
         database = tmp_path / "runtime-evidence.sqlite"
         first_store = SQLiteSessionStore(database)
@@ -2727,7 +2987,7 @@ def test_runtime_evidence_sqlite_restart_and_v5_golden_are_exact(tmp_path: Path)
 
     first, second = asyncio.run(scenario())
     assert first == second
-    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v5.json"
+    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v6.json"
     assert first.model_dump(mode="json") == json.loads(golden_path.read_text())
 
 

@@ -1,6 +1,11 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "AuxiliaryInferenceUnsupportedError": (
+        "cayu.providers.base",
+        "AuxiliaryInferenceUnsupportedError",
+    ),
+    "ModelResponse": ("cayu.providers.response", "ModelResponse"),
     "AnthropicAPIError": ("cayu.providers.anthropic", "AnthropicAPIError"),
     "AnthropicContextOverflowError": ("cayu.providers.anthropic", "AnthropicContextOverflowError"),
     "AnthropicError": ("cayu.providers.anthropic", "AnthropicError"),
@@ -189,6 +194,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "AuxiliaryInferenceUnsupportedError",
+    "ModelResponse",
     "AnthropicAPIError",
     "AnthropicContextOverflowError",
     "AnthropicError",

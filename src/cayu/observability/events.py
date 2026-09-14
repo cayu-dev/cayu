@@ -17,6 +17,8 @@ class _EventSinkDelivery:
     private_interaction_id: str | None = None
     private_tool_call_id: str | None = None
     private_parent_session_id: str | None = None
+    private_model_attempt_id: str | None = None
+    private_auxiliary_tool_call_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.event) is not Event:
@@ -31,6 +33,8 @@ class _EventSinkDelivery:
             "private_interaction_id",
             "private_tool_call_id",
             "private_parent_session_id",
+            "private_model_attempt_id",
+            "private_auxiliary_tool_call_id",
         ):
             value = getattr(self, field_name)
             if value is not None and (type(value) is not str or not value.strip()):

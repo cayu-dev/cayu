@@ -5692,6 +5692,20 @@ class SessionEngine:
             if active_model_completion is None
             else model_completion_recovery_context_from_stage(active_model_completion.stage)
         )
+        completion_profile_fingerprint = (
+            None
+            if model_completion_context is None
+            else model_completion_context.execution_profile_fingerprint
+        )
+        if (
+            active_model_completion is not None
+            and active_model_completion.stage.purpose == "auxiliary-inference"
+        ):
+            completion_profile_fingerprint = active_model_completion.stage.intent.get(
+                "execution_profile_fingerprint"
+            )
+            if type(completion_profile_fingerprint) is not str:
+                raise ValueError("Auxiliary recovery stage lost its execution profile fingerprint.")
         provider_options, provider_options_process_local = _execution_profile_provider_options(
             registered_agent.spec.provider_options,
             provider=registered_provider.provider,
@@ -5749,15 +5763,7 @@ class SessionEngine:
             ),
             additional_profile_fingerprints=(
                 *additional_profile_fingerprints,
-                *(
-                    ()
-                    if active_model_completion is None
-                    else (
-                        None
-                        if model_completion_context is None
-                        else model_completion_context.execution_profile_fingerprint,
-                    )
-                ),
+                *(() if active_model_completion is None else (completion_profile_fingerprint,)),
             ),
             frozen_candidate_profile=frozen_candidate_profile,
             provider_options=provider_options,
@@ -8836,13 +8842,23 @@ class SessionEngine:
             budget_recovery_contexts = (
                 () if recovery_context is None else recovery_context.budget_reservations
             )
+            if active_model_completion.stage.purpose == "auxiliary-inference":
+                from cayu.runtime._auxiliary_inference_contract import (
+                    auxiliary_budget_recovery_contexts,
+                )
+
+                budget_recovery_contexts = auxiliary_budget_recovery_contexts(
+                    active_model_completion.stage
+                )
             budget_dispatch_id = active_model_completion.stage.stage_id
-            if active_model_completion.stage.purpose == "context-compaction":
+            if active_model_completion.stage.purpose in {
+                "context-compaction",
+                "auxiliary-inference",
+            }:
                 model_attempt_id = active_model_completion.stage.intent.get("model_attempt_id")
                 if type(model_attempt_id) is not str:
                     raise SessionModelCompletionStageConflict(
-                        "Receipt-less context-compaction terminalization lost its budget "
-                        "dispatch identity."
+                        "Model-stage terminalization lost its budget dispatch identity."
                     )
                 budget_dispatch_id = require_clean_nonblank(
                     model_attempt_id,
@@ -24231,6 +24247,7 @@ class SessionEngine:
                 active_run=active_run,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
+                run_limit_accounting=run_limit_accounting,
             )
 
             def model_completion_recovery_context(

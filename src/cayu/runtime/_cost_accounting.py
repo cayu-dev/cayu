@@ -38,7 +38,11 @@ if TYPE_CHECKING:
 
 COST_ACCOUNTING_PAGE_SIZE = 256
 COST_ACCOUNTING_MAX_PENDING_EVENTS = 256
-COST_EVENT_TYPES = (EventType.MODEL_COMPLETED, EventType.MODEL_HOSTED_TOOL_CALL)
+COST_EVENT_TYPES = (
+    EventType.MODEL_COMPLETED,
+    EventType.MODEL_HOSTED_TOOL_CALL,
+    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+)
 CostGroupKey = tuple[str, bool, str]
 
 
@@ -118,6 +122,8 @@ class _Totals:
     model_steps: int = 0
     priced_model_steps: int = 0
     unpriced_model_steps: int = 0
+    auxiliary_attempts: int = 0
+    unpriced_auxiliary_attempts: int = 0
     missing_usage_model_steps: int = 0
     missing_pricing_model_steps: int = 0
     unsupported_pricing_model_steps: int = 0
@@ -125,6 +131,8 @@ class _Totals:
     total_cost: Decimal = Decimal(0)
 
     def add(self, item: CostLineItem) -> None:
+        self.auxiliary_attempts += int(item.auxiliary_attempt)
+        self.unpriced_auxiliary_attempts += int(item.auxiliary_attempt and not item.priced)
         if item.model_step:
             self.model_steps += 1
             self.priced_model_steps += int(item.priced)
@@ -148,6 +156,8 @@ class _Totals:
             model_steps=self.model_steps,
             priced_model_steps=self.priced_model_steps,
             unpriced_model_steps=self.unpriced_model_steps,
+            auxiliary_attempts=self.auxiliary_attempts,
+            unpriced_auxiliary_attempts=self.unpriced_auxiliary_attempts,
             missing_usage_model_steps=self.missing_usage_model_steps,
             missing_pricing_model_steps=self.missing_pricing_model_steps,
             unsupported_pricing_model_steps=self.unsupported_pricing_model_steps,
@@ -217,7 +227,7 @@ class CostAccountingReducer:
                     "Cost accounting requires hosted evidence before completions in each group."
                 )
             self._add_hosted(sequence, event)
-        elif event.type == EventType.MODEL_COMPLETED:
+        elif event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
             self._add_pending_hosted()
             self._add_completion(sequence, event)
 
@@ -257,6 +267,7 @@ class CostAccountingReducer:
                 self._add_hosted(sequence, event)
 
     def _add_completion(self, sequence: int, event: Event) -> None:
+        auxiliary = event.type == EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED
         metrics = _cost_usage_metrics_from_event_payload(event.payload)
         profile = _optional_execution_profile_fingerprint(
             event.payload.get("execution_profile_fingerprint")
@@ -266,7 +277,7 @@ class CostAccountingReducer:
         self._completion_seen = True
         if metrics is None:
             item = _unpriced_line_item(
-                model_step=1,
+                model_step=0 if auxiliary else 1,
                 provider_name=_optional_nonblank(event.payload.get("provider_name")),
                 requested_model=_optional_nonblank(event.payload.get("requested_model")),
                 model=_optional_nonblank(event.payload.get("model")),
@@ -277,14 +288,16 @@ class CostAccountingReducer:
             )
         else:
             item = _cost_line_item(
-                model_step=1,
+                model_step=0 if auxiliary else 1,
                 metrics=metrics,
                 pricing=self._pricing,
                 currency=self._currency,
                 effective_on=_effective_date(event.timestamp),
                 execution_profile_fingerprint=profile,
             )
-        self._add_item(0, sequence, event.session_id, item)
+        self._add_item(
+            0, sequence, event.session_id, item.model_copy(update={"auxiliary_attempt": auxiliary})
+        )
 
     def _add_item(self, category: int, sequence: int, session_id: str, item: CostLineItem) -> None:
         self._totals.add(item)
@@ -300,7 +313,7 @@ class CostAccountingReducer:
             return
         self._add_pending_hosted()
         for sequence, event in self._current_pending:
-            if event.type == EventType.MODEL_COMPLETED:
+            if event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
                 self._add_completion(sequence, event)
         if not self._completion_seen and self._hosted is not None:
             assert self._hosted_time is not None
@@ -338,14 +351,15 @@ class CostAccountingReducer:
             per_session_lines: dict[str, list[CostLineItem]] = {}
             per_session_steps: dict[str, int] = {}
             for category, _sequence, session_id, item in self._lines:
-                if category == 0:
+                is_model_step = category == 0 and not item.auxiliary_attempt
+                if is_model_step:
                     step += 1
-                lines.append(item.model_copy(update={"model_step": step if category == 0 else 0}))
+                lines.append(item.model_copy(update={"model_step": step if is_model_step else 0}))
                 if self._by_session:
-                    local_step = per_session_steps.get(session_id, 0) + int(category == 0)
+                    local_step = per_session_steps.get(session_id, 0) + int(is_model_step)
                     per_session_steps[session_id] = local_step
                     per_session_lines.setdefault(session_id, []).append(
-                        item.model_copy(update={"model_step": local_step if category == 0 else 0})
+                        item.model_copy(update={"model_step": local_step if is_model_step else 0})
                     )
             details = SessionCostSummary(**totals.model_dump(), line_items=tuple(lines))
             session_details = tuple(

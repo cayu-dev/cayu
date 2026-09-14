@@ -165,6 +165,7 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
     child_session_id_prefix,
@@ -408,6 +409,7 @@ from cayu.sessions.base import (
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _invocation_lifecycle_authority_read_scope,
+    _model_completion_stage_promotion_statuses,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     _SessionRunFenceOwnership,
@@ -3026,6 +3028,7 @@ class RecoveryCoordinator:
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext:
                 raise TypeError("invocation_context must be an authenticated InvocationContext.")
+            invocation_context._validate()
             if (
                 invocation_context.binding.session_id != session.id
                 or invocation_context.binding.session_instance_id != session.instance_id
@@ -3107,13 +3110,21 @@ class RecoveryCoordinator:
                     evidence_ref_suffix="dispatch-receipt-absent",
                 )
                 recovery_context = model_completion_recovery_context_from_stage(stage)
+                budget_recovery_contexts = (
+                    () if recovery_context is None else recovery_context.budget_reservations
+                )
+                if stage.purpose == "auxiliary-inference":
+                    from cayu.runtime._auxiliary_inference_contract import (
+                        auxiliary_budget_recovery_contexts,
+                    )
+
+                    budget_recovery_contexts = auxiliary_budget_recovery_contexts(stage)
                 budget_dispatch_id = stage.stage_id
-                if stage.purpose == "context-compaction":
+                if stage.purpose in {"context-compaction", "auxiliary-inference"}:
                     model_attempt_id = stage.intent.get("model_attempt_id")
                     if type(model_attempt_id) is not str:
                         raise ModelCompletionManualRecoveryRequired(
-                            "Receipt-less context-compaction recovery lost its budget "
-                            "dispatch identity."
+                            "Receipt-less model-stage recovery lost its budget dispatch identity."
                         )
                     budget_dispatch_id = require_clean_nonblank(
                         model_attempt_id,
@@ -3122,9 +3133,7 @@ class RecoveryCoordinator:
                 release_events = await (
                     self._run_limit_controller.release_pre_provider_dispatch_reservations(
                         reservation_ids=stage.reservation_ids,
-                        recovery_contexts=(
-                            () if recovery_context is None else recovery_context.budget_reservations
-                        ),
+                        recovery_contexts=budget_recovery_contexts,
                         dispatch_id=budget_dispatch_id,
                     )
                 )
@@ -3142,7 +3151,22 @@ class RecoveryCoordinator:
                 )
         if active is not None:
             stage = active.stage
-            if session.status in {
+            if (
+                stage.purpose == "auxiliary-inference"
+                and stage.state == "in_flight"
+                and invocation_context is not None
+                and invocation_context.recovery_claim_id is not None
+            ):
+                await self._complete_unknown_auxiliary_stage(
+                    session=session,
+                    stage=stage,
+                    invocation=invocation_context,
+                )
+                active = await self._session_store.load_active_model_completion_stage(session.id)
+                if active is None or active.stage.stage_id != stage.stage_id:
+                    raise RuntimeError("Auxiliary recovery lost its active completion boundary.")
+                stage = active.stage
+            if stage.purpose != "auxiliary-inference" and session.status in {
                 SessionStatus.COMPLETED,
                 SessionStatus.INTERRUPTED,
             }:
@@ -3269,16 +3293,40 @@ class RecoveryCoordinator:
                     raise KeyError(f"Session not found: {stage.session_id}")
                 session = loaded_session
                 state = "provider_operation_reconciled"
-            elif session.status not in {
-                stage.source_status,
-                SessionStatus.INTERRUPTING,
-                SessionStatus.FAILED,
-            }:
+            elif session.status not in _model_completion_stage_promotion_statuses(stage):
                 raise ModelCompletionManualRecoveryRequired(
                     "The completed model stage cannot be promoted from the current session "
                     f"status ({session.status.value}); expected {stage.source_status.value}."
                 )
             else:
+                if stage.purpose == "auxiliary-inference":
+                    from cayu.runtime._auxiliary_inference_contract import (
+                        auxiliary_budget_recovery_contexts,
+                        validate_auxiliary_publication,
+                    )
+
+                    publication = stage.publication
+                    if publication is None:
+                        raise ModelCompletionManualRecoveryRequired(
+                            "Auxiliary terminal stage lost its publication."
+                        )
+                    validate_auxiliary_publication(publication, session_id=session.id, stage=stage)
+                    budget_events = (
+                        await self._run_limit_controller.reconcile_model_completion_settlements(
+                            publication.events[0],
+                            reservation_ids=stage.reservation_ids,
+                        )
+                    )
+                    await (
+                        self._run_limit_controller.require_model_completion_reservation_settlements(
+                            reservation_ids=stage.reservation_ids,
+                            recovery_contexts=auxiliary_budget_recovery_contexts(stage),
+                            dispatch_id=stage.intent["model_attempt_id"],
+                        )
+                    )
+                    recovery_events = tuple(
+                        {event.id: event for event in (*recovery_events, *budget_events)}.values()
+                    )
                 if stage.purpose == "context-compaction" and stage.reservation_ids:
                     recovery_context = model_completion_recovery_context_from_stage(stage)
                     pricing_provider_name = stage.intent.get("pricing_provider_name")
@@ -3325,6 +3373,14 @@ class RecoveryCoordinator:
                     session=session,
                     stage_id=stage.stage_id,
                 )
+                if stage.purpose == "auxiliary-inference":
+                    assert stage.publication is not None
+                    terminal_events = await self._event_writer.fan_out_persisted(
+                        list(stage.publication.events)
+                    )
+                    recovery_events = tuple(
+                        {event.id: event for event in (*recovery_events, *terminal_events)}.values()
+                    )
                 state = "promoted"
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
@@ -4414,6 +4470,104 @@ class RecoveryCoordinator:
                 "The tool-result transcript conflicts with its durable terminal evidence."
             )
         return True
+
+    async def _complete_unknown_auxiliary_stage(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        invocation: InvocationContext,
+    ) -> None:
+        """Retain unknown consumption without manufacturing a response or redispatch."""
+        from cayu.budgets.billing import BillingIdentity
+        from cayu.events import event_with_runtime_nested_payload_authority
+        from cayu.runtime._auxiliary_inference_contract import (
+            AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS,
+            auxiliary_budget_recovery_contexts,
+            auxiliary_terminal_publication,
+        )
+        from cayu.runtime._durable_model_terminalization import terminalization_plan_owner
+        from cayu.sessions.base import ModelCompletionStageRecoveryFence
+
+        invocation._validate()
+        if invocation.recovery_claim_id is None:
+            raise ModelCompletionManualRecoveryRequired("Auxiliary recovery requires a live claim.")
+        binding = invocation.binding
+        if (
+            stage.purpose != "auxiliary-inference"
+            or stage.intent.get("session_instance_id") != binding.session_instance_id
+            or stage.intent.get("interaction_id") != binding.interaction_id
+            or stage.intent.get("provider_name") != binding.provider_name
+            or stage.intent.get("requested_model") != binding.model
+            or stage.intent.get("execution_profile_fingerprint") != invocation.profile.fingerprint
+        ):
+            raise ModelCompletionManualRecoveryRequired(
+                "Auxiliary recovery invocation conflicts with its stage."
+            )
+        identity = ModelAttemptIdentity.model_validate(
+            {
+                "model_step_id": stage.intent.get("model_step_id"),
+                "model_attempt_id": stage.intent.get("model_attempt_id"),
+            }
+        )
+        pricing_provider = stage.intent.get("pricing_provider_name")
+        if type(pricing_provider) is not str:
+            raise ModelCompletionManualRecoveryRequired(
+                "Auxiliary recovery lost its pricing provider."
+            )
+        pricing_provider = require_clean_nonblank(pricing_provider, "pricing_provider_name")
+        raw_billing = stage.intent.get("billing_identity")
+        billing_identity = (
+            None if raw_billing is None else BillingIdentity.model_validate(raw_billing)
+        )
+        event = Event(
+            type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
+            session_id=session.id,
+            interaction_id=binding.interaction_id,
+            agent_name=binding.agent_name,
+            environment_name=binding.environment_name,
+            payload={
+                **identity.payload(),
+                "auxiliary_inference": stage.intent["auxiliary_inference"],
+                "provider_name": binding.provider_name,
+                "requested_model": binding.model,
+                "provider": pricing_provider,
+                "model": binding.model,
+                "execution_profile_fingerprint": invocation.profile.fingerprint,
+                "auxiliary_outcome": "outcome_unknown",
+                "attempt": stage.dispatch_ordinal + 1,
+                "usage_status": "missing",
+            },
+        )
+        event = event_with_execution_profile_authority(
+            event_with_runtime_payload_authority(event, "model_step_id", "model_attempt_id"),
+            invocation.profile,
+        )
+        event = await self._run_limit_controller.recover_model_completion_budget_evidence(
+            event_with_runtime_nested_payload_authority(
+                event, *AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS
+            ),
+            reservation_ids=stage.reservation_ids,
+            recovery_contexts=auxiliary_budget_recovery_contexts(stage),
+            session=session,
+            provider_name=pricing_provider,
+            model_attempt_identity=identity,
+            dispatch_id=identity.model_attempt_id,
+            request_billing_identity=billing_identity,
+        )
+        await self._session_store.complete_recovered_model_completion_stage(
+            session.id,
+            stage_id=stage.stage_id,
+            publication=auxiliary_terminal_publication(stage, event),
+            recovery_fence=ModelCompletionStageRecoveryFence(
+                expected_session_instance_id=binding.session_instance_id,
+                expected_run_epoch=binding.run_epoch,
+                expected_active_profile=invocation.active_profile,
+                recovery_claim_id=invocation.recovery_claim_id,
+                preparation_digest=stage.preparation_digest,
+                recovery_plan_ownership=terminalization_plan_owner(),
+            ),
+        )
 
     @staticmethod
     def _validate_active_model_completion_stage(session: Session, stage) -> None:
@@ -9413,6 +9567,11 @@ class RecoveryCoordinator:
                     request_metadata=response.metadata,
                     budget_limits=pending.budget_limits or (),
                     task_id=pending.task_id,
+                    auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
+                        limits=effective_limits,
+                        retry_policy=effective_retry_policy,
+                        accounting=continued_run_limit_accounting,
+                    ),
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=invocation_context,
                     check_policy=False,
@@ -10089,6 +10248,7 @@ class RecoveryCoordinator:
                 tool_call=tool_call,
                 request_metadata={},
                 budget_limits=(),
+                auxiliary_invocation_policy=None,
                 task_id=task_id,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
@@ -11119,6 +11279,11 @@ class RecoveryCoordinator:
                     request_metadata=request.metadata,
                     budget_limits=pending_approval.budget_limits or (),
                     task_id=pending_approval.task_id,
+                    auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
+                        limits=effective_limits,
+                        retry_policy=effective_retry_policy,
+                        accounting=continued_run_limit_accounting,
+                    ),
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=invocation_context,
                     check_policy=False,
@@ -18759,6 +18924,11 @@ class RecoveryCoordinator:
                     budget_policy=budget_policy_snapshot,
                     require_open_interaction=not (
                         (
+                            active_model_completion is not None
+                            and active_model_completion.stage.purpose == "auxiliary-inference"
+                            and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
+                        )
+                        or (
                             (terminal_repair_required or bool(pending_allocations))
                             and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
                         )

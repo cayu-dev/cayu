@@ -166,6 +166,9 @@ from cayu.tools.grants import TargetedToolUseDisposition as TargetedToolUseDispo
 from cayu.tools.grants import TargetedToolUseRejectionReason as TargetedToolUseRejectionReason
 from cayu.tools.grants import TargetedToolUseRequest as TargetedToolUseRequest
 from cayu.tools.grants import TargetedToolUseResult as TargetedToolUseResult
+from cayu.tools.inference import AuxiliaryInferencePolicy as AuxiliaryInferencePolicy
+from cayu.tools.inference import InferenceInvoker as InferenceInvoker
+from cayu.tools.inference import InferenceLimits as InferenceLimits
 from cayu.tools.isolated import ProcessIsolatedTool as ProcessIsolatedTool
 from cayu.tools.isolated import ProcessIsolatedToolContext as ProcessIsolatedToolContext
 from cayu.tools.isolated import (

@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from enum import IntEnum, StrEnum
 from heapq import heappop, heappush
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 from pydantic import (
     AwareDatetime,
@@ -33,6 +33,11 @@ from cayu.budgets.pricing import PriceBook, estimate_model_step_cost
 from cayu.budgets.usage import AggregateCount, UsageMetrics, usage_metrics_from_event_payload
 from cayu.events import EventType
 from cayu.memory.attribution import MemoryAttribution, MemoryAttributionBounds
+from cayu.runtime._auxiliary_inference_contract import (
+    AuxiliaryInferenceAttribution,
+    AuxiliaryInferenceOutcome,
+    AuxiliaryInferenceUsageStatus,
+)
 from cayu.runtime._memory_attribution import (
     MemoryAttributionCaptureBudget,
     project_memory_attribution,
@@ -51,13 +56,14 @@ from cayu.sessions.base import (
     SessionStatus,
 )
 from cayu.tasks.base import TaskTopologyQuery
+from cayu.tools.inference import validate_inference_purpose
 from cayu.tools.policy import taint_labels_from_metadata
 from cayu.workspaces.observation_recovery import (
     WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
     workspace_observation_terminal_from_delta_status,
 )
 
-RUNTIME_EVIDENCE_SCHEMA_VERSION = 5
+RUNTIME_EVIDENCE_SCHEMA_VERSION = 6
 
 _HARD_MAX_SESSIONS = 500
 _HARD_MAX_EVENTS = 100_000
@@ -173,6 +179,7 @@ class RuntimeEvidenceOperation(StrEnum):
     """Why a retained provider attempt was dispatched."""
 
     AGENT_STEP = "agent_step"
+    AUXILIARY_INFERENCE = "auxiliary_inference"
     COMPACTION = "compaction"
     STRUCTURED_OUTPUT_REPAIR = "structured_output_repair"
     EVALUATION = "evaluation"
@@ -189,6 +196,9 @@ class RuntimeEvidenceAttemptStatus(StrEnum):
     DISCARDED = "discarded"
     FAILED = "failed"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 class RuntimeEvidenceUsageStatus(StrEnum):
@@ -216,6 +226,7 @@ class RuntimeEvidenceWarningCode(StrEnum):
     LEGACY_ATTEMPT_IDENTITY = "legacy_attempt_identity"
     MISSING_USAGE = "missing_usage"
     MALFORMED_USAGE = "malformed_usage"
+    MALFORMED_AUXILIARY_INFERENCE = "malformed_auxiliary_inference"
     UNPRICED_USAGE = "unpriced_usage"
     MALFORMED_CHECKPOINT = "malformed_checkpoint"
     MALFORMED_COMPACTION = "malformed_compaction"
@@ -513,6 +524,24 @@ class RuntimeEvidenceTotals(BaseModel):
     unpriced_attempt_count: AggregateCount = Field(default=0, ge=0)
 
 
+class RuntimeEvidenceAuxiliaryInference(BaseModel):
+    """Content-free auxiliary purpose and exact enclosing operation links."""
+
+    model_config = _MODEL_CONFIG
+
+    operation_id: StrictStr = Field(min_length=1, max_length=_MAX_IDENTITY_CHARS)
+    purpose: StrictStr = Field(min_length=1, max_length=128)
+    parent_model_step_id: StrictStr = Field(min_length=1, max_length=_MAX_IDENTITY_CHARS)
+    parent_model_attempt_id: StrictStr = Field(min_length=1, max_length=_MAX_IDENTITY_CHARS)
+    parent_tool_round_id: StrictStr = Field(min_length=1, max_length=_MAX_IDENTITY_CHARS)
+    parent_tool_call_id: StrictStr = Field(min_length=1, max_length=_MAX_IDENTITY_CHARS)
+
+    @field_validator("purpose")
+    @classmethod
+    def validate_purpose(cls, value: str) -> str:
+        return validate_inference_purpose(value)
+
+
 class RuntimeEvidenceAttempt(BaseModel):
     """One durable provider dispatch and its allowlisted accounting evidence."""
 
@@ -526,6 +555,10 @@ class RuntimeEvidenceAttempt(BaseModel):
         exclude_if=lambda value: value is None,
     )
     operation: RuntimeEvidenceOperation
+    auxiliary_inference: RuntimeEvidenceAuxiliaryInference | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     attempt_ordinal: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     provider_name: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     requested_model: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
@@ -1060,7 +1093,7 @@ class RuntimeEvidenceReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[5] = RUNTIME_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[6] = RUNTIME_EVIDENCE_SCHEMA_VERSION
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     scope: RuntimeEvidenceScope
     sessions: tuple[RuntimeEvidenceSession, ...] = Field(max_length=_HARD_MAX_SESSIONS)
@@ -1098,6 +1131,7 @@ class _AttemptRecord:
     model_step_id: str | None
     operation: RuntimeEvidenceOperation
     attempt_ordinal: int
+    auxiliary_inference: RuntimeEvidenceAuxiliaryInference | None = None
     execution_profile_fingerprint: str | None = None
     execution_profile_conflict: bool = False
     provider_name: str | None = None
@@ -2817,6 +2851,18 @@ def _project_receipts(
     return tuple(projected.values())
 
 
+def _auxiliary_attribution(payload: dict[str, object]) -> RuntimeEvidenceAuxiliaryInference:
+    attribution = AuxiliaryInferenceAttribution.model_validate(payload.get("auxiliary_inference"))
+    return RuntimeEvidenceAuxiliaryInference(
+        operation_id=attribution.operation_id,
+        purpose=attribution.purpose,
+        parent_model_step_id=attribution.parent.model_step_id,
+        parent_model_attempt_id=attribution.parent.model_attempt_id,
+        parent_tool_round_id=attribution.parent.tool_round_id,
+        parent_tool_call_id=attribution.tool_call_id,
+    )
+
+
 def _project_attempts(
     session: Session,
     records: tuple[EventRecord, ...],
@@ -2830,8 +2876,21 @@ def _project_attempts(
         EventType.MODEL_ATTEMPT_DISCARDED,
         EventType.MODEL_ERROR,
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
     }
     builders: dict[str, _AttemptRecord] = {}
+    auxiliary_terminals: dict[str, dict[str, object]] = {}
+
+    def warn_auxiliary(record: EventRecord) -> None:
+        warnings.append(
+            RuntimeEvidenceWarning(
+                code=RuntimeEvidenceWarningCode.MALFORMED_AUXILIARY_INFERENCE,
+                session_id=session.id,
+                event_id=record.event.id,
+                sequence=record.sequence,
+            )
+        )
+
     operation_by_model_step: dict[
         str,
         tuple[RuntimeEvidenceOperation, _OperationPrecedence],
@@ -2859,6 +2918,37 @@ def _project_attempts(
         attempt_id = _optional_text(payload.get("model_attempt_id"))
         model_step_id = _optional_text(payload.get("model_step_id"))
         ordinal = _positive_int(payload.get("attempt"))
+        is_auxiliary = event_type is EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED
+        auxiliary = None
+        auxiliary_status = None
+        if is_auxiliary:
+            try:
+                if attempt_id is None or model_step_id is None or ordinal is None:
+                    raise ValueError("Auxiliary attempt identity is incomplete.")
+                auxiliary = _auxiliary_attribution(payload)
+                outcome = payload.get("auxiliary_outcome")
+                if type(outcome) is not str or outcome not in get_args(AuxiliaryInferenceOutcome):
+                    raise ValueError("Auxiliary outcome is invalid.")
+                auxiliary_status = RuntimeEvidenceAttemptStatus(outcome)
+                usage_status = payload.get("usage_status")
+                if type(usage_status) is not str or usage_status not in get_args(
+                    AuxiliaryInferenceUsageStatus
+                ):
+                    raise ValueError("Auxiliary usage status is invalid.")
+            except (TypeError, ValueError):
+                warn_auxiliary(record)
+                continue
+            if attempt_id in builders:
+                if auxiliary_terminals.get(attempt_id) != payload:
+                    warn_auxiliary(record)
+                else:
+                    builders[attempt_id].source_refs.append(_source_ref(record))
+                continue
+            auxiliary_terminals[attempt_id] = payload
+        elif attempt_id in auxiliary_terminals:
+            # An ordinary event cannot rewrite a typed auxiliary terminal.
+            warn_auxiliary(record)
+            continue
         if attempt_id is None:
             if model_step_id is not None and ordinal is not None:
                 attempt_id = f"{model_step_id}:{ordinal}"
@@ -2872,13 +2962,17 @@ def _project_attempts(
                         sequence=record.sequence,
                     )
                 )
-        operation, operation_rank = _attempt_operation(
-            payload=payload,
-            session=session,
-            repair_pending=repair_pending,
-            has_stable_identity=model_step_id is not None,
+        operation, operation_rank = (
+            (RuntimeEvidenceOperation.AUXILIARY_INFERENCE, _OperationPrecedence.RUNTIME_PROTOCOL)
+            if is_auxiliary
+            else _attempt_operation(
+                payload=payload,
+                session=session,
+                repair_pending=repair_pending,
+                has_stable_identity=model_step_id is not None,
+            )
         )
-        if model_step_id is not None:
+        if model_step_id is not None and not is_auxiliary:
             prior = operation_by_model_step.get(model_step_id)
             if prior is not None and operation_rank < prior[1]:
                 operation, operation_rank = prior
@@ -2915,9 +3009,10 @@ def _project_attempts(
                 model_step_id=model_step_id,
                 operation=operation,
                 attempt_ordinal=ordinal or 1,
+                auxiliary_inference=auxiliary,
             )
             builders[attempt_id] = builder
-            if model_step_id is not None:
+            if model_step_id is not None and not is_auxiliary:
                 builders_by_model_step[model_step_id].append(builder)
         else:
             builder.operation = operation
@@ -2956,14 +3051,18 @@ def _project_attempts(
             payload.get("requested_model")
         )
         builder.model = builder.model or _optional_text(payload.get("model"))
-        builder.status = {
-            EventType.MODEL_STARTED: RuntimeEvidenceAttemptStatus.STARTED,
-            EventType.MODEL_RETRY: RuntimeEvidenceAttemptStatus.RETRY_SCHEDULED,
-            EventType.MODEL_ATTEMPT_DISCARDED: RuntimeEvidenceAttemptStatus.DISCARDED,
-            EventType.MODEL_ERROR: RuntimeEvidenceAttemptStatus.FAILED,
-            EventType.MODEL_COMPLETED: RuntimeEvidenceAttemptStatus.COMPLETED,
-        }[event_type]
-        if event_type == EventType.MODEL_COMPLETED:
+        builder.status = (
+            auxiliary_status
+            if auxiliary_status is not None
+            else {
+                EventType.MODEL_STARTED: RuntimeEvidenceAttemptStatus.STARTED,
+                EventType.MODEL_RETRY: RuntimeEvidenceAttemptStatus.RETRY_SCHEDULED,
+                EventType.MODEL_ATTEMPT_DISCARDED: RuntimeEvidenceAttemptStatus.DISCARDED,
+                EventType.MODEL_ERROR: RuntimeEvidenceAttemptStatus.FAILED,
+                EventType.MODEL_COMPLETED: RuntimeEvidenceAttemptStatus.COMPLETED,
+            }[event_type]
+        )
+        if event_type == EventType.MODEL_COMPLETED or is_auxiliary:
             builder.completed_at = event.timestamp
             try:
                 metrics = usage_metrics_from_event_payload(payload)
@@ -2974,6 +3073,14 @@ def _project_attempts(
             else:
                 warning_code = RuntimeEvidenceWarningCode.MISSING_USAGE
                 builder.usage_status = RuntimeEvidenceUsageStatus.MISSING
+            if is_auxiliary and payload["usage_status"] != "observed":
+                metrics = None
+                if payload["usage_status"] == "malformed":
+                    warning_code = RuntimeEvidenceWarningCode.MALFORMED_USAGE
+                    builder.usage_status = RuntimeEvidenceUsageStatus.MALFORMED
+            elif is_auxiliary and metrics is None:
+                warning_code = RuntimeEvidenceWarningCode.MALFORMED_USAGE
+                builder.usage_status = RuntimeEvidenceUsageStatus.MALFORMED
             if metrics is None:
                 builder.usage_warning_recorded = True
                 warnings.append(
@@ -2985,8 +3092,9 @@ def _project_attempts(
                     )
                 )
             else:
-                builder.provider_name = metrics.provider_name or builder.provider_name
-                builder.requested_model = metrics.requested_model or builder.requested_model
+                if not is_auxiliary:
+                    builder.provider_name = metrics.provider_name or builder.provider_name
+                    builder.requested_model = metrics.requested_model or builder.requested_model
                 builder.model = metrics.model or builder.model
                 builder.metrics = metrics
                 builder.usage = _usage_from_metrics(metrics)
@@ -3021,6 +3129,7 @@ def _project_attempts(
                 model_step_id=builder.model_step_id,
                 execution_profile_fingerprint=builder.execution_profile_fingerprint,
                 operation=builder.operation,
+                auxiliary_inference=builder.auxiliary_inference,
                 attempt_ordinal=builder.attempt_ordinal,
                 provider_name=builder.provider_name,
                 requested_model=builder.requested_model,
@@ -3045,14 +3154,20 @@ def _attempt_operation(
     explicit = payload.get("operation")
     if type(explicit) is str:
         try:
-            return RuntimeEvidenceOperation(explicit), _OperationPrecedence.EVENT_DECLARATION
+            operation = RuntimeEvidenceOperation(explicit)
+            if operation is RuntimeEvidenceOperation.AUXILIARY_INFERENCE:
+                operation = RuntimeEvidenceOperation.UNKNOWN
+            return operation, _OperationPrecedence.EVENT_DECLARATION
         except ValueError:
             return RuntimeEvidenceOperation.UNKNOWN, _OperationPrecedence.EVENT_DECLARATION
     configured = session.labels.get("runtime_evidence_operation")
     if configured is not None:
         try:
+            operation = RuntimeEvidenceOperation(configured)
+            if operation is RuntimeEvidenceOperation.AUXILIARY_INFERENCE:
+                operation = RuntimeEvidenceOperation.UNKNOWN
             return (
-                RuntimeEvidenceOperation(configured),
+                operation,
                 _OperationPrecedence.SESSION_DECLARATION,
             )
         except ValueError:
@@ -3200,7 +3315,12 @@ def _totals_from_attempts(
     return RuntimeEvidenceTotals(
         session_count=session_count,
         model_step_count=len(
-            {attempt.model_step_id for attempt in attempts if attempt.model_step_id is not None}
+            {
+                attempt.model_step_id
+                for attempt in attempts
+                if attempt.model_step_id is not None
+                and attempt.operation is not RuntimeEvidenceOperation.AUXILIARY_INFERENCE
+            }
         ),
         attempt_count=len(attempts),
         first_attempt_count=sum(attempt.attempt_ordinal == 1 for attempt in attempts),

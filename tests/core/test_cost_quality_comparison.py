@@ -785,6 +785,27 @@ def test_hosted_search_usage_and_cost_survive_cost_quality_projection() -> None:
     assert result.candidate_cost == Decimal("40")
 
 
+@pytest.mark.parametrize("serialized", [False, True])
+def test_native_cost_discriminator_is_validated_before_safe_projection(serialized) -> None:
+    pair = _pair()
+    assert pair.candidate is not None
+    native = _cost(session_id="candidate", input_tokens=20)
+    payload = pair.candidate.attempts[0].model_dump(mode="python")
+    payload["cost"] = native.model_dump(mode="python") if serialized else native
+    accepted = PairedCostAttempt.model_validate(payload)
+    assert accepted.cost == ComparisonCostLineItem.from_cost_line_item(native)
+    assert "auxiliary_attempt" not in accepted.cost.model_dump()
+    assert "billing_identity" not in accepted.cost.model_dump()
+    invalid = native.model_dump(mode="python")
+    invalid["auxiliary_attempt"] = "not-a-boolean"
+    with pytest.raises(ValidationError):
+        PairedCostAttempt.model_validate({**payload, "cost": invalid})
+    invalid = native.model_dump(mode="python")
+    invalid["unrecognized_control"] = True
+    with pytest.raises(ValidationError):
+        PairedCostAttempt.model_validate({**payload, "cost": invalid})
+
+
 def test_missing_attempt_identity_is_unavailable_instead_of_guessed() -> None:
     pair = _pair()
     assert pair.candidate is not None

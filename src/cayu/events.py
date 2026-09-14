@@ -144,6 +144,8 @@ class EventType(StrEnum):
     MODEL_HOSTED_TOOL_CALL = "model.hosted_tool_call"
     MODEL_CITATION = "model.citation"
     MODEL_COMPLETED = "model.completed"
+    MODEL_AUXILIARY_ATTEMPT_STARTED = "model.auxiliary.attempt_started"
+    MODEL_AUXILIARY_ATTEMPT_SETTLED = "model.auxiliary.attempt_settled"
     MODEL_ERROR = "model.error"
     MODEL_HTTP_CLEANUP = "model.http_cleanup"
     MODEL_RETRY = "model.retry"

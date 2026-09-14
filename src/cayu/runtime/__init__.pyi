@@ -502,6 +502,9 @@ from cayu.runtime.evidence import RUNTIME_EVIDENCE_SCHEMA_VERSION as RUNTIME_EVI
 from cayu.runtime.evidence import RuntimeEvidenceApproval as RuntimeEvidenceApproval
 from cayu.runtime.evidence import RuntimeEvidenceAttempt as RuntimeEvidenceAttempt
 from cayu.runtime.evidence import RuntimeEvidenceAttemptStatus as RuntimeEvidenceAttemptStatus
+from cayu.runtime.evidence import (
+    RuntimeEvidenceAuxiliaryInference as RuntimeEvidenceAuxiliaryInference,
+)
 from cayu.runtime.evidence import RuntimeEvidenceBranchTotals as RuntimeEvidenceBranchTotals
 from cayu.runtime.evidence import RuntimeEvidenceCacheUsage as RuntimeEvidenceCacheUsage
 from cayu.runtime.evidence import RuntimeEvidenceCheckpoint as RuntimeEvidenceCheckpoint

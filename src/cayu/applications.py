@@ -159,6 +159,7 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
 from cayu.runtime._browser_control_runtime import BrowserControlRuntime
 from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
@@ -1189,6 +1190,14 @@ class CayuApp:
         )
         self._tool_round_executor = ToolRoundExecutor(
             session_store=self._runtime_session_store,
+            auxiliary_inference=AuxiliaryInferenceOwner(
+                session_store=self._runtime_session_store,
+                event_writer=self._event_writer,
+                run_limit_controller=self._run_limit_controller,
+                clock=self._clock,
+                execution_profile_process_identity=self._execution_profile_process_identity,
+                profile_redactor=self._secret_redactor,
+            ),
             event_writer=self._event_writer,
             session_control=self._session_control,
             hook_runtime=self,
@@ -6754,6 +6763,7 @@ class CayuApp:
             session_ids=session_ids,
             session_count=len(session_ids),
             model_steps=total.model_steps,
+            unmeasured_model_attempts=total.unmeasured_model_attempts,
             tool_calls=total.tool_calls,
             provider_names=total.provider_names,
             models=total.models,
@@ -8695,6 +8705,9 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         execution_requirements=ToolSpec(
             name=tool.name, execution_requirements=tool.execution_requirements
         ).execution_requirements,
+        auxiliary_inference=ToolSpec(
+            name=tool.name, auxiliary_inference=tool.auxiliary_inference
+        ).auxiliary_inference,
         child_session_recovery=tool.child_session_recovery,
         durable_tool_recovery=tool.durable_tool_recovery,
         effect_reconciler=tool.effect_reconciler,
@@ -8984,9 +8997,14 @@ def _validate_registered_tool(
         workspace_mutation=spec.workspace_mutation,
         max_terminal_payload_bytes=spec.max_terminal_payload_bytes,
         execution_requirements=spec.execution_requirements,
+        auxiliary_inference=spec.auxiliary_inference,
     )
     command_policy = getattr(tool, "command_policy", None)
     if isinstance(tool, ProcessIsolatedTool):
+        if validated_spec.auxiliary_inference is not None:
+            raise ValueError(
+                "Process-isolated tools cannot request in-process auxiliary inference."
+            )
         if validated_spec.workspace_mutation:
             raise ValueError(
                 "Process-isolated tools cannot request Cayu workspace mutation authority."
@@ -9033,6 +9051,7 @@ def _validate_registered_tool(
         ),
         tool=tool,
         execution_requirements=validated_spec.execution_requirements,
+        auxiliary_inference=validated_spec.auxiliary_inference,
         child_session_recovery=(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
         ),
@@ -9066,6 +9085,7 @@ def _registered_tool_descriptor(
         workspace_mutation=tool.workspace_mutation,
         execution_contract=ToolExecutionContract.model_validate(tool.execution_contract),
         execution_requirements=tool.execution_requirements,
+        auxiliary_inference=tool.auxiliary_inference,
         provenance=provenance,
     )
 

@@ -282,7 +282,7 @@ def project_aggregate_usage_inspection_event(
     zero without discarding otherwise valid counters.
     """
 
-    if event.type == EventType.MODEL_COMPLETED:
+    if event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
         metrics = aggregate_usage_metrics_from_event_payload(event.payload)
     elif event.type == EventType.MODEL_HOSTED_TOOL_CALL:
         metrics = aggregate_hosted_tool_usage_metrics_from_event_payload(event.payload)
@@ -309,7 +309,7 @@ def pricing_usage_metrics_from_event_payload(
         # Native stores cross the memory boundary with a bounded normalized
         # ``usage_metrics`` projection rather than the original event payload.
         # Event authority still comes from the separately selected event type.
-    elif event_type != EventType.MODEL_COMPLETED:
+    elif event_type not in {EventType.MODEL_COMPLETED, EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED}:
         return None
     if payload.get("usage_normalization_failed") is True:
         return None
@@ -639,10 +639,14 @@ class UsageSessionAggregateBreakdown(BaseModel):
         return self
 
 
-UsagePricingEventType = Literal["model.completed", "model.hosted_tool_call"]
+UsagePricingEventType = Literal[
+    "model.completed", "model.hosted_tool_call", "model.auxiliary.attempt_settled"
+]
 
 
 def _usage_pricing_event_type(event_type: EventType) -> UsagePricingEventType:
+    if event_type == EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED:
+        return "model.auxiliary.attempt_settled"
     if event_type == EventType.MODEL_COMPLETED:
         return "model.completed"
     if event_type == EventType.MODEL_HOSTED_TOOL_CALL:
@@ -1169,7 +1173,7 @@ class UsageRollupStoreResult(BaseModel):
             and sum(
                 item.occurrences
                 for item in self.pricing_inputs
-                if not _is_hosted_resource_pricing_input(item)
+                if item.event_type == "model.completed"
             )
             != self.totals.model_steps
         ):
@@ -1399,14 +1403,14 @@ class UsageRollupStoreResult(BaseModel):
         for item in self.session_pricing_inputs:
             assert item.session_id is not None
             session_id = item.session_id
-            hosted_resource = _is_hosted_resource_pricing_input(item)
-            if not hosted_resource:
+            model_step = item.event_type == "model.completed"
+            if model_step:
                 occurrences_by_session[session_id] = (
                     occurrences_by_session.get(session_id, 0) + item.occurrences
                 )
             if item.metrics is None:
                 continue
-            if not hosted_resource:
+            if model_step:
                 valid_usage_steps_by_session[session_id] = (
                     valid_usage_steps_by_session.get(session_id, 0) + item.occurrences
                 )
@@ -1501,6 +1505,7 @@ class UsageCurrencyCost(BaseModel):
 
     currency: str
     model_steps: AggregateCount = Field(ge=0)
+    auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     hosted_resources: AggregateCount = Field(
         default=0,
         ge=0,
@@ -1515,7 +1520,7 @@ class UsageCurrencyCost(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence_count(self) -> UsageCurrencyCost:
-        if self.model_steps == 0 and self.hosted_resources == 0:
+        if self.model_steps == 0 and self.hosted_resources == 0 and self.auxiliary_attempts == 0:
             raise ValueError("Currency cost requires model-step or hosted-resource evidence.")
         return self
 
@@ -1528,6 +1533,7 @@ class UsageUnpricedReason(BaseModel):
     unpriced_reason: UnpricedReason | None = None
     reason: str
     model_steps: AggregateCount = Field(ge=0)
+    auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     hosted_resources: AggregateCount = Field(
         default=0,
         ge=0,
@@ -1541,7 +1547,7 @@ class UsageUnpricedReason(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence_count(self) -> UsageUnpricedReason:
-        if self.model_steps == 0 and self.hosted_resources == 0:
+        if self.model_steps == 0 and self.hosted_resources == 0 and self.auxiliary_attempts == 0:
             raise ValueError("An unpriced reason requires model-step or hosted-resource evidence.")
         return self
 
@@ -1593,7 +1599,8 @@ class UsageBillingCostGroup(BaseModel):
     pricing_provider_name: str | None = None
     pricing_model: str | None = None
     priced: StrictBool
-    model_steps: PositiveAggregateCount = Field(ge=1)
+    model_steps: AggregateCount = Field(ge=0)
+    auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     currency: str | None = None
     total_cost: Decimal = Field(ge=0)
     missing_pricing_reason: str | None = None
@@ -1618,6 +1625,10 @@ class UsageBillingCostGroup(BaseModel):
 
     @model_validator(mode="after")
     def validate_outcome(self) -> UsageBillingCostGroup:
+        if self.model_steps + self.auxiliary_attempts == 0:
+            raise ValueError(
+                "Billing cost groups require model-step or auxiliary-attempt evidence."
+            )
         if self.priced:
             if (
                 self.currency is None
@@ -1649,12 +1660,22 @@ class UsageBillingCostRemainder(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     group_count: PositiveAggregateCount = Field(ge=1)
-    model_steps: PositiveAggregateCount = Field(ge=1)
+    model_steps: AggregateCount = Field(ge=0)
+    auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
+    priced_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
+    unpriced_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     priced_model_steps: AggregateCount = Field(ge=0)
     unpriced_model_steps: AggregateCount = Field(ge=0)
 
     @model_validator(mode="after")
     def validate_step_accounting(self) -> UsageBillingCostRemainder:
+        if self.model_steps + self.auxiliary_attempts == 0:
+            raise ValueError("Billing remainder requires model-step or auxiliary-attempt evidence.")
+        if (
+            self.priced_auxiliary_attempts + self.unpriced_auxiliary_attempts
+            != self.auxiliary_attempts
+        ):
+            raise ValueError("Remainder auxiliary pricing counts must sum to auxiliary_attempts.")
         if self.priced_model_steps + self.unpriced_model_steps != self.model_steps:
             raise ValueError("Remainder priced and unpriced steps must sum to model_steps.")
         return self
@@ -1666,6 +1687,7 @@ class UsageBillingCostBreakdown(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     identified_model_steps: AggregateCount = Field(ge=0)
+    identified_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     groups: tuple[UsageBillingCostGroup, ...] = Field(max_length=100)
     remainder: UsageBillingCostRemainder | None
     accuracy: AggregateAccuracy
@@ -1682,6 +1704,11 @@ class UsageBillingCostBreakdown(BaseModel):
 
     @model_validator(mode="after")
     def validate_scope(self) -> UsageBillingCostBreakdown:
+        represented_auxiliary = sum(group.auxiliary_attempts for group in self.groups)
+        if self.remainder is not None:
+            represented_auxiliary += self.remainder.auxiliary_attempts
+        if represented_auxiliary != self.identified_auxiliary_attempts:
+            raise ValueError("Billing groups must account for every identified auxiliary attempt.")
         represented_steps = sum(group.model_steps for group in self.groups)
         if self.remainder is not None:
             represented_steps += self.remainder.model_steps
@@ -1705,6 +1732,9 @@ class UsageCostRollup(BaseModel):
     price_book_generated_at: str
     accuracy: AggregateAccuracy
     evaluated_model_steps: AggregateCount = Field(ge=0)
+    evaluated_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
+    priced_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
+    unpriced_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     priced_model_steps: AggregateCount = Field(ge=0)
     unpriced_model_steps: AggregateCount = Field(ge=0)
     unevaluated_model_steps: AggregateCount = Field(ge=0)
@@ -1729,6 +1759,9 @@ class UsageCostRollup(BaseModel):
 
     @model_validator(mode="after")
     def validate_step_accounting(self) -> UsageCostRollup:
+        _validate_auxiliary_cost_accounting(self)
+        if self.billing_breakdown.identified_auxiliary_attempts > self.evaluated_auxiliary_attempts:
+            raise ValueError("Billing-identified auxiliary attempts exceed evaluated attempts.")
         if self.priced_model_steps + self.unpriced_model_steps != self.evaluated_model_steps:
             raise ValueError("Priced and unpriced steps must sum to evaluated_model_steps.")
         if sum(item.model_steps for item in self.currencies) != self.priced_model_steps:
@@ -1761,6 +1794,9 @@ class UsageSessionCostSummary(BaseModel):
 
     accuracy: AggregateAccuracy
     evaluated_model_steps: AggregateCount = Field(ge=0)
+    evaluated_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
+    priced_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
+    unpriced_auxiliary_attempts: AggregateCount = Field(default=0, ge=0)
     priced_model_steps: AggregateCount = Field(ge=0)
     unpriced_model_steps: AggregateCount = Field(ge=0)
     unevaluated_model_steps: AggregateCount = Field(ge=0)
@@ -1779,6 +1815,7 @@ class UsageSessionCostSummary(BaseModel):
 
     @model_validator(mode="after")
     def validate_step_accounting(self) -> UsageSessionCostSummary:
+        _validate_auxiliary_cost_accounting(self)
         if self.priced_model_steps + self.unpriced_model_steps != self.evaluated_model_steps:
             raise ValueError("Priced and unpriced steps must sum to evaluated_model_steps.")
         if sum(item.model_steps for item in self.currencies) != self.priced_model_steps:
@@ -1790,6 +1827,26 @@ class UsageSessionCostSummary(BaseModel):
         if self.accuracy.kind is AggregateAccuracyKind.TRUNCATED and self.evaluated_model_steps:
             raise ValueError("Truncated session costs cannot report partial evaluated totals.")
         return self
+
+
+def _validate_auxiliary_cost_accounting(value: UsageCostRollup | UsageSessionCostSummary) -> None:
+    if (
+        value.priced_auxiliary_attempts + value.unpriced_auxiliary_attempts
+        != value.evaluated_auxiliary_attempts
+    ):
+        raise ValueError("Auxiliary pricing counts must sum to evaluated_auxiliary_attempts.")
+    if sum(item.auxiliary_attempts for item in value.currencies) != value.priced_auxiliary_attempts:
+        raise ValueError("Currency counts must account for every priced auxiliary attempt.")
+    if (
+        sum(item.auxiliary_attempts for item in value.unpriced_reasons)
+        != value.unpriced_auxiliary_attempts
+    ):
+        raise ValueError("Unpriced reasons must account for every unpriced auxiliary attempt.")
+    if (
+        value.accuracy.kind is AggregateAccuracyKind.TRUNCATED
+        and value.evaluated_auxiliary_attempts
+    ):
+        raise ValueError("Truncated cost projections cannot report partial auxiliary totals.")
 
 
 class UsageSessionCostGroup(BaseModel):
@@ -1870,6 +1927,7 @@ class _UsageBillingCostAccumulator:
     currency: str | None
     missing_pricing_reason: str | None
     model_steps: int = 0
+    auxiliary_attempts: int = 0
     total_cost: Decimal = Decimal(0)
 
 
@@ -1942,27 +2000,32 @@ def _estimate_usage_cost(
     currency_costs: dict[str, Decimal] = {}
     currency_steps: dict[str, int] = {}
     currency_hosted_resources: dict[str, int] = {}
-    unpriced_reasons: dict[str, tuple[int, int]] = {}
+    currency_auxiliary_attempts: dict[str, int] = {}
+    unpriced_reasons: dict[str, tuple[int, int, int]] = {}
     billing_groups: dict[str, _UsageBillingCostAccumulator] = {}
     priced_model_steps = 0
     unpriced_model_steps = 0
+    priced_auxiliary_attempts = 0
+    unpriced_auxiliary_attempts = 0
     for item in pricing_inputs:
         hosted_resource_input = _is_hosted_resource_pricing_input(item)
+        auxiliary_occurrences = (
+            item.occurrences if item.event_type == "model.auxiliary.attempt_settled" else 0
+        )
+        model_step_occurrences = item.occurrences if item.event_type == "model.completed" else 0
         if item.metrics is None:
-            reason = (
-                "model.hosted_tool_call event has no valid normalized usage metrics"
-                if hosted_resource_input
-                else "model.completed event has no valid normalized usage metrics"
+            reason = f"{item.event_type} event has no valid normalized usage metrics"
+            reason_steps, reason_resources, reason_auxiliary = unpriced_reasons.get(
+                reason, (0, 0, 0)
             )
-            reason_steps, reason_resources = unpriced_reasons.get(reason, (0, 0))
             unpriced_reasons[reason] = (
-                reason_steps + (0 if hosted_resource_input else item.occurrences),
+                reason_steps + model_step_occurrences,
                 reason_resources + (item.occurrences if hosted_resource_input else 0),
+                reason_auxiliary + auxiliary_occurrences,
             )
-            if not hosted_resource_input:
-                unpriced_model_steps += item.occurrences
+            unpriced_model_steps += model_step_occurrences
+            unpriced_auxiliary_attempts += auxiliary_occurrences
             continue
-        model_step_occurrences = 0 if hosted_resource_input else item.occurrences
         hosted_resource_occurrences = (
             item.metrics.hosted_tools.web_search_calls
             + item.metrics.hosted_tools.web_search_outcome_unknown
@@ -1980,7 +2043,7 @@ def _estimate_usage_cost(
         else:
             estimate = cast("ModelStepCostEstimate", estimate)
         pricing_identity = item.metrics.billing_identity
-        if pricing_identity is not None and model_step_occurrences:
+        if pricing_identity is not None and (model_step_occurrences or auxiliary_occurrences):
             billing_identity = _billing_identity_for_breakdown(pricing_identity)
             group_key = json.dumps(
                 {
@@ -2007,15 +2070,20 @@ def _estimate_usage_cost(
                 )
                 billing_groups[group_key] = group
             group.model_steps += model_step_occurrences
+            group.auxiliary_attempts += auxiliary_occurrences
             group.total_cost += estimate.total_cost * item.occurrences
         if not estimate.priced:
             reason = estimate.missing_pricing_reason or "no matching model pricing"
-            reason_steps, reason_resources = unpriced_reasons.get(reason, (0, 0))
+            reason_steps, reason_resources, reason_auxiliary = unpriced_reasons.get(
+                reason, (0, 0, 0)
+            )
             unpriced_reasons[reason] = (
                 reason_steps + model_step_occurrences,
                 reason_resources + hosted_resource_occurrences,
+                reason_auxiliary + auxiliary_occurrences,
             )
             unpriced_model_steps += model_step_occurrences
+            unpriced_auxiliary_attempts += auxiliary_occurrences
             continue
         assert estimate.currency is not None
         currency = estimate.currency.upper()
@@ -2023,10 +2091,14 @@ def _estimate_usage_cost(
             estimate.total_cost * item.occurrences
         )
         currency_steps[currency] = currency_steps.get(currency, 0) + model_step_occurrences
+        currency_auxiliary_attempts[currency] = (
+            currency_auxiliary_attempts.get(currency, 0) + auxiliary_occurrences
+        )
         currency_hosted_resources[currency] = (
             currency_hosted_resources.get(currency, 0) + hosted_resource_occurrences
         )
         priced_model_steps += model_step_occurrences
+        priced_auxiliary_attempts += auxiliary_occurrences
 
     ordered_billing_groups = sorted(
         (
@@ -2036,6 +2108,7 @@ def _estimate_usage_cost(
                 pricing_model=group.pricing_model,
                 priced=group.priced,
                 model_steps=group.model_steps,
+                auxiliary_attempts=group.auxiliary_attempts,
                 currency=group.currency,
                 total_cost=group.total_cost,
                 missing_pricing_reason=group.missing_pricing_reason,
@@ -2043,7 +2116,7 @@ def _estimate_usage_cost(
             for group in billing_groups.values()
         ),
         key=lambda group: (
-            -group.model_steps,
+            -(group.model_steps + group.auxiliary_attempts),
             group.billing_identity.provider_name,
             group.billing_identity.resource_id,
             json.dumps(
@@ -2066,6 +2139,13 @@ def _estimate_usage_cost(
         else UsageBillingCostRemainder(
             group_count=len(omitted_billing_groups),
             model_steps=sum(group.model_steps for group in omitted_billing_groups),
+            auxiliary_attempts=sum(group.auxiliary_attempts for group in omitted_billing_groups),
+            priced_auxiliary_attempts=sum(
+                group.auxiliary_attempts for group in omitted_billing_groups if group.priced
+            ),
+            unpriced_auxiliary_attempts=sum(
+                group.auxiliary_attempts for group in omitted_billing_groups if not group.priced
+            ),
             priced_model_steps=sum(
                 group.model_steps for group in omitted_billing_groups if group.priced
             ),
@@ -2090,6 +2170,9 @@ def _estimate_usage_cost(
         price_book_generated_at=pricing.generated_at,
         accuracy=cost_accuracy,
         evaluated_model_steps=priced_model_steps + unpriced_model_steps,
+        evaluated_auxiliary_attempts=priced_auxiliary_attempts + unpriced_auxiliary_attempts,
+        priced_auxiliary_attempts=priced_auxiliary_attempts,
+        unpriced_auxiliary_attempts=unpriced_auxiliary_attempts,
         priced_model_steps=priced_model_steps,
         unpriced_model_steps=unpriced_model_steps,
         unevaluated_model_steps=0,
@@ -2097,6 +2180,7 @@ def _estimate_usage_cost(
             UsageCurrencyCost(
                 currency=currency,
                 model_steps=currency_steps.get(currency, 0),
+                auxiliary_attempts=currency_auxiliary_attempts.get(currency, 0),
                 hosted_resources=currency_hosted_resources.get(currency, 0),
                 total_cost=currency_costs[currency],
             )
@@ -2108,14 +2192,18 @@ def _estimate_usage_cost(
                 reason=reason,
                 model_steps=model_steps,
                 hosted_resources=hosted_resources,
+                auxiliary_attempts=auxiliary_attempts,
             )
-            for reason, (model_steps, hosted_resources) in sorted(
+            for reason, (model_steps, hosted_resources, auxiliary_attempts) in sorted(
                 unpriced_reasons.items(),
-                key=lambda item: (-(item[1][0] + item[1][1]), item[0]),
+                key=lambda item: (-sum(item[1]), item[0]),
             )
         ),
         billing_breakdown=UsageBillingCostBreakdown(
             identified_model_steps=sum(group.model_steps for group in ordered_billing_groups),
+            identified_auxiliary_attempts=sum(
+                group.auxiliary_attempts for group in ordered_billing_groups
+            ),
             groups=retained_billing_groups,
             remainder=billing_remainder,
             accuracy=billing_accuracy,
@@ -2215,7 +2303,7 @@ def estimate_usage_session_cost_breakdown(
             sum(
                 item.occurrences
                 for item in remainder_inputs
-                if not _is_hosted_resource_pricing_input(item)
+                if item.event_type == "model.completed"
             )
             != result.session_breakdown.remainder.totals.model_steps
         ):
@@ -2248,6 +2336,9 @@ def _session_cost_summary(cost: UsageCostRollup) -> UsageSessionCostSummary:
     return UsageSessionCostSummary(
         accuracy=cost.accuracy.model_copy(deep=True),
         evaluated_model_steps=cost.evaluated_model_steps,
+        evaluated_auxiliary_attempts=cost.evaluated_auxiliary_attempts,
+        priced_auxiliary_attempts=cost.priced_auxiliary_attempts,
+        unpriced_auxiliary_attempts=cost.unpriced_auxiliary_attempts,
         priced_model_steps=cost.priced_model_steps,
         unpriced_model_steps=cost.unpriced_model_steps,
         unevaluated_model_steps=cost.unevaluated_model_steps,

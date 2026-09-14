@@ -56,6 +56,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     parse_public_authority_alias,
 )
+from cayu.runtime.retry_policy import RetryDecision, RetryDisposition, RetryReason, RetrySuppression
 from cayu.tools.base import (
     _COMMAND_POLICY_DENIAL_SOURCE,
     _POLICY_DENIAL_TRUNCATION_MARKER,
@@ -689,6 +690,18 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     },
     EventType.MODEL_STARTED: {
         ("purpose",): frozenset({"context_compaction"}),
+    },
+    EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED: {
+        ("auxiliary_outcome",): frozenset(
+            {"completed", "failed", "cancelled", "timed_out", "outcome_unknown"}
+        ),
+        ("usage_status",): frozenset({"observed", "missing", "malformed"}),
+        ("retry_decision", "retry"): frozenset({True, False}),
+        ("retry_decision", "disposition"): frozenset(item.value for item in RetryDisposition),
+        ("retry_decision", "reason"): frozenset({None, *(item.value for item in RetryReason)}),
+        ("retry_decision", "suppression"): frozenset(
+            {None, *(item.value for item in RetrySuppression)}
+        ),
     },
     **{
         event_type: {("status",): _PROVIDER_OPERATION_STATUS_VALUES}
@@ -2058,6 +2071,55 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.MODEL_STARTED] = model_started
+    auxiliary_attribution_paths = {
+        ("auxiliary_inference", "operation_id"),
+        ("auxiliary_inference", "tool_call_id"),
+        ("auxiliary_inference", "parent", "model_step_id"),
+        ("auxiliary_inference", "parent", "model_attempt_id"),
+        ("auxiliary_inference", "parent", "tool_round_id"),
+    }
+    auxiliary_start = _observed_policy(
+        "attempt auxiliary_inference provider_name requested_model",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        owned_nested_paths={
+            ("auxiliary_inference", "purpose"),
+            ("auxiliary_inference", "parent"),
+        },
+        nested_authority_paths=auxiliary_attribution_paths,
+    )
+    policies[EventType.MODEL_AUXILIARY_ATTEMPT_STARTED] = auxiliary_start
+    policies[EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED] = replace(
+        auxiliary_start,
+        owned_keys=auxiliary_start.owned_keys
+        | frozenset(
+            {
+                "provider",
+                "model",
+                "auxiliary_outcome",
+                "usage_status",
+                "usage_metrics",
+                "billing_identity",
+                "budget_settlements",
+                "provider_error",
+                "retry_decision",
+            }
+        ),
+        owned_nested_paths=(
+            auxiliary_start.owned_nested_paths
+            | _MODEL_USAGE_METRICS_NESTED_PATHS
+            | _MODEL_BILLING_IDENTITY_NESTED_PATHS
+            | _MODEL_BUDGET_SETTLEMENT_NESTED_PATHS
+            | {("retry_decision", key) for key in RetryDecision.model_fields}
+        ),
+        nested_authority_paths=(
+            auxiliary_start.nested_authority_paths | _MODEL_BUDGET_SETTLEMENT_AUTHORITY_PATHS
+        ),
+        untrusted_container_keys=frozenset({"provider_error", "retry_decision"}),
+        untrusted_container_paths=(
+            _MODEL_ACCOUNTING_UNTRUSTED_CONTAINER_PATHS | _MODEL_BUDGET_SETTLEMENT_UNTRUSTED_PATHS
+        ),
+    )
     policies[EventType.REQUEST_FOOTPRINT_RECORDED] = _observed_policy(
         "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure execution_profile_fingerprint "
         "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
@@ -2283,6 +2345,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "status_code",
         "step",
         "stream_cleanup_failed",
+    )
+    auxiliary_terminal = policies[EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED]
+    policies[EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED] = replace(
+        auxiliary_terminal,
+        owned_nested_paths=auxiliary_terminal.owned_nested_paths
+        | {("provider_error", key) for key in model_failure_keys},
     )
     policies[EventType.MODEL_HTTP_CLEANUP] = _policy(
         "model_attempt_id",
@@ -3538,6 +3606,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "currency execution_profile_fingerprint instruction_digest instruction_present key limit_reached maximum message "
         "mode model_attempt_id model_step_id model_steps operation_id reason request_id "
         "requested scope source_run_epoch source_transcript_cursor unpriced_model_steps "
+        "unpriced_auxiliary_attempts "
         "window window_details"
     )
     for event_type in (
@@ -3902,6 +3971,23 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.RUNNER_EXEC_STARTED] = runner_policy
     policies[EventType.RUNNER_EXEC_COMPLETED] = runner_policy
+
+    # These counters are fixed runtime schema, not caller-selected object keys.
+    # Register each diagnostic consumer without granting authority to its values
+    # or to arbitrary sibling fields in the containing summary.
+    for event_type, policy in tuple(policies.items()):
+        accounting_paths = set()
+        if "cost_summary" in policy.owned_keys:
+            accounting_paths.update(
+                ("cost_summary", key)
+                for key in ("auxiliary_attempts", "unpriced_auxiliary_attempts")
+            )
+        if "usage_summary" in policy.owned_keys:
+            accounting_paths.add(("usage_summary", "unmeasured_model_attempts"))
+        if accounting_paths:
+            policies[event_type] = replace(
+                policy, owned_nested_paths=policy.owned_nested_paths | accounting_paths
+            )
 
     return policies
 

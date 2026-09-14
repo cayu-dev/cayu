@@ -119,7 +119,7 @@ usage_events AS MATERIALIZED (
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
       AND event.event_type IN (
-          'model.completed', 'tool.call.started', 'model.hosted_tool_call'
+          'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
 ),
 overall_grouped AS (
@@ -146,7 +146,7 @@ provider_grouped_raw AS (
         SUM(event_type = 'model.completed' AND has_usage = 1) AS model_steps_with_usage,
         {group_usage_sum} AS usage_sums
     FROM usage_events
-    WHERE event_type = 'model.completed'
+    WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
        OR web_search_calls > 0
        OR web_search_outcome_unknown > 0
     GROUP BY provider_name
@@ -177,7 +177,7 @@ provider_remainder_raw AS (
         MAX(ranked.total_groups) - (SELECT group_limit FROM scope) AS group_count
     FROM usage_events AS event
     JOIN provider_ranked AS ranked ON event.provider_name IS ranked.provider_name
-    WHERE (event.event_type = 'model.completed'
+    WHERE (event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
            OR event.web_search_calls > 0
            OR event.web_search_outcome_unknown > 0)
       AND ranked.group_rank > (SELECT group_limit FROM scope)
@@ -198,7 +198,7 @@ model_grouped_raw AS (
         SUM(event_type = 'model.completed' AND has_usage = 1) AS model_steps_with_usage,
         {group_usage_sum} AS usage_sums
     FROM usage_events
-    WHERE event_type = 'model.completed'
+    WHERE event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
        OR web_search_calls > 0
        OR web_search_outcome_unknown > 0
     GROUP BY provider_name, model
@@ -232,7 +232,7 @@ model_remainder_raw AS (
     JOIN model_ranked AS ranked
       ON event.provider_name IS ranked.provider_name
      AND event.model IS ranked.model
-    WHERE (event.event_type = 'model.completed'
+    WHERE (event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
            OR event.web_search_calls > 0
            OR event.web_search_outcome_unknown > 0)
       AND ranked.group_rank > (SELECT group_limit FROM scope)
@@ -318,6 +318,8 @@ SELECT
 FROM model_remainder
 """
 
+# Keep both pricing projections bounded by type/time even when a small requested
+# session set makes SQLite prefer an unbounded session-history index scan.
 _PRICING_INPUT_SQL = """
 WITH
 scope(max_input_bytes, identity_trim) AS (
@@ -334,12 +336,15 @@ pricing_candidates AS (
         substr(event.timestamp, 1, 10) AS effective_on,
         {usage_metrics_projection} AS usage_metrics_json,
         {billing_identity_projection} AS billing_identity_json
-    FROM cayu_events AS event
+    FROM cayu_events AS event INDEXED BY idx_cayu_events_type_timestamp
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
+      AND event.event_type IN (
+          'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
+      )
       AND (
-          event.event_type = 'model.completed'
+          event.event_type != 'model.hosted_tool_call'
           OR (
               event.event_type = 'model.hosted_tool_call'
               AND json_extract(event.payload_json, '$.tool_type') = 'web_search'
@@ -419,12 +424,15 @@ pricing_candidates AS (
         substr(event.timestamp, 1, 10) AS effective_on,
         {usage_metrics_projection} AS usage_metrics_json,
         {billing_identity_projection} AS billing_identity_json
-    FROM cayu_events AS event
+    FROM cayu_events AS event INDEXED BY idx_cayu_events_type_timestamp
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
+      AND event.event_type IN (
+          'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
+      )
       AND (
-          event.event_type = 'model.completed'
+          event.event_type != 'model.hosted_tool_call'
           OR (
               event.event_type = 'model.hosted_tool_call'
               AND json_extract(event.payload_json, '$.tool_type') = 'web_search'
@@ -529,7 +537,7 @@ usage_events AS MATERIALIZED (
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
       AND event.event_type IN (
-          'model.completed', 'tool.call.started', 'model.hosted_tool_call'
+          'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
 ),
 session_grouped_raw AS (
@@ -902,7 +910,7 @@ def _sqlite_usage_metrics_projection() -> str:
                         THEN 1 ELSE 0 END
                 )
             )
-            WHEN event.event_type = 'model.completed'
+            WHEN event.event_type IN ('model.completed', 'model.auxiliary.attempt_settled')
              AND json_type(
                      event.payload_json,
                      '$.usage_normalization_failed'
@@ -1027,7 +1035,7 @@ def _exact_event_usage_sum(*, qualifier: str = "") -> str:
     event_type = f"{qualifier}event_type"
     for column in _USAGE_COUNTER_COLUMNS:
         value = f"{qualifier}{column}"
-        include = f"{event_type} = 'model.completed'"
+        include = f"{event_type} IN ('model.completed', 'model.auxiliary.attempt_settled')"
         if column in {"web_search_calls", "web_search_outcome_unknown"}:
             include = f"{event_type} = 'model.hosted_tool_call' AND {value} > 0"
         arguments.append(f"CASE WHEN {include} THEN {value} ELSE 0 END")

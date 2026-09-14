@@ -2687,6 +2687,7 @@ from cayu.providers.operations import (
 from cayu.providers.operations import ProviderOperationStartRequest as ProviderOperationStartRequest
 from cayu.providers.operations import ProviderOperationState as ProviderOperationState
 from cayu.providers.operations import ProviderOperationStatus as ProviderOperationStatus
+from cayu.providers.response import ModelResponse as ModelResponse
 from cayu.providers.vertex import VertexProvider as VertexProvider
 from cayu.proxies.base import CredentialProxy as CredentialProxy
 from cayu.proxies.base import ProxyAuthorizationResult as ProxyAuthorizationResult
@@ -2865,6 +2866,9 @@ from cayu.runtime.evidence import RUNTIME_EVIDENCE_SCHEMA_VERSION as RUNTIME_EVI
 from cayu.runtime.evidence import RuntimeEvidenceApproval as RuntimeEvidenceApproval
 from cayu.runtime.evidence import RuntimeEvidenceAttempt as RuntimeEvidenceAttempt
 from cayu.runtime.evidence import RuntimeEvidenceAttemptStatus as RuntimeEvidenceAttemptStatus
+from cayu.runtime.evidence import (
+    RuntimeEvidenceAuxiliaryInference as RuntimeEvidenceAuxiliaryInference,
+)
 from cayu.runtime.evidence import RuntimeEvidenceBranchTotals as RuntimeEvidenceBranchTotals
 from cayu.runtime.evidence import RuntimeEvidenceCacheUsage as RuntimeEvidenceCacheUsage
 from cayu.runtime.evidence import RuntimeEvidenceCheckpoint as RuntimeEvidenceCheckpoint
@@ -4283,6 +4287,9 @@ from cayu.tools.grants import TargetedToolUseDisposition as TargetedToolUseDispo
 from cayu.tools.grants import TargetedToolUseRejectionReason as TargetedToolUseRejectionReason
 from cayu.tools.grants import TargetedToolUseRequest as TargetedToolUseRequest
 from cayu.tools.grants import TargetedToolUseResult as TargetedToolUseResult
+from cayu.tools.inference import AuxiliaryInferencePolicy as AuxiliaryInferencePolicy
+from cayu.tools.inference import InferenceInvoker as InferenceInvoker
+from cayu.tools.inference import InferenceLimits as InferenceLimits
 from cayu.tools.isolated import ProcessIsolatedTool as ProcessIsolatedTool
 from cayu.tools.isolated import ProcessIsolatedToolContext as ProcessIsolatedToolContext
 from cayu.tools.isolated import (

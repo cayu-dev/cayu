@@ -1,6 +1,10 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "RuntimeEvidenceAuxiliaryInference": (
+        "cayu.runtime.evidence",
+        "RuntimeEvidenceAuxiliaryInference",
+    ),
     "PersistedEventSideEffectHealth": (
         "cayu.runtime.event_side_effect_health",
         "PersistedEventSideEffectHealth",
@@ -1916,6 +1920,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "RuntimeEvidenceAuxiliaryInference",
     "PersistedEventSideEffectHealth",
     "PersistedEventSideEffectInspection",
     "PersistedEventSideEffectPage",

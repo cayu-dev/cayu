@@ -34,9 +34,13 @@ from cayu.runtime.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.tools.base import ToolEffect, ToolExecutionRequirement, copy_tool_execution_requirements
+from cayu.tools.inference import (
+    AuxiliaryInferencePolicy,
+    validate_optional_auxiliary_inference_policy,
+)
 from cayu.tools.isolated import ISOLATED_TOOL_PROTOCOL_NAME
 
-TOOL_DESCRIPTOR_SCHEMA_VERSION = 3
+TOOL_DESCRIPTOR_SCHEMA_VERSION = 4
 TOOL_CATALOGUE_SCHEMA_VERSION = 1
 TOOL_CATALOGUE_MAX_TOOLS = 10_000
 TOOL_CATALOGUE_MAX_BYTES = 32 * 1024 * 1024
@@ -356,7 +360,7 @@ class ToolDescriptor(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[3] = TOOL_DESCRIPTOR_SCHEMA_VERSION
+    schema_version: Literal[4] = TOOL_DESCRIPTOR_SCHEMA_VERSION
     tool_id: str = ""
     name: str
     description: str = ""
@@ -367,6 +371,7 @@ class ToolDescriptor(BaseModel):
     workspace_mutation: StrictBool = False
     execution_contract: ToolExecutionContract = Field(default_factory=ToolExecutionContract)
     execution_requirements: tuple[ToolExecutionRequirement, ...] = ()
+    auxiliary_inference: AuxiliaryInferencePolicy | None = None
     provenance: ToolDescriptorProvenance = Field(default_factory=ToolDescriptorProvenance)
     schema_fingerprint: str = Field(default="", pattern=r"^(?:|sha256:[0-9a-f]{64})$")
     version: str = Field(default="", pattern=r"^(?:|sha256:[0-9a-f]{64})$")
@@ -376,11 +381,16 @@ class ToolDescriptor(BaseModel):
     def copy_execution_requirements(cls, value: object) -> tuple[ToolExecutionRequirement, ...]:
         return copy_tool_execution_requirements(value)
 
+    @field_validator("auxiliary_inference", mode="before")
+    @classmethod
+    def copy_auxiliary_inference(cls, value: object) -> AuxiliaryInferencePolicy | None:
+        return validate_optional_auxiliary_inference_policy(value)
+
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
         if type(value) is not int or value != TOOL_DESCRIPTOR_SCHEMA_VERSION:
-            raise ValueError("Tool descriptor schema_version must be the integer 3.")
+            raise ValueError("Tool descriptor schema_version must be the integer 4.")
         return value
 
     @field_validator("name")
@@ -445,6 +455,11 @@ class ToolDescriptor(BaseModel):
                 "execution_requirements": [
                     item.model_dump(mode="json") for item in self.execution_requirements
                 ],
+                "auxiliary_inference": (
+                    None
+                    if self.auxiliary_inference is None
+                    else self.auxiliary_inference.model_dump(mode="json")
+                ),
                 "provenance": self.provenance.model_dump(mode="json"),
             },
             "tool_descriptor",
@@ -498,6 +513,7 @@ def build_tool_descriptor(
     workspace_mutation: bool,
     execution_contract: ToolExecutionContract | None = None,
     execution_requirements: tuple[ToolExecutionRequirement, ...] = (),
+    auxiliary_inference: AuxiliaryInferencePolicy | None = None,
     provenance: ToolDescriptorProvenance | None = None,
 ) -> ToolDescriptor:
     """Build one descriptor from copied runtime-admitted registration state."""
@@ -511,6 +527,7 @@ def build_tool_descriptor(
         publishes_arguments=publishes_arguments,
         workspace_mutation=workspace_mutation,
         execution_requirements=execution_requirements,
+        auxiliary_inference=auxiliary_inference,
         execution_contract=(
             ToolExecutionContract()
             if execution_contract is None
