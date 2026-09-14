@@ -17,6 +17,7 @@ from cayu._validation import (
     safe_durable_value_error_details,
 )
 from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
+from cayu.failure_evidence import FailureEvidence
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._diagnostics import (
@@ -81,6 +82,7 @@ _TERMINAL_OUTCOMES = frozenset(
 _RUNTIME_TERMINAL_CONTROL_FIELDS = frozenset(
     {
         "terminal_outcome",
+        "failure_evidence",
         "tool_effect",
         "outcome_unknown",
         "manual_reconciliation_required",
@@ -245,7 +247,7 @@ def redact_tool_result_event(
         raise TypeError("redactor must be a SecretRedactor.")
     if type(include_terminal_controls) is not bool:
         raise TypeError("include_terminal_controls must be a bool.")
-    event_controls = runtime_terminal_controls(event.payload)
+    event_controls = runtime_terminal_controls(event.payload, redactor=redactor)
     boundary_controls = runtime_tool_execution_boundary_controls(event.payload)
     event_controls.update(boundary_controls)
     result_controls = dict(event_controls) if include_terminal_controls else dict(boundary_controls)
@@ -394,7 +396,48 @@ def _runtime_tool_event_linkage_fields(payload: dict[str, Any]) -> dict[str, str
     return linkage
 
 
-def runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
+def _redacted_failure_evidence(
+    evidence: FailureEvidence, *, redactor: SecretRedactor | None
+) -> dict[str, Any]:
+    """Keep typed diagnostic structure without exempting variable strings.
+
+    Omit secret-bearing type names and identities rather than inventing their
+    replacements. Deadline labels use a fixed schema-valid redaction marker;
+    a secret-bearing expiry cannot remain a valid timestamp, so omit that
+    deadline and downgrade its classification to unknown.
+    """
+    payload = evidence.model_dump(mode="json")
+    if redactor is None or not redactor.has_values:
+        return payload
+
+    def contains_secret(value: str) -> bool:
+        return redactor.redact_text(value) != value
+
+    for snapshot in (payload, *payload.get("branch_failures", [])):
+        names = snapshot["exception_types"]
+        snapshot["exception_types"] = [name for name in names if not contains_secret(name)]
+        if len(snapshot["exception_types"]) != len(names):
+            snapshot["truncated"] = True
+        for key in ("session_id", "terminal_event_id"):
+            if snapshot[key] is not None and contains_secret(snapshot[key]):
+                snapshot[key] = None
+        deadline = snapshot["deadline"]
+        if deadline is not None:
+            if deadline["expires_at"] is not None and contains_secret(deadline["expires_at"]):
+                snapshot["deadline"] = None
+                snapshot["deadline_phase"] = None
+                snapshot["classification"] = "unknown"
+                snapshot["truncated"] = True
+            else:
+                for key in ("source", "scope"):
+                    if contains_secret(deadline[key]):
+                        deadline[key] = "redacted"
+    return payload
+
+
+def runtime_terminal_controls(
+    payload: dict[str, Any], *, redactor: SecretRedactor | None = None
+) -> dict[str, Any]:
     """Validate runtime controls before exempting them from secret redaction."""
 
     if "terminal_outcome" not in payload:
@@ -423,6 +466,9 @@ def runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
         "outcome_unknown": outcome_unknown,
         "manual_reconciliation_required": manual_reconciliation_required,
     }
+    if "failure_evidence" in payload:
+        evidence = FailureEvidence.model_validate(payload["failure_evidence"])
+        controls["failure_evidence"] = _redacted_failure_evidence(evidence, redactor=redactor)
     code_present = "durable_value_error_code" in payload
     path_present = "durable_value_error_path" in payload
     if code_present is not path_present:
@@ -504,7 +550,7 @@ def runtime_tool_event_boundary_controls(
     controls: dict[str, Any] = _runtime_tool_event_linkage_fields(payload)
     projection_references: dict[int, dict[str, Any]] = {}
     if include_terminal_controls:
-        controls.update(runtime_terminal_controls(payload))
+        controls.update(runtime_terminal_controls(payload, redactor=redactor))
         controls.update(runtime_tool_execution_boundary_controls(payload))
     evidence = _runtime_tool_result_projection(payload)
     if evidence is not None:
@@ -677,7 +723,7 @@ def redact_runtime_owned_tool_call_outcomes(
     redacted_outcomes: list[runtime_records.ToolCallOutcome] = []
     for outcome in outcomes:
         structured = dict(outcome.result.structured or {})
-        controls: dict[str, Any] = runtime_terminal_controls(structured)
+        controls: dict[str, Any] = runtime_terminal_controls(structured, redactor=redactor)
         controls.update(runtime_tool_execution_boundary_controls(structured))
         if not controls:
             redacted_result = redact_tool_result(outcome.result, redactor)

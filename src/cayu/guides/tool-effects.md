@@ -80,9 +80,16 @@ it is different from an unknown external outcome. Recovery atomically settles th
 exact unconsumed preparation as `tool.call.failed`, with `executed=false` and
 `outcome_unknown=false` in the structured result. The effect record retains no
 dispatch identity or external receipt. This settlement competes with dispatch on
-the same durable comparison; it never reruns the tool. After
-`recover_incomplete_session`, use normal resume or the existing approval/user-input
-resolution entrance to continue. Approval and answer requirements are unchanged.
+the same durable comparison; it never reruns the tool. Recovery plans offer
+`automatic_repair` for a prepared call when ownership and registration checks
+permit it. Executing that exact plan can settle an ordinary round, retaining its
+completed siblings, without calling a model or tool. Re-plan after the receipt
+and inspect the remaining blockers before proceeding.
+
+Targeted grants still require their normal continuation owner after preparation
+settlement. Approval and answer requirements are unchanged. Use normal resume
+or the existing approval/user-input resolution entrance when continuation is
+needed; automatic repair does not authorize new research or an external retry.
 
 A terminal receipt and fresh verification answer different questions. The
 receipt is downstream evidence about the attempted operation. Verification is a

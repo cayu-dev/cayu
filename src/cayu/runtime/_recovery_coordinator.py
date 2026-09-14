@@ -286,7 +286,10 @@ from cayu.runtime._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.runtime._tool_effect_preparation_recovery import settle_prepared_tool_effects
+from cayu.runtime._tool_effect_preparation_recovery import (
+    requires_explicit_effect_continuation,
+    settle_prepared_tool_effects,
+)
 from cayu.runtime._tool_effect_reconciliation import (
     ToolEffectReconciliationOwner,
     project_accepted_reconciliation,
@@ -16417,17 +16420,15 @@ class RecoveryCoordinator:
                     tool_round_id=pending_round.tool_round_id,
                     tool_call_id=call.tool_call_id,
                 )
-                if (
-                    effect is not None
-                    and effect.terminal is not None
-                    and (effect.terminal.receipt is not None or effect.dispatch_id is None)
+                if effect is not None and requires_explicit_effect_continuation(
+                    effect, pending_round
                 ):
                     # Incomplete recovery does not run the model continuation.
                     # Closing this round would make exact receipt replay appear
                     # consumed before its explicit continuation has started.
-                    # A recovered unconsumed preparation likewise waits for
-                    # ordinary continuation; do not rejoin its targeted grant
-                    # under this interruption-only recovery claim.
+                    # Targeted preparations also wait for continuation; do not
+                    # rejoin their grants under an interruption-only claim.
+                    # Ordinary non-dispatch terminals can close deterministically.
                     raise ToolEffectReconciliationRequired()
         if expected_transcript_cursor is None:
             expected_transcript_cursor = await self._session_store.load_transcript_cursor(

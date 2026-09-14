@@ -556,6 +556,9 @@ def test_real_docker_native_child_completed_result_survives_cancellation(
             runner_factory=lambda root: runner,
             provider_factory=ContainerProvider,
             child_deadline=child_deadline,
+            # Container startup and publication are setup, not the speed SLA
+            # under test. Expiry must reach the retained terminal barrier.
+            child_deadline_seconds=30,
             binding_factory=DeterministicWorkspaceBinding if configured_binding else lambda: None,
         )
     finally:

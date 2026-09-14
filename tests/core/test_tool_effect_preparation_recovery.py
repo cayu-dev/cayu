@@ -28,6 +28,8 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
+    RecoveryDecision,
+    RecoveryExecutionRequest,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
@@ -275,12 +277,36 @@ def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_pat
                 store = SQLite(tmp_path / "prepared.sqlite", public_authority_alias_codec=codec)
                 stack.push_async_callback(store.close)
             app = application(store)
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id="prepared",
-                    inactive_for_seconds=0,
+            if pause in {"ordinary", "gateway", "workspace"}:
+                before_events = await store.load_events("prepared")
+                plan = await app.plan_recovery(
+                    RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=("prepared",)))
                 )
-            )
+                assert RecoveryPlanAction.AUTOMATIC_REPAIR in plan.items[0].allowed_actions
+                assert not plan.items[0].blockers
+                assert await store.load_events("prepared") == before_events
+                assert await store.load_session_operation("prepared", effect_key) == prior
+                receipt = await app.execute_recovery(
+                    RecoveryExecutionRequest(
+                        plan=plan,
+                        execution_id="settle-preparation",
+                        decisions=(
+                            RecoveryDecision(
+                                item_id=plan.items[0].item_id,
+                                action=RecoveryPlanAction.AUTOMATIC_REPAIR,
+                            ),
+                        ),
+                    )
+                )
+                assert receipt.items[0].status.value == "executed"
+                assert invocations == [] and model_results == []
+            else:
+                await app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id="prepared",
+                        inactive_for_seconds=0,
+                    )
+                )
             selected = await store.load_session_operation("prepared", effect_key)
             assert selected["state"] == "failed"
             assert selected["dispatch_id"] is None and selected["terminal"]["receipt"] is None
@@ -291,9 +317,13 @@ def test_cancelled_preparation_recovers_without_dispatch(backend, pause, tmp_pat
                     RecoveryPlanRequest(selection=RecoveryPlanSelection(session_ids=("prepared",)))
                 )
                 assert plan.items[0].allowed_actions == (RecoveryPlanAction.LEAVE_INTACT,)
-                assert RecoveryBlockerCode.TOOL_EFFECT_CONTINUATION_REQUIRED in {
-                    blocker.code for blocker in plan.items[0].blockers
-                }
+                if pause == "gateway":
+                    assert RecoveryBlockerCode.TOOL_EFFECT_CONTINUATION_REQUIRED in {
+                        blocker.code for blocker in plan.items[0].blockers
+                    }
+                else:
+                    assert not plan.items[0].blockers
+                    assert not plan.items[0].pending_actions
                 assert await store.load_events("prepared") == before_plan
                 assert await store.load_session_operation("prepared", effect_key) == selected
             events = [

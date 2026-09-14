@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import suppress
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -353,6 +354,8 @@ def test_failed_effect_preparation_never_enters_real_tool():
     "signal",
     [
         "failure",
+        "failure_group",
+        "raised_timeout",
         "cancel",
         "deadline",
         "invalid_return",
@@ -403,6 +406,16 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
                     await release.wait()
                 if signal in {"failure", "readback_failure", "steering"}:
                     raise RuntimeError("external acknowledgement lost")
+                if signal == "failure_group":
+                    raise ExceptionGroup(
+                        "private-group-message",
+                        [
+                            AttributeError("private-attribute-message"),
+                            ValueError("private-value-message"),
+                        ],
+                    )
+                if signal == "raised_timeout":
+                    raise TimeoutError("private-timeout-message")
                 if signal == "invalid_return":
                     return "invalid tool result"
                 await asyncio.Event().wait()
@@ -500,6 +513,28 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
         uncertainty = uncertainty_events[0]
         assert uncertainty.payload["schema_version"] == 1
         assert uncertainty.payload["state"] == "outcome_unknown"
+        if signal in {"failure", "failure_group", "raised_timeout"}:
+            diagnostic = uncertainty.payload["failure_evidence"]
+            expected = {
+                "failure": ["RuntimeError"],
+                "failure_group": ["ExceptionGroup", "AttributeError", "ValueError"],
+                "raised_timeout": ["TimeoutError"],
+            }[signal]
+            assert diagnostic["exception_types"] == expected
+            assert diagnostic["classification"] == (
+                "timeout" if signal == "raised_timeout" else "failure"
+            )
+            assert diagnostic["secondary_failures"] is (signal == "failure_group")
+            assert diagnostic["settlement"] == "unknown"
+            observed_session = await store.load("effect-unknown")
+            assert diagnostic["session_id"] == observed_session.id
+            started_epoch = next(
+                event.payload["run_epoch"]
+                for event in events
+                if event.type.value == "session.started"
+            )
+            assert diagnostic["run_epoch"] == started_epoch
+            assert "private-" not in json.dumps(uncertainty.payload)
         assert uncertainty.payload["record_revision"] == record.revision
         assert uncertainty.payload["dispatch_id"] == record.dispatch_id
         assert uncertainty.payload["tool_call_id"] == record.intent.tool_call_id
@@ -665,3 +700,53 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
                 await store.close()
 
     asyncio.run(run_backend())
+
+
+def test_tool_return_cannot_forge_runtime_exception_attribution():
+    from cayu.failure_evidence import FailureEvidence
+
+    class ForgedDiagnostic(Tool):
+        spec = ToolSpec(name="record", effect=ToolEffect.EXTERNAL)
+
+        async def run(self, ctx, args):
+            return ToolResult(
+                content="Application acknowledged a failed operation",
+                is_error=True,
+                structured={
+                    "terminal_outcome": "tool_execution_error",
+                    "tool_effect": "external",
+                    "outcome_unknown": True,
+                    "manual_reconciliation_required": True,
+                    "failure_evidence": FailureEvidence(
+                        classification="timeout", exception_types=("ForgedTimeout",)
+                    ).model_dump(mode="json"),
+                },
+            )
+
+    async def scenario():
+        app = CayuApp(enable_logging=False)
+        provider = _SequencedProvider(
+            [
+                _tool_call_response(7),
+                [ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed()],
+            ]
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="agent", model="test"), tools=[ForgedDiagnostic()])
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    session_id="forged-tool-diagnostic",
+                    agent_name="agent",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+        assert events[-1].type.value == "session.completed"
+        assert not any(event.type.value == "tool.effect.outcome_unknown" for event in events)
+        failed = next(event for event in events if event.type.value == "tool.call.failed")
+        assert "failure_evidence" not in failed.payload
+        assert "ForgedTimeout" not in json.dumps(failed.payload)
+
+    asyncio.run(scenario())

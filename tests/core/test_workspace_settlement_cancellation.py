@@ -53,6 +53,7 @@ def test_cancel_before_workspace_terminal(
     provider_factory=_ScriptedProvider,
     child_deadline=False,
     binding_factory=DeterministicWorkspaceBinding,
+    child_deadline_seconds=5,
 ):
     async def run():
         store = (
@@ -131,7 +132,9 @@ def test_cancel_before_workspace_terminal(
                     step_id="write",
                     prompt="create a file",
                     run_options=StepRunOptions(
-                        execution_deadline=ExecutionDeadline.after(5 if child_deadline else None)
+                        execution_deadline=ExecutionDeadline.after(
+                            child_deadline_seconds if child_deadline else None
+                        )
                     ),
                 )
             return [
@@ -148,10 +151,10 @@ def test_cancel_before_workspace_terminal(
         task = asyncio.create_task(consume())
         try:
             if cancel:
-                await asyncio.wait_for(reached.wait(), 15)
+                await asyncio.wait_for(reached.wait(), max(15, child_deadline_seconds + 5))
                 if child_deadline:
                     with pytest.raises(StepError) as caught:
-                        await asyncio.wait_for(task, 15)
+                        await asyncio.wait_for(task, max(15, child_deadline_seconds + 5))
                     assert caught.value.evidence.classification == "deadline"
                     assert not caught.value.evidence.secondary_failures
                 else:

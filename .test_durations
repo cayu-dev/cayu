@@ -32231,5 +32231,11 @@
     "tests/server/test_task_schedule_routes.py::test_schedule_http_validation_is_secret_safe[policy]": 0.23284424911253154,
     "tests/core/test_public_task_scheduling.py::test_contracted_schedule_creation_replays_after_edit_and_cancellation[memory]": 11.789527624147013,
     "tests/core/test_public_task_scheduling.py::test_contracted_schedule_creation_replays_after_edit_and_cancellation[postgres]": 17.209945917129517,
-    "tests/core/test_public_task_scheduling.py::test_contracted_schedule_creation_replays_after_edit_and_cancellation[sqlite]": 13.045676624868065
+    "tests/core/test_public_task_scheduling.py::test_contracted_schedule_creation_replays_after_edit_and_cancellation[sqlite]": 13.045676624868065,
+    "tests/core/test_tool_failure_evidence_redaction.py::test_native_tool_deadline_diagnostic_redacts_public_and_durable_evidence[external-memory]": 1.364567625336349,
+    "tests/core/test_tool_failure_evidence_redaction.py::test_native_tool_deadline_diagnostic_redacts_public_and_durable_evidence[external-sqlite]": 1.376935207983479,
+    "tests/core/test_tool_failure_evidence_redaction.py::test_native_tool_deadline_diagnostic_redacts_public_and_durable_evidence[none-memory]": 1.3352679170202464,
+    "tests/core/test_tool_failure_evidence_redaction.py::test_native_tool_deadline_diagnostic_redacts_public_and_durable_evidence[none-sqlite]": 1.4481275009457022,
+    "tests/core/test_tool_failure_evidence_redaction.py::test_secret_expiry_is_omitted_without_invalidating_failure_evidence": 0.0004805827047675848,
+    "tests/core/test_tool_failure_evidence_redaction.py::test_variable_failure_evidence_is_redacted_before_control_restoration": 0.012402667198330164
 }

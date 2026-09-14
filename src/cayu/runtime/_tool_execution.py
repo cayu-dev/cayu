@@ -17,6 +17,7 @@ from cayu._validation import (
 )
 from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
+from cayu.failure_evidence import exception_evidence
 from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope
@@ -267,10 +268,17 @@ class ToolExecutionOutcome:
 def _execution_outcome(
     result: ToolResult,
     terminal_payload: dict[str, Any] | None = None,
+    *,
+    exception: BaseException | None = None,
 ) -> ToolExecutionOutcome:
+    controls = dict(terminal_payload or {})
+    if exception is not None:
+        # Only the caught invocation exception populates this diagnostic. The
+        # effect remains uncertain; exception type is never settlement evidence.
+        controls["failure_evidence"] = exception_evidence(exception).model_dump(mode="json")
     return ToolExecutionOutcome(
         result,
-        terminal_payload or {},
+        controls,
         _token=_OUTCOME_CONSTRUCTION_TOKEN,
     )
 
@@ -689,7 +697,7 @@ async def _run_tool(
             diagnostic=diagnostic,
             redactor=active_redactor,
         )
-        return _execution_outcome(result, controls)
+        return _execution_outcome(result, controls, exception=exc)
     except BaseExceptionGroup as exc:
         ctx._discard_policy_denials_for(tool)
         if exception_tree_contains(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
@@ -715,7 +723,7 @@ async def _run_tool(
                 message="Tool execution reported multiple failures.",
                 redactor=active_redactor,
             )
-            return _execution_outcome(result, controls)
+            return _execution_outcome(result, controls, exception=exc)
         else:
             current_cancellation = is_current_runner_cancellation_group(exc) or (
                 current_task is not None and current_task.cancelling() > cancellation_baseline
@@ -728,7 +736,7 @@ async def _run_tool(
                     message="Tool execution reported multiple failures.",
                     redactor=active_redactor,
                 )
-                return _execution_outcome(result, controls)
+                return _execution_outcome(result, controls, exception=exc)
             grouped_failure = sanitize_runner_failure_group(
                 exc,
                 caller_cancelled=True,
@@ -741,7 +749,7 @@ async def _run_tool(
             effect=effect,
             redactor=active_redactor,
         )
-        return _execution_outcome(result, controls)
+        return _execution_outcome(result, controls, exception=exc)
     except Exception as exc:
         # Only this invocation's runtime callback proves that Tool.run was
         # never entered. Identical tool-authored errors remain ordinary tool
@@ -839,7 +847,7 @@ async def _run_tool(
                 diagnostic=diagnostic,
                 redactor=active_redactor,
             )
-            return _execution_outcome(result, controls)
+            return _execution_outcome(result, controls, exception=exc)
 
     if grouped_failure is not None:
         raise grouped_failure

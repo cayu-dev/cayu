@@ -1395,6 +1395,15 @@ finalize a retained complete workspace delta without changing the unknown effect
 re-executing the tool, or retiring its pending round. Capture-failure details belong
 to `workspace.observation.finalized` when there is no terminal tool event.
 
+When Runtime catches an invocation exception, the retained
+`tool.effect.outcome_unknown.payload["failure_evidence"]` includes its bounded
+exception-type tree and failure classification, bound to the dispatch session and
+run epoch. Exception messages and tracebacks are omitted. Secret-bearing diagnostic
+fields are redacted or omitted without upgrading settlement evidence. Tool-returned structured
+data and hook rewrites cannot supply this Runtime-owned diagnostic. An observed
+exception does not prove external settlement: the effect remains unknown and
+requires reconciliation before continuation, without automatic tool replay.
+
 Tool-terminal publication timing and pending-round retirement wait until all workspace observations have settled durably. If cancellation interrupts observation publication, Cayu retains the original content-bound stage and its pending round for recovery; it does not retimestamp the stage or remove the round after publishing only the delta. The interaction may pause for tool recovery while the session records interruption. Caller cancellation and supervisory signals still propagate. Recovery settles observation evidence before publishing the tool terminal and retiring the round, without replaying the mutation.
 
 Fresh-process incomplete-session recovery closes every surviving observation record before ordinary tool-round repair. Intent or before-only records become `workspace.observation.finalized` with `ambiguous`; a durable tool outcome without complete after/delta evidence becomes `incomplete`; a complete durable delta is verified and finalized without observing the current workspace or assigning later changes to the original tool. A terminal recovery event without a verified mutation receipt carries explicit `external_or_unknown` (or `concurrent_ambiguity` for an ambiguous lifecycle) attribution with unknown isolation and no direct-operation claim. When an unmaterialized factory leaves the historical concrete observation authority unavailable, even complete retained delta evidence is finalized as incomplete rather than being upgraded through a replacement environment. The recovery action is `repaired_workspace_observation`. Competing workers use the session recovery claim plus run-epoch/CAS transitions and therefore converge on one terminal event. Missing or conflicting content-bound tool evidence fails closed as ambiguous rather than authorizing reconstructed causality.

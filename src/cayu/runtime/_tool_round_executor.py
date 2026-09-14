@@ -1195,17 +1195,25 @@ class _ToolRoundPublicationCoordinator:
                         tool_round_id=self._tool_round_identity.tool_round_id,
                         tool_call_ids=(tool_call_id,),
                         unverified_output=unverified_output,
-                        failure_evidence=FailureEvidence(
-                            classification=(
-                                "timeout"
-                                if projected.payload.get("terminal_outcome")
-                                == "tool_execution_timeout"
-                                else "interruption"
-                                if projected.payload.get("interrupted") is True
-                                else "failure"
-                            ),
-                            session_id=session.id,
-                            run_epoch=session.run_epoch,
+                        failure_evidence=(
+                            FailureEvidence.model_validate(projected.payload["failure_evidence"])
+                            if "failure_evidence" in projected.payload
+                            else FailureEvidence(
+                                classification=(
+                                    "timeout"
+                                    if projected.payload.get("terminal_outcome")
+                                    == "tool_execution_timeout"
+                                    else "interruption"
+                                    if projected.payload.get("interrupted") is True
+                                    else "failure"
+                                ),
+                            )
+                        ).model_copy(
+                            update={
+                                "session_id": session.id,
+                                "run_epoch": session.run_epoch,
+                                "terminal_event_id": None,
+                            }
                         ),
                     )
                 ):

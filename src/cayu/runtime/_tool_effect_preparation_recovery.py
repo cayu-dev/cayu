@@ -11,7 +11,11 @@ from cayu.events import Event, EventType
 from cayu.runtime._approval_support import tool_call_request_from_pending
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_argument_publication import unavailable_argument_projection
-from cayu.runtime._tool_effect_state import ToolEffectStateOwner, ToolEffectTerminal
+from cayu.runtime._tool_effect_state import (
+    ToolEffectRecord,
+    ToolEffectStateOwner,
+    ToolEffectTerminal,
+)
 from cayu.runtime._tool_round_executor import (
     _event_with_targeted_tool_invocation_authority,
     _event_with_tool_round_authority,
@@ -26,6 +30,22 @@ from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.tool_effects import ToolEffectConflict
 from cayu.sessions.base import Session, SessionStore
 from cayu.tools.base import ToolResult
+
+
+def requires_explicit_effect_continuation(
+    record: ToolEffectRecord, pending: PendingToolRound
+) -> bool:
+    """Receipt consumption and targeted grants still require a continuation owner."""
+    if record.terminal is None:
+        return False
+    if record.terminal.receipt is not None:
+        return True
+    return record.dispatch_id is None and any(
+        call.targeted_tool_grant_id is not None
+        or call.targeted_tool_invocation is not None
+        or call.targeted_tool_rejection is not None
+        for call in pending.tool_calls
+    )
 
 
 async def settle_prepared_tool_effects(

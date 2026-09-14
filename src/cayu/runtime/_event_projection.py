@@ -2663,6 +2663,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "outcome_unknown",
         "registration_state",
         "terminal_outcome",
+        "failure_evidence",
         "tool_effect",
         "tool_execution_boundary",
         "tool_timeout_strength",
@@ -3285,6 +3286,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "truncated",
         )
     } | {("failure_evidence", "deadline", key) for key in ("expires_at", "source", "scope")}
+    for event_type in (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED):
+        policies[event_type] = replace(
+            policies[event_type],
+            owned_nested_paths=policies[event_type].owned_nested_paths
+            | frozenset(failure_evidence_owned_paths),
+        )
     policies[EventType.TOOL_EFFECT_OUTCOME_UNKNOWN] = replace(
         policies[EventType.TOOL_EFFECT_OUTCOME_UNKNOWN],
         owned_nested_paths=frozenset(failure_evidence_owned_paths),

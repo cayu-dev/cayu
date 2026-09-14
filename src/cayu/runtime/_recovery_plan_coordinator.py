@@ -53,6 +53,7 @@ from cayu.runtime._recovery_coordinator import (
 from cayu.runtime._task_store_operation_boundary import (
     task_store_exact_interrupted_handoff_capability_is_complete,
 )
+from cayu.runtime._tool_effect_preparation_recovery import requires_explicit_effect_continuation
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
@@ -732,10 +733,14 @@ class RecoveryPlanCoordinator:
                     tool_round_id=action.round_id,
                     tool_call_id=action.tool_call_id,
                 )
-                if effect is not None and effect.terminal is not None:
+                if effect is not None and (
+                    effect.terminal is not None or effect.state == "prepared"
+                ):
                     # The effect owner already selected an immutable result.
                     # Existing automatic recovery publishes/repairs that evidence;
                     # an operator must not replace it with a manual result.
+                    # Preparation is positive non-dispatch evidence: recovery
+                    # competes with dispatch using the same exact revision CAS.
                     continue
                 blockers.append(
                     RecoveryPlanBlocker(
@@ -783,10 +788,8 @@ class RecoveryPlanCoordinator:
                     tool_round_id=pending_round.tool_round_id,
                     tool_call_id=call.tool_call_id,
                 )
-                if (
-                    effect is not None
-                    and effect.terminal is not None
-                    and (effect.terminal.receipt is not None or effect.dispatch_id is None)
+                if effect is not None and requires_explicit_effect_continuation(
+                    effect, pending_round
                 ):
                     blockers.append(
                         RecoveryPlanBlocker(
