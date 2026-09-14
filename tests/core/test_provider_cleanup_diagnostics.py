@@ -715,3 +715,51 @@ def test_read_close_evidence_is_revalidated(name, value):
     fields[name] = value
     with pytest.raises(ValueError):
         copy_cleanup_diagnostics(fields)
+
+
+def test_detached_wrapper_preserves_close_cancellation():
+    from cayu.providers._credential_boundary import detach_provider_stream_traceback
+
+    async def scenario():
+        entered = asyncio.Event()
+        closes = 0
+
+        class Source:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return ModelStreamEvent.text_delta("synthetic")
+
+            async def aclose(self):
+                nonlocal closes
+                closes += 1
+                raise asyncio.CancelledError(CANARY)
+
+        @detach_provider_stream_traceback
+        def wrapped():
+            return Source()
+
+        async def consume():
+            async with aclosing_provider_stream(wrapped()) as stream:
+                await anext(stream)
+                entered.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(entered.wait(), 10)
+        task.cancel("caller")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(task, 10)
+        assert task.cancelling() == 1
+        assert closes == 1
+        (diagnostic,) = provider_cancellation_failures(caught.value)
+        assert diagnostic["cleanup_reason"] == "cleanup_cancelled"
+        assert diagnostic["cleanup_exception_type"] == "CancelledError"
+        assert diagnostic["cleanup_failure_phase"] == "close"
+        assert diagnostic["cleanup_close_exception_type"] == "CancelledError"
+        assert diagnostic["stream_close_state"] == "not_confirmed"
+        assert diagnostic["remote_settlement_state"] == "unknown"
+        assert CANARY not in json.dumps(diagnostic)
+
+    asyncio.run(scenario())

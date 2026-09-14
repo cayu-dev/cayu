@@ -27,6 +27,7 @@ from cayu.providers._cleanup_diagnostics import (
     MAX_CLEANUP_DIAGNOSTIC_FIELDS,
     cleanup_diagnostics,
     copy_cleanup_diagnostics,
+    mark_close_cancellation,
 )
 from cayu.providers.base import ModelProviderError, ModelStreamDeadlineError
 from cayu.providers.deadlines import (
@@ -1045,6 +1046,7 @@ def detach_provider_stream_traceback(
                 and cancellation_count <= cleanup_cancellation_baseline
             ):
                 terminal_failure = _provider_stream_cleanup_error()
+                mark_close_cancellation(terminal_failure)
                 cleanup_failure = None
                 task = None
                 _raise_detached_provider_stream_cleanup_error(terminal_failure)

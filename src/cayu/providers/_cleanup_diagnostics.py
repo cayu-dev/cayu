@@ -9,9 +9,18 @@ from typing import Any
 
 import httpx
 
-from cayu._exception_state import exception_state
+from cayu._exception_state import exception_state, set_exception_state
 from cayu._validation import EXECUTION_UNIT_ID_MAX_CHARS, require_execution_unit_id
 from cayu.providers.base import ModelProviderError
+
+_CLOSE_CANCELLATION_STATE = "_cayu_close_cancellation"
+_CLOSE_CANCELLATION_TOKEN = object()
+
+
+def mark_close_cancellation(failure: BaseException) -> None:
+    """Retain only a Runtime-authenticated type, never the source exception."""
+    set_exception_state(failure, _CLOSE_CANCELLATION_STATE, _CLOSE_CANCELLATION_TOKEN)
+
 
 # Exact classes only: extension class names and formatting hooks are untrusted.
 _EXCEPTION_TYPES = (
@@ -143,6 +152,11 @@ def cleanup_diagnostics(
     exception_type = next(
         (name for cls, name in _EXCEPTION_TYPES if type(failure) is cls), "unknown"
     )
+    if (
+        failure is not None
+        and exception_state(failure, _CLOSE_CANCELLATION_STATE) is _CLOSE_CANCELLATION_TOKEN
+    ):
+        exception_type = "CancelledError"
     if exception_type == "CancelledError":
         reason = "cleanup_cancelled"
     elif exception_type in {
