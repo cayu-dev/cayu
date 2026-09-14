@@ -28,9 +28,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     thaw_json_value,
 )
-from cayu.artifacts import ArtifactStore
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import ToolContext
+from cayu.artifacts.base import ArtifactStore
 from cayu.credentials import CredentialMode
 from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
 from cayu.environments.admission import (
@@ -72,11 +70,13 @@ from cayu.immutable_inputs import (
     LocalImmutableInput,
     docker_immutable_input_capability,
 )
-from cayu.runners import ExecCommand, Runner
+from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
-from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
-from cayu.workspaces.base import matches_list_pattern
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools.base import ToolContext
+from cayu.workspaces.base import Workspace, matches_list_pattern
+from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
@@ -85,6 +85,7 @@ from cayu.workspaces.revisions import (
     compare_workspace_revisions,
     observe_deterministic_workspace,
 )
+from cayu.workspaces.runner import RunnerWorkspace
 
 DOCKER_CODING_PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")

@@ -21,19 +21,8 @@ from tests.server._app_native_takeover_race import NativeTakeoverRace
 from tests.server._app_native_terminal_disconnect import NativeTerminalDisconnect
 from tests.server._browser_control_tls_server import browser_control_tls_server
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    InMemorySessionStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    run_to_completion,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.browser_profiles import (
     AESGCMBrowserProfileKeyAuthority,
     BrowserProfileBinding,
@@ -42,11 +31,12 @@ from cayu.browser_profiles import (
     BrowserProfileScope,
     SQLiteBrowserProfileStore,
 )
-from cayu.runners import ExecResult, Runner
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import ExecResult, Runner
 from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
-from cayu.runtime.browser_control import BrowserControlCheckpoint
-from cayu.runtime.browser_control_config import BrowserControlConfig
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.server import (
     BasicAuth,
     BrowserControlServerConfig,
@@ -54,11 +44,18 @@ from cayu.server import (
     ServerConfig,
     create_server,
 )
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.sessions.outcomes import run_to_completion
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import _browser_guest
 from cayu.tools._browser_control_transport import open_guest_control_channel
 from cayu.tools._redaction import active_secret_redactor
+from cayu.tools.browser_control import BrowserControlCheckpoint
+from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
-from cayu.vaults import SecretRef, StaticVault
+from cayu.vaults.base import SecretRef
+from cayu.vaults.static import StaticVault
 
 control_tls = _control_tls
 pytestmark = pytest.mark.skipif(

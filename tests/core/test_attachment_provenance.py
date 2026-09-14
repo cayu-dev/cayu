@@ -11,15 +11,17 @@ from tests.core._execution_profile_fixtures import versioned_test_provider_ident
 from tests.core.test_builtin_tools import FakeProvider
 
 from cayu import ArtifactScope, Environment, EnvironmentSpec, LocalArtifactStore, file_attachment
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import FilePart
-from cayu.core.tools import ToolContext
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.base import DefaultContextPolicy
+from cayu.events import EventType
+from cayu.messages import FilePart, Message
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import CayuApp, ResumeRequest, RunRequest
 from cayu.runtime._model_step_executor import _file_attachment_refs
-from cayu.runtime.context import DefaultContextPolicy
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import ToolContext
 from cayu.tools.files import ReadFileTool
 
 
@@ -270,11 +272,11 @@ def test_compatible_provenance_cannot_authorize_unavailable_derived_artifact(
 ):
     from tests._session_provenance import fixture_session_invocation
 
-    from cayu.runtime import Session
     from cayu.runtime._model_step_executor import (
         _FileAttachmentUnavailable,
         _resolved_file_attachments,
     )
+    from cayu.sessions.base import Session
 
     async def scenario():
         store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")

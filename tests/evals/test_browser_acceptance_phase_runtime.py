@@ -21,26 +21,19 @@ from tests.evals.test_browser_acceptance_operator_oracle import (
     _settled_record,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    InMemorySessionStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-)
-from cayu.evals import (
-    BrowserAcceptanceAuthenticationCollector,
-    EvalCase,
-    EvalSuite,
-    SessionCompleted,
-    run_eval_suite,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import EnvironmentSpec
+from cayu.evals.assertions import SessionCompleted
 from cayu.evals.browser_acceptance import _case_authentication_evidence
+from cayu.evals.browser_acceptance_authentication import BrowserAcceptanceAuthenticationCollector
 from cayu.evals.corpus import _content_revision
+from cayu.evals.runner import EvalCase, EvalSuite, run_eval_suite
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.browser_session import (
     BrowserSessionTool,
     _durable_browser_operation_key,

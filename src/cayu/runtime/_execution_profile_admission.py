@@ -13,7 +13,7 @@ from uuid import uuid4
 from weakref import ReferenceType, ref
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
 from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
 from cayu.providers.deadlines import _provider_deadline_material
 from cayu.runtime import _approval_support as approval_support
@@ -21,6 +21,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._runtime_replay_profile import runtime_replay_profile_source
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileComponentClass,
@@ -32,20 +33,19 @@ from cayu.runtime.execution_profiles import (
     execution_profile_with_component,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.sessions import Session
 from cayu.runtime.stop_policy import RunLimits
-from cayu.runtime.targeted_tool_projection import (
-    TargetedToolProjectionKind,
-    resolve_targeted_tool_projection,
-)
-from cayu.runtime.tool_discovery import (
+from cayu.sessions.base import Session
+from cayu.tools.discovery import (
     ToolDiscoveryProjectionKind,
     resolve_tool_discovery_projection,
     tool_discovery_execution_profile_material,
 )
-from cayu.runtime.tool_gateway import call_tool_gateway_execution_profile_material
-from cayu.runtime.user_input import user_input_lifecycle_authority_from_checkpoint
-from cayu.vaults import SecretRedactor
+from cayu.tools.gateway import call_tool_gateway_execution_profile_material
+from cayu.tools.targeted_projection import (
+    TargetedToolProjectionKind,
+    resolve_targeted_tool_projection,
+)
+from cayu.vaults.redaction import SecretRedactor
 
 _MODEL_FINALIZATION_MATERIAL_KIND = "cayu:model-finalization:v2"
 _MODEL_COMPACTOR_MATERIAL_VERSION = 2
@@ -307,7 +307,7 @@ def resolve_execution_profile_identity(
     # Preserve the historical expose-all profile byte-for-byte. Any other
     # exposure policy changes provider-visible behavior and therefore belongs
     # in the existing execution-policies identity component.
-    from cayu.runtime.tool_exposure import AllRegisteredToolsExposurePolicy
+    from cayu.tools.exposure import AllRegisteredToolsExposurePolicy
 
     tool_exposure_policy_entry: dict[str, Any] | None = None
     if type(registered_agent.tool_exposure_policy) is not AllRegisteredToolsExposurePolicy:
@@ -1079,19 +1079,19 @@ def _cayu_runner_material(runner: object) -> dict[str, Any] | None:
 
 @lru_cache(maxsize=1)
 def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMaterialExtractor]:
-    from cayu.runtime.tool_exposure import (
+    from cayu.tools.command_policy import ProcessCommandPolicy
+    from cayu.tools.exposure import (
         AllRegisteredToolsExposurePolicy,
         StaticToolExposurePolicy,
     )
-    from cayu.runtime.tool_policy import (
+    from cayu.tools.git_command_policy import GitCommandPolicy
+    from cayu.tools.policy import (
         AllowAllToolPolicy,
         AlwaysRequireApprovalToolPolicy,
         ParameterConstrainedToolPolicy,
         StaticToolPolicy,
         TaintAwareToolPolicy,
     )
-    from cayu.tools.command_policy import ProcessCommandPolicy
-    from cayu.tools.git_command_policy import GitCommandPolicy
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     policy_types = (
@@ -1292,7 +1292,7 @@ def _cayu_context_policy_material(
     behavior_identities: Mapping[int, ExecutionProfileBehaviorIdentity | None],
     process_identity: str,
 ) -> _ContextComponentMaterials | None:
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         CheckpointCompactionContextPolicy,
         DefaultContextPolicy,
@@ -1301,7 +1301,7 @@ def _cayu_context_policy_material(
         TranscriptDigestCompactor,
         UsageTriggeredContextPolicy,
     )
-    from cayu.runtime.memory_context import AutomaticRecallContextPolicy
+    from cayu.memory.context import AutomaticRecallContextPolicy
 
     declared_identity = behavior_identities.get(id(policy))
     if declared_identity is not None:
@@ -1591,7 +1591,7 @@ def _cayu_compactor_material(
 ) -> dict[str, Any] | None:
     """Identify transparent built-in compactors without retaining prompt content."""
 
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         ModelCompactor,
         PromptCacheCompactor,
         TranscriptDigestCompactor,

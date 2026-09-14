@@ -6,21 +6,21 @@ from configuration.maintenance import (  # ty: ignore[unresolved-import]
     configured_maintenance_git_authority,
 )
 
-from cayu import (
-    InvocationOrigin,
-    InvocationOriginClaim,
-    InvocationOriginTrust,
+from cayu.delivery.git import (
     RemoteGitDeliveryApproval,
     RemoteGitDeliveryRepository,
     RemoteGitDeliveryRequest,
     RemoteGitDeliveryState,
-    Task,
-    TaskCreate,
-    TaskInvocation,
-    TaskStatus,
     approve_remote_git_delivery,
     remote_git_delivery_request,
 )
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    TaskInvocation,
+)
+from cayu.tasks.base import Task, TaskCreate, TaskStatus
 from tests.qualification.repository_maintenance_identity import copy_identity
 from tests.qualification.repository_maintenance_intake import (
     MaintenanceTaskConflict,

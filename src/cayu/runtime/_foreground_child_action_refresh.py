@@ -13,7 +13,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import Event, EventType
+from cayu.events import Event, EventType
 from cayu.runtime._foreground_child_wait import (
     FOREGROUND_CHILD_WAIT_KEY,
     ForegroundChildWait,
@@ -27,7 +27,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     Session,
     SessionOperationPublication,
     SessionRunFenced,

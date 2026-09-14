@@ -6,8 +6,8 @@ import os
 from typing import Any
 
 from cayu import AgentSpec, CayuApp, OpenAIProvider, ScriptedModelProvider, WorkflowSpec
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.providers import ModelStreamEvent
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.workflows import StepRunOptions, WorkflowBase, step
 
 SUMMARY_SCHEMA = {

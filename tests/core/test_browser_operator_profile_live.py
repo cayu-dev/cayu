@@ -27,14 +27,14 @@ from cayu.browser_profiles import (
 )
 from cayu.runners import ExecResult
 from cayu.runtime._browser_control_model import browser_model_control_admission
-from cayu.runtime.browser_control import (
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools._browser_guest import _interactive_request_from_json, _InteractiveDaemon
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlCheckpoint,
     BrowserControlRecord,
     BrowserOperatorPageOperations,
 )
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
-from cayu.tools._browser_guest import _interactive_request_from_json, _InteractiveDaemon
 from cayu.tools.browser_session import BrowserSessionTool
 
 

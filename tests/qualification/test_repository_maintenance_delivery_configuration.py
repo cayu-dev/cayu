@@ -7,8 +7,8 @@ import warnings
 
 import pytest
 
-from cayu import remote_git_broker_behavior_fingerprint
 from cayu.cli.project import project_context
+from cayu.delivery.git import remote_git_broker_behavior_fingerprint
 from tests.qualification.test_repository_maintenance_application import project as project
 
 

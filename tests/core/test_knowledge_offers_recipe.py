@@ -11,23 +11,21 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    InMemoryEmbeddingKnowledgeStore,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    ModelProvider,
-    ModelStreamEvent,
-)
-from cayu.core.messages import TextPart, ToolResultPart
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.providers.base import ModelRequest
-from cayu.runtime.sessions import InMemorySessionStore
+from cayu.messages import TextPart, ToolResultPart
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore
+from cayu.storage.memory import (
+    InMemoryEmbeddingKnowledgeStore,
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+)
 
 
 class _FixtureEmbeddings(TextEmbeddingProvider):

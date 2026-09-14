@@ -23,10 +23,10 @@ from urllib.parse import quote, urlsplit
 from pydantic import SecretStr
 
 from cayu.evals.corpus import _content_revision
-from cayu.runtime.browser_control import BrowserControlIdentity, BrowserControlPage
-from cayu.runtime.browser_control_config import BrowserControlConfig
 from cayu.server._browser_input_routes import OPERATOR_INPUT_SUBPROTOCOL
 from cayu.tools._browser_control_transport import _private_transport_logger
+from cayu.tools.browser_control import BrowserControlIdentity, BrowserControlPage
+from cayu.tools.browser_control_config import BrowserControlConfig
 
 if TYPE_CHECKING:
     import httpx

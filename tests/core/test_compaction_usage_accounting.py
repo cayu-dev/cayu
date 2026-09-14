@@ -6,20 +6,16 @@ from decimal import Decimal
 
 import pytest
 
-import cayu.runtime.context as runtime_context_module
-from cayu.core import AgentSpec, Event, EventType, Message
+import cayu.context.base as runtime_context_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, budget_actual_cost_for_event
+from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
+from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
-from cayu.runtime import (
-    BudgetLimit,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    ModelCompactor,
-    ModelPrice,
-    PriceBook,
-    RunRequest,
-    estimate_session_cost,
-)
-from cayu.runtime.budgets import budget_actual_cost_for_event
+from cayu.sessions.base import RunRequest
 
 
 class FakeProvider(ModelProvider):

@@ -13,7 +13,8 @@ from pydantic import ValidationError
 
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
-from cayu.runtime import (
+from cayu.sessions.base import SessionStatus
+from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CONCURRENCY,
     RECOVERY_PLAN_MAX_INSPECTIONS,
     RECOVERY_PLAN_MAX_ITEMS,
@@ -23,7 +24,6 @@ from cayu.runtime import (
     RecoveryPlanBounds,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    SessionStatus,
 )
 
 _MAX_PLAN_FILE_BYTES = 16 * 1024 * 1024

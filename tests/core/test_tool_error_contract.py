@@ -14,9 +14,8 @@ import pytest
 from pydantic import BaseModel, StrictInt, ValidationError
 
 from cayu.artifacts import LocalArtifactStore
-from cayu.core.tools import ToolContext, ToolResult
 from cayu.runners import LocalRunner
-from cayu.runtime.sessions import InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.tools import (
     ApplyPatchTool,
     DeleteFileTool,
@@ -37,6 +36,7 @@ from cayu.tools._errors import (
     structured_invalid_arguments,
     tool_argument_validation,
 )
+from cayu.tools.base import ToolContext, ToolResult
 from cayu.workspaces import LocalWorkspace
 
 

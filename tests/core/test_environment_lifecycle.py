@@ -12,26 +12,19 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
-from cayu import CayuConfig, OperationsConfig
 from cayu._exception_groups import iter_exception_tree
 from cayu._workspace_mutation import WorkspaceMutationSettlementError
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.environments import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import InMemoryBudgetStore
+from cayu.configuration import CayuConfig, OperationsConfig
+from cayu.environments.base import Environment, EnvironmentSpec, WorkspaceInstructions
+from cayu.environments.bindings import (
     BoundWorkspace,
-    Environment,
-    EnvironmentLifecycleOperation,
-    EnvironmentLifecyclePhase,
-    EnvironmentLifecyclePolicy,
-    EnvironmentLifecycleProgress,
-    EnvironmentLifecycleProgressStatus,
-    EnvironmentSpec,
     SyncBinding,
     SyncTargetWorkspacePlan,
     WorkspaceBinding,
-    WorkspaceInstructions,
     WorkspaceSnapshot,
-    current_environment_lifecycle_progress_reporter,
-    environment_lifecycle_progress_from_event,
 )
 from cayu.environments.factory import (
     EnvironmentFactory,
@@ -41,18 +34,18 @@ from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     register_environment_factory_cleanup_retry,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    InvocationContext,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionStatus,
+from cayu.environments.lifecycle import (
+    EnvironmentLifecycleOperation,
+    EnvironmentLifecyclePhase,
+    EnvironmentLifecyclePolicy,
+    EnvironmentLifecycleProgress,
+    EnvironmentLifecycleProgressStatus,
+    current_environment_lifecycle_progress_reporter,
+    environment_lifecycle_progress_from_event,
 )
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
@@ -63,9 +56,20 @@ from cayu.runtime._environment_lifecycle import (
     render_initial_system_prompt,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.budgets import InMemoryBudgetStore
-from cayu.runtime.sessions import CheckpointTransform, Session
-from cayu.workspaces import LocalWorkspace, Workspace
+from cayu.runtime._invocation_lifecycle import InvocationContext
+from cayu.sessions.base import (
+    CheckpointTransform,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionStatus,
+)
+from cayu.workspaces.base import Workspace
+from cayu.workspaces.local import LocalWorkspace
 
 
 def _preserve_session_control_state(

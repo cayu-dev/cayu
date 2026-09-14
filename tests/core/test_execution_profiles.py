@@ -20,60 +20,105 @@ from tests._tool_admission_fixtures import (
 
 import cayu.runtime._execution_profile_admission as execution_profile_admission
 import cayu.runtime._session_engine as session_engine_module
-from cayu import (
-    EXECUTION_PROFILE_METADATA_KEY,
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
-    AgentSpec,
-    AutomaticRecallContextPolicy,
-    AutomaticRecallMode,
-    AutomaticRecallPolicy,
-    AutomaticRecallSourceConfig,
-    BeforeStopContext,
-    BeforeStopDecision,
-    BrowserSessionTool,
-    BrowserWebFetchAdapter,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    CacheBreakpoint,
-    CachePolicy,
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
+from cayu.configuration import CayuConfig, RunDefaults, ToolExecutionConfig
+from cayu.context.base import (
     CheckpointCompactionContextPolicy,
-    CommandPolicy,
-    CommandPolicyDecision,
-    CommandPolicyResult,
-    CommandRequest,
-    DenyPatternRule,
-    DispatchRequest,
-    DockerRunner,
-    EgressAuthorityAdoptionHandler,
-    EgressAuthorityAdoptionResult,
-    EgressAuthorityBindingIdentity,
-    EgressAuthorityChangeKind,
+    MessageWindowContextPolicy,
+    ModelCompactor,
+    PromptCacheCompactor,
+    TranscriptDigestCompactor,
+    UsageTriggeredContextPolicy,
+)
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.context.structured_output import StructuredOutputSpec
+from cayu.context.thinking import ThinkingConfig
+from cayu.egress.adapter import (
     EgressAuthorityCutoverRequest,
     EgressAuthorityCutoverResult,
-    EgressAuthorityCutoverStrategy,
     EgressAuthorityRenewalRequest,
+    EgressBinding,
+    RunnerFinalizationResult,
+    SandboxEgressAdapter,
+)
+from cayu.egress.authority import (
+    EgressAuthorityBindingIdentity,
+    EgressAuthorityChangeKind,
+    EgressAuthorityCutoverStrategy,
+    EgressAuthorityTransitionState,
+    _build_adapter_verified_egress_authority_cutover_receipt,
+    build_egress_authority_cutover_receipt,
+    build_egress_authority_identity,
+    compare_egress_authority,
+)
+from cayu.egress.errors import VirtualCredentialError
+from cayu.egress.policy import HttpEgressPolicy
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.egress.transitions import (
+    EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY,
+    EgressAuthorityAdoptionHandler,
+    EgressAuthorityAdoptionResult,
     EgressAuthorityTransitionConflict,
     EgressAuthorityTransitionCoordinator,
     EgressAuthorityTransitionRecord,
-    EgressAuthorityTransitionState,
-    Environment,
+    SessionCheckpointEgressAuthorityTransitionStore,
+    _build_transition_record,
+    _find_parked_egress_authority_allocation,
+    _park_egress_authority_allocation,
+    _runtime_egress_authority_adoption_result,
+    _with_runtime_verified_active_transition,
+    advance_egress_authority_transition,
+    authorized_egress_authority_transition,
+    egress_authority_owner_fingerprint,
+)
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentLifecyclePolicy,
-    EnvironmentSpec,
-    Event,
-    EventType,
-    ExecCommand,
-    ExecCommandTool,
-    ExecResult,
+)
+from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.memory.base import AutomaticRecallMode, AutomaticRecallPolicy
+from cayu.memory.context import AutomaticRecallContextPolicy, AutomaticRecallSourceConfig
+from cayu.memory.retrieval import (
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    WeightedReciprocalRankFusionConfig,
+)
+from cayu.messages import Message
+from cayu.observability.events import InMemoryEventSink
+from cayu.observability.hooks import RuntimeHook, ToolCallHookContext
+from cayu.providers.anthropic import AnthropicProvider
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.cache import CacheBreakpoint, CachePolicy
+from cayu.providers.chat_completions import ChatCompletionsProvider
+from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.providers.openai import OpenAIProvider
+from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.runners.docker import DockerRunner
+from cayu.runners.local import LocalRunner
+from cayu.runtime._event_projection import (
+    prepare_new_runtime_event,
+    project_persisted_runtime_event,
+)
+from cayu.runtime.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
+from cayu.runtime.evidence import RuntimeEvidenceRequest, runtime_evidence
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
-    ExecutionProfileBehaviorIdentity,
     ExecutionProfileComponentClass,
     ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
@@ -87,113 +132,6 @@ from cayu import (
     ExecutionProfilePolicyError,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    HttpEgressPolicy,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    LocalRunner,
-    LoopPolicy,
-    Message,
-    MessageWindowContextPolicy,
-    ModelCompactor,
-    ModelPrice,
-    ModelTarget,
-    ParameterConstrainedToolPolicy,
-    PriceBook,
-    ProcessCommandPolicy,
-    PromptCacheCompactor,
-    RememberKnowledgePolicy,
-    RememberKnowledgeTool,
-    RequestFootprintConfig,
-    RequiredAllowlistRule,
-    RequiredFieldRule,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RetryPolicy,
-    RunDefaults,
-    RunLimits,
-    Runner,
-    RunRequest,
-    RuntimeEvidenceRequest,
-    RuntimeHook,
-    ScriptedModelProvider,
-    SearchTextTool,
-    SecretRedactor,
-    SecretRef,
-    SessionCheckpointEgressAuthorityTransitionStore,
-    SessionIdentity,
-    SessionStatus,
-    SQLiteSessionStore,
-    StaticToolPolicy,
-    StaticVault,
-    StructuredOutputSpec,
-    TaintAwareToolPolicy,
-    ThinkingConfig,
-    Tool,
-    ToolCallHookContext,
-    ToolContext,
-    ToolExecutionConfig,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolResult,
-    ToolSpec,
-    TranscriptDigestCompactor,
-    UsageTriggeredContextPolicy,
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-    WebFetchTool,
-    WeightedReciprocalRankFusionConfig,
-    advance_egress_authority_transition,
-    authorized_egress_authority_transition,
-    build_egress_authority_cutover_receipt,
-    build_egress_authority_identity,
-    compare_egress_authority,
-    egress_authority_owner_fingerprint,
-    estimate_session_cost,
-    runtime_evidence,
-)
-from cayu.egress import (
-    EgressBinding,
-    RunnerFinalizationResult,
-    SandboxEgressAdapter,
-    VirtualCredentialError,
-)
-from cayu.egress.authority import _build_adapter_verified_egress_authority_cutover_receipt
-from cayu.providers import (
-    AnthropicProvider,
-    ChatCompletionsProvider,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    OpenAIProvider,
-    ProviderStreamDeadlines,
-)
-from cayu.runtime._event_projection import (
-    prepare_new_runtime_event,
-    project_persisted_runtime_event,
-)
-from cayu.runtime.build_provenance import (
-    RuntimeBuildArtifactKind,
-    RuntimeBuildProvenance,
-    RuntimeBuildProvenanceOrigin,
-)
-from cayu.runtime.config import CayuConfig
-from cayu.runtime.egress_authority_transitions import (
-    EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY,
-    _build_transition_record,
-    _find_parked_egress_authority_allocation,
-    _park_egress_authority_allocation,
-    _runtime_egress_authority_adoption_result,
-    _with_runtime_verified_active_transition,
-)
-from cayu.runtime.event_sinks import InMemoryEventSink
-from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     changed_execution_profile_components,
     event_with_execution_profile_fingerprint_authority,
@@ -201,11 +139,54 @@ from cayu.runtime.execution_profiles import (
     execution_profile_metadata_after_adoption,
     execution_profile_session_metadata,
 )
-from cayu.runtime.sessions import (
+from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    InMemorySessionStore,
+    ModelTarget,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
     _runtime_resume_transport_metadata,
     _with_runtime_resume_transport_metadata,
     execution_profile_adoption_request_fingerprint,
 )
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tasks.dispatch import DispatchRequest
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.browser import BrowserWebFetchAdapter
+from cayu.tools.browser_session import BrowserSessionTool
+from cayu.tools.command_policy import ProcessCommandPolicy
+from cayu.tools.commands import (
+    CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
+    ExecCommandTool,
+)
+from cayu.tools.knowledge import RememberKnowledgePolicy, RememberKnowledgeTool
+from cayu.tools.policy import (
+    DenyPatternRule,
+    ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
+    RequiredFieldRule,
+    StaticToolPolicy,
+    TaintAwareToolPolicy,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
+from cayu.tools.search import SearchTextTool
+from cayu.tools.web import WebFetchTool
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.static import StaticVault
 
 
 def _test_runtime_build_provenance() -> RuntimeBuildProvenance:

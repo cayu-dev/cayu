@@ -7,9 +7,10 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.core import Event, EventType, Message
-from cayu.runtime import CayuApp, EventQuery, InMemorySessionStore, RunRequest
-from cayu.runtime.event_watchers import (
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.watchers import (
     EventWatcher,
     EventWatcherClaim,
     EventWatcherDelivery,
@@ -18,7 +19,13 @@ from cayu.runtime.event_watchers import (
     EventWatcherStore,
     InMemoryEventWatcherStore,
 )
-from cayu.runtime.sessions import EventRecord, SessionIdentity
+from cayu.sessions.base import (
+    EventQuery,
+    EventRecord,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+)
 from cayu.storage import SQLiteEventWatcherStore
 from cayu.storage.migrations import SchemaMode
 
@@ -485,9 +492,9 @@ def test_sqlite_crashed_claimants_exhaust_attempts_across_processes(tmp_path):
     script.write_text("""
 import asyncio, os, sys
 from datetime import UTC, datetime, timedelta
-from cayu.core import Event, EventType
-from cayu.runtime.sessions import EventRecord
-from cayu.runtime.event_watchers import EventWatcherClaim
+from cayu.events import Event, EventType
+from cayu.sessions.base import EventRecord
+from cayu.observability.watchers import EventWatcherClaim
 from cayu.storage import SQLiteEventWatcherStore
 async def run():
     now = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=int(sys.argv[2]) * 2)

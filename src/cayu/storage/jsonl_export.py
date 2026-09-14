@@ -38,16 +38,9 @@ from cayu._validation import (
     reject_nonportable_json_constant,
     require_durable_text,
 )
-from cayu.core import Event, EventType, Message
-from cayu.runtime.checkpoints import decode_runtime_checkpoint
-from cayu.runtime.exports import (
-    SessionExportBoundary,
-    SessionExportLimits,
-    SessionExportSnapshot,
-    validate_export_boundary,
-    validate_export_ownership,
-)
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
     DeferredInteractionInput,
     Session,
     SessionOrder,
@@ -56,8 +49,16 @@ from cayu.runtime.sessions import (
     TranscriptRecord,
     restore_persisted_event_authority,
 )
-from cayu.runtime.tasks import Task, TaskOrder, TaskQuery, TaskStore
-from cayu.runtime.tool_grants import (
+from cayu.sessions.checkpoints import decode_runtime_checkpoint
+from cayu.sessions.exports import (
+    SessionExportBoundary,
+    SessionExportLimits,
+    SessionExportSnapshot,
+    validate_export_boundary,
+    validate_export_ownership,
+)
+from cayu.tasks.base import Task, TaskOrder, TaskQuery, TaskStore
+from cayu.tools.grants import (
     TargetedToolGrantStateSnapshot,
     validate_targeted_tool_grant_batch_evidence,
 )

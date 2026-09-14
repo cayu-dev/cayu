@@ -62,6 +62,7 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
+from cayu.approvals.tools import PendingToolCallApproval
 from cayu.providers import (
     AnthropicProvider,
     BedrockProvider,
@@ -74,9 +75,8 @@ from cayu.providers import (
     VertexProvider,
 )
 from cayu.providers.base import _preflight_provider_portable_messages
-from cayu.runtime import SessionStore
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.approvals import PendingToolCallApproval
+from cayu.sessions.base import SessionStore
 
 
 def _fork_profile_adoption(key: str) -> ExecutionProfileAdoptionIntent:

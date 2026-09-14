@@ -8,23 +8,19 @@ import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 from tests.environments.test_docker_coding_live import _configuration_or_skip
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
-    EnvironmentFactory,
-    EnvironmentFactoryReleaseAction,
-    EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
-    LocalWorkspace,
-    Message,
-    ModelProvider,
-    ModelStreamEvent,
-    RunRequest,
-    SQLiteSessionStore,
-    SyncBinding,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import EnvironmentSpec
+from cayu.environments.bindings import SyncBinding
+from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
+from cayu.environments.factory import EnvironmentFactory, EnvironmentFactoryReleaseAction
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelStreamEvent
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workspaces.local import LocalWorkspace
 
 pytestmark = pytest.mark.process
 

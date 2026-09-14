@@ -6,16 +6,11 @@ import warnings
 
 import pytest
 
-from cayu import (
-    CayuApp,
-    InMemoryTaskStore,
-    InvocationOriginClaim,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-)
+from cayu.applications import CayuApp
 from cayu.cli.project import project_context
+from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
 from tests.qualification.repository_maintenance_application import maintenance_project_files
 
 

@@ -8,28 +8,19 @@ import sys
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventQuery,
-    ExecCommand,
-    InMemorySessionStore,
-    LocalArtifactStore,
-    LocalRunner,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    Tool,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runners import _subprocess as subprocess_module
+from cayu.runners.base import ExecCommand
+from cayu.runners.local import LocalRunner
+from cayu.sessions.base import EventQuery, InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.workspaces.local import LocalWorkspace
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX process group evidence")
 

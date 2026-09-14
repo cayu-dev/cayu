@@ -83,13 +83,13 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDraftV1,
     compile_eval_suite_draft,
 )
-from cayu.runtime.invocation import (
+from cayu.runtime.manifest import AppManifest, ToolManifest, _app_manifest_fingerprint
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionExecutionSource,
 )
-from cayu.runtime.manifest import AppManifest, ToolManifest, _app_manifest_fingerprint
-from cayu.runtime.stop_policy import RunLimits
 from cayu.vaults.redaction import SecretRedactor
 
 _NO_SECRETS = SecretRedactor()

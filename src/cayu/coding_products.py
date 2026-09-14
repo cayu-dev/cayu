@@ -33,21 +33,20 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
-from cayu.artifacts import (
+from cayu.applications import CayuApp
+from cayu.artifacts.base import (
     ArtifactReadResult,
     ArtifactScope,
     ArtifactStore,
     copy_artifact_read_result,
 )
-from cayu.core.events import Event, EventType, copy_event
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message
+from cayu.events import Event, EventType, copy_event
+from cayu.messages import Message
 from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._invocation_lifecycle import (
     released_invocation_evidence,
     require_invocation_rebind_lineage,
 )
-from cayu.runtime.app import CayuApp
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolver,
     CompletionResultResolverRequest,
@@ -56,17 +55,18 @@ from cayu.runtime.completion_verifiers import (
     CompletionVerifierRequest,
     DeterministicCompletionVerifier,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
-from cayu.runtime.invocation import SessionInvocationBinding
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     RunRequest,
     SessionStatus,
     parse_session_input_contract_evidence,
     session_input_messages_sha256,
 )
-from cayu.runtime.work_contracts import (
+from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.tasks.contracts import (
     CompletionConstraintOutcome,
     CompletionContinuationPolicy,
     CompletionCriterionOutcome,
@@ -88,9 +88,10 @@ from cayu.runtime.work_contracts import (
     WorkEvidenceRequirement,
     work_contract_from_draft,
 )
-from cayu.vaults import REDACTED_SECRET
-from cayu.workspaces import Workspace, WorkspaceRevisionObservation
+from cayu.vaults.redaction import REDACTED_SECRET
+from cayu.workspaces.base import Workspace
 from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
     observe_deterministic_workspace,

@@ -22,7 +22,7 @@ from pydantic import (
 )
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core.events import Event, EventType
+from cayu.events import Event, EventType
 from cayu.tools.web_access import WebAccessEvidence
 
 if TYPE_CHECKING:

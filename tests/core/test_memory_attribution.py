@@ -35,7 +35,7 @@ from cayu import (
     SQLiteSessionStore,
     runtime_evidence,
 )
-from cayu.memory_evidence import validate_new_context_exposure
+from cayu.memory.evidence import validate_new_context_exposure
 
 
 def _digest(label: str) -> str:

@@ -21,7 +21,7 @@ from cayu.runners import (
     RemoteWorkspaceBranchCapability,
     RunnerExecutionError,
 )
-from cayu.testing import verify_provider_credential_isolation
+from cayu.testing.base import verify_provider_credential_isolation
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

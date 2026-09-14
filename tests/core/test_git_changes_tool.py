@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 
 import cayu.tools.git as git_module
-from cayu.core.tools import ToolContext, ToolResult
 from cayu.runners import ExecResult, LocalRunner
 from cayu.tools import GitChangesTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.git import _workspace_cwd
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import (

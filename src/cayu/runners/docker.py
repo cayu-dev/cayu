@@ -21,7 +21,6 @@ from cayu._validation import (
     require_durable_clean_nonblank,
 )
 from cayu.capabilities import CapabilityDetail
-from cayu.core.tools import ToolExecutableRequirement, copy_tool_executable_probes
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.immutable_inputs import DockerImmutableInputMount
 from cayu.runners._admission_probes import EXECUTABLE_AVAILABILITY_SCRIPT
@@ -89,19 +88,15 @@ from cayu.runners.workloads import (
     PINNED_BROWSER_FETCH_WORKLOAD,
     PINNED_BROWSER_SESSION_WORKLOAD,
 )
+from cayu.tools.base import ToolExecutableRequirement, copy_tool_executable_probes
 
 if TYPE_CHECKING:
     from cayu.environments.admission import (
         ExecutionEnvironmentAuthority,
         ExecutionToolRequirementEvidence,
     )
-from cayu.vaults import (
-    SecretEnv,
-    SecretRedactor,
-    SecretRef,
-    SecretResolver,
-    resolve_secret_env,
-)
+from cayu.vaults.base import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
+from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
 DEFAULT_DOCKER_CWD = "/workspace"

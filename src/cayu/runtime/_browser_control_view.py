@@ -13,7 +13,7 @@ from cayu.runtime._browser_control_frames import (
     PrivateBrowserFrame,
     decode_browser_frame,
 )
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPage,
     BrowserControlPrincipal,

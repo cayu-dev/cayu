@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.core.tools import DurableToolRecoveryEvidence, ToolResult
+from cayu.tools.base import DurableToolRecoveryEvidence, ToolResult
 
 
 @pytest.mark.parametrize("disposition", ["confirmed", "not_started", "unresolved"])

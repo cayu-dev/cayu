@@ -13,24 +13,14 @@ pytest.importorskip("sse_starlette")
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    ArtifactScope,
-    CayuApp,
-    CorpusTarget,
-    Environment,
-    EnvironmentSpec,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.base import ArtifactScope
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.execution import CorpusTarget
+from cayu.evals.scenario import (
     EvalScenarioDocumentV2,
-    EvalScenarioDraftV2,
-    EvalScenarioTrialPhase,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    LocalArtifactStore,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    RunRequest,
     ScenarioApprovalCheckpointEventV2,
     ScenarioArtifactRequirementV2,
     ScenarioFilePartV2,
@@ -38,14 +28,18 @@ from cayu import (
     ScenarioInputV2,
     ScenarioTextPartV2,
     ScenarioUserMessageV2,
-    ScriptedModelProvider,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
 )
+from cayu.evals.scenario_authoring import EvalScenarioDraftV2
+from cayu.evals.store import EvalScenarioTrialPhase
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.server import AuthContext, DashboardConfig, EvalsConfig, ServerConfig, create_server
+from cayu.sessions.base import RunRequest
 from cayu.storage.evals_sqlite import SQLiteEvalStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 
 _AUTH_HEADERS = {"Authorization": "Bearer valid"}
 

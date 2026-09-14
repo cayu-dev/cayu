@@ -9,8 +9,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import require_durable_clean_nonblank
-from cayu.recall import RecallSituation, RecallSource, RecallSourceResult
-from cayu.runtime.context import ContextRequest
+from cayu.context.base import ContextRequest
+from cayu.memory.recall import RecallSituation, RecallSource, RecallSourceResult
 from cayu.storage.memory import KnowledgeAccessScope
 
 

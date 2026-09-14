@@ -6,19 +6,18 @@ from configuration.maintenance import (  # ty: ignore[unresolved-import]
     configured_maintenance_github_authority,
 )
 
-from cayu import (
+from cayu.delivery.github import (
     GitHubCheckState,
     GitHubDeliveryApproval,
     GitHubDeliveryRepository,
     GitHubDeliveryState,
     GitHubPullRequestDeliveryRequest,
     GitHubReviewState,
-    InvocationOriginClaim,
-    Task,
-    TaskCreate,
     approve_github_delivery,
     github_pull_request_delivery_request,
 )
+from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.tasks.base import Task, TaskCreate
 from tests.qualification.repository_maintenance_git_intake import (
     _completed_digest,
     _encode,

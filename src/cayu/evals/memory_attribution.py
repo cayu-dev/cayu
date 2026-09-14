@@ -25,7 +25,7 @@ from cayu._validation import (
     json_utf8_size_within_limit,
     require_durable_clean_nonblank,
 )
-from cayu.memory_attribution import (
+from cayu.memory.attribution import (
     MEMORY_ATTRIBUTION_DEFAULT_MAX_EXPOSURES,
     MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS,
     MEMORY_ATTRIBUTION_DEFAULT_MAX_RECEIPTS,
@@ -34,8 +34,8 @@ from cayu.memory_attribution import (
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
 )
-from cayu.memory_evidence import ContextExposureState
-from cayu.memory_interventions import memory_attribution_fingerprint
+from cayu.memory.evidence import ContextExposureState
+from cayu.memory.interventions import memory_attribution_fingerprint
 
 EVAL_MEMORY_ATTRIBUTION_SCHEMA_VERSION = 1
 EVAL_MEMORY_ATTRIBUTION_POLICY_SCHEMA_VERSION = 1

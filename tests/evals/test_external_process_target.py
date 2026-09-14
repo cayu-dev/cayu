@@ -34,8 +34,8 @@ from cayu import (
     preflight_eval_scenario,
     run_compiled_eval_scenario,
 )
+from cayu.applications import CayuApp
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION
-from cayu.core.messages import TextPart
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -74,6 +74,7 @@ from cayu.evals.external import (
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.store import EvalRunStatus
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.messages import TextPart
 from cayu.providers import ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.providers.operations import (
     ProviderOperationAdapter,
@@ -84,7 +85,6 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime.app import CayuApp
 from cayu.server.config import EvalsConfig
 from cayu.server.evals_registry import (
     explicit_eval_target_registry,

@@ -9,12 +9,13 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.messages import Message
+from cayu.approvals.tools import ResolutionActor
+from cayu.context.structured_output import require_secret_free_structured_output_spec
+from cayu.messages import Message
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
     redact_untrusted_message_for_boundary,
 )
-from cayu.runtime.approvals import ResolutionActor
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
@@ -25,7 +26,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     public_authority_alias_is_reserved,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
@@ -51,9 +52,8 @@ from cayu.runtime.sessions import (
     session_user_metadata,
     strip_runtime_session_create_claim_before_redaction,
 )
-from cayu.runtime.structured_output import require_secret_free_structured_output_spec
-from cayu.runtime.tool_policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
-from cayu.vaults import SecretRedactor
+from cayu.tools.policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
+from cayu.vaults.redaction import SecretRedactor
 
 
 class ForkAuthorityError(ValueError):

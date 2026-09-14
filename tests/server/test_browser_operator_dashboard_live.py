@@ -258,9 +258,9 @@ def test_rendered_discovery_uses_production_authentication(tmp_path, authenticat
 
     from cayu import CayuApp
     from cayu.runtime._browser_control_publisher import BrowserControlPublisher
-    from cayu.runtime.browser_control_config import BrowserControlConfig
     from cayu.server import BrowserControlServerConfig, ServerConfig, create_server
     from cayu.server.auth import BasicAuth
+    from cayu.tools.browser_control_config import BrowserControlConfig
 
     async def scenario():
         root = os.environ["CAYU_BROWSER_DASHBOARD_URL"].rstrip("/")

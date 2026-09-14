@@ -22,8 +22,8 @@ from cayu._exception_groups import (
     iter_exception_tree,
     set_exception_cause,
 )
-from cayu.core import Event, EventType
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.sessions.base import (
     Session,
     SessionOperationTransform,
     SessionStatus,

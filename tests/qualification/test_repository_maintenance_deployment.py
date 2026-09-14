@@ -7,14 +7,14 @@ import json
 
 import pytest
 
-from cayu import (
-    DockerImageIdentity,
+from cayu.cli.project import project_context
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.storage.postgres import (
     PostgresBudgetLedger,
     PostgresKnowledgeStore,
     PostgresSessionStore,
     PostgresTaskStore,
 )
-from cayu.cli.project import project_context
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
@@ -179,7 +179,7 @@ def test_worker_binding_rejects_unsupported_graph(deployment, monkeypatch, inval
         monkeypatch.setattr(original.app, "get_environment_factory", lambda: object())
     elif invalid == "artifacts":
         # Public native factory construction, with no configured artifact store.
-        from cayu import DockerCodingEnvironmentFactory
+        from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 
         factory = DockerCodingEnvironmentFactory(
             source_workspace=original.source_workspace,

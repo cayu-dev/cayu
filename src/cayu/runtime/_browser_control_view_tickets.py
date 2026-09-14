@@ -10,7 +10,7 @@ from hashlib import sha256
 
 from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
 from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
-from cayu.runtime.browser_control import BrowserControlPrincipal, BrowserViewIntent
+from cayu.tools.browser_control import BrowserControlPrincipal, BrowserViewIntent
 
 
 @dataclass(frozen=True, slots=True, repr=False)

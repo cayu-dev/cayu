@@ -17,21 +17,22 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Protocol
 
 from cayu._validation import require_nonblank, require_unicode_scalar_text
-from cayu.artifacts import (
+from cayu.artifacts._images import decode_verified_image_format
+from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     FILE_ATTACHMENT_IMAGE_CONTENT_TYPES,
+    FileAttachmentKind,
+    file_attachment,
+    file_attachment_from_payload,
+)
+from cayu.artifacts.base import (
     ArtifactMetadata,
     ArtifactReadResult,
     ArtifactScope,
     ArtifactStore,
-    FileAttachmentKind,
     InvalidArtifactIdError,
     copy_artifact_read_result,
-    file_attachment,
-    file_attachment_from_payload,
 )
-from cayu.artifacts._images import decode_verified_image_format
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools._errors import (
     invalid_tool_arguments_result,
     reject_unknown_tool_arguments,
@@ -45,7 +46,8 @@ from cayu.tools._redaction import (
     record_ambiguous_secret_output,
     unstable_secret_redaction_result,
 )
-from cayu.workspaces import (
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.workspaces.base import (
     Workspace,
     WorkspaceReadOffsetError,
     WorkspaceReadResult,

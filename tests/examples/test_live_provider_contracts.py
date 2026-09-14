@@ -20,6 +20,7 @@ from cayu import (
     ScriptedModelProvider,
     ToolEffect,
 )
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -33,7 +34,6 @@ from cayu.providers import (
     ProviderStreamDeadlines,
     build_openai_payload,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage import KnowledgeEntry, KnowledgeHit, KnowledgeQuery, KnowledgeSearchResult
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"

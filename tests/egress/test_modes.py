@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from cayu.core.events import EventType
 from cayu.credentials import (
     AGENT_READABLE_MODES,
     CredentialMode,
     is_agent_readable,
     normalize_credential_mode,
 )
+from cayu.events import EventType
 
 
 def test_credential_mode_values() -> None:

@@ -108,15 +108,15 @@ That is a tighter default workspace boundary than Pi or Claude Code's
 model-visible file schemas, which accept absolute paths.
 
 `ToolSpec` explicitly declares side-effect class and parallel safety.
-`src/cayu/core/tools.py:103-110`
-`src/cayu/core/tools.py:128-170`
+`src/cayu/tools/base.py:103-110`
+`src/cayu/tools/base.py:128-170`
 The runtime turns unsafe calls into ordering barriers while batching consecutive
 safe calls.
 `src/cayu/runtime/_tool_round_executor.py:2296-2314`
 
 `ToolResult` also separates a bounded model-facing summary from structured,
 durable evidence for dashboards and workflows.
-`src/cayu/core/tools.py:221-246`
+`src/cayu/tools/base.py:221-246`
 That is a good foundation for digest, paging, replacement-count, diff, and Git
 status metadata.
 

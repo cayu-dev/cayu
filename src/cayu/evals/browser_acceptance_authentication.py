@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.evals.browser_acceptance_authenticated import BrowserAcceptanceAuthenticatedConfigV1
-from cayu.runtime.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
+from cayu.observability.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 
 @dataclass(frozen=True, slots=True, repr=False)

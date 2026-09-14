@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from cayu._validation import require_clean_nonblank
-from cayu.core.messages import Message
+from cayu.messages import Message
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,

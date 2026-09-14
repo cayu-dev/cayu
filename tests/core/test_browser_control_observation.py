@@ -19,18 +19,12 @@ from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_session import _FakeBrowserBackend
 from tests.core.test_environment_allocation_recovery import _FakeRemoteProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    InMemorySessionStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    run_to_completion,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
 from cayu.runtime._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
@@ -38,15 +32,18 @@ from cayu.runtime._browser_control_checkpoint import (
 )
 from cayu.runtime._browser_control_publication import BrowserControlPublication
 from cayu.runtime._browser_control_service import BrowserControlService
-from cayu.runtime.browser_control import (
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.sessions.outcomes import run_to_completion
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
     BrowserControlConflict,
     BrowserControlPrincipal,
     BrowserOperatorPageOperations,
     BrowserTakeoverIntent,
 )
-from cayu.runtime.browser_control_config import BrowserControlConfig
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.tools.browser_session import (
     BrowserBackendFailure,
     BrowserSessionTool,
@@ -500,7 +497,7 @@ def test_guest_channel_accepts_only_exact_runtime_terminal_successors(transition
 
     from cayu.runtime._browser_control_channel import BoundBrowserGuest, BrowserGuestCommandOwner
     from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
-    from cayu.runtime.browser_control import BrowserControlRecord
+    from cayu.tools.browser_control import BrowserControlRecord
 
     async def scenario():
         previous = BrowserControlRecord(
@@ -563,7 +560,7 @@ def test_guest_observation_status_cannot_clear_unpublished_host_fence(corruption
     from cayu.runtime._browser_control_channel import BoundBrowserGuest, BrowserGuestCommandOwner
     from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
     from cayu.runtime._browser_control_model import browser_model_control_epoch
-    from cayu.runtime.browser_control import BrowserControlAllocation, BrowserControlRecord
+    from cayu.tools.browser_control import BrowserControlAllocation, BrowserControlRecord
 
     async def scenario():
         record = BrowserControlRecord(

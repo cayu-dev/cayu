@@ -24,11 +24,11 @@ from cayu.runtime._binding_cleanup import (
     record_binding_finalize_failures,
 )
 from cayu.runtime._diagnostics import exception_diagnostic
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     copy_workspace_observation_pending_cancellation_requests,
     retain_workspace_observation_pending_cancellation_requests,
 )
-from cayu.vaults import SecretRedactor
 
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
 _BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]

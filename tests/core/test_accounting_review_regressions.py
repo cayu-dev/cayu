@@ -9,9 +9,10 @@ import pytest
 from tests.core.test_cost_accounting import _priced_event, _pricing
 from tests.core.test_run_limits import _controller
 
-from cayu.core import Event, EventType, Message
-from cayu.runtime.budgets import BudgetLimit
-from cayu.runtime.sessions import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.budgets.base import BudgetLimit
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 
@@ -230,15 +231,11 @@ def test_explicit_compaction_budget_survives_more_than_256_provider_completions(
         _create_profiled_session,
     )
 
-    from cayu.core import AgentSpec
-    from cayu.runtime import (
-        CayuApp,
-        CheckpointCompactionContextPolicy,
-        CompactSessionRequest,
-        ModelCompactor,
-        SessionStatus,
-    )
-    from cayu.runtime.costs import ModelPrice, PriceBook
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.budgets.pricing import ModelPrice, PriceBook
+    from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
+    from cayu.sessions.base import CompactSessionRequest, SessionStatus
 
     async def run():
         provider = UsageCompactionProvider()

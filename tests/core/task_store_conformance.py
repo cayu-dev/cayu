@@ -11,19 +11,19 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 
-from cayu import (
+from cayu.sessions.invocation import TaskExecutionSource
+from cayu.tasks.base import (
     Task,
     TaskClaimLost,
     TaskCreate,
-    TaskExecutionSource,
     TaskQuery,
     TaskStatus,
     TaskStore,
     TaskTerminalizationRequest,
     TaskTerminalKind,
     interrupted_task_handoff_request,
+    task_create_with_runtime_invocation,
 )
-from cayu.runtime.tasks import task_create_with_runtime_invocation
 
 
 async def assert_task_contract_queue_filter_conformance(store: TaskStore) -> None:

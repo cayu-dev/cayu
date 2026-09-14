@@ -33,17 +33,8 @@ from cayu._validation import (
     copy_bounded_durable_json_value,
     copy_durable_json_object,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.events import Event, EventType, copy_event
 from cayu.failure_evidence import FailureEvidence
-from cayu.runtime.sessions import (
-    MAX_SESSION_ID_BYTES,
-    EventQuery,
-    RuntimePublicationMutation,
-    Session,
-    SessionOperationPublication,
-    SessionStore,
-    apply_runtime_publication_checkpoint_mutation,
-)
 from cayu.runtime.tool_effects import (
     ToolEffectConflict,
     ToolEffectReceipt,
@@ -51,6 +42,15 @@ from cayu.runtime.tool_effects import (
     _bounded_text,
     _copy_string_map,
     copy_tool_effect_receipt,
+)
+from cayu.sessions.base import (
+    MAX_SESSION_ID_BYTES,
+    EventQuery,
+    RuntimePublicationMutation,
+    Session,
+    SessionOperationPublication,
+    SessionStore,
+    apply_runtime_publication_checkpoint_mutation,
 )
 
 EffectState = Literal[
@@ -1080,8 +1080,8 @@ def _validate_selected_terminal(
     checkpoint: dict[str, Any] | None,
     events: tuple[Event, ...],
 ) -> None:
+    from cayu.approvals.user_input import pending_user_input_from_checkpoint
     from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
-    from cayu.runtime.user_input import pending_user_input_from_checkpoint
 
     terminal = record.terminal
     assert terminal is not None

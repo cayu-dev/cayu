@@ -14,22 +14,14 @@ from tests.core.test_queued_session_messages import (
 )
 
 import cayu.runtime._environment_exposure as exposure_module
-import cayu.runtime.sessions as session_module
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.events import copy_event
-from cayu.environments import Environment, EnvironmentSpec, SyncBinding
-from cayu.runtime import (
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    TaskCreate,
-    TaskStatus,
-)
+import cayu.sessions.base as session_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import SyncBinding
+from cayu.events import Event, EventType, copy_event
+from cayu.messages import Message
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.runtime._environment_exposure import require_environment_exposed
 from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
@@ -40,12 +32,17 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageTarget,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+    EnqueueSessionMessageRequest,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    RunRequest,
     Session,
     SessionStatus,
 )
-from cayu.workspaces import LocalWorkspace
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.workspaces.local import LocalWorkspace
 
 
 class _CompletionPublicationBarrierStore(InMemorySessionStore):

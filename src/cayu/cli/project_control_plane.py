@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
+from cayu.budgets.pricing import PriceBook, default_price_book
 from cayu.cli.project import ProjectError
 from cayu.cli.store_targets import (
     SessionStoreBackend,
@@ -24,7 +25,6 @@ from cayu.project_control_plane import (
     ProjectEvalJudgeConfiguration,
     _create_project_control_plane_context,
 )
-from cayu.runtime.costs import PriceBook, default_price_book
 
 _DISTRIBUTION_NAME_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\Z",

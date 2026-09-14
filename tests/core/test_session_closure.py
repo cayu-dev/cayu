@@ -12,8 +12,8 @@ from cayu.runtime.session_closure import (
     SessionClosurePolicy,
     TaskSessionClosureStore,
 )
-from cayu.runtime.tasks import InMemoryTaskStore, TaskCreate
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
 
 
 class _SessionStore:

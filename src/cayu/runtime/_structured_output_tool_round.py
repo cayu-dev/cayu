@@ -13,14 +13,21 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_json_value
-from cayu.core.events import (
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputError,
+    StructuredOutputSpec,
+    StructuredOutputValidation,
+    structured_output_repair_lead,
+    validate_structured_output_tool_arguments,
+)
+from cayu.events import (
     Event,
     EventType,
     copy_event,
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import ToolResult
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
@@ -31,16 +38,9 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_tool_round_identity,
 )
-from cayu.runtime.sessions import RuntimePublicationRequest, Session
-from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputError,
-    StructuredOutputSpec,
-    StructuredOutputValidation,
-    structured_output_repair_lead,
-    validate_structured_output_tool_arguments,
-)
-from cayu.vaults import SecretRedactor
+from cayu.sessions.base import RuntimePublicationRequest, Session
+from cayu.tools.base import ToolResult
+from cayu.vaults.redaction import SecretRedactor
 
 
 @dataclass(frozen=True, slots=True)

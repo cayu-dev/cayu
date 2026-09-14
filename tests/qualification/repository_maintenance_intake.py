@@ -2,17 +2,15 @@
 
 from uuid import UUID
 
-from cayu import (
-    CayuApp,
+from cayu.applications import CayuApp
+from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
-    Task,
-    TaskCreate,
     TaskExecutionSource,
     TaskInvocation,
-    TaskStatus,
 )
+from cayu.tasks.base import Task, TaskCreate, TaskStatus
 from tests.qualification.repository_maintenance_identity import (
     MaintenanceRunIdentity,
     copy_identity,

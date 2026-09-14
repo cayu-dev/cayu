@@ -4,7 +4,7 @@ import pytest
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
 from cayu import TaskCreate, TaskStore
-from cayu.runtime.tasks import (
+from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     TaskTopologyInconsistent,

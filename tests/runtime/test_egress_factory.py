@@ -16,45 +16,52 @@ from tests.runners.lambda_microvm_harness import (
     SupervisorTransport,
 )
 
-from cayu import CayuConfig, OperationsConfig
 from cayu._exception_groups import iter_exception_tree
-from cayu.artifacts import LocalArtifactStore
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.egress import (
-    ApprovedEgressDestination,
-    CapturedRequest,
-    CapturedResponse,
-    CredentialMode,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.configuration import CayuConfig, OperationsConfig
+from cayu.credentials import CredentialMode
+from cayu.egress.adapter import (
     EgressAdapterRegistry,
-    EgressAuthorityCutoverStrategy,
     EgressBinding,
-    EgressCapabilityClaim,
-    EgressCapabilityEvidence,
-    EgressUpstreamLimits,
-    EgressUpstreamOperation,
-    HttpEgressPolicy,
-    InvalidEgressReconnectMetadataError,
     RunnerFinalizationResult,
     SandboxEgressAdapter,
-    TransparentEgressBroker,
     UnsupportedEgressAdapter,
+)
+from cayu.egress.authority import EgressAuthorityCutoverStrategy
+from cayu.egress.broker import (
+    CapturedRequest,
+    CapturedResponse,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
+    TransparentEgressBroker,
+)
+from cayu.egress.capabilities import EgressCapabilityClaim, EgressCapabilityEvidence
+from cayu.egress.destinations import ApprovedEgressDestination
+from cayu.egress.errors import (
+    InvalidEgressReconnectMetadataError,
     UnsupportedEgressError,
     UnsupportedEgressReconnectError,
     VirtualCredentialError,
 )
-from cayu.environments import (
-    EFSAccessPointBinding,
-    Environment,
+from cayu.egress.policy import HttpEgressPolicy
+from cayu.environments.admission import (
+    ExecutionCapabilityClaim,
+    ExecutionCapabilityEvidence,
+    ExecutionEvidenceOverride,
+    ExecutionRequirements,
+    evaluate_execution_admission,
+)
+from cayu.environments.aws_filesystems import EFSAccessPointBinding
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import (
+    BoundWorkspace,
+    SyncBinding,
+    SyncTargetWorkspacePlan,
+    WorkspaceBinding,
+)
+from cayu.environments.factory import (
     EnvironmentAllocationContext,
     EnvironmentAllocationIntent,
     EnvironmentAllocationState,
@@ -62,46 +69,38 @@ from cayu.environments import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
-    EnvironmentSpec,
-    ExecutionCapabilityClaim,
-    ExecutionCapabilityEvidence,
-    ExecutionEvidenceOverride,
-    ExecutionRequirements,
-    SyncBinding,
-    SyncTargetWorkspacePlan,
-    evaluate_execution_admission,
-)
-from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
-from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     environment_factory_cleanup_settlement_task,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import (
-    DockerRunner,
-    E2BRunner,
-    LambdaMicroVMRunner,
-    LocalRunner,
-    MicrosandboxRunner,
-    RunnerExecutionError,
-)
-from cayu.runners.base import ExecCommand, ExecResult, Runner
-from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.events import EventSink
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner
+from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerExecutionError
+from cayu.runners.docker import DockerRunner
+from cayu.runners.e2b import E2BRunner
+from cayu.runners.local import LocalRunner
+from cayu.runners.microsandbox import MicrosandboxRunner
 from cayu.runtime._environment_lifecycle import (
     _persist_binding_finalize_failure_event,
     _reconcile_binding_finalize_failure_event,
 )
-from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
-from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
-from cayu.workspaces import (
-    LocalWorkspace,
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.base import (
     RunnerBoundWorkspace,
     WorkspaceListResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
 )
+from cayu.workspaces.local import LocalWorkspace
 
 pytest.importorskip("cryptography")
 
@@ -111,6 +110,14 @@ from cayu.egress.adapter import (
     _raise_primary_with_cleanup_cancellation,
 )
 from cayu.egress.docker_adapter import GUEST_CA_PATH
+from cayu.egress.runtime import (
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
+    _await_cleanup_task,
+    _EgressManagedRunner,
+    _EgressTeardownBinding,
+    _workspace_dispatch_settlement_kind,
+)
 from cayu.runtime._binding_cleanup import (
     BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES,
     BindingFinalizeFailure,
@@ -119,15 +126,7 @@ from cayu.runtime._binding_cleanup import (
     binding_finalize_fatal_signal,
     record_binding_finalize_failures,
 )
-from cayu.runtime.egress import (
-    VirtualCredentialSpec,
-    VirtualEgressEnvironmentFactory,
-    _await_cleanup_task,
-    _EgressManagedRunner,
-    _EgressTeardownBinding,
-    _workspace_dispatch_settlement_kind,
-)
-from cayu.testing import verify_provider_credential_isolation
+from cayu.testing.base import verify_provider_credential_isolation
 
 REAL_SECRET = "sk_test_51FactoryRealSecret"
 POLICY_NAME = "provider-example"
@@ -1679,8 +1678,9 @@ def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence(
 def test_virtual_egress_combines_adapter_security_with_actual_guest_tool_probes(executable_present):
     from tests.runners.test_microsandbox_admission import Guest, sdk
 
-    from cayu import MicrosandboxRunner, SearchTextTool
     from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+    from cayu.runners.microsandbox import MicrosandboxRunner
+    from cayu.tools.search import SearchTextTool
 
     async def create_runner(request):
         guest = Guest(0 if executable_present else 1)

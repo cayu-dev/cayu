@@ -15,7 +15,7 @@ from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
 from cayu.runtime._browser_control_frames import BrowserViewUnavailable
 from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._browser_control_view_tickets import BrowserViewTickets
-from cayu.runtime.browser_control import BrowserControlConflict
+from cayu.tools.browser_control import BrowserControlConflict
 
 OPERATOR_VIEW_SUBPROTOCOL = "cayu.browser-view.v1"
 

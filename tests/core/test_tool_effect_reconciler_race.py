@@ -10,30 +10,22 @@ from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider, _tool_call_response
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    Tool,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.core.tools import DurableToolRecoveryEvidence
-from cayu.providers import ModelStreamEvent
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._tool_effect_state import ToolEffectRecord
-from cayu.runtime.approvals import ToolApprovalDecision, ToolApprovalRequest
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.sessions import IncompleteSessionRecoveryRequest
 from cayu.runtime.tool_effects import (
     ToolEffectReceipt,
     ToolEffectReconciliationRegistration,
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, ResumeRequest, RunRequest
+from cayu.tools.base import DurableToolRecoveryEvidence, Tool, ToolEffect, ToolResult, ToolSpec
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

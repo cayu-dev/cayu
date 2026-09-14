@@ -93,9 +93,9 @@ def test_copy_does_not_serialize_or_format_mutated_hostile_values(capsys, caplog
 
 
 def test_user_input_receipt_request_rejects_hostile_review_without_diagnostics(capsys, caplog):
-    from cayu.runtime.human_review import HumanReviewContext, HumanReviewReference
+    from cayu.approvals.review import HumanReviewContext, HumanReviewReference
+    from cayu.approvals.user_input import UserInputResponse
     from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
-    from cayu.runtime.user_input import UserInputResponse
 
     class Hostile:
         def __repr__(self):

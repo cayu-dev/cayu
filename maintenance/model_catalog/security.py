@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit, urlunsplit
 
-from cayu.core.tools import ToolContext
+from cayu.tools.base import ToolContext
 from maintenance.model_catalog.policy import OFFICIAL_HOSTS
 
 PROVIDER_METADATA_KEY = "model_catalog_provider"

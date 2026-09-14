@@ -13,7 +13,7 @@ from cayu import (
     CachePolicy,
     ThinkingConfig,
 )
-from cayu.runtime import load_price_book
+from cayu.budgets.pricing import load_price_book
 
 if TYPE_CHECKING:
     from examples._advanced_support import ScenarioResult

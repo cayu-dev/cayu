@@ -10,9 +10,8 @@ from cayu.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.core.events import Event, EventType
-from cayu.evals import (
-    BROWSER_ACCEPTANCE_FIXTURE_REVISION,
+from cayu.evals import browser_acceptance as acceptance_module
+from cayu.evals.browser_acceptance import (
     BrowserAcceptanceAccessState,
     BrowserAcceptanceAgentReportState,
     BrowserAcceptanceCaseCategory,
@@ -36,9 +35,8 @@ from cayu.evals import (
     BrowserAcceptanceTrialReceiptV1,
     BrowserAcceptanceUsageV1,
     BrowserAllocationDisposition,
-    EvalStatus,
-    EvalTrialResult,
-    Trajectory,
+    _request_summaries_from_trajectory,
+    _semantic_state,
     browser_acceptance_report_from_json,
     browser_acceptance_report_to_json,
     build_browser_acceptance_report,
@@ -46,17 +44,15 @@ from cayu.evals import (
     render_browser_acceptance_html,
     write_browser_acceptance_report,
 )
-from cayu.evals import browser_acceptance as acceptance_module
-from cayu.evals.browser_acceptance import (
-    _request_summaries_from_trajectory,
-    _semantic_state,
-)
+from cayu.evals.browser_acceptance_fixture import BROWSER_ACCEPTANCE_FIXTURE_REVISION
 from cayu.evals.browser_acceptance_manifests import (
     deterministic_browser_acceptance_manifest,
     live_authenticated_browser_acceptance_manifest,
     live_public_browser_acceptance_manifest,
 )
 from cayu.evals.corpus import _content_revision
+from cayu.evals.models import EvalStatus, EvalTrialResult, Trajectory
+from cayu.events import Event, EventType
 
 
 def _case(

@@ -14,10 +14,15 @@ from tests.core.completion_verifier_profile_fixtures import (
 from tests.core.task_invocation_fixtures import unattributed_session_invocation_binding
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import CayuApp, SessionInvocationBinding
-from cayu.runtime.invocation import InvocationOrigin, InvocationOriginTrust
-from cayu.runtime.sessions import InMemorySessionStore
-from cayu.runtime.tasks import (
+from cayu.applications import CayuApp
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionInvocationBinding,
+)
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
     InMemoryTaskStore,
     Task,
@@ -25,7 +30,7 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStore,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionContinuationPolicy,
     CompletionCriterionOutcome,
     CompletionDecision,
@@ -54,8 +59,7 @@ from cayu.runtime.work_contracts import (
     copy_completion_decision_application_request,
     work_contract_from_draft,
 )
-from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 
 def _digest(value: str) -> str:

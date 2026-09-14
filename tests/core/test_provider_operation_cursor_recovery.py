@@ -9,16 +9,12 @@ import pytest
 from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu import SQLiteSessionStore
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ThinkingConfig,
-    ThinkingPart,
-)
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.usage import session_usage_summary
+from cayu.context.thinking import ThinkingConfig
+from cayu.events import Event, EventType
+from cayu.messages import Message, ThinkingPart
 from cayu.providers import (
     ModelProvider,
     ModelProviderError,
@@ -38,22 +34,9 @@ from cayu.providers import (
     ProviderStreamDeadlineEvidence,
 )
 from cayu.providers._credential_boundary import ProviderStreamCleanupError
-from cayu.runtime import (
-    AllowAllToolPolicy,
-    CayuApp,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    ModelCompletionManualRecoveryRequired,
-    RunRequest,
-    Session,
-    SessionRunFenced,
-    SessionStatus,
-    SessionStore,
-    ToolCapabilityCeiling,
-    session_usage_summary,
-)
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
+from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -66,12 +49,22 @@ from cayu.runtime.provider_operations import (
     provider_operation_progress_event_id,
     provider_operation_progress_payload,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
     ModelCompletionStage,
     ModelCompletionStageRequest,
+    RunRequest,
+    Session,
     SessionOperationTransform,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStore,
 )
-from cayu.runtime.tool_exposure import resolved_tool_exposure_authority
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling, resolved_tool_exposure_authority
+from cayu.tools.policy import AllowAllToolPolicy
 from cayu.vaults import SecretRedactor
 
 _PROFILE_UNSET = object()

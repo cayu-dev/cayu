@@ -32,8 +32,8 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
 )
-from cayu.core.tools import ToolContext
 from cayu.tools import GitCommandPolicy as ToolsGitCommandPolicy
+from cayu.tools.base import ToolContext
 
 _SAFE_PREFIX = ("git", "--no-pager", "-c", "core.fsmonitor=false")
 _SAFE_INSPECTION_PREFIX = (

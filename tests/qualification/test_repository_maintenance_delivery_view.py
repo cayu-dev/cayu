@@ -7,15 +7,17 @@ import warnings
 
 import pytest
 
-from cayu import (
-    GitHubDeliveryState,
-    GitHubPullRequestDeliveryRequest,
+from cayu.delivery.git import (
     RemoteGitDeliveryRepository,
     RemoteGitDeliveryState,
     RemoteGitLifecycleReceipt,
-    TaskQuery,
+)
+from cayu.delivery.github import (
+    GitHubDeliveryState,
+    GitHubPullRequestDeliveryRequest,
     approve_github_delivery,
 )
+from cayu.tasks.base import TaskQuery
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr
 from tests.qualification.test_repository_maintenance_git_approval import (
     approval_context as approval_context,

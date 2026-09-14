@@ -4,7 +4,8 @@ from collections.abc import Awaitable, Callable
 from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import Event, EventType
+from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime._foreground_child_wait import (
@@ -21,9 +22,8 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
-from cayu.runtime.pending_actions import pending_action_evidence_round_from_checkpoint
-from cayu.runtime.sessions import EventQuery, Session, SessionStatus, SessionStore
-from cayu.runtime.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.sessions.base import EventQuery, Session, SessionStatus, SessionStore
+from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
 
 
 async def _has_unsettled_parent_spawn(

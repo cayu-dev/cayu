@@ -7,21 +7,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import (
-    CayuApp,
+from cayu.applications import CayuApp
+from cayu.cli.project import project_context
+from cayu.delivery.github import (
     GitHubCheckBundle,
     GitHubCheckObservation,
     GitHubDeliveryState,
     GitHubReviewPolicy,
-    InMemoryTaskStore,
-    SQLiteTaskStore,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-    run_task_worker,
+    approve_github_delivery,
 )
-from cayu.cli.project import project_context
-from cayu.github_delivery import approve_github_delivery
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr, _request
 from tests.qualification.test_repository_maintenance_application import project as project
 

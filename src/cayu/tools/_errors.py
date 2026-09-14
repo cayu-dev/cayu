@@ -19,7 +19,7 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
-from cayu.core.tools import ToolContext, ToolResult
+from cayu.tools.base import ToolContext, ToolResult
 
 _ToolT = TypeVar("_ToolT")
 

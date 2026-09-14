@@ -13,6 +13,7 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 
+import cayu.tasks.base as tasks_module
 from cayu import (
     CayuApp,
     CompletionCriterionOutcome,
@@ -46,7 +47,6 @@ from cayu import (
     completion_result_sha256,
     work_contract_from_draft,
 )
-from cayu.runtime import tasks as tasks_module
 from cayu.storage import _postgres_verified_work as postgres_verified_work
 from cayu.storage._postgres_verified_work import PostgresVerifiedWorkMixin
 from cayu.vaults import SecretRedactor

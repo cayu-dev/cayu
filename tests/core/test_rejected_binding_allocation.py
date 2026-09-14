@@ -6,25 +6,21 @@ from dataclasses import replace
 import pytest
 from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory, _FakeRemoteProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import SyncBinding
+from cayu.environments.factory import (
     EnvironmentAllocationState,
     EnvironmentFactoryReleaseAction,
-    EnvironmentSpec,
-    IncompleteSessionRecoveryRequest,
-    LocalWorkspace,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    SyncBinding,
-)
-from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     register_environment_factory_cleanup_retry,
 )
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workspaces.local import LocalWorkspace
 
 
 @pytest.mark.parametrize(
@@ -220,12 +216,13 @@ def test_new_allocation_binding_rejection_retains_exact_cleanup(tmp_path, fault)
 def test_rejected_publication_fence_rejects_changed_authority(conflict):
     from tests.core.test_environment_allocation_recovery import _create_session, _resolve
 
-    from cayu import EnvironmentFactoryOperation, InMemorySessionStore
+    from cayu.environments.factory import EnvironmentFactoryOperation
     from cayu.runtime._environment_allocation import (
         EnvironmentAllocationCoordinator,
         EnvironmentAllocationTransitionConflict,
     )
-    from cayu.vaults import SecretRedactor
+    from cayu.sessions.base import InMemorySessionStore
+    from cayu.vaults.redaction import SecretRedactor
 
     async def scenario():
         store = InMemorySessionStore()

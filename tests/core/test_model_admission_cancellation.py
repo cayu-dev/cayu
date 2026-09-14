@@ -5,8 +5,7 @@ from contextlib import suppress
 
 import pytest
 
-from cayu import ExecutionDeadline, ExecutionDeadlineExceeded
-from cayu.deadlines import bind_execution_deadline
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded, bind_execution_deadline
 from cayu.failure_evidence import exception_evidence
 from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.providers.deadlines import ProviderStreamDeadlineAdmission, ProviderStreamDeadlines
@@ -128,16 +127,13 @@ def test_native_admission_and_caller_cancellation(mode):
 
 @pytest.mark.parametrize("next_turn", [False, True])
 def test_native_admission_race_retains_durable_child_evidence(tmp_path, monkeypatch, next_turn):
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        ScriptedModelProvider,
-        SQLiteSessionStore,
-        WorkflowBase,
-        WorkflowSpec,
-        step,
-    )
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.evals.testing import ScriptedModelProvider
     from cayu.runtime import _model_step_executor as executor
+    from cayu.storage.sqlite import SQLiteSessionStore
+    from cayu.workflows.base import WorkflowSpec
+    from cayu.workflows.workflow import WorkflowBase, step
 
     original = executor._admitted_model_provider_events
 

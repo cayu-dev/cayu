@@ -11,8 +11,8 @@ from operations.maintenance_requests import (  # ty: ignore[unresolved-import]
     capture_accepted_request,
 )
 
-from cayu import Task, TaskStatus
 from cayu.server import AuthenticatedAccess, mount_cayu
+from cayu.tasks.base import Task, TaskStatus
 from tests.qualification.repository_maintenance_auth import MaintenanceAccess
 from tests.qualification.repository_maintenance_budget import require_maintenance_budget
 from tests.qualification.repository_maintenance_cost import inspect_cost_evidence

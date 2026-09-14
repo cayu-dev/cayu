@@ -7,9 +7,17 @@ from typing import TypeVar
 
 import pytest
 
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message, ToolCallPart, ToolResultPart
-from cayu.core.tools import ToolResult
+from cayu.approvals.tools import PendingToolCallApproval
+from cayu.budgets.base import InMemoryBudgetStore
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputError,
+    StructuredOutputSpec,
+    StructuredOutputValidation,
+)
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart, ToolResultPart
+from cayu.observability.events import InMemoryEventSink
 from cayu.runtime._assistant_tool_round_publication import AssistantToolRoundPublication
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -27,10 +35,7 @@ from cayu.runtime._tool_round_recovery import (
     PendingToolRound,
     pending_tool_round_identity,
 )
-from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.budgets import InMemoryBudgetStore
-from cayu.runtime.event_sinks import InMemoryEventSink
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
@@ -42,12 +47,7 @@ from cayu.runtime.sessions import (
     SessionRuntimePublicationConflict,
     SessionStatus,
 )
-from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputError,
-    StructuredOutputSpec,
-    StructuredOutputValidation,
-)
+from cayu.tools.base import ToolResult
 
 _INTERACTION_ID = "interaction-tool-round-publication"
 

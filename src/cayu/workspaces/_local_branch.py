@@ -34,7 +34,7 @@ from pydantic import (
 
 from cayu._exception_groups import exception_group_children
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
-from cayu.core.runtime_authority import SessionRunFenced
+from cayu.runtime.authority import SessionRunFenced
 from cayu.workspaces._local_guard import (
     _LocalGuardStagingCleanupError,
     _LocalGuardStagingConflictError,

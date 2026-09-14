@@ -3,7 +3,7 @@
 import json
 from hashlib import sha256
 
-from cayu import CausalBudgetCostSummary, copy_price_book
+from cayu.budgets.pricing import CausalBudgetCostSummary, copy_price_book
 from tests.qualification.repository_maintenance_budget import require_maintenance_budget
 from tests.qualification.repository_maintenance_identity import copy_identity
 

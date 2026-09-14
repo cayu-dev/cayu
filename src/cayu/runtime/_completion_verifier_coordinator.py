@@ -21,6 +21,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import require_durable_clean_nonblank, revalidate_model_input
+from cayu.approvals.tools import ResolutionActor
 from cayu.deadlines import ExecutionDeadline, effective_deadline
 from cayu.runtime._diagnostics import (
     MAX_DIAGNOSTIC_UTF8_BYTES,
@@ -44,7 +45,6 @@ from cayu.runtime._verified_work_authority import (
     require_completion_proposal_integrity,
     require_completion_verifier_profile_integrity,
 )
-from cayu.runtime.approvals import ResolutionActor
 from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierExecutionProfile,
     CompletionVerifierProfileAdoptionDecision,
@@ -75,8 +75,8 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     copy_execution_profile_policy_result,
 )
-from cayu.runtime.tasks import TaskClaimLost, TaskStore
-from cayu.runtime.work_contracts import (
+from cayu.tasks.base import TaskClaimLost, TaskStore
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionCreate,
     CompletionProposal,
@@ -102,11 +102,11 @@ from cayu.runtime.work_contracts import (
     copy_work_contract,
     validate_completion_decision_contract,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,
 )
-from cayu.vaults import SecretRedactor
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _ExecutionKey = str

@@ -10,9 +10,8 @@ from uuid import uuid4
 import pytest
 
 from cayu import SQLiteSessionStore, TranscriptQuery
-from cayu.core import Message, ThinkingPart
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
-from cayu.runtime.sessions import TranscriptSnapshot
+from cayu.messages import Message, ThinkingPart
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, TranscriptSnapshot
 
 
 async def _create(store):

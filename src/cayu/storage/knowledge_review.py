@@ -227,7 +227,7 @@ class KnowledgeReviewWorkflow:
     ) -> KnowledgeReviewApproval:
         """Approve one exact pending revision with durable reviewer attribution."""
 
-        from cayu.knowledge_governance import reviewed_approval_authority
+        from cayu.knowledge.governance import reviewed_approval_authority
 
         clean_entry_id = require_clean_nonblank(entry_id, "entry_id")
         raw_prior = await self.store.load_activation_receipt(

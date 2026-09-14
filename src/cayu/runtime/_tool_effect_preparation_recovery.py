@@ -5,7 +5,9 @@ from __future__ import annotations
 from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core import Event, EventType, ToolResult
+from cayu.approvals.tools import PendingToolApproval
+from cayu.approvals.user_input import PendingUserInput
+from cayu.events import Event, EventType
 from cayu.runtime._approval_support import tool_call_request_from_pending
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_argument_publication import unavailable_argument_projection
@@ -16,15 +18,14 @@ from cayu.runtime._tool_round_executor import (
     _targeted_tool_invocation_payload,
 )
 from cayu.runtime._tool_round_recovery import PendingToolRound
-from cayu.runtime.approvals import PendingToolApproval
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
-from cayu.runtime.sessions import Session, SessionStore
 from cayu.runtime.tool_effects import ToolEffectConflict
-from cayu.runtime.user_input import PendingUserInput
+from cayu.sessions.base import Session, SessionStore
+from cayu.tools.base import ToolResult
 
 
 async def settle_prepared_tool_effects(

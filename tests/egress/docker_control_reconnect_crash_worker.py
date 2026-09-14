@@ -10,8 +10,8 @@ from cayu import ApprovedEgressDestination
 from cayu.egress import HttpEgressPolicy
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.egress.errors import DockerEgressReconnectError
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
 
 
 async def main(mode):

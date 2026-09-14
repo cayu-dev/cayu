@@ -23,7 +23,7 @@ from cayu import (
 from cayu.providers import ModelRequest
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.openai import build_openai_payload
-from cayu.runtime.tool_grants import TARGETED_TOOL_TRANSCRIPT_REFERENCE
+from cayu.tools.grants import TARGETED_TOOL_TRANSCRIPT_REFERENCE
 
 _TARGETED_CONTEXT_SCHEMA = "cayu.targeted-tool-context.v1"
 

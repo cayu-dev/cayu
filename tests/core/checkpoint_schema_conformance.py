@@ -5,11 +5,21 @@ from collections.abc import AsyncIterator
 import pytest
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.messages import ProviderStatePart, ToolCallPart
+import cayu.sessions.base as sessions_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.user_input import AmbiguousUserInputPauseAuthorityError, UserInputResponse
+from cayu.events import EventType
+from cayu.messages import Message, ProviderStatePart, ToolCallPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.runtime.execution_units import new_model_step_identity
+from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InterruptSessionRequest,
@@ -20,15 +30,10 @@ from cayu.runtime import (
     RuntimePublicationRequest,
     SessionIdentity,
     SessionStatus,
-    ToolCapabilityCeiling,
-    UserInputResponse,
+    SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime import sessions as sessions_module
-from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -37,12 +42,7 @@ from cayu.runtime.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
-from cayu.runtime.execution_profiles import (
-    active_invocation_execution_profile_from_checkpoint,
-)
-from cayu.runtime.execution_units import new_model_step_identity
-from cayu.runtime.sessions import SessionStore
-from cayu.runtime.user_input import AmbiguousUserInputPauseAuthorityError
+from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor
 

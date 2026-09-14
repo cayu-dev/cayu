@@ -8,7 +8,7 @@ the business outcome sits next to the runtime decision.
 Cayu's approval primitive is deliberately small: one durable pending approval
 per round, resolved with a binary approve/deny. This recipe composes the
 business semantics on top of that primitive with the
-`cayu.runtime.business_approvals` adapter — the primitive stays untouched, and
+`cayu.approvals.business` adapter — the primitive stays untouched, and
 everything below rides on public surface (policy metadata, resolution
 metadata, and the event log). The complete runnable no-key demo is
 [`examples/business_approval_tiers.py`](../../examples/business_approval_tiers.py):

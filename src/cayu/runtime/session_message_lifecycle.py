@@ -28,7 +28,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
-from cayu.runtime.approvals import ResolutionActor, copy_resolution_actor
+from cayu.approvals.tools import ResolutionActor, copy_resolution_actor
 
 
 class _MessageLifecycleModel(BaseModel):

@@ -18,8 +18,8 @@ from cayu import (
     ScriptedModelProvider,
     WorkflowSpec,
 )
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.providers import ModelStreamEvent
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.workflows import EventStoreJournal, WorkflowBase, parallel, pipeline, step
 
 COUNT_SCHEMA = {

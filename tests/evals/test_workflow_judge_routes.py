@@ -107,7 +107,7 @@ def test_workflow_judge_replay_withholds_dispatch_for_incomplete_routes(structur
     from tests.evals.test_workflow_eval_target import _register_app, _suite
 
     from cayu import evaluate_assertions, run_workflow_eval_suite
-    from cayu.core.events import EventType
+    from cayu.events import EventType
 
     if structured:
         judge, judge_provider = _judge(_judgment(), allow_same_model=True)

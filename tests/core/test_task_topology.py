@@ -11,7 +11,7 @@ from tests.core.task_topology_conformance import (
 )
 
 from cayu import InMemoryTaskStore, SQLiteTaskStore, TaskCreate, TaskStore
-from cayu.runtime.tasks import (
+from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH,
     TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
     TASK_TOPOLOGY_MAX_NODES,

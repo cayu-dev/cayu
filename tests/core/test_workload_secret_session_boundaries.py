@@ -15,33 +15,14 @@ from tests.core._workload_secret_support import (
     collect_resume_events,
 )
 
-from cayu.core import AgentSpec, Event, EventType, Message, MessageRole, ToolCallPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.events import Event, EventType
+from cayu.messages import Message, MessageRole, ToolCallPart
+from cayu.observability.events import InMemoryEventSink
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    ExecutionProfileAdoptionIntent,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    ForkSourceSnapshot,
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    InvocationOriginClaim,
-    ModelTarget,
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    Session,
-    SessionIdentity,
-    SessionQuery,
-    SessionStatus,
-    ToolCapabilityCeiling,
-)
 from cayu.runtime._session_engine import _with_environment_name
 from cayu.runtime._session_request_boundary import (
     prepare_derived_fork_session,
@@ -50,12 +31,28 @@ from cayu.runtime._session_request_boundary import (
     prepare_resume_request,
     prepare_run_request,
 )
-from cayu.runtime.event_sinks import InMemoryEventSink
-from cayu.runtime.sessions import (
+from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    ForkSourceSnapshot,
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ModelTarget,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionQuery,
+    SessionStatus,
     fork_session_invocation,
     run_request_with_runtime_generated_authority,
 )
+from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.storage import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

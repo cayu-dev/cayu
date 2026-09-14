@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from cayu.core.events import Event, EventType
-from cayu.runtime.approvals import resolution_actor_payload
+from cayu.approvals.tools import resolution_actor_payload
+from cayu.events import Event, EventType
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConflict,
@@ -64,7 +64,7 @@ def raw_revision(raw: Mapping[str, Any]) -> str:
 
 def inspection_priority(delivery_mode: Any) -> int:
     """Existing delivery precedence, with unknown modes inspectable at the end."""
-    from cayu.runtime.sessions import SessionMessageDeliveryMode
+    from cayu.sessions.base import SessionMessageDeliveryMode
 
     if delivery_mode is SessionMessageDeliveryMode.NEXT_TURN or (
         type(delivery_mode) is str and delivery_mode == "next_turn"
@@ -124,7 +124,7 @@ def inspection_next_cursor(
 
 
 def inspect_record(raw: Mapping[str, Any], decode: Callable[[], Any]) -> Any:
-    from cayu.runtime.sessions import SessionMessageInspectionRecord
+    from cayu.sessions.base import SessionMessageInspectionRecord
 
     try:
         status = SessionMessageQueueStatus(raw["status"])
@@ -364,7 +364,7 @@ def source_snapshot(
     checkpoint: Any = None,
     include_checkpoint_digest: bool = False,
 ) -> SessionMessageSource:
-    from cayu.runtime.sessions import fork_source_transcript_sha256
+    from cayu.sessions.base import fork_source_transcript_sha256
 
     checkpoint_digest = None
     if include_checkpoint_digest:

@@ -25,13 +25,13 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
-from cayu.core.execution_identity import (
+from cayu.approvals.review import HumanReviewContext, HumanReviewReference
+from cayu.approvals.user_input import UserInputResponse, copy_user_input_response
+from cayu.configuration import MAX_STEPS
+from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.runtime.config import MAX_STEPS
-from cayu.runtime.human_review import HumanReviewContext, HumanReviewReference
-from cayu.runtime.user_input import UserInputResponse, copy_user_input_response
 
 TOOL_EFFECT_RECEIPT_MAX_BYTES = 96 * 1024
 TOOL_EFFECT_RESULT_MAX_BYTES = 64 * 1024
@@ -202,7 +202,7 @@ class ToolEffectReconciliationContext(BaseModel):
     @field_validator("*", mode="after")
     @classmethod
     def validate_identity(cls, value, info):
-        from cayu.runtime.sessions import MAX_SESSION_ID_BYTES
+        from cayu.sessions.base import MAX_SESSION_ID_BYTES
 
         if isinstance(value, str):
             return _bounded_text(

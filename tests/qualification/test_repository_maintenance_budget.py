@@ -4,18 +4,15 @@ import asyncio
 import importlib
 import importlib.util
 
-from cayu import (
-    CodingProductState,
-    DockerImageIdentity,
-    EventQuery,
-    EventType,
-    InMemoryBudgetLedger,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-)
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.base import InMemoryBudgetLedger
 from cayu.cli.project import project_context
+from cayu.coding_products import CodingProductState
+from cayu.events import EventType
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import EventQuery, InMemorySessionStore
+from cayu.storage.memory import InMemoryKnowledgeStore
+from cayu.tasks.base import InMemoryTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository

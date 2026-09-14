@@ -25,7 +25,7 @@ from cayu import (
     estimate_session_cost,
     extract_durable_value_error,
 )
-from cayu.core.billing import completed_billing_identity, copy_billing_identity
+from cayu.budgets.billing import completed_billing_identity, copy_billing_identity
 
 
 def _identity(*, contexts: tuple[PricingContext, ...]) -> BillingIdentity:

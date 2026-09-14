@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import cayu.cli.serve as serve_cli
 from cayu.cli import main
 from cayu.cli.scaffold import project_files
-from cayu.runtime.sessions import SessionStatus
+from cayu.sessions.base import SessionStatus
 
 
 def test_serve_missing_project_guidance_matches_supported_cli(

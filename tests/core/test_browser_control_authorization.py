@@ -11,7 +11,7 @@ from cayu.runtime._browser_control_authorization import (
     BrowserControlPermissionDenied,
     authorize_browser_control,
 )
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlPolicy,
     BrowserControlPolicyResult,
     BrowserControlPrincipal,

@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, JsonUtf8SizeCounter, require_clean_nonblank
-from cayu.core import Event, EventType
-from cayu.runtime.aggregates import aggregate_hosted_tool_usage_metrics_from_event_payload
-from cayu.runtime.costs import (
+from cayu.budgets.aggregates import aggregate_hosted_tool_usage_metrics_from_event_payload
+from cayu.budgets.pricing import (
     CausalBudgetCostSummary,
     CostLineItem,
     PriceBook,
@@ -31,10 +30,11 @@ from cayu.runtime.costs import (
     add_cost_amounts,
     copy_price_book,
 )
-from cayu.runtime.usage import UsageMetrics
+from cayu.budgets.usage import UsageMetrics
+from cayu.events import Event, EventType
 
 if TYPE_CHECKING:
-    from cayu.runtime.sessions import EventQuery
+    from cayu.sessions.base import EventQuery
 
 COST_ACCOUNTING_PAGE_SIZE = 256
 COST_ACCOUNTING_MAX_PENDING_EVENTS = 256
@@ -78,7 +78,7 @@ def cost_group_key(event: Event) -> CostGroupKey:
 
 
 def cost_accounting_query(query: EventQuery) -> EventQuery:
-    from cayu.runtime.sessions import EventOrder, copy_event_query
+    from cayu.sessions.base import EventOrder, copy_event_query
 
     query = copy_event_query(query)
     if query.event_type is not None or query.event_types or query.exclude_event_types:
@@ -96,8 +96,8 @@ def cost_accounting_query(query: EventQuery) -> EventQuery:
 
 def cost_pending_events(query: EventQuery, events: tuple[Event, ...]) -> tuple[Event, ...]:
     """Copy and filter a bounded in-flight tail; stores additionally check causal membership."""
-    from cayu.core.events import copy_event
-    from cayu.runtime.sessions import EventRecord, _event_record_matches, copy_event_query
+    from cayu.events import copy_event
+    from cayu.sessions.base import EventRecord, _event_record_matches, copy_event_query
 
     if type(events) is not tuple:
         raise TypeError("additional_events must be a tuple.")

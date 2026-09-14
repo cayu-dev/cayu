@@ -15,13 +15,13 @@ from cayu.runtime._browser_control_authorization import BrowserControlPermission
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._browser_control_view_tickets import BrowserViewTickets
-from cayu.runtime.browser_control import BrowserControlCheckpoint, BrowserControlPrincipal
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.server._browser_control_routes import (
     BrowserOperatorSessionTokens,
     create_browser_control_router,
 )
 from cayu.server.auth import BasicAuth
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools.browser_control import BrowserControlCheckpoint, BrowserControlPrincipal
 
 
 @pytest.mark.parametrize("allowed", [False, True])

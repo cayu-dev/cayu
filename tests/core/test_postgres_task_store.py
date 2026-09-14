@@ -64,31 +64,36 @@ from tests.core.test_verified_work_contracts import (
     _verifier_profile_fingerprint,
 )
 
-from cayu import (
-    CayuApp,
-    CompletionContinuationPolicy,
-    CompletionDecisionApplicationRequest,
-    CompletionProposalCreate,
-    CompletionRejectionAction,
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    DurableValueError,
+    extract_durable_value_error,
+)
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.messages import Message
+from cayu.runtime._durable_worker_loop import DurableWorkerMetrics
+from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
     CompletionResultResolverRequest,
-    CompletionVerificationClaimLost,
-    CompletionVerificationClaimRequest,
-    CompletionVerifierDecision,
-    CompletionVerifierExecutionError,
-    CompletionVerifierExecutionRequest,
+)
+from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfileAdoptionDecision,
     CompletionVerifierProfilePreparationRequest,
+    build_completion_verifier_execution_profile,
+    changed_completion_verifier_profile_components,
+)
+from cayu.runtime.completion_verifiers import (
+    CompletionVerifierExecutionError,
+    CompletionVerifierExecutionRequest,
     CompletionVerifierRequest,
     CompletionVerifierUnavailable,
     DeterministicCompletionVerifier,
-    DurableWorkerMetrics,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileBehaviorIdentity,
-    InvocationOrigin,
-    InvocationOriginClaim,
-    InvocationOriginTrust,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import ExecutionProfileAuthorityDecision
+from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptConflict,
     LocalExecutionAttemptEffectOutcome,
     LocalExecutionAttemptQuiescence,
@@ -100,21 +105,27 @@ from cayu import (
     LocalExecutionAttemptStart,
     LocalExecutionEffectPolicy,
     LocalExecutionProcessIdentity,
-    Message,
-    PostgresTaskStore,
-    ResolutionActor,
-    ResolutionActorSource,
-    RunRequest,
-    SessionIdentity,
+    _authenticate_local_execution_attempt_settlement,
+    build_local_execution_attempt_authority,
+    local_execution_attempt_list_cursor,
+    local_execution_attempt_receipt_sha256,
+)
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    TaskExecutionSource,
+    TaskInvocation,
+)
+from cayu.storage.postgres import PostgresTaskStore
+from cayu.tasks.base import (
     Task,
     TaskClaimLost,
-    TaskCompletionDecisionRequired,
     TaskCreate,
-    TaskExecutionSource,
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
-    TaskInvocation,
     TaskOrder,
     TaskQuery,
     TaskRetryAttemptDisposition,
@@ -133,31 +144,25 @@ from cayu import (
     TaskTerminalizationRetryPolicy,
     TaskTerminalKind,
     TaskTopologyQuery,
-    WorkAttemptCreate,
-    WorkCompletionConflict,
-    build_local_execution_attempt_authority,
     interrupted_task_handoff_request,
-    run_task_worker,
+    prepare_task_terminalization,
     task_create_with_execution_source,
     terminalize_task_with_retry,
 )
-from cayu._validation import (
-    MAX_DURABLE_JSON_INTEGER,
-    DurableValueError,
-    extract_durable_value_error,
+from cayu.tasks.contracts import (
+    CompletionContinuationPolicy,
+    CompletionDecisionApplicationRequest,
+    CompletionProposalCreate,
+    CompletionRejectionAction,
+    CompletionVerificationClaimLost,
+    CompletionVerificationClaimRequest,
+    CompletionVerifierDecision,
+    TaskCompletionDecisionRequired,
+    WorkAttemptCreate,
+    WorkCompletionConflict,
+    completion_verification_claim_authority_sha256,
 )
-from cayu.runtime.completion_verifier_profiles import (
-    build_completion_verifier_execution_profile,
-    changed_completion_verifier_profile_components,
-)
-from cayu.runtime.local_execution_attempts import (
-    _authenticate_local_execution_attempt_settlement,
-    local_execution_attempt_list_cursor,
-    local_execution_attempt_receipt_sha256,
-)
-from cayu.runtime.sessions import InMemorySessionStore
-from cayu.runtime.tasks import prepare_task_terminalization
-from cayu.runtime.work_contracts import completion_verification_claim_authority_sha256
+from cayu.tasks.worker import run_task_worker
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -863,8 +868,8 @@ def test_postgres_downgraded_verified_work_records_fail_closed_before_migration(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresTaskStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresTaskStore
 
         await _truncate(postgres_dsn)
         store = _new_store(postgres_dsn)
@@ -1225,9 +1230,9 @@ def test_postgres_cancelled_worker_claim_aborts_close_return_pool_connection(
         import psycopg
         from psycopg_pool import AsyncConnectionPool
 
-        from cayu import PostgresTaskStore
         from cayu.storage import _postgres_verified_work as postgres_verified_work
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresTaskStore
 
         await _truncate(postgres_dsn)
         monkeypatch.setattr(
@@ -1297,8 +1302,8 @@ def test_postgres_rollback_failure_physically_discards_close_return_connection(
         from psycopg import AsyncConnection
         from psycopg_pool import AsyncConnectionPool
 
-        from cayu import PostgresTaskStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresTaskStore
 
         await _truncate(postgres_dsn)
         pool = AsyncConnectionPool(
@@ -3424,8 +3429,8 @@ class _MutableClock:
 
 
 def _new_store(dsn: str, *, clock=None):
-    from cayu import PostgresTaskStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresTaskStore
 
     # Tests own a throwaway database and (re)create the schema each run.
     return PostgresTaskStore(

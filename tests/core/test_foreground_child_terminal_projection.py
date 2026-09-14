@@ -6,22 +6,16 @@ import pytest
 from tests.core.test_foreground_subagent_recovery import _identity, _Provider
 from tests.core.test_tool_round_execution_identities import _RecordingTool
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemorySessionStore,
-    Message,
-    RunRequest,
-    SessionQuery,
-    SessionStatus,
-    SQLiteSessionStore,
-    SubagentSpec,
-    SubagentTool,
-    ToolApprovalDecision,
-)
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import ToolApprovalRequest, UserInputResponse
-from cayu.runtime.tool_policy import AlwaysRequireApprovalToolPolicy
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionQuery, SessionStatus
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.tools.user_input import UserInputTool
 
 

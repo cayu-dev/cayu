@@ -11,10 +11,13 @@ from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider
 
-from cayu import AgentSpec, CayuApp, ExecutionProfileBehaviorIdentity, Message, RunRequest
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.mcp.tools import McpToolAdapter, McpToolset
-from cayu.providers import ModelStreamEvent
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._tool_effect_state import ToolEffectRecord
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.tool_effects import (
     ToolEffectReceipt,
@@ -22,7 +25,8 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.sessions.base import RunRequest
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

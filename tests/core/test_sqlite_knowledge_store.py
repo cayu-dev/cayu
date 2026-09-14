@@ -33,8 +33,11 @@ from tests.core.knowledge_publication_conformance import (
 )
 
 from cayu._validation import DurableValueError, extract_durable_value_error
-from cayu.core.tools import ToolContext
-from cayu.storage import (
+from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import migrations as schema_migrations
+from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
+from cayu.storage.knowledge_transition import KnowledgeRevisionResetRequired
+from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
     KnowledgeAccessScope,
@@ -50,17 +53,14 @@ from cayu.storage import (
     KnowledgeRelationQuery,
     KnowledgeRevisionConflict,
     KnowledgeRevisionRef,
-    KnowledgeRevisionResetRequired,
     KnowledgeSearchMode,
     KnowledgeStatus,
     KnowledgeVisibility,
-    SQLiteKnowledgeStore,
-    SQLiteSessionStore,
+    knowledge_entry_payload_bytes,
 )
-from cayu.storage import _sqlite_support as sqlite_support
-from cayu.storage import migrations as schema_migrations
-from cayu.storage.memory import knowledge_entry_payload_bytes
-from cayu.tools import RememberKnowledgeTool
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import ToolContext
+from cayu.tools.knowledge import RememberKnowledgeTool
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 

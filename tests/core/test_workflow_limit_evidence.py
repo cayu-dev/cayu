@@ -7,25 +7,18 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemorySessionStore,
-    ModelStreamEvent,
-    RunLimits,
-    RuntimeHook,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    StepError,
-    Tool,
-    ToolResult,
-    ToolSpec,
-    WorkflowBase,
-    WorkflowSpec,
-    parallel,
-    step,
-)
-from cayu.workflows import StepRunOptions
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.observability.hooks import RuntimeHook
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import InMemorySessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolResult, ToolSpec
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.models import StepError
+from cayu.workflows.workflow import StepRunOptions, WorkflowBase, parallel, step
 
 
 class Workflow(WorkflowBase):
@@ -234,17 +227,16 @@ def test_native_limit_identity_and_replay(tmp_path, sqlite, kind):
 
 @pytest.mark.parametrize("race", ["newer_run", "missing", "stale", "lookup_failure"])
 def test_limit_correlation_does_not_adopt_unresolved_or_newer_terminal(tmp_path, monkeypatch, race):
-    from cayu import (
+    from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+    from cayu.messages import Message
+    from cayu.runtime.execution_profiles import (
         ExecutionProfileAdoptionIntent,
         ExecutionProfileAuthorityDecision,
         ExecutionProfilePolicy,
         ExecutionProfilePolicyAction,
         ExecutionProfilePolicyResult,
-        Message,
-        ResolutionActor,
-        ResolutionActorSource,
-        ResumeRequest,
     )
+    from cayu.sessions.base import ResumeRequest
 
     class AllowExplicitResume(ExecutionProfilePolicy):
         identity = "test:limit-race-resume:v1"
@@ -370,7 +362,7 @@ def test_limit_correlation_does_not_adopt_unresolved_or_newer_terminal(tmp_path,
 
 @pytest.mark.parametrize("boundary", ["session.limit_reached", "session.interrupted"])
 def test_limit_publication_loses_to_store_epoch_fence(tmp_path, monkeypatch, boundary):
-    from cayu import SessionStatus
+    from cayu.sessions.base import SessionStatus
 
     async def run():
         store = SQLiteSessionStore(tmp_path / "fence.db")

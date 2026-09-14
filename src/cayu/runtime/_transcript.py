@@ -7,7 +7,8 @@ from typing import Any, cast
 from uuid import uuid4
 
 from cayu._validation import copy_json_value
-from cayu.core.messages import (
+from cayu.budgets.usage import strip_provider_billing_identity
+from cayu.messages import (
     CitationPart,
     FilePart,
     HostedToolCallPart,
@@ -27,8 +28,7 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
     strip_runtime_owned_execution_identity,
 )
-from cayu.runtime.sessions import SessionStore
-from cayu.runtime.usage import strip_provider_billing_identity
+from cayu.sessions.base import SessionStore
 from cayu.vaults import SecretRedactor
 
 

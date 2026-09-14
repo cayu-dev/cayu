@@ -25,6 +25,7 @@ from hashlib import sha256
 from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
+import cayu.sessions.pending_actions as pending_actions
 from cayu._exception_groups import (
     add_exception_note_safely,
     exception_cause,
@@ -51,8 +52,87 @@ from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
 )
-from cayu.artifacts import ArtifactReadResult, ArtifactStore, copy_artifact_read_result
-from cayu.core.events import (
+from cayu.approvals.review import (
+    HumanReviewCall,
+    HumanReviewConflict,
+    HumanReviewContext,
+    HumanReviewDenied,
+    HumanReviewPolicy,
+    HumanReviewReference,
+    HumanReviewSource,
+    HumanReviewView,
+    build_review,
+    require_current_review,
+    require_review_authority,
+)
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+    ToolPolicyEvidence,
+    expiry_resolution_actor,
+    resolution_actor_payload,
+)
+from cayu.approvals.user_input import (
+    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    USER_INPUT_SUPERSESSION_INTENT_KEY,
+    AmbiguousUserInputSupersessionIntent,
+    PendingUserInput,
+    UserInputPauseState,
+    UserInputRecoveryRequest,
+    UserInputResolutionIntent,
+    UserInputResponse,
+    UserInputSupersessionIntent,
+    ambiguous_pending_user_input_from_checkpoint,
+    checkpoint_with_executing_user_input_resolution_intent,
+    checkpoint_with_user_input_resolution_intent,
+    checkpoint_without_exact_pending_user_input,
+    event_with_ambiguous_user_input_supersession_authority,
+    event_with_pending_user_input_authority,
+    event_with_user_input_supersession_authority,
+    pending_user_input_digest,
+    pending_user_input_identity,
+    pending_user_input_interruption_payload,
+    require_resolution_intent_matches_pending,
+    user_input_answer_request_digest,
+    user_input_lifecycle_authority_from_checkpoint,
+    user_input_resolution_request_digest,
+    user_input_supersession_intent_for,
+)
+from cayu.artifacts.base import ArtifactReadResult, ArtifactStore, copy_artifact_read_result
+from cayu.budgets.base import (
+    BudgetLimit,
+    BudgetPolicy,
+    copy_budget_policy,
+    copy_request_budget_limits,
+    request_budget_limits_for_session,
+)
+from cayu.budgets.pricing import SessionCostTotals
+from cayu.budgets.usage import SessionUsageSummary, session_usage_summary
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputSpec,
+    StructuredOutputStrategy,
+    copy_structured_output_spec,
+    require_secret_free_structured_output_spec,
+)
+from cayu.context.structured_output import (
+    _require_native_structured_output_support as _require_provider_native_output_support,
+)
+from cayu.context.thinking import ThinkingConfig
+from cayu.deadlines import (
+    ExecutionDeadline,
+    current_execution_deadline,
+    effective_deadline,
+    expired_execution_deadline,
+)
+from cayu.environments.bindings import _runtime_owned_workspace_observer_name
+from cayu.environments.factory import EnvironmentFactoryOperation
+from cayu.events import (
     Event,
     EventType,
     copy_event,
@@ -60,33 +140,18 @@ from cayu.core.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
-from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import (
-    _TOOL_POLICY_DENIAL_SOURCE,
-    DurableToolOperationConflict,
-    DurableToolRecoveryAuthority,
-    DurableToolRecoveryEvidence,
-    ToolEffect,
-    ToolResult,
-)
-from cayu.deadlines import (
-    ExecutionDeadline,
-    current_execution_deadline,
-    effective_deadline,
-    expired_execution_deadline,
-)
-from cayu.environments import EnvironmentFactoryOperation
-from cayu.environments.bindings import _runtime_owned_workspace_observer_name
+from cayu.exceptions import InteractionLifecyclePublicationRejected
 from cayu.failure_evidence import FailureEvidence, exception_evidence
-from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
-from cayu.providers import (
+from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
+from cayu.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
+from cayu.observability.hooks import RuntimeHookPhase
+from cayu.providers._credential_boundary import copy_provider_cancellation_failures
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationMode,
     ProviderOperationSnapshot,
     ProviderOperationStatus,
 )
-from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -100,7 +165,6 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime import pending_actions
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
     child_session_id_prefix,
@@ -254,35 +318,6 @@ from cayu.runtime._tool_round_executor import (
 )
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime._work_attempt_session_mutation import record_work_attempt_execution_stop
-from cayu.runtime.approvals import (
-    PendingToolApproval,
-    PendingToolCallApproval,
-    ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRecoveryRequest,
-    ToolApprovalRequest,
-    ToolPolicyEvidence,
-    expiry_resolution_actor,
-    resolution_actor_payload,
-)
-from cayu.runtime.budgets import (
-    BudgetLimit,
-    BudgetPolicy,
-    copy_budget_policy,
-    copy_request_budget_limits,
-    request_budget_limits_for_session,
-)
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-)
-from cayu.runtime.costs import SessionCostTotals
-from cayu.runtime.dispatch import (
-    _new_prepared_subagent_dispatch_envelope,
-    _require_dispatch_task_authority,
-    _task_matches_queued_dispatch,
-)
-from cayu.runtime.errors import InteractionLifecyclePublicationRejected
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
@@ -300,31 +335,6 @@ from cayu.runtime.execution_units import (
     ModelStepIdentity,
     ToolRoundIdentity,
     copy_tool_round_identity,
-)
-from cayu.runtime.hooks import RuntimeHookPhase
-from cayu.runtime.human_review import (
-    HumanReviewCall,
-    HumanReviewConflict,
-    HumanReviewContext,
-    HumanReviewDenied,
-    HumanReviewPolicy,
-    HumanReviewReference,
-    HumanReviewSource,
-    HumanReviewView,
-    build_review,
-    require_current_review,
-    require_review_authority,
-)
-from cayu.runtime.interactions import (
-    INTERACTION_LIFECYCLE_EVENT_TYPES,
-    INTERACTION_TERMINAL_EVENT_TYPES,
-    InteractionStatus,
-    InteractionSummaryEvidence,
-)
-from cayu.runtime.invocation import (
-    SessionExecutionSource,
-    SessionInvocationBinding,
-    inherited_session_invocation,
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
@@ -350,14 +360,14 @@ from cayu.runtime.provider_operations import (
     resolve_provider_operation_stage,
     validate_provider_operation_resolution_outcome_event,
 )
-from cayu.runtime.recovery_cleanup import (
-    RecoveryCleanup,
-    RecoveryCleanupStep,
-    RecoveryCleanupStepInput,
-    RecoveryCleanupSupervisor,
-)
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
+from cayu.runtime.tool_effects import (
+    ToolEffectReconciliationRequest,
+    ToolEffectReconciliationTarget,
+    tool_effect_receipt_digest,
+)
+from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
@@ -406,18 +416,28 @@ from cayu.runtime.sessions import (
     copy_interaction_transition_spec,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
-from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputSpec,
-    StructuredOutputStrategy,
-    copy_structured_output_spec,
-    require_secret_free_structured_output_spec,
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
-from cayu.runtime.structured_output import (
-    _require_native_structured_output_support as _require_provider_native_output_support,
+from cayu.sessions.cleanup import (
+    RecoveryCleanup,
+    RecoveryCleanupStep,
+    RecoveryCleanupStepInput,
+    RecoveryCleanupSupervisor,
 )
-from cayu.runtime.tasks import (
+from cayu.sessions.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+    InteractionStatus,
+    InteractionSummaryEvidence,
+)
+from cayu.sessions.invocation import (
+    SessionExecutionSource,
+    SessionInvocationBinding,
+    inherited_session_invocation,
+)
+from cayu.tasks.base import (
     Task,
     TaskQuery,
     TaskStatus,
@@ -427,13 +447,24 @@ from cayu.runtime.tasks import (
     _terminalize_claimed_task,
     copy_task,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_effects import (
-    ToolEffectReconciliationRequest,
-    ToolEffectReconciliationTarget,
-    tool_effect_receipt_digest,
+from cayu.tasks.dispatch import (
+    _new_prepared_subagent_dispatch_envelope,
+    _require_dispatch_task_authority,
+    _task_matches_queued_dispatch,
 )
-from cayu.runtime.tool_exposure import (
+from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import durable_runner_recovery_authority
+from cayu.tools.base import (
+    _TOOL_POLICY_DENIAL_SOURCE,
+    DurableToolOperationConflict,
+    DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
+    ToolEffect,
+    ToolResult,
+)
+from cayu.tools.catalogue import CALL_TOOL_NAME
+from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     NOT_EXPOSED_IN_REQUEST_REASON,
     ResolvedToolExposureAuthority,
@@ -441,38 +472,11 @@ from cayu.runtime.tool_exposure import (
     unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
 )
-from cayu.runtime.tool_gateway import gateway_lifecycle_matches_outer_call
-from cayu.runtime.tool_policy import ToolPolicyDecision
-from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
-from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
-from cayu.runtime.user_input import (
-    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
-    PENDING_USER_INPUT_CHECKPOINT_KEY,
-    USER_INPUT_SUPERSESSION_INTENT_KEY,
-    AmbiguousUserInputSupersessionIntent,
-    PendingUserInput,
-    UserInputPauseState,
-    UserInputRecoveryRequest,
-    UserInputResolutionIntent,
-    UserInputResponse,
-    UserInputSupersessionIntent,
-    ambiguous_pending_user_input_from_checkpoint,
-    checkpoint_with_executing_user_input_resolution_intent,
-    checkpoint_with_user_input_resolution_intent,
-    checkpoint_without_exact_pending_user_input,
-    event_with_ambiguous_user_input_supersession_authority,
-    event_with_pending_user_input_authority,
-    event_with_user_input_supersession_authority,
-    pending_user_input_digest,
-    pending_user_input_identity,
-    pending_user_input_interruption_payload,
-    require_resolution_intent_matches_pending,
-    user_input_answer_request_digest,
-    user_input_lifecycle_authority_from_checkpoint,
-    user_input_resolution_request_digest,
-    user_input_supersession_intent_for,
-)
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.tools.gateway import gateway_lifecycle_matches_outer_call
+from cayu.tools.policy import ToolPolicyDecision
+from cayu.tools.rounds import ToolRoundRecoveryRequest
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
     WorkspaceObservationArtifactState,
     WorkspaceObservationEvidenceState,
@@ -493,10 +497,6 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_terminal_from_delta_status,
     workspace_observations_from_checkpoint,
 )
-from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
-from cayu.tools._redaction import InvocationRedactorSnapshot
-from cayu.tools._runner import durable_runner_recovery_authority
-from cayu.vaults import SecretRedactor
 
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
@@ -8045,7 +8045,7 @@ class RecoveryCoordinator:
         request: ToolEffectReconciliationRequest,
     ) -> _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None:
         """Read exact settlement and consumption proof without acquiring execution authority."""
-        from cayu.runtime.sessions import runtime_publication_event_reference
+        from cayu.sessions.base import runtime_publication_event_reference
 
         if request.session_instance_id != session.instance_id:
             raise ToolEffectConflict("Receipt replay has a different session incarnation.")
@@ -24360,7 +24360,7 @@ class RecoveryCoordinator:
             and subagent_metadata.get("mode") == "foreground"
             and child.status == SessionStatus.INTERRUPTED
         ):
-            from cayu.runtime.pending_actions import pending_action_evidence_round_from_checkpoint
+            from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
 
             child_checkpoint = await self._session_store.load_checkpoint(child.id)
             child_action_pending = (

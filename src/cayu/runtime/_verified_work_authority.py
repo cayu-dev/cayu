@@ -7,8 +7,8 @@ from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfileRecord,
     completion_verifier_profile_preparation_request_sha256,
 )
-from cayu.runtime.invocation import SessionInvocation, TaskInvocation
-from cayu.runtime.work_contracts import (
+from cayu.sessions.invocation import SessionInvocation, TaskInvocation
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionCreate,
     CompletionProposal,

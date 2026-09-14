@@ -10,8 +10,9 @@ from integrations.remote_git import (  # ty: ignore[unresolved-import]
     build_remote_git_delivery_broker,
 )
 
-from cayu import RemoteGitHttpCredentials
-from cayu.vaults import LocalEnvVault, SecretRef
+from cayu.delivery.git import RemoteGitHttpCredentials
+from cayu.vaults.base import SecretRef
+from cayu.vaults.local_env import LocalEnvVault
 
 
 def configured_git_broker(artifact_store):

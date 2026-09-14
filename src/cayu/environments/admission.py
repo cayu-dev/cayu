@@ -24,7 +24,7 @@ from cayu.capabilities import (
     CapabilityObservation,
     CapabilityState,
 )
-from cayu.core.tools import (
+from cayu.tools.base import (
     ToolExecutableRequirement,
     ToolExecutionRequirement,
     _copy_bounded_iterable,

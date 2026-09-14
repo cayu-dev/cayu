@@ -18,10 +18,10 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, copy_durable_json_object
-from cayu.core.events import Event
-from cayu.core.messages import Message
+from cayu.events import Event
+from cayu.messages import Message
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionStatus,

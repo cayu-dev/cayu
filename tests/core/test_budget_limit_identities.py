@@ -8,20 +8,17 @@ import pytest
 from pydantic import ValidationError
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
-from cayu.runtime import (
+from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
     InMemoryBudgetLedger,
-    ModelPrice,
-    PriceBook,
-)
-from cayu.runtime.budgets import (
     _copy_effective_budget_limit,
     _operation_budget_limits_for_session,
     budget_limits_for_session,
     request_budget_limits_for_session,
 )
+from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.storage import SQLiteBudgetLedger
 
 
@@ -253,7 +250,7 @@ def test_sqlite_ledger_reconstructs_exact_limit_and_separates_semantic_change(
 
 
 def test_causal_profile_policy_is_stable_while_ledger_scopes_are_distinct() -> None:
-    from cayu.runtime.budgets import request_budget_execution_profile_ids
+    from cayu.budgets.base import request_budget_execution_profile_ids
 
     first = _limit().model_copy(update={"scope": "causal", "key": "trial-one"})
     second = first.model_copy(update={"key": "trial-two"})

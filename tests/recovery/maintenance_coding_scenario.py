@@ -12,14 +12,23 @@ import pytest
 from tests.qualification.repository_maintenance_delivery_case import build_journey_http
 from worker_harness import _wait_for_task_lease_expiry, _write_json_atomic
 
-from cayu import (
-    BudgetPolicy,
-    DockerCodingToolchainProfile,
-    ExecutionProfileBehaviorIdentity,
-    ModelStreamEvent,
-    ResolutionActor,
-    ResolutionActorSource,
-    ScriptedModelProvider,
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.budgets.base import BudgetPolicy
+from cayu.cli.project import project_context
+from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.recovery import (
+    RecoveryDecision,
+    RecoveryExecutionRequest,
+    RecoveryItemExecutionStatus,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
+)
+from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.tasks.base import (
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
@@ -28,19 +37,8 @@ from cayu import (
     TaskQuery,
     TaskStatus,
     TaskTerminalizationConflict,
-    complete_managed_task,
-    run_task_worker,
 )
-from cayu.cli.project import project_context
-from cayu.runtime import (
-    RecoveryDecision,
-    RecoveryExecutionRequest,
-    RecoveryItemExecutionStatus,
-    RecoveryPlanAction,
-    RecoveryPlanRequest,
-    RecoveryPlanSelection,
-)
-from cayu.storage import SQLiteBudgetLedger
+from cayu.tasks.worker import complete_managed_task, run_task_worker
 
 
 class _Provider(ScriptedModelProvider):

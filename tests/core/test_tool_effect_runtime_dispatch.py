@@ -8,21 +8,14 @@ from hashlib import sha256
 import pytest
 from tests.core.test_tool_round_execution_identities import _SequencedProvider, _tool_call_response
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    IncompleteSessionRecoveryRequest,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    Tool,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
 from cayu._validation import canonical_durable_json_bytes
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import InMemorySessionStore
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalRecoveryOutcome
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.messages import Message
+from cayu.observability.events import EventSink, InMemoryEventSink
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._tool_effect_state import (
     ToolEffectConflict,
@@ -31,12 +24,16 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectStateOwner,
 )
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
-from cayu.runtime.approvals import ToolApprovalRecoveryOutcome
-from cayu.runtime.config import CayuConfig, ToolExecutionConfig
-from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
-from cayu.runtime.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
-from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+)
+from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.rounds import ToolRoundRecoveryRequest
 
 
 class _ObservingStore(InMemorySessionStore):
@@ -440,10 +437,10 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
         task = asyncio.create_task(run())
         await asyncio.wait_for(entered.wait(), 3)
         if signal == "steering":
-            from cayu import StopAfterCurrentToolRoundRequest
             from cayu.runtime.execution_profiles import (
                 active_invocation_execution_profile_from_checkpoint,
             )
+            from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
 
             # These observing stores delegate publication unchanged. Explicitly
             # opt this test double into the complete upstream steering contract.
@@ -580,7 +577,7 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
         )
         if signal == "close_intent_conflict":
             from cayu.runtime._recovery_coordinator import _approval_interrupt_close_intent_matches
-            from cayu.runtime.sessions import SessionStatus
+            from cayu.sessions.base import SessionStatus
 
             def inject_contradictory_close_intent(_session, checkpoint):
                 # Deliberately contradictory persisted evidence: real dispatch

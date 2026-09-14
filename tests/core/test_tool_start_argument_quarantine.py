@@ -14,75 +14,61 @@ from tests.core._workload_secret_support import (
     collect_tool_approval_events,
 )
 
-from cayu import (
-    ArtifactExternalizingToolResultPolicy,
-    CayuConfig,
-    LocalArtifactStore,
-    PostgresSessionStore,
-    SQLiteSessionStore,
-    ToolExecutionConfig,
-)
-from cayu.core import (
-    AgentSpec,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ToolEffect,
-)
-from cayu.core.messages import ProviderStatePart, ThinkingPart, ToolCallPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.environments import (
-    Environment,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
 )
-from cayu.providers import (
-    ModelStreamEvent,
-    build_chat_completions_payload,
-    build_openai_payload,
-)
-from cayu.proxies import PassthroughProxy
-from cayu.runners import LocalRunner
-from cayu.runtime import (
+from cayu.events import EventType
+from cayu.messages import Message, ProviderStatePart, ThinkingPart, ToolCallPart
+from cayu.observability.events import InMemoryEventSink
+from cayu.observability.hooks import (
     AfterToolCallDecision,
     BeforeToolCallDecision,
     BeforeToolCallHookContext,
-    CayuApp,
-    EventQuery,
-    EventWatcher,
+    RuntimeHook,
+    RuntimeHookContext,
+    ToolCallHookContext,
+)
+from cayu.observability.watchers import EventWatcher, InMemoryEventWatcherStore
+from cayu.providers.base import ModelStreamEvent
+from cayu.providers.chat_completions import build_chat_completions_payload
+from cayu.providers.openai import build_openai_payload
+from cayu.proxies.passthrough import PassthroughProxy
+from cayu.runners.local import LocalRunner
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime import _transcript as transcript_support
+from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
+)
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    EventQuery,
     IncompleteSessionRecoveryRequest,
-    InMemoryEventSink,
-    InMemoryEventWatcherStore,
     InMemorySessionStore,
     InterruptSessionRequest,
     PendingActionQuery,
     ResumeRequest,
-    RunLimits,
     RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
     SessionStatus,
-    StructuredOutputSpec,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolCallHookContext,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    UserInputResponse,
 )
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime import _transcript as transcript_support
-from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage.jsonl_export import export_sessions
 from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.commands import (
     CommandPolicy,
     CommandPolicyDecision,
@@ -90,8 +76,12 @@ from cayu.tools.commands import (
     CommandRequest,
     ExecCommandTool,
 )
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
+from cayu.tools.result_projection import ArtifactExternalizingToolResultPolicy
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
 
 
 def _test_behavior_identity(name: str) -> ExecutionProfileBehaviorIdentity:

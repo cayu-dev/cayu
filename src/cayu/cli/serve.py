@@ -23,7 +23,7 @@ from cayu.cli.project_control_plane import (
     close_project_control_plane_context,
 )
 from cayu.project_control_plane import ProjectControlPlaneContext
-from cayu.runtime.sessions import SessionStatus
+from cayu.sessions.base import SessionStatus
 
 
 class ServeError(ValueError):

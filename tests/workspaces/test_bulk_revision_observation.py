@@ -7,12 +7,13 @@ import sys
 import pytest
 from tests.workspaces.test_runner_workspace import _ListResultRunner
 
-from cayu.runners import LocalRunner
-from cayu.workspaces import LocalWorkspace, RunnerWorkspace
+from cayu.runners.local import LocalRunner
+from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,
 )
+from cayu.workspaces.runner import RunnerWorkspace
 
 
 def observe(workspace, **limits):

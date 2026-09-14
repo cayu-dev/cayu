@@ -6,10 +6,10 @@ from uuid import uuid4
 import pytest
 
 from cayu import SQLiteSessionStore
-from cayu.core import Event, EventType, Message
-from cayu.core.events import event_with_runtime_payload_authority
-from cayu.core.messages import ProviderStatePart, TextPart, ThinkingPart
-from cayu.runtime import (
+from cayu.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart
+from cayu.sessions.base import (
+    MODEL_TARGET_PROJECTION_METADATA_KEY,
     EventQuery,
     InMemorySessionStore,
     ModelTarget,
@@ -18,9 +18,6 @@ from cayu.runtime import (
     SessionModelTransition,
     SessionStatus,
     SessionStatusConflict,
-)
-from cayu.runtime.sessions import (
-    MODEL_TARGET_PROJECTION_METADATA_KEY,
     SessionStore,
     session_input_messages_sha256,
 )

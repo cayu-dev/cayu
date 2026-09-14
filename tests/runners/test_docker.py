@@ -22,7 +22,7 @@ from cayu.runners.docker import (
     _require_docker,
     _validate_mount_path,
 )
-from cayu.testing import verify_provider_credential_isolation
+from cayu.testing.base import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRedactor, SecretRef, StaticVault
 
 

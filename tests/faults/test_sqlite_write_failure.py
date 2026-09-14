@@ -6,26 +6,19 @@ from typing import Any
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ModelStreamEvent,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    Tool,
-    ToolApprovalRecoveryOutcome,
-    ToolContext,
-    ToolResult,
-    ToolRoundRecoveryRequest,
-    ToolSpec,
-)
-from cayu.runtime import SessionStatus
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalRecoveryOutcome
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import ToolEffectConflict
-from cayu.storage import SQLiteSessionStore
+from cayu.sessions.base import ResumeRequest, RunRequest, SessionStatus
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.rounds import ToolRoundRecoveryRequest
 
 
 class FileSideEffectTool(Tool):

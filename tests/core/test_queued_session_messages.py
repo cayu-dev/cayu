@@ -11,72 +11,64 @@ from tests.core._execution_profile_fixtures import (
     versioned_test_provider_identity,
 )
 
-from cayu.artifacts import FileAttachment, FileAttachmentKind
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    FilePart,
-    Message,
-    MessageRole,
-)
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InterruptSessionRequest,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
     ResolutionActor,
     ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionMessageDeliveryBatch,
-    SessionMessageDeliveryMode,
-    SessionStatus,
-    TaskCreate,
-    TaskHandlerOutcome,
-    TaskStatus,
     ToolApprovalDecision,
     ToolApprovalRequest,
-    ToolCapabilityCeiling,
-    TranscriptQuery,
-    UserInputResponse,
 )
+from cayu.approvals.user_input import UserInputResponse
+from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
+from cayu.events import Event, EventType
+from cayu.messages import FilePart, Message, MessageRole
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
 from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
 from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    EnqueueSessionMessageRequest,
     EventQuery,
+    InMemorySessionStore,
+    InterruptSessionRequest,
     QueuedInteractionProfileHandoff,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionMessageDeliveryBatch,
+    SessionMessageDeliveryMode,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
+    SessionStatus,
+    TranscriptQuery,
     _canonical_runtime_publication_digest,
     _model_completion_stage_dispatch_storage_key,
 )
-from cayu.runtime.task_worker import run_task_worker
-from cayu.storage import SQLiteSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tasks.worker import TaskHandlerOutcome, run_task_worker
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class _ReconstructableQueuedProvider(ModelProvider):

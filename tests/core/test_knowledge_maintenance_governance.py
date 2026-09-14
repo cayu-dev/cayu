@@ -24,7 +24,7 @@ from tests.core.test_knowledge_maintenance_persistence import (
 )
 
 import cayu
-from cayu.knowledge_maintenance_governance import (
+from cayu.knowledge.maintenance_governance import (
     KnowledgeMaintenanceGovernanceDecision,
     KnowledgeMaintenanceGovernanceDisposition,
     KnowledgeMaintenanceGovernancePolicyError,

@@ -16,7 +16,7 @@ from cayu.evals.browser_acceptance import (
     _validated_operator_observation_revision,
 )
 from cayu.evals.corpus import _content_revision
-from cayu.runtime.browser_control import BrowserControlCheckpoint, BrowserControlRecord
+from cayu.tools.browser_control import BrowserControlCheckpoint, BrowserControlRecord
 from cayu.tools.browser_session import _browser_operation_id_sha256, _durable_browser_operation_key
 
 

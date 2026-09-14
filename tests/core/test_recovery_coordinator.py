@@ -11,13 +11,16 @@ from typing import Any
 
 import pytest
 
-from cayu.core import Event, Message
-from cayu.core.events import EventType
-from cayu.core.thinking import ThinkingConfig
-from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest, SessionIdentity
+import cayu.sessions.base as sessions_module
+from cayu.applications import CayuApp
+from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
+from cayu.budgets.base import BudgetLimit
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.context.thinking import ThinkingConfig
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.runtime import _recovery_coordinator as recovery_coordinator
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import sessions as sessions_module
 from cayu.runtime._recovery_coordinator import (
     _effective_approval_budget_limits,
     _effective_approval_max_steps,
@@ -31,23 +34,23 @@ from cayu.runtime._recovery_coordinator import (
     _run_recovery_cleanup_steps,
     _task_cancellation_count,
 )
-from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-from cayu.runtime.budgets import BudgetLimit
 from cayu.runtime.build_provenance import (
     RuntimeBuildArtifactKind,
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     CheckpointTransform,
+    InMemorySessionStore,
+    RunRequest,
     Session,
+    SessionIdentity,
     SessionStatus,
 )
-from cayu.runtime.stop_policy import RunLimits
 
 
 def _pending_approval(**kwargs) -> PendingToolApproval:

@@ -17,12 +17,17 @@ from cayu import (
     ModelCompactor,
     RunRequest,
 )
+from cayu.budgets.base import BudgetLimit, budget_check_from_events, budget_check_from_totals
+from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
+from cayu.context.base import ContextBuildError
 from cayu.providers import ModelProvider, ModelProviderError
-from cayu.runtime import BudgetLimit, CompactSessionRequest
-from cayu.runtime.budgets import budget_check_from_events, budget_check_from_totals
-from cayu.runtime.context import ContextBuildError
-from cayu.runtime.costs import ModelPrice, PriceBook, estimate_session_cost
-from cayu.runtime.sessions import EventQuery, SessionIdentity, SessionStatus, UsageRollupQuery
+from cayu.sessions.base import (
+    CompactSessionRequest,
+    EventQuery,
+    SessionIdentity,
+    SessionStatus,
+    UsageRollupQuery,
+)
 from cayu.storage import SQLiteSessionStore
 
 
@@ -116,7 +121,7 @@ def test_failed_compaction_usage_classification_survives_reload(tmp_path, explic
                 EventQuery(session_id="usage"), pricing(), previous=first
             )
             assert restored.totals == first.totals
-            from cayu.runtime.aggregates import UsageCostRollup, estimate_usage_rollup_cost
+            from cayu.budgets.aggregates import UsageCostRollup, estimate_usage_rollup_cost
 
             timestamp = completed[0].timestamp
             rollup = await store.aggregate_usage(

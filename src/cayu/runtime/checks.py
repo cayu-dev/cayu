@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cayu.core.agents import AgentAuthoringState
+from cayu.agents import AgentAuthoringState
 from cayu.runtime.manifest import AppManifest, FrozenJsonObject
 from cayu.runtime.service_manifest import (
     PublicServiceManifest,

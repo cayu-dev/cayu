@@ -12,20 +12,21 @@ from tests.core.test_workspace_mutation_receipts import (
     _SingleToolProvider,
 )
 
-from cayu import CayuConfig, SQLiteSessionStore, ToolExecutionConfig
 from cayu._exception_groups import exception_cause, iter_exception_tree
-from cayu.core import AgentSpec, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.environments import DeterministicWorkspaceBinding, Environment
-from cayu.runners import RunnerExecutionError
-from cayu.runtime import (
-    CayuApp,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    RunRequest,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment
+from cayu.environments.bindings import DeterministicWorkspaceBinding
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.runners.base import RunnerExecutionError
 from cayu.runtime._session_engine import SessionEngine
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, InMemorySessionStore, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workspaces.observation_recovery import (
     is_workspace_observation_recovery_rejected,
     workspace_observations_from_checkpoint,
 )

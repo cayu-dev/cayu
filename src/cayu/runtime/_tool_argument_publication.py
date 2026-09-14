@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 ARGUMENTS_STATE_FIELD = "arguments_state"
 ARGUMENTS_FIELD = "arguments"

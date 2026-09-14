@@ -22,12 +22,12 @@ from cayu import (
     TargetedToolGrant,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime.tool_gateway import (
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.gateway import (
     DynamicToolReferenceRejection,
     dynamic_tool_reference_rejection,
 )
-from cayu.runtime.tool_grants import TargetedToolUseRejectionReason
-from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.grants import TargetedToolUseRejectionReason
 
 
 class _CorrectingProvider(ModelProvider):

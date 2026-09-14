@@ -13,25 +13,22 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Event,
-    EventType,
-    InMemorySessionStore,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.pricing import (
     ModelCatalog,
     ModelInfo,
     ModelPrice,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
     PriceBook,
     PriceTier,
-    ToolContext,
     default_model_catalog,
     default_price_book,
     estimate_session_cost,
 )
+from cayu.events import Event, EventType
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore
+from cayu.tools.base import ToolContext
 from maintenance.model_catalog import agent_tools as catalog_tools
 from maintenance.model_catalog import browser, local_refresh, refresh, search
 from maintenance.model_catalog import browser_verifier as browser_verifier_module

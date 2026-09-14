@@ -10,11 +10,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from cayu.core.events import Event, event_with_durable_sequence
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.events import Event, event_with_durable_sequence
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime._session_request_boundary import require_secret_free_session_authority
-from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
     SessionMessageAccessDenied,
@@ -24,7 +24,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageSource,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventQuery,
@@ -36,7 +36,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     copy_enqueue_session_message_request,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 
 class SessionMessageAuthorizationUnavailable(RuntimeError):

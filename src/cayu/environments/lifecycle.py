@@ -24,8 +24,8 @@ from pydantic import (
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER, require_durable_clean_nonblank
 from cayu.capabilities import CapabilityIdentity, CapabilityState
-from cayu.core.events import Event, EventType
 from cayu.environments.admission import ExecutionExecutableEvidenceState
+from cayu.events import Event, EventType
 
 ENVIRONMENT_LIFECYCLE_PROGRESS_SCHEMA_VERSION = 1
 ENVIRONMENT_LIFECYCLE_TRANSITION_SCHEMA_VERSION = 1

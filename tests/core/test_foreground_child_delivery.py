@@ -4,10 +4,11 @@ import asyncio
 
 import pytest
 
-from cayu import InMemorySessionStore, Message, RunRequest, SQLiteSessionStore
-from cayu.core.events import Event, EventType
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
-from cayu.runtime.sessions import SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

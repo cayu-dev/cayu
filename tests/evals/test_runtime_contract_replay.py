@@ -9,14 +9,18 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from cayu import CayuConfig, ToolExecutionConfig
-from cayu.core.agents import AgentSpec
-from cayu.core.billing import BillingIdentity, PricingContext
-from cayu.core.events import EventType
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message, MessageRole
-from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.budgets.billing import BillingIdentity, PricingContext
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.context.footprints import (
+    RequestFingerprint,
+    RequestFingerprintAvailability,
+    RequestFootprintConfig,
+)
+from cayu.context.thinking import ThinkingConfig
 from cayu.evals import runtime_replay as runtime_replay_module
 from cayu.evals.models import Trajectory, _trajectory_promotion_capture_sha256
 from cayu.evals.runtime_replay import (
@@ -30,16 +34,14 @@ from cayu.evals.runtime_replay import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import trajectory_from_session
-from cayu.providers import ModelStreamEvent, ProviderStreamDeadlines
-from cayu.runtime import CayuApp, RequestFootprintConfig, RunRequest
-from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.request_footprints import (
-    RequestFingerprint,
-    RequestFingerprintAvailability,
-)
-from cayu.runtime.sessions import ModelTarget
-from cayu.runtime.tool_policy import StaticToolPolicy
+from cayu.events import EventType
+from cayu.messages import Message, MessageRole
+from cayu.providers.base import ModelStreamEvent
+from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import ModelTarget, RunRequest
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.policy import StaticToolPolicy
 
 
 class _WeatherTool(Tool):

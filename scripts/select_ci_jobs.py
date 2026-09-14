@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 _SCOPE_DEFINITION_PATHS = {
     ".github/workflows/ci.yml",
@@ -11,12 +13,43 @@ _SCOPE_DEFINITION_PATHS = {
     "scripts/package_ci_steps.yml",
     "scripts/run_ci.py",
     "scripts/select_ci_jobs.py",
+    "docs/public-api-migration.json",
+    "docs/public-api-packages.json",
     "tests/core/test_ci_verification_scope.py",
     "tests/core/test_local_ci.py",
 }
 _SHARED_DEPENDENCY_PATHS = {
     "pyproject.toml",
     "uv.lock",
+}
+# Derive migrated ownership from the same inventory checked by release validation.
+_ROOT = Path(__file__).resolve().parents[1]
+_PUBLIC_MOVES = json.loads((_ROOT / "docs/public-api-migration.json").read_text())
+_PUBLIC_PACKAGES = json.loads((_ROOT / "docs/public-api-packages.json").read_text())
+_RELOCATED_RUNTIME_PATHS = {
+    "src/" + canonical.replace(".", "/") + ".py"
+    for original, canonical in _PUBLIC_MOVES.items()
+    if original.startswith("cayu.runtime.")
+}
+_RELOCATED_CORE_PATHS = {
+    "src/" + canonical.replace(".", "/") + ".py"
+    for original, canonical in _PUBLIC_MOVES.items()
+    if original.startswith("cayu.core.")
+}
+# A concept owns future helpers too, not just files listed in the migration.
+# Root-level concepts remain exact paths so unrelated modules stay selective.
+_RUNTIME_CONCEPT_PREFIXES = tuple(
+    sorted(
+        {path.rsplit("/", 1)[0] + "/" for path in _RELOCATED_RUNTIME_PATHS if path.count("/") > 2}
+    )
+)
+_CORE_CONCEPT_PREFIXES = tuple(
+    sorted({path.rsplit("/", 1)[0] + "/" for path in _RELOCATED_CORE_PATHS if path.count("/") > 2})
+)
+_PUBLIC_EXPORT_PATHS = {
+    "src/" + package.replace(".", "/") + "/" + filename
+    for package in _PUBLIC_PACKAGES
+    for filename in ("__init__.py", "__init__.pyi", "_exports.py")
 }
 _SQLITE_EXACT_PATHS = {
     "src/cayu/_task_wait.py",
@@ -95,7 +128,10 @@ def select_pull_request_jobs(changed_paths: Iterable[str]) -> VerificationScope:
 
 def _affects_sqlite_cancellation(path: str) -> bool:
     return (
-        path in _SQLITE_EXACT_PATHS
+        path in _PUBLIC_EXPORT_PATHS
+        or path in _SQLITE_EXACT_PATHS
+        or path in _RELOCATED_RUNTIME_PATHS
+        or path.startswith(_RUNTIME_CONCEPT_PREFIXES)
         or path.startswith(("src/cayu/runtime/", "src/cayu/storage/", "tests/runtime/"))
         or (
             path.startswith("tests/")
@@ -105,8 +141,15 @@ def _affects_sqlite_cancellation(path: str) -> bool:
 
 
 def _affects_dashboard(path: str) -> bool:
-    return path in _DASHBOARD_EXACT_PATHS or path.startswith(
-        (
+    return path in (
+        _DASHBOARD_EXACT_PATHS
+        | _RELOCATED_RUNTIME_PATHS
+        | _RELOCATED_CORE_PATHS
+        | _PUBLIC_EXPORT_PATHS
+    ) or path.startswith(
+        _RUNTIME_CONCEPT_PREFIXES
+        + _CORE_CONCEPT_PREFIXES
+        + (
             "dashboard/",
             "src/cayu/artifacts/",
             "src/cayu/core/",
@@ -120,7 +163,7 @@ def _affects_dashboard(path: str) -> bool:
 
 
 def _affects_release_artifacts(path: str) -> bool:
-    if path in _RELEASE_EXACT_PATHS:
+    if path in _RELEASE_EXACT_PATHS or path in _PUBLIC_EXPORT_PATHS:
         return True
     if path.startswith(
         (

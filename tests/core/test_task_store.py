@@ -35,9 +35,16 @@ from tests.core.task_terminalization_conformance import (
     ordinary_cancellation_reconciliation_request,
 )
 
-from cayu import (
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    DurableValueError,
+    extract_durable_value_error,
+)
+from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import migrations as schema_migrations
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import (
     InMemoryTaskStore,
-    SQLiteTaskStore,
     Task,
     TaskClaimLost,
     TaskCreate,
@@ -52,23 +59,14 @@ from cayu import (
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
     TaskTerminalKind,
-    interrupted_task_handoff_request,
-)
-from cayu._validation import (
-    MAX_DURABLE_JSON_INTEGER,
-    DurableValueError,
-    extract_durable_value_error,
-)
-from cayu.runtime.tasks import (
     _legacy_task_terminalization_request_sha256,
     _require_interrupted_task_handoff_authority,
     _task_terminalization_request_matches_sha256,
     copy_task_query,
+    interrupted_task_handoff_request,
     prepare_interrupted_task_handoff,
     prepare_task_terminalization,
 )
-from cayu.storage import _sqlite_support as sqlite_support
-from cayu.storage import migrations as schema_migrations
 
 StoreFactory = Callable[[object], TaskStore]
 

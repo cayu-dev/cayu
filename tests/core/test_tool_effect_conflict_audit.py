@@ -10,12 +10,12 @@ from tests.core.test_tool_effect_store_conformance import _stores
 from cayu.runtime._checkpoint_store import _RuntimeCheckpointSessionStore
 from cayu.runtime._tool_effect_conflicts import ToolEffectConflictAudit
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.sessions import (
+from cayu.runtime.tool_effects import ToolEffectConflict
+from cayu.sessions.base import (
     SessionRunFenced,
     _activate_session_run_fence,
     _deactivate_session_run_fence,
 )
-from cayu.runtime.tool_effects import ToolEffectConflict
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

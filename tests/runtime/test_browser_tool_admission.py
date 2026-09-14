@@ -20,34 +20,35 @@ from tests.runtime.test_execution_admission_dispatch import (
     _run,
 )
 
-from cayu import (
-    AgentSpec,
-    ApprovedEgressDestination,
-    BrowserSessionTool,
-    BrowserWebFetchAdapter,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.egress.destinations import ApprovedEgressDestination
+from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionExecutableEvidence,
     ExecutionRequirements,
     ExecutionToolRequirementEvidence,
-    ScreenshotPageTool,
+)
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import EventType
+from cayu.runners import docker as docker_module
+from cayu.runners.base import ExecResult
+from cayu.runners.docker import DockerRunner
+from cayu.tools.base import (
     Tool,
     ToolExecutableRequirement,
     ToolExecutionRequirement,
     ToolRunnerCapabilityRequirement,
     ToolSpec,
-    WebFetchTool,
 )
-from cayu.egress.docker_adapter import DockerEgressAdapter
-from cayu.runners import DockerRunner, ExecResult
-from cayu.runners import docker as docker_module
-from cayu.tools.browser_session import BrowserSessionBackend
-from cayu.vaults import SecretRef, StaticVault
+from cayu.tools.browser import BrowserWebFetchAdapter, ScreenshotPageTool
+from cayu.tools.browser_session import BrowserSessionBackend, BrowserSessionTool
+from cayu.tools.web import WebFetchTool
+from cayu.vaults.base import SecretRef
+from cayu.vaults.static import StaticVault
 
 
 @pytest.mark.parametrize(

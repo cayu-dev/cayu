@@ -9,64 +9,59 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+import cayu.sessions.base as sessions_module
 from cayu import SQLiteSessionStore
 from cayu._exception_groups import exception_cause, iter_exception_tree
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.environments import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
 )
+from cayu.events import Event, EventType
+from cayu.exceptions import (
+    InteractionLifecyclePublicationRejected,
+    TerminalEventPublicationUncertain,
+    _is_runtime_interaction_lifecycle_publication_rejection,
+    _runtime_interaction_lifecycle_publication_rejected,
+)
+from cayu.messages import Message
+from cayu.observability.events import EventSink
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.runtime import _session_engine as session_engine_module
+from cayu.runtime.loop_policies import LoopPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     EventQuery,
-    EventSink,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
-    InMemoryTaskStore,
-    InteractionLifecyclePublicationRejected,
     InteractionTransitionReceiptResult,
     InteractionTransitionResult,
     InteractionTransitionSpec,
     InterruptSessionRequest,
-    LoopPolicy,
     ResumeRequest,
-    RunLimits,
     RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
     SessionIdentity,
     SessionMessageDeliveryMode,
     SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
-    TaskCreate,
-    TaskStatus,
-    TerminalEventPublicationUncertain,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
 )
-from cayu.runtime import _session_engine as session_engine_module
-from cayu.runtime import sessions as sessions_module
-from cayu.runtime.errors import (
-    _is_runtime_interaction_lifecycle_publication_rejection,
-    _runtime_interaction_lifecycle_publication_rejected,
-)
-from cayu.runtime.interactions import (
+from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     InteractionStatus,
     InteractionSummaryEvidence,
 )
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 
 
 @pytest.mark.parametrize(

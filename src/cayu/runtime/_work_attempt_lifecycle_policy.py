@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from cayu.runtime.tasks import (
-    CompletionDecisionApplicationReceipt,
-    Task,
-    TaskStatus,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
-    _ensure_exact_owned_active_task_lease,
-    _task_cancellation_requested,
-    copy_task,
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    copy_work_attempt_lifecycle_settlement,
+    copy_work_attempt_preparation_hold,
+    runtime_stop_reason_for_execution_stop,
+    work_attempt_admission_authority_sha256,
+    work_attempt_lifecycle_settlement_sha256,
+    work_attempt_preparation_hold_sha256,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionConflict,
     WorkAttemptAdmissionState,
@@ -29,17 +29,17 @@ from cayu.runtime.work_attempt_admission import (
     copy_work_attempt_execution_stop_request,
     require_work_attempt_admission_result,
 )
-from cayu.runtime.work_attempt_lifecycle import (
-    WorkAttemptLifecycleSettlement,
-    WorkAttemptPreparationHold,
-    copy_work_attempt_lifecycle_settlement,
-    copy_work_attempt_preparation_hold,
-    runtime_stop_reason_for_execution_stop,
-    work_attempt_admission_authority_sha256,
-    work_attempt_lifecycle_settlement_sha256,
-    work_attempt_preparation_hold_sha256,
+from cayu.tasks.base import (
+    CompletionDecisionApplicationReceipt,
+    Task,
+    TaskStatus,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
+    _ensure_exact_owned_active_task_lease,
+    _task_cancellation_requested,
+    copy_task,
 )
-from cayu.runtime.work_contracts import CompletionDecision, CompletionProposal, CompletionVerdict
+from cayu.tasks.contracts import CompletionDecision, CompletionProposal, CompletionVerdict
 
 
 def plan_work_attempt_execution_entry(

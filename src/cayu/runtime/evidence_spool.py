@@ -21,8 +21,8 @@ from typing import Generic, TypeVar, cast, overload
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import Event, EventType
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.sessions.base import (
     _TERMINAL_SESSION_EVIDENCE_LIFECYCLE_EVENT_TYPES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     EventRecord,

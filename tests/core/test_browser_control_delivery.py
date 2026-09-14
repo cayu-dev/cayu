@@ -6,8 +6,8 @@ import json
 import pytest
 from tests.core.test_browser_session import _WireRunner
 
-from cayu.core.tools import ToolContext
 from cayu.runners import ExecResult
+from cayu.tools.base import ToolContext
 from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
 
 

@@ -24,11 +24,6 @@ from cayu.runtime._browser_control_channel import (
     bind_browser_guest_channel,
     browser_allocation_digest,
 )
-from cayu.runtime.browser_control import (
-    BrowserControlAllocation,
-    BrowserControlConflict,
-    BrowserControlPrincipal,
-)
 from cayu.tools._browser_control_guest import (
     GuestControlChannel,
     GuestControlFailure,
@@ -36,6 +31,11 @@ from cayu.tools._browser_control_guest import (
 )
 from cayu.tools._browser_control_transport import CONTROL_SUBPROTOCOL, open_guest_control_channel
 from cayu.tools._browser_guest import _InteractiveDaemon, _InteractivePage
+from cayu.tools.browser_control import (
+    BrowserControlAllocation,
+    BrowserControlConflict,
+    BrowserControlPrincipal,
+)
 
 control_tls = _control_tls
 

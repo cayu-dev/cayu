@@ -9,9 +9,9 @@ from uuid import uuid4
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 
 if TYPE_CHECKING:
-    from cayu.core.tools import ToolResult
-    from cayu.runtime.invocation import SessionInvocation
-    from cayu.runtime.sessions import RunRequest, Session
+    from cayu.sessions.base import RunRequest, Session
+    from cayu.sessions.invocation import SessionInvocation
+    from cayu.tools.base import ToolResult
 
 
 def _subagent_lineage_digest(request: RunRequest) -> str:
@@ -34,7 +34,7 @@ def run_request_with_subagent_lineage(request: RunRequest) -> RunRequest:
     This private entrance is called only after SubagentTool constructs linkage
     from its runtime-owned ToolContext. Public metadata never supplies this seal.
     """
-    from cayu.runtime.sessions import copy_run_request
+    from cayu.sessions.base import copy_run_request
 
     copied = copy_run_request(request)
     copied._runtime_generated_authority = copied._runtime_generated_authority | {

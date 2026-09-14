@@ -890,8 +890,8 @@ def test_storage_export_emits_jsonl(tmp_path, capsys):
     import asyncio
 
     from cayu import SQLiteSessionStore
-    from cayu.core import Message
-    from cayu.runtime import RunRequest, SessionIdentity
+    from cayu.messages import Message
+    from cayu.sessions.base import RunRequest, SessionIdentity
 
     async def seed() -> None:
         store = SQLiteSessionStore(db, schema_mode=schema.SchemaMode.CREATE)

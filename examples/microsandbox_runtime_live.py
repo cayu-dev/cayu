@@ -20,9 +20,9 @@ from cayu import (
     MicrosandboxRunner,
     RunRequest,
 )
-from cayu.core import Event, EventType
-from cayu.core.tools import ToolContext
+from cayu.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.tools.base import ToolContext
 
 
 class FakeProvider(ModelProvider):

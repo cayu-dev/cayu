@@ -20,26 +20,24 @@ from tests.core.test_runtime import (
 )
 
 import cayu.runtime._tool_results as tool_results_module
-from cayu import CayuConfig, RunDefaults
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    Message,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import (
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    BudgetWindow,
+    InMemoryBudgetStore,
 )
-from cayu.core.tools import (
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.environments import (
-    Environment,
-    EnvironmentSpec,
-)
-from cayu.providers import (
+from cayu.budgets.billing import BillingIdentity
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import CheckpointCompactionContextPolicy, CompactionRequest, ModelCompactor
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook, ToolCallHookContext
+from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
@@ -47,28 +45,25 @@ from cayu.providers import (
     ModelStreamEventType,
     UsageDialect,
 )
-from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
-from cayu.runtime import (
-    AfterToolCallDecision,
-    BillingIdentity,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    BudgetWindow,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactionRequest,
-    InMemoryBudgetStore,
+from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
+from cayu.proxies.passthrough import PassthroughProxy
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,
-    ModelCompactor,
     ResumeRequest,
-    RetryPolicy,
     RunRequest,
-    RuntimeHook,
-    ToolCallHookContext,
 )
-from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
+from cayu.tools.base import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
+from cayu.vaults.base import ResolvedSecret, SecretRef
+from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.static import StaticVault
 
 _HOSTILE_DURABLE_ERROR_SECRET = "workload-secret-durable-error-accessor"
 
@@ -1583,7 +1578,7 @@ def test_external_tool_nonportable_exception_retains_unknown_effect():
             self.calls += 1
             raise RuntimeError("charged receipt-456\x00workload-secret")
 
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     session_id = "sess_nonportable_external_exception"
     tool = NonPortableExceptionTool()
@@ -1779,7 +1774,7 @@ def test_nonportable_after_tool_hook_failure_keeps_original_terminal_result():
             del context
             raise RuntimeError("hook failed\x00workload-secret")
 
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     tool = ReceiptTool()
     provider = _portable_tool_boundary_provider(tool.spec.name, "call_hook_receipt")
@@ -1888,7 +1883,7 @@ def test_forged_invalid_after_tool_modification_is_failed_closed():
 
 
 def test_invalid_tool_output_evidence_is_redacted_before_hooks_and_publication():
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "receipt-workload-secret"
     observed: list[dict[str, Any] | None] = []
@@ -1957,7 +1952,7 @@ def test_invalid_tool_output_evidence_is_redacted_before_hooks_and_publication()
 
 
 def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_redaction():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "zz"
     redactor = SecretRedactor(secret)
@@ -2034,7 +2029,7 @@ def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_r
 
 
 def test_terminal_diagnostic_and_evidence_redact_secret_crossing_byte_boundaries() -> None:
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "boundary-secret-canary"
     redactor = SecretRedactor(secret)
@@ -2076,7 +2071,7 @@ def test_terminal_diagnostic_and_evidence_redact_secret_crossing_byte_boundaries
 
 
 def test_tool_result_redaction_does_not_trust_caller_supplied_web_framing() -> None:
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "forged-prefix\n\n<untrusted_web_content>\n"
     result = tool_results_module.redact_tool_result(
@@ -2092,7 +2087,7 @@ def test_tool_result_redaction_does_not_trust_caller_supplied_web_framing() -> N
 
 def test_exception_type_name_is_redacted_before_its_byte_bound() -> None:
     from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_TYPE_UTF8_BYTES
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "exception-type-boundary-secret"
     exception_type = type(
@@ -2402,7 +2397,7 @@ def test_external_invalid_tool_output_precedes_proxy_telemetry_failure_and_repla
 
 
 def test_unknown_tool_controls_survive_matching_secret_redaction():
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     error_path = "$/#1"
     control_values = [
@@ -2479,7 +2474,7 @@ def test_unknown_tool_controls_survive_matching_secret_redaction():
 
 
 def test_secret_bearing_provider_call_id_fails_closed_before_tool_execution() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     call_id = "call_secret_identity"
 

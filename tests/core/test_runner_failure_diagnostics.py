@@ -8,26 +8,17 @@ import json
 import pytest
 from tests.core._workload_secret_support import FakeProvider, collect_resume_events
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventType,
-    ExecCommand,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SQLiteSessionStore,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.providers import ModelStreamEvent
-from cayu.runners import Runner
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runners._diagnostics import tag_runner_failure_phase
+from cayu.runners.base import ExecCommand, Runner
+from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 
 
 def verify_durable_failure(tmp_path, runner, command, number, phase, *, abandon_stream=False):

@@ -14,9 +14,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cayu.applications import CayuApp
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.project_control_plane import ProjectControlPlaneContext
-from cayu.runtime.app import CayuApp
 
 
 @dataclass(frozen=True)

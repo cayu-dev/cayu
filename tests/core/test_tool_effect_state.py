@@ -7,8 +7,8 @@ from hashlib import sha256
 import pytest
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core import Event, EventType, Message
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.runtime._tool_effect_state import (
     ToolEffectConflict,
     ToolEffectIntent,
@@ -18,8 +18,14 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectTerminal,
     validate_tool_effect_uncertainty_event,
 )
-from cayu.runtime.sessions import RuntimePublicationCheckpointOperation, RuntimePublicationMutation
 from cayu.runtime.tool_effects import ToolEffectReceipt, ToolEffectReconciliationResult
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    RunRequest,
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+    SessionIdentity,
+)
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

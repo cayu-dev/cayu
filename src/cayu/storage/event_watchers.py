@@ -13,7 +13,7 @@ from cayu._validation import (
     require_durable_nonblank,
     require_nonblank,
 )
-from cayu.runtime.event_watchers import (
+from cayu.observability.watchers import (
     EventWatcherClaim,
     EventWatcherDeadLetter,
     EventWatcherDelivery,
@@ -28,13 +28,13 @@ from cayu.runtime.event_watchers import (
     replay_event_watcher_settlement,
     settle_event_watcher_transition,
 )
-from cayu.runtime.event_watchers import (
+from cayu.observability.watchers import (
     _clean_error as clean_watcher_error,
 )
-from cayu.runtime.event_watchers import (
+from cayu.observability.watchers import (
     _validate_max_attempts as validate_watcher_max_attempts,
 )
-from cayu.runtime.sessions import EventRecord
+from cayu.sessions.base import EventRecord
 from cayu.storage import migrations as schema
 
 from . import _sqlite_support as sqlite_support

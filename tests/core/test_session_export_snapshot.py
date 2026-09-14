@@ -7,13 +7,9 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.core import Event, EventType, Message
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-)
-from cayu.runtime.exports import SessionExportBuilder, SessionExportLimits, SessionExportTooLarge
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     InMemorySessionStore,
     RunRequest,
@@ -21,6 +17,11 @@ from cayu.runtime.sessions import (
     SessionMessageDeliveryMode,
     SessionStatus,
 )
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
+from cayu.sessions.exports import SessionExportBuilder, SessionExportLimits, SessionExportTooLarge
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.migrations import SchemaMode
@@ -359,7 +360,7 @@ def test_postgres_snapshot_keeps_targeted_grants_and_uses_in_the_same_state(post
 
     from tests.core.test_targeted_tool_grants import _codec, _open_targeted_grant
 
-    from cayu.runtime.tool_grants import TargetedToolUseRequest
+    from cayu.tools.grants import TargetedToolUseRequest
 
     async def run():
         store = PostgresSessionStore(
@@ -493,7 +494,7 @@ def test_deferred_input_materialization_cannot_disappear_between_export_componen
 
 
 def test_custom_store_without_snapshot_support_fails_closed():
-    from cayu.runtime.sessions import SessionStore
+    from cayu.sessions.base import SessionStore
 
     class LegacyStore(InMemorySessionStore):
         load_session_export_snapshot = SessionStore.load_session_export_snapshot

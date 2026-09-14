@@ -7,7 +7,7 @@ import pytest
 from tests.core import test_openai_search_ordering as search
 from tests.providers._responses_ordering import run_ordering_attempts
 
-from cayu import EventType
+from cayu.events import EventType
 
 
 @pytest.mark.anyio

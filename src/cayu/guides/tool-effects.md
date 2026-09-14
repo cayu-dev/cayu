@@ -332,7 +332,7 @@ without another validator call. `not_found` and `unsupported` instead use
 
 Tools with an existing operation journal can implement the narrow
 `DurableToolRecovery.reconcile_durable_tool_call` extension from
-`cayu.core.tools`. It returns `DurableToolRecoveryEvidence` or `None`, not a
+`cayu.tools.base`. It returns `DurableToolRecoveryEvidence` or `None`, not a
 bare `ToolResult`. The evidence pairs a diagnostic result with one explicit
 disposition:
 
@@ -363,7 +363,7 @@ invokes one registered tool against a bounded temporary Cayu workspace, then
 reports the declared effect and any created, updated, or deleted paths:
 
 ```python
-from cayu.testing import ToolEffectVerificationStatus, verify_tool_effect
+from cayu.testing.base import ToolEffectVerificationStatus, verify_tool_effect
 
 evidence = await verify_tool_effect(
     app,

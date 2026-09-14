@@ -5,32 +5,33 @@ from pathlib import Path
 
 from tests.evals.eval_store_conformance import captured_result_for_corpus
 
-from cayu import (
-    AgentSpec,
-    CorpusTarget,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.cli import main
+from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
-    EvalPlan,
     EvalSuiteSpec,
     EvaluationEvidencePolicySpec,
     EvaluationSourceIdentityV1,
     FinalOutputEqualsAssertionSpec,
-    Message,
     ModelJudgeAssertionSpec,
-    ModelJudgeTarget,
-    ModelStreamEvent,
     RunInputSpec,
-    RunRequest,
-    ScriptedModelProvider,
     TrialRequestSpec,
-    captured_evaluation_result_to_json,
     eval_corpus_to_json,
-    load_corpus_execution_result,
     load_eval_corpus,
 )
-from cayu.cli import main
-from cayu.runtime.app import CayuApp
+from cayu.evals.execution import CorpusTarget, ModelJudgeTarget
+from cayu.evals.execution_reporting import (
+    captured_evaluation_result_to_json,
+    load_corpus_execution_result,
+)
+from cayu.evals.runner import EvalPlan
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import RunRequest
 
 
 def _source() -> EvaluationSourceIdentityV1:
@@ -570,7 +571,7 @@ def test_eval_run_requires_explicit_suite_for_multi_suite_corpus(
     first = _corpus()
     second = _corpus(suite_id="accounts", case_id="account-approved")
     corpus_path = tmp_path / "multi.json"
-    from cayu import merge_eval_corpora
+    from cayu.evals.corpus import merge_eval_corpora
 
     corpus_path.write_text(
         eval_corpus_to_json(merge_eval_corpora((first, second))),

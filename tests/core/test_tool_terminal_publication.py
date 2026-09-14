@@ -9,16 +9,16 @@ import pytest
 
 import cayu._validation as validation
 from cayu._validation import DurableValueError
-from cayu.core.events import (
+from cayu.events import (
     Event,
     EventType,
     copy_event,
     event_with_runtime_payload_authority,
 )
 from cayu.runtime._event_projection import prepare_new_runtime_event
-from cayu.runtime.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
-from cayu.runtime.tool_terminal_publication import ToolTerminalPublicationGovernor
-from cayu.vaults import SecretRedactor
+from cayu.sessions.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
+from cayu.tools.terminal_publication import ToolTerminalPublicationGovernor
+from cayu.vaults.redaction import SecretRedactor
 
 _TIMING_FIELDS = (
     "tool_effect_completed_at",

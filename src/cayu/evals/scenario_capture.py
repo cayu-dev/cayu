@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from cayu._validation import canonical_durable_json_bytes, require_durable_text
+from cayu.applications import CayuApp
 from cayu.artifacts import (
     ArtifactScope,
     ArtifactStore,
@@ -31,8 +32,6 @@ from cayu.artifacts.attachments import (
     MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
     FileAttachment,
 )
-from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
-from cayu.core.messages import FilePart, Message, MessageRole, TextPart
 from cayu.evals.corpus import EvaluationSourceIdentityV1, _portable_id
 from cayu.evals.scenario import (
     EVAL_SCENARIO_MAX_ARTIFACT_REQUIREMENTS,
@@ -51,8 +50,9 @@ from cayu.evals.scenario import (
     ScenarioTextPartV2,
     ScenarioUserMessageV2,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
+from cayu.messages import FilePart, Message, MessageRole, TextPart
+from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     SessionInputContractEvidence,
     SessionMessageDeliveryMode,

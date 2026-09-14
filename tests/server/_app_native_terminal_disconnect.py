@@ -3,9 +3,9 @@
 import asyncio
 
 from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
-from cayu.runtime.browser_control import BrowserControlCheckpoint
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.server._browser_guest_routes import _GuestSocket
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools.browser_control import BrowserControlCheckpoint
 
 
 class NativeTerminalDisconnect:

@@ -11,19 +11,14 @@ from tests.core.test_explicit_compaction_transcript_redaction import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import AgentSpec, Message
-from cayu.core.events import EventType
-from cayu.runtime import (
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactSessionRequest,
-    InMemorySessionStore,
-    ModelCompactor,
-    RunRequest,
-)
-from cayu.runtime.context import ContextBuildError
-from cayu.runtime.request_footprints import RequestFootprintConfig
-from cayu.vaults import SecretRedactor
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.base import CheckpointCompactionContextPolicy, ContextBuildError, ModelCompactor
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.sessions.base import CompactSessionRequest, InMemorySessionStore, RunRequest
+from cayu.vaults.redaction import SecretRedactor
 
 _CANARY = "fictional-rejected-compaction-result-secret-1710"
 

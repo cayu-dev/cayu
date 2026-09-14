@@ -441,7 +441,8 @@ def test_missing_case_result_rejects_aggregate(tmp_path, monkeypatch):
 def test_named_workers_share_durable_task_claims_without_duplicates(tmp_path):
     import asyncio
 
-    from cayu import SQLiteTaskStore, TaskCreate
+    from cayu.storage.sqlite import SQLiteTaskStore
+    from cayu.tasks.base import TaskCreate
 
     _project(
         tmp_path,
@@ -555,7 +556,7 @@ Provider.stream=crash_stream
     _assert_dead([int(p.stem.split("-")[1]) for p in tmp_path.glob("factory-*.json")])
     import asyncio
 
-    from cayu import inspect_process_eval_run
+    from cayu.evals.process_inspection import inspect_process_eval_run
 
     snapshot = asyncio.run(inspect_process_eval_run(tmp_path / "workers"))
     assert snapshot.phase == "incomplete"
@@ -631,7 +632,7 @@ def build_eval():
 def test_process_eval_status_observes_active_sqlite_cases_without_loading_target(tmp_path):
     import asyncio
 
-    from cayu import inspect_process_eval_run
+    from cayu.evals.process_inspection import inspect_process_eval_run
 
     _project(
         tmp_path,

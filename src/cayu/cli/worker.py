@@ -14,6 +14,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
+from cayu.applications import CayuApp
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import (
     _discover_configured_project,
@@ -28,7 +29,6 @@ from cayu.runtime._process_workers import (
     supervisor_watchdog,
     watch_supervisor,
 )
-from cayu.runtime.app import CayuApp
 
 
 class WorkerError(ValueError):

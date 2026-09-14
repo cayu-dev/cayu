@@ -22,10 +22,10 @@ from guard_harness import (
 import cayu.workspaces._guest_guard as guest_guard_module
 import cayu.workspaces.runner as runner_workspace_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core.tools import ToolContext
 from cayu.environments import SyncBinding
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.tools.base import ToolContext
 from cayu.workspaces import (
     BoundedTarReader,
     BoundedTarStreamReader,

@@ -27,7 +27,7 @@ from cayu import (
     ToolContext,
     ToolResult,
 )
-from cayu.core import EventType
+from cayu.events import EventType
 from cayu.providers import ModelStreamEvent
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools._redaction import InvocationRedactorSnapshot

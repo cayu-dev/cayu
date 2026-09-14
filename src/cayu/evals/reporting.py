@@ -17,6 +17,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
+from cayu.budgets.usage import aggregate_usage_metrics_from_json_payload
 from cayu.evals.memory_attribution import eval_memory_attribution_summary
 from cayu.evals.models import (
     EVAL_SCHEMA_VERSION,
@@ -30,7 +31,6 @@ from cayu.evals.models import (
     _validate_trajectory_record_contract,
 )
 from cayu.evals.operation_outcomes import OperationOutcomeSummary, operation_outcome_summary_text
-from cayu.runtime.usage import aggregate_usage_metrics_from_json_payload
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 

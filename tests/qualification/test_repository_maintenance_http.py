@@ -9,8 +9,9 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from cayu import BudgetWindow, TaskQuery
+from cayu.budgets.base import BudgetWindow
 from cayu.server import ProductPrincipal
+from cayu.tasks.base import TaskQuery
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.qualification.test_repository_maintenance_application import project as project
 from tests.qualification.test_repository_maintenance_request import consumer as consumer
@@ -180,7 +181,7 @@ def invalid_policy(case):
     elif case == "unpriced":
         limit.reservation, limit.allow_unpriced = None, True
     elif case == "action":
-        limit.reservation, limit.action = None, "observe"
+        limit.reservation, limit.action = None, "notify"
     elif case == "pricing":
         limit.pricing.prices = ()
     else:
@@ -201,7 +202,6 @@ def invalid_policy(case):
         "reservation",
         "unpriced",
         "action",
-        "pricing",
     ],
 )
 def test_host_and_intake_require_bounded_budget(host, case, monkeypatch):
@@ -229,6 +229,14 @@ def test_host_and_intake_require_bounded_budget(host, case, monkeypatch):
         assert not provider.requests
 
     asyncio.run(scenario())
+
+
+def test_invalid_pricing_is_rejected_before_budget_policy_replacement(host):
+    _server, application, _registry, _provider, _auth = host
+    original = application.app.budget_policy
+    with pytest.raises(ValueError, match="pricing.prices"):
+        application.app.budget_policy = invalid_policy("pricing")
+    assert application.app.budget_policy == original
 
 
 def test_budget_copy_and_corrupt_field_diagnostics(host, caplog, capsys):

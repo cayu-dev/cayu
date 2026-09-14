@@ -8,7 +8,7 @@ from typing import Any, cast
 
 import pytest
 
-import cayu.testing as testing
+import cayu.testing.base as testing
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -20,14 +20,14 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
-from cayu.core.isolated_tools import (
+from cayu.testing.base import (
+    ToolEffectVerificationStatus,
+    verify_tool_effect,
+)
+from cayu.tools.isolated import (
     ProcessIsolatedTool,
     ProcessIsolatedToolFactoryRef,
     ProcessIsolatedToolLimits,
-)
-from cayu.testing import (
-    ToolEffectVerificationStatus,
-    verify_tool_effect,
 )
 
 
@@ -332,7 +332,7 @@ def test_verify_tool_effect_rejects_process_isolated_tool_portably(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "cayu.runtime.app.validate_process_isolated_tool_registration",
+        "cayu.applications.validate_process_isolated_tool_registration",
         lambda *_args, **_kwargs: None,
     )
     tool = ProcessIsolatedTool(
@@ -346,7 +346,7 @@ def test_verify_tool_effect_rejects_process_isolated_tool_portably(
             ),
         ),
         factory=ProcessIsolatedToolFactoryRef(
-            module="cayu.testing_isolated_tools",
+            module="cayu.testing.isolated_tools",
             qualname="build_deterministic_isolated_tool",
             identity=ExecutionProfileBehaviorIdentity(
                 name="tests:isolated-verifier-factory",

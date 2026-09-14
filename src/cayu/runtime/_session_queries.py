@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     EventRecord,

@@ -96,6 +96,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
     sidecar = sidecar or _canonical_sidecar()
     compiled_dashboard = _canonical_compiled_dashboard()
     return {
+        *artifact_validator["_PUBLIC_LAYOUT_REQUIRED"],
         "cayu/__init__.py",
         "cayu/cli/_targets.py",
         "cayu/cli/__init__.py",
@@ -637,3 +638,32 @@ def test_sidecar_manifest_generator_detects_and_repairs_stale_manifest(
     assert generator["main"](["--check"]) == 1
     assert generator["main"]([]) == 0
     assert generator["main"](["--check"]) == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["cayu/sessions/base.py", "cayu/tools/__init__.pyi", "cayu/_exports.py", "cayu/py.typed"],
+)
+def test_release_wheel_requires_complete_concept_layout(tmp_path: Path, name: str) -> None:
+    archive = tmp_path / "cayu.whl"
+    _write_wheel(archive, _valid_wheel_names() - {name})
+    with pytest.raises(ValueError, match="missing required wheel files"):
+        artifact_validator["validate_wheel"](archive)
+
+
+@pytest.mark.parametrize("name", ["cayu/runtime/app.py", "cayu/core/tools.pyi", "cayu/memory.py"])
+def test_release_wheel_rejects_removed_module_aliases(tmp_path: Path, name: str) -> None:
+    archive = tmp_path / "cayu.whl"
+    _write_wheel(archive, _valid_wheel_names() | {name})
+    with pytest.raises(ValueError, match="removed public module paths"):
+        artifact_validator["validate_wheel"](archive)
+
+
+@pytest.mark.parametrize(
+    "name", ["src/cayu/runtime/app.py", "src/cayu/core/tools.pyi", "src/cayu/testing.py"]
+)
+def test_release_sdist_rejects_removed_module_aliases(tmp_path: Path, name: str) -> None:
+    archive = tmp_path / "cayu.tar.gz"
+    _write_sdist(archive, additional_names={name})
+    with pytest.raises(ValueError, match="removed public module paths"):
+        validate_sdist(archive)

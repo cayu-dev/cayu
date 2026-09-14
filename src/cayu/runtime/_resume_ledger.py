@@ -5,14 +5,14 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 from cayu._validation import copy_durable_metadata, copy_json_value
-from cayu.core.events import Event, EventType
-from cayu.core.tools import _bound_policy_denial_text
+from cayu.approvals.tools import PendingToolCallApproval
+from cayu.events import Event, EventType
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
-from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.tool_gateway import gateway_lifecycle_matches_outer_call
-from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.tools.base import _bound_policy_denial_text
+from cayu.tools.gateway import gateway_lifecycle_matches_outer_call
+from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.vaults import SecretRedactor
 
 TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY = "tool_evidence_conflict"

@@ -48,58 +48,109 @@ import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
-import cayu.runtime.sessions as sessions_module
+import cayu.sessions.base as sessions_module
 import cayu.tools.shared_artifacts as shared_artifacts_module
-from cayu import (
-    KNOWLEDGE_LEXICAL_CHANNEL,
-    KNOWLEDGE_SEMANTIC_CHANNEL,
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
-    AutomaticRecallContextPolicy,
-    AutomaticRecallPolicy,
-    AutomaticRecallSourceConfig,
-    ContextExposure,
-    ContextExposureEvidenceKind,
-    ContextExposureState,
-    ContextExposureTransition,
-    ContextExposureTransitionConflict,
-    ContextExposureTransitionRequest,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    MemoryAttributionStatus,
-    RecallEvidenceConflict,
-    RecallEvidenceQuery,
-    RecallItemExposure,
-    RecallReceipt,
-    RecallReceiptItem,
-    RecallSourceCoverage,
-    RuntimeEvidenceRequest,
-    SessionWorkspaceBranchStore,
-    SQLiteSessionStore,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
-    WeightedReciprocalRankFusionConfig,
-    runtime_evidence,
-)
 from cayu._exception_groups import iter_exception_tree
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
     extract_durable_value_error,
 )
-from cayu.artifacts import (
-    FileAttachment,
-    FileAttachmentKind,
-    LocalArtifactStore,
-    file_attachment,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    PendingToolApprovalEventView,
+    PendingToolCallApproval,
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
 )
-from cayu.core import (
-    AgentSpec,
-    CitationPart,
-    CitationProvenance,
+from cayu.approvals.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+    PendingUserInput,
+    UserInputResponse,
+    user_input_answer_request_digest,
+    user_input_resolution_intent_for,
+    user_input_resolution_request_digest,
+)
+from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind, file_attachment
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.aggregates import estimate_usage_rollup_cost
+from cayu.budgets.base import (
+    MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReconciliation,
+    BudgetReservation,
+    InMemoryBudgetStore,
+    budget_reconciliation_payload,
+    budget_settlement_id,
+)
+from cayu.budgets.billing import BillingIdentity
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.usage import UsageMetrics
+from cayu.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    CompactionRequest,
+    CompactionResult,
+    ContextCompactor,
+    MessageWindowContextPolicy,
+    ModelCompactor,
+)
+from cayu.context.footprints import RequestFootprint, RequestFootprintConfig
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputSpec,
+)
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import (
+    BoundWorkspace,
+    DeterministicWorkspaceBinding,
+    WorkspaceBinding,
+    WorkspaceSnapshot,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import (
     Event,
     EventType,
-    ExecutionProfileBehaviorIdentity,
+    event_durable_envelope,
+    event_payload_authority_is_runtime_generated,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_payload_authority,
+)
+from cayu.memory.attribution import MemoryAttributionStatus
+from cayu.memory.base import AutomaticRecallPolicy
+from cayu.memory.context import AutomaticRecallContextPolicy, AutomaticRecallSourceConfig
+from cayu.memory.evidence import (
+    ContextExposure,
+    ContextExposureEvidenceKind,
+    ContextExposureState,
+    ContextExposureTransition,
+    ContextExposureTransitionConflict,
+    ContextExposureTransitionRequest,
+    RecallEvidenceConflict,
+    RecallEvidenceQuery,
+    RecallItemExposure,
+    RecallReceipt,
+    RecallReceiptItem,
+    RecallSourceCoverage,
+)
+from cayu.memory.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL
+from cayu.memory.retrieval import (
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    WeightedReciprocalRankFusionConfig,
+)
+from cayu.messages import (
+    CitationPart,
+    CitationProvenance,
     FilePart,
     HostedToolCallPart,
     Message,
@@ -112,144 +163,11 @@ from cayu.core import (
     WebSearchAPISource,
     WebSearchSource,
 )
-from cayu.core.billing import BillingIdentity
-from cayu.core.events import (
-    event_durable_envelope,
-    event_payload_authority_is_runtime_generated,
-    event_with_runtime_envelope_authority,
-    event_with_runtime_payload_authority,
-)
-from cayu.core.tools import (
-    DurableToolOperationConflict,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.environments import (
-    BoundWorkspace,
-    DeterministicWorkspaceBinding,
-    Environment,
-    EnvironmentSpec,
-    WorkspaceBinding,
-    WorkspaceSnapshot,
-)
-from cayu.evals.testing import ScriptedModelProvider
-from cayu.providers import (
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    ProviderOperationState,
-    ProviderOperationStatus,
-    UsageDialect,
-    bedrock_billing_identity,
-    completed_bedrock_billing_identity,
-)
-from cayu.runtime import (
-    AllowAllToolPolicy,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    ChildSessionContextContributor,
-    CompactionRequest,
-    CompactionResult,
-    CompactSessionRequest,
-    ContextCompactor,
-    EnqueueSessionMessageRequest,
-    EventOrder,
-    EventQuery,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileComponentClass,
-    ExecutionProfileDecisionKind,
-    ExecutionProfileMismatchError,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    ForkSystemPromptReplacement,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    InMemoryBudgetStore,
-    InMemorySessionStore,
-    InteractionTransitionSpec,
-    InterruptSessionRequest,
-    InvocationOriginClaim,
-    InvocationOriginTrust,
-    McpManifestBaseline,
-    MessageWindowContextPolicy,
-    ModelCompactor,
-    ModelCompletionStageDisposition,
-    ModelCompletionStageRequest,
-    ModelTarget,
-    PendingToolApproval,
-    PendingToolApprovalEventView,
-    PersistedEventSideEffectClaimLost,
-    PersistedEventSideEffectStatus,
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
-    ReleaseInvocationCommand,
-    RequestFootprint,
-    RequestFootprintConfig,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunLimits,
-    RunRequest,
-    RuntimeBuildArtifactKind,
-    RuntimeBuildProvenance,
-    RuntimeBuildProvenanceOrigin,
-    RuntimeHook,
-    RuntimeHookContext,
-    RuntimePublicationCheckpointOperation,
-    RuntimePublicationMutation,
-    RuntimePublicationOperationRecordMutation,
-    RuntimePublicationRequest,
-    Session,
-    SessionExecutionSource,
-    SessionIdentity,
-    SessionMessageDeliveryMode,
-    SessionMessageQueueStatus,
-    SessionModelCompletionStageConflict,
-    SessionModelCompletionStageIncomplete,
-    SessionOperationPublication,
-    SessionOrder,
-    SessionQuery,
-    SessionQueuedMessage,
-    SessionQueuedMessagesPending,
-    SessionRunFenced,
-    SessionRuntimePublicationConflict,
-    SessionStatus,
-    SessionStatusConflict,
-    SessionStore,
-    TargetedToolGrant,
-    TargetedToolGrantRecord,
-    TargetedToolUseDisposition,
-    TargetedToolUseRejectionReason,
-    TargetedToolUseRequest,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolCapabilityCeiling,
-    ToolExposure,
-    ToolExposureDecision,
-    ToolExposurePolicy,
-    ToolExposurePolicyRequest,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolRoundIdentity,
-    TranscriptQuery,
-    TranscriptSnapshot,
-    UsageRollupQuery,
-    UserInputResponse,
-    runtime_publication_checkpoint_mutation,
-    runtime_publication_checkpoint_value_digest,
-    runtime_publication_event_reference,
-    runtime_publication_operation_record_value_digest,
-)
+from cayu.observability.events import EventSink, InMemoryEventSink
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
+from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
+from cayu.providers.operations import ProviderOperationState, ProviderOperationStatus
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -266,7 +184,10 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._invocation_lifecycle import _release_invocation_command_with_cleanup_authority
+from cayu.runtime._invocation_lifecycle import (
+    ReleaseInvocationCommand,
+    _release_invocation_command_with_cleanup_authority,
+)
 from cayu.runtime._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
@@ -283,30 +204,23 @@ from cayu.runtime._recovery_coordinator import (
     _checkpoint_with_legacy_approval_round,
     _pending_approval_for_atomic_claim,
 )
-from cayu.runtime.aggregates import estimate_usage_rollup_cost
-from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.budgets import (
-    MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReconciliation,
-    BudgetReservation,
-    budget_reconciliation_payload,
-    budget_settlement_id,
-)
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    CheckpointCompatibilityError,
-)
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
+from cayu.runtime.authority import SessionRunFenced
+from cayu.runtime.evidence import RuntimeEvidenceRequest, runtime_evidence
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfileDecisionKind,
+    ExecutionProfileMismatchError,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.execution_units import ModelAttemptIdentity
-from cayu.runtime.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
+from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     ProviderOperationResolutionAction,
@@ -320,36 +234,130 @@ from cayu.runtime.provider_operations import (
     provider_operation_progress_payload,
     resolve_provider_operation_stage,
 )
-from cayu.runtime.sessions import (
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
+    CompactSessionRequest,
+    EnqueueSessionMessageRequest,
+    EventOrder,
+    EventQuery,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    ForkSystemPromptReplacement,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    InteractionTransitionSpec,
+    InterruptSessionRequest,
+    McpManifestBaseline,
+    ModelCompletionStageDisposition,
+    ModelCompletionStageRequest,
+    ModelTarget,
+    PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
+    PersistedEventSideEffectStatus,
     QueuedDispatchTerminalReceiptQuery,
     QueuedInteractionProfileHandoff,
+    ResumeRequest,
+    RunRequest,
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+    RuntimePublicationOperationRecordMutation,
+    RuntimePublicationRequest,
+    Session,
+    SessionIdentity,
+    SessionMessageDeliveryMode,
+    SessionModelCompletionStageConflict,
+    SessionModelCompletionStageIncomplete,
+    SessionOperationPublication,
+    SessionOrder,
+    SessionQuery,
+    SessionQueuedMessage,
+    SessionQueuedMessagesPending,
+    SessionRuntimePublicationConflict,
+    SessionStatus,
+    SessionStatusConflict,
+    SessionStore,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+    TranscriptQuery,
+    TranscriptSnapshot,
+    UsageRollupQuery,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
     fork_session_invocation,
     queued_interaction_profile_handoff_evidence,
+    runtime_publication_checkpoint_mutation,
+    runtime_publication_checkpoint_value_digest,
+    runtime_publication_event_reference,
+    runtime_publication_operation_record_value_digest,
 )
-from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputSpec,
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    CheckpointCompatibilityError,
 )
-from cayu.runtime.usage import UsageMetrics
-from cayu.runtime.user_input import (
-    PENDING_USER_INPUT_CHECKPOINT_KEY,
-    USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
-    PendingUserInput,
-    user_input_answer_request_digest,
-    user_input_resolution_intent_for,
-    user_input_resolution_request_digest,
+from cayu.sessions.child_context import ChildSessionContextContributor
+from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
+from cayu.sessions.invocation import (
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    SessionExecutionSource,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.storage.jsonl_export import export_sessions, import_sessions
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import (
+    DurableToolOperationConflict,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
+from cayu.tools.exposure import (
+    ToolCapabilityCeiling,
+    ToolExposure,
+    ToolExposureDecision,
+    ToolExposurePolicy,
+    ToolExposurePolicyRequest,
+)
+from cayu.tools.grants import (
+    TargetedToolGrant,
+    TargetedToolGrantRecord,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
+)
+from cayu.tools.policy import (
+    AllowAllToolPolicy,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
+from cayu.tools.shared_artifacts import (
+    SharedArtifactAudience,
+    SharedArtifactGrant,
+    SharedArtifactPolicy,
+    SharedArtifactRef,
+)
+from cayu.tools.user_input import UserInputTool
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.branch_lifecycle import SessionWorkspaceBranchStore
+from cayu.workspaces.local import LocalWorkspace
+from cayu.workspaces.observation_recovery import (
     WorkspaceObservationArtifact,
     WorkspaceObservationArtifactState,
     WorkspaceObservationEvidenceState,
@@ -361,17 +369,6 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_event_digest,
     workspace_observations_from_checkpoint,
 )
-from cayu.storage.jsonl_export import export_sessions, import_sessions
-from cayu.storage.migrations import SchemaMode
-from cayu.tools.shared_artifacts import (
-    SharedArtifactAudience,
-    SharedArtifactGrant,
-    SharedArtifactPolicy,
-    SharedArtifactRef,
-)
-from cayu.tools.user_input import UserInputTool
-from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
-from cayu.workspaces import LocalWorkspace
 
 pytestmark = pytest.mark.postgres
 
@@ -519,7 +516,7 @@ def _recall_receipt(
         situation_fingerprint=_memory_evidence_fingerprint(
             f"situation:{label}", "recall_situation"
         ),
-        engine_version="cayu.recall.v1",
+        engine_version="cayu.memory.recall.v1",
         source_configuration_fingerprint=_memory_evidence_fingerprint(
             f"sources:{label}", "recall_source_configuration"
         ),
@@ -812,7 +809,7 @@ def _new_postgres_store(
     schema_mode: SchemaMode = SchemaMode.VALIDATE,
     store_type: type[Any] | None = None,
 ) -> SessionStore:
-    from cayu import PostgresSessionStore
+    from cayu.storage.postgres import PostgresSessionStore
 
     selected_store_type = PostgresSessionStore if store_type is None else store_type
     return selected_store_type(
@@ -4616,7 +4613,7 @@ async def _open_store(
         await _reset_postgres_data(postgres_dsn)
         postgres_store_type = None
         if workspace_observation_crash_phase is not None:
-            from cayu import PostgresSessionStore
+            from cayu.storage.postgres import PostgresSessionStore
 
             class _WorkspaceObservationProcessLossPostgresSessionStore(
                 _WorkspaceObservationProcessLossStoreMixin,
@@ -26619,7 +26616,7 @@ def test_session_store_conformance_pages_hundreds_of_interactions(
 def test_session_store_conformance_distinguishes_inherited_and_explicit_null_transcript_ids(
     session_store_case,
 ) -> None:
-    from cayu.runtime.sessions import (
+    from cayu.sessions.base import (
         _activate_session_interaction,
         _deactivate_session_interaction,
     )

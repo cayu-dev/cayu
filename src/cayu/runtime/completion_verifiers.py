@@ -8,15 +8,15 @@ from typing import cast
 from pydantic import Field, StrictFloat, StrictInt, field_validator, model_validator
 
 from cayu._validation import require_durable_clean_nonblank, revalidate_model_input
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfileComponentDeclaration,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
     copy_execution_profile_adoption_intent,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     WORK_CONTRACT_IDENTIFIER_MAX_BYTES,
     WORK_VERIFICATION_LEASE_MAX_SECONDS,
     CompletionProposal,

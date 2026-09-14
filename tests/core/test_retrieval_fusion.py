@@ -5,7 +5,7 @@ import math
 import pytest
 from pydantic import ValidationError
 
-from cayu.retrieval import (
+from cayu.memory.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     RankedRetrievalChannel,
     RankedRetrievalHit,

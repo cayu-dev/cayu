@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, dataclass
 from typing import TYPE_CHECKING, Never, SupportsIndex
 
-from cayu.runtime.work_attempt_admission import (
+from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,
     WorkAttemptExecutionClaimRequest,
@@ -21,7 +21,7 @@ _WORK_ATTEMPT_INVOCATION_TOKEN = object()
 _RECOVERY_OWNERSHIP_TOKEN = object()
 
 if TYPE_CHECKING:
-    from cayu.runtime.tasks import TaskStore
+    from cayu.tasks.base import TaskStore
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)

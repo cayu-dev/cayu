@@ -17,12 +17,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
-from cayu.core.messages import Message, ProviderStatePart, ToolCallPart
-from cayu.vaults import SecretRedactor
+from cayu.messages import Message, ProviderStatePart, ToolCallPart
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.runtime._runtime_records import ToolCallRequest
-    from cayu.runtime.sessions import Session, SessionStore
+    from cayu.sessions.base import Session, SessionStore
     from cayu.storage.memory import KnowledgeAccessScope
 
 STORAGE_KEY = "cayu:private-argument-continuity"

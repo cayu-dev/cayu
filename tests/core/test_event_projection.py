@@ -13,17 +13,34 @@ import pytest
 from pydantic import SecretStr
 from tests._session_provenance import fixture_session_invocation
 
-import cayu.core.events as events_module
+import cayu.events as events_module
 import cayu.runtime._event_projection as event_projection_module
-from cayu import (
-    CayuApp,
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.applications import CayuApp
+from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
+from cayu.approvals.user_input import (
+    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+    AmbiguousUserInputSupersessionIntent,
+    PendingUserInput,
+    event_with_ambiguous_user_input_supersession_authority,
+)
+from cayu.budgets.base import (
+    BudgetReconciliation,
+    BudgetSettlementRecord,
+    BudgetWindow,
+    InMemoryBudgetStore,
+    budget_reconciliation_payload,
+    budget_settlement_event_id,
+    budget_settlement_id,
+)
+from cayu.context.footprints import (
     PromptContributionKind,
     PromptContributionManifest,
     RequestFootprintConfig,
     build_prompt_contribution_manifest,
 )
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core.events import (
+from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputValidation
+from cayu.events import (
     Event,
     EventType,
     event_envelope_authority_is_runtime_generated,
@@ -35,7 +52,7 @@ from cayu.core.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import ToolEffect
+from cayu.observability.events import EventSink
 from cayu.runtime._event_projection import (
     EVENT_PAYLOAD_POLICIES,
     PRIVATE_EVENT_AUTHORITY,
@@ -57,17 +74,6 @@ from cayu.runtime._structured_output_tool_round import (
     _structured_output_validating_event,
 )
 from cayu.runtime._tool_identity import tool_idempotency_key
-from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-from cayu.runtime.budgets import (
-    BudgetReconciliation,
-    BudgetSettlementRecord,
-    BudgetWindow,
-    InMemoryBudgetStore,
-    budget_reconciliation_payload,
-    budget_settlement_event_id,
-    budget_settlement_id,
-)
-from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
@@ -76,7 +82,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
@@ -84,14 +90,8 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     restore_persisted_event_authority,
 )
-from cayu.runtime.structured_output import StructuredOutputSpec, StructuredOutputValidation
-from cayu.runtime.user_input import (
-    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
-    AmbiguousUserInputSupersessionIntent,
-    PendingUserInput,
-    event_with_ambiguous_user_input_supersession_authority,
-)
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tools.base import ToolEffect
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 def test_event_equality_uses_only_public_durable_fields() -> None:
@@ -3085,7 +3085,7 @@ def test_writer_rejects_forged_tool_idempotency_before_any_publication() -> None
 def test_legacy_sink_recovery_logs_only_the_public_projection(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from cayu.observability import LoggingEventSink
+    from cayu.observability.logging import LoggingEventSink
 
     secret = "legacy-log-event-secret"
     logger = logging.getLogger("cayu.test.event-projection")

@@ -8,27 +8,33 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemorySessionStore,
-    ResumeRequest,
-    RetryPolicy,
-    RunRequest,
-    SQLiteSessionStore,
-)
-from cayu.core import EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.core.messages import MessageRole, ProviderStatePart, TextPart
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.providers import (
-    HttpxOpenAITransport,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message, MessageRole, ProviderStatePart, TextPart
+from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     ModelRequest,
     ModelStreamDeadlineError,
     ModelStreamEventType,
+    TargetedToolProjectionRequest,
+    ToolDiscoveryProjectionRequest,
+)
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderProgressKind,
+    ProviderStreamDeadlines,
+)
+from cayu.providers.openai import (
+    HttpxOpenAITransport,
     OpenAIAPIError,
     OpenAIProtocolError,
     OpenAIProvider,
-    ProviderDeadlineKind,
+)
+from cayu.providers.operations import (
     ProviderOperationCancellationSupport,
     ProviderOperationMalformedError,
     ProviderOperationMode,
@@ -36,34 +42,31 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
-    ProviderProgressKind,
-    ProviderStreamDeadlines,
-    TargetedToolProjectionRequest,
-    ToolDiscoveryProjectionRequest,
 )
-from cayu.providers.base import (
-    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
-    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
-    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
-    TARGETED_TOOL_PROJECTION_MARKER_TYPE,
-)
-from cayu.runtime import (
-    IncompleteSessionRecoveryRequest,
-    ModelCompletionManualRecoveryRequired,
-    SessionStatus,
-)
+from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     ProviderOperationUnavailableReason,
     inspect_provider_operation,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_discovery import (
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.catalogue import CALL_TOOL_NAME
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryViewState,
     search_tools_spec,
 )
-from cayu.runtime.tool_gateway import call_tool_spec
+from cayu.tools.gateway import call_tool_spec
 
 
 def _request() -> ModelRequest:

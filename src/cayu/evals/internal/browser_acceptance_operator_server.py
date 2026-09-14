@@ -102,13 +102,13 @@ async def operator_fixture_setup(
     import httpx
     import uvicorn
 
-    from cayu.runtime.browser_control import (
+    from cayu.server import BasicAuth, BrowserControlServerConfig, ServerConfig, create_server
+    from cayu.tools.browser_control import (
         BrowserControlPolicy,
         BrowserControlPolicyResult,
         BrowserOperatorPurpose,
     )
-    from cayu.runtime.browser_control_config import BrowserControlConfig
-    from cayu.server import BasicAuth, BrowserControlServerConfig, ServerConfig, create_server
+    from cayu.tools.browser_control_config import BrowserControlConfig
 
     if not server_private_key.is_absolute() or not server_private_key.is_file():
         raise ValueError("Operator fixture requires an existing absolute private TLS key path.")

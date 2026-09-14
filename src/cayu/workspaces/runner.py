@@ -13,14 +13,14 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
-from cayu.runners import (
+from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
-    LocalRunner,
     RemoteWorkspaceBranchCapability,
     Runner,
     RunnerBinaryStreamCapability,
 )
+from cayu.runners.local import LocalRunner
 from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
     guard_create,

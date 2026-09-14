@@ -22,7 +22,6 @@ import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._resources as resources_module
 import cayu.tools._runner as runner_module
-from cayu import CayuConfig, ToolExecutionConfig
 from cayu._exception_groups import iter_exception_tree
 from cayu._task_wait import capture_awaitable_outcome
 from cayu._validation import compact_json_utf8_size
@@ -30,24 +29,27 @@ from cayu._workspace_mutation import (
     WorkspaceMutationProcessFence,
     workspace_mutation_task_settlement_probe,
 )
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import ModelStreamEvent
-from cayu.proxies import PassthroughProxy
-from cayu.runners import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.proxies.passthrough import PassthroughProxy
+from cayu.runners._cleanup import runner_cancellation_failure, sanitize_runner_artifacts
+from cayu.runners.base import (
     ExecCommand,
     ExecResult,
-    LocalRunner,
     Runner,
     RunnerExecutionError,
     RunnerUnavailableError,
     attach_cancellation_artifacts,
 )
-from cayu.runners._cleanup import runner_cancellation_failure, sanitize_runner_artifacts
-from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest, SessionStatus
+from cayu.runners.local import LocalRunner
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.runtime._tool_execution import run_tool
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
     InvocationWorkspaceMutationOwner,
@@ -59,14 +61,10 @@ from cayu.tools._runner import (
     is_current_runner_cancellation_group,
     sanitize_runner_failure_group,
 )
-from cayu.vaults import (
-    REDACTED_SECRET,
-    ResolvedSecret,
-    SecretRedactor,
-    SecretRef,
-    StaticVault,
-    Vault,
-)
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.vaults.base import ResolvedSecret, SecretRef, Vault
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
 
 
 class _BlockingRunner(Runner):

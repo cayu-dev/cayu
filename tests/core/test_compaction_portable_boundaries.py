@@ -24,14 +24,22 @@ from tests.core.test_runtime import (
 )
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    Message,
-    MessageRole,
-    TextPart,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.budgets.billing import BillingIdentity
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    CompactionPrompt,
+    CompactionRequest,
+    CompactionResult,
+    ContextCompactor,
+    ModelCompactor,
+    PromptCacheCompactor,
 )
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.events import Event, EventType
+from cayu.messages import Message, MessageRole, TextPart
 from cayu.providers import (
     ModelContextOverflowError,
     ModelProvider,
@@ -40,24 +48,8 @@ from cayu.providers import (
     ModelStreamEvent,
     UsageDialect,
 )
-from cayu.runtime import (
-    BillingIdentity,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactionPrompt,
-    CompactionRequest,
-    CompactionResult,
-    ContextCompactor,
-    ModelCompactor,
-    PromptCacheCompactor,
-    RequestFootprintConfig,
-    RetryPolicy,
-    RunRequest,
-    Session,
-)
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import RunRequest, Session
 
 
 def _assert_internal_post_dispatch_compaction_failure(

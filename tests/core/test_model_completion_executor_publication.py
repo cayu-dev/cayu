@@ -9,24 +9,13 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 
 from cayu._exception_groups import iter_exception_tree
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.providers import (
-    ModelProvider,
-    ModelProviderError,
-    ModelRequest,
-    ModelStreamEvent,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.base import context_input_coverage
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers._credential_boundary import provider_cancellation_failures
-from cayu.runtime import (
-    CayuApp,
-    InMemorySessionStore,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    Session,
-    ToolCapabilityCeiling,
-    context_input_coverage,
-)
+from cayu.providers.base import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
@@ -40,10 +29,16 @@ from cayu.runtime._model_step_executor import (
 )
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime.execution_units import new_model_step_identity
-from cayu.runtime.sessions import (
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    RunRequest,
     RuntimePublicationRequest,
+    Session,
     runtime_publication_checkpoint_mutation,
 )
+from cayu.tools.exposure import ToolCapabilityCeiling
 
 
 class _RetryThenCompleteProvider(ModelProvider):

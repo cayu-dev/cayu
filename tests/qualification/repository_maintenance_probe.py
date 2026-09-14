@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 
-from cayu import ExecCommand, ExecutionProfileBehaviorIdentity, NamedCheck
+from cayu.runners.base import ExecCommand
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools.named_checks import NamedCheck
 from tests.qualification.repository_maintenance_case import (
     PROBES,
     BehavioralOutcome,

@@ -19,47 +19,49 @@ from uuid import uuid4
 
 from pydantic import SecretStr
 
-from cayu import ExecutionProfileBehaviorIdentity
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
-    EventSink,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRequest,
+)
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.events import EventSink
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+)
+from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionQuery,
+    SessionStatus,
+)
+from cayu.sessions.recovery import (
     RecoveryDecision,
     RecoveryExecutionRequest,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    Session,
-    SessionQuery,
-    SessionStatus,
-    Task,
-    TaskCreate,
-    TaskHandlerOutcome,
-    TaskQuery,
-    ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRequest,
-    ToolRoundRecoveryRequest,
-    run_task_worker,
 )
-from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
-from cayu.runtime.public_authority import (
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
-)
-from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tools import SubagentExecutionMode, SubagentSpec, SubagentTool
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import Task, TaskCreate, TaskQuery
+from cayu.tasks.worker import TaskHandlerOutcome, run_task_worker
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.rounds import ToolRoundRecoveryRequest
+from cayu.tools.subagents import SubagentExecutionMode, SubagentSpec, SubagentTool
 
 # Covers interpreter startup, durable recovery, replay checks, and process exit.
 # These integration guards are independent of the Runtime deadlines under test.
@@ -799,8 +801,8 @@ def _session_store(backend: BackendConfig):
     if backend.kind == "postgres":
         if backend.dsn is None:
             raise ValueError("Postgres backend requires dsn")
-        from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         return PostgresSessionStore(
             backend.dsn,
@@ -840,8 +842,8 @@ def _task_store(backend: BackendConfig):
     if backend.kind == "postgres":
         if backend.dsn is None:
             raise ValueError("Postgres backend requires dsn")
-        from cayu.storage import PostgresTaskStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresTaskStore
 
         return PostgresTaskStore(backend.dsn, schema_mode=SchemaMode.CREATE)
     raise ValueError(f"Unknown backend: {backend.kind}")

@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import get_args
 
-from cayu.runtime.browser_control import BrowserControlAction
+from cayu.tools.browser_control import BrowserControlAction
 
 
 def test_documented_browser_policy_actions_match_runtime():

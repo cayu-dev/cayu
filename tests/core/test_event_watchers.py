@@ -8,32 +8,33 @@ import pytest
 from pydantic import ValidationError
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
-    CayuApp,
-    Event,
-    EventQuery,
-    EventType,
-    EventWatcher,
-    EventWatcherContext,
-    EventWatcherDeliveryStatus,
-    RunRequest,
-    SQLiteEventWatcherStore,
-)
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
-from cayu.core.events import event_durable_sequence, event_with_durable_sequence
-from cayu.runtime import InMemoryEventWatcherStore, InMemorySessionStore
-from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_event_id
-from cayu.runtime.event_watchers import (
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType, event_durable_sequence, event_with_durable_sequence
+from cayu.observability.watchers import (
+    EventWatcher,
     EventWatcherClaim,
+    EventWatcherContext,
     EventWatcherDelivery,
+    EventWatcherDeliveryStatus,
     EventWatcherRunResult,
     EventWatcherState,
     EventWatcherStore,
+    InMemoryEventWatcherStore,
     event_query_after_cursor,
 )
-from cayu.runtime.sessions import EventRecord, SessionIdentity, SessionStore
+from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_event_id
+from cayu.sessions.base import (
+    EventQuery,
+    EventRecord,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    SessionStore,
+)
+from cayu.storage.event_watchers import SQLiteEventWatcherStore
 from cayu.storage.migrations import SchemaMode
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 _POSTGRES_TABLES = (
     "cayu_knowledge_embeddings",
@@ -498,7 +499,7 @@ def test_event_watcher_cursor_query_preserves_event_id_filter() -> None:
 
 
 def test_event_watcher_preserves_before_sequence_across_cursor_pages(monkeypatch) -> None:
-    import cayu.runtime.app as app_module
+    import cayu.applications as app_module
 
     monkeypatch.setattr(app_module, "EVENT_WATCHER_QUERY_PAGE_LIMIT", 1)
 
@@ -1076,7 +1077,7 @@ async def _drop_postgres_tables(dsn: str) -> None:
 
 def test_postgres_event_watcher_store_rejects_nonportable_text(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import PostgresEventWatcherStore
+        from cayu.storage.postgres import PostgresEventWatcherStore
 
         await _drop_postgres_tables(postgres_dsn)
         store = PostgresEventWatcherStore(
@@ -1095,7 +1096,7 @@ def test_postgres_event_watcher_store_rejects_nonportable_text(postgres_dsn: str
 
 def test_postgres_event_watcher_store_persists_cursor(postgres_dsn: str) -> None:
     async def run():
-        from cayu import PostgresEventWatcherStore
+        from cayu.storage.postgres import PostgresEventWatcherStore
 
         await _drop_postgres_tables(postgres_dsn)
         session_store = InMemorySessionStore()
@@ -1155,7 +1156,7 @@ def test_postgres_event_watcher_store_persists_cursor(postgres_dsn: str) -> None
 
 def test_postgres_event_watcher_store_serializes_first_claim(postgres_dsn: str) -> None:
     async def run():
-        from cayu import PostgresEventWatcherStore
+        from cayu.storage.postgres import PostgresEventWatcherStore
 
         await _drop_postgres_tables(postgres_dsn)
         session_store = InMemorySessionStore()

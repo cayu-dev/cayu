@@ -7,21 +7,21 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.browser_profiles import BrowserProfileCheckpointConsentDenied
-from cayu.core.tools import _RuntimeBrowserControlAdmission
 from cayu.runtime._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     BrowserControlCloseCheckpointMutation,
 )
-from cayu.runtime.browser_control import (
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools.base import _RuntimeBrowserControlAdmission
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlCheckpoint,
     BrowserControlConflict,
     closed_browser_control_successor,
 )
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 
 if TYPE_CHECKING:
-    from cayu.runtime.sessions import Session
+    from cayu.sessions.base import Session
 
 
 def browser_terminal_checkpoint_mutation(

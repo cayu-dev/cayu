@@ -15,15 +15,22 @@ from tests.core._execution_profile_fixtures import (
 from tests.core.task_invocation_fixtures import stored_session_invocation
 
 import cayu.runtime._recovery_plan_coordinator as recovery_plan_coordinator_module
-from cayu import SecretRedactor, SQLiteSessionStore, SQLiteTaskStore
-from cayu.core import AgentSpec, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
     InMemorySessionStore,
-    InMemoryTaskStore,
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+    run_request_with_task_invocation,
+)
+from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     RecoveryDecision,
     RecoveryExecutionRequest,
@@ -35,16 +42,16 @@ from cayu.runtime import (
     RecoveryPlanSelection,
     RecoveryRegistrationStatus,
     RecoveryTaskClaimEvidence,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import (
+    InMemoryTaskStore,
     TaskCreate,
     TaskInvocationSnapshot,
     TaskQuery,
     TaskStatus,
 )
-from cayu.runtime.sessions import run_request_with_task_invocation
+from cayu.vaults.redaction import SecretRedactor
 
 
 class _FakeProvider(ModelProvider):

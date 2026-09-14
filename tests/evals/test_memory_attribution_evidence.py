@@ -9,7 +9,8 @@ from pydantic import ValidationError
 from tests._session_provenance import session_fixture
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core.events import Event, EventType
+from cayu.applications import CayuApp
+from cayu.budgets.usage import SessionUsageSummary
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_runtime_source,
     eval_memory_attribution_evidence_from_trajectory,
@@ -42,7 +43,8 @@ from cayu.evals.memory_attribution import (
 )
 from cayu.evals.models import EvalOutcome, Trajectory
 from cayu.evals.portable_evaluation import evaluate_assertion_spec
-from cayu.memory_attribution import (
+from cayu.events import Event, EventType
+from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
     MemoryAttributionStatus,
@@ -51,10 +53,8 @@ from cayu.memory_attribution import (
     MemoryEvidenceAlias,
     MemoryExposureTransitionAttribution,
 )
-from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import SessionStatus
-from cayu.runtime.usage import SessionUsageSummary
+from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
+from cayu.sessions.base import SessionStatus
 
 _STATE_PATHS = {
     ContextExposureState.PLANNED: (ContextExposureState.PLANNED,),

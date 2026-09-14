@@ -6,17 +6,16 @@ import hashlib
 import pytest
 
 from cayu import AgentSpec, Message
-from cayu.runtime import (
+from cayu.context.base import (
     CheckpointCompactionContextPolicy,
     CompactionRequest,
     CompactionResult,
+    ContextBuildError,
     ContextCompactor,
     ContextRequest,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
+    _estimate_model_facing_context_pressure,
 )
-from cayu.runtime.context import ContextBuildError, _estimate_model_facing_context_pressure
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 
 
 class GrowingSummary(ContextCompactor):

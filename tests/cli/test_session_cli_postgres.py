@@ -11,8 +11,9 @@ import pytest
 
 from cayu import PostgresSessionStore, SQLiteSessionStore
 from cayu.cli import main
-from cayu.core import Event, EventType, Message
-from cayu.runtime import RunRequest, SessionIdentity, SessionStatus, SessionStore
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStatus, SessionStore
 from cayu.storage.migrations import SchemaMode
 
 

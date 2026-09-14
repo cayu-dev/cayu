@@ -14,7 +14,8 @@ from typing import cast
 from uuid import uuid4
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
-from cayu.core.events import (
+from cayu.approvals.tools import ToolApprovalRecoveryOutcome
+from cayu.events import (
     Event,
     EventType,
     event_with_runtime_envelope_authority,
@@ -53,20 +54,41 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_exact_interrupted_handoff_capability_is_complete,
 )
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.approvals import ToolApprovalRecoveryOutcome
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.pending_actions import (
+from cayu.runtime.provider_operations import RecoverableProviderOperation
+from cayu.sessions.base import (
+    PENDING_ACTION_EVENT_TYPE_VALUES,
+    EventOrder,
+    EventQuery,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryResult,
+    PendingActionKind,
+    PendingActionQuery,
+    PendingActionRecord,
+    PendingActionSession,
+    Session,
+    SessionOrder,
+    SessionQuery,
+    SessionStatus,
+    SessionStore,
+    _incomplete_recovery_claim_from_checkpoint,
+    _invocation_lifecycle_authority_read_scope,
+    _session_run_operation_from_checkpoint,
+)
+from cayu.sessions.pending_actions import (
     checkpoint_has_pending_action_candidate,
     pending_action_from_records,
     pending_action_source_is_invalid,
     project_pending_action_checkpoint,
     project_pending_action_event_record,
 )
-from cayu.runtime.provider_operations import RecoverableProviderOperation
-from cayu.runtime.recovery_plans import (
+from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CURSOR_BYTES,
     RecoveryBlockerCode,
     RecoveryClaimEvidence,
@@ -91,29 +113,7 @@ from cayu.runtime.recovery_plans import (
     RecoveryTaskClaimEvidence,
     StaleRecoveryPlanError,
 )
-from cayu.runtime.sessions import (
-    PENDING_ACTION_EVENT_TYPE_VALUES,
-    EventOrder,
-    EventQuery,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionRecoveryResult,
-    ModelCompletionManualRecoveryRequest,
-    ModelCompletionManualRecoveryResult,
-    PendingActionKind,
-    PendingActionQuery,
-    PendingActionRecord,
-    PendingActionSession,
-    Session,
-    SessionOrder,
-    SessionQuery,
-    SessionStatus,
-    SessionStore,
-    _incomplete_recovery_claim_from_checkpoint,
-    _invocation_lifecycle_authority_read_scope,
-    _session_run_operation_from_checkpoint,
-)
-from cayu.runtime.tasks import (
+from cayu.tasks.base import (
     Task,
     TaskClaimLost,
     TaskInterruptedHandoffReceipt,
@@ -124,7 +124,7 @@ from cayu.runtime.tasks import (
     TaskTerminalKind,
     interrupted_task_handoff_request,
 )
-from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
+from cayu.tools.rounds import ToolRoundRecoveryRequest
 
 RECOVERY_PLAN_EXECUTION_CHECKPOINT_KEY = "recovery_plan_execution"
 _RECOVERY_PLAN_EXECUTION_LEASE_SECONDS = 900

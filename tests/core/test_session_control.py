@@ -6,8 +6,13 @@ from collections.abc import AsyncIterator
 import pytest
 
 import cayu.runtime._session_control as session_control_module
-from cayu.core import Event, EventType, Message
-from cayu.runtime import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.runtime._session_control import (
+    SessionControl,
+    SessionInterruptedByRequest,
+)
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     EventRecord,
@@ -15,10 +20,6 @@ from cayu.runtime import (
     RunRequest,
     SessionIdentity,
     SessionStatus,
-)
-from cayu.runtime._session_control import (
-    SessionControl,
-    SessionInterruptedByRequest,
 )
 
 

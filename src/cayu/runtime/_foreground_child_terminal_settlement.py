@@ -3,7 +3,7 @@
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from cayu.core.events import Event, EventType
+from cayu.events import Event, EventType
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
     ChildSessionRecoveryMatcher,
@@ -14,7 +14,7 @@ from cayu.runtime._foreground_child_wait import (
     foreground_child_state_from_checkpoint,
 )
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,

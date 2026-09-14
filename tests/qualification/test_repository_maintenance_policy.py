@@ -5,23 +5,18 @@ import importlib
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    ApplyPatchTool,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventQuery,
-    EventType,
-    InMemorySessionStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    WriteFileTool,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.cli.project import project_context
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
+from cayu.tools.files import WriteFileTool
+from cayu.tools.patches import ApplyPatchTool
+from cayu.workspaces.local import LocalWorkspace
 from tests.qualification.repository_maintenance_application import maintenance_project_files
 from tests.qualification.repository_maintenance_policy import (
     MaintenancePatchScopeRule,

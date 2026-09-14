@@ -36,8 +36,8 @@ from cayu._exception_groups import (
     exception_group_children,
 )
 from cayu._exception_state import exception_state
+from cayu.budgets.pricing import resolve_price_book
 from cayu.runtime._diagnostics import exception_diagnostic
-from cayu.runtime.costs import resolve_price_book
 from maintenance.model_catalog.browser_verifier import (
     DEFAULT_MAX_VERIFY_COST_USD,
     DEFAULT_VERIFIER_MODEL,

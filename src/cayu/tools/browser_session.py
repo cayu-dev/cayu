@@ -32,13 +32,13 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
-from cayu.artifacts import (
+from cayu.artifacts.attachments import file_attachment
+from cayu.artifacts.base import (
     ArtifactMetadata,
     ArtifactReadResult,
     ArtifactScope,
     copy_artifact_read_result,
 )
-from cayu.artifacts.attachments import file_attachment
 from cayu.browser_profiles import (
     BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
     BrowserProfileBinding,
@@ -55,7 +55,15 @@ from cayu.browser_profiles import (
     browser_profile_state_to_playwright,
 )
 from cayu.browser_recording import BrowserRecordingConfig
-from cayu.core.tools import (
+from cayu.environments.admission import ExecutionEnvironmentAuthority
+from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError, RunnerWorkloadAuthority
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.tools._redaction import (
+    InvocationRedactorSnapshot,
+    active_secret_redactor_snapshot,
+    await_revision_stable_secret_output,
+)
+from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
     Tool,
@@ -64,19 +72,6 @@ from cayu.core.tools import (
     ToolResult,
     ToolSpec,
     _runtime_tool_invocation_authority,
-)
-from cayu.environments.admission import ExecutionEnvironmentAuthority
-from cayu.runners import (
-    PINNED_BROWSER_SESSION_WORKLOAD,
-    RunnerExecutionError,
-    RunnerUnavailableError,
-    RunnerWorkloadAuthority,
-)
-from cayu.runtime.tool_policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
-from cayu.tools._redaction import (
-    InvocationRedactorSnapshot,
-    active_secret_redactor_snapshot,
-    await_revision_stable_secret_output,
 )
 from cayu.tools.browser import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
@@ -105,13 +100,14 @@ from cayu.tools.browser_visual import (
     BrowserVisualPolicy,
     canonical_visual_point,
 )
+from cayu.tools.policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
 from cayu.tools.web import MAX_WEB_FETCH_URL_LENGTH, _canonicalize_url
 from cayu.tools.web_access import (
     WebAccessEvidence,
     WebAccessEvidenceSource,
     web_destination_fingerprint,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 BROWSER_SESSION_PROTOCOL_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.protocol_version
 BROWSER_SESSION_WORKER_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.worker_version

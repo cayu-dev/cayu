@@ -5,16 +5,13 @@ import asyncio
 import pytest
 from tests.evals.test_workflow_eval_target import _register_app, _suite, _target
 
-from cayu import (
-    EvalStatus,
-    FinalOutputContains,
-    ModelStreamEvent,
-    SQLiteSessionStore,
-    WorkflowBase,
-    WorkflowSpec,
-    run_workflow_eval_suite,
-    step,
-)
+from cayu.evals.assertions import FinalOutputContains
+from cayu.evals.models import EvalStatus
+from cayu.evals.runner import run_workflow_eval_suite
+from cayu.providers.base import ModelStreamEvent
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.workflow import WorkflowBase, step
 
 
 class _AfterWorkFailure(WorkflowBase):
@@ -93,8 +90,9 @@ class _BeforeStartFailure(WorkflowBase):
 def test_failed_workflow_report_reopens_without_dispatch(tmp_path):
     import hashlib
 
-    from cayu import EventQuery, load_eval_run, render_html_report, write_eval_run_json
     from cayu._validation import canonical_durable_json_bytes
+    from cayu.evals.reporting import load_eval_run, render_html_report, write_eval_run_json
+    from cayu.sessions.base import EventQuery
 
     async def scenario():
         path = tmp_path / "reopen.sqlite"
@@ -195,7 +193,7 @@ def test_before_start_failure_has_no_invented_record_identity():
 
 def test_capture_event_limit_preserves_root_without_inventing_child_usage(tmp_path):
     from cayu.evals.capture_policy import SessionTrajectoryBounds
-    from cayu.runtime.sessions import TerminalSessionEvidenceErrorCode
+    from cayu.sessions.base import TerminalSessionEvidenceErrorCode
 
     async def scenario():
         store = SQLiteSessionStore(tmp_path / "limited.sqlite")
@@ -346,13 +344,13 @@ def test_failure_projection_rejects_unrelated_evidence(tmp_path, monkeypatch, fa
 def test_failed_workflow_portable_report_preserves_failure_and_usage(tmp_path):
     from tests.evals.test_workflow_eval_target import _corpus
 
-    from cayu import (
+    from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
+    from cayu.evals.execution import run_corpus_suite
+    from cayu.evals.execution_reporting import (
         corpus_execution_result_from_json,
         corpus_execution_result_to_json,
         render_corpus_execution_html,
     )
-    from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
-    from cayu.evals.execution import run_corpus_suite
     from cayu.evals.result_contract import EvalTrialDiagnosticCode
 
     async def scenario():
@@ -443,7 +441,7 @@ def test_work_without_usage_does_not_become_zero_usage():
 
 
 def build_failure_cli_plan():
-    from cayu import EvalPlan
+    from cayu.evals.runner import EvalPlan
 
     app = _register_app(_batches())
     return EvalPlan(
@@ -452,8 +450,8 @@ def build_failure_cli_plan():
 
 
 def test_cli_failed_workflow_writes_inspectable_report(tmp_path, monkeypatch):
-    from cayu import load_eval_run
     from cayu.cli import main
+    from cayu.evals.reporting import load_eval_run
 
     (tmp_path / "pyproject.toml").write_text(
         "[tool.cayu]\n"
@@ -470,15 +468,10 @@ def test_cli_failed_workflow_writes_inspectable_report(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("count", [0, 1, 2, 20])
 def test_typed_workflow_failures_survive_eval_report(tmp_path, count):
-    from cayu import (
-        ExecutionDeadline,
-        FailureEvidence,
-        ParallelStepError,
-        StepError,
-        load_eval_run,
-        write_eval_run_json,
-    )
-    from cayu.workflows.models import StepFailure
+    from cayu.deadlines import ExecutionDeadline
+    from cayu.evals.reporting import load_eval_run, write_eval_run_json
+    from cayu.failure_evidence import FailureEvidence
+    from cayu.workflows.models import ParallelStepError, StepError, StepFailure
 
     children = [
         FailureEvidence(
@@ -540,15 +533,10 @@ def test_typed_workflow_failures_survive_eval_report(tmp_path, count):
 @pytest.mark.parametrize("chain", ["none", "cause", "context"])
 @pytest.mark.parametrize("nested", [False, True])
 def test_parallel_secondary_failures_survive_eval_report(tmp_path, chain, nested):
-    from cayu import (
-        ExecutionDeadline,
-        FailureEvidence,
-        ParallelStepError,
-        load_eval_run,
-        write_eval_run_json,
-    )
-    from cayu.failure_evidence import exception_evidence
-    from cayu.workflows.models import StepFailure
+    from cayu.deadlines import ExecutionDeadline
+    from cayu.evals.reporting import load_eval_run, write_eval_run_json
+    from cayu.failure_evidence import FailureEvidence, exception_evidence
+    from cayu.workflows.models import ParallelStepError, StepFailure
 
     child = FailureEvidence(
         classification="deadline",

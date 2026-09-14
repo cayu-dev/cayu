@@ -18,6 +18,7 @@ from typing import Any, Literal, ParamSpec, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
+from cayu.agents import AgentAuthoringState
 from cayu.cli._generator_transaction import (
     GeneratorTransactionEdit,
     GeneratorTransactionError,
@@ -45,7 +46,6 @@ from cayu.cli.scaffold import (
     GENERATED_STARTER_TOOLS_START,
     PROVIDER_OVERRIDE_AGENT_HELPER,
 )
-from cayu.core.agents import AgentAuthoringState
 from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION
 
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")

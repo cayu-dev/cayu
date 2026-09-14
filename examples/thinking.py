@@ -11,7 +11,7 @@ from cayu import (
     RunRequest,
     ThinkingConfig,
 )
-from cayu.core.events import EventType
+from cayu.events import EventType
 
 
 async def main() -> None:

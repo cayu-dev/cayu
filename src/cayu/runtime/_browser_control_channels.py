@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from cayu.runtime.browser_control import BrowserControlConflict
+from cayu.tools.browser_control import BrowserControlConflict
 
 
 class BrowserGuestChannelSettlement:

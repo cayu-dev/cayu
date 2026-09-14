@@ -366,7 +366,7 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
         base_sha="a" * 40,
         head_sha="b" * 40,
         merge_base="a" * 40,
-        changed_paths=("src/cayu/runtime/tasks.py",),
+        changed_paths=("src/cayu/tasks/base.py",),
         scope=VerificationScope(True, True, True),
         source_untracked=("?? local-proof.md",),
         execution_untracked=("?? generated-output.txt",),

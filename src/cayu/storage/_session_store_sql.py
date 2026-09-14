@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from cayu.core.events import EventType
-from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
-from cayu.runtime.sessions import (
+from cayu.events import EventType
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     LabelSelectorOperator,
@@ -22,6 +21,7 @@ from cayu.runtime.sessions import (
     session_order_is_descending,
     session_sort_column,
 )
+from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 
 @dataclass(frozen=True)

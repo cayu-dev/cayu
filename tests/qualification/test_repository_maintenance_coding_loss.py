@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from cayu import DockerImageIdentity
+from cayu.runners.docker_workload import DockerImageIdentity
 from tests.qualification.repository_maintenance_case import SEED_FILES, materialize_seed_repository
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain
 from tests.qualification.test_repository_maintenance_application import (

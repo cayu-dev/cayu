@@ -10,13 +10,13 @@ from cayu.runtime._browser_control_checkpoint import (
     project_browser_control_checkpoint,
     require_browser_control_operation_owner,
 )
-from cayu.runtime.browser_control import (
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY as KEY
+from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
     BrowserControlConflict,
     BrowserControlRecord,
     closed_browser_control_successor,
 )
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY as KEY
 
 
 def fixture():

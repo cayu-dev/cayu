@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import TaskQuery, github_connector_behavior_fingerprint
+from cayu.delivery.github import github_connector_behavior_fingerprint
+from cayu.tasks.base import TaskQuery
 from tests.qualification.test_repository_maintenance_delivery_configuration import authority
 from tests.qualification.test_repository_maintenance_github_intake import configuration
 from tests.qualification.test_repository_maintenance_http import _A, _B, _BODY, _OP, client

@@ -8,8 +8,9 @@ import pytest
 from tests._session_provenance import fixture_session_invocation
 
 from cayu import AgentSpec, ModelProvider, ModelStreamEvent, RunRequest, ScriptedModelProvider
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message, ToolCallPart
+from cayu.applications import CayuApp
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.usage import SessionUsageSummary, UsageMetrics, session_usage_summary
 from cayu.evals.assertions import (
     ChildSessionCompleted,
     FinalOutputContains,
@@ -54,10 +55,9 @@ from cayu.evals.runner import (
     run_eval_case,
     run_eval_suite,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.sessions import Session, SessionStatus
-from cayu.runtime.usage import SessionUsageSummary, UsageMetrics, session_usage_summary
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart
+from cayu.sessions.base import Session, SessionStatus
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

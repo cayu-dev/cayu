@@ -14,9 +14,10 @@ from cayu import (
     ThinkingConfig,
     ThinkingPart,
 )
-from cayu.core.events import Event, EventType
-from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, copy_message_part
-from cayu.core.thinking import MIN_THINKING_BUDGET_TOKENS, thinking_config_payload
+from cayu.budgets.usage import normalize_usage_metrics
+from cayu.context.thinking import MIN_THINKING_BUDGET_TOKENS, thinking_config_payload
+from cayu.events import Event, EventType
+from cayu.messages import MessageRole, ProviderStatePart, TextPart, copy_message_part
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from cayu.providers.anthropic import (
     _anthropic_message,
@@ -44,12 +45,11 @@ from cayu.runtime.model_steps import (
     StepClassificationType,
     classify_assistant_step,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     TranscriptQuery,
     TranscriptRecord,
     filter_transcript_records,
 )
-from cayu.runtime.usage import normalize_usage_metrics
 
 
 def _anthropic_state(state_type: str, **opaque: str) -> dict[str, str]:
@@ -818,7 +818,7 @@ def test_materialize_thinking_drops_only_display_only_when_excluded() -> None:
 # Per-run override threading (approval / dispatch / server)
 # --------------------------------------------------------------------------- #
 def test_thinking_threads_through_request_copies() -> None:
-    from cayu.runtime.approvals import (
+    from cayu.approvals.tools import (
         PendingToolApproval,
         PendingToolCallApproval,
         ToolApprovalDecision,
@@ -826,7 +826,7 @@ def test_thinking_threads_through_request_copies() -> None:
         copy_pending_tool_approval,
         copy_tool_approval_request,
     )
-    from cayu.runtime.dispatch import DispatchRequest, copy_dispatch_request
+    from cayu.tasks.dispatch import DispatchRequest, copy_dispatch_request
 
     cfg = ThinkingConfig(effort="high")
     approval = ToolApprovalRequest(

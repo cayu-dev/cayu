@@ -8,22 +8,22 @@ from typing import cast
 
 import pytest
 
-from cayu import (
-    ArtifactStoreHandle,
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.cli.project import project_context
+from cayu.coding_products import (
     CodingProductArtifactRepository,
     CodingProductState,
-    DockerImageIdentity,
-    ExecResult,
-    LocalArtifactStore,
-    LocalWorkspace,
-    RunCheckTool,
-    RunnerHandle,
-    ToolContext,
-    WorkspaceRevisionObservationLimits,
     compile_coding_product_candidate,
 )
-from cayu.cli.project import project_context
-from cayu.workspaces.revisions import observe_deterministic_workspace
+from cayu.runners.base import ExecResult
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.tools.base import ArtifactStoreHandle, RunnerHandle, ToolContext
+from cayu.tools.named_checks import RunCheckTool
+from cayu.workspaces.local import LocalWorkspace
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservationLimits,
+    observe_deterministic_workspace,
+)
 from tests.core.test_coding_products import _check_event, _request, _terminal_events, _tool_event
 from tests.core.test_named_checks import RecordingRunner, _policy
 from tests.qualification.repository_maintenance_acceptance import (

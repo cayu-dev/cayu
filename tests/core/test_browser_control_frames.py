@@ -8,13 +8,13 @@ from tests.core.test_browser_control import identity
 
 from cayu.runtime._browser_control_channel import BoundBrowserGuest
 from cayu.runtime._browser_control_frames import decode_browser_frame
-from cayu.runtime.browser_control import (
+from cayu.tools._browser_control_guest import GuestControlChannel
+from cayu.tools._browser_guest import _InteractiveDaemon
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPage,
     BrowserControlRecord,
 )
-from cayu.tools._browser_control_guest import GuestControlChannel
-from cayu.tools._browser_guest import _InteractiveDaemon
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 from tests.core.postgres_contention_support import drop_cayu_tables
 
-import cayu.runtime.sessions as sessions_module
+import cayu.sessions.base as sessions_module
 import cayu.storage.sqlite as sqlite_store_module
 from cayu import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
@@ -44,7 +44,7 @@ from cayu.runtime._terminal_evidence import (
     TERMINAL_EVIDENCE_QUERY_LIMIT,
     classify_current_terminal_evidence,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     RunnerObservedEventIdentity,
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,

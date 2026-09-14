@@ -25,16 +25,15 @@ from tests.core._budget_ledger_contract import (
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.runtime import (
+from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
     BudgetWindow,
-    ModelPrice,
-    PriceBook,
+    budget_limits_for_session,
 )
-from cayu.runtime.budgets import budget_limits_for_session
-from cayu.runtime.sessions import BudgetReservationIdentityConflict
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.sessions.base import BudgetReservationIdentityConflict
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -185,8 +184,8 @@ async def _age_reservation(
 
 
 def _new_ledger(dsn: str, **kwargs):
-    from cayu import PostgresBudgetLedger
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresBudgetLedger
 
     # Tests own a throwaway database and (re)create the schema each run.
     return PostgresBudgetLedger(
@@ -361,8 +360,8 @@ def test_postgres_revision_twenty_five_refuses_ambiguous_active_reservations(
     async def verify_rejection() -> None:
         import psycopg
 
-        from cayu import PostgresBudgetLedger
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresBudgetLedger
 
         await _drop_all(postgres_dsn)
         creator = PostgresBudgetLedger(
@@ -564,8 +563,8 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
     async def runner() -> None:
         import psycopg
 
-        from cayu import PostgresBudgetLedger
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresBudgetLedger
 
         await _drop_all(postgres_dsn)
         limit = _reservation_budget_limit(max_cost="0.25")
@@ -633,8 +632,8 @@ def test_postgres_budget_ledger_fails_closed_on_missing_attempt_identity(
     async def runner() -> None:
         import psycopg
 
-        from cayu import PostgresBudgetLedger
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresBudgetLedger
 
         await _drop_all(postgres_dsn)
         limit = _reservation_budget_limit(max_cost="0.25")
@@ -916,8 +915,8 @@ def test_postgres_budget_ledger_resamples_time_after_reap_lock_wait(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresBudgetLedger
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresBudgetLedger
 
         class ObservedPostgresBudgetLedger(PostgresBudgetLedger):
             def __init__(self) -> None:

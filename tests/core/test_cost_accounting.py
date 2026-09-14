@@ -5,10 +5,10 @@ from decimal import Decimal
 
 import pytest
 
-from cayu.core import Event, EventType
+from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost, session_cost_totals
+from cayu.events import Event, EventType
 from cayu.runtime._cost_accounting import CostAccountingReducer, cost_group_key
-from cayu.runtime.costs import ModelPrice, PriceBook, estimate_session_cost, session_cost_totals
-from cayu.runtime.sessions import EventQuery
+from cayu.sessions.base import EventQuery
 
 
 def _pricing():
@@ -100,8 +100,8 @@ def test_native_cost_snapshot_matches_reference(backend, tmp_path, request, monk
     import asyncio
     from uuid import uuid4
 
-    from cayu.core import Message
-    from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+    from cayu.messages import Message
+    from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.migrations import SchemaMode
 
@@ -186,9 +186,9 @@ def test_incremental_cost_reprices_only_changed_groups_and_expires_windows(
     import asyncio
     from datetime import UTC, datetime, timedelta
 
-    from cayu.core import Message
+    from cayu.messages import Message
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-    from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+    from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 
     async def run():
         from uuid import uuid4
@@ -294,7 +294,7 @@ def test_incremental_cost_reprices_only_changed_groups_and_expires_windows(
 
 
 def test_cost_addition_and_removal_preserve_small_charges():
-    from cayu.runtime.costs import add_cost_amounts
+    from cayu.budgets.pricing import add_cost_amounts
 
     total = add_cost_amounts(Decimal("1e100"), Decimal("0.1"))
     assert add_cost_amounts(total, Decimal("-1e100")) == Decimal("0.1")
@@ -322,8 +322,8 @@ def test_cost_cursor_rejects_modified_totals_and_invalidates_after_deletion(
     import asyncio
     from uuid import uuid4
 
-    from cayu.core import Message
-    from cayu.runtime.sessions import (
+    from cayu.messages import Message
+    from cayu.sessions.base import (
         InMemorySessionStore,
         RunRequest,
         SessionIdentity,
@@ -395,9 +395,9 @@ def test_cost_group_lookup_uses_index_and_keeps_full_attempt_identity(backend, t
     import asyncio
     from uuid import uuid4
 
-    from cayu.core import Message
+    from cayu.messages import Message
     from cayu.runtime._cost_accounting import cost_accounting_query
-    from cayu.runtime.sessions import RunRequest, SessionIdentity
+    from cayu.sessions.base import RunRequest, SessionIdentity
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage import _session_store_sql as sql
     from cayu.storage import postgres as postgres_module
@@ -481,9 +481,9 @@ def test_cost_snapshot_race_keeps_pending_out_of_next_durable_baseline(
     import asyncio
     from uuid import uuid4
 
-    from cayu.core import Message
+    from cayu.messages import Message
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-    from cayu.runtime.sessions import RunRequest, SessionIdentity
+    from cayu.sessions.base import RunRequest, SessionIdentity
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage.migrations import SchemaMode
 
@@ -588,7 +588,7 @@ def test_budget_memory_store_refresh_and_unsupported_store_fail_closed(monkeypat
     import asyncio
     from datetime import UTC, datetime, timedelta
 
-    from cayu.runtime.budgets import BudgetStore, BudgetWindow, InMemoryBudgetStore
+    from cayu.budgets.base import BudgetStore, BudgetWindow, InMemoryBudgetStore
 
     class LegacyStore(BudgetStore):
         async def append_event(self, event):
@@ -636,10 +636,11 @@ def test_budget_memory_store_refresh_and_unsupported_store_fail_closed(monkeypat
 def test_active_cost_refresh_serializes_and_drops_removed_scopes():
     import asyncio
 
-    from cayu.core import Message
-    from cayu.runtime import CayuApp, RunLimits
+    from cayu.applications import CayuApp
+    from cayu.messages import Message
     from cayu.runtime._run_limits import SessionUsageTracker
-    from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+    from cayu.runtime.stop_policy import RunLimits
+    from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 
     async def run():
         store = InMemorySessionStore()

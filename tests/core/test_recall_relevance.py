@@ -7,9 +7,9 @@ import pytest
 
 from cayu.cli import main
 from cayu.cli.project import project_context
-from cayu.memory import admit_recall
-from cayu.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
-from cayu.recall_relevance import query_concept_eligibility
+from cayu.memory.base import admit_recall
+from cayu.memory.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
+from cayu.memory.relevance import query_concept_eligibility
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
@@ -33,7 +33,7 @@ from cayu.storage.memory import (
             True,
         ),
         ("Atlas-42", "Atlas-42 migration uses an expand-contract sequence.", True),
-        ("src/cayu/recall.py", "Edit src/cayu/recall.py to change recall.", True),
+        ("src/cayu/memory/recall.py", "Edit src/cayu/memory/recall.py to change recall.", True),
         ("login credentials", "Store authentication passwords in the vault.", True),
         ("request deadlines", "Bound every request with a timeout.", True),
         ("request deadlines", "The request picnic has a table.", False),
@@ -49,7 +49,7 @@ def test_concept_support_independent_of_rank(query, text, eligible):
 def test_title_aware_coding_recall_keeps_related_contracts_and_rejects_control(tmp_path, backend):
     from test_memory_admission import _policy
 
-    from cayu import WeightedReciprocalRankFusionConfig
+    from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 
     async def run():
         scope = KnowledgeAccessScope.for_namespace("default")
@@ -192,7 +192,7 @@ def test_title_byte_admission_and_candidate_diagnostics_agree(relevance_policy, 
 def test_v2_policy_identity_and_title_byte_bound():
     from test_memory_admission import _candidate, _policy, _result
 
-    from cayu.recall_relevance import TITLE_RELEVANCE_TEXT_VERSION
+    from cayu.memory.relevance import TITLE_RELEVANCE_TEXT_VERSION
 
     legacy = _policy(relevance_policy="cayu.query_concepts.v1")
     policy = _policy(relevance_policy="cayu.query_concepts.v2")
@@ -299,9 +299,9 @@ def test_generated_default_rejects_picnics_and_keeps_useful_procedure(
 def test_semantic_agreement_and_coverage_cannot_manufacture_relevance(semantic):
     from test_memory_admission import _policy
 
-    from cayu import InMemoryEmbeddingKnowledgeStore
     from cayu.embeddings import TextEmbedding, TextEmbeddingProvider, TextEmbeddingResult
-    from cayu.retrieval import WeightedReciprocalRankFusionConfig
+    from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
+    from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore
 
     class TiedEmbeddingProvider(TextEmbeddingProvider):
         name = "tied-test"
@@ -425,7 +425,7 @@ def test_relevance_capacity_and_missing_evidence_are_distinct():
 def test_relevance_configuration_binds_unicode_and_preserves_rank_only_identity():
     from test_memory_admission import _policy
 
-    from cayu.recall_relevance import RELEVANCE_TEXT_VERSION
+    from cayu.memory.relevance import RELEVANCE_TEXT_VERSION
 
     legacy = _policy()
     assert "relevance_policy" not in legacy.model_dump(mode="json")
@@ -451,7 +451,7 @@ def test_generated_context_combines_resolution_and_strong_admission(tmp_path, qu
 
     from test_automatic_recall_context import _fixture, _request
 
-    from cayu.core.messages import Message
+    from cayu.messages import Message
     from cayu.runtime._memory_evidence import MemoryEvidenceKey, memory_evidence_key_scope
 
     assert main(["new", "combined_app", "--dir", str(tmp_path)]) == 0

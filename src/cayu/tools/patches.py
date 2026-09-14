@@ -18,17 +18,7 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
-from cayu.artifacts import ArtifactMetadata, ArtifactScope
-from cayu.core.tools import (
-    DurableToolRecoveryAuthority,
-    DurableToolRecoveryEvidence,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-    _runtime_tool_invocation_authority,
-)
+from cayu.artifacts.base import ArtifactMetadata, ArtifactScope
 from cayu.tools._errors import (
     ToolArgumentShapeError,
     reject_unknown_tool_arguments,
@@ -40,8 +30,18 @@ from cayu.tools._redaction import (
     active_secret_redactor_snapshot,
     record_ambiguous_secret_output,
 )
-from cayu.vaults import SecretRedactor
-from cayu.workspaces import (
+from cayu.tools.base import (
+    DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    _runtime_tool_invocation_authority,
+)
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.base import (
     Workspace,
     WorkspaceMoveAmbiguousError,
     WorkspaceMoveResult,

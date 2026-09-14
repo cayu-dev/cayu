@@ -21,33 +21,28 @@ from tests.core._execution_profile_fixtures import (
 
 import cayu.runtime._session_engine as session_engine_module
 from cayu._exception_groups import exception_cause, iter_exception_tree
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import PendingToolCallApproval, ResolutionActor, ResolutionActorSource
 from cayu.build_provenance import current_runtime_build_provenance
-from cayu.core import (
-    AgentSpec,
+from cayu.context.structured_output import NativeStructuredOutputUnsupported, StructuredOutputSpec
+from cayu.events import (
     Event,
     EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ProviderStatePart,
-    TextPart,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.core.events import (
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    DispatchHandle,
-    DispatchRequest,
-    DispatchStatus,
-    DurableWorkerMetrics,
-    EventQuery,
+from cayu.messages import Message, ProviderStatePart, TextPart
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
+from cayu.runtime._durable_worker_loop import DurableWorkerMetrics
+from cayu.runtime._recovery_coordinator import ModelCompletionBoundaryReconciliation
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
@@ -57,62 +52,6 @@ from cayu.runtime import (
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
-    ForkSessionRequest,
-    ForkSourceSnapshot,
-    IncompleteSessionRecoveryAction,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InvocationOrigin,
-    InvocationOriginTrust,
-    ModelTarget,
-    NativeStructuredOutputUnsupported,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    Session,
-    SessionExecutionSource,
-    SessionIdentity,
-    SessionInvocation,
-    SessionInvocationBinding,
-    SessionModelTransition,
-    SessionRunFenced,
-    SessionStatus,
-    SessionStatusConflict,
-    StructuredOutputSpec,
-    TargetedToolGrant,
-    Task,
-    TaskClaimLost,
-    TaskCreate,
-    TaskExecutionSource,
-    TaskQuery,
-    TaskStatus,
-    TaskStore,
-    TaskStoreDispatcher,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-    ToolCapabilityCeiling,
-)
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
-from cayu.runtime._recovery_coordinator import ModelCompletionBoundaryReconciliation
-from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.dispatch import (
-    _STALLED_RECOVERED_ACTIONS,
-    _dispatch_status_after_event,
-    _DispatchLeaseAuthority,
-    _new_queued_dispatch_envelope,
-    _queued_dispatch_task_id,
-    _QueuedDispatchAuthorityRejected,
-    _QueuedDispatchEnvelope,
-    _QueuedDispatchSettlement,
-    _QueuedDispatchSettlementState,
-    copy_dispatch_request,
-)
-from cayu.runtime.execution_profiles import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
     build_execution_profile_identity,
@@ -125,8 +64,22 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
+    EventQuery,
+    ForkSessionRequest,
+    ForkSourceSnapshot,
+    IncompleteSessionRecoveryAction,
+    InMemorySessionStore,
+    ModelTarget,
     QueuedDispatchTerminalReceipt,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionModelTransition,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStatusConflict,
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,
     _invocation_lifecycle_authority_mutation_scope,
@@ -136,12 +89,50 @@ from cayu.runtime.sessions import (
     session_input_messages_sha256,
     validate_profiled_fork_evidence,
 )
-from cayu.runtime.tasks import task_create_with_runtime_invocation
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    SessionInvocation,
+    SessionInvocationBinding,
+    TaskExecutionSource,
+)
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    Task,
+    TaskClaimLost,
+    TaskCreate,
+    TaskQuery,
+    TaskStatus,
+    TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    task_create_with_runtime_invocation,
+)
+from cayu.tasks.dispatch import (
+    _STALLED_RECOVERED_ACTIONS,
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
+    TaskStoreDispatcher,
+    _dispatch_status_after_event,
+    _DispatchLeaseAuthority,
+    _new_queued_dispatch_envelope,
+    _queued_dispatch_task_id,
+    _QueuedDispatchAuthorityRejected,
+    _QueuedDispatchEnvelope,
+    _QueuedDispatchSettlement,
+    _QueuedDispatchSettlementState,
+    copy_dispatch_request,
+)
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.grants import TargetedToolGrant
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.workspaces.observation_recovery import (
     workspace_observation_recovery_rejected,
 )
-from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 _DISPATCH_TASK_TYPE = "cayu.dispatch"
 _TEST_DISPATCH_ROOTS: dict[str, str] = {}
@@ -2840,7 +2831,7 @@ def test_stalled_recovery_log_redacts_workload_secret(
         raise RuntimeError(f"recovery failed with {secret}")
 
     monkeypatch.setattr(h.app, "recover_incomplete_session", fail_recovery)
-    with caplog.at_level("WARNING", logger="cayu.runtime.dispatch"):
+    with caplog.at_level("WARNING", logger="cayu.tasks.dispatch"):
         result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_recovery"))
 
     assert result is not None
@@ -6254,7 +6245,7 @@ def test_process_next_rejects_authenticated_dispatch_provenance_with_profile_evi
 def test_submit_rejects_loop_policies() -> None:
     # loop_policies are process-local callables that cannot survive serialization; queuing a
     # dispatch that carries them must fail loudly rather than silently drop them.
-    from cayu.runtime import LoopPolicy
+    from cayu.runtime.loop_policies import LoopPolicy
 
     class _NoopPolicy(LoopPolicy):
         pass
@@ -6272,7 +6263,7 @@ def test_submit_rejects_loop_policies() -> None:
 
 
 def test_durable_request_redaction_rejects_loop_policies_for_custom_dispatchers() -> None:
-    from cayu.runtime import LoopPolicy
+    from cayu.runtime.loop_policies import LoopPolicy
 
     class _NoopPolicy(LoopPolicy):
         pass
@@ -7364,8 +7355,8 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
     # In-memory sessions + a real PostgresTaskStore queue: two concurrent workers must
     # claim distinct dispatch tasks through the actual FOR UPDATE SKIP LOCKED path. A
     # per-process-unique task type isolates this run from any leftover rows.
-    from cayu.storage import PostgresTaskStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresTaskStore
 
     task_type = f"cayu.dispatch.test.{os.getpid()}"
 
@@ -7407,9 +7398,8 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
 def test_postgres_restart_preserves_queued_profile_and_executes_once(
     postgres_dsn: str,
 ) -> None:
-    from cayu import PostgresSessionStore
-    from cayu.storage import PostgresTaskStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
 
     suffix = uuid4().hex
     session_id = f"dispatch-profile-{suffix}"

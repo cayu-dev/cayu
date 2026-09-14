@@ -10,36 +10,30 @@ from pathlib import Path
 import pytest
 
 import cayu.tools.search as search_module
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventQuery,
-    EventType,
-    ExecCommand,
-    ExecResult,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityEvidence,
     ExecutionExecutableEvidence,
     ExecutionToolRequirementEvidence,
-    InMemorySessionStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    Runner,
-    RunRequest,
-    ScriptedModelProvider,
-    SearchTextTool,
-    ToolContext,
-    ToolExecutableRequirement,
 )
-from cayu.providers import ModelRequest, build_openai_payload
-from cayu.runners import LocalRunner, RunnerUnavailableError
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelRequest, ModelStreamEvent
+from cayu.providers.openai import build_openai_payload
+from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerUnavailableError
+from cayu.runners.local import LocalRunner
 from cayu.runtime._event_projection import project_runtime_event
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tools.base import ToolContext, ToolExecutableRequirement
+from cayu.tools.search import SearchTextTool
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.workspaces.local import LocalWorkspace
 
 
 class _ResultRunner(Runner):

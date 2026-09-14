@@ -26,7 +26,6 @@ from cayu import (
     default_price_book,
     eval_corpus_from_json,
 )
-from cayu.runtime import InMemorySessionStore
 from cayu.server import (
     AuthContext,
     DashboardConfig,
@@ -36,6 +35,7 @@ from cayu.server import (
     create_server,
 )
 from cayu.server.contracts import MAX_EVALUATION_PROMOTION_REQUEST_BYTES
+from cayu.sessions.base import InMemorySessionStore
 from cayu.vaults import SecretRedactor
 
 _SESSION_ID = "server-promotion-session"

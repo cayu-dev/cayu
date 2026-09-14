@@ -33,12 +33,6 @@ from cayu._validation import (
     copy_durable_json_object,
     inspect_bounded_durable_json,
 )
-from cayu.core.isolated_tools import (
-    MAX_ISOLATED_TOOL_JSON_NODES,
-    ProcessIsolatedTool,
-    ProcessIsolatedToolContext,
-)
-from cayu.core.tools import ToolContext, ToolResult, _runtime_tool_invocation_authority
 from cayu.runtime._isolated_tool_protocol import (
     ISOLATED_TOOL_TERMINAL_FRAME_HEADER_BYTES,
     IsolatedToolChildErrorCode,
@@ -47,7 +41,13 @@ from cayu.runtime._isolated_tool_protocol import (
     decode_isolated_tool_response,
     isolated_tool_terminal_frame_payload_length,
 )
-from cayu.runtime.tool_gateway import validate_effective_tool_arguments
+from cayu.tools.base import ToolContext, ToolResult, _runtime_tool_invocation_authority
+from cayu.tools.gateway import validate_effective_tool_arguments
+from cayu.tools.isolated import (
+    MAX_ISOLATED_TOOL_JSON_NODES,
+    ProcessIsolatedTool,
+    ProcessIsolatedToolContext,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 _WORKER_MODULE: Final = "cayu.runtime._isolated_tool_worker"

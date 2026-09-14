@@ -31,7 +31,7 @@ from cayu._validation import (
 )
 
 if TYPE_CHECKING:
-    from cayu.recall_processing import AgentRecallProcessingResult
+    from cayu.memory.processing import AgentRecallProcessingResult
 
 AGENT_WORK_CONTEXT_SCHEMA_VERSION = "cayu.agent_work_context.v1"
 AGENT_WORK_CONTEXT_PUBLICATION_SCHEMA_VERSION = "cayu.agent_work_context_publication_receipt.v1"
@@ -673,7 +673,7 @@ class AgentRecallDelivery(_WorkContextModel):
     @field_validator("processing_result", mode="before")
     @classmethod
     def copy_processing_result(cls, value: object) -> dict[str, Any]:
-        from cayu.recall_processing import AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingResult
 
         if type(value) is AgentRecallProcessingResult:
             value = value.model_dump(mode="json")
@@ -725,7 +725,7 @@ class AgentRecallDelivery(_WorkContextModel):
 
     @model_validator(mode="after")
     def validate_processing_authority(self) -> AgentRecallDelivery:
-        from cayu.recall_processing import AgentRecallProcessingMode, AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingMode, AgentRecallProcessingResult
 
         result = AgentRecallProcessingResult.model_validate_json(
             canonical_durable_json_bytes(self.processing_result, "processing_result")
@@ -786,7 +786,7 @@ class AgentRecallDelivery(_WorkContextModel):
         staged_by: str,
         staged_at: datetime,
     ) -> AgentRecallDelivery:
-        from cayu.recall_processing import AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingResult
 
         if type(result) is not AgentRecallProcessingResult:
             raise TypeError("result must be an AgentRecallProcessingResult.")
@@ -815,7 +815,7 @@ class AgentRecallDelivery(_WorkContextModel):
         )
 
     def materialized_result(self) -> AgentRecallProcessingResult:
-        from cayu.recall_processing import AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingResult
 
         return AgentRecallProcessingResult.model_validate_json(
             canonical_durable_json_bytes(self.processing_result, "processing_result")
@@ -1256,7 +1256,7 @@ class AgentRecallSubscription(_WorkContextModel):
     @field_validator("admission_policy", mode="before")
     @classmethod
     def copy_admission_policy(cls, value: object) -> dict[str, Any]:
-        from cayu.memory import AutomaticRecallPolicy
+        from cayu.memory.base import AutomaticRecallPolicy
 
         if type(value) is AutomaticRecallPolicy:
             value = value.model_dump(mode="json")
@@ -1310,8 +1310,8 @@ class AgentRecallSubscription(_WorkContextModel):
 
     @model_validator(mode="after")
     def validate_authority(self) -> AgentRecallSubscription:
-        from cayu.memory import AutomaticRecallPolicy
-        from cayu.recall import RECALL_MAX_QUERY_BYTES
+        from cayu.memory.base import AutomaticRecallPolicy
+        from cayu.memory.recall import RECALL_MAX_QUERY_BYTES
         from cayu.storage.memory import KnowledgeQuery, KnowledgeSearchMode
 
         policy = AutomaticRecallPolicy.model_validate_json(
@@ -1374,7 +1374,7 @@ class AgentRecallSubscription(_WorkContextModel):
         priority: int = 0,
         status: AgentRecallSubscriptionStatus = AgentRecallSubscriptionStatus.ACTIVE,
     ) -> AgentRecallSubscription:
-        from cayu.memory import AutomaticRecallPolicy
+        from cayu.memory.base import AutomaticRecallPolicy
 
         context = copy_agent_work_context(work_context)
         if type(admission_policy) is not AutomaticRecallPolicy:
@@ -1434,7 +1434,7 @@ class AgentRecallSubscription(_WorkContextModel):
         return f"{_AGENT_RECALL_SUBSCRIPTION_CHECKPOINT_STREAM_PREFIX}:{digest}"
 
     def policy(self):
-        from cayu.memory import AutomaticRecallPolicy
+        from cayu.memory.base import AutomaticRecallPolicy
 
         return AutomaticRecallPolicy.model_validate_json(
             canonical_durable_json_bytes(self.admission_policy, "admission_policy")
@@ -1455,7 +1455,7 @@ class AgentRecallSubscription(_WorkContextModel):
     def recall_situation(self, access_scope: Any, *, current_time: datetime):
         """Build the exact recurring processor input for this subscription."""
 
-        from cayu.recall import RecallSituation
+        from cayu.memory.recall import RecallSituation
         from cayu.storage.memory import (
             KnowledgeAccessScope,
             copy_knowledge_access_scope,
@@ -1481,8 +1481,8 @@ class AgentRecallSubscription(_WorkContextModel):
         )
 
     def situation_sha256(self) -> str:
-        from cayu.recall import RecallSituation
-        from cayu.recall_processing import agent_recall_situation_input_sha256
+        from cayu.memory.processing import agent_recall_situation_input_sha256
+        from cayu.memory.recall import RecallSituation
 
         return agent_recall_situation_input_sha256(
             RecallSituation(
@@ -2833,7 +2833,7 @@ def agent_recall_subscription_evaluation_request_sha256(
     staged_by: str,
     evaluated_at: datetime,
 ) -> str:
-    from cayu.recall_processing import AgentRecallProcessingResult
+    from cayu.memory.processing import AgentRecallProcessingResult
 
     claim = copy_agent_recall_subscription_claim(claim)
     if type(result) is not AgentRecallProcessingResult:
@@ -2874,8 +2874,8 @@ def _prepare_agent_recall_subscription_evaluation(
     AgentRecallDelivery | None,
     AgentRecallSubscriptionRecord,
 ]:
-    from cayu.memory import admit_recall
-    from cayu.recall_processing import AgentRecallProcessingMode, AgentRecallProcessingResult
+    from cayu.memory.base import admit_recall
+    from cayu.memory.processing import AgentRecallProcessingMode, AgentRecallProcessingResult
 
     record = copy_agent_recall_subscription_record(record)
     claim = copy_agent_recall_subscription_claim(claim)
@@ -4216,7 +4216,7 @@ class InMemoryAgentWorkContextStore(AgentWorkContextStore):
         staged_by: str,
         evaluated_at: datetime,
     ) -> AgentRecallSubscriptionEvaluation:
-        from cayu.recall_processing import AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingResult
 
         claim = copy_agent_recall_subscription_claim(claim)
         if type(result) is not AgentRecallProcessingResult:

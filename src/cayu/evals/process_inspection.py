@@ -496,8 +496,8 @@ async def inspect_process_eval_run(
             )
     if include_sessions:
         from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
-        from cayu.storage import SQLiteSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.sqlite import SQLiteSessionStore
 
         remaining_sessions, remaining_diagnostics = max_sessions, max_diagnostics
         for index, case in enumerate(cases):

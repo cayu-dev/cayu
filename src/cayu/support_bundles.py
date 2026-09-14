@@ -37,31 +37,31 @@ from pydantic import (
 )
 
 from cayu._version import package_version
-from cayu.core.events import EventType
+from cayu.applications import CayuApp
 from cayu.environments.lifecycle import (
     EnvironmentLifecyclePolicy,
     EnvironmentLifecycleProgress,
     environment_lifecycle_progress_from_event,
 )
 from cayu.evals.store import EvalStore
-from cayu.runtime.app import CayuApp
+from cayu.events import EventType
 from cayu.runtime.checks import ProjectCheckReport
 from cayu.runtime.manifest import AppManifest
-from cayu.runtime.recovery_cleanup import (
-    RECOVERY_CLEANUP_MAX_TIMEOUT_SECONDS,
-    RecoveryCleanupDeadlineScope,
-    RecoveryCleanupSupervisorSnapshot,
-)
 from cayu.runtime.service_manifest import PublicServiceManifest
-from cayu.runtime.sessions import (
+from cayu.runtime.system_diagnostics import SystemDiagnosticsResponse
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     EventQueryResultTooLarge,
     SessionOperationalSnapshot,
     SessionStore,
 )
-from cayu.runtime.system_diagnostics import SystemDiagnosticsResponse
-from cayu.runtime.tasks import TaskOperationalSnapshot
+from cayu.sessions.cleanup import (
+    RECOVERY_CLEANUP_MAX_TIMEOUT_SECONDS,
+    RecoveryCleanupDeadlineScope,
+    RecoveryCleanupSupervisorSnapshot,
+)
+from cayu.tasks.base import TaskOperationalSnapshot
 from cayu.workspaces.branches import (
     WorkspaceBranchCapabilities,
     WorkspaceBranchLifecycleSummary,
@@ -165,12 +165,12 @@ _POSTGRES_SCHEMA_STORE_IDENTITIES = frozenset(
 )
 _SCHEMALESS_STORE_IDENTITIES = frozenset(
     {
-        ("cayu.runtime.budgets", "InMemoryBudgetLedger"),
-        ("cayu.runtime.budgets", "InMemoryBudgetStore"),
-        ("cayu.runtime.budgets", "SessionBudgetStore"),
-        ("cayu.runtime.event_watchers", "InMemoryEventWatcherStore"),
-        ("cayu.runtime.sessions", "InMemorySessionStore"),
-        ("cayu.runtime.tasks", "InMemoryTaskStore"),
+        ("cayu.budgets.base", "InMemoryBudgetLedger"),
+        ("cayu.budgets.base", "InMemoryBudgetStore"),
+        ("cayu.budgets.base", "SessionBudgetStore"),
+        ("cayu.observability.watchers", "InMemoryEventWatcherStore"),
+        ("cayu.sessions.base", "InMemorySessionStore"),
+        ("cayu.tasks.base", "InMemoryTaskStore"),
         ("cayu.storage.memory", "InMemoryEmbeddingKnowledgeStore"),
         ("cayu.storage.memory", "InMemoryKnowledgeStore"),
     }

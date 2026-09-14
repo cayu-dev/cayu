@@ -34,9 +34,20 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
-from cayu.artifacts import ArtifactMetadata, ArtifactScope, ArtifactStore, copy_artifact_read_result
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import (
+from cayu.artifacts.base import (
+    ArtifactMetadata,
+    ArtifactScope,
+    ArtifactStore,
+    copy_artifact_read_result,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import SessionOperationPublication, SessionStore
+from cayu.sessions.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
+from cayu.tools._redaction import (
+    active_secret_redactor_snapshot,
+    await_revision_stable_secret_output,
+)
+from cayu.tools.base import (
     DurableToolOperationConflict,
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
@@ -47,13 +58,7 @@ from cayu.core.tools import (
     ToolSpec,
     _runtime_tool_invocation_authority,
 )
-from cayu.runtime.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
-from cayu.runtime.sessions import SessionOperationPublication, SessionStore
-from cayu.tools._redaction import (
-    active_secret_redactor_snapshot,
-    await_revision_stable_secret_output,
-)
-from cayu.workspaces import Workspace, WorkspaceRevisionMismatchError
+from cayu.workspaces.base import Workspace, WorkspaceRevisionMismatchError
 
 SHARED_ARTIFACT_SCHEMA_VERSION = 1
 SHARED_ARTIFACT_REFERENCE_PREFIX = "cayu-shared-artifact-v1."

@@ -20,7 +20,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
-from cayu.core.events import EVENT_ID_MAX_CHARS, EventType
+from cayu.events import EVENT_ID_MAX_CHARS, EventType
 
 CHILD_SESSION_NOTIFICATION_INTENT_KEY = "child_session_notifications"
 CHILD_SESSION_NOTIFICATION_STAGE_BINDING_VERSION = (

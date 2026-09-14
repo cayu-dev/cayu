@@ -3,26 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import httpx
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    RecoveryPlanRequest,
-    RecoveryPlanSelection,
-    SQLiteSessionStore,
-    StepError,
-    WorkflowBase,
-    WorkflowSpec,
-    step,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.providers import _credential_boundary as credential_boundary
 from cayu.providers import deadlines as ds
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
+from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.models import StepError
+from cayu.workflows.workflow import WorkflowBase, step
 
 
 class Workflow(WorkflowBase):
@@ -120,7 +117,10 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            # A peer reset is also a completed transport close. Preserve the
+            # fixture completion signal on macOS socket timing.
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
             handlers.discard(asyncio.current_task())
             closed.set()
 

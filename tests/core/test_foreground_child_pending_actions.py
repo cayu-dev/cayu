@@ -8,25 +8,25 @@ from pydantic import SecretStr
 from tests.core.test_foreground_subagent_recovery import _identity, _Provider
 from tests.core.test_tool_round_execution_identities import _RecordingTool
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,
-    Message,
+    PendingActionKind,
+    PendingActionQuery,
     RunRequest,
     SessionQuery,
-    SQLiteSessionStore,
-    SubagentSpec,
-    SubagentTool,
 )
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import UserInputResponse
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.sessions import PendingActionKind, PendingActionQuery
-from cayu.runtime.tool_policy import AlwaysRequireApprovalToolPolicy
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 
 def _check_delegated_discovery(
@@ -129,8 +129,8 @@ def _check_delegated_discovery(
             assert len(children.sessions) == 1
             child = children.sessions[0]
             if redacted_child_id and action_kind == "user_input":
+                from cayu.approvals.user_input import pending_user_input_from_checkpoint
                 from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
-                from cayu.runtime.user_input import pending_user_input_from_checkpoint
 
                 private_checkpoint = await store.load_checkpoint(child.id)
                 assert private_checkpoint is not None

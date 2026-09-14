@@ -7,8 +7,8 @@ from cayu.runtime.completion_verifier_profiles import (
     build_completion_verifier_execution_profile,
     completion_verifier_profile_preparation_request_sha256,
 )
-from cayu.runtime.tasks import TaskStore
-from cayu.runtime.work_contracts import WorkCompletionConflict
+from cayu.tasks.base import TaskStore
+from cayu.tasks.contracts import WorkCompletionConflict
 
 
 async def prepare_test_completion_verifier_profile(

@@ -16,60 +16,69 @@ import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 
 import cayu.environments.docker_coding as docker_coding_module
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu._coding_product_authority import (
+    CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY,
+    CodingProductSourceCopyAuthority,
+)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.admission import (
+    ExecutionRequirements,
+    ExecutionToolRequirement,
+    evaluate_execution_admission,
+)
+from cayu.environments.base import EnvironmentSpec
+from cayu.environments.bindings import (
+    NoWorkspaceBinding,
+    SyncBinding,
+    SyncBindingSourceConflictError,
+)
+from cayu.environments.docker_coding import (
+    DockerCodingEnvironmentFactory,
+    DockerCodingWorkspaceBinding,
+    DockerWorkspaceTransferLimits,
+)
+from cayu.environments.docker_toolchains import (
     DockerCodingCommandAuthority,
     DockerCodingDependencyInput,
-    DockerCodingEnvironmentFactory,
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    DockerCodingWorkspaceBinding,
-    DockerImageIdentity,
-    DockerWorkloadRestrictions,
-    DockerWorkspaceTransferLimits,
+)
+from cayu.environments.factory import (
     EnvironmentAllocationContext,
     EnvironmentAllocationIntent,
     EnvironmentAllocationState,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
-    EnvironmentSpec,
-    EventType,
-    ExecCommand,
-    ExecutionRequirements,
-    ExecutionToolRequirement,
+)
+from cayu.events import EventType
+from cayu.immutable_inputs import (
     ImmutableInputProjectionCapability,
     ImmutableInputStore,
-    LocalArtifactStore,
-    LocalRunner,
-    Message,
-    NoWorkspaceBinding,
-    RunRequest,
-    SearchTextTool,
-    SyncBinding,
-    SyncBindingSourceConflictError,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    evaluate_execution_admission,
     inspect_local_immutable_input,
 )
-from cayu._coding_product_authority import (
-    CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY,
-    CodingProductSourceCopyAuthority,
-)
-from cayu.providers import ModelProvider, ModelRequest
-from cayu.runners.base import ExecResult
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest
+from cayu.runners.base import ExecCommand, ExecResult
 from cayu.runners.docker import (
     DockerContainerOwnershipError,
     DockerRunner,
     DockerRuntimeConfigurationError,
 )
-from cayu.workspaces import LocalWorkspace, RunnerWorkspace, WorkspaceMutationResult
+from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
+from cayu.runners.local import LocalRunner
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement
+from cayu.tools.search import SearchTextTool
+from cayu.workspaces.base import WorkspaceMutationResult
+from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,
 )
+from cayu.workspaces.runner import RunnerWorkspace
 
 _CONTAINER_ID = "a" * 64
 _IMAGE_ID = "sha256:" + ("b" * 64)

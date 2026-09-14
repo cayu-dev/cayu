@@ -11,7 +11,7 @@ import pytest
 from examples.counterfactual_approval.deployment import DeploymentState
 from worker_harness import BackendConfig, RecoveryHarness
 
-from cayu.core import ToolResultPart
+from cayu.messages import ToolResultPart
 
 pytestmark = [
     pytest.mark.process,

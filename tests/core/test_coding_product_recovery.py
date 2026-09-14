@@ -11,8 +11,8 @@ from hashlib import sha256
 import pytest
 from tests.core.test_coding_products import _request
 
-from cayu import CayuApp, Message, RunRequest
-from cayu.artifacts import LocalArtifactStore
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.coding_products import (
     CodingProductAdmissionError,
     CodingProductArtifactRepository,
@@ -21,8 +21,9 @@ from cayu.coding_products import (
     CodingProductState,
     CodingTaskAuthority,
 )
-from cayu.runtime.sessions import session_input_messages_sha256
-from cayu.workspaces import LocalWorkspace
+from cayu.messages import Message
+from cayu.sessions.base import RunRequest, session_input_messages_sha256
+from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
@@ -109,7 +110,9 @@ def test_runner_preserves_primary_when_real_stream_close_fails(
 ):
     from tests.core.test_queued_session_messages import RecordingOneShotProvider
 
-    from cayu import AgentSpec, Environment, EnvironmentSpec, SessionStatus
+    from cayu.agents import AgentSpec
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.sessions.base import SessionStatus
 
     runner, request, run_request, _ = product
     provider = RecordingOneShotProvider()
@@ -206,7 +209,9 @@ def test_runner_cancellation_during_failure_receipt(
 ):
     from tests.core.test_queued_session_messages import RecordingOneShotProvider
 
-    from cayu import AgentSpec, Environment, EnvironmentSpec, SessionStatus
+    from cayu.agents import AgentSpec
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.sessions.base import SessionStatus
 
     runner, request, run_request, _ = product
     provider = RecordingOneShotProvider()
@@ -656,9 +661,11 @@ def test_recover_settled_execution_without_provider_redispatch(
 ):
     from tests.core.test_queued_session_messages import RecordingOneShotProvider
 
-    from cayu import AgentSpec, ExecutionProfileBehaviorIdentity, SQLiteSessionStore
-    from cayu.environments import Environment, EnvironmentSpec
-    from cayu.runtime import InMemorySessionStore, ResumeRequest
+    from cayu.agents import AgentSpec
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+    from cayu.sessions.base import InMemorySessionStore, ResumeRequest
+    from cayu.storage.sqlite import SQLiteSessionStore
 
     old_runner, request, run_request, _ = product
     if intervening_operation == "lineage":
@@ -694,7 +701,8 @@ def test_recover_settled_execution_without_provider_redispatch(
 
         app = build_app(store)
         if intervening_operation == "lineage":
-            from cayu import WorkflowBase, WorkflowSpec
+            from cayu.workflows.base import WorkflowSpec
+            from cayu.workflows.workflow import WorkflowBase
 
             class RootWorkflow(WorkflowBase):
                 spec = WorkflowSpec(name="coding-recovery-root")

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from cayu import Message, RunRequest, SQLiteSessionStore
-from cayu.runtime.sessions import SessionIdentity
+from cayu.sessions.base import SessionIdentity
 from cayu.storage import _sqlite_support
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.storage.budget_ledger import SQLiteBudgetLedger

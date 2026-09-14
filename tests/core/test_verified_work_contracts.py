@@ -23,15 +23,90 @@ from tests.core.task_invocation_fixtures import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
+import cayu.tasks.base as tasks_module
+import cayu.tasks.contracts as work_contracts_module
+from cayu._validation import FrozenJsonDict, FrozenJsonList, canonical_durable_json_bytes
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    PendingToolApprovalEventView,
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+)
+from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputStrategy
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfilePreparationRequest,
+    build_completion_verifier_execution_profile,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+)
+from cayu.sessions.base import (
+    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    ForkSystemPromptPolicy,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionStatus,
+    run_request_with_runtime_invocation,
+)
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    TaskExecutionSource,
+    TaskInvocation,
+)
+from cayu.storage import migrations as schema_migrations
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import (
+    CompletionDecisionApplicationReceipt,
+    InMemoryTaskStore,
+    Task,
+    TaskClaimLost,
+    TaskCreate,
+    TaskQuery,
+    TaskRetryPolicy,
+    TaskStatus,
+    TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    copy_task,
+)
+from cayu.tasks.contracts import (
+    WORK_COMPLETION_APPLICATION_MAX_BYTES,
+    WORK_COMPLETION_APPLICATION_MAX_ITEMS,
+    WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
+    WORK_COMPLETION_LINKED_ID_MAX_BYTES,
+    WORK_CONTRACT_MAX_CRITERIA,
+    WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
+    WORK_CONTRACT_TASK_MAX_BYTES,
     CompletionConstraintOutcome,
     CompletionContinuationPolicy,
     CompletionCriterionOutcome,
-    CompletionDecisionApplicationReceipt,
     CompletionDecisionApplicationRequest,
     CompletionDecisionCreate,
     CompletionGap,
@@ -44,72 +119,9 @@ from cayu import (
     CompletionVerdict,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
-    CompletionVerifierProfileAdoptionDecision,
-    CompletionVerifierProfilePreparationRequest,
     CompletionVerifierRef,
     CriterionOutcomeStatus,
-    Dispatcher,
-    DispatchHandle,
-    DispatchRequest,
-    DispatchStatus,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileBehaviorIdentity,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    ForkSystemPromptPolicy,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InvocationOrigin,
-    InvocationOriginClaim,
-    InvocationOriginTrust,
-    Message,
-    ModelCompactor,
-    PendingToolApprovalEventView,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RunRequest,
-    SecretRedactor,
-    Session,
-    SessionExecutionSource,
-    SessionIdentity,
-    SessionStatus,
-    SQLiteTaskStore,
-    StructuredOutputSpec,
-    StructuredOutputStrategy,
-    Task,
-    TaskClaimLost,
     TaskCompletionDecisionRequired,
-    TaskCreate,
-    TaskExecutionSource,
-    TaskInvocation,
-    TaskQuery,
-    TaskRetryPolicy,
-    TaskStatus,
-    TaskStore,
-    TaskStoreDispatcher,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolCapabilityCeiling,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolResult,
-    ToolSpec,
     WorkAttemptCreate,
     WorkCompletionConflict,
     WorkConstraint,
@@ -120,44 +132,32 @@ from cayu import (
     WorkCriterion,
     WorkEvidenceReference,
     WorkEvidenceRequirement,
-    completion_gap_fingerprint,
-    completion_result_sha256,
-    run_task_worker,
-    work_contract_from_draft,
-)
-from cayu._validation import FrozenJsonDict, FrozenJsonList, canonical_durable_json_bytes
-from cayu.core.tools import Tool, ToolContext
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import tasks as tasks_module
-from cayu.runtime import work_contracts as work_contracts_module
-from cayu.runtime.completion_verifier_profiles import (
-    build_completion_verifier_execution_profile,
-)
-from cayu.runtime.sessions import (
-    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
-    run_request_with_runtime_invocation,
-)
-from cayu.runtime.tasks import copy_task
-from cayu.runtime.work_contracts import (
-    WORK_COMPLETION_APPLICATION_MAX_BYTES,
-    WORK_COMPLETION_APPLICATION_MAX_ITEMS,
-    WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
-    WORK_COMPLETION_LINKED_ID_MAX_BYTES,
-    WORK_CONTRACT_MAX_CRITERIA,
-    WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
-    WORK_CONTRACT_TASK_MAX_BYTES,
     completion_decision_application_request_sha256,
     completion_decision_request_sha256,
+    completion_gap_fingerprint,
     completion_proposal_request_sha256,
+    completion_result_sha256,
     completion_verification_claim_request_sha256,
     copy_completion_verification_claim,
     work_attempt_request_sha256,
+    work_contract_from_draft,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.tasks.dispatch import (
+    Dispatcher,
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
+    TaskStoreDispatcher,
+)
+from cayu.tasks.worker import run_task_worker
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
+from cayu.tools.user_input import UserInputTool
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     workspace_observation_pending_cancellation_requests,
 )
-from cayu.storage import migrations as schema_migrations
-from cayu.tools import UserInputTool
 
 
 def _digest(value: str) -> str:

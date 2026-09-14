@@ -7,22 +7,25 @@ import pytest
 from tests.core.test_recovery_plans import _app, _create_running_session, _FakeProvider
 
 from cayu import SQLiteSessionStore
-from cayu.core import AgentSpec, Event, EventType
-from cayu.runtime import (
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._zero_work_interruption import ZeroWorkInterruptionRequest
+from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
+    SessionStatus,
+)
+from cayu.sessions.recovery import (
     RecoveryExecutionRequest,
     RecoveryItemExecutionStatus,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    SessionStatus,
 )
-from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime._zero_work_interruption import ZeroWorkInterruptionRequest
 
 
 async def _orphan(store):
@@ -98,7 +101,7 @@ def test_profile_drift_terminalizes_and_replays_exactly(store):
         result = await app.recover_incomplete_session(request)
         assert result.status is SessionStatus.INTERRUPTED
         assert result.actions == (IncompleteSessionRecoveryAction.TERMINALIZED_ZERO_WORK,)
-        from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+        from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
         summary = InteractionSummaryEvidence.model_validate(result.events[0].payload)
         assert summary.status is InteractionStatus.INTERRUPTED
@@ -242,8 +245,8 @@ def test_public_recovery_reconciles_commit_acknowledgement_loss(store, monkeypat
 
 
 def test_terminalization_preserves_ordinary_resume_admission(store):
-    from cayu.core import Message
-    from cayu.runtime import ResumeRequest
+    from cayu.messages import Message
+    from cayu.sessions.base import ResumeRequest
 
     async def exercise():
         await _orphan(store)
@@ -277,7 +280,7 @@ def test_terminalization_preserves_ordinary_resume_admission(store):
 def test_pending_evidence_never_uses_profile_independent_terminalization(store, key):
     async def exercise():
         await _orphan(store)
-        from cayu.runtime.sessions import _workspace_observation_authority_mutation_scope
+        from cayu.sessions.base import _workspace_observation_authority_mutation_scope
 
         with _workspace_observation_authority_mutation_scope():
             await runtime_checkpoint_session_store(store).transform_checkpoint(
@@ -304,7 +307,7 @@ def test_pending_evidence_never_uses_profile_independent_terminalization(store, 
 
 
 def test_custom_store_without_atomic_protocol_retains_profile_admission(monkeypatch):
-    from cayu.runtime.sessions import SessionStore
+    from cayu.sessions.base import SessionStore
 
     store = InMemorySessionStore()
 

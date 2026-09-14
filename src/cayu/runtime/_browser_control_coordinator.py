@@ -31,7 +31,9 @@ from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
 )
-from cayu.runtime.browser_control import (
+from cayu.sessions.base import SessionStatus, SessionStore
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlCheckpoint,
     BrowserControlConflict,
@@ -52,8 +54,6 @@ from cayu.runtime.browser_control import (
     rebound_browser_control_successor,
     request_browser_takeover,
 )
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
-from cayu.runtime.sessions import SessionStatus, SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 

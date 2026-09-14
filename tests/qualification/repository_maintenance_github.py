@@ -8,7 +8,8 @@ from workflows.maintenance_delivery import (  # ty: ignore[unresolved-import]
     run_verified_github_delivery,
 )
 
-from cayu import ExecutionDeadline, complete_managed_task, execution_deadline_scope
+from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
+from cayu.tasks.worker import complete_managed_task
 from tests.qualification.repository_maintenance_git_intake import load_verified_git_result
 from tests.qualification.repository_maintenance_github_intake import (
     _configured_github_request,

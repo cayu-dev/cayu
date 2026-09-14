@@ -23,10 +23,10 @@ from cayu._validation import (
     require_unicode_scalar_json,
     require_unicode_scalar_text,
 )
-from cayu.core.events import Event, EventType
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message, MessageRole, TextPart
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.budgets.base import copy_request_budget_limits
+from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.events import Event, EventType
+from cayu.messages import Message, MessageRole, TextPart
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
     ChildSessionRecoveryMatcher,
@@ -45,16 +45,10 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_receipt_matches_intent,
     require_durable_subagent_receipt_matches_seed,
 )
-from cayu.runtime.budgets import copy_request_budget_limits
-from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
-from cayu.runtime.invocation import (
-    SessionExecutionSource,
-    SessionInvocation,
-    TaskExecutionSource,
-    inherited_session_invocation,
-)
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions.base import (
     InterruptSessionRequest,
     RunRequest,
     Session,
@@ -66,13 +60,19 @@ from cayu.runtime.sessions import (
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
 )
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.runtime.tasks import Task, TaskStatus, TaskStore
-from cayu.runtime.tool_policy import metadata_with_taint_labels, taint_labels_from_metadata
+from cayu.sessions.invocation import (
+    SessionExecutionSource,
+    SessionInvocation,
+    TaskExecutionSource,
+    inherited_session_invocation,
+)
+from cayu.tasks.base import Task, TaskStatus, TaskStore
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.policy import metadata_with_taint_labels, taint_labels_from_metadata
 
 if TYPE_CHECKING:
-    from cayu.runtime.dispatch import DispatchHandle
+    from cayu.tasks.dispatch import DispatchHandle
 
 logger = logging.getLogger(__name__)
 
@@ -1835,7 +1835,7 @@ async def _validated_durable_subagent_session_authority(
     idempotency_key: str,
 ) -> tuple[DurableSubagentSubmissionIntent, Session] | None:
     try:
-        from cayu.runtime.sessions import _queued_dispatch_session_instance_fingerprint
+        from cayu.sessions.base import _queued_dispatch_session_instance_fingerprint
 
         parent = await session_store.load(child.parent_session_id or "")
         if parent is None:
@@ -1934,11 +1934,11 @@ def _task_matches_durable_subagent_child(
     if type(envelope) is not dict:
         return False
     try:
-        from cayu.runtime.dispatch import (
+        from cayu.sessions.base import _queued_dispatch_session_instance_fingerprint
+        from cayu.tasks.dispatch import (
             _new_prepared_subagent_dispatch_envelope,
             _QueuedDispatchEnvelope,
         )
-        from cayu.runtime.sessions import _queued_dispatch_session_instance_fingerprint
 
         parsed_envelope = _QueuedDispatchEnvelope.model_validate(envelope)
         expected_envelope = _new_prepared_subagent_dispatch_envelope(

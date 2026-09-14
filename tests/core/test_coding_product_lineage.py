@@ -6,7 +6,10 @@ from typing import Any
 import pytest
 from tests.core.test_coding_product_recovery import product as product
 
-from cayu import CodingProductAdmissionError, admit_or_recover_coding_product_request
+from cayu.coding_products import (
+    CodingProductAdmissionError,
+    admit_or_recover_coding_product_request,
+)
 
 
 @pytest.mark.parametrize("field", ["parent_session_id", "causal_budget_id"])

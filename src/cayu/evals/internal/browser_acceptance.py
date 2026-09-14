@@ -24,29 +24,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import SecretStr
 
-from cayu import (
-    AgentSpec,
-    ApprovedEgressDestination,
-    ArtifactScope,
-    BrowserEgressPolicy,
-    BrowserVisualPolicy,
-    CayuApp,
-    EnvironmentSpec,
-    EvalCase,
-    EvalPlan,
-    EvalSuite,
-    LocalArtifactStore,
-    Message,
-    RunLimits,
-    RunRequest,
-    SessionCompleted,
-    WebBridge,
-)
 from cayu._task_wait import (
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
 )
 from cayu._validation import canonical_durable_json_bytes
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.base import ArtifactScope
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.browser_profiles import (
     AESGCMBrowserProfileKeyAuthority,
     BrowserProfileBinding,
@@ -54,15 +40,16 @@ from cayu.browser_profiles import (
     BrowserProfileScope,
     InMemoryBrowserProfileStore,
 )
-from cayu.core.events import Event, EventType, event_durable_sequence
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import TextPart, ToolResultPart
-from cayu.core.tools import DurableToolRecoveryEvidence
-from cayu.egress import HttpxUpstream
+from cayu.egress.broker import HttpxUpstream
+from cayu.egress.destinations import ApprovedEgressDestination
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.egress.policy import BrowserEgressPolicy
+from cayu.egress.runtime import VIRTUAL_EGRESS_EVENT_TYPES, VirtualEgressEnvironmentFactory
+from cayu.environments.base import EnvironmentSpec
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
+from cayu.evals.assertions import SessionCompleted
 from cayu.evals.browser_acceptance import (
     BrowserAcceptanceFaultEvidenceV1,
     BrowserAcceptanceFaultScenario,
@@ -86,27 +73,34 @@ from cayu.evals.evidence import (
     project_assertion_evidence_view,
 )
 from cayu.evals.models import EvalStatus, EvalTrialResult
+from cayu.evals.runner import EvalCase, EvalPlan, EvalSuite
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import _trajectory_from_terminal_evidence, trajectory_from_session
-from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand, Runner
+from cayu.events import Event, EventType, event_durable_sequence
+from cayu.messages import Message, TextPart, ToolResultPart
+from cayu.observability.events import EventSink
+from cayu.providers.base import ModelRequest, ModelStreamEvent
+from cayu.runners.base import ExecCommand, Runner
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
-from cayu.runtime.egress import VIRTUAL_EGRESS_EVENT_TYPES, VirtualEgressEnvironmentFactory
-from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
     EventQuery,
     IncompleteSessionRecoveryRequest,
     RunnerObservedEventIdentity,
+    RunRequest,
     SessionOperationPublication,
     SessionStatus,
     TerminalSessionEvidenceLimits,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import DurableToolRecoveryEvidence
 from cayu.tools.browser_session import (
     BROWSER_SESSION_PROTOCOL_VERSION,
     BROWSER_SESSION_WORKER_VERSION,
@@ -115,7 +109,9 @@ from cayu.tools.browser_session import (
     BrowserSessionTool,
     _durable_browser_operation_locator_key,
 )
-from cayu.vaults import SecretRedactor
+from cayu.tools.browser_visual import BrowserVisualPolicy
+from cayu.tools.webbridge import WebBridge
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.evals.internal.browser_acceptance_operator import OperatorFixtureBinding

@@ -2,7 +2,7 @@
 
 from decimal import Decimal
 
-from cayu import BudgetLimit, BudgetPolicy
+from cayu.budgets.base import BudgetLimit, BudgetPolicy
 
 
 def require_maintenance_budget(value: object) -> BudgetPolicy:

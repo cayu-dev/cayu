@@ -18,14 +18,18 @@ from tests.core.test_cost_quality_comparison import _attempt, _side
 import cayu.cli._guarded_tree_publication as guarded_publication
 import cayu.evals.causal_memory_campaign as reference_campaign
 import cayu.evals.external_private_memory_ablation as private_ablation
-from cayu.agent_snapshots import (
-    AgentSnapshotCoordinator,
-    AgentSnapshotResultBinding,
-    AgentSnapshotTerminalDisposition,
-    SQLiteAgentSnapshotStore,
-    execution_profile_snapshot_ref,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, BudgetReservation, BudgetWindow
+from cayu.budgets.pricing import (
+    ModelPrice,
+    PriceBook,
+    PriceSchedule,
+    PriceTier,
+    Provenance,
+    TieredPricing,
+    default_price_book,
 )
-from cayu.core import AgentSpec, Message
 from cayu.evals.corpus import (
     MemoryAttributionAssertionSpec,
     PrivateJudgeReferenceV1,
@@ -88,7 +92,7 @@ from cayu.evals.memory_reporting import (
     memory_experiment_report_to_json,
 )
 from cayu.evals.testing import ScriptedModelProvider
-from cayu.memory_intervention_execution import (
+from cayu.memory.execution import (
     CayuMemoryInterventionRuntimeRunner,
     MemoryInterventionExecutionStatus,
     MemoryInterventionExecutor,
@@ -99,20 +103,17 @@ from cayu.memory_intervention_execution import (
     MemoryInterventionTrialRequest,
     SQLiteMemoryInterventionExecutionStore,
 )
-from cayu.memory_interventions import MemoryInterventionTrialBinding
+from cayu.memory.interventions import MemoryInterventionTrialBinding
+from cayu.messages import Message
 from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.runtime.app import CayuApp
-from cayu.runtime.budgets import BudgetLimit, BudgetReservation, BudgetWindow
-from cayu.runtime.costs import (
-    ModelPrice,
-    PriceBook,
-    PriceSchedule,
-    PriceTier,
-    Provenance,
-    TieredPricing,
-    default_price_book,
-)
 from cayu.runtime.stop_policy import RunLimits
+from cayu.snapshots.base import (
+    AgentSnapshotCoordinator,
+    AgentSnapshotResultBinding,
+    AgentSnapshotTerminalDisposition,
+    SQLiteAgentSnapshotStore,
+    execution_profile_snapshot_ref,
+)
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import SubagentSpec, SubagentTool
@@ -3407,7 +3408,7 @@ def test_native_compaction_then_resume_precedes_provider_work_and_recovers(
     import subprocess
     import sys
 
-    from cayu.core.events import EventType
+    from cayu.events import EventType
 
     if crash_before_resume:
         child = subprocess.run(
@@ -3424,7 +3425,7 @@ _campaign_fixture = fixture_module._campaign_fixture
 _AccountingEvidenceCollector = fixture_module._AccountingEvidenceCollector
 _NOW = fixture_module._NOW
 from cayu.evals.external_private_memory_ablation import run_external_private_memory_ablation
-from cayu.runtime.app import CayuApp
+from cayu.applications import CayuApp
 async def crash(self, *args, **kwargs):
     os._exit(75)
     yield
@@ -3527,8 +3528,8 @@ def test_prepared_trial_recovery_rejects_undeclared_continuation(tamper: str):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
-    from cayu.core.events import Event, EventType
-    from cayu.memory_intervention_execution import (
+    from cayu.events import Event, EventType
+    from cayu.memory.execution import (
         CayuMemoryInterventionRuntimeRunner,
         MemoryInterventionExecutionConflict,
     )
@@ -3602,9 +3603,9 @@ def test_prepared_trial_recovery_rejects_undeclared_continuation(tamper: str):
 def test_native_preparation_rejects_zero_progress_compaction(already_resumed: bool):
     from types import SimpleNamespace
 
-    from cayu.core.events import EventType
-    from cayu.memory_intervention_execution import MemoryInterventionExecutionConflict
-    from cayu.runtime import InMemorySessionStore, ResumeRequest, RunRequest
+    from cayu.events import EventType
+    from cayu.memory.execution import MemoryInterventionExecutionConflict
+    from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
 
     async def run():
         store = InMemorySessionStore()

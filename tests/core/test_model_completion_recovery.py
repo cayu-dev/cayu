@@ -12,42 +12,29 @@ from tests.core._execution_profile_fixtures import (
     versioned_test_provider_identity,
 )
 
-from cayu import SQLiteBudgetLedger, SQLiteSessionStore
-from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.core.messages import ToolCallPart, ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    DEFAULT_MAX_STEPS,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import PendingUserInput
+from cayu.budgets.base import (
     BudgetLimit,
     BudgetReservation,
-    CayuApp,
-    EventQuery,
-    ExecutionProfileMismatchError,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
+    BudgetReservationRecoveryContext,
     InMemoryBudgetLedger,
-    InMemorySessionStore,
-    ModelCompletionManualRecoveryRequest,
-    ModelCompletionManualRecoveryRequired,
-    ModelCompletionStageDisposition,
-    ModelPrice,
-    PriceBook,
-    RecoveryBlockerCode,
-    RecoveryDecision,
-    RecoveryExecutionRequest,
-    RecoveryItemExecutionStatus,
-    RecoveryPlanAction,
-    RecoveryPlanRequest,
-    RecoveryPlanSelection,
-    ResumeRequest,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    Session,
-    SessionStatus,
-    ToolCapabilityCeiling,
+    InMemoryBudgetStore,
+    budget_reservation_authority_sha256,
+    budget_settlement_id,
 )
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.configuration import DEFAULT_MAX_STEPS
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart, ToolResultPart
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _model_completion_publication as model_completion_publication
@@ -63,38 +50,52 @@ from cayu.runtime._model_step_executor import (
     ModelCompletionRecoveryContext,
     reconstruct_assistant_step_result,
 )
-from cayu.runtime.approvals import (
-    PendingToolApproval,
-    PendingToolCallApproval,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-)
-from cayu.runtime.budgets import (
-    BudgetReservationRecoveryContext,
-    InMemoryBudgetStore,
-    budget_reservation_authority_sha256,
-    budget_settlement_id,
-)
+from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.build_provenance import current_runtime_build_provenance
-from cayu.runtime.checkpoints import (
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity, ExecutionProfileMismatchError
+from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    EventQuery,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionStage,
+    ModelCompletionStageDisposition,
+    ModelCompletionStageRequest,
+    ResumeRequest,
+    RunRequest,
+    RuntimePublicationMutation,
+    RuntimePublicationRequest,
+    Session,
+    SessionStatus,
+    runtime_publication_checkpoint_mutation,
+)
+from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
-from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
-from cayu.runtime.sessions import (
-    ModelCompletionStage,
-    ModelCompletionStageRequest,
-    RuntimePublicationMutation,
-    RuntimePublicationRequest,
-    runtime_publication_checkpoint_mutation,
+from cayu.sessions.recovery import (
+    RecoveryBlockerCode,
+    RecoveryDecision,
+    RecoveryExecutionRequest,
+    RecoveryItemExecutionStatus,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
 )
-from cayu.runtime.tool_exposure import (
+from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
+    ToolCapabilityCeiling,
     resolved_tool_exposure_authority,
 )
-from cayu.runtime.user_input import PendingUserInput
-from cayu.tools import UserInputTool
+from cayu.tools.user_input import UserInputTool
 
 
 class _RecordingProvider(ModelProvider):

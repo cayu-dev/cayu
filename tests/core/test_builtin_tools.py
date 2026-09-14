@@ -17,27 +17,56 @@ import pytest
 from pydantic import SecretStr
 
 import cayu.tools.files as files_module
-from cayu import (
+from cayu._validation import thaw_json_value
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
-    REDACTED_SECRET,
     RESOLVED_FILE_ATTACHMENTS_OPTION,
+    file_attachment,
+)
+from cayu.artifacts.base import (
     ArtifactMetadata,
     ArtifactReadResult,
     ArtifactScope,
     ArtifactStore,
-    CayuConfig,
-    Environment,
-    EnvironmentSpec,
-    SecretRedactor,
-    ToolExecutionConfig,
-    file_attachment,
+    ArtifactStoreUnavailableError,
 )
-from cayu._validation import thaw_json_value
-from cayu.artifacts import ArtifactStoreUnavailableError, LocalArtifactStore
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.tools import (
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook, ToolCallHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners.base import (
+    ExecCommand,
+    ExecResult,
+    Runner,
+    RunnerExecutionError,
+    RunnerUnavailableError,
+)
+from cayu.runners.docker import DockerRunner
+from cayu.runners.local import LocalRunner
+from cayu.runtime._invocation_secrets import InvocationSecretTracker
+from cayu.runtime._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    model_step_publication_from_checkpoint,
+)
+from cayu.runtime._tool_execution import run_tool
+from cayu.sessions.base import RunRequest
+from cayu.sessions.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+)
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._resources import InvocationArtifactStoreHandle, InvocationWorkspaceHandle
+from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools.base import (
     _POLICY_DENIAL_TEXT_MAX_BYTES,
     _POLICY_DENIAL_TRUNCATION_MARKER,
     Tool,
@@ -47,43 +76,6 @@ from cayu.core.tools import (
     ToolSpec,
     _bound_policy_denial_text,
 )
-from cayu.providers import (
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-)
-from cayu.runners import (
-    DockerRunner,
-    ExecCommand,
-    ExecResult,
-    LocalRunner,
-    Runner,
-    RunnerExecutionError,
-    RunnerUnavailableError,
-)
-from cayu.runtime import (
-    AfterToolCallDecision,
-    CayuApp,
-    RunRequest,
-    RuntimeHook,
-    ToolCallHookContext,
-)
-from cayu.runtime._invocation_secrets import InvocationSecretTracker
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    model_step_publication_from_checkpoint,
-)
-from cayu.runtime._tool_execution import run_tool
-from cayu.runtime.checkpoints import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-)
-from cayu.tools import ExecCommandTool
-from cayu.tools._redaction import InvocationRedactorSnapshot
-from cayu.tools._resources import InvocationArtifactStoreHandle, InvocationWorkspaceHandle
-from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.commands import (
     DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
@@ -93,6 +85,7 @@ from cayu.tools.commands import (
     CommandPolicyDecision,
     CommandPolicyResult,
     CommandRequest,
+    ExecCommandTool,
 )
 from cayu.tools.files import (
     DEFAULT_ATTACHMENT_LIMIT_BYTES,
@@ -111,8 +104,11 @@ from cayu.tools.files import (
     ReadFileTool,
     WriteFileTool,
 )
-from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
-from cayu.workspaces import LocalWorkspace, WorkspaceReadResult
+from cayu.vaults.base import ResolvedSecret, SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.base import WorkspaceReadResult
+from cayu.workspaces.local import LocalWorkspace
 
 TINY_PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
@@ -5447,7 +5443,7 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
 
 
 def test_command_policy_denial_is_redacted_before_runtime_bounding():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "BOUNDARY_SECRET_command_value"
     raw_reason = "a" * 4050 + secret_value
@@ -5507,7 +5503,7 @@ def test_command_policy_denial_is_redacted_before_runtime_bounding():
 
 
 def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets():
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret_values = [
         "reason",
@@ -5812,7 +5808,7 @@ def test_command_approval_member_is_distinct_from_tool_policy():
     # #125 footgun 2: the command-policy approval member must NOT share a name OR a bare string with
     # the tool-policy one. The tool-policy member creates a durable pause/resume checkpoint; the
     # command-policy one only refuses the command inline (no session pause).
-    from cayu.runtime import ToolPolicyDecision
+    from cayu.tools.policy import ToolPolicyDecision
 
     assert CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL != ToolPolicyDecision.REQUIRE_APPROVAL
     assert str(CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL) == "require_command_approval"

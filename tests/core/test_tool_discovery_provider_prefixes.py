@@ -13,8 +13,8 @@ from cayu.providers.bedrock import build_bedrock_converse_payload
 from cayu.providers.chat_completions import build_chat_completions_payload
 from cayu.providers.openai import build_openai_payload
 from cayu.providers.vertex import VertexProvider
-from cayu.runtime.tool_discovery import search_tools_spec
-from cayu.runtime.tool_gateway import call_tool_spec
+from cayu.tools.discovery import search_tools_spec
+from cayu.tools.gateway import call_tool_spec
 
 _HIDDEN_DISCOVERED_TOOL_NAME = "hidden_discovered_tool"
 _HIDDEN_DISCOVERED_ARGUMENT_NAME = "secret_argument"

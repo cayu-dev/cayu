@@ -4,20 +4,16 @@ import asyncio
 
 import pytest
 
-from cayu.memory import admit_recall
-from cayu.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
-from cayu.recall_relevance import (
+from cayu.memory.base import admit_recall
+from cayu.memory.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
+from cayu.memory.relevance import (
     PHRASE_RELEVANCE_TEXT_VERSION,
     PHRASE_RELEVANCE_VERSION,
     query_concept_eligibility,
 )
-from cayu.retrieval import WeightedReciprocalRankFusionConfig
-from cayu.storage import (
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    SQLiteKnowledgeStore,
-)
+from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 
 QUERY = (
     "Explain the release rollback procedure. Return only JSON with keys action and reason. "
@@ -317,10 +313,14 @@ def test_runtime_delivers_phrase_supported_record_and_persists_its_reason(versio
         _RecordingCountScriptedProvider,
     )
 
-    from cayu import AgentSpec, CayuApp, Environment, EnvironmentSpec, Message, RunRequest
-    from cayu.memory_evidence import RecallEvidenceQuery
-    from cayu.providers import ModelStreamEvent
-    from cayu.runtime.request_footprints import RequestFootprintConfig
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.context.footprints import RequestFootprintConfig
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.memory.evidence import RecallEvidenceQuery
+    from cayu.messages import Message
+    from cayu.providers.base import ModelStreamEvent
+    from cayu.sessions.base import RunRequest
 
     async def check():
         sessions = _CountingSessionStore()

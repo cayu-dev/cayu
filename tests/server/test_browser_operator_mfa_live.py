@@ -42,12 +42,6 @@ from cayu import (
 from cayu.artifacts import LocalArtifactStore
 from cayu.runners import ExecResult, Runner
 from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
-from cayu.runtime.browser_control import (
-    BrowserControlPolicy,
-    BrowserControlPolicyResult,
-    BrowserOperatorPurpose,
-)
-from cayu.runtime.browser_control_config import BrowserControlConfig
 from cayu.server import (
     BasicAuth,
     BrowserControlServerConfig,
@@ -57,6 +51,12 @@ from cayu.server import (
 )
 from cayu.tools import _browser_guest
 from cayu.tools._browser_control_transport import open_guest_control_channel
+from cayu.tools.browser_control import (
+    BrowserControlPolicy,
+    BrowserControlPolicyResult,
+    BrowserOperatorPurpose,
+)
+from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.tools.browser_session import BrowserSessionTool
 
 control_tls = _control_tls

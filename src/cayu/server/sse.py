@@ -11,7 +11,7 @@ from cayu._validation import (
     inspect_bounded_durable_json,
     require_clean_nonblank,
 )
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, validate_event_envelope
+from cayu.events import EVENT_ID_MAX_CHARS, Event, validate_event_envelope
 
 SSE_EVENT_DATA_MAX_BYTES = DURABLE_EVENT_LIMITS.max_bytes
 SSE_ERROR_TEXT_MAX_BYTES = 512

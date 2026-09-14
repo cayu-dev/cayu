@@ -11,7 +11,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from cayu import (
+from cayu.delivery.git import (
     RemoteGitCommitAuthority,
     RemoteGitDeliveryApproval,
     RemoteGitDeliveryError,
@@ -20,14 +20,13 @@ from cayu import (
     RemoteGitDeliveryState,
     RemoteGitRepositoryAuthority,
     RemoteGitSecurityAuthority,
-    TaskQuery,
-    TaskStatus,
     approve_remote_git_delivery,
     remote_git_broker_behavior_fingerprint,
     remote_git_delivery_request,
-    run_task_worker,
 )
 from cayu.server import ProductPrincipal
+from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
 from tests.qualification.repository_maintenance_case import SEED_BASE_REVISION
 from tests.qualification.repository_maintenance_github_case import exercise_github_delivery
 from tests.qualification.repository_maintenance_restart_case import exercise_approval_restart

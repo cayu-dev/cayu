@@ -9,40 +9,33 @@ from datetime import UTC, datetime
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    AutomaticRecallContextPolicy,
-    AutomaticRecallPolicy,
-    AutomaticRecallSourceConfig,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    InMemoryEmbeddingKnowledgeStore,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeIndexer,
-    KnowledgeIndexRequest,
-    Message,
-    ModelProvider,
-    ModelStreamEvent,
-    ReadKnowledgeTool,
-    RequestFootprintConfig,
-    RunRequest,
-    ScriptedModelProvider,
-    SearchKnowledgeTool,
-    WeightedReciprocalRankFusionConfig,
-)
-from cayu.core.messages import ToolResultPart
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.footprints import RequestFootprintConfig
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.providers.base import ModelRequest
-from cayu.recall_relevance import query_concept_eligibility
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.memory.base import AutomaticRecallPolicy
+from cayu.memory.context import AutomaticRecallContextPolicy, AutomaticRecallSourceConfig
+from cayu.memory.relevance import query_concept_eligibility
+from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.messages import Message, ToolResultPart
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions.base import RunRequest
+from cayu.storage.knowledge_indexer import KnowledgeIndexer, KnowledgeIndexRequest
+from cayu.storage.memory import (
+    InMemoryEmbeddingKnowledgeStore,
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+)
+from cayu.tools.knowledge import ReadKnowledgeTool, SearchKnowledgeTool
 
 
 class _FixtureEmbeddings(TextEmbeddingProvider):

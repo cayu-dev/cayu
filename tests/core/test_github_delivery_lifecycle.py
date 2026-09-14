@@ -6,14 +6,16 @@ import threading
 import pytest
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr, _request
 
-from cayu import CayuApp, InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus, run_task_worker
+from cayu.applications import CayuApp
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementPhase,
     ArtifactWriteSettlementStatus,
     register_artifact_write_operation,
 )
-from cayu.github_delivery import GitHubDeliveryAdmissionError, approve_github_delivery
+from cayu.delivery.github import GitHubDeliveryAdmissionError, approve_github_delivery
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
 
 
 @pytest.mark.parametrize("timeout", [True, -1, float("inf"), float("nan"), "1", 10**400])

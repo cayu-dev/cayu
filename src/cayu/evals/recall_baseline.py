@@ -17,10 +17,9 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
-from cayu.core.messages import Message, MessageRole
 from cayu.evals.memory_baseline import MemoryRetrievalAccessSpec
-from cayu.memory import AutomaticRecallPolicy, admit_recall
-from cayu.recall import (
+from cayu.memory.base import AutomaticRecallPolicy, admit_recall
+from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     RECALL_ENGINE_VERSION,
@@ -35,12 +34,13 @@ from cayu.recall import (
     RecallSourceUnavailable,
     TranscriptRecallSource,
 )
-from cayu.retrieval import (
+from cayu.memory.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     RetrievalCandidateIdentity,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.runtime.sessions import (
+from cayu.messages import Message, MessageRole
+from cayu.sessions.base import (
     TRANSCRIPT_SEARCH_MAX_BYTES,
     TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
     TRANSCRIPT_SEARCH_MIN_MAX_BYTES,

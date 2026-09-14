@@ -16,9 +16,7 @@ from cayu._validation import (
     require_durable_text,
     safe_durable_value_error_details,
 )
-from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
-from cayu.core.tools import ToolEffect, ToolResult
-from cayu.runtime import _runtime_records as runtime_records
+from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._diagnostics import (
@@ -27,15 +25,17 @@ from cayu.runtime._diagnostics import (
     bound_diagnostic_text,
     exception_diagnostic,
 )
-from cayu.runtime.tool_result_projection import (
+from cayu.tools.base import ToolEffect, ToolResult
+from cayu.tools.result_projection import (
     _TOOL_RESULT_PROJECTION_AUTHORITY_FIELD,
     TOOL_RESULT_ARTIFACT_TYPE,
     redact_tool_result_projection_content,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
-    from cayu.runtime.tool_result_projection import ToolResultProjection
+    from cayu.runtime import _runtime_records as runtime_records
+    from cayu.tools.result_projection import ToolResultProjection
 
 _MAX_DIAGNOSTIC_UTF8_BYTES = MAX_DIAGNOSTIC_UTF8_BYTES
 _MAX_PORTABLE_EVIDENCE_UTF8_BYTES = 12 * 1024
@@ -590,7 +590,7 @@ def _runtime_tool_result_projection(
     if type(record_payload) is not dict or type(result_payload) is not dict:
         raise TypeError("Projected tool-result events require object result and record fields.")
 
-    from cayu.runtime.tool_result_projection import (
+    from cayu.tools.result_projection import (
         ToolResultProjection,
         ToolResultProjectionRecord,
         ToolResultProjectionStatus,
@@ -645,6 +645,10 @@ def redact_tool_call_outcomes(
     redactor: SecretRedactor,
 ) -> list[runtime_records.ToolCallOutcome]:
     """Redact tool outcomes while preserving their call identity and order."""
+    # Outcome records depend on hook/dispatch contracts, which also import the
+    # basic redaction helpers in this module. Load records only when needed.
+    from cayu.runtime import _runtime_records as runtime_records
+
     if not redactor.has_values:
         return outcomes
     return [
@@ -666,6 +670,7 @@ def redact_runtime_owned_tool_call_outcomes(
     a value merely shaped like a runtime control is not authority to bypass
     workload-secret redaction.
     """
+    from cayu.runtime import _runtime_records as runtime_records
 
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from tests.egress._browser_visual_container import run_visual_container
 
-from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 
 pytestmark = [
     pytest.mark.process,

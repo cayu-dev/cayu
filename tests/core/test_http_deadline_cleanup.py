@@ -8,21 +8,15 @@ import json
 import httpx
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionDeadline,
-    SQLiteSessionStore,
-    StepError,
-    WorkflowBase,
-    WorkflowSpec,
-    execution_deadline_scope,
-    parallel,
-    step,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
 from cayu.providers import deadlines as deadline_state
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
-from cayu.workflows import StepRunOptions
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.models import StepError
+from cayu.workflows.workflow import StepRunOptions, WorkflowBase, parallel, step
 
 
 class ProbeWorkflow(WorkflowBase):
@@ -234,11 +228,12 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
 
 @pytest.mark.parametrize("close_kind", ["delayed", "failure", "timeout", "cancelled"])
 def test_http_close_failure_or_retention_is_not_clean(close_kind):
-    from cayu import Message, ModelRequest
+    from cayu.messages import Message
     from cayu.providers._credential_boundary import (
         aclosing_provider_stream,
         provider_cancellation_failures,
     )
+    from cayu.providers.base import ModelRequest
 
     async def scenario():
         owners_before = set(deadline_state._PROVIDER_DEADLINE_AWAIT_OWNERS)
@@ -334,11 +329,12 @@ def test_http_close_failure_or_retention_is_not_clean(close_kind):
 
 
 def test_loopback_repeated_cancellation_during_owned_close():
-    from cayu import Message, ModelRequest
+    from cayu.messages import Message
     from cayu.providers._credential_boundary import (
         aclosing_provider_stream,
         provider_cancellation_failures,
     )
+    from cayu.providers.base import ModelRequest
 
     async def scenario():
         owners_before = set(deadline_state._PROVIDER_DEADLINE_AWAIT_OWNERS)

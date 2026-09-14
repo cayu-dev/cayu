@@ -274,20 +274,20 @@ async def _signal_root_process_group(root: Path) -> None:
 
 
 async def _run_process_isolated_tool(root: Path) -> None:
-    from cayu.core import ExecutionProfileBehaviorIdentity
-    from cayu.core.isolated_tools import (
-        ProcessIsolatedTool,
-        ProcessIsolatedToolContextProjection,
-        ProcessIsolatedToolFactoryRef,
-        ProcessIsolatedToolLimits,
-    )
-    from cayu.core.tools import (
+    from cayu.runtime._isolated_tool_process import execute_process_isolated_tool
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+    from cayu.tools.base import (
         ToolContext,
         ToolEffect,
         ToolSpec,
         _bind_runtime_tool_invocation_authority,
     )
-    from cayu.runtime._isolated_tool_process import execute_process_isolated_tool
+    from cayu.tools.isolated import (
+        ProcessIsolatedTool,
+        ProcessIsolatedToolContextProjection,
+        ProcessIsolatedToolFactoryRef,
+        ProcessIsolatedToolLimits,
+    )
     from cayu.vaults import SecretRedactor
 
     schema = {
@@ -309,7 +309,7 @@ async def _run_process_isolated_tool(root: Path) -> None:
             execution_profile_identity=identity,
         ),
         factory=ProcessIsolatedToolFactoryRef(
-            module="cayu.testing_isolated_tools",
+            module="cayu.testing.isolated_tools",
             qualname="build_deterministic_isolated_tool",
             identity=identity,
         ),

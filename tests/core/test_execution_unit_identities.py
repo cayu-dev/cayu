@@ -5,8 +5,8 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import ToolCallPart, ToolResultPart
-from cayu.runtime import (
+from cayu.messages import ToolCallPart, ToolResultPart
+from cayu.runtime.execution_units import (
     BudgetLimitIdentity,
     ModelAttemptIdentity,
     ModelStepIdentity,

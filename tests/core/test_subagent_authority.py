@@ -6,11 +6,14 @@ import re
 import pytest
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
-from cayu.core import AgentSpec, EventType, Message
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import CayuApp, RunRequest, SessionQuery
-from cayu.tools import SubagentSpec, SubagentTool
-from cayu.vaults import SecretRedactor
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import RunRequest, SessionQuery
+from cayu.tools.subagents import SubagentSpec, SubagentTool
+from cayu.vaults.redaction import SecretRedactor
 
 
 def test_foreground_subagent_generated_lineage_survives_short_secret_collision() -> None:
@@ -71,7 +74,7 @@ def test_foreground_subagent_generated_lineage_survives_short_secret_collision()
 def test_subagent_lineage_redaction_requires_exact_private_provenance(provenance):
     from cayu.runtime._child_session_identity import run_request_with_subagent_lineage
     from cayu.runtime._session_request_boundary import prepare_run_request
-    from cayu.runtime.sessions import run_request_with_runtime_generated_authority
+    from cayu.sessions.base import run_request_with_runtime_generated_authority
 
     request = RunRequest(
         session_id="child",

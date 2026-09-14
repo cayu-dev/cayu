@@ -5,27 +5,24 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityEvidence,
     ExecutionExecutableEvidence,
     ExecutionToolRequirementEvidence,
-    GitChangesTool,
-    Message,
-    ModelStreamEvent,
-    Runner,
-    RunRequest,
-    ScriptedModelProvider,
-    SearchTextTool,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolSpec,
 )
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import Runner
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
+from cayu.tools.git import GitChangesTool
+from cayu.tools.search import SearchTextTool
 
 
 def custom_spec(tool_type, requirements=()):

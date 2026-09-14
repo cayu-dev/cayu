@@ -10,7 +10,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from cayu._validation import canonical_durable_json_bytes, compact_json_utf8_size
-from cayu.memory_attribution import (
+from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
     MemoryAttributionStatus,
@@ -22,7 +22,7 @@ from cayu.memory_attribution import (
     MemoryRecallAttribution,
     MemoryRecallItemAttribution,
 )
-from cayu.memory_evidence import (
+from cayu.memory.evidence import (
     MAX_MEMORY_EVIDENCE_PAGE_BYTES,
     MAX_MEMORY_EVIDENCE_PAGE_LIMIT,
     MAX_RECALL_ITEM_EXPOSURE_BYTES,
@@ -41,7 +41,7 @@ from cayu.memory_evidence import (
     validate_new_context_exposure,
 )
 from cayu.runtime._memory_evidence import MemoryEvidenceKey
-from cayu.runtime.sessions import SessionStore
+from cayu.sessions.base import SessionStore
 
 _ALIAS_CONTEXT = b"cayu.memory-attribution.alias.v1"
 _AliasKind = Literal["receipt", "exposure", "item", "interaction"]

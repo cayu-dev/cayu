@@ -8,10 +8,12 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import CayuApp, ModelTarget, ResumeRequest, RunRequest
-from cayu.runtime.sessions import copy_run_request
+from cayu.sessions.base import ModelTarget, ResumeRequest, RunRequest, copy_run_request
 
 
 class NamedFakeProvider(ModelProvider):

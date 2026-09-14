@@ -14,8 +14,122 @@ from typing import Literal
 
 import pytest
 
-import cayu.memory_intervention_execution as memory_intervention_execution_module
-from cayu.agent_snapshots import (
+import cayu.memory.execution as memory_intervention_execution_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLedger, InMemoryBudgetLedger
+from cayu.budgets.usage import SessionUsageSummary
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.memory_attribution import (
+    EvalMemoryEvidenceCompleteness,
+    EvalMemoryEvidenceLimitation,
+    standard_eval_memory_attribution_bounds,
+)
+from cayu.evals.models import (
+    EvalAssertionResult,
+    EvalCaseContractV1,
+    EvalOutcome,
+    EvalStatus,
+    EvalTrialResult,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.memory.attribution import (
+    MemoryAttribution,
+    MemoryAttributionBounds,
+    MemoryAttributionStatus,
+    MemoryContextExposureAttribution,
+    MemoryEvidenceAlias,
+    MemoryExposureTransitionAttribution,
+    MemoryRecallAttribution,
+    MemoryRecallItemAttribution,
+)
+from cayu.memory.base import AutomaticRecallMode, AutomaticRecallPolicy
+from cayu.memory.context import (
+    AutomaticRecallContextPolicy,
+    AutomaticRecallSourceConfig,
+)
+from cayu.memory.evidence import (
+    ContextExposureEvidenceKind,
+    ContextExposureState,
+    RecallEvidenceQuery,
+    RecallItemAdmission,
+    RecallItemSelectionReason,
+)
+from cayu.memory.execution import (
+    MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS,
+    MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
+    MEMORY_INTERVENTION_RUNTIME_OWNERSHIP_WAIT_SECONDS,
+    CayuMemoryInterventionRuntimeRunner,
+    InMemoryMemoryInterventionExecutionStore,
+    MemoryInterventionEvaluator,
+    MemoryInterventionExecutionConflict,
+    MemoryInterventionExecutionPhase,
+    MemoryInterventionExecutionRecord,
+    MemoryInterventionExecutionStatus,
+    MemoryInterventionExecutionStore,
+    MemoryInterventionExecutor,
+    MemoryInterventionIsolationAuthority,
+    MemoryInterventionOverlayProvider,
+    MemoryInterventionProviderExecutionMode,
+    MemoryInterventionRequestFingerprintKey,
+    MemoryInterventionRuntimeApplicationFactory,
+    MemoryInterventionRuntimeOwnershipResult,
+    MemoryInterventionRuntimeResult,
+    MemoryInterventionRuntimeRunner,
+    MemoryInterventionRuntimeView,
+    MemoryInterventionTrialRequest,
+    SQLiteMemoryInterventionExecutionStore,
+)
+from cayu.memory.interventions import (
+    MemoryInterventionBounds,
+    MemoryInterventionChangeKind,
+    MemoryInterventionEffectReceiptRef,
+    MemoryInterventionEffectStatus,
+    MemoryInterventionFixtureRef,
+    MemoryInterventionItemChange,
+    MemoryInterventionItemIdentity,
+    MemoryInterventionItemIdentityKind,
+    MemoryInterventionKind,
+    MemoryInterventionOperation,
+    MemoryInterventionReceipt,
+    MemoryInterventionSpec,
+    MemoryNegativeControlKind,
+)
+from cayu.memory.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL
+from cayu.memory.retrieval import (
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    WeightedReciprocalRankFusionConfig,
+)
+from cayu.messages import Message
+from cayu.providers.base import ModelRequest, ModelStreamEvent
+from cayu.runtime._durable_operation_ownership import (
+    DurableOperationOwnershipAction,
+    DurableOperationOwnershipDisposition,
+    DurableOperationOwnershipResult,
+    DurableOperationOwnershipState,
+    DurableOperationOwnershipTransition,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+from cayu.sessions.base import (
+    InterruptSessionRequest,
+    RunRequest,
+    RuntimeSessionCreateClaimReference,
+    SessionIdentity,
+    SessionStatus,
+    SessionStore,
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+    run_request_with_runtime_invocation,
+)
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+)
+from cayu.snapshots.base import (
     AgentSnapshot,
     AgentSnapshotAuthorityRef,
     AgentSnapshotCaptureRequest,
@@ -47,120 +161,6 @@ from cayu.agent_snapshots import (
     SQLiteAgentSnapshotStore,
     execution_profile_snapshot_ref,
 )
-from cayu.core.agents import AgentSpec
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.evals.memory_attribution import (
-    EvalMemoryEvidenceCompleteness,
-    EvalMemoryEvidenceLimitation,
-    standard_eval_memory_attribution_bounds,
-)
-from cayu.evals.models import (
-    EvalAssertionResult,
-    EvalCaseContractV1,
-    EvalOutcome,
-    EvalStatus,
-    EvalTrialResult,
-)
-from cayu.evals.testing import ScriptedModelProvider
-from cayu.memory import AutomaticRecallMode, AutomaticRecallPolicy
-from cayu.memory_attribution import (
-    MemoryAttribution,
-    MemoryAttributionBounds,
-    MemoryAttributionStatus,
-    MemoryContextExposureAttribution,
-    MemoryEvidenceAlias,
-    MemoryExposureTransitionAttribution,
-    MemoryRecallAttribution,
-    MemoryRecallItemAttribution,
-)
-from cayu.memory_evidence import (
-    ContextExposureEvidenceKind,
-    ContextExposureState,
-    RecallEvidenceQuery,
-    RecallItemAdmission,
-    RecallItemSelectionReason,
-)
-from cayu.memory_intervention_execution import (
-    MEMORY_INTERVENTION_RUNTIME_HEARTBEAT_SECONDS,
-    MEMORY_INTERVENTION_RUNTIME_LEASE_SECONDS,
-    MEMORY_INTERVENTION_RUNTIME_OWNERSHIP_WAIT_SECONDS,
-    CayuMemoryInterventionRuntimeRunner,
-    InMemoryMemoryInterventionExecutionStore,
-    MemoryInterventionEvaluator,
-    MemoryInterventionExecutionConflict,
-    MemoryInterventionExecutionPhase,
-    MemoryInterventionExecutionRecord,
-    MemoryInterventionExecutionStatus,
-    MemoryInterventionExecutionStore,
-    MemoryInterventionExecutor,
-    MemoryInterventionIsolationAuthority,
-    MemoryInterventionOverlayProvider,
-    MemoryInterventionProviderExecutionMode,
-    MemoryInterventionRequestFingerprintKey,
-    MemoryInterventionRuntimeApplicationFactory,
-    MemoryInterventionRuntimeOwnershipResult,
-    MemoryInterventionRuntimeResult,
-    MemoryInterventionRuntimeRunner,
-    MemoryInterventionRuntimeView,
-    MemoryInterventionTrialRequest,
-    SQLiteMemoryInterventionExecutionStore,
-)
-from cayu.memory_interventions import (
-    MemoryInterventionBounds,
-    MemoryInterventionChangeKind,
-    MemoryInterventionEffectReceiptRef,
-    MemoryInterventionEffectStatus,
-    MemoryInterventionFixtureRef,
-    MemoryInterventionItemChange,
-    MemoryInterventionItemIdentity,
-    MemoryInterventionItemIdentityKind,
-    MemoryInterventionKind,
-    MemoryInterventionOperation,
-    MemoryInterventionReceipt,
-    MemoryInterventionSpec,
-    MemoryNegativeControlKind,
-)
-from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL
-from cayu.retrieval import (
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
-    WeightedReciprocalRankFusionConfig,
-)
-from cayu.runtime._durable_operation_ownership import (
-    DurableOperationOwnershipAction,
-    DurableOperationOwnershipDisposition,
-    DurableOperationOwnershipResult,
-    DurableOperationOwnershipState,
-    DurableOperationOwnershipTransition,
-)
-from cayu.runtime.app import CayuApp
-from cayu.runtime.budgets import BudgetLedger, InMemoryBudgetLedger
-from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.runtime.invocation import (
-    InvocationOrigin,
-    InvocationOriginTrust,
-    SessionExecutionSource,
-)
-from cayu.runtime.memory_context import (
-    AutomaticRecallContextPolicy,
-    AutomaticRecallSourceConfig,
-)
-from cayu.runtime.request_footprints import RequestFootprintConfig
-from cayu.runtime.sessions import (
-    InterruptSessionRequest,
-    RunRequest,
-    RuntimeSessionCreateClaimReference,
-    SessionIdentity,
-    SessionStatus,
-    SessionStore,
-    TerminalSessionEvidence,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
-    run_request_with_runtime_invocation,
-)
-from cayu.runtime.usage import SessionUsageSummary
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,

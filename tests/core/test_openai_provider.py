@@ -13,53 +13,20 @@ from pydantic import ValidationError
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 import cayu.providers.openai as openai_module
-from cayu import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.attachments import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
-    AgentSpec,
-    BudgetLimit,
-    CayuApp,
-    CayuConfig,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
     FileAttachmentKind,
-    InMemorySessionStore,
-    Message,
-    ModelPrice,
-    PriceBook,
-    RecentTurnsContextPolicy,
-    ResumeRequest,
-    RetryPolicy,
-    RunDefaults,
-    RunRequest,
-    SQLiteSessionStore,
     file_attachment,
 )
-from cayu.core.messages import FilePart, MessageRole, ProviderStatePart, TextPart, ToolCallPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.budgets.base import BudgetLimit
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import RecentTurnsContextPolicy
 from cayu.embeddings import TextEmbeddingRequest
-from cayu.providers import (
-    HttpxOpenAITransport,
-    InputTokenCountConfidence,
-    InputTokenCountMethod,
-    ModelContextOverflowError,
-    ModelFinishReason,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    ModelStreamEventType,
-    NativeStructuredOutputSchemaInvalid,
-    OpenAIAPIError,
-    OpenAIContextOverflowError,
-    OpenAIProtocolError,
-    OpenAIProvider,
-    UsageDialect,
-    build_openai_embedding_payload,
-    build_openai_payload,
-    openai_embedding_result,
-    openai_response_events,
-    preflight_openai_native_structured_output_schema,
-)
+from cayu.events import Event, EventType
+from cayu.messages import FilePart, Message, MessageRole, ProviderStatePart, TextPart, ToolCallPart
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.base import (
@@ -69,9 +36,19 @@ from cayu.providers.base import (
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    ModelContextOverflowError,
+    ModelFinishReason,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    ModelStreamEventType,
+    NativeStructuredOutputSchemaInvalid,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
     ToolDiscoveryProjectionResult,
+    UsageDialect,
 )
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
@@ -79,12 +56,29 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlineExceeded,
     ProviderStreamDeadlines,
 )
-from cayu.providers.openai import openai_stream_events
+from cayu.providers.openai import (
+    HttpxOpenAITransport,
+    OpenAIAPIError,
+    OpenAIContextOverflowError,
+    OpenAIProtocolError,
+    OpenAIProvider,
+    build_openai_embedding_payload,
+    build_openai_payload,
+    openai_embedding_result,
+    openai_response_events,
+    openai_stream_events,
+    preflight_openai_native_structured_output_schema,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_discovery import search_tools_spec
-from cayu.runtime.tool_gateway import call_tool_spec
-from cayu.runtime.tool_grants import TARGETED_TOOL_TRANSCRIPT_REFERENCE
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.catalogue import CALL_TOOL_NAME
+from cayu.tools.discovery import search_tools_spec
+from cayu.tools.gateway import call_tool_spec
+from cayu.tools.grants import TARGETED_TOOL_TRANSCRIPT_REFERENCE
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -209,7 +203,7 @@ class EchoTool(Tool):
 
 @pytest.mark.anyio
 async def test_agent_hosted_web_search_projects_native_openai_tool() -> None:
-    from cayu.providers import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     transport = RecordingTransport(
         stream_events=[
@@ -286,7 +280,7 @@ async def test_agent_hosted_web_search_projects_native_openai_tool() -> None:
 
 @pytest.mark.anyio
 async def test_agent_hosted_web_search_rejects_unsupported_provider_before_dispatch() -> None:
-    from cayu.providers import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     class UnsupportedProvider(ModelProvider):
         name = "unsupported"
@@ -326,7 +320,7 @@ async def test_agent_hosted_web_search_rejects_unsupported_provider_before_dispa
 
 
 def test_openai_hosted_web_search_custom_endpoint_requires_explicit_capability() -> None:
-    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+    from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
     provider = OpenAIProvider(
         api_key="test-key",
@@ -355,7 +349,7 @@ def test_openai_hosted_web_search_custom_endpoint_requires_explicit_capability()
 
 
 def test_openai_hosted_web_search_unlimited_budget_requires_gpt5_reasoning() -> None:
-    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+    from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
     provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
 
@@ -369,7 +363,7 @@ def test_openai_hosted_web_search_unlimited_budget_requires_gpt5_reasoning() -> 
 
 @pytest.mark.parametrize("model", ["gpt-4.1", "gpt-5.6-unverified", "gpt-5.7"])
 def test_openai_hosted_web_search_rejects_model_without_verified_support(model: str) -> None:
-    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+    from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
     provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
 
@@ -383,7 +377,7 @@ def test_openai_hosted_web_search_rejects_model_without_verified_support(model: 
 
 @pytest.mark.anyio
 async def test_agent_hosted_web_search_rejects_strict_budget_without_call_ceiling() -> None:
-    from cayu.providers import HostedToolCapabilityError, OpenAIWebSearch
+    from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
     transport = RecordingTransport()
     app = CayuApp()
@@ -424,7 +418,7 @@ async def test_agent_hosted_web_search_rejects_strict_budget_without_call_ceilin
 
 @pytest.mark.anyio
 async def test_hosted_web_search_configuration_changes_execution_profile_identity() -> None:
-    from cayu.providers import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     async def run_with(search_context_size: str) -> str:
         transport = RecordingTransport(
@@ -482,7 +476,8 @@ async def test_hosted_web_search_configuration_changes_execution_profile_identit
 async def test_runtime_accepts_empty_terminal_output_and_replays_hosted_search_evidence(
     tmp_path,
 ) -> None:
-    from cayu import CitationPart, HostedToolCallPart, OpenAIWebSearch
+    from cayu.messages import CitationPart, HostedToolCallPart
+    from cayu.providers.hosted import OpenAIWebSearch
 
     transport = RecordingTransport(
         stream_events=[
@@ -757,7 +752,7 @@ async def test_runtime_accepts_empty_terminal_output_and_replays_hosted_search_e
 
 @pytest.mark.anyio
 async def test_runtime_accounts_terminal_only_web_search_evidence_once() -> None:
-    from cayu import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     transport = RecordingTransport(
         stream_events=[
@@ -826,7 +821,7 @@ async def test_runtime_accounts_terminal_only_web_search_evidence_once() -> None
 
 @pytest.mark.anyio
 async def test_runtime_accounts_for_ambiguous_search_before_provider_retry() -> None:
-    from cayu import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     transport = RecordingTransport(
         stream_events=[
@@ -929,7 +924,7 @@ async def test_runtime_accounts_for_ambiguous_search_before_provider_retry() -> 
 
 @pytest.mark.anyio
 async def test_runtime_accounts_started_search_before_later_parser_failure() -> None:
-    from cayu import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     transport = RecordingTransport(
         stream_events=[
@@ -6939,7 +6934,7 @@ def test_openai_native_cache_anchor_is_inert_without_a_grant() -> None:
 
 
 def test_openai_native_callability_excludes_only_the_cache_anchor() -> None:
-    from cayu.providers import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     marker, projection = _targeted_projection_fixture()
     inspect = {
@@ -7760,7 +7755,7 @@ async def test_server_mode_stale_chain_replays_targeted_item_at_its_exact_positi
 
 @pytest.mark.anyio
 async def test_server_mode_stale_chain_rebuilds_completed_hosted_search_in_order() -> None:
-    from cayu import (
+    from cayu.messages import (
         CitationPart,
         CitationProvenance,
         HostedToolCallPart,
@@ -8348,7 +8343,7 @@ async def test_openai_protocol_diagnostics_survive_sqlite_and_unknown_retries(
     stage,
     field,
 ) -> None:
-    from cayu import OpenAIWebSearch
+    from cayu.providers.hosted import OpenAIWebSearch
 
     raw = [
         {"type": "response.created", "response": {"id": "resp_safe"}},

@@ -22,6 +22,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.configuration import MAX_STEPS
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
@@ -36,10 +37,9 @@ from cayu.evals.execution import (
     CorpusTarget,
     WorkflowEvalTarget,
 )
-from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
-from cayu.runtime.sessions import copy_run_request
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions.base import copy_run_request
 
 EVAL_EXECUTION_PROFILE_MAX_TEXT_CHARS = 256
 _EVAL_EXECUTION_PROFILE_REVISION_DOMAIN = "eval_execution_profile_v1"

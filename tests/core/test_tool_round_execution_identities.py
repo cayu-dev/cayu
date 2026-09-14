@@ -7,9 +7,19 @@ from typing import Any, cast
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 
-from cayu import ApplyPatchTool
-from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart, ToolResultPart
-from cayu.core.tools import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart, ToolResultPart
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
+from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStore
+from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
     Tool,
@@ -18,20 +28,7 @@ from cayu.core.tools import (
     ToolResult,
     ToolSpec,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    SessionStore,
-)
-from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
-from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.tools.patches import ApplyPatchTool
 
 
 class _SequencedProvider(ModelProvider):

@@ -5,8 +5,9 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.runtime._event_projection import prepare_new_runtime_event, project_runtime_event
 from cayu.runtime._foreground_child_wait import (
     ForegroundChildResumeRequest,
@@ -15,8 +16,7 @@ from cayu.runtime._foreground_child_wait import (
     event_with_foreground_child_wait_authority,
     foreground_child_state_from_checkpoint,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import ResumeRequest
+from cayu.sessions.base import ResumeRequest
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -54,10 +54,12 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.knowledge_maintenance_persistence import (
+from cayu.knowledge.maintenance_persistence import (
     KnowledgeMaintenanceProposalPublicationConflict,
 )
-from cayu.storage import (
+from cayu.storage import migrations as schema_migrations
+from cayu.storage.knowledge_transition import KnowledgeRevisionResetRequired
+from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,
     MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
@@ -78,18 +80,14 @@ from cayu.storage import (
     KnowledgeRelationKind,
     KnowledgeRelationQuery,
     KnowledgeRevisionRef,
-    KnowledgeRevisionResetRequired,
     KnowledgeSearchMode,
     KnowledgeStatus,
     KnowledgeVisibility,
-    knowledge_chunk_embedding_identity,
-)
-from cayu.storage import migrations as schema_migrations
-from cayu.storage.memory import (
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
     _knowledge_chunk_content_hash,
     _knowledge_publication_v1_request_sha256,
+    knowledge_chunk_embedding_identity,
     knowledge_entry_payload_bytes,
 )
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
@@ -104,7 +102,7 @@ def test_postgres_maintenance_governance_route_apply_and_replay_are_atomic(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -134,7 +132,7 @@ def test_postgres_revision_77_does_not_infer_governance_for_reviewed_history(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -210,7 +208,7 @@ def test_postgres_revision_77_rejects_malformed_governance_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -257,15 +255,15 @@ def test_postgres_governed_publication_and_review_approval_are_atomic(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import (
+        from cayu.knowledge.governance import decide_knowledge_activation
+        from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+        from cayu.storage.memory import (
             KnowledgeActivationSource,
             KnowledgeGovernanceConfig,
             KnowledgeGovernanceMode,
-            KnowledgeReviewWorkflow,
-            PostgresKnowledgeStore,
-            decide_knowledge_activation,
             prepare_knowledge_activation_request,
         )
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         class SnapshotCheckingActivationStore(PostgresKnowledgeStore):
             verify_next_activation_read_snapshot = False
@@ -390,14 +388,14 @@ def test_postgres_activation_receipt_failure_rolls_back_the_whole_publication(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import (
+        from cayu.knowledge.governance import decide_knowledge_activation
+        from cayu.storage.memory import (
             KnowledgeActivationSource,
             KnowledgeGovernanceConfig,
             KnowledgeGovernanceMode,
-            PostgresKnowledgeStore,
-            decide_knowledge_activation,
             prepare_knowledge_activation_request,
         )
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         class FailingActivationReceiptStore(PostgresKnowledgeStore):
             async def _insert_activation_receipt(self, cur, receipt, *, access_entry):
@@ -468,7 +466,8 @@ def test_postgres_review_activation_receipt_failure_rolls_back_the_successor(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import KnowledgeReviewWorkflow, PostgresKnowledgeStore
+        from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         class FailingActivationReceiptStore(PostgresKnowledgeStore):
             async def _insert_activation_receipt(self, cur, receipt, *, access_entry):
@@ -522,11 +521,9 @@ def test_postgres_review_approval_cannot_reuse_a_publication_operation(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import (
-            KnowledgeActivationConflict,
-            KnowledgeReviewWorkflow,
-            PostgresKnowledgeStore,
-        )
+        from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+        from cayu.storage.memory import KnowledgeActivationConflict
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -587,15 +584,15 @@ def test_postgres_activation_receipt_rejects_inconsistent_indexed_columns(
     async def run() -> None:
         import psycopg
 
-        from cayu import (
+        from cayu.knowledge.governance import decide_knowledge_activation
+        from cayu.storage.memory import (
             KnowledgeActivationConflict,
             KnowledgeActivationSource,
             KnowledgeGovernanceConfig,
             KnowledgeGovernanceMode,
-            PostgresKnowledgeStore,
-            decide_knowledge_activation,
             prepare_knowledge_activation_request,
         )
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -663,7 +660,7 @@ def test_postgres_inaccessible_malformed_activation_receipt_is_hidden(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -703,15 +700,15 @@ def test_postgres_governed_replay_rejects_receipt_commit_boundary_mismatch(
     async def run() -> None:
         import psycopg
 
-        from cayu import (
+        from cayu.knowledge.governance import decide_knowledge_activation
+        from cayu.storage.memory import (
             KnowledgeActivationSource,
             KnowledgeGovernanceConfig,
             KnowledgeGovernanceMode,
             KnowledgePublicationConflict,
-            PostgresKnowledgeStore,
-            decide_knowledge_activation,
             prepare_knowledge_activation_request,
         )
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -791,7 +788,7 @@ def test_postgres_accepted_plan_publication_and_review_handoff(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -815,7 +812,7 @@ def test_postgres_publication_load_validates_the_decision_record(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -862,7 +859,7 @@ def test_postgres_bounded_entry_read_refuses_before_loading_content(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -896,7 +893,7 @@ def test_postgres_bounded_entry_read_reuses_one_authorization_time(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -1042,7 +1039,7 @@ async def _initialize_historical_schema(
     through_revision: int,
 ) -> None:
     """Create an intentionally old schema without relaxing current store startup."""
-    from cayu import PostgresSessionStore
+    from cayu.storage.postgres import PostgresSessionStore
 
     revisions = schema_migrations.REVISIONS
     schema_migrations.REVISIONS = tuple(
@@ -1272,7 +1269,7 @@ def test_postgres_cancelled_relation_publication_rolls_back_atomically(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -1348,14 +1345,14 @@ def test_postgres_maintenance_candidate_routing_matches_exact_relation_state(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import (
+        from cayu.knowledge.maintenance import (
             KnowledgeMaintenanceCandidateSignal,
             KnowledgeMaintenanceRouter,
             KnowledgeMaintenanceRoutingOmissionReason,
             KnowledgeMaintenanceRoutingRequest,
             KnowledgeMaintenanceSignalKind,
-            PostgresKnowledgeStore,
         )
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -1425,7 +1422,7 @@ def test_postgres_cancelled_maintenance_rolls_back_atomically(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -1491,7 +1488,7 @@ def test_postgres_relation_change_access_fails_closed_for_malformed_audiences(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         store = PostgresKnowledgeStore(
@@ -1610,7 +1607,7 @@ async def _legacy_knowledge_snapshot(cursor) -> tuple[object, ...]:
 
 
 def _new_store(dsn: str):
-    from cayu import PostgresKnowledgeStore
+    from cayu.storage.postgres import PostgresKnowledgeStore
 
     return PostgresKnowledgeStore(
         dsn,
@@ -1628,7 +1625,7 @@ def _new_embedding_store(
     max_size: int = 4,
     access_scope: KnowledgeAccessScope | None = _ACCESS_SCOPE,
 ):
-    from cayu import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     return PostgresEmbeddingKnowledgeStore(
         dsn,
@@ -2068,7 +2065,7 @@ def test_postgres_index_readiness_conformance(postgres_dsn: str) -> None:
 def test_postgres_owned_publication_does_not_hold_sequence_lock_while_writing_payload(
     postgres_dsn: str,
 ) -> None:
-    from cayu import PostgresKnowledgeStore
+    from cayu.storage.postgres import PostgresKnowledgeStore
 
     class BlockingEvidenceStore(PostgresKnowledgeStore):
         def __init__(self, *args, **kwargs) -> None:
@@ -2138,7 +2135,7 @@ def test_postgres_owned_publication_does_not_hold_sequence_lock_while_writing_pa
 
 
 def test_postgres_knowledge_access_scope_conformance(postgres_dsn: str) -> None:
-    from cayu import PostgresKnowledgeStore
+    from cayu.storage.postgres import PostgresKnowledgeStore
 
     async def run() -> None:
         await _drop_all(postgres_dsn)
@@ -2159,7 +2156,7 @@ def test_postgres_knowledge_access_scope_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_exact_revision_search_filters_before_ranking(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         scope = KnowledgeAccessScope.for_namespace("project:exact-recall")
@@ -2238,18 +2235,19 @@ def test_postgres_exact_revision_search_filters_before_ranking(postgres_dsn: str
 
 def test_postgres_checkpoint_recall_full_delta_and_no_work_parity(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import (
-            DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
-            KNOWLEDGE_LEXICAL_CHANNEL,
-            KNOWLEDGE_SEMANTIC_CHANNEL,
+        from cayu.memory.processing import (
             AgentRecallProcessingMode,
             AgentRecallProcessingRequest,
             AgentRecallProcessor,
-            AgentWorkContext,
-            PostgresKnowledgeStore,
-            RecallSituation,
-            WeightedReciprocalRankFusionConfig,
         )
+        from cayu.memory.recall import (
+            KNOWLEDGE_LEXICAL_CHANNEL,
+            KNOWLEDGE_SEMANTIC_CHANNEL,
+            RecallSituation,
+        )
+        from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
+        from cayu.storage.postgres import PostgresKnowledgeStore
+        from cayu.work_context import DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID, AgentWorkContext
 
         await _drop_all(postgres_dsn)
         now = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
@@ -2344,7 +2342,7 @@ def test_postgres_scoped_entry_hydration_uses_one_read_snapshot(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         privileged = _new_store(postgres_dsn)
@@ -2418,7 +2416,7 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -2528,7 +2526,7 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
 
 def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -2804,7 +2802,7 @@ def test_postgres_embedding_worker_fences_superseded_attempt_vector_write(
 def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
     postgres_dsn: str,
 ) -> None:
-    from cayu import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     class DelayedDeleteCleanupStore(PostgresEmbeddingKnowledgeStore):
         def __init__(self, *args, **kwargs) -> None:
@@ -2912,7 +2910,9 @@ def test_postgres_remember_knowledge_reconciles_ack_loss_and_restart(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore, RememberKnowledgeTool, ToolContext
+        from cayu.storage.postgres import PostgresKnowledgeStore
+        from cayu.tools.base import ToolContext
+        from cayu.tools.knowledge import RememberKnowledgeTool
 
         class AcknowledgementLossPostgresStore(PostgresKnowledgeStore):
             async def publish_entry_revision(
@@ -2987,7 +2987,8 @@ def test_postgres_remember_knowledge_reports_failed_embedding_without_repeating_
             raise RuntimeError("secret canary embedding failure")
 
     async def run() -> tuple[object, object, object, int]:
-        from cayu import RememberKnowledgeTool, ToolContext
+        from cayu.tools.base import ToolContext
+        from cayu.tools.knowledge import RememberKnowledgeTool
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3034,7 +3035,7 @@ def test_postgres_knowledge_publication_rolls_back_each_material_write(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         class FailingPublicationStore(PostgresKnowledgeStore):
             failure_phase: str | None = None
@@ -3097,7 +3098,7 @@ def test_postgres_maintenance_rolls_back_every_material_boundary(
     failure_phase: str,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         class FailingMaintenanceStore(PostgresKnowledgeStore):
             lifecycle_writes = 0
@@ -3490,7 +3491,7 @@ def test_postgres_embedding_worker_pages_stale_cleanup_within_record_budget(
 def test_postgres_embedding_worker_repairs_committed_vector_after_restart(
     postgres_dsn: str,
 ) -> None:
-    from cayu import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     class CrashAfterVectorStore(PostgresEmbeddingKnowledgeStore):
         fail_ready_once = True
@@ -3634,7 +3635,7 @@ def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3686,7 +3687,7 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3753,7 +3754,7 @@ def test_postgres_embedding_schema_rejects_missing_declared_constraints(
         import psycopg
         from psycopg import sql
 
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3892,7 +3893,7 @@ def test_postgres_embedding_schema_rejects_cross_space_hnsw_index(
     async def ops() -> None:
         import psycopg
 
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3947,7 +3948,6 @@ def test_postgres_embedding_schema_rejects_restricted_current_hnsw_index(
         import psycopg
         from psycopg import sql
 
-        from cayu import PostgresEmbeddingKnowledgeStore
         from cayu.storage.memory import (
             KNOWLEDGE_CHUNK_TEXT_GENERATOR,
             KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
@@ -3955,6 +3955,7 @@ def test_postgres_embedding_schema_rejects_restricted_current_hnsw_index(
             KNOWLEDGE_CHUNK_TEXT_PROJECTION,
             KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
         )
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -4173,7 +4174,7 @@ def test_postgres_embedding_failure_is_visible_until_explicit_backfill_recovers(
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
         provider = FlakyEmbeddingProvider()
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         store = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
@@ -4288,7 +4289,7 @@ def test_postgres_accepts_precomputed_projection_only_for_current_pending_attemp
                 KnowledgeEntry(id="external-postgres-projection", text="GitHub proxy.")
             )
             chunk = (await store.read_chunks("external-postgres-projection"))[0]
-            from cayu import knowledge_chunk_embedding_identity
+            from cayu.storage.memory import knowledge_chunk_embedding_identity
 
             identity = knowledge_chunk_embedding_identity(
                 chunk,
@@ -4380,7 +4381,7 @@ def test_postgres_projection_write_result_reapplies_per_call_access_scope(
                     access_scope=privileged,
                 )
             )[0]
-            from cayu import knowledge_chunk_embedding_identity
+            from cayu.storage.memory import knowledge_chunk_embedding_identity
 
             identity = knowledge_chunk_embedding_identity(
                 chunk,
@@ -4440,7 +4441,7 @@ def test_postgres_concurrent_projection_writers_cannot_replace_one_attempt_vecto
                 KnowledgeEntry(id="concurrent-projection", text="GitHub proxy.")
             )
             chunk = (await store.read_chunks("concurrent-projection"))[0]
-            from cayu import knowledge_chunk_embedding_identity
+            from cayu.storage.memory import knowledge_chunk_embedding_identity
 
             identity = knowledge_chunk_embedding_identity(
                 chunk,
@@ -4489,7 +4490,7 @@ def test_postgres_concurrent_projection_writers_cannot_replace_one_attempt_vecto
 def test_postgres_projection_store_serializes_readiness_and_keeps_one_current_attempt(
     postgres_dsn: str,
 ) -> None:
-    from cayu import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     class BlockingProjectionStore(PostgresEmbeddingKnowledgeStore):
         def __init__(self, *args, **kwargs) -> None:
@@ -5096,7 +5097,7 @@ def test_postgres_embedding_access_filters_cannot_hide_ready_hnsw_candidates(
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -5704,7 +5705,7 @@ def test_postgres_revision_schema_validation_rejects_missing_structural_objects(
     async def ops() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         create_store = _new_store(postgres_dsn)
@@ -5754,9 +5755,9 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
     async def ops():
         import psycopg
 
-        from cayu import PostgresKnowledgeStore, PostgresSessionStore
-        from cayu.core import Message
-        from cayu.runtime import RunRequest, SessionIdentity
+        from cayu.messages import Message
+        from cayu.sessions.base import RunRequest, SessionIdentity
+        from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
 
         await _drop_all(postgres_dsn)
         session_store = PostgresSessionStore(
@@ -6028,7 +6029,7 @@ def test_postgres_embedding_store_segregates_models_until_explicit_reindex(
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -6100,7 +6101,7 @@ def test_postgres_revision_60_refuses_populated_knowledge_without_backfill(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=59)
@@ -6152,7 +6153,7 @@ def test_postgres_revision_60_initializes_empty_pre_relation_schema_directly(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=59)
@@ -6199,7 +6200,7 @@ def test_postgres_revision_63_refuses_populated_knowledge_without_interpretation
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=62)
@@ -6251,7 +6252,7 @@ def test_postgres_revision_63_initializes_empty_knowledge_schema_directly(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=62)
@@ -6294,7 +6295,7 @@ def test_postgres_revision_65_refuses_populated_knowledge_without_backfill(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=64)
@@ -6351,7 +6352,7 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -6421,7 +6422,7 @@ def test_postgres_revision_75_refuses_populated_knowledge_without_backfill(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=74)
@@ -6475,7 +6476,7 @@ def test_postgres_revision_75_initializes_empty_knowledge_schema_directly(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=74)
@@ -6514,7 +6515,7 @@ def test_postgres_revision_75_rejects_malformed_activation_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -6566,7 +6567,7 @@ def test_postgres_revision_75_rejects_malformed_activation_retirement_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -6617,7 +6618,7 @@ def test_postgres_revision_67_rejects_malformed_proposal_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -6665,7 +6666,7 @@ def test_postgres_revision_63_rejects_a_malformed_maintenance_table(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -6859,8 +6860,8 @@ def test_postgres_revision_43_preserves_migrated_expiration_cleanup_audiences(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
         from cayu.storage import postgres as postgres_storage
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=42)
@@ -7070,7 +7071,7 @@ def test_postgres_revision_migration_refuses_populated_legacy_knowledge_unchange
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=41)
@@ -7155,7 +7156,7 @@ def test_postgres_revision_migration_refuses_unversioned_knowledge_before_ddl(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
+        from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
         async with (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import stat
 import sys
@@ -24,6 +25,25 @@ from cayu.cli.dashboard import (
 from cayu.cli.guide import _GUIDES
 from cayu.cli.lambda_microvm import _SidecarArtifactError, _validate_artifact_contents
 
+_ROOT = Path(__file__).resolve().parents[1]
+_PUBLIC_MOVES = json.loads((_ROOT / "docs/public-api-migration.json").read_text())
+_PUBLIC_PACKAGES = json.loads((_ROOT / "docs/public-api-packages.json").read_text())
+_PUBLIC_LAYOUT_REQUIRED = {
+    "cayu/py.typed",
+    *(module.replace(".", "/") + ".py" for module in _PUBLIC_MOVES.values()),
+    *(
+        package.replace(".", "/") + "/" + name
+        for package in _PUBLIC_PACKAGES
+        for name in ("__init__.py", "__init__.pyi", "_exports.py")
+    ),
+}
+_REMOVED_LAYOUT_PATHS = {
+    *(module.replace(".", "/") + suffix for module in _PUBLIC_MOVES for suffix in (".py", ".pyi")),
+    "cayu/core/__init__.py",
+    "cayu/core/__init__.pyi",
+    "cayu/core/_exports.py",
+}
+
 _SIDECAR_MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
 _SDIST_SIDECAR_PREFIX = "examples/aws/lambda_microvm_sidecar"
 _WHEEL_SIDECAR_PREFIX = "cayu/data/lambda_microvm_sidecar"
@@ -32,6 +52,7 @@ _WHEEL_DASHBOARD_SOURCE_PREFIX = "cayu/data/dashboard_source"
 _DASHBOARD_SOURCE_REQUIRED = _REQUIRED_SOURCE_FILES
 _GUIDE_FILES = {filename for filename, _description in _GUIDES.values()}
 _SDIST_REQUIRED = {
+    *{"src/" + name for name in _PUBLIC_LAYOUT_REQUIRED},
     "LICENSE",
     "NOTICE",
     "PKG-INFO",
@@ -58,6 +79,7 @@ _SDIST_ALLOWED_ROOTS = {
 }
 _SDIST_ALLOWED_TREES = {"src"}
 _WHEEL_REQUIRED = {
+    *_PUBLIC_LAYOUT_REQUIRED,
     "cayu/__init__.py",
     "cayu/cli/_targets.py",
     "cayu/cli/__init__.py",
@@ -106,6 +128,12 @@ class ValidatedReleaseContents:
 
 def _fail(message: str) -> Never:
     raise ValueError(message)
+
+
+def _validate_public_layout(names: set[str], *, archive: Path, prefix: str) -> None:
+    removed = sorted(names & {prefix + name for name in _REMOVED_LAYOUT_PATHS})
+    if removed:
+        _fail(f"{archive}: removed public module paths included: {', '.join(removed)}")
 
 
 def _validate_safe_path(name: str, *, archive: Path) -> PurePosixPath:
@@ -251,6 +279,7 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
             contents_by_relative_name[relative_name] = content
             _validate_publication_contents(content, archive=archive, member_name=member.name)
 
+    _validate_public_layout(relative_names, archive=archive, prefix="src/")
     missing = sorted(_SDIST_REQUIRED - relative_names)
     if missing:
         _fail(f"{archive}: missing required source files: {', '.join(missing)}")
@@ -315,6 +344,7 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
                 member_name=member.filename,
             )
 
+    _validate_public_layout(name_set, archive=archive, prefix="")
     missing = sorted(_WHEEL_REQUIRED - name_set)
     if missing:
         _fail(f"{archive}: missing required wheel files: {', '.join(missing)}")

@@ -6,9 +6,9 @@ import asyncio
 
 import pytest
 
-from cayu.core.events import Event, EventType
-from cayu.core.tools import ToolContext
+from cayu.events import Event, EventType
 from cayu.tools import subagents
+from cayu.tools.base import ToolContext
 from cayu.tools.subagents import (
     SubagentSpec,
     SubagentTool,

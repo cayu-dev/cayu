@@ -18,22 +18,22 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
     runtime_owned_exception_renderings_are_credential_safe,
 )
-from cayu.runtime.tasks import TaskClaimLost, TaskStore
-from cayu.runtime.work_attempt_admission import (
+from cayu.tasks.admission import (
     WorkAttemptAdmissionConflict,
     WorkAttemptExecutionClaimLost,
     WorkAttemptRecoveryRequired,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.base import TaskClaimLost, TaskStore
+from cayu.tasks.contracts import (
     CompletionVerificationClaimLost,
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
     WorkContractConflict,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
 )
-from cayu.vaults import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]

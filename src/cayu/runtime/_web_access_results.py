@@ -6,12 +6,12 @@ from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_value
-from cayu.core.events import (
+from cayu.events import (
     Event,
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import ToolResult
+from cayu.tools.base import ToolResult
 
 WEB_ACCESS_RESULT_AUTHORITY_FIELD = "web_access_result_authority"
 _AUTHORITY_PREFIX = "cayu.web-access-result.v1"

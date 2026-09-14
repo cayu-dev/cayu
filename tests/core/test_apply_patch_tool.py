@@ -9,37 +9,31 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    ApplyPatchTool,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    InMemorySessionStore,
-    LocalArtifactStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    ToolContext,
-    ToolEffect,
-    WorkspaceMoveAmbiguousError,
-    WorkspaceMutationResult,
-)
-from cayu.core.tools import (
-    DurableToolRecoveryAuthority,
-    _bind_runtime_tool_invocation_authority,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
     InvocationWorkspaceMutationOwner,
     invocation_workspace_handle,
 )
-from cayu.tools.patches import _patch_journal_key
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tools.base import (
+    DurableToolRecoveryAuthority,
+    ToolContext,
+    ToolEffect,
+    _bind_runtime_tool_invocation_authority,
+)
+from cayu.tools.patches import ApplyPatchTool, _patch_journal_key
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.workspaces.base import WorkspaceMoveAmbiguousError, WorkspaceMutationResult
+from cayu.workspaces.local import LocalWorkspace
 
 
 def _revision(content: bytes) -> str:
@@ -1129,7 +1123,7 @@ def test_patch_shape_diagnostics_bound_untrusted_keys(tmp_path):
 
 
 def test_patch_missing_revision_can_be_repaired_from_read(tmp_path):
-    from cayu.tools import ReadFileTool
+    from cayu.tools.files import ReadFileTool
 
     root = tmp_path / "workspace"
     root.mkdir()

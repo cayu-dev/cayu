@@ -16,18 +16,21 @@ from tests.core.test_workspace_mutation_receipts import (
     collect_events,
 )
 
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.artifacts import LocalArtifactStore
-from cayu.core import AgentSpec, EventType, Message
 from cayu.environments import Environment
+from cayu.events import EventType
+from cayu.messages import Message
 from cayu.runners import DockerRunner
-from cayu.runtime import CayuApp, EventQuery, RunRequest
 from cayu.runtime._runtime_records import RegisteredEnvironment
-from cayu.runtime.workspace_checkpoints import (
+from cayu.sessions.base import EventQuery, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workspaces import RunnerWorkspace
+from cayu.workspaces.checkpoint_lifecycle import (
     WORKSPACE_CHECKPOINTS_KEY,
     ensure_workspace_checkpoint,
 )
-from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.workspaces import RunnerWorkspace
 from cayu.workspaces.checkpoints import WorkspaceCheckpointError, WorkspaceCheckpointPolicy
 
 

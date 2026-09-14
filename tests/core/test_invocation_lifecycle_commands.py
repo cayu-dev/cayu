@@ -12,43 +12,21 @@ from uuid import uuid4
 
 import pytest
 
-from cayu import AgentSpec, CayuApp, SQLiteSessionStore
+import cayu.sessions.base as sessions_module
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core import Event, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.core.events import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetPolicy
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import (
+    Event,
+    EventType,
     event_envelope_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
 )
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    AdmitInvocationCommand,
-    CreateInvocationCommand,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    InteractionTransitionSpec,
-    InvocationCheckpointPatch,
-    InvocationContext,
-    InvocationLifecycleCommandConflict,
-    InvocationMutationResult,
-    InvocationReleaseResult,
-    LoopPolicy,
-    PreparedInvocationBinding,
-    RejectInvocationCommand,
-    ReleaseInvocationCommand,
-    ResumeRequest,
-    RunRequest,
-    RuntimePublicationCheckpointOperation,
-    RuntimePublicationMutation,
-    SessionIdentity,
-    SessionRunFenced,
-    SessionStatus,
-    SessionStore,
-    SettleInvocationCommand,
-    ToolCapabilityCeiling,
-)
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _invocation_lifecycle as invocation_lifecycle_module
-from cayu.runtime import sessions as sessions_module
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
@@ -56,6 +34,17 @@ from cayu.runtime._checkpoint_store import (
 )
 from cayu.runtime._invocation_lifecycle import (
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS,
+    AdmitInvocationCommand,
+    CreateInvocationCommand,
+    InvocationCheckpointPatch,
+    InvocationContext,
+    InvocationLifecycleCommandConflict,
+    InvocationMutationResult,
+    InvocationReleaseResult,
+    PreparedInvocationBinding,
+    RejectInvocationCommand,
+    ReleaseInvocationCommand,
+    SettleInvocationCommand,
     _authenticated_invocation_context,
     _InvocationLifecycleCommandReceipt,
     _InvocationLifecycleReceiptLedger,
@@ -67,20 +56,12 @@ from cayu.runtime._invocation_lifecycle import (
     require_invocation_rebind_lineage,
     retire_released_invocation_context,
 )
-from cayu.runtime.budgets import BudgetPolicy
 from cayu.runtime.build_provenance import (
     RuntimeBuildArtifactKind,
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    CheckpointCompatibilityError,
-)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     EXECUTION_PROFILE_METADATA_KEY,
@@ -91,15 +72,36 @@ from cayu.runtime.execution_profiles import (
     changed_execution_profile_components,
     checkpoint_with_active_invocation_execution_profile,
 )
-from cayu.runtime.sessions import (
+from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    InteractionTransitionSpec,
     ModelTarget,
+    ResumeRequest,
+    RunRequest,
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+    SessionIdentity,
     SessionInvocationAdmission,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStore,
     _current_session_run_epoch,
     run_request_with_runtime_session_instance_authority,
 )
-from cayu.runtime.tool_exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY
-from cayu.vaults import SecretRedactor
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    CheckpointCompatibilityError,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY, ToolCapabilityCeiling
+from cayu.vaults.redaction import SecretRedactor
 
 
 def test_session_store_lifecycle_command_runtime_annotations_are_resolvable() -> None:
@@ -2423,7 +2425,7 @@ def test_invocation_lifecycle_commands_are_atomic_in_local_stores(
         try:
             await _assert_create_result_preparation_failure_is_atomic(store, store_kind)
             if store_kind == "memory":
-                from cayu.runtime import sessions as receipt_module
+                import cayu.sessions.base as receipt_module
             else:
                 from cayu.storage import sqlite as receipt_module
 
@@ -2547,8 +2549,8 @@ def test_invocation_lifecycle_commands_are_atomic_in_postgres(
     monkeypatch,
 ) -> None:
     async def run() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         class FailCreateResultPreparationPostgresStore(
             _FailCreateResultPreparationMixin,

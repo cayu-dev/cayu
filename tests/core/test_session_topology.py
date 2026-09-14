@@ -11,15 +11,19 @@ from tests.core.session_topology_conformance import (
 )
 
 from cayu import SQLiteSessionStore
-from cayu.core import Event, EventType, Message
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity, SessionStore
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
     SESSION_TOPOLOGY_MAX_NODES,
     EventQuery,
     EventQueryResultTooLarge,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
     SessionLineageNode,
     SessionLineageResult,
     SessionStatus,
+    SessionStore,
     SessionTopologyBranch,
     SessionTopologyCycle,
     SessionTopologyNode,

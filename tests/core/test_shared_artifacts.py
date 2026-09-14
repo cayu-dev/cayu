@@ -20,56 +20,52 @@ from tests.core._session_operation_fault_harness import (
     SessionOperationSelector,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventType,
-    ExecCommandTool,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.local import LocalRunner
+from cayu.runtime import _shared_artifact_results as shared_artifact_results
+from cayu.runtime._tool_round_executor import _project_staged_terminal_event
+from cayu.sessions.base import (
     InMemorySessionStore,
-    ListArtifactsTool,
-    LocalArtifactStore,
-    LocalRunner,
-    LocalWorkspace,
-    MaterializeSharedArtifactTool,
-    Message,
-    PublishWorkspaceArtifactTool,
-    ReadFileTool,
     RunRequest,
-    SessionExecutionSource,
     SessionIdentity,
+    SessionOperationPublication,
     SessionStatus,
+    SessionStore,
+    run_request_with_runtime_invocation,
+)
+from cayu.sessions.invocation import SessionExecutionSource
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import shared_artifacts as shared_artifact_tools
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools.base import (
+    DurableToolOperationConflict,
+    DurableToolRecoveryAuthority,
+    ToolContext,
+    ToolResult,
+    _bind_runtime_tool_invocation_authority,
+)
+from cayu.tools.commands import ExecCommandTool
+from cayu.tools.files import ListArtifactsTool, ReadFileTool
+from cayu.tools.shared_artifacts import (
+    MaterializeSharedArtifactTool,
+    PublishWorkspaceArtifactTool,
     SharedArtifactAuthorizationError,
     SharedArtifactMaterializationReceipt,
     SharedArtifactPolicy,
     SharedArtifactPublicationReceipt,
     SharedArtifactRef,
-    SQLiteSessionStore,
-    ToolContext,
-    ToolResult,
     authorize_shared_artifact_materialization,
     revoke_shared_artifact_grant,
 )
-from cayu.core.events import event_payload_authority_is_runtime_generated
-from cayu.core.tools import (
-    DurableToolOperationConflict,
-    DurableToolRecoveryAuthority,
-    _bind_runtime_tool_invocation_authority,
-)
-from cayu.evals.testing import ScriptedModelProvider
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
-from cayu.runtime._tool_round_executor import _project_staged_terminal_event
-from cayu.runtime.sessions import (
-    SessionOperationPublication,
-    SessionStore,
-    run_request_with_runtime_invocation,
-)
-from cayu.tools import shared_artifacts as shared_artifact_tools
-from cayu.tools._redaction import InvocationRedactorSnapshot
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.local import LocalWorkspace
 
 _NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
 _PROFILE_FINGERPRINT = "e" * 64

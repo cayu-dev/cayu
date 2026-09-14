@@ -7,8 +7,8 @@ import warnings
 
 import pytest
 
-from cayu import PostgresBudgetLedger
 from cayu.cli.project import build_project_app
+from cayu.storage.postgres import PostgresBudgetLedger
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.qualification.test_repository_maintenance_application import project as project
 from tests.qualification.test_repository_maintenance_deployment import deployment as deployment

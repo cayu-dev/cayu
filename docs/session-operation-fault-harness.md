@@ -8,7 +8,7 @@ The optional `PublicationBoundary.EVENT_APPEND` target wraps the same store's
 `append_events()` entry point for runtime event publications that do not carry a
 session-operation transform. The default remains `SESSION_OPERATION`.
 The helper is repository-private test infrastructure. It is not part of the
-installed `cayu.testing` API and must not be imported by production code.
+installed `cayu.testing.base` API and must not be imported by production code.
 
 ## Fault vocabulary
 

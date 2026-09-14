@@ -21,17 +21,18 @@ from tests.core.verified_worker_fixtures import (
     verified_work_postgres_dsn as verified_work_postgres_dsn,
 )
 
-from cayu.runtime.invocation import TaskExecutionSource
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
-from cayu.runtime.tasks import (
-    InMemoryTaskStore,
-    TaskAggregateFilter,
-    TaskClaimLost,
-    TaskCreate,
-    TaskStatus,
-    task_create_with_runtime_invocation,
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    work_attempt_admission_authority_sha256,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+from cayu.sessions.invocation import TaskExecutionSource
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresTaskStore
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.admission import (
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmissionActivate,
     WorkAttemptAdmissionConflict,
@@ -46,22 +47,21 @@ from cayu.runtime.work_attempt_admission import (
     require_work_attempt_execution_entry_result,
     require_work_attempt_execution_stop_result,
 )
-from cayu.runtime.work_attempt_lifecycle import (
-    WorkAttemptLifecycleSettlement,
-    WorkAttemptPreparationHold,
-    work_attempt_admission_authority_sha256,
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    TaskAggregateFilter,
+    TaskClaimLost,
+    TaskCreate,
+    TaskStatus,
+    task_create_with_runtime_invocation,
 )
-from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
     CompletionVerificationClaimRequest,
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
 )
-from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
-from cayu.storage.sqlite import SQLiteTaskStore
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])

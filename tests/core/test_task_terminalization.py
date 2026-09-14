@@ -24,7 +24,7 @@ from cayu import (
     TaskTerminalKind,
     terminalize_task_with_retry,
 )
-from cayu.runtime.tasks import _terminalize_claimed_task, prepare_task_terminalization
+from cayu.tasks.base import _terminalize_claimed_task, prepare_task_terminalization
 
 
 def _request(task_id: str = "task_retry_classification") -> TaskTerminalizationRequest:

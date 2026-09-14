@@ -6,12 +6,12 @@ from itertools import pairwise
 
 import pytest
 
-from cayu import EvalCase, EvalStatus, EvalSuite, RunRequest
 from cayu.evals import _admission
 from cayu.evals._admission import LaunchAdmission, admission_scope
-from cayu.evals.models import EvalTrialResult
-from cayu.evals.runner import _schedule_suite_trials
+from cayu.evals.models import EvalStatus, EvalTrialResult
+from cayu.evals.runner import EvalCase, EvalSuite, _schedule_suite_trials
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.sessions.base import RunRequest
 
 
 class Clock:

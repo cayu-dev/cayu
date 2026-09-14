@@ -26,15 +26,15 @@ from cayu.credentials import (
 from cayu.runners._diagnostics import tag_runner_failure_phase
 from cayu.runners._subprocess import runner_env_name_identity, validate_runner_env_name
 from cayu.runners.base import ExecResult
-from cayu.vaults import (
+from cayu.vaults.base import (
     ResolvedSecret,
     SecretEnv,
-    SecretRedactor,
     SecretRef,
     SecretResolver,
     secret_env_refs,
     validate_secret_resolver,
 )
+from cayu.vaults.redaction import SecretRedactor
 
 DOCKER_ENV_FILE_MAX_LINE_BYTES = 64 * 1024 - 1
 

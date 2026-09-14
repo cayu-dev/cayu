@@ -27,13 +27,13 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message, detach_message
-from cayu.core.workflows import WorkflowSpec, copy_workflow_spec
+from cayu.applications import CayuApp
 from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowAttemptAnchor
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import TerminalSessionEvidenceErrorCode
-from cayu.workflows import WorkflowBase
+from cayu.events import Event, EventType
+from cayu.messages import Message, detach_message
+from cayu.sessions.base import TerminalSessionEvidenceErrorCode
+from cayu.workflows.base import WorkflowSpec, copy_workflow_spec
+from cayu.workflows.workflow import WorkflowBase
 
 WORKFLOW_EVAL_MAX_FINAL_OUTPUT_CHARS = 65_536
 WORKFLOW_EVAL_MAX_STRUCTURED_OUTPUT_BYTES = 256 << 10

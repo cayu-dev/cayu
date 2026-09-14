@@ -24,23 +24,16 @@ from pydantic import (
 )
 
 from cayu._validation import require_durable_text
-from cayu.artifacts import (
+from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
+    FileAttachmentKind,
+    file_attachment,
+)
+from cayu.artifacts.base import (
     ArtifactMetadata,
     ArtifactScope,
     ArtifactStore,
-    FileAttachmentKind,
     copy_artifact_read_result,
-    file_attachment,
-)
-from cayu.core.tools import (
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolResult,
-    ToolSpec,
 )
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -49,13 +42,22 @@ from cayu.environments.admission import (
     ExecutionRequirements,
     evaluate_execution_admission,
 )
-from cayu.runners import (
-    PINNED_BROWSER_FETCH_WORKLOAD,
+from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     RunnerExecutionError,
     RunnerUnavailableError,
     RunnerWorkloadAuthority,
+)
+from cayu.runners.workloads import PINNED_BROWSER_FETCH_WORKLOAD
+from cayu.tools.base import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolSpec,
 )
 from cayu.tools.web import (
     MAX_WEB_FETCH_TITLE_BYTES,

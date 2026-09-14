@@ -12,7 +12,7 @@ from tests.runners import test_tool_admission_live as live_driver
 from tests.runners.test_tool_admission_live import _configured, _disable_docker_pulls, _qualify
 
 import cayu.runners.docker as docker_module
-from cayu import LocalRunner
+from cayu.runners.local import LocalRunner
 
 
 @pytest.mark.parametrize("proof", ["present", "missing"])

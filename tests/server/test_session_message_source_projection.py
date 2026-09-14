@@ -11,7 +11,7 @@ from tests.server.test_session_message_lifecycle_api import (
     sse_events,
 )
 
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.parametrize("collision", ["session_id", "transcript_sha256", "checkpoint_sha256"])

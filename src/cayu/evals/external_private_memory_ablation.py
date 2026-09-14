@@ -41,7 +41,12 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     revalidate_model_input,
 )
-from cayu.agent_snapshots import AgentSnapshot
+from cayu.budgets.quality import (
+    PairedCostQualityComparisonRequest,
+    PairedCostQualityPair,
+    PairedCostQualitySide,
+    compare_paired_cost_quality,
+)
 from cayu.cli._guarded_tree_publication import (
     DestinationPolicy,
     GuardedTreePublicationError,
@@ -115,7 +120,7 @@ from cayu.evals.result_contract import (
     EvalTrialOutputPreviewV1,
     _EvalTrialPublicData,
 )
-from cayu.memory_intervention_execution import (
+from cayu.memory.execution import (
     MEMORY_INTERVENTION_EXECUTION_MAX_RECORD_BYTES,
     MemoryInterventionExecutionStatus,
     MemoryInterventionExecutor,
@@ -125,14 +130,9 @@ from cayu.memory_intervention_execution import (
     MemoryInterventionTrialOutcome,
     MemoryInterventionTrialRequest,
 )
-from cayu.memory_interventions import MemoryInterventionKind
-from cayu.runtime.cost_quality import (
-    PairedCostQualityComparisonRequest,
-    PairedCostQualityPair,
-    PairedCostQualitySide,
-    compare_paired_cost_quality,
-)
-from cayu.runtime.sessions import RunRequest
+from cayu.memory.interventions import MemoryInterventionKind
+from cayu.sessions.base import RunRequest
+from cayu.snapshots.base import AgentSnapshot
 
 EXTERNAL_PRIVATE_MEMORY_ABLATION_SCHEMA_VERSION = 1
 # Used only in a trusted CorpusTarget's request budget template. Preflight

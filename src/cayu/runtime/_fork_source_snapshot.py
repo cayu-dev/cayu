@@ -9,7 +9,7 @@ from cayu._validation import canonical_durable_json_bytes, copy_durable_record
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
 )
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,

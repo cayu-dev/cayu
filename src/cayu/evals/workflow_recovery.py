@@ -15,7 +15,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.messages import Message
 from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowAttemptAnchor
 from cayu.evals.corpus import AssertionSpec, assertion_spec_revision, pricing_profile_identity
 from cayu.evals.execution import WorkflowEvalTarget, _copy_corpus_target
@@ -44,7 +43,8 @@ from cayu.evals.workflow_target import (
     workflow_eval_output_sha256,
     workflow_eval_trial_session_id,
 )
-from cayu.runtime.sessions import SessionStatus
+from cayu.messages import Message
+from cayu.sessions.base import SessionStatus
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 

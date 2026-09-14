@@ -24,7 +24,7 @@ from cayu import (
 from cayu.environments.docker_coding import _docker_coding_reconnect_metadata
 from cayu.runners import DockerRunner, ExecResult
 from cayu.runtime._environment_allocation import EnvironmentAllocationCoordinator
-from cayu.runtime.sessions import SessionIdentity
+from cayu.sessions.base import SessionIdentity
 from cayu.vaults import SecretRedactor
 
 _ID = "a" * 64

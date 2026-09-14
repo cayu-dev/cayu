@@ -22,7 +22,7 @@ from cayu.evals.browser_acceptance import (
 )
 from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
 from cayu.evals.runner import EvalPlan
-from cayu.runtime.browser_control import BrowserControlPageAudit
+from cayu.tools.browser_control import BrowserControlPageAudit
 
 
 def _settled_record():

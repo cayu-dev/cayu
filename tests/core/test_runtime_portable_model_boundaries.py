@@ -17,12 +17,19 @@ from tests.core.test_runtime import (
 
 from cayu import CayuConfig, RunDefaults
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
-from cayu.core import (
-    AgentSpec,
-    EventType,
-    Message,
-    ToolCallPart,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetWindow, InMemoryBudgetStore
+from cayu.budgets.billing import BillingIdentity
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    CompactionRequest,
+    CompactionResult,
+    ContextCompactor,
 )
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.events import EventType
+from cayu.messages import Message, ToolCallPart
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -34,23 +41,9 @@ from cayu.providers import (
     ModelStreamEventType,
     UsageDialect,
 )
-from cayu.runtime import (
-    BillingIdentity,
-    BudgetWindow,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactionRequest,
-    CompactionResult,
-    ContextCompactor,
-    ContextCountingConfig,
-    ContextCountingMode,
-    EventQuery,
-    InMemoryBudgetStore,
-    InMemorySessionStore,
-    RetryPolicy,
-    RunRequest,
-)
 from cayu.runtime._event_projection import public_event_sequence
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
 
 
 def test_context_counting_oversized_result_fails_at_boundary_without_blocking_model():

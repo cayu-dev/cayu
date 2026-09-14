@@ -48,9 +48,9 @@ from cayu import (
     trajectory_from_session,
 )
 from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
-from cayu.core.events import event_payload_authority_is_runtime_generated
 from cayu.evals.scenario_capture import _resolve_artifact_requirements
-from cayu.runtime.sessions import (
+from cayu.events import event_payload_authority_is_runtime_generated
+from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     parse_session_input_contract_evidence,
 )

@@ -8,34 +8,28 @@ from pydantic import SecretStr
 from tests.core.test_verified_work_contracts import _contract, _RecordingProvider
 from tests.core.test_work_attempt_admission import _assert_secret_absent_from_work_attempt_error
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SecretRedactor,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    TaskCreate,
-    WorkAttemptExecutionRequest,
-    WorkAttemptRecoveryRequest,
-    WorkCompletionConflict,
-)
 from cayu._validation import canonical_durable_json_bytes
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.messages import Message
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.work_attempt_admission import (
-    WorkAttemptAdmission,
-    WorkAttemptAdmissionState,
-)
 from cayu.runtime.work_attempt_source import (
     WORK_ATTEMPT_SOURCE_MAX_BYTES,
     WORK_ATTEMPT_SOURCE_MAX_FIELDS,
     WORK_ATTEMPT_SOURCE_MAX_ITEMS,
     WorkAttemptSourceRequest,
 )
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.admission import (
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionState,
+    WorkAttemptExecutionRequest,
+    WorkAttemptRecoveryRequest,
+)
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.contracts import WorkCompletionConflict
+from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.parametrize("boundary", ["bytes", "items", "fields"])

@@ -8,40 +8,15 @@ import pytest
 from pydantic import ValidationError
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.agent_snapshots import (
-    AgentSnapshot,
-    AgentSnapshotAccess,
-    AgentSnapshotCompleteness,
-    AgentSnapshotComponentKind,
-    AgentSnapshotComponentRef,
-    AgentSnapshotConsistency,
-    AgentSnapshotExecutionProfileComponent,
-    AgentSnapshotExecutionProfileRef,
-    AgentSnapshotLearningDisposition,
-    AgentSnapshotLogicalRef,
-    AgentSnapshotMaterialization,
-    AgentSnapshotMaterializationCapability,
-    AgentSnapshotMaterializationRequest,
-    AgentSnapshotMaterializedComponent,
-    AgentSnapshotOverlayKind,
-    AgentSnapshotOverlayRef,
-    AgentSnapshotRedaction,
-    AgentSnapshotResultBinding,
-    AgentSnapshotSubject,
-    AgentSnapshotTerminalDisposition,
-    AgentSnapshotTrialBinding,
-    AgentSnapshotTrialStateMode,
-    MemoryStateRef,
-)
-from cayu.memory import AutomaticRecallMode, AutomaticRecallPolicy
-from cayu.memory_attribution import (
+from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
     MemoryEvidenceAlias,
     MemoryRecallAttribution,
 )
-from cayu.memory_interventions import (
+from cayu.memory.base import AutomaticRecallMode, AutomaticRecallPolicy
+from cayu.memory.interventions import (
     MEMORY_INTERVENTION_MAX_BYTES,
     MEMORY_INTERVENTION_MAX_CHANGED_ITEMS,
     MEMORY_INTERVENTION_MAX_EFFECT_RECEIPTS,
@@ -65,6 +40,31 @@ from cayu.memory_interventions import (
     memory_attribution_fingerprint,
     memory_intervention_from_json,
     memory_intervention_to_json,
+)
+from cayu.snapshots.base import (
+    AgentSnapshot,
+    AgentSnapshotAccess,
+    AgentSnapshotCompleteness,
+    AgentSnapshotComponentKind,
+    AgentSnapshotComponentRef,
+    AgentSnapshotConsistency,
+    AgentSnapshotExecutionProfileComponent,
+    AgentSnapshotExecutionProfileRef,
+    AgentSnapshotLearningDisposition,
+    AgentSnapshotLogicalRef,
+    AgentSnapshotMaterialization,
+    AgentSnapshotMaterializationCapability,
+    AgentSnapshotMaterializationRequest,
+    AgentSnapshotMaterializedComponent,
+    AgentSnapshotOverlayKind,
+    AgentSnapshotOverlayRef,
+    AgentSnapshotRedaction,
+    AgentSnapshotResultBinding,
+    AgentSnapshotSubject,
+    AgentSnapshotTerminalDisposition,
+    AgentSnapshotTrialBinding,
+    AgentSnapshotTrialStateMode,
+    MemoryStateRef,
 )
 
 

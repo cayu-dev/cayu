@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 from cayu._validation import require_durable_clean_nonblank
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlAction,
     BrowserControlConflict,
     BrowserControlPolicy,

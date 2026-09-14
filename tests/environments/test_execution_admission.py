@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import (
+from cayu.environments.admission import (
     EXECUTION_CAPABILITY_EVIDENCE_SCHEMA,
     ExecutionAdmissionDecision,
     ExecutionAdmissionRefusal,
@@ -14,9 +14,9 @@ from cayu import (
     ExecutionExecutableEvidence,
     ExecutionRequirements,
     ExecutionToolRequirementEvidence,
-    LocalRunner,
     evaluate_execution_admission,
 )
+from cayu.runners.local import LocalRunner
 
 
 def test_untrusted_requirements_cover_every_execution_security_dimension() -> None:

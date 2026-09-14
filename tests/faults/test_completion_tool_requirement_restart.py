@@ -11,30 +11,28 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import SyncBinding
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
-    EventType,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._environment_exposure import require_environment_exposed
+from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
     RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    SyncBinding,
-    Tool,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolSpec,
 )
-from cayu.runtime._environment_exposure import require_environment_exposed
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
+from cayu.workspaces.local import LocalWorkspace
 
 
 async def _child(root: Path, mode: str, kind: str, changed: bool) -> None:

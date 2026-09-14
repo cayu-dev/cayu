@@ -23,9 +23,9 @@ from cayu import (
     TranscriptRecallSource,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.core.messages import Message, MessageRole
-from cayu.memory import AutomaticRecallContributor, AutomaticRecallPolicy
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.memory.base import AutomaticRecallContributor, AutomaticRecallPolicy
+from cayu.messages import Message, MessageRole
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 
 
 async def main() -> None:

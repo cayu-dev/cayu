@@ -4,21 +4,24 @@ import asyncio
 
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-from cayu.core import EventType, Message
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionStatus
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-)
+from cayu.events import EventType
+from cayu.messages import Message
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     SESSION_CREATE_CLAIM_METADATA_KEY,
+    InMemorySessionStore,
+    RunRequest,
+    SessionStatus,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_session_create_claim,
+)
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 
 

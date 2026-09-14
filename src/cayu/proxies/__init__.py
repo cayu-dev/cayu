@@ -1,16 +1,17 @@
 """Credential proxy contracts."""
 
-from cayu.proxies.base import (
-    CredentialProxy,
-    ProxyAuthorizationResult,
-    copy_proxy_authorization_result,
-)
-from cayu.proxies.passthrough import AllowlistProxy, PassthroughProxy
+from typing import Any as _Any
 
-__all__ = [
-    "AllowlistProxy",
-    "CredentialProxy",
-    "PassthroughProxy",
-    "ProxyAuthorizationResult",
-    "copy_proxy_authorization_result",
-]
+from cayu._api import resolve_export as _resolve_export
+from cayu.proxies._exports import EXPORTS as _EXPORTS
+from cayu.proxies._exports import PUBLIC_NAMES as _PUBLIC_NAMES
+
+__all__ = _PUBLIC_NAMES
+
+
+def __getattr__(name: str) -> _Any:
+    return _resolve_export(name, globals(), _EXPORTS)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))

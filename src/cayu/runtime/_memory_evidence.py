@@ -12,9 +12,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
-from cayu.core.messages import MessageRole
-from cayu.memory import AutomaticRecallContribution, AutomaticRecallPolicy
-from cayu.memory_evidence import (
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.memory.base import AutomaticRecallContribution, AutomaticRecallPolicy
+from cayu.memory.evidence import (
     ContextExposure,
     ContextExposureEvidenceKind,
     ContextExposureState,
@@ -40,17 +40,17 @@ from cayu.memory_evidence import (
     new_provider_attempt_id,
     new_recall_receipt_id,
 )
+from cayu.memory.recall import RecallResult, RecallSituation, RecallSourceStatus
+from cayu.messages import MessageRole
 from cayu.providers.base import ModelRequest
-from cayu.recall import RecallResult, RecallSituation, RecallSourceStatus
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileIdentity,
 )
 from cayu.runtime.execution_units import ModelAttemptIdentity
-from cayu.runtime.request_footprints import RequestFootprintConfig
-from cayu.runtime.sessions import SessionStore
-from cayu.runtime.tool_exposure import ResolvedToolExposure
+from cayu.sessions.base import SessionStore
+from cayu.tools.exposure import ResolvedToolExposure
 
 _MEMORY_EVIDENCE_KEY_DERIVATION_CONTEXT = b"cayu.memory-evidence.request-footprint-key.v1"
 _AUTOMATIC_RECALL_CHECKPOINT_BINDING_CONTEXT = b"cayu.automatic-recall-checkpoint-binding.v1"
@@ -1045,8 +1045,8 @@ def _evidence_locator(
 def _provider_representation_hashes(
     request: ModelRequest, manifest_sha256: str | None
 ) -> dict[int, str]:
-    from cayu.core.messages import TextPart
-    from cayu.runtime.memory_context import _serialize_provider_value
+    from cayu.memory.context import _serialize_provider_value
+    from cayu.messages import TextPart
 
     for message in request.messages:
         for part in message.content:
@@ -1078,7 +1078,7 @@ def _provider_representation_hashes(
 def _request_memory_manifest_locations(
     request: ModelRequest,
 ) -> tuple[tuple[int, int, str], ...]:
-    from cayu.core.messages import TextPart
+    from cayu.messages import TextPart
 
     return tuple(
         (message_index, part_index, hashlib.sha256(part.text.encode("utf-8")).hexdigest())

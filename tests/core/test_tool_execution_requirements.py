@@ -5,20 +5,19 @@ import warnings
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentFactoryRequest,
-    ExecutionRequirements,
-    ExecutionToolRequirement,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.admission import ExecutionRequirements, ExecutionToolRequirement
+from cayu.environments.factory import EnvironmentFactoryRequest
+from cayu.tools.base import (
     Tool,
-    ToolDescriptor,
     ToolEffect,
     ToolExecutableRequirement,
     ToolExecutionRequirement,
     ToolRunnerCapabilityRequirement,
     ToolSpec,
 )
+from cayu.tools.catalogue import ToolDescriptor
 
 
 def _search_requirement() -> ToolExecutionRequirement:

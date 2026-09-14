@@ -9,14 +9,19 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Literal, NoReturn
 
-from cayu.artifacts import (
+from cayu.approvals.tools import (
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import UserInputResponse
+from cayu.artifacts.attachments import (
     FILE_ATTACHMENT_DOCUMENT_CONTENT_TYPES,
     FILE_ATTACHMENT_IMAGE_CONTENT_TYPES,
     FileAttachment,
     FileAttachmentKind,
 )
-from cayu.core.events import Event, EventType
-from cayu.core.messages import FilePart, Message, MessageRole, TextPart
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals._trial_publication import save_trial_checkpoint_with_retry
 from cayu.evals.capacity import EvalExecutionCapacity
@@ -87,17 +92,14 @@ from cayu.evals.store import (
     EvalStore,
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
-from cayu.runtime.approvals import (
-    ResolutionActor,
-    ResolutionActorSource,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-)
+from cayu.events import Event, EventType
+from cayu.messages import FilePart, Message, MessageRole, TextPart
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     PendingActionKind,
     PendingActionQuery,
@@ -108,8 +110,6 @@ from cayu.runtime.sessions import (
     SessionStatus,
     copy_run_request,
 )
-from cayu.runtime.stop_policy import RunLimits
-from cayu.runtime.user_input import UserInputResponse
 
 
 class ScenarioExecutionError(RuntimeError):

@@ -12,33 +12,29 @@ import pytest
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.billing import BillingIdentity, PricingContext
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import (
     BudgetLedger,
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
-    BudgetSettlementCursor,
-    BudgetSettlementFallback,
-    CayuApp,
-    InMemorySessionStore,
-    ModelPrice,
-    PriceBook,
-    RunRequest,
-)
-from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._run_limits import RunLimitController
-from cayu.runtime.budgets import (
     BudgetReservationIdentityConflict,
     BudgetReservationRecoveryContext,
+    BudgetSettlementCursor,
+    BudgetSettlementFallback,
     SessionBudgetStore,
     budget_reservation_authority_sha256,
     budget_settlement_id,
 )
-from cayu.runtime.costs import ContextualPricingRequirement
-from cayu.runtime.sessions import SessionIdentity, SessionStatus
+from cayu.budgets.billing import BillingIdentity, PricingContext
+from cayu.budgets.pricing import ContextualPricingRequirement, ModelPrice, PriceBook
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._run_limits import RunLimitController
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
 from cayu.vaults import REDACTED_SECRET
 
 
@@ -430,7 +426,7 @@ async def assert_reservation_identity_collision_is_rejected(
         "model": "fake-model",
     }
 
-    with patch("cayu.runtime.budgets.uuid4", return_value=fixed_uuid):
+    with patch("cayu.budgets.base.uuid4", return_value=fixed_uuid):
         first = await ledger.reserve(
             session_id="sess_reservation_identity_winner",
             model_attempt_identity=first_identity,

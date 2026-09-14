@@ -17,7 +17,8 @@ from tests.core.test_remote_git_delivery import (
     _request,
 )
 
-from cayu.remote_git_delivery import (
+from cayu.delivery import _git_cleanup
+from cayu.delivery.git import (
     RemoteGitDeliveryAdmissionError,
     RemoteGitDeliveryError,
     RemoteGitDeliveryReconstructionRequiredError,
@@ -129,7 +130,7 @@ def test_cleanup_deadline_keeps_partial_receipt_and_allows_owned_retry(
 
     async def stall_cleanup(command, **kwargs):
         nonlocal cleanup_pid
-        if any("_remote_git_cleanup.py" in part for part in command.argv):
+        if _git_cleanup.__file__ in command.argv:
             command = ExecCommand.process(
                 sys.executable,
                 "-I",
@@ -414,8 +415,8 @@ def test_repository_config_cannot_redirect_the_push(tmp_path: Path) -> None:
 def test_cancelled_artifact_writer_fences_peer_until_real_settlement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker_failure: bool
 ) -> None:
-    import cayu._remote_git_ownership as ownership
     import cayu.artifacts.local as local
+    import cayu.delivery._git_ownership as ownership
 
     remote, workspace, product, broker, request = _case(tmp_path)
     peer = _broker(tmp_path, remote, broker.coding_repository, broker.repository.store)

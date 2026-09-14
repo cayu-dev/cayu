@@ -18,9 +18,9 @@ from cayu import (
     SecretRedactor,
     TaskCreate,
 )
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
-from cayu.runtime.tasks import TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH
 from cayu.server import ServerConfig, create_server
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.tasks.base import TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH
 
 
 def _client(

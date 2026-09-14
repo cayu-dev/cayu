@@ -1,6 +1,7 @@
 """Coding-stage workflow; delivery and human approval remain separate phases."""
 
-from cayu import WorkflowBase, WorkflowSpec
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.workflow import WorkflowBase
 from tests.qualification.repository_maintenance_acceptance import MaintenanceAcceptanceRejected
 from tests.qualification.repository_maintenance_request import copy_request, invalid_request
 

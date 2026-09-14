@@ -16,14 +16,14 @@ from tests.core.test_remote_git_delivery import (
 )
 from tests.core.test_remote_git_delivery_recovery import _case
 
-from cayu.core.tools import ToolContext
-from cayu.remote_git_delivery import (
+from cayu.delivery.git import (
     RemoteGitDeliveryAdmissionError,
     RemoteGitDeliveryState,
     approve_remote_git_delivery,
 )
 from cayu.runners import LocalRunner
 from cayu.tools import GitChangesTool
+from cayu.tools.base import ToolContext
 
 
 @pytest.mark.parametrize("changed_source", [False, True])

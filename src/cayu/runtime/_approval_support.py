@@ -13,20 +13,7 @@ from cayu._validation import (
     copy_durable_metadata,
     require_durable_clean_nonblank,
 )
-from cayu.core.events import (
-    Event,
-    EventType,
-    event_with_runtime_nested_payload_authority,
-    event_with_runtime_payload_authority,
-)
-from cayu.core.tools import ToolResult
-from cayu.runtime import _resume_ledger as resume_ledger
-from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
-from cayu.runtime import _tool_results as tool_results
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
-from cayu.runtime.approvals import (
+from cayu.approvals.tools import (
     PendingToolApproval,
     PendingToolCallApproval,
     ResolutionActor,
@@ -38,14 +25,27 @@ from cayu.runtime.approvals import (
     pending_tool_call_for_approval_event,
     resolution_actor_payload,
 )
+from cayu.events import (
+    Event,
+    EventType,
+    event_with_runtime_nested_payload_authority,
+    event_with_runtime_payload_authority,
+)
+from cayu.runtime import _resume_ledger as resume_ledger
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
+from cayu.runtime import _tool_results as tool_results
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     Session,
     SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
-from cayu.vaults import SecretRedactor, contains_redacted_secret
+from cayu.tools.base import ToolResult
+from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY = "approval_resolution_intent"

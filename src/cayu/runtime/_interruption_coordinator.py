@@ -17,12 +17,12 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import copy_durable_metadata, copy_json_value
-from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
+from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_control import clear_current_task_cancellation
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
-from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     InterruptSessionRequest,
     Session,
     SessionOrder,

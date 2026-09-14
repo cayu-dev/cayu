@@ -15,7 +15,6 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu import RunRequest, SQLiteSessionStore
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
-from cayu.runtime import InMemorySessionStore
 from cayu.runtime._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     browser_control_checkpoint_mutation_scope,
@@ -24,7 +23,13 @@ from cayu.runtime._browser_control_checkpoint import (
 from cayu.runtime._browser_control_model import validate_browser_model_publication
 from cayu.runtime._browser_control_publication import BrowserControlPublication
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime.browser_control import (
+from cayu.sessions.base import InMemorySessionStore, SessionIdentity, SessionOperationPublication
+from cayu.sessions.checkpoints import (
+    BROWSER_CONTROLS_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
+from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
     BrowserControlConflict,
     BrowserControlIdentity,
@@ -35,12 +40,6 @@ from cayu.runtime.browser_control import (
     BrowserTakeoverRequest,
     request_browser_takeover,
 )
-from cayu.runtime.checkpoints import (
-    BROWSER_CONTROLS_CHECKPOINT_KEY,
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-)
-from cayu.runtime.sessions import SessionIdentity, SessionOperationPublication
 
 
 def operator_purpose() -> BrowserOperatorPurpose:
@@ -132,7 +131,7 @@ def test_operator_accounting_rejects_malformed_or_unbounded_evidence(counts):
 
 def test_operator_accounting_is_cumulative_across_pages_and_takeovers():
     from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
-    from cayu.runtime.browser_control import BrowserTextInputIntent
+    from cayu.tools.browser_control import BrowserTextInputIntent
 
     pages = tuple(
         BrowserControlPage(page_id=name, revision="revision", control_epoch=1)
@@ -382,7 +381,7 @@ def test_checkpoint_rejects_duplicate_and_unsorted_allocations() -> None:
 
 
 def test_checkpoint_version_reserves_control_authority() -> None:
-    from cayu.runtime.checkpoints import (
+    from cayu.sessions.checkpoints import (
         BROWSER_CONTROLS_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -660,7 +659,7 @@ async def _assert_control_publication(backend: str, tmp_path) -> None:
 
 
 def test_reconnect_advances_only_the_same_view_only_guest():
-    from cayu.runtime.browser_control import rebound_browser_control_successor
+    from cayu.tools.browser_control import rebound_browser_control_successor
 
     old = BrowserControlRecord(identity=identity(), state="control_uncertain")
     current = old.identity.model_copy(update={"run_epoch": 2, "interaction_id": "resumed"})
@@ -693,7 +692,7 @@ def test_reconnect_advances_only_the_same_view_only_guest():
     ],
 )
 def test_reconnect_never_substitutes_an_allocation_or_reuses_an_epoch(field, value):
-    from cayu.runtime.browser_control import rebound_browser_control_successor
+    from cayu.tools.browser_control import rebound_browser_control_successor
 
     old = BrowserControlRecord(identity=identity(), state="control_uncertain")
     desired = old.identity.model_copy(
@@ -704,7 +703,7 @@ def test_reconnect_never_substitutes_an_allocation_or_reuses_an_epoch(field, val
 
 
 def test_reconnect_preserves_active_takeover_and_sensitive_entry_fences():
-    from cayu.runtime.browser_control import rebound_browser_control_successor
+    from cayu.tools.browser_control import rebound_browser_control_successor
 
     old = request_browser_takeover(
         BrowserControlRecord(identity=identity()), request(), now_ms=1000

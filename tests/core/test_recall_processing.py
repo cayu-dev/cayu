@@ -11,12 +11,7 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.recall import (
-    KNOWLEDGE_LEXICAL_CHANNEL,
-    KNOWLEDGE_SEMANTIC_CHANNEL,
-    RecallSituation,
-)
-from cayu.recall_processing import (
+from cayu.memory.processing import (
     AgentRecallProcessingError,
     AgentRecallProcessingMode,
     AgentRecallProcessingRequest,
@@ -24,7 +19,12 @@ from cayu.recall_processing import (
     AgentRecallProcessor,
     AgentRecallProcessorConfig,
 )
-from cayu.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.memory.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    RecallSituation,
+)
+from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage import (
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
@@ -79,7 +79,7 @@ def _context(
         operation_id=f"work-context-{revision}",
         published_by="test-suite",
         published_at=_NOW,
-        repository_paths=("src/cayu/recall_processing.py",),
+        repository_paths=("src/cayu/memory/processing.py",),
     )
 
 
@@ -1192,7 +1192,7 @@ def test_request_rejects_caller_supplied_ephemeral_work_context() -> None:
 
 
 def test_replay_frontier_requires_an_unchanged_checkpoint_context() -> None:
-    from cayu.recall_processing import AgentRecallFrontier
+    from cayu.memory.processing import AgentRecallFrontier
 
     with pytest.raises(ValueError, match="unchanged checkpoint work context"):
         _request(

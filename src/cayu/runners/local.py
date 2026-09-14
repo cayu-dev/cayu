@@ -42,13 +42,8 @@ from cayu.runners.base import (
     copy_exec_command,
     runner_workspace_mutation_settlement,
 )
-from cayu.vaults import (
-    SecretEnv,
-    SecretRedactor,
-    SecretRef,
-    SecretResolver,
-    resolve_secret_env,
-)
+from cayu.vaults.base import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.environments.admission import (

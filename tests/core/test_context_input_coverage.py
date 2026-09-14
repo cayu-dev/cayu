@@ -5,34 +5,25 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from cayu.core import (
-    AgentSpec,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.base import (
     ContextPolicy,
     ContextRequest,
     ContextUsageState,
-    EventQuery,
-    InMemorySessionStore,
     ObservedDeltaContextEstimator,
-    ResumeRequest,
-    RunRequest,
-    StructuredOutputSpec,
+    _prompt_cache_extension_messages,
     context_input_coverage,
 )
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._model_step_executor import _context_usage_state_for_session
-from cayu.runtime.context import _prompt_cache_extension_messages
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import EventQuery, InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.storage import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 
 
 def test_large_assistant_completion_is_not_covered_by_previous_input() -> None:

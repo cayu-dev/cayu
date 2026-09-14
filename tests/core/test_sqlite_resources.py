@@ -15,7 +15,8 @@ import pytest
 from tests.core.knowledge_publication_conformance import assert_concurrent_publication_conformance
 from tests.sqlite_resources import SQLiteResourceLeak, SQLiteResourceScope, _failure_evidence
 
-from cayu import InMemoryKnowledgeStore, KnowledgeAccessScope, SQLiteSessionStore
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
+from cayu.storage.sqlite import SQLiteSessionStore
 
 _STORAGE_CASES = (
     "tests/core/test_session_operation_fault_harness.py::"

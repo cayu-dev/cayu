@@ -1,13 +1,12 @@
 """Historical delivery evidence; never current remote observations or retry authority."""
 
-from cayu import (
-    GitHubDeliveryReconstructionRequiredError,
-    GitHubDeliveryRepository,
+from cayu.delivery.git import (
     RemoteGitDeliveryReconstructionRequiredError,
     RemoteGitDeliveryRepository,
     RemoteGitDeliveryState,
-    TaskStatus,
 )
+from cayu.delivery.github import GitHubDeliveryReconstructionRequiredError, GitHubDeliveryRepository
+from cayu.tasks.base import TaskStatus
 from tests.qualification.repository_maintenance_git_intake import (
     _completed_digest,
     _stored_delivery,

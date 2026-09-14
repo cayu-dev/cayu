@@ -30,7 +30,7 @@ from cayu.cli.project_control_plane import (
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 from cayu.project_control_plane import resolve_project_control_plane_context
 from cayu.runtime.checks import DiagnosticSeverity, ProjectControlPlaneCheckEvidence
-from cayu.runtime.sessions import MAX_SESSION_ID_BYTES
+from cayu.sessions.base import MAX_SESSION_ID_BYTES
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.support_bundles import (
     DEFAULT_SUPPORT_BUNDLE_LIMITS,

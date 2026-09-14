@@ -15,9 +15,8 @@ from uuid import UUID, uuid5
 from weakref import WeakKeyDictionary
 
 from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
-from cayu.core.events import Event, EventType, event_with_runtime_generated_id
-from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
-from cayu.runtime import (
+from cayu.events import Event, EventType, event_with_runtime_generated_id
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     EventRecord,
@@ -27,6 +26,7 @@ from cayu.runtime import (
     SessionStore,
 )
 from cayu.workflows._step_identity import replay_eligible_completed_step_id
+from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 # Identity stamped on the synthetic session that holds a workflow run's journal.
 # The session is never executed by ``app.run``; it only anchors the append-only

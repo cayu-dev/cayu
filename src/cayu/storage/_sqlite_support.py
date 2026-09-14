@@ -20,10 +20,9 @@ from cayu._validation import (
     require_clean_nonblank,
     require_execution_unit_id,
 )
-from cayu.core.events import Event
-from cayu.core.messages import Message
-from cayu.runtime.invocation import SessionInvocation, TaskInvocation
-from cayu.runtime.sessions import (
+from cayu.events import Event
+from cayu.messages import Message
+from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
@@ -42,19 +41,7 @@ from cayu.runtime.sessions import (
     transcript_search_document,
     transcript_search_session_token,
 )
-from cayu.runtime.tasks import (
-    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
-    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    Task,
-    TaskInterruptedHandoffRequest,
-    TaskOrder,
-    TaskRetrySeriesSnapshot,
-    TaskStatus,
-    TaskTopologyInconsistent,
-    TaskTopologyNode,
-    prepare_interrupted_task_handoff,
-)
-from cayu.runtime.work_contracts import WorkContractRef
+from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL
@@ -67,6 +54,19 @@ from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_ENTRY_ID_BYTES,
 )
+from cayu.tasks.base import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    Task,
+    TaskInterruptedHandoffRequest,
+    TaskOrder,
+    TaskRetrySeriesSnapshot,
+    TaskStatus,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+    prepare_interrupted_task_handoff,
+)
+from cayu.tasks.contracts import WorkContractRef
 
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -206,7 +206,7 @@ def connect_read_only_inspection(path: Path) -> sqlite3.Connection:
 
 
 def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
-    from cayu.runtime.pending_actions import pending_action_lookup_key
+    from cayu.sessions.pending_actions import pending_action_lookup_key
 
     def lookup_key(value: object) -> str | None:
         return pending_action_lookup_key(value) if type(value) is str else None
@@ -4971,7 +4971,7 @@ def _backfill_pending_action_checkpoint_batch(
     connection: sqlite3.Connection,
     after_session_id: str | None,
 ) -> str | None:
-    from cayu.runtime.pending_actions import (
+    from cayu.sessions.pending_actions import (
         pending_action_checkpoint_metrics,
     )
 
@@ -5007,7 +5007,7 @@ def _backfill_pending_action_event_batch(
     connection: sqlite3.Connection,
     after_sequence: int,
 ) -> int | None:
-    from cayu.runtime.pending_actions import (
+    from cayu.sessions.pending_actions import (
         PENDING_ACTION_EVENT_TYPE_VALUES,
         pending_action_event_storage_values,
     )
@@ -11333,7 +11333,7 @@ def checkpoint_row_values(
     checkpoint: dict[str, Any],
     updated_at: datetime,
 ) -> tuple[object, ...]:
-    from cayu.runtime.pending_actions import pending_action_checkpoint_metrics
+    from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
 
     checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)

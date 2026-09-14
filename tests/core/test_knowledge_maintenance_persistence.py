@@ -8,20 +8,20 @@ from typing import Any
 import pytest
 
 import cayu
-from cayu.knowledge_maintenance import (
+from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRouter,
     KnowledgeMaintenanceRouterConfig,
     KnowledgeMaintenanceRoutingRequest,
     KnowledgeMaintenanceSignalKind,
 )
-from cayu.knowledge_maintenance_persistence import (
+from cayu.knowledge.maintenance_persistence import (
     KnowledgeMaintenanceProposalPublicationConflict,
     KnowledgeMaintenanceProposalPublicationOutcome,
     KnowledgeMaintenanceProposalPublisher,
     KnowledgeMaintenanceProposalPublisherConfig,
 )
-from cayu.knowledge_maintenance_planning import (
+from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenanceEvaluationVerdict,
     KnowledgeMaintenanceEvaluatorDecision,
     KnowledgeMaintenanceEvaluatorOutput,
@@ -916,7 +916,7 @@ def test_sqlite_publication_load_validates_the_decision_record(tmp_path: Path) -
 
 
 def test_max_source_publication_fingerprint_work_is_constant(monkeypatch) -> None:
-    import cayu.knowledge_maintenance_persistence as persistence
+    import cayu.knowledge.maintenance_persistence as persistence
 
     async def scenario() -> None:
         store = InMemoryKnowledgeStore()

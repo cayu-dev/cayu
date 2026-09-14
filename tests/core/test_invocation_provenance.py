@@ -17,7 +17,7 @@ from cayu import (
     SessionInvocation,
     SQLiteSessionStore,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     fork_session_invocation,
     run_request_with_runtime_invocation,
 )

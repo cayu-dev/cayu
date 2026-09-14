@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import runpy
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).parents[2]
 _SELECTOR = runpy.run_path(str(_ROOT / "scripts" / "select_ci_jobs.py"))
@@ -13,7 +16,7 @@ def test_unrelated_pull_request_keeps_expensive_jobs_skipped() -> None:
     assert select_pull_request_jobs(
         [
             "docs/runtime-contracts.md",
-            "src/cayu/tools/search.py",
+            "src/cayu/providers/openai.py",
             "tests/core/test_search_text_tool.py",
         ]
     ) == VerificationScope(
@@ -36,7 +39,7 @@ def test_sqlite_regression_path_selects_only_cross_version_lane() -> None:
 
 
 def test_runtime_change_selects_sqlite_and_dashboard_contract_lanes() -> None:
-    assert select_pull_request_jobs(["src/cayu/runtime/sessions.py"]) == VerificationScope(
+    assert select_pull_request_jobs(["src/cayu/sessions/base.py"]) == VerificationScope(
         dashboard=True,
         release_artifacts=False,
         sqlite_cancellation=True,
@@ -141,4 +144,62 @@ def test_github_outputs_are_stable_lowercase_booleans() -> None:
         sqlite_cancellation=True,
     ).render_github_outputs() == (
         "dashboard=true\nrelease_artifacts=false\nsqlite_cancellation=true"
+    )
+
+
+@pytest.mark.parametrize(
+    "canonical",
+    [
+        canonical
+        for original, canonical in json.loads(
+            (_ROOT / "docs/public-api-migration.json").read_text()
+        ).items()
+        if original.startswith("cayu.runtime.")
+    ],
+)
+def test_relocated_runtime_implementations_keep_runtime_ci_coverage(canonical: str) -> None:
+    scope = select_pull_request_jobs(["src/" + canonical.replace(".", "/") + ".py"])
+    assert scope.dashboard
+    assert scope.sqlite_cancellation
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/cayu/_exports.py",
+        "src/cayu/sessions/__init__.pyi",
+        "src/cayu/tools/__init__.py",
+        "docs/public-api-migration.json",
+        "docs/public-api-packages.json",
+    ],
+)
+def test_public_export_and_layout_changes_select_all_contract_lanes(path: str) -> None:
+    assert select_pull_request_jobs([path]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=True,
+        sqlite_cancellation=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "package",
+    [
+        "approvals",
+        "budgets",
+        "context",
+        "egress",
+        "memory",
+        "observability",
+        "sessions",
+        "tasks",
+        "tools",
+        "workspaces",
+    ],
+)
+@pytest.mark.parametrize("helper", ["new_helper.py", "internal/new_helper.py"])
+def test_new_concept_helpers_keep_runtime_ci_coverage(package: str, helper: str) -> None:
+    assert select_pull_request_jobs([f"src/cayu/{package}/{helper}"]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=False,
+        sqlite_cancellation=True,
     )

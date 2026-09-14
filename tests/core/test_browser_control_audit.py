@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 from tests.core.test_browser_control import identity, request
 
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlPageAudit,
     BrowserControlRecord,
     BrowserObservedPageLocation,

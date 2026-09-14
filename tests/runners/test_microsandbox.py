@@ -24,7 +24,7 @@ from cayu.runners.microsandbox import (
     _defer_reconnect_restoration,
     microsandbox_reconnect_settlement_task,
 )
-from cayu.testing import verify_provider_credential_isolation
+from cayu.testing.base import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -1371,7 +1371,7 @@ def test_microsandbox_runner_classifies_no_exit_event_when_agent_ping_fails(poli
         expected = RunnerExecutionError if policy == "sandbox" else MicrosandboxUnavailableError
         with pytest.raises(expected) as exc_info:
             await runner.exec(ExecCommand.process("sleep", "30"))
-        from cayu.runtime.egress import _workspace_dispatch_settlement_kind
+        from cayu.egress.runtime import _workspace_dispatch_settlement_kind
 
         assert _workspace_dispatch_settlement_kind(result=None, error=exc_info.value) == (
             "runner_quiescent" if policy == "sandbox" else "complete"
@@ -1411,8 +1411,8 @@ def test_microsandbox_runner_classifies_no_exit_event_when_agent_ping_fails(poli
 
 @pytest.mark.anyio
 async def test_health_probe_cancellation_preserves_completed_command_cleanup():
+    from cayu.egress.runtime import _workspace_dispatch_settlement_kind
     from cayu.runners._cleanup import runner_cancellation_failure
-    from cayu.runtime.egress import _workspace_dispatch_settlement_kind
 
     reset_fake_module()
     sandbox = FakeSandbox("cancelled-probe")
@@ -3355,8 +3355,8 @@ def test_microsandbox_runner_kills_command_on_cancellation_by_default() -> None:
 async def test_sandbox_command_cleanup_finalizes_open_transports(
     timeout, close_fails, kill_fails, close_stalls
 ):
+    from cayu.egress.runtime import _workspace_dispatch_settlement_kind
     from cayu.runners.base import runner_workspace_mutation_settlement
-    from cayu.runtime.egress import _workspace_dispatch_settlement_kind
 
     closed = []
     errors = []

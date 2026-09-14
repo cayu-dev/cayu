@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from cayu._validation import canonical_durable_json_bytes
+from cayu.approvals.tools import ToolApprovalRequest
+from cayu.approvals.user_input import (
+    UserInputRecoveryRequest,
+    UserInputResponse,
+    user_input_lifecycle_authority_from_checkpoint,
+)
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._foreground_child_wait import (
     FOREGROUND_CHILD_TERMINAL_KEY,
@@ -19,20 +25,14 @@ from cayu.runtime._foreground_child_wait import (
     foreground_child_state_from_checkpoint,
     post_action_continuation_round_from_checkpoint,
 )
-from cayu.runtime.approvals import ToolApprovalRequest
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     Session,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
     _invocation_lifecycle_authority_read_scope,
-)
-from cayu.runtime.user_input import (
-    UserInputRecoveryRequest,
-    UserInputResponse,
-    user_input_lifecycle_authority_from_checkpoint,
 )
 
 

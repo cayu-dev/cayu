@@ -1,0 +1,9502 @@
+"""Application composition, registration, and session execution."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import mimetypes
+import os
+import traceback as traceback_module
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from datetime import datetime
+from fnmatch import fnmatchcase
+from hashlib import sha256
+from itertools import islice
+from math import isfinite
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+from uuid import uuid4
+
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_durable_metadata,
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_unicode_scalar_text,
+)
+from cayu.agents import AgentSpec
+from cayu.approvals.review import (
+    HumanReviewContext,
+    HumanReviewPolicy,
+    HumanReviewReference,
+    HumanReviewView,
+)
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+    copy_tool_approval_recovery_request,
+    copy_tool_approval_request,
+)
+from cayu.approvals.user_input import (
+    UserInputRecoveryRequest,
+    UserInputResponse,
+    copy_user_input_recovery_request,
+    copy_user_input_response,
+)
+from cayu.artifacts.attachments import (
+    FileAttachmentKind,
+    file_attachment,
+    validate_file_attachment_bytes,
+    validate_file_attachment_content_type,
+)
+from cayu.artifacts.base import ArtifactScope, ArtifactStore
+from cayu.budgets.base import (
+    BudgetLedger,
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetStore,
+    InMemoryBudgetLedger,
+    SessionBudgetStore,
+    copy_budget_policy,
+)
+from cayu.budgets.pricing import (
+    CausalBudgetCostSummary,
+    PriceBook,
+    SessionCostSummary,
+    SessionCostTotals,
+)
+from cayu.budgets.usage import (
+    CausalBudgetUsageSummary,
+    SessionUsageSummary,
+)
+from cayu.configuration import (
+    CayuConfig,
+    CayuConfigSource,
+    copy_cayu_config,
+)
+from cayu.context.base import (
+    ContextPolicy,
+    DefaultContextPolicy,
+)
+from cayu.context.counting import (
+    ContextCountingConfig,
+    copy_context_counting_config,
+)
+from cayu.context.footprints import (
+    RequestFootprintConfig,
+    copy_request_footprint_config,
+)
+from cayu.context.structured_output import (
+    StructuredOutputSpec,
+    StructuredOutputStrategy,
+)
+from cayu.context.thinking import ThinkingConfig
+from cayu.deadlines import (
+    ExecutionDeadline,
+    current_execution_deadline,
+    deadline_stream,
+    effective_deadline,
+    resumed_execution_deadline,
+)
+from cayu.egress.transitions import (
+    EgressAuthorityAdoptionHandler,
+    _drain_parked_egress_authority_allocations,
+)
+from cayu.environments.admission import ExecutionRequirements
+from cayu.environments.base import Environment, EnvironmentSpec, copy_environment
+from cayu.environments.bindings import copy_bound_workspace
+from cayu.environments.factory import EnvironmentFactory
+from cayu.events import (
+    Event,
+    EventType,
+    event_durable_sequence,
+    event_with_durable_sequence,
+    validate_public_custom_event_type,
+)
+from cayu.knowledge._publication import KnowledgePublicationLifecycle
+from cayu.mcp.tools import (
+    McpToolAdapter,
+    McpToolset,
+    McpToolsetRefreshBlocked,
+    McpToolsetRefreshResult,
+    McpToolsetUnavailable,
+    mcp_toolset_manifest_diff,
+)
+from cayu.messages import (
+    FilePart,
+    Message,
+)
+from cayu.observability.events import EventSink
+from cayu.observability.hooks import (
+    RuntimeHook,
+    RuntimeHookPhase,
+)
+from cayu.observability.watchers import (
+    EVENT_WATCHER_QUERY_PAGE_LIMIT,
+    EventWatcher,
+    EventWatcherClaim,
+    EventWatcherContext,
+    EventWatcherDelivery,
+    EventWatcherDeliveryStatus,
+    EventWatcherRunResult,
+    EventWatcherStore,
+    InMemoryEventWatcherStore,
+    _clock_or_utc_now,
+    event_query_after_cursor,
+    event_watcher_error_payload,
+)
+from cayu.providers.base import ModelProvider, copy_usage_dialect
+from cayu.providers.hosted import OpenAIWebSearch, copy_openai_web_search
+from cayu.providers.operations import ProviderOperationSnapshot
+from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._browser_control_runtime import BrowserControlRuntime
+from cayu.runtime._checkpoint_store import (
+    load_runtime_session_checkpoint_snapshot,
+    runtime_checkpoint_session_store,
+)
+from cayu.runtime._completion_decision_application_coordinator import (
+    CompletionDecisionApplicationCoordinator,
+)
+from cayu.runtime._completion_result_resolver_coordinator import (
+    CompletionResultResolverCoordinator,
+)
+from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
+from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
+from cayu.runtime._delegated_event_stream import (
+    _close_delegated_event_stream as _close_delegated_event_stream,
+)
+from cayu.runtime._delegated_event_stream import (
+    _RunFenceOwnedEventStream,
+)
+from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
+from cayu.runtime._durable_subagent_coordinator import (
+    DurableSubagentCoordinator,
+    DurableSubagentPreparedRun,
+)
+from cayu.runtime._durable_subagents import (
+    DurableSubagentSubmissionIntent,
+    durable_subagent_worker_incompatible,
+)
+from cayu.runtime._environment_lifecycle import EnvironmentLifecycle, render_initial_system_prompt
+from cayu.runtime._event_projection import (
+    PUBLIC_EVENT_ID_PREFIX,
+    private_event_linkage_value,
+    project_persisted_runtime_event,
+    project_runtime_event,
+    public_event_envelope_alias,
+    public_event_id,
+    public_event_linkage_id,
+    public_event_linkage_sequence,
+)
+from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._execution_profile_identity_validation import (
+    copy_secret_free_execution_profile_behavior_identity,
+)
+from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
+from cayu.runtime._foreground_child_wait import ForegroundChildTerminal, ForegroundChildWait
+from cayu.runtime._fork_source_snapshot import (
+    fork_source_checkpoint_projection,
+    fork_source_checkpoint_sha256,
+)
+from cayu.runtime._interruption_coordinator import (
+    BackgroundInterruptionCoordinator,
+)
+from cayu.runtime._invocation_lifecycle import (
+    InvocationContext,
+    InvocationMutationResult,
+    invocation_lifecycle_receipt_history_present,
+    prepare_rebind_invocation_command,
+)
+from cayu.runtime._invocation_terminal_decision import (
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.runtime._isolated_tool_process import (
+    isolated_tool_execution_contract,
+    validate_process_isolated_tool_registration,
+)
+from cayu.runtime._model_step_executor import (
+    ModelCompletionPublicationRequest,
+    ModelCompletionPublicationResult,
+    ModelCompletionRecoveryContext,
+    ModelStepBudgetEvaluationRequest,
+    ModelStepBudgetReservationFailureRequest,
+    ModelStepExecutor,
+    ModelStepLimitEvaluationRequest,
+    model_completion_recovery_context_from_stage,
+)
+from cayu.runtime._recovery_coordinator import (
+    ProviderOperationFailureRequest,
+    RecoveryAbandonedTurnRequest,
+    RecoveryCoordinator,
+    RecoveryInterruptionRequest,
+    RecoveryLimitStopRequest,
+    RecoverySessionRunRequest,
+    RecoveryTaskEventRequest,
+    RecoveryTerminalEventRequest,
+)
+from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
+from cayu.runtime._run_limits import (
+    RunLimitController,
+    SessionUsageTracker,
+)
+from cayu.runtime._session_control import (
+    ActiveSessionRun,
+    SessionControl,
+)
+from cayu.runtime._session_engine import (
+    SessionEngine,
+    _checkpoint_with_pending_session_interrupt,
+    _environment_name,
+    _interaction_transition_replay_failures,
+    _reject_unresumable_session_checkpoint,
+    _replace_checkpoint_preserving_runtime_state,
+    _require_native_structured_output_support,
+    _task_event,
+    _validate_resume_request,
+    _validate_run_request,
+    _WorkAttemptRecoveryAlreadyActive,
+    _WorkAttemptRuntimeAuthority,
+)
+from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
+from cayu.runtime._session_queries import query_all_sessions
+from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
+from cayu.runtime._task_store_operation_boundary import (
+    TaskStoreOperationOutcome,
+    capture_sensitive_result_validation,
+    capture_sensitive_validation,
+    capture_task_store_operation,
+    raise_task_store_operation_failure,
+    task_store_work_attempt_admission_capability_is_complete,
+)
+from cayu.runtime._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    TERMINAL_EVENT_TYPES,
+)
+from cayu.runtime._tool_effect_reconciliation import register_tool_effect_reconciler
+from cayu.runtime._tool_round_executor import (
+    InterruptedToolRoundRequest,
+    ToolRoundExecutor,
+    ToolRoundLimitRequest,
+)
+from cayu.runtime._verified_task_decision_coordinator import (
+    VerifiedTaskDecisionCoordinator,
+    VerifiedTaskDecisionDependencies,
+    VerifiedTaskDecisionExecution,
+    VerifiedTaskDecisionResult,
+)
+from cayu.runtime._verified_work_authority import (
+    invocation_contains_secret_public_identity,
+)
+from cayu.runtime._work_attempt_invocation import (
+    WorkAttemptRecoveryOwnership,
+    _acknowledged_work_attempt_recovery,
+)
+from cayu.runtime._work_attempt_session_mutation import (
+    capture_work_attempt_checkpoint_result,
+    capture_work_attempt_deferred_input_result,
+    capture_work_attempt_session_result,
+    read_work_attempt_session_store,
+    settle_work_attempt_session_mutation,
+)
+from cayu.runtime.build_provenance import current_runtime_build_provenance
+from cayu.runtime.completion_result_resolvers import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+)
+from cayu.runtime.completion_verifier_profiles import CompletionVerifierProfilePolicy
+from cayu.runtime.completion_verifiers import (
+    CompletionVerifierExecutionRequest,
+    DeterministicCompletionVerifier,
+)
+from cayu.runtime.config_inspection import EffectiveRunConfiguration
+from cayu.runtime.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
+from cayu.runtime.execution_profiles import (
+    ActiveInvocationExecutionProfile,
+    ExecutionProfileIdentity,
+    ExecutionProfilePolicy,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_from_session_metadata,
+    unavailable_execution_profile_components,
+)
+from cayu.runtime.loop_policies import (
+    LoopPolicy,
+    validate_loop_policies,
+)
+from cayu.runtime.manifest import AppManifest, describe_app
+from cayu.runtime.mcp_manifest_policy import (
+    McpManifestPolicy,
+    McpManifestPolicyAction,
+    copy_mcp_manifest_policy,
+)
+from cayu.runtime.provider_operation_cancellation import (
+    ProviderOperationCancellationLifecycle,
+    ProviderOperationCancellationLifecycleSnapshot,
+)
+from cayu.runtime.provider_operations import (
+    ProviderOperationRecoveryResult,
+    ProviderOperationResolutionAction,
+    ProviderOperationResolutionRequest,
+    RecoverableProviderOperation,
+    RecoverableProviderOperationStart,
+    copy_provider_operation_resolution_request,
+)
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+    parse_public_authority_alias,
+    public_authority_alias_is_reserved,
+)
+from cayu.runtime.retry_policy import (
+    RetryPolicy,
+    copy_retry_policy,
+)
+from cayu.runtime.session_closure import (
+    ArtifactSessionClosureStore,
+    RetainedSessionClosureStore,
+    SessionClosureCoordinator,
+    SessionClosureExport,
+    SessionClosurePolicy,
+    SessionClosureReport,
+    SessionClosureStore,
+    SessionEvidenceClosureStore,
+    SharedSessionClosureStore,
+    TaskSessionClosureStore,
+)
+from cayu.runtime.session_message_lifecycle import (
+    SessionMessageAccessContext,
+    SessionMessageAccessPolicy,
+    SessionMessageActionRequest,
+    SessionMessageQuery,
+    SessionMessageSource,
+)
+from cayu.runtime.session_steering import (
+    SessionSteeringReceipt,
+    StopAfterCurrentToolRoundRequest,
+)
+from cayu.runtime.stop_policy import (
+    RunLimits,
+    StopDecision,
+)
+from cayu.runtime.tool_effects import (
+    ToolEffectConflict,
+    ToolEffectReceipt,
+    ToolEffectReconciliationRegistration,
+    ToolEffectReconciliationRequest,
+    ToolEffectReconciliationTarget,
+)
+from cayu.sessions.base import (
+    CompactSessionRequest,
+    EnqueueSessionMessageRequest,
+    EnqueueSessionMessageResult,
+    EventOrder,
+    EventQuery,
+    EventRecord,
+    ForkSessionRequest,
+    ForkSourceSnapshot,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
+    IncompleteSessionsRecoveryRequest,
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryResult,
+    ModelCompletionStage,
+    ModelTarget,
+    PendingActionQuery,
+    PendingActionResultTooLarge,
+    PersistedEventSideEffectClaim,
+    QueuedDispatchTerminalReceipt,
+    QueuedDispatchTerminalReceiptQuery,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionMessageActionResult,
+    SessionMessageInspection,
+    SessionOrder,
+    SessionQuery,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStore,
+    TranscriptSnapshot,
+    _activate_session_interaction,
+    _activate_session_run_fence,
+    _checkpoint_after_queued_dispatch_acknowledgement,
+    _deactivate_session_interaction,
+    _deactivate_session_run_fence,
+    _fork_source_session_instance_fingerprint,
+    _initial_transcript_pending_interaction_id,
+    _queued_dispatch_session_instance_fingerprint,
+    _queued_dispatch_terminal_receipts_from_checkpoint,
+    _session_run_operation_from_checkpoint,
+    copy_fork_session_request,
+    copy_incomplete_session_recovery_request,
+    copy_incomplete_sessions_recovery_request,
+    copy_interrupt_session_request,
+    copy_model_completion_manual_recovery_request,
+    copy_resume_request,
+    copy_session,
+    fork_source_transcript_sha256,
+    session_fork_profile_relationship,
+    system_prompt_messages_sha256,
+)
+from cayu.sessions.child_context import ChildSessionContextContributor
+from cayu.sessions.cleanup import (
+    RecoveryCleanupSupervisor,
+    RecoveryCleanupSupervisorSnapshot,
+    copy_recovery_cleanup_policy,
+)
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionInvocationBinding,
+    TaskExecutionSource,
+    copy_session_invocation_binding,
+)
+from cayu.sessions.recovery import (
+    RecoveryExecutionRequest,
+    RecoveryPlan,
+    RecoveryPlanRequest,
+    RecoveryReceipt,
+)
+from cayu.storage.memory import (
+    KnowledgeAccessScope,
+    KnowledgeStore,
+    copy_knowledge_access_scope,
+)
+from cayu.tasks.admission import (
+    WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
+    WORK_ATTEMPT_RENEWABLE_STATES,
+    AdmittedCompletionProposalRequest,
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionState,
+    WorkAttemptClaimRenewalRequest,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionRequest,
+    WorkAttemptProposalRequest,
+    WorkAttemptRecoveryActivate,
+    WorkAttemptRecoveryRequest,
+    WorkAttemptRecoveryRequired,
+    WorkAttemptRunRequest,
+    copy_work_attempt_claim_renewal_request,
+    copy_work_attempt_execution_request,
+    copy_work_attempt_proposal_request,
+    copy_work_attempt_recovery_request,
+    copy_work_attempt_run_request,
+    require_admitted_completion_proposal_result,
+    require_work_attempt_admission_result,
+    require_work_attempt_claim_result,
+    require_work_attempt_execution_claim_result,
+    require_work_attempt_recovery_activation_result,
+    work_attempt_recovery_session_authority,
+    work_attempt_recovery_session_authority_from_checkpoint,
+)
+from cayu.tasks.base import (
+    Task,
+    TaskCreate,
+    TaskInvocationSnapshot,
+    TaskStatus,
+    TaskStore,
+    copy_task,
+    copy_task_create,
+    preflight_contract_bound_task_creation,
+    require_contract_bound_task_creation_snapshot,
+    task_create_with_runtime_invocation,
+)
+from cayu.tasks.contracts import (
+    CompletionDecision,
+    CompletionDecisionApplicationRequest,
+    CompletionProposal,
+    CompletionResultResolverRef,
+    CompletionVerifierRef,
+    TaskCompletionDecisionRequired,
+    WorkCompletionConflict,
+    WorkContract,
+    WorkContractConflict,
+    WorkContractDraft,
+    WorkContractRef,
+    copy_work_contract,
+    copy_work_contract_ref,
+    work_contract_from_draft,
+)
+from cayu.tasks.dispatch import (
+    Dispatcher,
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
+    InlineDispatcher,
+    _copy_queued_dispatch_envelope,
+    _new_queued_dispatch_envelope,
+    _QueuedDispatchAuthorityRejected,
+    _QueuedDispatchEnvelope,
+    _QueuedDispatchSettlement,
+    _QueuedDispatchSettlementState,
+    copy_dispatch_handle,
+    copy_dispatch_request,
+    redact_dispatch_request,
+)
+from cayu.tools.base import (
+    DurableToolRecovery,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
+from cayu.tools.browser_control_config import BrowserControlConfig
+from cayu.tools.catalogue import (
+    SEARCH_TOOLS_NAME,
+    ToolDescriptor,
+    ToolDescriptorProvenance,
+    ToolExecutionContract,
+    build_tool_catalog_snapshot,
+    build_tool_descriptor,
+    mcp_source_tool_fingerprint,
+    validate_application_tool_name,
+)
+from cayu.tools.discovery import (
+    TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    TOOL_DISCOVERY_ONLY_PROFILE_ID,
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    SearchToolsTool,
+    ToolDiscoveryMode,
+    ToolDiscoveryViewInconsistentError,
+    ToolDiscoveryViewInspection,
+    ToolDiscoveryViewNotEnabledError,
+    copy_tool_discovery_mode,
+    current_tool_discovery_view,
+    tool_discovery_generation_id,
+    tool_discovery_view_inspection,
+)
+from cayu.tools.exposure import (
+    ALL_REGISTERED_TOOLS_PROFILE_ID,
+    AllRegisteredToolsExposurePolicy,
+    RegisteredToolCapability,
+    ResolvedToolExposure,
+    StaticToolExposurePolicy,
+    ToolExposurePolicy,
+    tool_capability_ceiling_from_session_metadata,
+)
+from cayu.tools.grants import (
+    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    TargetedToolGrantInspection,
+    targeted_tool_grant_inspection,
+)
+from cayu.tools.isolated import ProcessIsolatedTool
+from cayu.tools.policy import (
+    AllowAllToolPolicy,
+    ToolPolicy,
+)
+from cayu.tools.result_projection import (
+    ToolResultProjectionPolicy,
+    copy_tool_result_projection_policy,
+)
+from cayu.tools.rounds import (
+    ToolRoundRecoveryRequest,
+    copy_tool_round_recovery_request,
+)
+from cayu.tools.targeted_projection import (
+    TargetedToolMode,
+    copy_targeted_tool_mode,
+)
+from cayu.tools.terminal_publication import ToolTerminalPublicationMetricsSnapshot
+from cayu.vaults.redaction import SecretRedactionStream, SecretRedactor
+
+RegisteredAgent = runtime_records.RegisteredAgent
+RegisteredEnvironment = runtime_records.RegisteredEnvironment
+
+_RunConfigurationRequest = TypeVar(
+    "_RunConfigurationRequest",
+    RunRequest,
+    ResumeRequest,
+    DispatchRequest,
+)
+
+
+def _work_attempt_recovery_session_snapshot_sha256(session: Session) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            copy_session(session).model_dump(mode="json", warnings=False),
+            "work_attempt_recovery_source_session",
+        )
+    ).hexdigest()
+
+
+def _work_attempt_recovery_checkpoint_snapshot_sha256(
+    checkpoint: dict[str, Any] | None,
+) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            checkpoint,
+            "work_attempt_recovery_source_checkpoint",
+        )
+    ).hexdigest()
+
+
+if TYPE_CHECKING:
+    from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
+
+
+def _clear_untrusted_exception_traceback(error: BaseException) -> None:
+    """Best-effort frame clearing that cannot replace the public failure."""
+
+    try:
+        exception_traceback = error.__traceback__
+        if exception_traceback is not None:
+            traceback_module.clear_frames(exception_traceback)
+    except BaseException:
+        return
+
+
+def _render_fork_source_snapshot_failure(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> str:
+    """Best-effort public rendering for an untrusted store failure."""
+
+    try:
+        return redactor.redact_text(str(value)).strip()
+    except BaseException as rendering_error:
+        _clear_untrusted_exception_traceback(rendering_error)
+        return ""
+
+
+def _render_fork_source_snapshot_key_failure(
+    error: KeyError,
+    *,
+    redactor: SecretRedactor,
+    fallback: str,
+) -> str:
+    """Render a conventional KeyError argument without trusting its subclass."""
+
+    try:
+        arguments = error.args
+        if len(arguments) == 1 and type(arguments[0]) is str:
+            return _render_fork_source_snapshot_failure(arguments[0], redactor=redactor)
+    except BaseException as rendering_error:
+        _clear_untrusted_exception_traceback(rendering_error)
+    return fallback
+
+
+def _detached_fork_source_snapshot_failure(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> BaseException:
+    """Return a public failure without retaining source authority or store frames."""
+
+    _clear_untrusted_exception_traceback(error)
+    if isinstance(error, asyncio.CancelledError):
+        return asyncio.CancelledError()
+    message = _render_fork_source_snapshot_failure(error, redactor=redactor)
+    if isinstance(error, SessionRunFenced):
+        return SessionRunFenced(message or "Fork source changed during exact snapshot capture.")
+    if isinstance(error, KeyError):
+        key_message = _render_fork_source_snapshot_key_failure(
+            error,
+            redactor=redactor,
+            fallback=message,
+        )
+        return KeyError(key_message or "Fork source session was not found.")
+    if isinstance(error, ValueError):
+        return ValueError(message or "Fork source snapshot authority is invalid.")
+    if isinstance(error, RuntimeError):
+        return RuntimeError(message or "Fork source snapshot failed.")
+    return RuntimeError("Fork source snapshot failed.")
+
+
+def _fork_source_snapshot_from_material(
+    source: Session,
+    checkpoint: dict[str, Any] | None,
+    transcript: TranscriptSnapshot,
+    *,
+    redactor: SecretRedactor,
+) -> ForkSourceSnapshot:
+    """Validate and digest one store-detached fork-source materialization."""
+
+    messages = tuple(record.message for record in transcript.records)
+    checkpoint_projection: dict[str, Any] = {}
+    try:
+        if not session_request_boundary.fork_transcript_is_secret_free(
+            messages,
+            redactor=redactor,
+        ):
+            raise ValueError(
+                "Fork source transcript contains a workload secret and cannot be copied."
+            ) from None
+        checkpoint_projection = fork_source_checkpoint_projection(checkpoint)
+        if not session_request_boundary.fork_checkpoint_is_secret_free(
+            checkpoint_projection,
+            redactor=redactor,
+        ):
+            raise ValueError(
+                "Fork source checkpoint contains a workload secret and cannot be copied."
+            ) from None
+        _, profile, _ = session_request_boundary.prepare_fork_source_execution_profile(
+            source,
+            checkpoint,
+        )
+        return ForkSourceSnapshot(
+            source_session_id=source.id,
+            source_instance_fingerprint=_fork_source_session_instance_fingerprint(source),
+            status=source.status,
+            run_epoch=source.run_epoch,
+            transcript_cursor=transcript.cursor,
+            transcript_sha256=fork_source_transcript_sha256(transcript),
+            checkpoint_sha256=fork_source_checkpoint_sha256(checkpoint),
+            execution_profile_fingerprint=profile.fingerprint,
+            causal_budget_id=source.causal_budget_id,
+        )
+    finally:
+        messages = ()
+        checkpoint_projection.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactStoreRegistration:
+    store_id: str
+    store: ArtifactStore
+    fingerprint: str
+
+
+_CAYU_CONFIG_FIELD_OWNERS = {
+    "evals.max_concurrency": "cayu.configuration.EvalConfig",
+    "run.max_steps": "cayu.configuration.RunDefaults",
+    "run.limits": "cayu.runtime.stop_policy.RunLimits",
+    "run.retry_policy": "cayu.runtime.retry_policy.RetryPolicy",
+    "run.thinking": "cayu.context.thinking.ThinkingConfig",
+    "tool_execution.max_file_attachment_bytes": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.max_total_file_attachment_bytes": ("cayu.configuration.ToolExecutionConfig"),
+    "tool_execution.max_file_attachments_per_request": ("cayu.configuration.ToolExecutionConfig"),
+    "tool_execution.tool_timeout_seconds": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.max_parallel_tool_calls": "cayu.configuration.ToolExecutionConfig",
+    "operations.max_environment_lifecycle_owners": "cayu.configuration.OperationsConfig",
+    "operations.recovery_cleanup_policy": ("cayu.sessions.cleanup.RecoveryCleanupPolicy"),
+}
+
+
+def _resolve_cayu_app_config(
+    config: CayuConfig | None,
+) -> tuple[CayuConfig, dict[str, CayuConfigSource]]:
+    resolved = copy_cayu_config(config)
+    sources: dict[str, CayuConfigSource] = {path: "framework" for path in _CAYU_CONFIG_FIELD_OWNERS}
+    if config is not None:
+        for section_name in config.model_fields_set:
+            section = getattr(config, section_name)
+            for field_name in section.model_fields_set:
+                path = f"{section_name}.{field_name}"
+                if path in sources:
+                    sources[path] = "application"
+    return resolved, sources
+
+
+class CayuApp:
+    """Application runtime for registered agents, providers, and session state."""
+
+    def __init__(
+        self,
+        *,
+        config: CayuConfig | None = None,
+        session_store: SessionStore | None = None,
+        task_store: TaskStore | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
+        knowledge_review_namespace: str | None = None,
+        knowledge_review_labels: dict[str, str] | None = None,
+        dispatcher: Dispatcher | None = None,
+        budget_policy: BudgetPolicy | None = None,
+        budget_store: BudgetStore | None = None,
+        budget_ledger: BudgetLedger | None = None,
+        event_watcher_store: EventWatcherStore | None = None,
+        runtime_hooks: Iterable[RuntimeHook] | None = None,
+        loop_policies: Iterable[LoopPolicy] | None = None,
+        mcp_manifest_policy: McpManifestPolicy | None = None,
+        human_review_policy: HumanReviewPolicy | None = None,
+        session_message_access_policy: SessionMessageAccessPolicy | None = None,
+        tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
+        execution_profile_policy: ExecutionProfilePolicy | None = None,
+        completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
+        browser_control: BrowserControlConfig | None = None,
+        egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
+        context_counting: ContextCountingConfig | None = None,
+        request_footprint: RequestFootprintConfig | None = None,
+        event_sinks: Iterable[EventSink] | None = None,
+        enable_logging: bool = True,
+        secret_redactor: SecretRedactor | None = None,
+        public_authority_alias_keyring: PublicAuthorityAliasKeyring | None = None,
+        session_closure_stores: Iterable[SessionClosureStore] | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        # Resolve once at application startup. Strict deployments fail here,
+        # before any session or provider authority can be admitted.
+        if browser_control is not None:
+            if type(browser_control) is not BrowserControlConfig:
+                raise TypeError("browser_control must be BrowserControlConfig.")
+            browser_control = BrowserControlConfig(
+                policy=browser_control.policy,
+                guest_endpoint=browser_control.guest_endpoint,
+                purpose=browser_control.purpose,
+            )
+        current_runtime_build_provenance()
+        resolved_config, config_sources = _resolve_cayu_app_config(config)
+        self._config = resolved_config
+        self._config_sources = cast(
+            "Mapping[str, CayuConfigSource]",
+            MappingProxyType(dict(config_sources)),
+        )
+        self._config_owners = MappingProxyType(dict(_CAYU_CONFIG_FIELD_OWNERS))
+        if session_store is not None and not isinstance(session_store, SessionStore):
+            raise TypeError("session_store must be a SessionStore.")
+        if task_store is not None and not isinstance(task_store, TaskStore):
+            raise TypeError("task_store must be a TaskStore.")
+        if knowledge_store is not None and not isinstance(knowledge_store, KnowledgeStore):
+            raise TypeError("knowledge_store must be a KnowledgeStore.")
+        bound_knowledge_access_scope = (
+            None if knowledge_store is None else knowledge_store.bound_access_scope()
+        )
+        if knowledge_store is not None and knowledge_access_scope is None:
+            knowledge_access_scope = bound_knowledge_access_scope
+        if (knowledge_store is None) != (knowledge_access_scope is None):
+            raise ValueError(
+                "knowledge_store and knowledge_access_scope must be configured together."
+            )
+        if (
+            knowledge_access_scope is not None
+            and bound_knowledge_access_scope is not None
+            and copy_knowledge_access_scope(knowledge_access_scope) != bound_knowledge_access_scope
+        ):
+            raise ValueError(
+                "knowledge_access_scope must match the scope bound to knowledge_store."
+            )
+        if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
+            raise TypeError("dispatcher must be a Dispatcher.")
+        if budget_store is not None and not isinstance(budget_store, BudgetStore):
+            raise TypeError("budget_store must be a BudgetStore.")
+        if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
+            raise TypeError("budget_ledger must be a BudgetLedger.")
+        if event_watcher_store is not None and not isinstance(
+            event_watcher_store,
+            EventWatcherStore,
+        ):
+            raise TypeError("event_watcher_store must be an EventWatcherStore.")
+        if secret_redactor is not None and not isinstance(secret_redactor, SecretRedactor):
+            raise TypeError("secret_redactor must be a SecretRedactor.")
+        if public_authority_alias_keyring is not None and not isinstance(
+            public_authority_alias_keyring,
+            PublicAuthorityAliasKeyring,
+        ):
+            raise TypeError("public_authority_alias_keyring must be a PublicAuthorityAliasKeyring.")
+        if execution_profile_policy is not None and not isinstance(
+            execution_profile_policy,
+            ExecutionProfilePolicy,
+        ):
+            raise TypeError("execution_profile_policy must be an ExecutionProfilePolicy.")
+        if completion_verifier_profile_policy is not None and not isinstance(
+            completion_verifier_profile_policy,
+            CompletionVerifierProfilePolicy,
+        ):
+            raise TypeError(
+                "completion_verifier_profile_policy must be a CompletionVerifierProfilePolicy."
+            )
+        if egress_authority_adoption_handler is not None and not isinstance(
+            egress_authority_adoption_handler,
+            EgressAuthorityAdoptionHandler,
+        ):
+            raise TypeError(
+                "egress_authority_adoption_handler must be an EgressAuthorityAdoptionHandler."
+            )
+        self._egress_authority_adoption_handler = egress_authority_adoption_handler
+        if type(enable_logging) is not bool:
+            raise TypeError("enable_logging must be a bool.")
+        resolved_secret_redactor = (
+            secret_redactor if secret_redactor is not None else SecretRedactor()
+        )
+        hooks = _validate_runtime_hooks(
+            runtime_hooks,
+            field_name="runtime_hooks",
+            redactor=resolved_secret_redactor,
+        )
+        policies = validate_loop_policies(loop_policies, field_name="loop_policies")
+        policy_execution_profile_identities = tuple(
+            copy_secret_free_execution_profile_behavior_identity(
+                policy.execution_profile_identity,
+                redactor=resolved_secret_redactor,
+                field_name=f"loop_policies[{index}].execution_profile_identity",
+            )
+            for index, policy in enumerate(policies)
+        )
+        # Opaque registrations are comparable only within this frozen app
+        # registration. A new app may carry different behavior behind the same
+        # component type and slot, even when it lives in the same OS process.
+        self._execution_profile_process_identity = uuid4().hex
+        self._work_attempt_execution_pid = os.getpid()
+        self._work_attempt_execution_owner_id = uuid4().hex
+        # Wall-clock seam for time-based approval expiry (tests inject a fake).
+        self._clock = _clock_or_utc_now(clock)
+        manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
+        result_projection_policy = copy_tool_result_projection_policy(tool_result_projection_policy)
+        context_counting_config = copy_context_counting_config(context_counting)
+        request_footprint_config = copy_request_footprint_config(request_footprint)
+        execution_profile_policy_identity = None
+        if execution_profile_policy is not None:
+            execution_profile_policy_identity = require_durable_clean_nonblank(
+                execution_profile_policy.identity,
+                "execution_profile_policy.identity",
+            )
+            require_unicode_scalar_text(
+                execution_profile_policy_identity,
+                "execution_profile_policy.identity",
+            )
+            if len(execution_profile_policy_identity.encode("utf-8")) > 256:
+                raise ValueError(
+                    "execution_profile_policy.identity must be at most 256 UTF-8 bytes."
+                )
+            if (
+                resolved_secret_redactor.redact_text(execution_profile_policy_identity)
+                != execution_profile_policy_identity
+            ):
+                raise ValueError(
+                    "execution_profile_policy.identity contains a workload secret and cannot "
+                    "be used as durable policy authority."
+                )
+        configured_alias_codec = (
+            None
+            if public_authority_alias_keyring is None
+            else PublicAuthorityAliasCodec(public_authority_alias_keyring)
+        )
+        if event_sinks is None:
+            sinks = []
+        else:
+            if isinstance(event_sinks, str | bytes):
+                raise TypeError("event_sinks must be an iterable of EventSink instances.")
+            try:
+                sinks = list(event_sinks)
+            except TypeError as exc:
+                raise TypeError("event_sinks must be an iterable of EventSink instances.") from exc
+        for sink in sinks:
+            if not isinstance(sink, EventSink):
+                raise TypeError("event_sinks must contain EventSink instances.")
+        if enable_logging:
+            from cayu.observability.logging import LoggingEventSink
+
+            sinks.insert(0, LoggingEventSink(redactor=resolved_secret_redactor))
+        tool_execution = resolved_config.tool_execution
+        operations = resolved_config.operations
+        self._max_file_attachment_bytes = tool_execution.max_file_attachment_bytes
+        self._max_total_file_attachment_bytes = tool_execution.max_total_file_attachment_bytes
+        self._max_file_attachments_per_request = tool_execution.max_file_attachments_per_request
+        self._tool_timeout_seconds = tool_execution.tool_timeout_seconds
+        self._max_parallel_tool_calls = tool_execution.max_parallel_tool_calls
+        self._max_environment_lifecycle_owners = operations.max_environment_lifecycle_owners
+        self._recovery_cleanup_policy = copy_recovery_cleanup_policy(
+            operations.recovery_cleanup_policy
+        )
+        self._recovery_cleanup_supervisor = RecoveryCleanupSupervisor(self._recovery_cleanup_policy)
+        self.session_store = (
+            session_store
+            if session_store is not None
+            else InMemorySessionStore(
+                public_authority_alias_codec=configured_alias_codec,
+            )
+        )
+        store_alias_codec = self.session_store.public_authority_alias_codec
+        if configured_alias_codec is not None and store_alias_codec != configured_alias_codec:
+            raise ValueError(
+                "session_store and CayuApp must use the same public authority alias keyring."
+            )
+        self._public_authority_alias_codec = store_alias_codec or configured_alias_codec
+        if resolved_secret_redactor.has_values and (
+            self._public_authority_alias_codec is None
+            or not self.session_store.supports_public_authority_aliases
+        ):
+            raise ValueError(
+                "A secret-redacting CayuApp requires a SessionStore configured with "
+                "durable public authority aliases and an explicit alias keyring."
+            )
+        self._runtime_session_store = runtime_checkpoint_session_store(self.session_store)
+        closure_stores = () if session_closure_stores is None else tuple(session_closure_stores)
+        for closure_store in closure_stores:
+            if not isinstance(getattr(closure_store, "store_id", None), str):
+                raise TypeError("session_closure_stores must expose a string store_id.")
+        self.task_store = task_store
+        self.knowledge_store = knowledge_store
+        owned_store_ids = list(closure_stores)
+        if self.task_store is not None:
+            owned_store_ids.append(TaskSessionClosureStore(self.task_store))
+        if self.knowledge_store is not None:
+            owned_store_ids.append(
+                SharedSessionClosureStore("knowledge-store", "knowledge_references")
+            )
+        owned_store_ids.append(RetainedSessionClosureStore("budget-store", "budget_ledger"))
+        self._session_closure_external_stores = tuple(owned_store_ids)
+        self._rebuild_session_closure()
+        self.knowledge_access_scope = (
+            None
+            if knowledge_access_scope is None
+            else copy_knowledge_access_scope(knowledge_access_scope)
+        )
+        self.knowledge_review_namespace = (
+            require_clean_nonblank(knowledge_review_namespace, "knowledge_review_namespace")
+            if knowledge_review_namespace is not None
+            else None
+        )
+        self.knowledge_review_labels = copy_label_map(
+            knowledge_review_labels or {},
+            "knowledge_review_labels",
+        )
+        self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
+        self.budget_policy = budget_policy
+        self.budget_store = (
+            budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
+        )
+        self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
+        self._event_watcher_supervisor = EventWatcherSupervisor()
+        self.event_watcher_store = (
+            event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
+        )
+        self._secret_redactor = resolved_secret_redactor
+        self._browser_control_runtime = (
+            None
+            if browser_control is None
+            else BrowserControlRuntime(
+                config=browser_control,
+                store=self._runtime_session_store,
+                redactor=self._secret_redactor,
+                clock=self._clock,
+            )
+        )
+        self._completion_verifier_coordinator = CompletionVerifierCoordinator(
+            task_store=self.task_store,
+            secret_redactor=self._secret_redactor,
+            profile_policy=completion_verifier_profile_policy,
+        )
+        self._completion_decision_application_coordinator = (
+            CompletionDecisionApplicationCoordinator(
+                task_store=self.task_store,
+                secret_redactor=self._secret_redactor,
+            )
+        )
+        self._runtime_hooks = tuple(hooks)
+        self._loop_policies = tuple(policies)
+        self._loop_policy_execution_profile_identities = policy_execution_profile_identities
+        self._mcp_manifest_policy = manifest_policy
+        self._tool_result_projection_policy = result_projection_policy
+        self._context_counting = context_counting_config
+        self._request_footprint = request_footprint_config
+        self._event_sinks = tuple(sinks)
+        self._foreground_child_delivery_owner = ForegroundChildDeliveryOwner(
+            self._runtime_session_store
+        )
+        self._event_writer = RuntimeEventWriter(
+            session_store=self._runtime_session_store,
+            budget_store=self.budget_store,
+            event_sinks=self._event_sinks,
+            secret_redactor=self._secret_redactor,
+            public_authority_alias_codec=self._public_authority_alias_codec,
+            continue_foreground_parent=self._continue_foreground_parent,
+        )
+        self._completion_result_resolver_coordinator = CompletionResultResolverCoordinator(
+            application_coordinator=self._completion_decision_application_coordinator,
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+        )
+        self._environment_lifecycle = EnvironmentLifecycle(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
+            secret_redactor=self._secret_redactor,
+            max_environment_lifecycle_owners=self._max_environment_lifecycle_owners,
+            egress_authority_adoption_handler=egress_authority_adoption_handler,
+        )
+        self._run_limit_controller = RunLimitController(
+            session_store=self._runtime_session_store,
+            budget_store=self.budget_store,
+            budget_ledger=self.budget_ledger,
+            event_writer=self._event_writer,
+            clock=self._clock,
+        )
+        self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
+        self._agent_thinking_sources: dict[str, CayuConfigSource] = {}
+        self._mcp_refresh_owner = object()
+        self._mcp_publication_lock = asyncio.Lock()
+        self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
+        self._knowledge_publications_sealed = False
+        self._providers: dict[str, runtime_records.RegisteredProvider] = {}
+        self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
+        self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
+        self._default_provider_name: str | None = None
+        self._default_environment_name: str | None = None
+        self._session_control = SessionControl[SessionUsageTracker](
+            session_store=self._runtime_session_store
+        )
+        self._provider_operation_cancellation_lifecycle = ProviderOperationCancellationLifecycle()
+        self._model_step_executor = ModelStepExecutor(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            run_limit_controller=self._run_limit_controller,
+            context_counting=self._context_counting,
+            request_footprint=self._request_footprint,
+            max_file_attachment_bytes=self._max_file_attachment_bytes,
+            max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
+            max_file_attachments_per_request=self._max_file_attachments_per_request,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            checkpoint_transform=(
+                self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
+            ),
+            apply_budget_evaluation=self._apply_model_step_budget_evaluation,
+            apply_limit_evaluation=self._apply_model_step_limit_evaluation,
+            stop_for_budget_reservation_failure=(
+                self._stop_for_model_step_budget_reservation_failure
+            ),
+            provider_operation_cancellation_lifecycle=(
+                self._provider_operation_cancellation_lifecycle
+            ),
+        )
+        self._tool_round_executor = ToolRoundExecutor(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            hook_runtime=self,
+            runtime_hooks=self._runtime_hooks,
+            mcp_manifest_policy=self._mcp_manifest_policy,
+            tool_result_projection_policy=self._tool_result_projection_policy,
+            secret_redactor=self._secret_redactor,
+            tool_timeout_seconds=self._tool_timeout_seconds,
+            max_parallel_tool_calls=self._max_parallel_tool_calls,
+            clock=self._clock,
+            checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
+            apply_limit_evaluation=self._apply_tool_round_limit,
+            close_interrupted_round=self._close_tool_round_after_interrupt,
+            browser_control_service=(
+                self._browser_control_runtime.service
+                if self._browser_control_runtime is not None
+                else None
+            ),
+        )
+        self._recovery_coordinator = RecoveryCoordinator(
+            human_review_policy=human_review_policy,
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            environment_lifecycle=self._environment_lifecycle,
+            run_limit_controller=self._run_limit_controller,
+            tool_round_executor=self._tool_round_executor,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
+            effective_retry_policy=self._effective_retry_policy,
+            run_session=self._run_recovery_session,
+            emit_terminal_event_with_hooks=self._emit_recovery_terminal_event_with_hooks,
+            terminal_runtime_hooks_are_settled=(
+                self._terminal_runtime_hooks_are_settled_for_recovery
+            ),
+            fail_provider_operation=self._fail_provider_operation_resolution,
+            stop_session_for_limit_reached=self._stop_recovery_session_for_limit_reached,
+            task_event=_recovery_task_event,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_provider=self._get_registered_provider,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+            resolve_budget_policy=lambda: self.budget_policy,
+            validate_execution_profile_continuation=(
+                self._validate_execution_profile_continuation_for_recovery
+            ),
+            interrupt_session_for_recovery=self._interrupt_session_for_recovery,
+            pending_session_interrupt_checkpoint=(
+                self._pending_session_interrupt_checkpoint_for_recovery
+            ),
+            abandoned_turn_completed=self._complete_abandoned_recovery_turn,
+            resume_interaction=self._resume_recovery_interaction,
+            recover_provider_operation=self._recover_provider_operation,
+            recover_provider_operation_start=self._recover_provider_operation_start,
+            cancel_provider_operation=self._cancel_provider_operation,
+            interaction_transition_replay_failures=_interaction_transition_replay_failures,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+        )
+        self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            clock=self._clock,
+            interrupt_session=self.interrupt_session,
+            load_pending_session_interrupt_payload=self._load_pending_session_interrupt_payload,
+            latest_session_interrupted_event=self._session_control.latest_interrupted_event,
+            load_pending_interruption_cascade=self._load_pending_interruption_cascade,
+            claim_pending_interruption_cascade=self._claim_pending_interruption_cascade,
+            mark_pending_interruption_cascade_failed=(
+                self._mark_pending_interruption_cascade_failed
+            ),
+            complete_pending_interruption_cascade=self._complete_pending_interruption_cascade,
+            renew_pending_interruption_cascade_claim=(
+                self._renew_pending_interruption_cascade_claim
+            ),
+            release_pending_interruption_cascade_claim=(
+                self._release_pending_interruption_cascade_claim
+            ),
+            secret_redactor=self._secret_redactor,
+        )
+
+        self._session_engine = SessionEngine(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            get_budget_policy=lambda: self.budget_policy,
+            event_writer=self._event_writer,
+            environment_lifecycle=self._environment_lifecycle,
+            run_limit_controller=self._run_limit_controller,
+            session_control=self._session_control,
+            model_step_executor=self._model_step_executor,
+            request_footprint=self._request_footprint,
+            tool_round_executor=self._tool_round_executor,
+            recovery_coordinator=self._recovery_coordinator,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
+            background_interruption_coordinator=(self._background_interruption_coordinator),
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=(
+                self._loop_policy_execution_profile_identities
+            ),
+            hook_runtime=self,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            route_registered_provider_for_model=(
+                lambda model: self._route_registered_provider_for_model(model=model)
+            ),
+            get_registered_environment=self._get_registered_environment,
+            get_registered_environment_for_session=(self._get_registered_environment_for_session),
+            effective_retry_policy=self._effective_retry_policy,
+            application_run_defaults=resolved_config.run,
+            execution_profile_policy=execution_profile_policy,
+            execution_profile_policy_identity=execution_profile_policy_identity,
+            egress_authority_adoption_handler=egress_authority_adoption_handler,
+            execution_profile_process_identity=self._execution_profile_process_identity,
+        )
+        self._recovery_coordinator.bind_committed_runtime_task_failure_recovery(
+            self._session_engine._recover_committed_runtime_task_failure
+        )
+        self._recovery_plan_coordinator = RecoveryPlanCoordinator(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            event_writer=self._event_writer,
+            recovery_coordinator=self._recovery_coordinator,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_provider=self._get_registered_provider,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+            recover_incomplete_session=self._recover_incomplete_session_private,
+            recover_model_completion=self._recover_model_completion_stage_private,
+            recover_tool_round=self._recover_tool_round_private,
+            recover_interruption_cascade=(self._session_engine.resume_pending_interruption_cascade),
+            project_session_id=self.project_session_id_for_exposure,
+            resolve_session_id=self._resolve_public_session_id,
+            clock=self._clock,
+        )
+        self._durable_subagent_coordinator = DurableSubagentCoordinator(
+            session_store=self.session_store,
+            runtime_session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            dispatcher=self.dispatcher,
+            prepare_initial_run=self._prepare_durable_subagent_run,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_provider=self._get_registered_provider,
+            route_registered_provider_for_model=(
+                lambda model: self._route_registered_provider_for_model(model=model)
+            ),
+            resolve_registered_environment=self._get_registered_environment,
+            interrupt_session=self._interrupt_session_private,
+            load_session_invocation=self.session_invocation_for_dispatch,
+            classify_dispatch_settlement=self._queued_dispatch_settlement_state,
+            acknowledge_dispatch=self._acknowledge_queued_dispatch,
+        )
+
+        self._session_message_coordinator = SessionMessageCoordinator(
+            store=self.session_store,
+            policy=session_message_access_policy,
+            redactor=self._secret_redactor,
+            resolve_session=self._resolve_public_session_authority,
+            project_session=self.project_session_id_for_exposure,
+            project_event=self._project_emitted_event_for_public_api,
+            enqueue=self._enqueue_session_message_private,
+            fan_out=self._event_writer.fan_out_persisted,
+        )
+
+    @property
+    def budget_policy(self) -> BudgetPolicy | None:
+        """Return a defensive copy of the app-owned budget policy."""
+
+        return copy_budget_policy(self._budget_policy)
+
+    @budget_policy.setter
+    def budget_policy(self, value: BudgetPolicy | None) -> None:
+        """Install a complete, validated app budget-policy replacement."""
+
+        copied = copy_budget_policy(value)
+        self._budget_policy = copied
+
+    def redact_json(self, value: Any) -> Any:
+        """Return a JSON-compatible value with configured secret values redacted."""
+        return self._secret_redactor.redact_json(value)
+
+    def redact_uppercase_text(self, value: str) -> str:
+        """Redact text after the same uppercase normalization used by authorities."""
+
+        return self._secret_redactor.redact_uppercase_text(value)
+
+    def _rebuild_session_closure(self) -> None:
+        stores = list(self._session_closure_external_stores)
+        known_ids = {store.store_id for store in stores}
+        if (
+            hasattr(self.session_store, "list_recall_receipts")
+            and hasattr(self.session_store, "list_context_exposures")
+            and "session-store-evidence" not in known_ids
+        ):
+            stores.append(SessionEvidenceClosureStore(self.session_store))
+            known_ids.add("session-store-evidence")
+        for store_id in getattr(self, "_artifact_store_registrations_by_id", {}):
+            if store_id not in known_ids:
+                stores.append(
+                    ArtifactSessionClosureStore(
+                        self._artifact_store_registrations_by_id[store_id].store
+                    )
+                )
+                known_ids.add(store_id)
+        self._session_closure = SessionClosureCoordinator(
+            self.session_store,
+            dependent_stores=tuple(stores),
+            clock=self._clock,
+        )
+
+    async def inspect_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+    ):
+        """Inspect all explicitly configured Cayu-owned closure stores."""
+
+        return await self._session_closure.inspect(session_id, policy=policy)
+
+    async def erase_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+        expected_plan_id: str | None = None,
+    ) -> SessionClosureReport:
+        """Perform a bounded, dependent-first session closure."""
+
+        return await self._session_closure.erase(
+            session_id,
+            policy=policy,
+            expected_plan_id=expected_plan_id,
+        )
+
+    async def validate_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+    ):
+        """Validate closure admission before any external cleanup begins."""
+        return await self._session_closure.validate(session_id, policy=policy)
+
+    async def export_session_closure(
+        self,
+        session_id: str,
+        *,
+        policy: SessionClosurePolicy | None = None,
+    ) -> SessionClosureExport:
+        """Export a bounded, redaction-safe closure manifest."""
+
+        return await self._session_closure.export(session_id, policy=policy)
+
+    def stream_redacted_bytes(
+        self,
+        *,
+        max_retained_bytes: int | None = None,
+    ) -> SecretRedactionStream:
+        """Create a chunk-safe redaction stream for application exposure boundaries."""
+
+        return self._secret_redactor.stream_bytes(
+            max_retained_bytes=max_retained_bytes,
+        )
+
+    def redact_utf8_head(
+        self,
+        value: bytes,
+        *,
+        max_bytes: int,
+        source_complete: bool,
+    ) -> tuple[str, bool]:
+        """Project a bounded UTF-8 prefix through the application secret registry."""
+
+        return self._secret_redactor.redact_utf8_head(
+            value,
+            max_bytes=max_bytes,
+            source_complete=source_complete,
+        )
+
+    def project_event_record_for_exposure(self, record: EventRecord) -> EventRecord:
+        """Project a caller-supplied record without granting persisted authority."""
+
+        if type(record) is not EventRecord:
+            raise TypeError("record must be an EventRecord.")
+        return EventRecord(
+            sequence=record.sequence,
+            event=project_runtime_event(
+                record.event,
+                sequence=record.sequence,
+                redactor=self._secret_redactor,
+                public_authority_alias_codec=self._public_authority_alias_codec,
+            ),
+        )
+
+    def _project_persisted_event_record_for_exposure(
+        self,
+        record: EventRecord,
+    ) -> EventRecord:
+        """Project a record obtained internally from the durable session store."""
+
+        if type(record) is not EventRecord:
+            raise TypeError("record must be an EventRecord.")
+        return EventRecord(
+            sequence=record.sequence,
+            event=project_persisted_runtime_event(
+                record.event,
+                sequence=record.sequence,
+                redactor=self._secret_redactor,
+                public_authority_alias_codec=self._public_authority_alias_codec,
+            ),
+        )
+
+    async def _project_emitted_event_for_public_api(self, event: Event) -> Event:
+        """Project one emitted private event at the public application boundary."""
+
+        sequence = event_durable_sequence(event)
+        if sequence is None:
+            records = await self.session_store.query_events(
+                EventQuery(session_id=event.session_id, event_id=event.id, limit=2)
+            )
+            if len(records) != 1:
+                raise RuntimeError(
+                    "Runtime event has no unique durable record for public projection."
+                )
+            sequence = records[0].sequence
+            event = records[0].event
+        projected = project_persisted_runtime_event(
+            event,
+            sequence=sequence,
+            redactor=self._secret_redactor,
+            public_authority_alias_codec=self._public_authority_alias_codec,
+        )
+        return event_with_durable_sequence(projected, sequence)
+
+    async def _project_incomplete_recovery_result_for_public_api(
+        self,
+        result: IncompleteSessionRecoveryResult,
+    ) -> IncompleteSessionRecoveryResult:
+        """Project recovery events and their actionable pending identifiers together."""
+
+        projected_events = tuple(
+            [await self._project_emitted_event_for_public_api(event) for event in result.events]
+        )
+        updates: dict[str, Any] = {
+            "events": projected_events,
+            "session_id": self.project_session_id_for_exposure(result.session_id),
+            "pending_subagent_session_ids": tuple(
+                self.project_session_id_for_exposure(child_id)
+                for child_id in result.pending_subagent_session_ids
+            ),
+        }
+        unavailable_linkage: list[str] = []
+        for result_field, event_field in (
+            ("pending_approval_id", "approval_id"),
+            ("pending_user_input_id", "input_id"),
+        ):
+            private_value = getattr(result, result_field)
+            if private_value is None:
+                continue
+            aliases = [
+                public_event_linkage_id(sequence, event_field)
+                for private_event, public_event in zip(
+                    result.events,
+                    projected_events,
+                    strict=True,
+                )
+                if private_event_linkage_value(
+                    private_event,
+                    field_name=event_field,
+                )
+                == private_value
+                and (sequence := event_durable_sequence(public_event)) is not None
+            ]
+            if not aliases:
+                try:
+                    records = await self.session_store.query_events(
+                        EventQuery(
+                            session_id=result.session_id,
+                            order_by=EventOrder.SEQUENCE_DESC,
+                            limit=5000,
+                        )
+                    )
+                except Exception:
+                    records = []
+                aliases = [
+                    public_event_linkage_id(record.sequence, event_field)
+                    for record in reversed(records)
+                    if private_event_linkage_value(
+                        record.event,
+                        field_name=event_field,
+                    )
+                    == private_value
+                ]
+            if not aliases:
+                # Recovery has already committed before this public projection
+                # boundary. A bounded legacy-history lookup may not locate an old
+                # linkage record, but that must not turn the committed recovery
+                # into a reported failure or expose the private action ID. Return
+                # a safe non-actionable representation and an explicit diagnostic
+                # in the result message instead.
+                updates[result_field] = None
+                unavailable_linkage.append(result_field)
+                continue
+            updates[result_field] = aliases[-1]
+        if unavailable_linkage:
+            fields = ", ".join(unavailable_linkage)
+            updates["message"] = (
+                f"{result.message} Public linkage unavailable for: {fields}; "
+                "inspect pending session actions before continuing."
+            )
+        return result.model_copy(update=updates, deep=True)
+
+    def project_session_id_for_exposure(self, value: str) -> str:
+        """Project private session authority to one stable public identifier."""
+
+        value = require_clean_nonblank(value, "session_id")
+        if self._secret_redactor.redact_text(value) == value:
+            return value
+        return public_event_envelope_alias(
+            value,
+            field_name="session_id",
+            codec=self._require_public_authority_alias_codec(),
+        )
+
+    def project_causal_budget_id_for_exposure(
+        self,
+        value: str,
+        *,
+        session_ids: Iterable[str],
+    ) -> str:
+        """Project session authority or redact an opaque causal-budget label."""
+
+        value = require_clean_nonblank(value, "causal_budget_id")
+        if any(
+            require_clean_nonblank(session_id, "session_id") == value for session_id in session_ids
+        ):
+            return self.project_session_id_for_exposure(value)
+        return self._secret_redactor.redact_text(value)
+
+    async def _project_fork_source_authority_for_exposure(
+        self,
+        *,
+        source_session_id: str,
+        causal_budget_id: str,
+    ) -> tuple[str, str]:
+        """Durably project exact source authority before public exposure."""
+
+        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
+        causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+        public_source_session_id = self.project_session_id_for_exposure(source_session_id)
+        if public_source_session_id != source_session_id:
+            await self.session_store.register_public_authority_alias(
+                public_source_session_id,
+                field_name="session_id",
+                private_value=source_session_id,
+            )
+        if causal_budget_id == source_session_id:
+            return public_source_session_id, public_source_session_id
+        if self._secret_redactor.redact_text(causal_budget_id) == causal_budget_id:
+            return public_source_session_id, causal_budget_id
+        public_causal_budget_id = self._require_public_authority_alias_codec().encode(
+            causal_budget_id,
+            field_name="causal_budget_id",
+        )
+        await self.session_store.register_public_authority_alias(
+            public_causal_budget_id,
+            field_name="causal_budget_id",
+            private_value=causal_budget_id,
+        )
+        return public_source_session_id, public_causal_budget_id
+
+    def project_interaction_id_for_exposure(
+        self,
+        value: str,
+        *,
+        session_id: str,
+    ) -> str:
+        """Project private interaction authority to one stable public identifier."""
+
+        value = require_clean_nonblank(value, "interaction_id")
+        if self._secret_redactor.redact_text(value) == value:
+            return value
+        return public_event_envelope_alias(
+            value,
+            field_name="interaction_id",
+            codec=self._require_public_authority_alias_codec(),
+            session_id=require_clean_nonblank(session_id, "session_id"),
+        )
+
+    def _require_public_authority_alias_codec(self) -> PublicAuthorityAliasCodec:
+        codec = self._public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError(
+                "Secret-bearing public authority requires a configured alias keyring."
+            )
+        return codec
+
+    async def _resolve_public_action_linkage(
+        self,
+        *,
+        session_id: str,
+        value: str,
+        field_name: str,
+    ) -> str:
+        """Resolve one public event alias back to private durable authority.
+
+        The alias selects a record and schema field only. The durable event,
+        rather than the caller-provided alias, remains the authority used by
+        approval, input, and recovery operations.
+        """
+
+        if not value.startswith(PUBLIC_EVENT_ID_PREFIX):
+            return value
+        try:
+            pending = await self.session_store.query_pending_actions(
+                PendingActionQuery(session_id=session_id, limit=200)
+            )
+        except PendingActionResultTooLarge as exc:
+            raise ValueError(
+                f"{field_name} cannot be disambiguated from legacy private "
+                "authority because the pending-action evidence is too large."
+            ) from exc
+        action_field_name = (
+            "round_id" if field_name in {"round_id", "tool_round_id"} else field_name
+        )
+        raw_match = any(
+            getattr(action, action_field_name, None) == value for action in pending.actions
+        )
+        sequence = public_event_linkage_sequence(value, field_name=field_name)
+        if sequence is None:
+            if raw_match:
+                return value
+            raise ValueError(f"Public {field_name} alias is malformed or field-mismatched.")
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                after_sequence=sequence - 1,
+                limit=1,
+            )
+        )
+        if (
+            not records
+            or records[0].sequence != sequence
+            or records[0].event.session_id != session_id
+        ):
+            raise ValueError(f"Public {field_name} alias was not found in the requested session.")
+        private_value = private_event_linkage_value(
+            records[0].event,
+            field_name=field_name,
+        )
+        if private_value is None:
+            raise ValueError(f"Public {field_name} alias has no private durable authority.")
+        if raw_match and private_value != value:
+            raise ValueError(
+                f"{field_name} is ambiguous between legacy private authority "
+                "and a public event alias."
+            )
+        return private_value
+
+    async def _resolve_public_session_id(self, value: str) -> str:
+        """Resolve a stable public session alias to private store authority."""
+
+        private_value, _store_resolved_value = await self._resolve_public_session_authority(value)
+        return private_value
+
+    async def _resolve_fork_source_causal_budget_authority(
+        self,
+        value: str,
+        *,
+        source_session_id: str,
+    ) -> tuple[str, str | None]:
+        """Resolve an exact public budget identity against its private fork source."""
+
+        value = require_clean_nonblank(value, "expected_source.causal_budget_id")
+        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
+        source = await self.session_store.load(source_session_id)
+        if source is None:
+            parsed = parse_public_authority_alias(value)
+            private_value: str | None = None
+            if parsed is not None and parsed.field_name == "causal_budget_id":
+                private_value = await self.session_store.resolve_public_authority_alias(
+                    value,
+                    field_name="causal_budget_id",
+                )
+            elif parsed is not None and parsed.field_name == "session_id":
+                resolved_session_id = await self.session_store.resolve_public_authority_alias(
+                    value,
+                    field_name="session_id",
+                )
+                if resolved_session_id == source_session_id:
+                    private_value = resolved_session_id
+            return (value, None) if private_value is None else (private_value, private_value)
+        if value == source.causal_budget_id:
+            return value, None
+
+        codec = self._public_authority_alias_codec
+        parsed = parse_public_authority_alias(value)
+        matched = bool(
+            codec is not None
+            and parsed is not None
+            and (
+                (
+                    parsed.field_name == "causal_budget_id"
+                    and codec.matches(
+                        value,
+                        source.causal_budget_id,
+                        field_name="causal_budget_id",
+                    )
+                )
+                or (
+                    source.causal_budget_id == source.id
+                    and parsed.field_name == "session_id"
+                    and codec.matches(
+                        value,
+                        source.causal_budget_id,
+                        field_name="session_id",
+                    )
+                )
+            )
+        )
+        private_value = source.causal_budget_id if matched else value
+        store_resolved_value = source.causal_budget_id if matched else None
+        del source
+        return private_value, store_resolved_value
+
+    async def _resolve_public_causal_budget_id(self, value: str) -> str:
+        """Disambiguate raw causal-budget authority from a public session alias."""
+
+        return await self._resolve_public_session_backed_filter(
+            value,
+            field_name="causal_budget_id",
+        )
+
+    async def _resolve_public_parent_session_id(self, value: str) -> str:
+        """Disambiguate raw parent authority from a public session alias."""
+
+        return await self._resolve_public_session_backed_filter(
+            value,
+            field_name="parent_session_id",
+        )
+
+    async def _resolve_public_session_backed_filter(
+        self,
+        value: str,
+        *,
+        field_name: str,
+    ) -> str:
+        """Resolve a public session alias while preserving matching legacy linkage."""
+
+        if field_name not in {"causal_budget_id", "parent_session_id"}:
+            raise ValueError("Unsupported session-backed authority filter.")
+        value = require_clean_nonblank(value, field_name)
+        parsed = parse_public_authority_alias(value)
+        if parsed is None or parsed.field_name != "session_id":
+            return value
+
+        query = (
+            SessionQuery(causal_budget_id=value, limit=1)
+            if field_name == "causal_budget_id"
+            else SessionQuery(parent_session_id=value, limit=1)
+        )
+        raw_match = bool((await self.session_store.list_sessions(query)).sessions)
+        private_value = await self.session_store.resolve_public_authority_alias(
+            value,
+            field_name="session_id",
+        )
+        if private_value is None:
+            if raw_match:
+                return value
+            raise ValueError(f"Public {field_name} alias was not found.")
+        if raw_match and private_value != value:
+            raise ValueError(
+                f"{field_name} is ambiguous between legacy private authority "
+                "and a public session alias."
+            )
+        return value if raw_match else private_value
+
+    async def _resolve_public_session_authority(
+        self,
+        value: str,
+    ) -> tuple[str, str | None]:
+        """Return private authority plus positive store-resolution evidence."""
+
+        if not public_authority_alias_is_reserved(value):
+            return value, None
+        raw_session = await self.session_store.load(value)
+        parsed = parse_public_authority_alias(value)
+        if parsed is None or parsed.field_name != "session_id":
+            if raw_session is not None:
+                return value, value
+            raise ValueError("Public session_id alias is malformed or field-mismatched.")
+        private_value = await self.session_store.resolve_public_authority_alias(
+            value,
+            field_name="session_id",
+        )
+        if private_value is None:
+            if raw_session is not None:
+                return value, value
+            raise ValueError("Public session_id alias was not found.")
+        if raw_session is not None and private_value != value:
+            raise ValueError(
+                "session_id is ambiguous between legacy private authority and a public event alias."
+            )
+        return private_value, private_value
+
+    async def _resolve_public_interaction_id(
+        self,
+        *,
+        session_id: str,
+        value: str,
+    ) -> str:
+        """Resolve a stable interaction alias inside one private session."""
+
+        if not public_authority_alias_is_reserved(value):
+            return value
+        raw_value_exists = await self.session_store.public_authority_private_value_exists(
+            value,
+            field_name="interaction_id",
+            scope_session_id=session_id,
+        )
+        parsed = parse_public_authority_alias(value)
+        if parsed is None or parsed.field_name != "interaction_id":
+            if raw_value_exists:
+                return value
+            raise ValueError("Public interaction_id alias is malformed or field-mismatched.")
+        private_value = await self.session_store.resolve_public_authority_alias(
+            value,
+            field_name="interaction_id",
+            scope_session_id=session_id,
+        )
+        if private_value is None:
+            if raw_value_exists:
+                return value
+            raise ValueError("Public interaction_id alias was not found in the requested session.")
+        if raw_value_exists and private_value != value:
+            raise ValueError(
+                "interaction_id is ambiguous between legacy private authority "
+                "and a public event alias."
+            )
+        return private_value
+
+    def redact_exception_diagnostic(
+        self,
+        error: BaseException,
+        *,
+        empty_message: str,
+        nonportable_message: str,
+    ) -> ExceptionDiagnostic:
+        """Snapshot a dispatch diagnostic with workload secrets removed before bounding."""
+
+        return exception_diagnostic(
+            error,
+            empty_message=empty_message,
+            nonportable_message=nonportable_message,
+            redactor=self._secret_redactor,
+        )
+
+    def redact_dispatch_request(self, request: DispatchRequest) -> DispatchRequest:
+        """Return a durable dispatch request scrubbed with this app's redactor."""
+
+        return redact_dispatch_request(request, redactor=self._secret_redactor)
+
+    def _pending_tool_approval_from_checkpoint(
+        self,
+        checkpoint: dict[str, Any] | None,
+        *,
+        consume_on_rejection: bool = False,
+    ) -> PendingToolApproval | None:
+        """Parse trusted approval state through this app's secret boundary."""
+
+        return approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=consume_on_rejection,
+        )
+
+    def describe(self, *, project_root: str | Path | None = None) -> AppManifest:
+        """Return this application's deterministic public manifest.
+
+        Description is structural only: it never invokes providers, tools,
+        environment factories, stores, workers, watchers, or recovery paths.
+        """
+
+        return describe_app(self, project_root=project_root)
+
+    async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
+        settled = await asyncio.gather(
+            self._session_engine.drain_background_interruptions(timeout_s=timeout_s),
+            self._foreground_child_delivery_owner.drain(timeout_s=timeout_s),
+        )
+        return all(settled)
+
+    def provider_operation_cancellation_status(
+        self,
+    ) -> ProviderOperationCancellationLifecycleSnapshot:
+        """Return content-free process-local provider-cancellation ownership state."""
+
+        return self._provider_operation_cancellation_lifecycle.snapshot()
+
+    def seal_provider_operation_cancellations(self) -> None:
+        """Reject new cancellation owners and request cancellation from active owners."""
+
+        self._provider_operation_cancellation_lifecycle.seal()
+
+    async def drain_provider_operation_cancellations(
+        self,
+        *,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Seal and boundedly drain every Runtime-owned provider cancellation."""
+
+        return await self._provider_operation_cancellation_lifecycle.drain(timeout_s=timeout_s)
+
+    def recovery_cleanup_status(self) -> RecoveryCleanupSupervisorSnapshot:
+        """Return content-free process-local cleanup supervision state."""
+
+        return self._recovery_cleanup_supervisor.snapshot()
+
+    def tool_terminal_publication_status(self) -> ToolTerminalPublicationMetricsSnapshot:
+        """Return content-free staged-terminal backlog and fairness measurements."""
+
+        return self._tool_round_executor.terminal_publication_metrics()
+
+    async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
+        """Wait boundedly for active and outcome-unknown recovery cleanup."""
+
+        return await self._recovery_cleanup_supervisor.drain(timeout_s=timeout_s)
+
+    async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
+        """Settle this process's retained cleanup without cancelling live mutations.
+
+        This is not a durable allocation census. After restart, use
+        ``recover_incomplete_session`` (including for terminal sessions) to
+        reconcile pending allocation intents before treating cleanup as closed.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_s)
+        handler = self._egress_authority_adoption_handler
+        parked_drained = True
+        if handler is not None:
+            parked_drained = await _drain_parked_egress_authority_allocations(
+                handler,
+                timeout_s=float(timeout_s),
+            )
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        retained_drained = await self._environment_lifecycle.drain_retained_cleanups(
+            timeout_s=remaining,
+        )
+        return retained_drained and parked_drained
+
+    def seal_knowledge_publications(self) -> None:
+        """Reject new retained knowledge writes before application shutdown drains."""
+
+        self._knowledge_publications_sealed = True
+        for lifecycle in self._registered_knowledge_publication_lifecycles():
+            lifecycle.seal()
+
+    async def drain_knowledge_publications(self, *, timeout_s: float = 10.0) -> bool:
+        """Seal and concurrently drain publications owned by registered tools."""
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        self.seal_knowledge_publications()
+        lifecycles = self._registered_knowledge_publication_lifecycles()
+        if not lifecycles:
+            return True
+        results = await asyncio.gather(
+            *(lifecycle.aclose(timeout_s=float(timeout_s)) for lifecycle in lifecycles)
+        )
+        return all(results)
+
+    def _registered_knowledge_publication_lifecycles(
+        self,
+    ) -> tuple[KnowledgePublicationLifecycle, ...]:
+        lifecycles: list[KnowledgePublicationLifecycle] = []
+        seen: set[int] = set()
+        for agent in self._agents.values():
+            for registered in agent.tools.values():
+                lifecycle = getattr(
+                    registered.tool,
+                    "_knowledge_publication_lifecycle",
+                    None,
+                )
+                if not isinstance(lifecycle, KnowledgePublicationLifecycle):
+                    continue
+                identity = id(lifecycle)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                lifecycles.append(lifecycle)
+        return tuple(lifecycles)
+
+    async def discard_parked_egress_allocations(
+        self,
+        session_id: str,
+        *,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Discard parked external allocations before abandoning one session."""
+
+        handler = self._egress_authority_adoption_handler
+        if handler is None:
+            return True
+        return await _drain_parked_egress_authority_allocations(
+            handler,
+            timeout_s=timeout_s,
+            session_id=require_durable_clean_nonblank(session_id, "session_id"),
+        )
+
+    async def resume_pending_interruption_cascades(
+        self,
+        *,
+        interrupting_inactive_for_seconds: int | None = None,
+    ) -> int:
+        return await self._session_engine.resume_pending_interruption_cascades(
+            interrupting_inactive_for_seconds=interrupting_inactive_for_seconds
+        )
+
+    async def interruption_cascade_status(self, session_id: str) -> str:
+        session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        return await self._session_engine.interruption_cascade_status(session_id=session_id)
+
+    async def inspect_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        interaction_id: str | None = None,
+        limit: int = TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    ) -> tuple[TargetedToolGrantInspection, ...]:
+        """Return bounded grant state through authenticated public aliases."""
+
+        if not self.session_store.supports_targeted_tool_grants:
+            raise RuntimeError("The configured SessionStore does not support targeted grants.")
+        private_session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        private_interaction_id = (
+            None
+            if interaction_id is None
+            else await self._resolve_public_interaction_id(
+                session_id=private_session_id,
+                value=require_clean_nonblank(interaction_id, "interaction_id"),
+            )
+        )
+        records = await self.session_store.list_targeted_tool_grants(
+            private_session_id,
+            interaction_id=private_interaction_id,
+            limit=limit,
+        )
+        codec = self.session_store.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Targeted grant inspection requires public alias authority.")
+        return tuple(targeted_tool_grant_inspection(record, codec) for record in records)
+
+    async def require_human_review_resolution_authority(
+        self,
+        session_id: str,
+        reference: HumanReviewReference | None,
+    ) -> None:
+        """Check decision permission independently of inspection and receipt replay."""
+        session_id = await self._resolve_public_session_id(session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id, reference
+        )
+
+    async def inspect_human_review(
+        self,
+        session_id: str,
+        *,
+        context: HumanReviewContext,
+    ) -> HumanReviewView:
+        """Inspect protected review content without executing or claiming work.
+
+        Direct SDK callers are trusted to supply verified recipient provenance.
+        The configured policy must authorize the exact session and tenant.
+        """
+        context = HumanReviewContext.model_validate(context.model_dump())
+        session_id = await self._resolve_public_session_id(session_id)
+        return await self._recovery_coordinator.inspect_human_review(session_id, context)
+
+    async def inspect_tool_discovery_view(
+        self,
+        session_id: str,
+        *,
+        limit: int = TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    ) -> ToolDiscoveryViewInspection:
+        """Return the current bounded view without refs, schemas, or query evidence."""
+
+        if type(limit) is not int or not 1 <= limit <= TOOL_DISCOVERY_INSPECTION_MAX_GRANTS:
+            raise ValueError(
+                f"limit must be an integer from 1 through {TOOL_DISCOVERY_INSPECTION_MAX_GRANTS}."
+            )
+        private_session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        session = await self.session_store.load(private_session_id)
+        if session is None:
+            raise KeyError("Session not found.")
+        return await self._inspect_tool_discovery_view_for_session(session, limit=limit)
+
+    async def _inspect_tool_discovery_view_for_session(
+        self,
+        session: Session,
+        *,
+        limit: int = TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    ) -> ToolDiscoveryViewInspection:
+        """Inspect a view fenced to one already-authorized session incarnation."""
+
+        if type(limit) is not int or not 1 <= limit <= TOOL_DISCOVERY_INSPECTION_MAX_GRANTS:
+            raise ValueError(
+                f"limit must be an integer from 1 through {TOOL_DISCOVERY_INSPECTION_MAX_GRANTS}."
+            )
+        session = copy_session(session)
+        registered_agent = self._agents.get(session.agent_name)
+        if registered_agent is None:
+            raise ToolDiscoveryViewInconsistentError(
+                "The session's registered agent is unavailable."
+            )
+        if registered_agent.tool_discovery_mode is None:
+            raise ToolDiscoveryViewNotEnabledError(
+                "Tool discovery is not enabled for this session."
+            )
+        try:
+            ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+            state = current_tool_discovery_view(
+                await self.session_store.load_session_operation(
+                    session.id,
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                ),
+                session_id=session.id,
+                generation_id=tool_discovery_generation_id(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                ),
+                agent_name=registered_agent.spec.name,
+                catalogue=registered_agent.tool_catalogue,
+                ceiling=ceiling,
+            )
+            current_session = await self.session_store.load(session.id)
+            if current_session is None or current_session.instance_id != session.instance_id:
+                raise ToolDiscoveryViewInconsistentError(
+                    "The session incarnation changed during tool-view inspection."
+                )
+            return tool_discovery_view_inspection(
+                state,
+                session_id=self.project_session_id_for_exposure(session.id),
+                limit=limit,
+            )
+        except ToolDiscoveryViewInconsistentError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolDiscoveryViewInconsistentError(
+                "The durable discovery view conflicts with current session authority."
+            ) from exc
+
+    def register_agent(
+        self,
+        spec: AgentSpec,
+        *,
+        tools: Iterable[Tool] | None = None,
+        tool_effect_reconcilers: Mapping[str, ToolEffectReconciliationRegistration] | None = None,
+        mcp_toolsets: Iterable[McpToolset] | None = None,
+        hosted_tools: Iterable[OpenAIWebSearch] | None = None,
+        context_policy: ContextPolicy | None = None,
+        context_overflow_policy: ContextPolicy | None = None,
+        child_session_context: ChildSessionContextContributor | None = None,
+        tool_exposure_policy: ToolExposurePolicy | None = None,
+        targeted_tool_mode: TargetedToolMode | str | None = None,
+        tool_discovery_mode: ToolDiscoveryMode | str | None = None,
+        tool_policy: ToolPolicy | None = None,
+        runtime_hooks: Iterable[RuntimeHook] | None = None,
+        loop_policies: Iterable[LoopPolicy] | None = None,
+        execution_requirements: ExecutionRequirements | None = None,
+    ) -> AgentSpec:
+        if type(spec) is not AgentSpec:
+            raise TypeError("Agent registration requires an AgentSpec.")
+        stored_spec = _validate_agent_spec(spec)
+        thinking_source: CayuConfigSource = (
+            "explicit" if stored_spec.thinking is not None else self._config_sources["run.thinking"]
+        )
+        if stored_spec.thinking is None and self._config.run.thinking is not None:
+            stored_spec = stored_spec.model_copy(
+                update={
+                    "thinking": ThinkingConfig.model_validate(
+                        self._config.run.thinking.model_dump(
+                            mode="python",
+                            warnings=False,
+                        )
+                    )
+                },
+                deep=True,
+            )
+        if stored_spec.name in self._agents:
+            raise ValueError(f"Agent already registered: {stored_spec.name}")
+        if context_policy is None:
+            stored_context_policy = DefaultContextPolicy()
+        elif isinstance(context_policy, ContextPolicy):
+            stored_context_policy = context_policy
+        else:
+            raise TypeError("context_policy must be a ContextPolicy.")
+        if context_overflow_policy is None:
+            stored_context_overflow_policy = None
+        elif isinstance(context_overflow_policy, ContextPolicy):
+            stored_context_overflow_policy = context_overflow_policy
+        else:
+            raise TypeError("context_overflow_policy must be a ContextPolicy.")
+        if child_session_context is None:
+            stored_child_session_context = None
+        elif type(child_session_context) is ChildSessionContextContributor:
+            if (
+                self.session_store.child_session_notification_version != 1
+                or not self.session_store.supports_public_authority_aliases
+                or self.session_store.public_authority_alias_codec is None
+            ):
+                raise RuntimeError(
+                    "child_session_context requires a v1 child-notification SessionStore "
+                    "with configured public authority aliases."
+                )
+            stored_child_session_context = child_session_context
+        else:
+            raise TypeError(
+                "child_session_context must be a ChildSessionContextContributor or None."
+            )
+        stored_tool_discovery_mode = (
+            None if tool_discovery_mode is None else copy_tool_discovery_mode(tool_discovery_mode)
+        )
+        if tool_exposure_policy is None:
+            stored_tool_exposure_policy = (
+                AllRegisteredToolsExposurePolicy()
+                if stored_tool_discovery_mode is None
+                else StaticToolExposurePolicy(
+                    profile_id=TOOL_DISCOVERY_ONLY_PROFILE_ID,
+                    tools=(),
+                )
+            )
+        elif isinstance(tool_exposure_policy, ToolExposurePolicy):
+            stored_tool_exposure_policy = tool_exposure_policy
+        else:
+            raise TypeError("tool_exposure_policy must be a ToolExposurePolicy.")
+        stored_targeted_tool_mode = (
+            None if targeted_tool_mode is None else copy_targeted_tool_mode(targeted_tool_mode)
+        )
+        if stored_targeted_tool_mode is not None and (
+            not self.session_store.supports_targeted_tool_grants
+            or not self.session_store.supports_public_authority_aliases
+            or self.session_store.public_authority_alias_codec is None
+        ):
+            raise RuntimeError(
+                "targeted_tool_mode requires a SessionStore with durable targeted-grant "
+                "state and configured public authority aliases."
+            )
+        if tool_policy is None:
+            stored_tool_policy = AllowAllToolPolicy()
+        elif isinstance(tool_policy, ToolPolicy):
+            stored_tool_policy = tool_policy
+        else:
+            raise TypeError("tool_policy must be a ToolPolicy.")
+        stored_runtime_hooks = _validate_runtime_hooks(
+            runtime_hooks,
+            field_name="runtime_hooks",
+            redactor=self._secret_redactor,
+        )
+        stored_loop_policies = validate_loop_policies(
+            loop_policies,
+            field_name="loop_policies",
+        )
+        if execution_requirements is None:
+            stored_execution_requirements = ExecutionRequirements.trusted()
+        elif isinstance(execution_requirements, ExecutionRequirements):
+            stored_execution_requirements = ExecutionRequirements.model_validate(
+                execution_requirements.model_dump(mode="python", warnings=False)
+            )
+        else:
+            raise TypeError("execution_requirements must be ExecutionRequirements or None.")
+
+        requested_mcp_toolsets = _copy_refreshable_mcp_toolsets(mcp_toolsets)
+        resolved_mcp_toolsets: list[McpToolset] = []
+        seen_mcp_sources: set[int] = set()
+        seen_mcp_manifest_identities: set[str] = set()
+        for index, toolset in enumerate(requested_mcp_toolsets):
+            source_key = _mcp_refresh_source_key(toolset)
+            if source_key in seen_mcp_sources:
+                raise ValueError("mcp_toolsets must contain unique MCP sources.")
+            seen_mcp_sources.add(source_key)
+            current = self._refreshable_mcp_toolsets.get(source_key)
+            resolved = toolset if current is None else current
+            if not resolved._refresh_source.registration_authority_is_current(resolved.generation):
+                raise ValueError("A refreshable MCP source must be ready during registration.")
+            if not resolved.manifest_identity_is_explicit:
+                raise ValueError(
+                    f"mcp_toolsets[{index}] requires an explicit McpServerSpec.connection_id."
+                )
+            if resolved.manifest_identity in seen_mcp_manifest_identities:
+                raise ValueError("mcp_toolsets must contain unique MCP connection identities.")
+            seen_mcp_manifest_identities.add(resolved.manifest_identity)
+            if current is None and any(
+                registered.manifest_identity == resolved.manifest_identity
+                for registered in self._refreshable_mcp_toolsets.values()
+            ):
+                raise ValueError(
+                    "Refreshable MCP sources require unique connection identities "
+                    "within one CayuApp."
+                )
+            if current is None and _agents_contain_mcp_source(self._agents, resolved):
+                raise ValueError(
+                    "A refreshable MCP source cannot also be registered through static tools."
+                )
+            resolved_mcp_toolsets.append(resolved)
+        stored_mcp_toolsets = tuple(resolved_mcp_toolsets)
+
+        if tools is None:
+            agent_tools = []
+        else:
+            if isinstance(tools, str | bytes):
+                raise TypeError("Agent tools must be an iterable of Tool instances.")
+            try:
+                agent_tools = list(tools)
+            except TypeError as exc:
+                raise TypeError("Agent tools must be an iterable of Tool instances.") from exc
+
+        refreshable_source_keys = {
+            _mcp_refresh_source_key(toolset) for toolset in stored_mcp_toolsets
+        }
+        static_mcp_toolsets: dict[int, McpToolset] = {}
+        for tool in agent_tools:
+            if isinstance(tool, McpToolAdapter):
+                source_key = _mcp_refresh_source_key(tool.toolset)
+                if (
+                    source_key in refreshable_source_keys
+                    or source_key in self._refreshable_mcp_toolsets
+                ):
+                    raise ValueError(
+                        "A refreshable MCP source cannot also be registered through static tools."
+                    )
+                static_mcp_toolsets.setdefault(source_key, tool.toolset)
+        for toolset in stored_mcp_toolsets:
+            agent_tools.extend(sorted(toolset.tools, key=lambda tool: tool.name))
+
+        tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
+        for tool in agent_tools:
+            if not isinstance(tool, Tool):
+                raise TypeError("Agent tools must be Tool instances.")
+            registered_tool = _validate_registered_tool(
+                tool,
+                redactor=self._secret_redactor,
+                timeout_seconds=self._tool_timeout_seconds,
+            )
+            if registered_tool.name in tools_by_name:
+                raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
+            tools_by_name[registered_tool.name] = registered_tool
+
+        if tool_effect_reconcilers is not None:
+            if not isinstance(tool_effect_reconcilers, Mapping):
+                raise TypeError(
+                    "tool_effect_reconcilers must map exact tool names to registrations."
+                )
+            for tool_name, registration in tool_effect_reconcilers.items():
+                if type(tool_name) is not str or tool_name not in tools_by_name:
+                    raise ValueError("Effect reconciler targets an unregistered tool.")
+                registered_tool = tools_by_name[tool_name]
+                tools_by_name[tool_name] = replace(
+                    registered_tool,
+                    effect_reconciler=register_tool_effect_reconciler(
+                        registration,
+                        effect=registered_tool.effect,
+                        redactor=self._secret_redactor,
+                    ),
+                )
+
+        runtime_tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
+        if stored_tool_discovery_mode is not None:
+            search_tool = _validate_registered_tool(
+                SearchToolsTool(),
+                redactor=self._secret_redactor,
+                framework_owned=True,
+                timeout_seconds=self._tool_timeout_seconds,
+            )
+            runtime_tools_by_name[search_tool.name] = search_tool
+
+        if hosted_tools is None:
+            stored_hosted_tools: tuple[OpenAIWebSearch, ...] = ()
+        else:
+            if isinstance(hosted_tools, str | bytes):
+                raise TypeError("Agent hosted_tools must be an iterable of hosted tool instances.")
+            try:
+                copied_hosted_tools = tuple(
+                    copy_openai_web_search(hosted_tool) for hosted_tool in hosted_tools
+                )
+            except TypeError as exc:
+                raise TypeError(
+                    "Agent hosted_tools must be an iterable of hosted tool instances."
+                ) from exc
+            if len(copied_hosted_tools) > 1:
+                raise ValueError("Duplicate OpenAI web search hosted tool registered for agent.")
+            stored_hosted_tools = copied_hosted_tools
+
+        registration_source, registration_symbol = _registration_site()
+        descriptors_by_name = {
+            tool.name: _registered_tool_descriptor(tool) for tool in tools_by_name.values()
+        }
+        tool_catalogue = build_tool_catalog_snapshot(descriptors_by_name.values())
+        tool_capabilities = tuple(
+            RegisteredToolCapability(**descriptors_by_name[name].exposure_capability_material())
+            for name in tools_by_name
+        )
+        all_registered_tool_exposure = ResolvedToolExposure(
+            profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+            catalogue_revision=tool_catalogue.revision,
+            tools=tool_capabilities,
+            registered_count=len(tool_capabilities),
+            ceiling_count=len(tool_capabilities),
+        )
+        # Keep one frozen exposure graph for registration/profile admission and
+        # the expose-all snapshot; the catalogue remains its canonical source.
+        tool_capabilities = all_registered_tool_exposure.tools
+        registered_agent = runtime_records.RegisteredAgentState(
+            spec=stored_spec,
+            tools=MappingProxyType(tools_by_name),
+            runtime_tools=MappingProxyType(runtime_tools_by_name),
+            tool_catalogue=tool_catalogue,
+            tool_capabilities=tool_capabilities,
+            all_registered_tool_exposure=all_registered_tool_exposure,
+            tool_exposure_policy=stored_tool_exposure_policy,
+            tool_exposure_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    stored_tool_exposure_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name=("tool_exposure_policy.execution_profile_identity"),
+                )
+            ),
+            targeted_tool_mode=stored_targeted_tool_mode,
+            tool_discovery_mode=stored_tool_discovery_mode,
+            hosted_tools=stored_hosted_tools,
+            context_policy=stored_context_policy,
+            context_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    stored_context_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="context_policy.execution_profile_identity",
+                )
+            ),
+            context_overflow_policy=stored_context_overflow_policy,
+            context_overflow_policy_execution_profile_identity=(
+                None
+                if stored_context_overflow_policy is None
+                else copy_secret_free_execution_profile_behavior_identity(
+                    stored_context_overflow_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="context_overflow_policy.execution_profile_identity",
+                )
+            ),
+            tool_policy=stored_tool_policy,
+            tool_policy_execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    stored_tool_policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="tool_policy.execution_profile_identity",
+                )
+            ),
+            runtime_hooks=stored_runtime_hooks,
+            loop_policies=stored_loop_policies,
+            loop_policy_execution_profile_identities=tuple(
+                copy_secret_free_execution_profile_behavior_identity(
+                    policy.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name=f"loop_policies[{index}].execution_profile_identity",
+                )
+                for index, policy in enumerate(stored_loop_policies)
+            ),
+            execution_requirements=stored_execution_requirements,
+            mcp_toolsets=stored_mcp_toolsets,
+            context_behavior_execution_profile_identities=(
+                _snapshot_context_behavior_execution_profile_identities(
+                    stored_context_policy,
+                    stored_context_overflow_policy,
+                    redactor=self._secret_redactor,
+                )
+            ),
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
+            child_session_context_contributor=stored_child_session_context,
+        )
+        newly_claimed_static: list[McpToolset] = []
+        newly_claimed_refreshable: list[McpToolset] = []
+        try:
+            for toolset in static_mcp_toolsets.values():
+                if toolset._refresh_source.claim_static_owner(self._mcp_refresh_owner):
+                    newly_claimed_static.append(toolset)
+            for toolset in stored_mcp_toolsets:
+                source_key = _mcp_refresh_source_key(toolset)
+                if source_key in self._refreshable_mcp_toolsets:
+                    continue
+                toolset._refresh_source.claim_refresh_owner(
+                    self._mcp_refresh_owner,
+                    notification_refresh=(
+                        lambda source_key=source_key: self._refresh_mcp_toolset_after_notification(
+                            source_key
+                        )
+                    ),
+                )
+                newly_claimed_refreshable.append(toolset)
+            if self._knowledge_publications_sealed:
+                for registered_tool in tools_by_name.values():
+                    lifecycle = getattr(
+                        registered_tool.tool,
+                        "_knowledge_publication_lifecycle",
+                        None,
+                    )
+                    if isinstance(lifecycle, KnowledgePublicationLifecycle):
+                        lifecycle.seal()
+        except BaseException:
+            for toolset in newly_claimed_refreshable:
+                toolset._refresh_source.release_refresh_owner(self._mcp_refresh_owner)
+            for toolset in newly_claimed_static:
+                toolset._refresh_source.release_static_owner(self._mcp_refresh_owner)
+            raise
+        self._agents[stored_spec.name] = registered_agent
+        self._agent_thinking_sources[stored_spec.name] = thinking_source
+        for toolset in stored_mcp_toolsets:
+            self._refreshable_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
+        return spec
+
+    async def _refresh_mcp_toolset_after_notification(self, source_key: int) -> None:
+        current = self._refreshable_mcp_toolsets.get(source_key)
+        if current is None:
+            return
+        await self.refresh_mcp_toolset(current)
+
+    async def refresh_mcp_toolset(
+        self,
+        toolset: McpToolset,
+    ) -> McpToolsetRefreshResult:
+        """Re-list and atomically publish one explicitly registered MCP source."""
+
+        if not isinstance(toolset, McpToolset):
+            raise TypeError("toolset must be a McpToolset.")
+        source_key = _mcp_refresh_source_key(toolset)
+        current = self._refreshable_mcp_toolsets.get(source_key)
+        if current is None:
+            raise ValueError("MCP toolset refresh requires explicit mcp_toolsets= registration.")
+        source = current._refresh_source
+        previous_generation = current.generation
+        refresh_started = False
+        refresh_dirty_epoch = 0
+        discovery = None
+        try:
+            refresh_dirty_epoch = await source.begin_refresh(
+                owner=self._mcp_refresh_owner,
+                expected_generation=previous_generation,
+            )
+            refresh_started = True
+            candidate, discovery = await current._prepare_refresh()
+            staged_discovery = discovery
+            diff = mcp_toolset_manifest_diff(current, candidate)
+            decision = None
+            if self._mcp_manifest_policy is not None:
+                decision = self._mcp_manifest_policy.decide(
+                    status="changed" if diff.changed else "unchanged",
+                    diff=diff.policy_input(),
+                )
+                if decision.action is McpManifestPolicyAction.BLOCK:
+                    source.quarantine_refresh(
+                        owner=self._mcp_refresh_owner,
+                        expected_generation=previous_generation,
+                        expected_dirty_epoch=refresh_dirty_epoch,
+                    )
+                    raise McpToolsetRefreshBlocked(decision.reason)
+            if not diff.changed:
+
+                def require_unchanged_refresh_current() -> None:
+                    source.require_refresh_current(
+                        owner=self._mcp_refresh_owner,
+                        expected_generation=previous_generation,
+                        expected_dirty_epoch=refresh_dirty_epoch,
+                    )
+
+                await source.finish_unchanged(
+                    owner=self._mcp_refresh_owner,
+                    expected_generation=previous_generation,
+                    expected_dirty_epoch=refresh_dirty_epoch,
+                    publish=lambda: staged_discovery.commit(
+                        validate=require_unchanged_refresh_current
+                    ),
+                )
+                discovery = None
+                return McpToolsetRefreshResult(
+                    toolset=current,
+                    status="unchanged",
+                    previous_generation=previous_generation,
+                    generation=previous_generation,
+                    previous_manifest_hash=current.manifest_hash,
+                    manifest_hash=current.manifest_hash,
+                    diff=diff,
+                    policy_action=(None if decision is None else decision.action.value),
+                )
+
+            async def publish() -> None:
+                async with self._mcp_publication_lock:
+                    published_current = self._refreshable_mcp_toolsets.get(source_key)
+                    if (
+                        published_current is None
+                        or published_current._refresh_source is not source
+                        or published_current.generation != previous_generation
+                    ):
+                        raise McpToolsetUnavailable(
+                            "MCP application publication authority changed during refresh."
+                        )
+                    replacements = {
+                        name: _registered_agent_after_mcp_refresh(
+                            registered_agent,
+                            source=source,
+                            candidate=candidate,
+                            redactor=self._secret_redactor,
+                            timeout_seconds=self._tool_timeout_seconds,
+                        )
+                        for name, registered_agent in self._agents.items()
+                        if _registered_agent_contains_mcp_source(registered_agent, source)
+                    }
+                    if not replacements:
+                        raise RuntimeError("Refreshable MCP source lost its agent registrations.")
+                    next_agents = {**self._agents, **replacements}
+                    next_toolsets = dict(self._refreshable_mcp_toolsets)
+                    next_toolsets[source_key] = candidate
+                    await staged_discovery.commit(
+                        validate=lambda: source.require_refresh_current(
+                            owner=self._mcp_refresh_owner,
+                            expected_generation=previous_generation,
+                            expected_dirty_epoch=refresh_dirty_epoch,
+                        )
+                    )
+                    self._agents = next_agents
+                    self._refreshable_mcp_toolsets = next_toolsets
+
+            await source.publish_refresh(
+                owner=self._mcp_refresh_owner,
+                expected_generation=previous_generation,
+                generation=candidate.generation,
+                expected_dirty_epoch=refresh_dirty_epoch,
+                publish=publish,
+            )
+            discovery = None
+            return McpToolsetRefreshResult(
+                toolset=candidate,
+                status="accepted",
+                previous_generation=previous_generation,
+                generation=candidate.generation,
+                previous_manifest_hash=current.manifest_hash,
+                manifest_hash=candidate.manifest_hash,
+                diff=diff,
+                policy_action=(None if decision is None else decision.action.value),
+            )
+        except BaseException:
+            if discovery is not None:
+                discovery.discard()
+            if refresh_started:
+                source.quarantine_refresh(
+                    owner=self._mcp_refresh_owner,
+                    expected_generation=previous_generation,
+                    expected_dirty_epoch=refresh_dirty_epoch,
+                )
+            raise
+
+    def register_completion_verifier(
+        self,
+        reference: CompletionVerifierRef,
+        verifier: DeterministicCompletionVerifier,
+    ) -> CompletionVerifierRef:
+        """Register one deterministic verifier under its complete durable identity."""
+
+        try:
+            registered = self._completion_verifier_coordinator.register(reference, verifier)
+        except BaseException:
+            del reference, verifier
+            raise
+        del reference, verifier
+        return registered
+
+    def register_completion_result_resolver(
+        self,
+        reference: CompletionResultResolverRef,
+        resolver: CompletionResultResolver,
+    ) -> CompletionResultResolverRef:
+        """Register one result resolver under its complete durable identity."""
+
+        try:
+            registered = self._completion_result_resolver_coordinator.register(
+                reference,
+                resolver,
+            )
+        except BaseException:
+            del reference, resolver
+            raise
+        del reference, resolver
+        return registered
+
+    def register_provider(
+        self,
+        provider: ModelProvider,
+        *,
+        default: bool = False,
+        model_patterns: Iterable[str] | None = None,
+    ) -> ModelProvider:
+        if not isinstance(provider, ModelProvider):
+            raise TypeError("Provider registration requires a ModelProvider.")
+        if not isinstance(default, bool):
+            raise TypeError("Provider default flag must be a bool.")
+        stored_model_patterns = _validate_provider_model_patterns(model_patterns)
+        provider_name = require_clean_nonblank(provider.name, "provider.name")
+        usage_dialect = copy_usage_dialect(provider.usage_dialect, "provider.usage_dialect")
+        if provider_name in self._providers:
+            raise ValueError(f"Provider already registered: {provider_name}")
+
+        registration_source, registration_symbol = _registration_site()
+        self._providers[provider_name] = runtime_records.RegisteredProvider(
+            name=provider_name,
+            provider=provider,
+            execution_profile_identity=(
+                copy_secret_free_execution_profile_behavior_identity(
+                    provider.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="provider.execution_profile_identity",
+                )
+            ),
+            model_patterns=stored_model_patterns,
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
+            usage_dialect=usage_dialect,
+        )
+        if default or self._default_provider_name is None:
+            self._default_provider_name = provider_name
+        return provider
+
+    def register_environment(
+        self,
+        environment: Environment,
+        *,
+        default: bool = False,
+    ) -> Environment:
+        if not isinstance(environment, Environment):
+            raise TypeError("Environment registration requires an Environment.")
+        if not isinstance(default, bool):
+            raise TypeError("Environment default flag must be a bool.")
+        stored_environment = copy_environment(environment)
+        stored_spec = _validate_environment_spec(
+            stored_environment.spec,
+            redactor=self._secret_redactor,
+        )
+        if stored_spec.name in self._environments:
+            raise ValueError(f"Environment already registered: {stored_spec.name}")
+        artifact_store = stored_environment.artifact_store
+        artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
+
+        registration_source, registration_symbol = _registration_site()
+        self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
+            spec=stored_spec,
+            environment=stored_environment,
+            runner_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                None
+                if stored_environment.runner is None
+                else stored_environment.runner.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name="environment.runner.execution_profile_identity",
+            ),
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
+        )
+        if artifact_store_registration is not None:
+            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
+                artifact_store_registration
+            )
+            self._rebuild_session_closure()
+        self._select_default_environment_if_requested(stored_spec.name, default=default)
+        return environment
+
+    def register_environment_factory(
+        self,
+        spec: EnvironmentSpec,
+        factory: EnvironmentFactory,
+        *,
+        artifact_store: ArtifactStore | None = None,
+        default: bool = False,
+    ) -> EnvironmentFactory:
+        if not isinstance(spec, EnvironmentSpec):
+            raise TypeError("Environment factory registration requires an EnvironmentSpec.")
+        if not isinstance(factory, EnvironmentFactory):
+            raise TypeError("Environment factory registration requires an EnvironmentFactory.")
+        if not isinstance(default, bool):
+            raise TypeError("Environment factory default flag must be a bool.")
+        stored_spec = _validate_environment_spec(
+            spec,
+            redactor=self._secret_redactor,
+        )
+        if stored_spec.name in self._environments:
+            raise ValueError(f"Environment already registered: {stored_spec.name}")
+        factory_secret_resolution_scope = factory.secret_resolution_scope
+        if factory_secret_resolution_scope not in ("static", "dynamic"):
+            raise ValueError(
+                "Environment factory secret_resolution_scope must be static or dynamic."
+            )
+        stored_environment = Environment(stored_spec, artifact_store=artifact_store)
+        artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
+
+        registration_source, registration_symbol = _registration_site()
+        self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
+            spec=stored_spec,
+            environment=stored_environment,
+            factory=factory,
+            factory_backed=True,
+            factory_secret_resolution_scope=factory_secret_resolution_scope,
+            factory_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                factory.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name="environment_factory.execution_profile_identity",
+            ),
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
+        )
+        if artifact_store_registration is not None:
+            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
+                artifact_store_registration
+            )
+            self._rebuild_session_closure()
+        self._select_default_environment_if_requested(stored_spec.name, default=default)
+        return factory
+
+    def _validate_artifact_store_registration(
+        self,
+        artifact_store: ArtifactStore | None,
+    ) -> _ArtifactStoreRegistration | None:
+        if artifact_store is None:
+            return None
+        artifact_store_id = require_clean_nonblank(artifact_store.id, "artifact_store.id")
+        artifact_store_id = require_unicode_scalar_text(
+            artifact_store_id,
+            "artifact_store.id",
+        )
+        registered = self._artifact_store_registrations_by_id.get(artifact_store_id)
+        if registered is not None and registered.store is not artifact_store:
+            raise ValueError(
+                "Artifact store id already belongs to a different registered store: "
+                f"{artifact_store_id}"
+            )
+        if registered is not None:
+            return registered
+        return _ArtifactStoreRegistration(
+            store_id=artifact_store_id,
+            store=artifact_store,
+            fingerprint=f"sha256:{sha256(artifact_store_id.encode('utf-8')).hexdigest()}",
+        )
+
+    def _select_default_environment_if_requested(
+        self,
+        environment_name: str,
+        *,
+        default: bool,
+    ) -> None:
+        if default:
+            self._default_environment_name = environment_name
+
+    def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
+        agent_name = require_clean_nonblank(name, "agent.name")
+        registered_agent = self._get_registered_agent(agent_name)
+        return runtime_records.RegisteredAgent(
+            spec=registered_agent.spec.model_copy(deep=True),
+            tools={
+                name: _copy_registered_tool(tool) for name, tool in registered_agent.tools.items()
+            },
+            hosted_tools=tuple(
+                copy_openai_web_search(tool) for tool in registered_agent.hosted_tools
+            ),
+        )
+
+    def resolve_run_model_target(self, request: RunRequest) -> ModelTarget:
+        """Resolve initial provider/model routing without preparing runtime state."""
+
+        return self._session_engine.resolve_initial_model_target(request)
+
+    async def inspect_run_execution_profile(self, request: RunRequest) -> str:
+        """Return the exact initial profile fingerprint without admitting a session.
+
+        The inspection performs the ordinary bounded, read-only run preflights but
+        creates no session and dispatches no provider, tool, hook, or environment
+        factory work. Applications can bind product authority to the returned
+        fingerprint before exposing an advanced execution surface.
+        """
+
+        return (
+            await self.inspect_effective_run_configuration(request)
+        ).execution_profile.fingerprint
+
+    async def inspect_effective_run_configuration(
+        self,
+        request: RunRequest,
+    ) -> EffectiveRunConfiguration:
+        """Return redacted effective run controls and their durable profile identity.
+
+        Inspection performs the ordinary bounded, read-only initial-run preflight.
+        It creates no session and dispatches no provider, tool, hook, or environment
+        factory work.
+        """
+
+        if type(request) is not RunRequest:
+            raise TypeError("Effective-configuration inspection requires a RunRequest.")
+        explicit_fields = frozenset(request.model_fields_set)
+        request = self._with_application_run_defaults(request)
+        prepared = await self._session_engine._prepare_initial_run(
+            request,
+            admit_session=False,
+            store_resolved_existing_session_id=request.session_id,
+        )
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        effective_request = prepared.request
+        effective_thinking = (
+            effective_request.thinking
+            if effective_request.thinking is not None
+            else prepared.registered_agent.spec.thinking
+        )
+        thinking_source: CayuConfigSource
+        if effective_request.thinking is not None:
+            thinking_source = "explicit"
+        else:
+            thinking_source = self._agent_thinking_sources[prepared.registered_agent.spec.name]
+        retry_policy = self._effective_retry_policy(effective_request.retry_policy)
+        return EffectiveRunConfiguration.model_validate(
+            {
+                "max_steps": {
+                    "value": effective_request.max_steps,
+                    "owner": self._config_owners["run.max_steps"],
+                    "source": (
+                        "explicit"
+                        if "max_steps" in explicit_fields
+                        else self._config_sources["run.max_steps"]
+                    ),
+                },
+                "limits": {
+                    "value": effective_request.limits.model_dump(
+                        mode="python",
+                        warnings=False,
+                    ),
+                    "owner": self._config_owners["run.limits"],
+                    "source": (
+                        "explicit"
+                        if "limits" in explicit_fields
+                        else self._config_sources["run.limits"]
+                    ),
+                },
+                "retry_policy": {
+                    "value": retry_policy,
+                    "owner": self._config_owners["run.retry_policy"],
+                    "source": (
+                        "explicit"
+                        if effective_request.retry_policy is not None
+                        else self._config_sources["run.retry_policy"]
+                    ),
+                },
+                "thinking": {
+                    "value": effective_thinking,
+                    "owner": self._config_owners["run.thinking"],
+                    "source": thinking_source,
+                },
+                "execution_profile": prepared.execution_profile,
+            }
+        )
+
+    async def current_prompt_anatomy_sha256(
+        self,
+        *,
+        agent_name: str,
+        environment_name: str | None,
+    ) -> str:
+        """Return a content-free digest of the prompt the current body would install."""
+
+        registered_agent = self._get_registered_agent(agent_name)
+        registered_environment = (
+            None if environment_name is None else self._get_registered_environment(environment_name)
+        )
+        if registered_environment is not None and registered_environment.factory is not None:
+            raise RuntimeError(
+                "Prompt anatomy cannot be inspected for a factory-backed environment before "
+                "session materialization."
+            )
+        workspace_instructions = await self._environment_lifecycle.load_workspace_instructions(
+            registered_environment
+        )
+        rendered = render_initial_system_prompt(
+            agent_system_prompt=registered_agent.spec.system_prompt,
+            workspace_instructions=workspace_instructions,
+        )
+        messages = [] if rendered is None else [Message.text("system", rendered)]
+        return system_prompt_messages_sha256(messages)
+
+    def list_agents(self) -> tuple[str, ...]:
+        """Return the names of all registered agents, sorted."""
+        return tuple(sorted(self._agents))
+
+    def list_providers(self) -> tuple[str, ...]:
+        """Return the names of all registered providers, sorted."""
+        return tuple(sorted(self._providers))
+
+    def list_environments(self) -> tuple[str, ...]:
+        """Return the names of all registered environments (concrete or factory), sorted."""
+        return tuple(sorted(self._environments))
+
+    def has_registered_artifact_store(self) -> bool:
+        """Return whether any registered environment exposes artifact storage.
+
+        The registration paths maintain this value, so the check is constant-time
+        and does not copy registration metadata or materialize environment factories.
+        """
+
+        return bool(self._artifact_store_registrations_by_id)
+
+    def artifact_store_registration_count(self) -> int:
+        """Return the exact registration count without projecting store identities."""
+
+        return len(self._artifact_store_registrations_by_id)
+
+    def artifact_store_registration_fingerprints(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[tuple[str, ...], int]:
+        """Return a bounded snapshot of opaque store identities and the exact count.
+
+        Fingerprints are fixed-size SHA-256 correlations of the store identities
+        accepted at registration. They let protected diagnostics correlate shared
+        registrations without returning a local path or application-defined id.
+        """
+
+        if type(limit) is not int:
+            raise TypeError("Artifact store fingerprint limit must be an integer.")
+        if limit < 1:
+            raise ValueError("Artifact store fingerprint limit must be positive.")
+        registrations = self._artifact_store_registrations_by_id
+        fingerprints = tuple(
+            registration.fingerprint for registration in islice(registrations.values(), limit)
+        )
+        return fingerprints, len(registrations)
+
+    def list_environment_registrations(self) -> tuple[runtime_records.RegisteredEnvironment, ...]:
+        """Return registered environment metadata without materializing factories."""
+        registrations: list[runtime_records.RegisteredEnvironment] = []
+        for name in sorted(self._environments):
+            registered_environment = self._environments[name]
+            registrations.append(
+                runtime_records.RegisteredEnvironment(
+                    spec=registered_environment.spec.model_copy(deep=True),
+                    environment=copy_environment(registered_environment.environment),
+                    runner_execution_profile_identity=(
+                        copy_execution_profile_behavior_identity(
+                            registered_environment.runner_execution_profile_identity
+                        )
+                    ),
+                    factory_execution_profile_identity=(
+                        copy_execution_profile_behavior_identity(
+                            registered_environment.factory_execution_profile_identity
+                        )
+                    ),
+                    factory=registered_environment.factory,
+                    factory_backed=registered_environment.factory_backed,
+                    factory_secret_resolution_scope=registered_environment.factory_secret_resolution_scope,
+                    bound_workspace=(
+                        copy_bound_workspace(registered_environment.bound_workspace)
+                        if registered_environment.bound_workspace is not None
+                        else None
+                    ),
+                    binding_payload=copy_json_value(
+                        registered_environment.binding_payload,
+                        "binding_payload",
+                    )
+                    if registered_environment.binding_payload is not None
+                    else None,
+                    registration_source=registered_environment.registration_source,
+                    registration_symbol=registered_environment.registration_symbol,
+                    binding_generation_id=registered_environment.binding_generation_id,
+                )
+            )
+        return tuple(registrations)
+
+    def _get_registered_agent(self, name: str) -> runtime_records.RegisteredAgentState:
+        agent_name = require_clean_nonblank(name, "agent.name")
+        try:
+            return self._agents[agent_name]
+        except KeyError as exc:
+            raise KeyError(f"Agent not registered: {agent_name}") from exc
+
+    def get_provider(self, name: str | None = None) -> ModelProvider:
+        return self._get_registered_provider(name).provider
+
+    def get_environment(self, name: str | None = None) -> runtime_records.RegisteredEnvironment:
+        registered_environment = self._get_registered_environment(name)
+        if registered_environment is None:
+            raise RuntimeError("No environment registered.")
+        if registered_environment.factory is not None:
+            raise RuntimeError(
+                "Environment is factory-backed and is only concrete for a session: "
+                f"{registered_environment.spec.name}"
+            )
+        return runtime_records.RegisteredEnvironment(
+            spec=registered_environment.spec.model_copy(deep=True),
+            environment=copy_environment(registered_environment.environment),
+            runner_execution_profile_identity=copy_execution_profile_behavior_identity(
+                registered_environment.runner_execution_profile_identity
+            ),
+            factory_execution_profile_identity=copy_execution_profile_behavior_identity(
+                registered_environment.factory_execution_profile_identity
+            ),
+            binding_generation_id=registered_environment.binding_generation_id,
+        )
+
+    def get_environment_factory(self, name: str | None = None) -> EnvironmentFactory:
+        registered_environment = self._get_registered_environment(name)
+        if registered_environment is None:
+            raise RuntimeError("No environment registered.")
+        if registered_environment.factory is None:
+            raise RuntimeError(
+                f"Environment is not factory-backed: {registered_environment.spec.name}"
+            )
+        return registered_environment.factory
+
+    async def attach_file(
+        self,
+        content: bytes,
+        *,
+        filename: str,
+        kind: FileAttachmentKind | str,
+        content_type: str | None = None,
+        environment_name: str | None = None,
+        scope: ArtifactScope = ArtifactScope.SESSION,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> FilePart:
+        """Save a file to the artifact store and return a user-prompt `FilePart` referencing it.
+
+        Attach the returned part to a user `Message` alongside text; the runtime inlines the file
+        into the provider request on the turn it is attached (and re-enforces the per-file/per-request
+        limits). `kind` is `"image"` (jpeg/png/gif/webp) or `"document"` (pdf). For a session-scoped
+        attachment, pass the same `session_id` you will use in the `RunRequest`.
+
+        The bytes are parsed to confirm they are a valid image/PDF whose detected format matches the
+        declared/inferred content type before being stored, which requires the optional file
+        dependencies (`cayu[files]`); without them this raises. The
+        (default or named) environment registration must expose an artifact store. For a
+        factory-backed environment, pass the durable store to
+        `register_environment_factory(..., artifact_store=...)`; `attach_file` uses that stable
+        handle without materializing a session environment.
+        """
+        if type(content) is not bytes:
+            raise TypeError("attach_file content must be bytes.")
+        if not content:
+            raise ValueError("attach_file content cannot be empty.")
+        if len(content) > self._max_file_attachment_bytes:
+            raise ValueError(
+                "File exceeds the prompt attachment byte limit: "
+                f"{len(content)} > {self._max_file_attachment_bytes}"
+            )
+        resolved_kind = FileAttachmentKind(kind)
+        if content_type is None:
+            guessed_type, guessed_encoding = mimetypes.guess_type(filename)
+            if guessed_encoding is not None:
+                raise ValueError(
+                    f"Cannot infer a content type for {filename!r} (encoding {guessed_encoding!r}); "
+                    "pass content_type explicitly."
+                )
+            content_type = guessed_type
+        if content_type is None:
+            raise ValueError(
+                f"Could not infer a content type for {filename!r}; pass content_type explicitly."
+            )
+        resolved_content_type = require_clean_nonblank(content_type, "content_type")
+        validate_file_attachment_content_type(
+            kind=resolved_kind,
+            content_type=resolved_content_type,
+        )
+        await asyncio.to_thread(
+            validate_file_attachment_bytes,
+            kind=resolved_kind,
+            content=content,
+            content_type=resolved_content_type,
+        )
+        registered_environment = self._get_registered_environment(environment_name)
+        artifact_store = _artifact_store(registered_environment)
+        if artifact_store is None:
+            raise RuntimeError(
+                "attach_file requires an environment registration with an artifact store; "
+                "pass artifact_store when registering a factory-backed environment."
+            )
+        artifact = await artifact_store.put_bytes(
+            content,
+            filename=filename,
+            content_type=resolved_content_type,
+            scope=scope,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=_environment_name(registered_environment),
+            metadata=metadata,
+        )
+        return FilePart(
+            attachment=file_attachment(
+                artifact_id=artifact.id,
+                kind=resolved_kind,
+                filename=artifact.filename,
+                content_type=artifact.content_type,
+                size_bytes=artifact.size_bytes,
+                metadata=artifact.metadata,
+            )
+        )
+
+    def _provider_operation_completion_publisher(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        publication_context: ModelCompletionRecoveryContext,
+    ) -> Callable[
+        [ModelCompletionPublicationRequest],
+        Awaitable[ModelCompletionPublicationResult],
+    ]:
+        async def publish(
+            publication: ModelCompletionPublicationRequest,
+        ) -> ModelCompletionPublicationResult:
+            return await self._session_engine._publish_assistant_model_completion(
+                publication,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                task_id=publication_context.task_id,
+                request_metadata=publication_context.request_metadata,
+                structured_output=publication_context.structured_output,
+                thinking=publication_context.thinking,
+                max_steps=publication_context.max_steps,
+                limits=publication_context.limits,
+                budget_limits=publication_context.budget_limits,
+                retry_policy=publication_context.retry_policy,
+                structured_output_attempt=(
+                    publication_context.structured_output_attempt
+                    if (
+                        publication.assistant_step_result is not None
+                        and _has_structured_output_tool_call(
+                            publication.assistant_step_result.tool_calls
+                        )
+                    )
+                    else None
+                ),
+                structured_output_retries=(
+                    max(publication_context.structured_output_attempt - 1, 0)
+                    if publication_context.structured_output_attempt is not None
+                    else 0
+                ),
+                run_limit_accounting=publication_context.run_limit_accounting,
+            )
+
+        return publish
+
+    async def _recover_provider_operation(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None = None,
+    ) -> ProviderOperationRecoveryResult:
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        publication_context = recovery_context or ModelCompletionRecoveryContext()
+        publish = self._provider_operation_completion_publisher(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            publication_context=publication_context,
+        )
+
+        return await self._model_step_executor.recover_provider_operation(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=_environment_name(registered_environment),
+            recovery_context=recovery_context,
+            model_completion_publisher=publish,
+            invocation_context=invocation_context,
+        )
+
+    async def _recover_provider_operation_start(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        start: RecoverableProviderOperationStart,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None = None,
+    ) -> ProviderOperationRecoveryResult:
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        publication_context = recovery_context or ModelCompletionRecoveryContext()
+        publish = self._provider_operation_completion_publisher(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            publication_context=publication_context,
+        )
+
+        return await self._model_step_executor.recover_provider_operation_start(
+            session=session,
+            stage=stage,
+            start=start,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=_environment_name(registered_environment),
+            model_completion_publisher=publish,
+            invocation_context=invocation_context,
+        )
+
+    async def _cancel_provider_operation(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None = None,
+    ) -> ProviderOperationSnapshot | None:
+        return await self._model_step_executor.cancel_provider_operation_for_interruption(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=_environment_name(registered_environment),
+            invocation_context=invocation_context,
+        )
+
+    def _get_registered_provider(
+        self, name: str | None = None
+    ) -> runtime_records.RegisteredProvider:
+        if name is not None:
+            provider_name = require_clean_nonblank(name, "provider.name")
+        else:
+            provider_name = self._default_provider_name
+        if provider_name is None:
+            raise RuntimeError("No model provider registered.")
+        try:
+            return self._providers[provider_name]
+        except KeyError as exc:
+            raise KeyError(f"Provider not registered: {provider_name}") from exc
+
+    def _route_registered_provider_for_model(
+        self,
+        *,
+        model: str,
+    ) -> runtime_records.RegisteredProvider | None:
+        model = require_clean_nonblank(model, "model")
+        matches: list[runtime_records.RegisteredProvider] = []
+        for registered_provider in self._providers.values():
+            if any(fnmatchcase(model, pattern) for pattern in registered_provider.model_patterns):
+                matches.append(registered_provider)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            match_names = ", ".join(provider.name for provider in matches)
+            raise ValueError(
+                f"Model matches multiple registered providers: {model} -> {match_names}"
+            )
+        return matches[0]
+
+    def _get_registered_environment(
+        self,
+        name: str | None = None,
+    ) -> runtime_records.RegisteredEnvironment | None:
+        if name is not None:
+            environment_name = require_clean_nonblank(name, "environment.name")
+        else:
+            environment_name = self._default_environment_name
+        if environment_name is None:
+            return None
+        try:
+            return self._environments[environment_name]
+        except KeyError as exc:
+            raise KeyError(f"Environment not registered: {environment_name}") from exc
+
+    def _get_registered_environment_for_session(
+        self,
+        name: str | None,
+    ) -> runtime_records.RegisteredEnvironment | None:
+        if name is None:
+            return None
+        return self._get_registered_environment(name)
+
+    def _effective_retry_policy(self, request_policy: RetryPolicy | None) -> RetryPolicy:
+        if request_policy is not None:
+            return copy_retry_policy(request_policy)
+        return copy_retry_policy(self._config.run.retry_policy)
+
+    @property
+    def config(self) -> CayuConfig:
+        """Return the immutable effective application configuration."""
+
+        return copy_cayu_config(self._config)
+
+    def _with_application_run_defaults(
+        self,
+        request: _RunConfigurationRequest,
+    ) -> _RunConfigurationRequest:
+        """Resolve omitted run controls once before admission or dispatch."""
+
+        updates: dict[str, object] = {}
+        fields_set = request.model_fields_set
+        if "max_steps" not in fields_set:
+            updates["max_steps"] = self._config.run.max_steps
+        if "limits" not in fields_set:
+            updates["limits"] = self._config.run.copy_limits()
+        if not updates:
+            return request
+        # Loop policies and other request collaborators can hold runtime
+        # objects that are intentionally not deepcopy-safe. The resolved
+        # configuration values above are already detached copies. Preserve the
+        # caller's explicit-field set so durable continuation can distinguish
+        # an inherited value from an explicit override.
+        resolved = request.model_copy(update=updates)
+        object.__setattr__(resolved, "__pydantic_fields_set__", set(fields_set))
+        return resolved
+
+    async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        stream = self._run_with_public_projection(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+        await self._event_writer.recover_persisted_side_effects()
+
+    async def _run_with_public_projection(
+        self,
+        request: RunRequest,
+        *,
+        expected_execution_profile: ExecutionProfileIdentity | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        """Run with pinned authority while retaining the public event contract."""
+
+        stream = self._run_private(
+            request,
+            expected_execution_profile=expected_execution_profile,
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def replay_session(self, request: RuntimeReplayRequest) -> RuntimeReplayReport:
+        """Re-drive one promoted trajectory against this app without live effects."""
+
+        from cayu.evals.runtime_replay import replay_session
+
+        return await replay_session(self, request)
+
+    def _current_work_attempt_execution_owner_id(self) -> str:
+        pid = os.getpid()
+        if pid != self._work_attempt_execution_pid:
+            self._work_attempt_execution_pid = pid
+            self._work_attempt_execution_owner_id = uuid4().hex
+        return f"cayu-work-attempt:{pid}:{self._work_attempt_execution_owner_id}"
+
+    async def admit_work_attempt(
+        self,
+        request: RunRequest | ResumeRequest,
+        *,
+        execution: WorkAttemptExecutionRequest,
+    ) -> WorkAttemptAdmission:
+        """Durably admit an initial or rejected/continue contracted attempt.
+
+        Admission starts and profiles the exact interaction but deliberately
+        dispatches no provider, tool, hook, or mutating environment work. The
+        automatic verified-work worker consumes this authority separately.
+        """
+
+        source_request_type = type(request)
+        execution_request_type = type(execution)
+        source_validation = _copied_public_work_attempt_source_request(
+            request,
+            redactor=self._secret_redactor,
+        )
+        execution_validation = _copied_public_work_attempt_execution_request(
+            execution,
+            redactor=self._secret_redactor,
+        )
+        del request, execution
+        source_failure = source_validation.failure
+        prepared_request = source_validation.result
+        execution_failure = execution_validation.failure
+        stable = execution_validation.result
+        del source_validation, execution_validation
+        if source_failure is not None:
+            del execution_failure, prepared_request, stable
+            raise source_failure from None
+        if execution_failure is not None:
+            del prepared_request, stable
+            raise execution_failure from None
+        if prepared_request is None:
+            del stable
+            if source_request_type not in {RunRequest, ResumeRequest}:
+                raise TypeError(
+                    "Work-attempt admission requires a RunRequest or ResumeRequest."
+                ) from None
+            raise ValueError("Work-attempt source request is invalid.") from None
+        if stable is None:
+            del prepared_request
+            if execution_request_type is not WorkAttemptExecutionRequest:
+                raise TypeError(
+                    "Work-attempt execution requires a WorkAttemptExecutionRequest."
+                ) from None
+            raise ValueError("Work-attempt execution request is invalid.") from None
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt execution.")
+        if not task_store_work_attempt_admission_capability_is_complete(task_store):
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not implement the complete "
+                "work-attempt admission contract."
+            )
+        owner = self._current_work_attempt_execution_owner_id()
+        if type(prepared_request) is RunRequest:
+            prepared_request = self._with_application_run_defaults(prepared_request)
+            if prepared_request.task_id is None:
+                raise ValueError("Initial work-attempt admission requires RunRequest.task_id.")
+            if prepared_request.session_id is None:
+                raise ValueError(
+                    "Initial work-attempt admission requires a caller-stable RunRequest.session_id."
+                )
+            if stable.predecessor_admission_id is not None:
+                raise ValueError(
+                    "Initial work-attempt admission cannot select a predecessor admission."
+                )
+            if stable.task_id is not None and stable.task_id != prepared_request.task_id:
+                raise ValueError(
+                    "Initial work-attempt task selection conflicts with RunRequest.task_id."
+                )
+            source_request_sha256 = self._session_engine.work_attempt_source_request_sha256(
+                prepared_request,
+                kind="initial",
+            )
+            snapshot_validation = capture_sensitive_validation(
+                lambda: (
+                    self._session_engine.work_attempt_source_snapshot(
+                        prepared_request,
+                        kind="initial",
+                        source_request_sha256=source_request_sha256,
+                    ),
+                ),
+                operation_name="Work-attempt source snapshot validation",
+                redactor=self._secret_redactor,
+            )
+            if snapshot_validation.failure is not None:
+                del prepared_request, stable
+                raise_task_store_operation_failure(snapshot_validation.failure)
+            if snapshot_validation.result is None:
+                del prepared_request, stable
+                raise ValueError(
+                    "Work-attempt source snapshot is invalid or exceeds its portable limit."
+                )
+            authority = _WorkAttemptRuntimeAuthority(
+                request=stable,
+                execution_owner_id=owner,
+                kind="initial",
+                source_request_sha256=source_request_sha256,
+                source_request=snapshot_validation.result[0],
+            )
+            del snapshot_validation
+            admission_operation = self._session_engine.admit_initial_work_attempt(
+                prepared_request,
+                authority=authority,
+            )
+            del (
+                stable,
+                owner,
+                prepared_request,
+                source_request_sha256,
+                authority,
+            )
+            return await admission_operation
+        if type(prepared_request) is ResumeRequest:
+            if stable.task_id is None or stable.predecessor_admission_id is None:
+                raise ValueError(
+                    "Continuation work-attempt admission requires task_id and "
+                    "predecessor_admission_id."
+                )
+            session_resolution = await capture_task_store_operation(
+                lambda session_id=prepared_request.session_id: (
+                    self._resolve_public_session_authority(session_id)
+                ),
+                operation_name="Work-attempt continuation session resolution",
+                redactor=self._secret_redactor,
+            )
+            if session_resolution.failure is not None:
+                raise_task_store_operation_failure(session_resolution.failure)
+            if session_resolution.result is None:
+                raise RuntimeError(
+                    "Work-attempt continuation session resolution returned no result."
+                )
+            session_id, _store_resolved_session_id = session_resolution.result
+            del session_resolution
+            prepared_request = prepared_request.model_copy(update={"session_id": session_id})
+            source_request_sha256 = self._session_engine.work_attempt_source_request_sha256(
+                prepared_request,
+                kind="continuation",
+            )
+            snapshot_validation = capture_sensitive_validation(
+                lambda: (
+                    self._session_engine.work_attempt_source_snapshot(
+                        prepared_request,
+                        kind="continuation",
+                        source_request_sha256=source_request_sha256,
+                    ),
+                ),
+                operation_name="Work-attempt source snapshot validation",
+                redactor=self._secret_redactor,
+            )
+            if snapshot_validation.failure is not None:
+                del prepared_request, stable, session_id, _store_resolved_session_id
+                raise_task_store_operation_failure(snapshot_validation.failure)
+            if snapshot_validation.result is None:
+                del prepared_request, stable, session_id, _store_resolved_session_id
+                raise ValueError(
+                    "Work-attempt source snapshot is invalid or exceeds its portable limit."
+                )
+            authority = _WorkAttemptRuntimeAuthority(
+                request=stable,
+                execution_owner_id=owner,
+                kind="continuation",
+                source_request_sha256=source_request_sha256,
+                source_request=snapshot_validation.result[0],
+            )
+            del snapshot_validation
+            admission_operation = self._session_engine.admit_continuation_work_attempt(
+                prepared_request,
+                authority=authority,
+            )
+            del (
+                stable,
+                owner,
+                prepared_request,
+                session_id,
+                _store_resolved_session_id,
+                source_request_sha256,
+                authority,
+            )
+            return await admission_operation
+        raise AssertionError("Validated work-attempt source request has an unknown type.")
+
+    async def _execute_work_attempt(self, request: WorkAttemptRunRequest) -> AsyncIterator[Event]:
+        """Resolve this process's exact claim and delegate governed execution.
+
+        Kept internal until the complete verified-worker capability and
+        recovery contract are exposed together. No caller admission object,
+        source settings or execution-owner identity cross this entrance.
+        """
+        request_type = type(request)
+        request_validation = capture_sensitive_validation(
+            lambda value=request: copy_work_attempt_run_request(value),
+            operation_name="Work-attempt run-request validation",
+            redactor=self._secret_redactor,
+        )
+        del request
+        if request_validation.failure is not None:
+            raise request_validation.failure from None
+        stable = request_validation.result
+        if stable is None:
+            if request_type is not WorkAttemptRunRequest:
+                raise TypeError(
+                    "Work-attempt execution requires a WorkAttemptRunRequest."
+                ) from None
+            raise ValueError("Work-attempt run request is invalid.")
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt execution.")
+        outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(stable.admission_id),
+            operation_name="Work-attempt run admission lookup",
+            redactor=self._secret_redactor,
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result: require_work_attempt_admission_result(
+                value, operation_name="Work-attempt run admission lookup"
+            ),
+            operation_name="Work-attempt run authority validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        admission = validation.result
+        if admission is None:
+            raise WorkAttemptRecoveryRequired("Work-attempt execution has no admission.")
+        claim = admission.claim
+        if (
+            admission.admission_id != stable.admission_id
+            or claim.claim_id != stable.claim_id
+            or claim.worker_id != stable.worker_id
+            or claim.generation != stable.generation
+            or claim.execution_owner_id != self._current_work_attempt_execution_owner_id()
+        ):
+            raise WorkAttemptExecutionClaimLost("Work-attempt execution claim is not owned here.")
+        # The delegated stream owns its execution context and restores this
+        # caller's context between advances. Do not let admission's inherited
+        # epoch escape the stream and fence later decision/result publication.
+        # Removing local tokens is not durable release or a dispatch grant.
+        _deactivate_session_interaction(admission.session_id)
+        _deactivate_session_run_fence(admission.session_id)
+        stream = self._session_engine.execute_admitted_work_attempt(
+            admission, lease_seconds=stable.lease_seconds
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def renew_work_attempt_claim(
+        self,
+        request: WorkAttemptClaimRenewalRequest,
+    ) -> WorkAttemptAdmission:
+        """Renew the exact live execution generation owned by this process."""
+
+        request_type = type(request)
+        request_validation = _copied_public_work_attempt_claim_renewal_request(
+            request,
+            redactor=self._secret_redactor,
+        )
+        del request
+        request_failure = request_validation.failure
+        stable = request_validation.result
+        del request_validation
+        if request_failure is not None:
+            raise request_failure from None
+        if stable is None:
+            if request_type is not WorkAttemptClaimRenewalRequest:
+                raise TypeError(
+                    "Claim renewal requires a WorkAttemptClaimRenewalRequest."
+                ) from None
+            raise ValueError("Work-attempt claim-renewal request is invalid.") from None
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt renewal.")
+        if not task_store_work_attempt_admission_capability_is_complete(task_store):
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not implement the complete "
+                "work-attempt admission contract."
+            )
+        claim_request = WorkAttemptExecutionClaimRequest(
+            admission_id=stable.admission_id,
+            claim_id=stable.claim_id,
+            worker_id=stable.worker_id,
+            execution_owner_id=self._current_work_attempt_execution_owner_id(),
+            generation=stable.generation,
+            lease_seconds=stable.lease_seconds,
+        )
+        prior_outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(stable.admission_id),
+            operation_name="Work-attempt renewal authority lookup",
+            redactor=self._secret_redactor,
+        )
+        if prior_outcome.failure is not None:
+            raise_task_store_operation_failure(prior_outcome.failure)
+        if prior_outcome.result is None:
+            raise KeyError(f"Work-attempt admission not found: {stable.admission_id}")
+        prior_validation = capture_sensitive_result_validation(
+            lambda value=prior_outcome.result: require_work_attempt_admission_result(
+                value,
+                operation_name="Work-attempt renewal authority lookup",
+            ),
+            operation_name="Work-attempt renewal authority validation",
+            redactor=self._secret_redactor,
+        )
+        del prior_outcome
+        if prior_validation.failure is not None:
+            raise_task_store_operation_failure(prior_validation.failure)
+        prior = prior_validation.result
+        del prior_validation
+        if prior is None:
+            raise RuntimeError("Work-attempt renewal authority lookup returned no authority.")
+        outcome = await capture_task_store_operation(
+            lambda: task_store.renew_work_attempt_execution_claim(claim_request),
+            operation_name="Work-attempt execution-claim renewal",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="renew_work_attempt_execution_claim",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result, previous=prior: require_work_attempt_claim_result(
+                value,
+                previous,
+                claim_request,
+                operation_name="Work-attempt execution-claim renewal",
+                allowed_states=WORK_ATTEMPT_RENEWABLE_STATES,
+                allowed_previous_states=WORK_ATTEMPT_RENEWABLE_STATES,
+                renewal=True,
+            ),
+            operation_name="Work-attempt execution-claim renewal result validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome, prior
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        renewed = validation.result
+        del validation
+        if renewed is None:
+            raise RuntimeError("Work-attempt execution-claim renewal returned no authority.")
+        current_outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(stable.admission_id),
+            operation_name="Work-attempt renewal reconciliation lookup",
+            redactor=self._secret_redactor,
+        )
+        if current_outcome.failure is not None:
+            raise_task_store_operation_failure(current_outcome.failure)
+        if current_outcome.result is None:
+            raise RuntimeError("Renewed work-attempt authority is no longer durable.")
+        current_validation = capture_sensitive_result_validation(
+            lambda value=current_outcome.result, previous=renewed: (
+                require_work_attempt_claim_result(
+                    value,
+                    previous,
+                    claim_request,
+                    operation_name="Work-attempt execution-claim renewal reconciliation",
+                    allowed_states=WORK_ATTEMPT_RENEWABLE_STATES,
+                    allowed_previous_states=WORK_ATTEMPT_RENEWABLE_STATES,
+                    renewal=True,
+                )
+            ),
+            operation_name="Work-attempt renewal reconciliation result validation",
+            redactor=self._secret_redactor,
+        )
+        del current_outcome, renewed
+        if current_validation.failure is not None:
+            raise_task_store_operation_failure(current_validation.failure)
+        current = current_validation.result
+        del current_validation
+        if current is None:
+            raise RuntimeError("Work-attempt renewal reconciliation returned no authority.")
+        return current
+
+    async def _settle_first_work_attempt_recovery_predecessor(
+        self,
+        *,
+        recovering: WorkAttemptAdmission,
+        claim_request: WorkAttemptExecutionClaimRequest,
+    ) -> None:
+        """Fence and settle the first crashed session owner before reactivation."""
+
+        task_store = self.task_store
+        if task_store is None:  # pragma: no cover - checked by the public owner
+            raise RuntimeError("task_store is required for work-attempt recovery.")
+
+        async def require_exact_recovery_claim() -> None:
+            current_outcome = await capture_task_store_operation(
+                lambda: task_store.claim_work_attempt_recovery(claim_request),
+                operation_name="Work-attempt predecessor settlement authority replay",
+                redactor=self._secret_redactor,
+                mutation_store=task_store,
+                mutation_method_name="claim_work_attempt_recovery",
+            )
+            if current_outcome.failure is not None:
+                raise_task_store_operation_failure(current_outcome.failure)
+            current_validation = capture_sensitive_result_validation(
+                lambda value=current_outcome.result: require_work_attempt_claim_result(
+                    value,
+                    recovering,
+                    claim_request,
+                    operation_name="Work-attempt predecessor settlement authority",
+                    allowed_states=frozenset(
+                        {
+                            WorkAttemptAdmissionState.RECOVERING,
+                            WorkAttemptAdmissionState.ACTIVE,
+                        }
+                    ),
+                    allowed_previous_states=frozenset({WorkAttemptAdmissionState.RECOVERING}),
+                ),
+                operation_name=("Work-attempt predecessor settlement authority validation"),
+                redactor=self._secret_redactor,
+            )
+            del current_outcome
+            if current_validation.failure is not None:
+                raise_task_store_operation_failure(current_validation.failure)
+            authenticated = current_validation.result
+            del current_validation
+            if authenticated is None:
+                raise RuntimeError("Work-attempt predecessor settlement returned no authority.")
+            if authenticated.state is WorkAttemptAdmissionState.ACTIVE:
+                del authenticated
+                raise _WorkAttemptRecoveryAlreadyActive
+            del authenticated
+
+        try:
+            recovered = await self._session_engine._recover_work_attempt_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=recovering.session_id,
+                    reason="work_attempt_predecessor_owner_expired",
+                ),
+                before_mutation=require_exact_recovery_claim,
+                interaction_id=recovering.interaction_id,
+                admission=recovering,
+            )
+        except _WorkAttemptRecoveryAlreadyActive:
+            return
+        if type(recovered) is not IncompleteSessionRecoveryResult:
+            raise RuntimeError("Work-attempt predecessor settlement returned an invalid result.")
+        if recovered.session_id != recovering.session_id:
+            raise RuntimeError("Work-attempt predecessor settlement changed the session identity.")
+        if IncompleteSessionRecoveryAction.SKIPPED_ACTIVE in recovered.actions:
+            raise WorkAttemptRecoveryRequired(
+                "Work-attempt predecessor settlement is still owned by another recovery."
+            )
+        if recovered.status not in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        }:
+            raise WorkAttemptRecoveryRequired(
+                "Work-attempt predecessor settlement remains active or ambiguous."
+            )
+
+    async def _load_work_attempt_runtime_checkpoint(
+        self,
+        session_id: str,
+        *,
+        operation_name: str,
+    ) -> dict[str, Any] | None:
+        """Load authenticated runtime checkpoint authority for work recovery."""
+
+        raw_checkpoint = await read_work_attempt_session_store(
+            lambda: self._runtime_session_store.load_checkpoint(session_id),
+            operation_name=operation_name,
+            redactor=self._secret_redactor,
+        )
+        checkpoint_validation = capture_work_attempt_checkpoint_result(
+            raw_checkpoint,
+            operation_name=operation_name,
+            redactor=self._secret_redactor,
+        )
+        del raw_checkpoint
+        if checkpoint_validation.failure is not None:
+            raise_task_store_operation_failure(checkpoint_validation.failure)
+        checkpoint = checkpoint_validation.result
+        del checkpoint_validation
+        if active_invocation_execution_profile_from_checkpoint(
+            checkpoint
+        ) is None and invocation_lifecycle_receipt_history_present(checkpoint):
+            raise WorkAttemptRecoveryRequired(
+                "Work-attempt recovery lost durable invocation profile authority."
+            )
+        return checkpoint
+
+    async def recover_work_attempt(
+        self,
+        request: WorkAttemptRecoveryRequest,
+    ) -> WorkAttemptAdmission:
+        """Replace an expired generation after positive session quiescence."""
+
+        operation = self._claim_work_attempt_recovery(request)
+        del request
+        try:
+            ownership = await operation
+        finally:
+            del operation
+        return await self._recover_claimed_work_attempt(ownership)
+
+    async def _claim_work_attempt_recovery(
+        self, request: WorkAttemptRecoveryRequest
+    ) -> WorkAttemptRecoveryOwnership:
+        """Acknowledge an exact claim before the worker starts its heartbeat."""
+
+        request_type = type(request)
+        request_validation = _copied_public_work_attempt_recovery_request(
+            request,
+            redactor=self._secret_redactor,
+        )
+        del request
+        request_failure = request_validation.failure
+        stable = request_validation.result
+        del request_validation
+        if request_failure is not None:
+            raise request_failure from None
+        if stable is None:
+            if request_type is not WorkAttemptRecoveryRequest:
+                raise TypeError(
+                    "Work-attempt recovery requires a WorkAttemptRecoveryRequest."
+                ) from None
+            raise ValueError("Work-attempt recovery request is invalid.") from None
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt recovery.")
+        if not task_store_work_attempt_admission_capability_is_complete(task_store):
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not implement the complete "
+                "work-attempt admission contract."
+            )
+        claim_request = WorkAttemptExecutionClaimRequest(
+            admission_id=stable.admission_id,
+            claim_id=stable.claim_id,
+            worker_id=stable.worker_id,
+            execution_owner_id=self._current_work_attempt_execution_owner_id(),
+            generation=stable.generation,
+            lease_seconds=stable.lease_seconds,
+        )
+        prior_outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(stable.admission_id),
+            operation_name="Work-attempt recovery authority lookup",
+            redactor=self._secret_redactor,
+        )
+        if prior_outcome.failure is not None:
+            raise_task_store_operation_failure(prior_outcome.failure)
+        if prior_outcome.result is None:
+            raise KeyError(f"Work-attempt admission not found: {stable.admission_id}")
+        prior_validation = capture_sensitive_result_validation(
+            lambda value=prior_outcome.result: require_work_attempt_admission_result(
+                value,
+                operation_name="Work-attempt recovery authority lookup",
+            ),
+            operation_name="Work-attempt recovery authority validation",
+            redactor=self._secret_redactor,
+        )
+        del prior_outcome
+        if prior_validation.failure is not None:
+            raise_task_store_operation_failure(prior_validation.failure)
+        prior = prior_validation.result
+        del prior_validation
+        if prior is None:
+            raise RuntimeError("Work-attempt recovery authority lookup returned no authority.")
+        if prior.state is WorkAttemptAdmissionState.PREPARING:
+            validation = capture_sensitive_result_validation(
+                lambda prior=prior: self._session_engine.reconstruct_preparing_work_attempt_source(
+                    prior
+                ),
+                operation_name="Prepared recovery source validation",
+                redactor=self._secret_redactor,
+            )
+            if validation.failure is not None:
+                del prior
+                raise_task_store_operation_failure(validation.failure)
+            del validation
+        # Reject ambiguous migrated lifecycle state before claiming the next
+        # TaskStore generation.  The runtime adapter is the sole owner of root
+        # checkpoint migration; bypassing it here could reinterpret pre-v5
+        # caller-writable state as executable recovery authority.
+        await self._load_work_attempt_runtime_checkpoint(
+            prior.session_id,
+            operation_name="Work-attempt recovery checkpoint preflight",
+        )
+        claimed_outcome = await capture_task_store_operation(
+            lambda: task_store.claim_work_attempt_recovery(claim_request),
+            operation_name="Work-attempt recovery claim",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="claim_work_attempt_recovery",
+        )
+        if claimed_outcome.failure is not None:
+            raise_task_store_operation_failure(claimed_outcome.failure)
+        claim_validation = capture_sensitive_result_validation(
+            lambda value=claimed_outcome.result, previous=prior: require_work_attempt_claim_result(
+                value,
+                previous,
+                claim_request,
+                operation_name="Work-attempt recovery claim",
+                allowed_states=frozenset(
+                    {
+                        WorkAttemptAdmissionState.PREPARING,
+                        WorkAttemptAdmissionState.RECOVERING,
+                        WorkAttemptAdmissionState.ACTIVE,
+                    }
+                ),
+                allowed_previous_states=frozenset(
+                    {
+                        WorkAttemptAdmissionState.PREPARING,
+                        WorkAttemptAdmissionState.ACTIVE,
+                        WorkAttemptAdmissionState.RECOVERING,
+                    }
+                ),
+            ),
+            operation_name="Work-attempt recovery claim result validation",
+            redactor=self._secret_redactor,
+        )
+        del claimed_outcome, prior
+        if claim_validation.failure is not None:
+            raise_task_store_operation_failure(claim_validation.failure)
+        claimed = claim_validation.result
+        del claim_validation
+        if claimed is None:
+            raise RuntimeError("Work-attempt recovery claim returned no authority.")
+        return _acknowledged_work_attempt_recovery(task_store, claimed, claim_request)
+
+    async def _recover_claimed_work_attempt(
+        self, ownership: WorkAttemptRecoveryOwnership
+    ) -> WorkAttemptAdmission:
+        """Continue existing cleanup under acknowledged same-runtime ownership."""
+        if type(ownership) is not WorkAttemptRecoveryOwnership:
+            raise TypeError("Work-attempt recovery requires acknowledged runtime ownership.")
+        task_store, claim_request, claimed = ownership.store, ownership.request, ownership.admission
+        if (
+            task_store is not self.task_store
+            or claim_request.execution_owner_id != self._current_work_attempt_execution_owner_id()
+        ):
+            raise WorkAttemptExecutionClaimLost("Recovery ownership belongs to another runtime.")
+        if claimed.state is WorkAttemptAdmissionState.PREPARING:
+            return await self._session_engine.recover_preparing_work_attempt(ownership)
+        del ownership
+        stable = WorkAttemptRecoveryRequest(
+            admission_id=claim_request.admission_id,
+            claim_id=claim_request.claim_id,
+            worker_id=claim_request.worker_id,
+            generation=claim_request.generation,
+            lease_seconds=claim_request.lease_seconds,
+        )
+        # A successful recovery claim replaces the prior execution generation.
+        # Retire any predecessor epoch copied into this caller before either
+        # replaying an already-active generation or mutating the recovered
+        # session.  The active replay branch below reinstalls only the current
+        # durable epoch after validating its complete authority.
+        _deactivate_session_run_fence(claimed.session_id)
+        released_recovery = await self._session_engine.reconcile_released_work_attempt_recovery(
+            claimed
+        )
+        if released_recovery is not None:
+            return released_recovery
+        already_active = claimed.state is WorkAttemptAdmissionState.ACTIVE
+        if already_active and claimed.execution_stop is not None:
+            raise WorkAttemptRecoveryRequired("Stopped work-attempt cleanup is unproven.")
+        if already_active and claimed.recovery_evidence_sha256 is None:
+            raise RuntimeError("Recovered admission has no durable recovery evidence.")
+        if already_active:
+            raw_session = await read_work_attempt_session_store(
+                lambda session_id=claimed.session_id: self._runtime_session_store.load(session_id),
+                operation_name="Recovered work-attempt session lookup",
+                redactor=self._secret_redactor,
+            )
+            if raw_session is None:
+                raise WorkAttemptRecoveryRequired("Recovered admission has no durable session.")
+            session_validation = capture_work_attempt_session_result(
+                raw_session,
+                operation_name="Recovered work-attempt session lookup",
+                redactor=self._secret_redactor,
+            )
+            del raw_session
+            if session_validation.failure is not None:
+                raise_task_store_operation_failure(session_validation.failure)
+            session = session_validation.result
+            del session_validation
+            if session is None:
+                raise RuntimeError("Recovered work-attempt session lookup returned no session.")
+            profile = execution_profile_from_session_metadata(session.metadata)
+            checkpoint = await self._load_work_attempt_runtime_checkpoint(
+                session.id,
+                operation_name="Recovered work-attempt checkpoint lookup",
+            )
+            recovery_authority = work_attempt_recovery_session_authority(claimed.claim)
+            checkpoint_recovery_authority = work_attempt_recovery_session_authority_from_checkpoint(
+                checkpoint
+            )
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if (
+                SessionInvocationBinding(
+                    id=session.id,
+                    session_instance_id=session.instance_id,
+                    invocation=session.invocation,
+                )
+                != claimed.session_invocation
+                or profile is None
+                or profile.fingerprint != claimed.source_execution_profile_fingerprint
+                or checkpoint_recovery_authority != recovery_authority
+                or (
+                    session.status is SessionStatus.RUNNING
+                    and (
+                        active_profile is None
+                        or active_profile.interaction_id != claimed.interaction_id
+                        or active_profile.profile != profile
+                        or not active_invocation_execution_profile_matches_session_epoch(
+                            active_profile,
+                            session_id=session.id,
+                            run_epoch=session.run_epoch,
+                        )
+                        or active_invocation_execution_profile_is_released(
+                            active_profile,
+                            session_id=session.id,
+                            run_epoch=session.run_epoch,
+                        )
+                    )
+                )
+            ):
+                raise WorkAttemptRecoveryRequired(
+                    "Recovered receipt conflicts with immutable session authority."
+                )
+            if session.status is SessionStatus.RUNNING:
+                _activate_session_run_fence(session)
+                _activate_session_interaction(session.id, claimed.interaction_id)
+            return await self._session_engine._fan_out_work_attempt_interaction_started(
+                claimed,
+                lease_seconds=stable.lease_seconds,
+            )
+        raw_session = await read_work_attempt_session_store(
+            lambda session_id=claimed.session_id: self._runtime_session_store.load(session_id),
+            operation_name="Work-attempt recovery session lookup",
+            redactor=self._secret_redactor,
+        )
+        if raw_session is None:
+            raise WorkAttemptRecoveryRequired(
+                "Recovery cannot prove settlement because the admitted session is missing."
+            )
+        session_validation = capture_work_attempt_session_result(
+            raw_session,
+            operation_name="Work-attempt recovery session lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_session
+        if session_validation.failure is not None:
+            raise_task_store_operation_failure(session_validation.failure)
+        session = session_validation.result
+        del session_validation
+        if session is None:
+            raise RuntimeError("Work-attempt recovery session lookup returned no session.")
+        profile = execution_profile_from_session_metadata(session.metadata)
+        if (
+            profile is None
+            or profile.fingerprint != claimed.source_execution_profile_fingerprint
+            or SessionInvocationBinding(
+                id=session.id,
+                session_instance_id=session.instance_id,
+                invocation=session.invocation,
+            )
+            != claimed.session_invocation
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Recovery cannot prove the admitted session and source profile."
+            )
+        recovery_authority = work_attempt_recovery_session_authority(claimed.claim)
+        recovery_marker = recovery_authority.checkpoint_value()
+        checkpoint = await self._load_work_attempt_runtime_checkpoint(
+            session.id,
+            operation_name="Work-attempt recovery checkpoint lookup",
+        )
+        pending_initial_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
+        if pending_initial_interaction_id is not None:
+            raw_deferred_input = await read_work_attempt_session_store(
+                lambda session_id=session.id: (
+                    self._runtime_session_store.load_deferred_interaction_input(session_id)
+                ),
+                operation_name="Work-attempt recovery deferred-input lookup",
+                redactor=self._secret_redactor,
+            )
+            deferred_validation = capture_work_attempt_deferred_input_result(
+                raw_deferred_input,
+                operation_name="Work-attempt recovery deferred-input lookup",
+                redactor=self._secret_redactor,
+            )
+            del raw_deferred_input
+            if deferred_validation.failure is not None:
+                raise_task_store_operation_failure(deferred_validation.failure)
+            deferred_authority = deferred_validation.result
+            del deferred_validation
+            if deferred_authority != (pending_initial_interaction_id, True):
+                raise WorkAttemptRecoveryRequired(
+                    "Recovery requires the authenticated complete initial transcript; "
+                    "source-only migrated input must start a new session."
+                )
+        checkpoint_recovery_authority = work_attempt_recovery_session_authority_from_checkpoint(
+            checkpoint
+        )
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        active_model_completion = await read_work_attempt_session_store(
+            lambda session_id=session.id: (
+                self._runtime_session_store.load_active_model_completion_stage(session_id)
+            ),
+            operation_name="Work-attempt recovery active model-stage lookup",
+            redactor=self._secret_redactor,
+        )
+        has_active_model_completion = active_model_completion is not None
+        del active_model_completion
+        exact_session_replay = (
+            checkpoint_recovery_authority == recovery_authority
+            and session.status is SessionStatus.RUNNING
+            and active_profile is not None
+            and active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+            and not active_invocation_execution_profile_is_released(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+            and active_profile.interaction_id == claimed.interaction_id
+            and active_profile.profile == profile
+        )
+        predecessor_settlement_required = checkpoint_recovery_authority is None and (
+            claimed.execution_stop is not None
+            or session.status
+            not in {
+                SessionStatus.COMPLETED,
+                SessionStatus.FAILED,
+                SessionStatus.INTERRUPTED,
+            }
+            or (
+                active_profile is not None
+                and not active_invocation_execution_profile_is_released(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+            )
+        )
+        if predecessor_settlement_required:
+            if (
+                active_profile is None
+                or not active_invocation_execution_profile_matches_session_epoch(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+                or active_profile.interaction_id != claimed.interaction_id
+                or active_profile.profile != profile
+            ):
+                raise WorkAttemptRecoveryRequired(
+                    "Recovery cannot prove the crashed predecessor invocation authority."
+                )
+            model_result_ready = (
+                await self._session_engine.has_recoverable_work_attempt_model_result(claimed)
+            )
+            if has_active_model_completion and not model_result_ready:
+                raise WorkAttemptRecoveryRequired(
+                    "Recovery is fenced while model-completion settlement remains active."
+                )
+            _reject_unresumable_session_checkpoint(
+                session,
+                checkpoint,
+                redactor=self._secret_redactor,
+                allow_pending_tool_round=model_result_ready,
+                allowed_initial_transcript_interaction_id=(
+                    claimed.interaction_id if claimed.kind == "initial" else None
+                ),
+            )
+            await self._settle_first_work_attempt_recovery_predecessor(
+                recovering=claimed,
+                claim_request=claim_request,
+            )
+            del (
+                claim_request,
+                claimed,
+                session,
+                profile,
+                recovery_authority,
+                recovery_marker,
+                checkpoint,
+                checkpoint_recovery_authority,
+                active_profile,
+                has_active_model_completion,
+                exact_session_replay,
+                predecessor_settlement_required,
+            )
+            return await self.recover_work_attempt(stable)
+        if claimed.execution_stop is not None:
+            raise WorkAttemptRecoveryRequired("Stopped work-attempt cleanup is unproven.")
+        prior_recovery_transition = False
+        if (
+            not exact_session_replay
+            and checkpoint_recovery_authority is not None
+            and session.status is SessionStatus.RUNNING
+            and active_profile is not None
+            and active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+            and not active_invocation_execution_profile_is_released(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+            and active_profile.interaction_id == claimed.interaction_id
+            and active_profile.profile == profile
+        ):
+            prior_claim_outcome = await capture_task_store_operation(
+                lambda: task_store.load_work_attempt_execution_claim(
+                    checkpoint_recovery_authority.claim_id
+                ),
+                operation_name="Prior work-attempt recovery claim lookup",
+                redactor=self._secret_redactor,
+            )
+            if prior_claim_outcome.failure is not None:
+                raise_task_store_operation_failure(prior_claim_outcome.failure)
+            raw_prior_claim = prior_claim_outcome.result
+            del prior_claim_outcome
+            if raw_prior_claim is None:
+                raise WorkAttemptRecoveryRequired(
+                    "Running session recovery marker has no historical claim authority."
+                )
+
+            def validate_prior_claim(
+                value: object = raw_prior_claim,
+                *,
+                expected_admission_id: str = claimed.admission_id,
+                expected_generation: int = claimed.claim.generation,
+                replacement_claimed_at: datetime = claimed.claim.claimed_at,
+            ) -> bool:
+                prior_claim = require_work_attempt_execution_claim_result(
+                    value,
+                    operation_name="Prior work-attempt recovery claim lookup",
+                )
+                if (
+                    work_attempt_recovery_session_authority(prior_claim)
+                    != checkpoint_recovery_authority
+                    or prior_claim.admission_id != expected_admission_id
+                    or prior_claim.generation >= expected_generation
+                    or prior_claim.lease_expires_at > replacement_claimed_at
+                ):
+                    raise WorkAttemptRecoveryRequired(
+                        "Running session recovery marker is not an expired predecessor "
+                        "of the current claim."
+                    )
+                return True
+
+            prior_claim_validation = capture_sensitive_result_validation(
+                validate_prior_claim,
+                operation_name="Prior work-attempt recovery claim result validation",
+                redactor=self._secret_redactor,
+            )
+            del raw_prior_claim, validate_prior_claim
+            if prior_claim_validation.failure is not None:
+                raise_task_store_operation_failure(prior_claim_validation.failure)
+            prior_claim_is_valid = prior_claim_validation.result
+            del prior_claim_validation
+            if prior_claim_is_valid is not True:
+                raise RuntimeError("Prior work-attempt recovery claim validation failed closed.")
+            prior_recovery_transition = True
+        if has_active_model_completion:
+            raise WorkAttemptRecoveryRequired(
+                "Recovery is fenced while model-completion settlement remains active."
+            )
+        if not exact_session_replay:
+            source_session_sha256 = _work_attempt_recovery_session_snapshot_sha256(session)
+            source_checkpoint_sha256 = _work_attempt_recovery_checkpoint_snapshot_sha256(checkpoint)
+
+            def claim_recovered_session_execution(
+                current_session: Session,
+                current_checkpoint: dict[str, Any] | None,
+                *,
+                interaction_id: str = claimed.interaction_id,
+                admission_kind: str = claimed.kind,
+            ) -> dict[str, Any]:
+                if (
+                    _work_attempt_recovery_session_snapshot_sha256(current_session)
+                    != source_session_sha256
+                    or _work_attempt_recovery_checkpoint_snapshot_sha256(current_checkpoint)
+                    != source_checkpoint_sha256
+                ):
+                    raise WorkAttemptRecoveryRequired(
+                        "Session authority changed after recovery was claimed."
+                    )
+                _reject_unresumable_session_checkpoint(
+                    current_session,
+                    current_checkpoint,
+                    redactor=self._secret_redactor,
+                    allowed_initial_transcript_interaction_id=(
+                        interaction_id if admission_kind == "initial" else None
+                    ),
+                )
+                # Replacing an execution owner cannot undo a terminal winner,
+                # including one published while settling the expired epoch.
+                for decision in (
+                    invocation_terminal_decision_from_checkpoint(current_checkpoint),
+                    settled_invocation_terminal_decision_from_checkpoint(current_checkpoint),
+                ):
+                    if decision is not None and decision.interaction_id == interaction_id:
+                        raise WorkAttemptRecoveryRequired(
+                            "Work-attempt interaction has a durable terminal decision."
+                        )
+                current_profile = active_invocation_execution_profile_from_checkpoint(
+                    current_checkpoint
+                )
+                if (
+                    current_profile is None
+                    or current_profile.interaction_id != interaction_id
+                    or current_profile.profile != profile
+                    or not active_invocation_execution_profile_matches_session_epoch(
+                        current_profile,
+                        session_id=current_session.id,
+                        run_epoch=current_session.run_epoch,
+                    )
+                ):
+                    raise WorkAttemptRecoveryRequired(
+                        "Recovery cannot prove the prior invocation profile authority."
+                    )
+                if current_session.status is SessionStatus.RUNNING:
+                    if not prior_recovery_transition:
+                        raise WorkAttemptRecoveryRequired(
+                            "Recovery cannot replace a running session without positive "
+                            "effect-settlement evidence."
+                        )
+                    if active_invocation_execution_profile_is_released(
+                        current_profile,
+                        session_id=current_session.id,
+                        run_epoch=current_session.run_epoch,
+                    ):
+                        raise WorkAttemptRecoveryRequired(
+                            "Running predecessor recovery has conflicting released authority."
+                        )
+                else:
+                    if not active_invocation_execution_profile_is_released(
+                        current_profile,
+                        session_id=current_session.id,
+                        run_epoch=current_session.run_epoch,
+                    ):
+                        raise WorkAttemptRecoveryRequired(
+                            "Terminal recovery requires a released prior invocation run fence."
+                        )
+                    if current_session.status not in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                        SessionStatus.INTERRUPTED,
+                    }:
+                        raise WorkAttemptRecoveryRequired(
+                            "Recovery requires a terminal, resumable prior session."
+                        )
+                if not active_invocation_execution_profile_matches_session_epoch(
+                    current_profile,
+                    session_id=current_session.id,
+                    run_epoch=current_session.run_epoch,
+                ):
+                    raise WorkAttemptRecoveryRequired(
+                        "Recovery cannot prove the released prior invocation epoch."
+                    )
+                updated = checkpoint_with_active_invocation_execution_profile(
+                    current_checkpoint,
+                    session_id=current_session.id,
+                    interaction_id=interaction_id,
+                    run_epoch=current_session.run_epoch + 1,
+                    profile=profile,
+                    expected=current_profile,
+                )
+                updated[WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY] = recovery_marker
+                return updated
+
+            recovery_rebind = prepare_rebind_invocation_command(
+                session,
+                checkpoint,
+                expected_statuses={
+                    SessionStatus.RUNNING,
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                    SessionStatus.INTERRUPTED,
+                },
+                target_status=SessionStatus.RUNNING,
+                checkpoint_transform=claim_recovered_session_execution,
+            )
+
+            async def transition_recovered_session() -> Session:
+                try:
+                    result = await self._runtime_session_store.apply_invocation_lifecycle_command(
+                        recovery_rebind
+                    )
+                except SessionRunFenced as exc:
+                    raise WorkAttemptRecoveryRequired(
+                        "Session authority changed after recovery was claimed."
+                    ) from exc
+                if type(result) is not InvocationMutationResult:
+                    raise RuntimeError(
+                        "Work-attempt recovery rebind returned an incompatible result."
+                    )
+                return result.session
+
+            mutation = settle_work_attempt_session_mutation(
+                transition_recovered_session,
+                operation_name="work-attempt-session-recovery",
+                preserved_failure_types=(
+                    SessionRunFenced,
+                    WorkAttemptRecoveryRequired,
+                ),
+                redactor=self._secret_redactor,
+            )
+            try:
+                raw_recovered_session = await mutation
+            except BaseException:
+                del (
+                    stable,
+                    claim_request,
+                    claimed,
+                    session,
+                    profile,
+                    recovery_authority,
+                    recovery_marker,
+                    checkpoint,
+                    checkpoint_recovery_authority,
+                    active_profile,
+                    has_active_model_completion,
+                    source_session_sha256,
+                    source_checkpoint_sha256,
+                    claim_recovered_session_execution,
+                    recovery_rebind,
+                    transition_recovered_session,
+                    mutation,
+                )
+                raise
+            del (
+                mutation,
+                transition_recovered_session,
+                recovery_rebind,
+                claim_recovered_session_execution,
+                session,
+            )
+            recovered_session_validation = capture_work_attempt_session_result(
+                raw_recovered_session,
+                operation_name="Work-attempt session recovery",
+                redactor=self._secret_redactor,
+            )
+            del raw_recovered_session
+            if recovered_session_validation.failure is not None:
+                raise_task_store_operation_failure(recovered_session_validation.failure)
+            session = recovered_session_validation.result
+            del recovered_session_validation
+            if session is None:
+                raise RuntimeError("Work-attempt session recovery returned no session.")
+            checkpoint = await self._load_work_attempt_runtime_checkpoint(
+                session.id,
+                operation_name="Recovered work-attempt checkpoint lookup",
+            )
+            if (
+                work_attempt_recovery_session_authority_from_checkpoint(checkpoint)
+                != recovery_authority
+            ):
+                raise WorkAttemptRecoveryRequired(
+                    "Session recovery did not publish its exact durable authority."
+                )
+        recovery_evidence = sha256(
+            canonical_durable_json_bytes(
+                {
+                    "admission_id": claimed.admission_id,
+                    "session_id": session.id,
+                    "session_status": session.status.value,
+                    "run_epoch": session.run_epoch,
+                    "session_updated_at": session.updated_at.isoformat(),
+                    "session_last_activity_at": session.last_activity_at.isoformat(),
+                    "claim_generation": stable.generation,
+                    "checkpoint_sha256": sha256(
+                        canonical_durable_json_bytes(
+                            checkpoint,
+                            "work_attempt_recovery_checkpoint",
+                        )
+                    ).hexdigest(),
+                },
+                "work_attempt_recovery_evidence",
+            )
+        ).hexdigest()
+        _activate_session_run_fence(session)
+        _activate_session_interaction(session.id, claimed.interaction_id)
+        activation = WorkAttemptRecoveryActivate(
+            admission_id=claimed.admission_id,
+            claim_id=claimed.claim.claim_id,
+            generation=claimed.claim.generation,
+            recovery_evidence_sha256=recovery_evidence,
+        )
+        activated_outcome = await capture_task_store_operation(
+            lambda: task_store.activate_work_attempt_recovery(activation),
+            operation_name="Work-attempt recovery activation",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="activate_work_attempt_recovery",
+        )
+        if activated_outcome.failure is not None:
+            raise_task_store_operation_failure(activated_outcome.failure)
+        activation_validation = capture_sensitive_result_validation(
+            lambda value=activated_outcome.result, recovering=claimed: (
+                require_work_attempt_recovery_activation_result(
+                    value,
+                    recovering,
+                    activation,
+                )
+            ),
+            operation_name="Work-attempt recovery activation result validation",
+            redactor=self._secret_redactor,
+        )
+        del activated_outcome, claimed
+        if activation_validation.failure is not None:
+            raise_task_store_operation_failure(activation_validation.failure)
+        active = activation_validation.result
+        del activation_validation
+        if active is None:
+            raise RuntimeError("Work-attempt recovery activation returned no authority.")
+        return await self._session_engine._fan_out_work_attempt_interaction_started(
+            active,
+            lease_seconds=stable.lease_seconds,
+        )
+
+    async def submit_work_attempt_proposal(
+        self,
+        request: WorkAttemptProposalRequest,
+    ) -> CompletionProposal:
+        """Publish one proposal under the exact live attempt execution claim."""
+
+        request_type = type(request)
+        request_validation = _copied_public_work_attempt_proposal_request(
+            request,
+            redactor=self._secret_redactor,
+        )
+        del request
+        request_failure = request_validation.failure
+        public_request = request_validation.result
+        del request_validation
+        if request_failure is not None:
+            raise request_failure from None
+        if public_request is None:
+            if request_type is not WorkAttemptProposalRequest:
+                raise TypeError(
+                    "Work-attempt proposal requires a WorkAttemptProposalRequest."
+                ) from None
+            raise ValueError("Work-attempt proposal request is invalid.") from None
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for completion proposals.")
+        if not task_store_work_attempt_admission_capability_is_complete(task_store):
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not implement the complete "
+                "work-attempt admission contract."
+            )
+        execution_owner_id = self._current_work_attempt_execution_owner_id()
+        admission_outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(public_request.admission_id),
+            operation_name="Admitted completion proposal reconciliation lookup",
+            redactor=self._secret_redactor,
+        )
+        if admission_outcome.failure is not None:
+            raise_task_store_operation_failure(admission_outcome.failure)
+        if admission_outcome.result is None:
+            raise KeyError(f"Work-attempt admission not found: {public_request.admission_id}")
+        admission_validation = capture_sensitive_result_validation(
+            lambda value=admission_outcome.result: require_work_attempt_admission_result(
+                value,
+                operation_name="Admitted completion proposal reconciliation lookup",
+            ),
+            operation_name="Admitted completion proposal authority validation",
+            redactor=self._secret_redactor,
+        )
+        del admission_outcome
+        if admission_validation.failure is not None:
+            raise_task_store_operation_failure(admission_validation.failure)
+        admission = admission_validation.result
+        del admission_validation
+        if admission is None:
+            raise RuntimeError("Admitted completion proposal lookup returned no authority.")
+        if (
+            admission.state is WorkAttemptAdmissionState.RELEASED
+            and admission.claim.claim_id == public_request.claim_id
+            and admission.claim.generation == public_request.generation
+            and admission.attempt_id == public_request.proposal.attempt_id
+        ):
+            # A committed release is positive store-owned replay evidence.
+            # Reconstruct its private owner only for the content-bound,
+            # non-mutating proposal receipt path after process replacement.
+            execution_owner_id = admission.claim.execution_owner_id
+        copied = AdmittedCompletionProposalRequest(
+            **public_request.model_dump(mode="python", warnings=False),
+            execution_owner_id=execution_owner_id,
+        )
+        outcome = await capture_task_store_operation(
+            lambda: task_store.submit_admitted_completion_proposal(copied),
+            operation_name="Admitted completion proposal publication",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="submit_admitted_completion_proposal",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        proposal_validation = capture_sensitive_result_validation(
+            lambda value=outcome.result, authority=admission: (
+                require_admitted_completion_proposal_result(
+                    value,
+                    copied,
+                    authority,
+                )
+            ),
+            operation_name="Admitted completion proposal result validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome, admission
+        if proposal_validation.failure is not None:
+            raise_task_store_operation_failure(proposal_validation.failure)
+        proposal = proposal_validation.result
+        del proposal_validation
+        if proposal is None:
+            raise RuntimeError("Admitted completion proposal returned no receipt.")
+        return proposal
+
+    async def _run_private(
+        self,
+        request: RunRequest,
+        *,
+        expected_execution_profile: ExecutionProfileIdentity | None = None,
+        expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
+        expected_context_policy: object | None = None,
+        pause_after_initial_transcript: bool = False,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not RunRequest:
+            raise TypeError("Runtime run requires a RunRequest.")
+        request = self._with_application_run_defaults(request)
+        request = _validate_run_request(request)
+        parent = (
+            await self.session_store.load(request.parent_session_id)
+            if request.parent_session_id is not None
+            else None
+        )
+        boundary = effective_deadline(
+            request.execution_deadline,
+            current_execution_deadline(),
+            parent.execution_deadline if parent is not None else ExecutionDeadline(),
+        )
+        boundary.require_admission("child_run" if parent is not None else "run")
+        request = request.model_copy(update={"execution_deadline": boundary})
+        stream = self._session_engine.run(
+            request=request,
+            expected_execution_profile=expected_execution_profile,
+            expected_registered_environment=expected_registered_environment,
+            expected_context_policy=expected_context_policy,
+            pause_after_initial_transcript=pause_after_initial_transcript,
+        )
+        del request
+        if boundary.expires_at is not None:
+            stream = deadline_stream(stream, boundary)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
+        if type(request) is not ResumeRequest:
+            raise TypeError("Runtime resume requires a ResumeRequest.")
+        request = copy_resume_request(request)
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id})
+        stream = self._resume_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _resume_private(
+        self,
+        request: ResumeRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ResumeRequest:
+            raise TypeError("Runtime resume requires a ResumeRequest.")
+        request = self._with_application_run_defaults(request)
+        request = _validate_resume_request(request)
+        stored = await self.session_store.load(request.session_id)
+        boundary = resumed_execution_deadline(
+            stored.execution_deadline if stored is not None else ExecutionDeadline()
+        )
+        boundary.require_admission("resume")
+        stream = self._session_engine.resume(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        del request
+        if boundary.expires_at is not None:
+            stream = deadline_stream(stream, boundary)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def compact_session(
+        self,
+        request: CompactSessionRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not CompactSessionRequest:
+            raise TypeError("Runtime compaction requires a CompactSessionRequest.")
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._compact_session_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _compact_session_private(
+        self,
+        request: CompactSessionRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not CompactSessionRequest:
+            raise TypeError("Runtime compaction requires a CompactSessionRequest.")
+        stored = await self.session_store.load(request.session_id)
+        boundary = resumed_execution_deadline(
+            stored.execution_deadline if stored is not None else ExecutionDeadline()
+        )
+        boundary.require_admission("compaction")
+        stream = self._session_engine.compact_session(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        if boundary.expires_at is not None:
+            stream = deadline_stream(stream, boundary)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def enqueue_session_message(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        context: SessionMessageAccessContext | None = None,
+    ) -> EnqueueSessionMessageResult:
+        """Queue steering; scoped/provenance admission requires trusted context."""
+        return await self._session_message_coordinator.enqueue(request, context=context)
+
+    async def inspect_session_messages(
+        self,
+        query: SessionMessageQuery,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> SessionMessageInspection:
+        """Inspect protected queue content without claiming or executing work."""
+        return await self._session_message_coordinator.inspect(query, context=context)
+
+    async def _authorize_session_message_enqueue(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> None:
+        """Authorize HTTP replay before exposing an earlier acceptance stream."""
+        await self._session_message_coordinator.prepare_enqueue(request, context=context)
+
+    async def _enqueue_session_message_from_http(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> EnqueueSessionMessageResult:
+        """Trusted server entrance; never pass caller-supplied actor objects."""
+        return await self._session_message_coordinator.enqueue_from_http(request, context=context)
+
+    async def _enqueue_session_message_from_scenario(
+        self, request: EnqueueSessionMessageRequest
+    ) -> EnqueueSessionMessageResult:
+        """Trusted scenario driver entrance; actor identity is runtime-authored."""
+        return await self._session_message_coordinator.enqueue_from_scenario(request)
+
+    async def _apply_session_message_action_from_http(
+        self,
+        request: SessionMessageActionRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> SessionMessageActionResult:
+        """Trusted server entrance for authenticated terminal-action actors."""
+        return await self._session_message_coordinator.apply_action_from_http(
+            request, context=context
+        )
+
+    async def apply_session_message_action(
+        self,
+        request: SessionMessageActionRequest,
+        *,
+        context: SessionMessageAccessContext,
+    ) -> SessionMessageActionResult:
+        """Withdraw/quarantine an exact record under application-owned authority."""
+        return await self._session_message_coordinator.apply_action(request, context=context)
+
+    async def snapshot_session_message_source(
+        self,
+        session_id: str,
+        *,
+        context: SessionMessageAccessContext,
+        include_transcript_digest: bool = False,
+        include_checkpoint_digest: bool = False,
+    ) -> SessionMessageSource:
+        """Authorize a source before reading its protected transcript/checkpoint."""
+        return await self._session_message_coordinator.snapshot_source(
+            session_id,
+            context=context,
+            include_transcript_digest=include_transcript_digest,
+            include_checkpoint_digest=include_checkpoint_digest,
+        )
+
+    async def _enqueue_session_message_private(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+        store_resolved_source_session_id: str | None = None,
+        expected_authorized_target_instance_id: str | None = None,
+    ) -> EnqueueSessionMessageResult:
+        if type(request) is not EnqueueSessionMessageRequest:
+            raise TypeError("Runtime queued input requires an EnqueueSessionMessageRequest.")
+        return await self._session_engine.enqueue_session_message(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+            expected_authorized_target_instance_id=expected_authorized_target_instance_id,
+        )
+
+    async def stop_after_current_tool_round(
+        self, request: StopAfterCurrentToolRoundRequest
+    ) -> SessionSteeringReceipt:
+        """Accept a durable cooperative stop without cancelling the current round."""
+
+        from cayu.runtime._session_steering import accept_session_steering
+
+        return await accept_session_steering(
+            request, session_store=self._runtime_session_store, redactor=self._secret_redactor
+        )
+
+    async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
+        if type(request) is not InterruptSessionRequest:
+            raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._interrupt_session_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _interrupt_session_private(
+        self,
+        request: InterruptSessionRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not InterruptSessionRequest:
+            raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
+        request = copy_interrupt_session_request(request)
+        stream = self._session_engine.interrupt_session(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def recover_incomplete_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        if type(request) is not IncompleteSessionRecoveryRequest:
+            raise TypeError(
+                "Runtime incomplete-session recovery requires an IncompleteSessionRecoveryRequest."
+            )
+        request = request.model_copy(
+            update={"session_id": await self._resolve_public_session_id(request.session_id)},
+            deep=True,
+        )
+        recovery = self._recover_incomplete_session_private(request)
+        del request
+        result = await recovery
+        return await self._project_incomplete_recovery_result_for_public_api(result)
+
+    async def plan_recovery(self, request: RecoveryPlanRequest) -> RecoveryPlan:
+        """Build a bounded, read-only recovery plan for this registered app."""
+
+        if type(request) is not RecoveryPlanRequest:
+            raise TypeError("Recovery planning requires a RecoveryPlanRequest.")
+        return await self._recovery_plan_coordinator.plan_recovery(request)
+
+    async def execute_recovery(self, request: RecoveryExecutionRequest) -> RecoveryReceipt:
+        """Execute exact recovery-plan decisions with durable per-session receipts."""
+
+        if type(request) is not RecoveryExecutionRequest:
+            raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
+        return await self._recovery_plan_coordinator.execute_recovery(request)
+
+    async def recover_model_completion_stage(
+        self,
+        request: ModelCompletionManualRecoveryRequest,
+    ) -> ModelCompletionManualRecoveryResult:
+        """Settle ambiguous provider work and linked budgets under runtime ownership."""
+
+        if type(request) is not ModelCompletionManualRecoveryRequest:
+            raise TypeError(
+                "Runtime model-completion recovery requires a ModelCompletionManualRecoveryRequest."
+            )
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = copy_model_completion_manual_recovery_request(
+            request,
+            session_id=session_id,
+        )
+        return await self._recover_model_completion_stage_private(request)
+
+    async def _recover_model_completion_stage_private(
+        self,
+        request: ModelCompletionManualRecoveryRequest,
+    ) -> ModelCompletionManualRecoveryResult:
+        request = copy_model_completion_manual_recovery_request(request)
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise_task_store_operation_failure(admission_failure)
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        return await self._session_engine.recover_model_completion_stage(request)
+
+    async def _recover_incomplete_session_private(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        request = copy_incomplete_session_recovery_request(request)
+        recovery = self._session_engine.recover_incomplete_session(request)
+        del request
+        return await recovery
+
+    async def _continue_foreground_parent(self, claim: PersistedEventSideEffectClaim) -> bool:
+        from cayu.runtime._foreground_child_continuation import deliver_foreground_child_terminal
+
+        async def resume(terminal: ForegroundChildTerminal) -> None:
+            await self._foreground_child_delivery_owner.run(
+                claim,
+                lambda before_mutation: self._session_engine.resume_foreground_child(
+                    terminal, before_mutation=before_mutation
+                ),
+            )
+            # The resumed parent may itself be a foreground child. Its terminal
+            # fan-out was deferred while that run was still active. Deliver only
+            # this exact session's latest outcome after its owner has settled,
+            # so each completed hop can wake its own parent without an unrelated
+            # resume or an unbounded scan of other sessions.
+            outcome = await self._runtime_session_store.summarize_outcome(
+                terminal.wait.parent_effect.session_id
+            )
+            if outcome.terminal_event is not None:
+                await self._event_writer.fan_out_persisted([outcome.terminal_event.event])
+
+        async def refresh(wait: ForegroundChildWait, event: Event) -> None:
+            await self._foreground_child_delivery_owner.run(
+                claim,
+                lambda before_mutation: self._session_engine.refresh_foreground_child_action(
+                    wait, event, before_mutation=before_mutation
+                ),
+            )
+
+        async def settle(wait: ForegroundChildWait, event: Event) -> None:
+            await self._foreground_child_delivery_owner.run(
+                claim,
+                lambda before_mutation: self._session_engine.settle_foreground_child_terminal(
+                    wait, event, before_mutation=before_mutation
+                ),
+            )
+
+        return await deliver_foreground_child_terminal(
+            claim.event,
+            store=self._runtime_session_store,
+            has_active_tasks=lambda session_id: (
+                self._session_control.has_active_tasks(session_id)
+                or self._session_control.is_interruption_request_active(session_id)
+                or self._session_control.is_emitting_interrupted(session_id)
+                or self._foreground_child_delivery_owner.active(session_id)
+            ),
+            resume=resume,
+            refresh=refresh,
+            settle=settle,
+        )
+
+    async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
+        """Retry committed event fan-out that was not acknowledged before a crash.
+
+        Delivery is at-least-once and returns only events whose configured
+        budget and sink side effects completed during this sweep. Failed and
+        dead-lettered deliveries remain inspectable through ``session_store``.
+        """
+        return await self._event_writer.recover_persisted_side_effects(limit=limit)
+
+    async def recover_incomplete_sessions(
+        self,
+        request: IncompleteSessionsRecoveryRequest,
+    ) -> IncompleteSessionsRecoveryPage:
+        """Sweep one bounded page of requested states, fault-isolated.
+
+        ``results`` contains one result per repaired or otherwise reportable
+        session. ``inspected_session_count`` includes healthy terminal rows
+        omitted from those results. When ``next_cursor`` is present, pass it in
+        a new request with the same statuses, inactivity boundary, reason, and
+        metadata to continue without rescanning earlier candidates.
+
+        A session whose agent is not
+        registered in this process is reported as
+        ``SKIPPED_UNREGISTERED_AGENT``; an unexpected per-session failure is
+        reported as ``FAILED`` with the error in ``message`` — neither aborts
+        the sweep, so one bad row cannot strand every healthy session. A
+        ``FAILED`` entry's ``previous_status`` comes from the sweep's listing
+        snapshot; its ``status`` is the current stored status when the session
+        can still be reloaded (a failed recovery may have progressed it),
+        falling back to the snapshot when it cannot. Session listing failures
+        and cancellation still raise. Every invocation inspects at most
+        ``request.inspection_limit`` rows, using at most ten store keyset pages
+        of at most 1,000 rows each. Terminal sessions are inspected through
+        bounded event queries. They are repaired only when their current run
+        lacks matching terminal evidence or retains incomplete recovery state.
+        Healthy terminal inspection candidates are omitted from the result and
+        do not consume ``request.limit``.
+        """
+        page = await self._recover_incomplete_sessions_private(request)
+        projected: list[IncompleteSessionRecoveryResult] = []
+        for result in page.results:
+            projected.append(await self._project_incomplete_recovery_result_for_public_api(result))
+        return page.model_copy(update={"results": tuple(projected)}, deep=True)
+
+    async def _recover_incomplete_sessions_private(
+        self,
+        request: IncompleteSessionsRecoveryRequest,
+    ) -> IncompleteSessionsRecoveryPage:
+        request = copy_incomplete_sessions_recovery_request(request)
+        return await self._session_engine.recover_incomplete_sessions(request)
+
+    async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
+        if type(request) is not DispatchRequest:
+            raise TypeError("Runtime dispatch requires a DispatchRequest.")
+        request = self._with_application_run_defaults(request)
+        request = copy_dispatch_request(request)
+        if request.task_id is not None and self.task_store is None:
+            raise RuntimeError("task_store is required when DispatchRequest.task_id is set.")
+        # Resolve at the public boundary to reject malformed or unknown aliases. Keep
+        # the public request value across dispatcher boundaries so durable queues do
+        # not persist private session authority; dispatch_inline resolves it again in
+        # the worker that owns execution.
+        private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
+        stored = await self.session_store.load(private_session_id)
+        if stored is not None:
+            resumed_execution_deadline(stored.execution_deadline).require_admission("dispatch")
+        (
+            contract_rejected,
+            admission_failure,
+        ) = await self._session_engine._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=private_session_id,
+        )
+        if admission_failure is not None:
+            del private_session_id, request
+            raise_task_store_operation_failure(admission_failure)
+        if contract_rejected:
+            del private_session_id, request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        handle = await self.dispatcher.submit(self, request)
+        _validate_dispatch_handle_for_request(handle=handle, request=request)
+        copied = copy_dispatch_handle(handle)
+        return copied.model_copy(
+            update={
+                "session_id": self.project_session_id_for_exposure(private_session_id),
+            },
+            deep=True,
+        )
+
+    async def session_invocation_for_dispatch(
+        self,
+        session_id: str,
+    ) -> SessionInvocationBinding:
+        """Return immutable private provenance for a trusted dispatcher boundary."""
+
+        private_session_id, _ = await self._resolve_public_session_authority(session_id)
+        snapshot = await self.session_store.load_invocation_snapshot(private_session_id)
+        if snapshot is None:
+            raise KeyError(f"Session not found: {private_session_id}")
+        return copy_session_invocation_binding(snapshot)
+
+    async def _prepare_durable_subagent_run(
+        self,
+        request: RunRequest,
+    ) -> DurableSubagentPreparedRun:
+        request = self._with_application_run_defaults(request)
+        preparation = self._session_engine._prepare_initial_run(request)
+        del request
+        prepared = await preparation
+        del preparation
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        try:
+            return DurableSubagentPreparedRun(
+                request=prepared.request,
+                provider_name=prepared.registered_provider.name,
+                model=prepared.session_identity.model,
+                runtime_name=prepared.session_identity.runtime_name,
+                runtime_version=prepared.session_identity.runtime_version,
+                runtime_build_provenance=(prepared.session_identity.runtime_build_provenance),
+                execution_profile=prepared.execution_profile,
+            )
+        finally:
+            del prepared
+
+    async def _submit_durable_subagent(
+        self,
+        *,
+        context: ToolContext,
+        request: RunRequest,
+        agent_alias: str,
+        tool_name: str,
+        spawn_fingerprint: str,
+        effective_arguments: dict[str, Any],
+    ) -> DispatchHandle:
+        return await self._durable_subagent_coordinator.submit(
+            context=context,
+            request=request,
+            agent_alias=agent_alias,
+            tool_name=tool_name,
+            spawn_fingerprint=spawn_fingerprint,
+            effective_arguments=effective_arguments,
+        )
+
+    async def _ensure_durable_subagent_submission(
+        self,
+        intent: DurableSubagentSubmissionIntent,
+    ) -> tuple[Session, DispatchHandle]:
+        return await self._durable_subagent_coordinator.ensure_submission(intent)
+
+    async def _reconcile_durable_subagent(
+        self,
+        *,
+        parent_session: Session,
+        tool_name: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        effective_arguments: dict[str, Any],
+    ) -> Session | ToolResult | None:
+        return await self._durable_subagent_coordinator.reconcile(
+            parent_session=parent_session,
+            tool_name=tool_name,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            idempotency_key=idempotency_key,
+            effective_arguments=effective_arguments,
+        )
+
+    async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+        if type(request) is not DispatchRequest:
+            raise TypeError("Inline dispatch requires a DispatchRequest.")
+        request = self._with_application_run_defaults(request)
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._dispatch_inline_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _load_queued_dispatch_session_snapshot(
+        self,
+        session_id: str,
+    ) -> tuple[Session, dict[str, Any] | None]:
+        """Load session and checkpoint authority under one store-owned boundary."""
+
+        return await load_runtime_session_checkpoint_snapshot(
+            self._runtime_session_store,
+            session_id,
+        )
+
+    async def _load_queued_dispatch_terminal_event(
+        self,
+        *,
+        private_session_id: str,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> Event | None:
+        """Load and validate the exact terminal event bound to an envelope."""
+
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=private_session_id,
+                event_id=envelope.terminal_event_id,
+                limit=2,
+            )
+        )
+        if not records:
+            return None
+        if len(records) != 1:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal evidence is duplicated."
+            )
+        terminal_event = records[0].event
+        if (
+            terminal_event.type not in TERMINAL_EVENT_TYPES
+            or terminal_event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+            != envelope.dispatch_operation_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal evidence conflicts with its envelope."
+            )
+        return terminal_event
+
+    async def _prepare_queued_dispatch(
+        self,
+        request: DispatchRequest,
+        *,
+        queue_task_id: str,
+    ) -> _QueuedDispatchEnvelope:
+        """Freeze runtime-owned profile authority before a queue task is published."""
+
+        if type(request) is not DispatchRequest:
+            raise TypeError("Queued dispatch preparation requires a DispatchRequest.")
+        request = copy_dispatch_request(request)
+        private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
+        (
+            contract_rejected,
+            admission_failure,
+        ) = await self._session_engine._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=private_session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del private_session_id, request
+            raise_task_store_operation_failure(admission_failure)
+        if contract_rejected:
+            del private_session_id, request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        session, checkpoint = await self._load_queued_dispatch_session_snapshot(private_session_id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        pending_model_completion = await self._recovery_coordinator.load_model_completion_boundary(
+            session
+        )
+        continues_active_invocation = (
+            pending_tool_round is not None or pending_model_completion is not None
+        )
+        if active_profile is not None:
+            if not active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            ):
+                raise RuntimeError(
+                    "Active invocation execution profile conflicts with the session epoch."
+                )
+            if (
+                active_invocation_execution_profile_is_released(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+                and not continues_active_invocation
+            ):
+                source_profile = execution_profile_from_session_metadata(session.metadata)
+            else:
+                source_profile = active_profile.profile
+        else:
+            if continues_active_invocation:
+                raise RuntimeError(
+                    "Queued dispatch recovery has no durable active invocation execution profile."
+                )
+            if session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+                raise RuntimeError(
+                    "A live session has no durable active invocation execution profile."
+                )
+            source_profile = execution_profile_from_session_metadata(session.metadata)
+        durable_request = self.redact_dispatch_request(request)
+        target_changed = durable_request.target is not None and (
+            durable_request.target.provider_name != session.provider_name
+            or durable_request.target.model != session.model
+        )
+        if target_changed:
+            if continues_active_invocation:
+                raise RuntimeError(
+                    "A queued dispatch model target cannot change while model or tool "
+                    "recovery is pending."
+                )
+            source_profile = execution_profile_from_session_metadata(session.metadata)
+        required_profile = source_profile
+        if not continues_active_invocation:
+            required_profile = self._session_engine._queued_dispatch_required_profile(
+                session=session,
+                source_profile=source_profile,
+                request=durable_request,
+            )
+        unavailable = set(unavailable_execution_profile_components(source_profile))
+        unavailable.update(unavailable_execution_profile_components(required_profile))
+        if unavailable:
+            raise RuntimeError(
+                "Queued dispatch requires an execution profile with available components: "
+                + ", ".join(
+                    component.value
+                    for component in sorted(unavailable, key=lambda item: item.value)
+                )
+            )
+        if (
+            durable_request.structured_output is not None
+            and durable_request.structured_output.strategy is StructuredOutputStrategy.NATIVE
+        ):
+            registered_provider = self._get_registered_provider(
+                durable_request.target.provider_name
+                if durable_request.target is not None
+                else session.provider_name
+            )
+            _require_native_structured_output_support(
+                durable_request.structured_output,
+                registered_provider=registered_provider,
+            )
+        (
+            contract_rejected,
+            admission_failure,
+        ) = await self._session_engine._verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=private_session_id,
+        )
+        if admission_failure is not None:
+            del durable_request, private_session_id, request
+            raise_task_store_operation_failure(admission_failure)
+        if contract_rejected:
+            del durable_request, private_session_id, request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        fork_relationship = session_fork_profile_relationship(session)
+        return _new_queued_dispatch_envelope(
+            queue_task_id=queue_task_id,
+            request=durable_request,
+            session_instance_fingerprint=(_queued_dispatch_session_instance_fingerprint(session)),
+            source_profile=source_profile,
+            required_profile=required_profile,
+            exact_fork_source_state_sha256=(
+                None if fork_relationship is None else fork_relationship.source_state_sha256
+            ),
+        )
+
+    async def _queued_dispatch_requests_match(
+        self,
+        existing: DispatchRequest,
+        candidate: DispatchRequest,
+    ) -> bool:
+        """Compare retries by private session authority, not rotating public aliases."""
+
+        existing = copy_dispatch_request(existing)
+        candidate = copy_dispatch_request(candidate)
+        existing_session_id, _ = await self._resolve_public_session_authority(existing.session_id)
+        candidate_session_id, _ = await self._resolve_public_session_authority(candidate.session_id)
+        if existing_session_id != candidate_session_id:
+            return False
+        comparison_session_id = "cayu-equivalent-session-authority"
+        return existing.model_copy(
+            update={"session_id": comparison_session_id},
+            deep=True,
+        ) == candidate.model_copy(
+            update={"session_id": comparison_session_id},
+            deep=True,
+        )
+
+    async def _acknowledge_queued_dispatch(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+        *,
+        dispatch_status: DispatchStatus,
+        receipt: QueuedDispatchTerminalReceipt | None = None,
+    ) -> None:
+        """Release exact terminal retention after the queue outcome is durable."""
+
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        if type(dispatch_status) is not DispatchStatus:
+            raise TypeError("Queued dispatch acknowledgement status has an invalid type.")
+        settlement = await self._queued_dispatch_settlement_state(envelope)
+        if settlement.state is _QueuedDispatchSettlementState.NOT_ADMITTED:
+            return
+        if settlement.state is not _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE:
+            raise RuntimeError(
+                "Queued dispatch terminal evidence is not durable enough to acknowledge."
+            )
+        if settlement.terminal_status is not dispatch_status:
+            raise RuntimeError(
+                "Queued dispatch task status conflicts with its exact terminal event."
+            )
+        private_session_id, _ = await self._resolve_public_session_authority(
+            envelope.request.session_id
+        )
+        if receipt is not None:
+            if type(receipt) is not QueuedDispatchTerminalReceipt:
+                raise TypeError("Queued dispatch acknowledgement receipt has an invalid type.")
+            receipt = QueuedDispatchTerminalReceipt(
+                session_id=receipt.session_id,
+                queue_task_id=receipt.queue_task_id,
+                operation_id=receipt.operation_id,
+                terminal_event_id=receipt.terminal_event_id,
+            )
+            if (
+                receipt.session_id != private_session_id
+                or receipt.queue_task_id != envelope.queue_task_id
+                or receipt.operation_id != envelope.dispatch_operation_id
+                or receipt.terminal_event_id != envelope.terminal_event_id
+            ):
+                raise RuntimeError(
+                    "Queued dispatch acknowledgement receipt conflicts with its envelope."
+                )
+
+        def acknowledge(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return _checkpoint_after_queued_dispatch_acknowledgement(
+                checkpoint,
+                queue_task_id=envelope.queue_task_id,
+                operation_id=envelope.dispatch_operation_id,
+                terminal_event_id=envelope.terminal_event_id,
+            )
+
+        await self.session_store.transform_checkpoint(private_session_id, acknowledge)
+
+    async def _list_queued_dispatch_terminal_receipts(
+        self,
+        query: QueuedDispatchTerminalReceiptQuery,
+    ) -> list[QueuedDispatchTerminalReceipt]:
+        """Delegate bounded restart discovery to the durable session store."""
+
+        return await self.session_store.list_queued_dispatch_terminal_receipts(query)
+
+    @staticmethod
+    def _queued_dispatch_terminal_ownership_released(
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> bool:
+        """Validate and classify the exact invocation generation behind a terminal event."""
+
+        try:
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            receipt = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint).get(
+                envelope.dispatch_operation_id
+            )
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership evidence is malformed."
+            ) from exc
+        if receipt is not None and (
+            receipt.queue_task_id != envelope.queue_task_id
+            or receipt.terminal_event_id != envelope.terminal_event_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal receipt identity conflicts."
+            )
+        terminal_run_epoch = None if receipt is None else receipt.run_epoch
+        if run_operation is not None and run_operation.operation_id == (
+            envelope.dispatch_operation_id
+        ):
+            if (
+                run_operation.queue_task_id != envelope.queue_task_id
+                or run_operation.terminal_event_id != envelope.terminal_event_id
+            ):
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch run operation identity conflicts."
+                )
+            if terminal_run_epoch not in {None, run_operation.run_epoch}:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch terminal ownership epoch conflicts."
+                )
+            terminal_run_epoch = run_operation.run_epoch
+
+        # The exact terminal event is supplied by the caller of this helper. If
+        # neither live handoff representation remains, acknowledgement already
+        # completed: terminal publication first leaves either the run marker or
+        # its receipt in the checkpoint, and only an exact durable queue outcome
+        # removes the last one. A later invocation's active profile must not
+        # become ownership evidence for that already-settled operation.
+        if terminal_run_epoch is None:
+            return True
+
+        try:
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal invocation profile is malformed."
+            ) from exc
+        if active_profile is None:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal evidence has no durable invocation profile."
+            )
+        if not active_invocation_execution_profile_matches_session_epoch(
+            active_profile,
+            session_id=session.id,
+            run_epoch=session.run_epoch,
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership conflicts with the session epoch."
+            )
+        if session.run_epoch < terminal_run_epoch:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership belongs to a future session epoch."
+            )
+        if active_profile.run_epoch < terminal_run_epoch:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal profile predates its ownership epoch."
+            )
+        if (
+            active_profile.run_epoch == terminal_run_epoch
+            and active_profile.profile != envelope.required_profile
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal profile conflicts with its envelope."
+            )
+        return session.run_epoch > terminal_run_epoch
+
+    async def _queued_dispatch_settlement_state(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> _QueuedDispatchSettlement:
+        """Classify the exact event/ownership evidence for one queued operation."""
+
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        if envelope.operation_kind == "prepared_subagent":
+            await self._durable_subagent_coordinator.require_prepared_subagent_parent_authority(
+                envelope
+            )
+        private_session_id, _ = await self._resolve_public_session_authority(
+            envelope.request.session_id
+        )
+        terminal_event = await self._load_queued_dispatch_terminal_event(
+            private_session_id=private_session_id,
+            envelope=envelope,
+        )
+        terminal_event_durable = terminal_event is not None
+
+        try:
+            session, checkpoint = await self._load_queued_dispatch_session_snapshot(
+                private_session_id
+            )
+        except KeyError as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session no longer exists."
+            ) from exc
+        if (
+            _queued_dispatch_session_instance_fingerprint(session)
+            != envelope.session_instance_fingerprint
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session instance changed."
+            )
+        self._require_queued_dispatch_fork_protocol(session, envelope)
+        try:
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal ownership evidence is malformed."
+            ) from exc
+        receipt = receipts.get(envelope.dispatch_operation_id)
+        if receipt is not None and (
+            receipt.queue_task_id != envelope.queue_task_id
+            or receipt.terminal_event_id != envelope.terminal_event_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch terminal receipt identity conflicts."
+            )
+        terminal_run_epoch = None if receipt is None else receipt.run_epoch
+        if run_operation is not None and run_operation.operation_id == (
+            envelope.dispatch_operation_id
+        ):
+            if (
+                run_operation.queue_task_id != envelope.queue_task_id
+                or run_operation.terminal_event_id != envelope.terminal_event_id
+            ):
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch run operation identity conflicts."
+                )
+            if terminal_run_epoch not in {None, run_operation.run_epoch}:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch terminal ownership epoch conflicts."
+                )
+            terminal_run_epoch = run_operation.run_epoch
+            if not terminal_event_durable:
+                return _QueuedDispatchSettlement(
+                    _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_PENDING
+                )
+        if receipt is not None and not terminal_event_durable:
+            # Publication and receipt transfer can commit after the first event
+            # query. The exact receipt pins the event, so one read after observing
+            # that receipt closes the cross-store classification race.
+            terminal_event = await self._load_queued_dispatch_terminal_event(
+                private_session_id=private_session_id,
+                envelope=envelope,
+            )
+            if terminal_event is None:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch receipt has no exact durable terminal event."
+                )
+            terminal_event_durable = True
+        if terminal_event_durable:
+            assert terminal_event is not None
+            if not self._queued_dispatch_terminal_ownership_released(
+                session=session,
+                checkpoint=checkpoint,
+                envelope=envelope,
+            ):
+                return _QueuedDispatchSettlement(
+                    _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_PENDING
+                )
+            terminal_status_by_type = {
+                str(EventType.SESSION_COMPLETED): DispatchStatus.COMPLETED,
+                str(EventType.SESSION_FAILED): DispatchStatus.FAILED,
+                str(EventType.SESSION_INTERRUPTED): DispatchStatus.INTERRUPTED,
+            }
+            try:
+                terminal_status = terminal_status_by_type[terminal_event.type]
+            except KeyError:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch terminal event has no dispatch status mapping."
+                ) from None
+            return _QueuedDispatchSettlement(
+                _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE,
+                terminal_status=terminal_status,
+            )
+        return _QueuedDispatchSettlement(_QueuedDispatchSettlementState.NOT_ADMITTED)
+
+    @staticmethod
+    def _require_queued_dispatch_fork_protocol(
+        session: Session,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> None:
+        """Bind the queue protocol to the target's immutable fork relationship."""
+
+        try:
+            relationship = session_fork_profile_relationship(session)
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target fork relationship is malformed."
+            ) from exc
+        expected_source_state_sha256 = (
+            None if relationship is None else relationship.source_state_sha256
+        )
+        if envelope.exact_fork_source_state_sha256 != expected_source_state_sha256:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch protocol conflicts with its target fork relationship."
+            )
+        if (
+            session.run_epoch == 0
+            and relationship is not None
+            and relationship.initial_dispatch_id is not None
+            and envelope.request.dispatch_id != relationship.initial_dispatch_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch identity conflicts with the target fork's first invocation."
+            )
+
+    async def _dispatch_queued(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> AsyncIterator[Event]:
+        """Run or replay one queue-owned dispatch under its frozen profile."""
+
+        envelope = _copy_queued_dispatch_envelope(envelope)
+        request = envelope.request
+        (
+            private_session_id,
+            store_resolved_session_id,
+        ) = await self._resolve_public_session_authority(request.session_id)
+        try:
+            session, checkpoint = await self._load_queued_dispatch_session_snapshot(
+                private_session_id
+            )
+        except KeyError as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session no longer exists."
+            ) from exc
+        if (
+            _queued_dispatch_session_instance_fingerprint(session)
+            != envelope.session_instance_fingerprint
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target session instance changed."
+            )
+        self._require_queued_dispatch_fork_protocol(session, envelope)
+        replay_event = await self._load_queued_dispatch_terminal_event(
+            private_session_id=private_session_id,
+            envelope=envelope,
+        )
+        if replay_event is not None:
+            if not self._queued_dispatch_terminal_ownership_released(
+                session=session,
+                checkpoint=checkpoint,
+                envelope=envelope,
+            ):
+                raise SessionRunFenced(
+                    "Queued dispatch terminal hooks or trailing cleanup still own the "
+                    "session run fence."
+                )
+            yield await self._project_emitted_event_for_public_api(replay_event)
+            return
+        try:
+            self._get_registered_agent(session.agent_name)
+            self._get_registered_provider(
+                request.target.provider_name
+                if request.target is not None
+                else session.provider_name
+            )
+            self._get_registered_environment_for_session(session.environment_name)
+        except KeyError as exc:
+            if envelope.operation_kind == "prepared_subagent":
+                raise durable_subagent_worker_incompatible() from exc
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch required runtime component is unavailable."
+            ) from exc
+
+        if envelope.operation_kind == "prepared_subagent":
+            run_request = self._durable_subagent_coordinator.prepare_queued_child_run(
+                envelope=envelope,
+                session=session,
+                checkpoint=checkpoint,
+            )
+            stream = self._run_private(run_request)
+            async with _close_delegated_event_stream(stream) as owned_stream:
+                async for event in owned_stream:
+                    yield await self._project_emitted_event_for_public_api(event)
+            return
+
+        private_request = request.model_copy(
+            update={"session_id": private_session_id},
+            deep=True,
+        )
+        stream = self._dispatch_inline_private(
+            private_request,
+            store_resolved_session_id=store_resolved_session_id,
+            source_execution_profile=envelope.source_profile,
+            required_execution_profile=envelope.required_profile,
+            required_session_instance_fingerprint=(envelope.session_instance_fingerprint),
+            dispatch_operation_id=envelope.dispatch_operation_id,
+            dispatch_terminal_event_id=envelope.terminal_event_id,
+            queue_task_id=envelope.queue_task_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _dispatch_inline_private(
+        self,
+        request: DispatchRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+        source_execution_profile: ExecutionProfileIdentity | None = None,
+        required_execution_profile: ExecutionProfileIdentity | None = None,
+        required_session_instance_fingerprint: str | None = None,
+        dispatch_operation_id: str | None = None,
+        dispatch_terminal_event_id: str | None = None,
+        queue_task_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not DispatchRequest:
+            raise TypeError("Inline dispatch requires a DispatchRequest.")
+        request = copy_dispatch_request(request)
+        if request.task_id is not None and self.task_store is None:
+            raise RuntimeError("task_store is required when DispatchRequest.task_id is set.")
+        resume_request = ResumeRequest(
+            session_id=request.session_id,
+            messages=request.messages,
+            target=request.target,
+            tool_capability_ceiling=request.tool_capability_ceiling,
+            tool_grants=request.tool_grants,
+            profile_adoption=request.profile_adoption,
+            metadata=request.metadata,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            budget_limits=request.budget_limits,
+            retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            loop_policies=request.loop_policies,
+        )
+        resume_request = session_request_boundary.prepare_resume_request(
+            resume_request,
+            redactor=self._secret_redactor,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        start_event_payload_extra: dict[str, Any] = {"dispatch_id": request.dispatch_id}
+        if request.task_id is not None:
+            start_event_payload_extra["task_id"] = request.task_id
+        if dispatch_operation_id is not None:
+            start_event_payload_extra.update(
+                {
+                    "dispatch_operation_id": dispatch_operation_id,
+                    "queue_task_id": queue_task_id,
+                    "source_execution_profile_fingerprint": (
+                        None
+                        if source_execution_profile is None
+                        else source_execution_profile.fingerprint
+                    ),
+                    "required_execution_profile_fingerprint": (
+                        None
+                        if required_execution_profile is None
+                        else required_execution_profile.fingerprint
+                    ),
+                }
+            )
+        session_stream = self._session_engine._resume_session(
+            request=resume_request,
+            task_id=request.task_id,
+            start_event_payload_extra=start_event_payload_extra,
+            start_task_on_enter=True,
+            source_execution_profile=source_execution_profile,
+            required_execution_profile=required_execution_profile,
+            required_session_instance_fingerprint=(required_session_instance_fingerprint),
+            run_operation_id=dispatch_operation_id,
+            terminal_event_id=dispatch_terminal_event_id,
+            queue_task_id=queue_task_id,
+            queued_dispatch_id=(None if dispatch_operation_id is None else request.dispatch_id),
+        )
+        async with _close_delegated_event_stream(session_stream) as owned_stream:
+            forwarded_stream = self._session_control.stream_with_out_of_band_events(
+                request.session_id,
+                owned_stream,
+            )
+            async with _close_delegated_event_stream(forwarded_stream) as owned_forwarded_stream:
+                async for event in owned_forwarded_stream:
+                    yield event
+
+    async def verify_completion_proposal(
+        self,
+        request: CompletionVerifierExecutionRequest,
+    ) -> CompletionDecision:
+        """Run the registered deterministic verifier and persist its decision."""
+
+        operation = self._completion_verifier_coordinator.verify(request)
+        del request
+        return await operation
+
+    async def apply_completion_decision(
+        self,
+        request: CompletionDecisionApplicationRequest,
+    ) -> Task:
+        """Apply or exactly replay one durable verifier decision."""
+
+        operation = self._completion_decision_application_coordinator.apply(request)
+        del request
+        return await operation
+
+    def _verified_task_decision_owner(self) -> VerifiedTaskDecisionCoordinator:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required for verified task decisions.")
+        return VerifiedTaskDecisionCoordinator(
+            VerifiedTaskDecisionDependencies(
+                store=self.task_store,
+                redactor=self._secret_redactor,
+                verify=self._completion_verifier_coordinator.verify,
+                start_verify=self._completion_verifier_coordinator.start_owned_verification,
+                resolve=self.resolve_completion_result,
+                apply=self.apply_completion_decision,
+                release=self._session_engine.load_work_attempt_release_evidence,
+                admit=self.admit_work_attempt,
+            )
+        )
+
+    async def _settle_verified_task_decision(
+        self, admission_id: str, verification: CompletionVerifierExecutionRequest
+    ) -> VerifiedTaskDecisionResult:
+        """Private worker composition; queue/handler authority is not public yet."""
+        operation = self._verified_task_decision_owner().settle(admission_id, verification)
+        del admission_id, verification
+        return await operation
+
+    async def _start_verified_task_decision(
+        self, admission_id: str, verification: CompletionVerifierExecutionRequest
+    ) -> VerifiedTaskDecisionExecution:
+        """Validate released authority before returning the owned verifier phase."""
+        operation = self._verified_task_decision_owner().start(admission_id, verification)
+        del admission_id, verification
+        return await operation
+
+    async def _continue_verified_task(
+        self, admission_id: str, decision_id: str, *, worker_id: str, lease_seconds: int
+    ) -> WorkAttemptAdmission:
+        """Private worker successor scheduling through exact admission ownership."""
+        operation = self._verified_task_decision_owner().continue_attempt(
+            admission_id, decision_id, worker_id=worker_id, lease_seconds=lease_seconds
+        )
+        del admission_id, decision_id, worker_id, lease_seconds
+        return await operation
+
+    async def resolve_completion_result(
+        self,
+        request: CompletionResultResolutionRequest,
+    ) -> Task:
+        """Resolve and exactly apply the accepted result for one durable decision."""
+
+        operation = self._completion_result_resolver_coordinator.resolve(request)
+        del request
+        return await operation
+
+    async def create_work_contract(self, request: WorkContractDraft) -> WorkContract:
+        if type(request) is not WorkContractDraft:
+            del request
+            raise TypeError("Work-contract creation requires a WorkContractDraft request.")
+        if self.task_store is None:
+            del request
+            raise RuntimeError("task_store is required to create work contracts.")
+        if not self.task_store.supports_verified_work_contracts:
+            del request
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support verified work contracts."
+            )
+        validation = _validated_public_work_contract(
+            request,
+            redactor=self._secret_redactor,
+        )
+        del request
+        validation_failure = validation.failure
+        contract = validation.result
+        del validation
+        if validation_failure is not None:
+            raise validation_failure from None
+        if contract is None:
+            raise ValueError("Work-contract creation request is invalid.") from None
+        contains_secret_identity = _work_contract_contains_secret_public_identity(
+            contract,
+            self._secret_redactor,
+        )
+        if contains_secret_identity:
+            del contract
+            raise ValueError(
+                "Work-contract public identity contains a workload secret and cannot be published."
+            ) from None
+        published_value, publication_failure = await _publish_public_work_contract(
+            self.task_store,
+            contract,
+            redactor=self._secret_redactor,
+        )
+        if publication_failure is not None:
+            del contract, published_value
+            raise_task_store_operation_failure(publication_failure)
+        validation = _copied_public_work_contract(
+            published_value,
+            redactor=self._secret_redactor,
+        )
+        del published_value
+        validation_failure = validation.failure
+        published = validation.result
+        del validation
+        if validation_failure is not None:
+            del contract
+            raise validation_failure from None
+        if published is None:
+            del contract
+            raise WorkContractConflict(
+                "Task store returned an invalid published work contract."
+            ) from None
+        if published != contract:
+            del contract, published
+            raise WorkContractConflict(
+                "Task store returned a work contract other than the exact published definition."
+            ) from None
+        return published
+
+    async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
+        if type(reference) is not WorkContractRef:
+            del reference
+            raise TypeError("Work-contract lookup requires a WorkContractRef.")
+        if self.task_store is None:
+            del reference
+            raise RuntimeError("task_store is required to load work contracts.")
+        if not self.task_store.supports_verified_work_contracts:
+            del reference
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support verified work contracts."
+            )
+        validation = _copied_public_work_contract_ref(
+            reference,
+            redactor=self._secret_redactor,
+        )
+        del reference
+        validation_failure = validation.failure
+        copied_reference = validation.result
+        del validation
+        if validation_failure is not None:
+            raise validation_failure from None
+        if copied_reference is None:
+            raise ValueError("Work-contract lookup reference is invalid.") from None
+        contains_secret_identity = (
+            self._secret_redactor.redact_text(copied_reference.contract_id)
+            != copied_reference.contract_id
+        )
+        if contains_secret_identity:
+            del copied_reference
+            raise ValueError(
+                "Work-contract identity contains a workload secret and cannot be used for lookup."
+            ) from None
+        loaded_value, lookup_failure = await _load_public_work_contract(
+            self.task_store,
+            copied_reference,
+            redactor=self._secret_redactor,
+        )
+        if lookup_failure is not None:
+            del copied_reference, loaded_value
+            raise_task_store_operation_failure(lookup_failure)
+        if loaded_value is None:
+            return None
+        validation = _copied_public_work_contract(
+            loaded_value,
+            redactor=self._secret_redactor,
+        )
+        del loaded_value
+        validation_failure = validation.failure
+        loaded = validation.result
+        del validation
+        if validation_failure is not None:
+            del copied_reference
+            raise validation_failure from None
+        if loaded is None:
+            del copied_reference
+            raise WorkContractConflict("Task store returned an invalid work contract.") from None
+        if loaded.reference() != copied_reference:
+            del copied_reference, loaded
+            raise WorkContractConflict(
+                "Task store returned a work contract other than the exact requested version."
+            ) from None
+        contains_secret_identity = _work_contract_contains_secret_public_identity(
+            loaded,
+            self._secret_redactor,
+        )
+        if contains_secret_identity:
+            del copied_reference, loaded
+            raise ValueError(
+                "Loaded work contract contains a workload secret in a public identity."
+            ) from None
+        return loaded
+
+    async def create_task(self, request: TaskCreate) -> Task:
+        if type(request) is not TaskCreate:
+            del request
+            raise TypeError("Task creation requires a TaskCreate request.")
+        if request.work_contract is None:
+            # Preserve the established ordinary-task validation contract,
+            # including actionable Pydantic field diagnostics. Contract-bound
+            # requests use the detached boundary below because their durable
+            # authority fields may contain workload-sensitive material.
+            request = copy_task_create(request)
+        else:
+            validation = _copied_public_task_create(
+                request,
+                redactor=self._secret_redactor,
+            )
+            del request
+            validation_failure = validation.failure
+            copied_request = validation.result
+            del validation
+            if validation_failure is not None:
+                raise validation_failure from None
+            if copied_request is None:
+                raise ValueError("Task creation request is invalid.") from None
+            request = copied_request
+            del copied_request
+        if self.task_store is None:
+            del request
+            raise RuntimeError("task_store is required to create tasks.")
+        if (
+            request.retry_policy is not None
+            and self._secret_redactor.redact_uppercase_text(request.retry_policy.cost_currency)
+            != request.retry_policy.cost_currency
+        ):
+            raise ValueError(
+                "Task retry cost currency contains a workload secret and cannot be used "
+                "as durable accounting authority."
+            ) from None
+        for origin in (request.invocation_origin, request._verified_invocation_origin):
+            if origin is None:
+                continue
+            for value in (origin.subject, origin.tenant):
+                if value is not None and self._secret_redactor.redact_text(value) != value:
+                    del origin, request, value
+                    raise ValueError(
+                        "Task invocation origin contains a workload secret and cannot be "
+                        "used as durable task authority."
+                    ) from None
+        if request.work_contract is not None:
+            if not self.task_store.supports_verified_work_contracts:
+                del request
+                raise NotImplementedError(
+                    f"{type(self.task_store).__name__} does not support verified work contracts."
+                )
+            if request.task_id is None:
+                del request
+                raise ValueError(
+                    "Contracted task creation requires a caller-stable task_id for "
+                    "cancellation reconciliation."
+                ) from None
+            if self._secret_redactor.redact_text(request.task_id) != request.task_id:
+                del request
+                raise ValueError(
+                    "Task identity contains a workload secret and cannot be exposed "
+                    "through durable task projections."
+                ) from None
+            contains_secret_identity = (
+                self._secret_redactor.redact_text(request.work_contract.contract_id)
+                != request.work_contract.contract_id
+            )
+            if contains_secret_identity:
+                del request
+                raise ValueError(
+                    "Work-contract identity contains a workload secret and cannot be exposed "
+                    "through durable task projections."
+                ) from None
+        if (
+            request.session_id is not None
+            and request._verified_invocation_origin is None
+            and request._runtime_session_binding is None
+        ):
+            snapshot = await self.session_store.load_invocation_snapshot(request.session_id)
+            if snapshot is not None:
+                request = task_create_with_runtime_invocation(
+                    request,
+                    source=(request._runtime_invocation_source or TaskExecutionSource.SDK_TASK),
+                    session_invocation=snapshot,
+                )
+            del snapshot
+        if request.available_at is not None and not self.task_store.supports_delayed_availability:
+            del request
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support delayed task availability."
+            )
+        if request.retry_policy is not None and not self.task_store.supports_task_retry_series:
+            del request
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support task retry series."
+            )
+        if request.work_contract is None:
+            return await self.task_store.create_task(request)
+        parent_invocation_snapshot: TaskInvocationSnapshot | None = None
+        if request.parent_task_id is not None:
+            (
+                parent_snapshot_value,
+                parent_lookup_failure,
+            ) = await _load_public_task_invocation_snapshot(
+                self.task_store,
+                request.parent_task_id,
+                redactor=self._secret_redactor,
+            )
+            if parent_lookup_failure is not None:
+                del parent_snapshot_value, request
+                raise_task_store_operation_failure(parent_lookup_failure)
+            parent_validation = _copied_public_task_invocation_snapshot(
+                parent_snapshot_value,
+                redactor=self._secret_redactor,
+            )
+            del parent_snapshot_value
+            parent_validation_failure = parent_validation.failure
+            parent_invocation_snapshot = parent_validation.result
+            del parent_validation
+            if parent_validation_failure is not None:
+                del parent_invocation_snapshot, request
+                raise parent_validation_failure from None
+            if (
+                parent_invocation_snapshot is None
+                or parent_invocation_snapshot.id != request.parent_task_id
+            ):
+                del parent_invocation_snapshot, request
+                raise WorkContractConflict(
+                    "Task parent invocation authority is unavailable for contracted creation."
+                ) from None
+        session_invocation_contains_secret = (
+            request._runtime_session_binding is not None
+            and invocation_contains_secret_public_identity(
+                request._runtime_session_binding.invocation,
+                self._secret_redactor,
+            )
+        )
+        parent_invocation_contains_secret = (
+            parent_invocation_snapshot is not None
+            and invocation_contains_secret_public_identity(
+                parent_invocation_snapshot.invocation,
+                self._secret_redactor,
+            )
+        )
+        direct_root_session_contains_secret = (
+            request._runtime_session_binding is None
+            and parent_invocation_snapshot is None
+            and request.session_id is not None
+            and self._secret_redactor.redact_text(request.session_id) != request.session_id
+        )
+        if (
+            session_invocation_contains_secret
+            or parent_invocation_contains_secret
+            or direct_root_session_contains_secret
+        ):
+            del parent_invocation_snapshot, request
+            raise ValueError(
+                "Task invocation identity contains a workload secret and cannot be exposed "
+                "through durable task projections."
+            ) from None
+        preflight_contract_bound_task_creation(
+            request,
+            parent_task=parent_invocation_snapshot,
+        )
+        task, creation_failure = await _create_public_contracted_task(
+            self.task_store,
+            request,
+            redactor=self._secret_redactor,
+        )
+        if creation_failure is not None:
+            del parent_invocation_snapshot, request, task
+            raise_task_store_operation_failure(creation_failure)
+        validation = _copied_public_task(
+            task,
+            redactor=self._secret_redactor,
+        )
+        del task
+        validation_failure = validation.failure
+        copied_task = validation.result
+        del validation
+        if validation_failure is not None:
+            del parent_invocation_snapshot, request
+            raise validation_failure from None
+        if copied_task is None:
+            del parent_invocation_snapshot, request
+            raise WorkContractConflict("Task store returned an invalid contracted task.") from None
+        task = copied_task
+        del copied_task
+        try:
+            require_contract_bound_task_creation_snapshot(task)
+        except (TypeError, ValueError):
+            del parent_invocation_snapshot, request, task
+            raise WorkContractConflict(
+                "Task store returned a contracted task outside the creation-snapshot bounds."
+            ) from None
+        (
+            invocation_snapshot,
+            invocation_lookup_failure,
+        ) = await _load_public_task_invocation_snapshot(
+            self.task_store,
+            task.id,
+            redactor=self._secret_redactor,
+        )
+        if invocation_lookup_failure is not None:
+            del invocation_snapshot, parent_invocation_snapshot, request, task
+            raise_task_store_operation_failure(invocation_lookup_failure)
+        validation = _copied_public_task_invocation_snapshot(
+            invocation_snapshot,
+            redactor=self._secret_redactor,
+        )
+        del invocation_snapshot
+        validation_failure = validation.failure
+        copied_invocation_snapshot = validation.result
+        del validation
+        if validation_failure is not None:
+            del parent_invocation_snapshot, request, task
+            raise validation_failure from None
+        if not _contracted_task_creation_result_matches_request(
+            task=task,
+            request=request,
+            invocation_snapshot=copied_invocation_snapshot,
+            parent_invocation_snapshot=parent_invocation_snapshot,
+            redactor=self._secret_redactor,
+        ):
+            del copied_invocation_snapshot, parent_invocation_snapshot, request, task
+            raise WorkContractConflict(
+                "Task store did not preserve the exact contracted task creation request."
+            ) from None
+        del copied_invocation_snapshot, parent_invocation_snapshot
+        return task
+
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to pause tasks.")
+        return await self.task_store.pause_task(task_id, reason=reason, payload=payload)
+
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to block tasks.")
+        return await self.task_store.block_task(task_id, reason=reason, payload=payload)
+
+    async def mark_task_needs_attention(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to mark tasks needs-attention.")
+        return await self.task_store.mark_task_needs_attention(
+            task_id,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def resume_task(self, task_id: str) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to resume tasks.")
+        return await self.task_store.resume_task(task_id)
+
+    async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
+        session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        summary = (
+            await self.session_store.read_usage_accounting(EventQuery(session_id=session_id))
+        ).summary
+        return summary.model_copy(
+            update={"session_id": self.project_session_id_for_exposure(session_id)},
+            deep=True,
+        )
+
+    async def get_causal_budget_usage(
+        self,
+        causal_budget_id: str,
+    ) -> CausalBudgetUsageSummary:
+        causal_budget_id = await self._resolve_public_causal_budget_id(causal_budget_id)
+        sessions = await self._list_all_sessions(
+            SessionQuery(
+                causal_budget_id=causal_budget_id,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        if not sessions:
+            raise KeyError("Causal budget not found") from None
+        session_ids = list(dict.fromkeys(session.id for session in sessions))
+        snapshot = await self.session_store.read_usage_accounting(
+            EventQuery(
+                causal_budget_id=causal_budget_id,
+                session_ids=tuple(session_ids),
+            ),
+            by_session=True,
+        )
+        per_session = {row.session_id: row for row in snapshot.session_summaries}
+        total = snapshot.summary
+        summary = CausalBudgetUsageSummary(
+            causal_budget_id=causal_budget_id,
+            session_ids=session_ids,
+            session_count=len(session_ids),
+            model_steps=total.model_steps,
+            tool_calls=total.tool_calls,
+            provider_names=total.provider_names,
+            models=total.models,
+            usage=total.usage,
+            session_summaries=tuple(
+                per_session.get(session_id, SessionUsageSummary(session_id=session_id))
+                for session_id in session_ids
+            ),
+        )
+        public_session_ids = [
+            self.project_session_id_for_exposure(session_id) for session_id in summary.session_ids
+        ]
+        public_causal_budget_id = self.project_causal_budget_id_for_exposure(
+            causal_budget_id,
+            session_ids=(session.id for session in sessions),
+        )
+        return summary.model_copy(
+            update={
+                "causal_budget_id": public_causal_budget_id,
+                "session_ids": public_session_ids,
+                "session_summaries": tuple(
+                    session_summary.model_copy(
+                        update={
+                            "session_id": self.project_session_id_for_exposure(
+                                session_summary.session_id
+                            )
+                        },
+                        deep=True,
+                    )
+                    for session_summary in summary.session_summaries
+                ),
+            },
+            deep=True,
+        )
+
+    async def _list_all_sessions(self, query: SessionQuery) -> list[Session]:
+        return await query_all_sessions(self.session_store, query)
+
+    async def run_event_watchers(
+        self,
+        watchers: Iterable[EventWatcher],
+        *,
+        limit: int = 100,
+    ) -> list[EventWatcherRunResult]:
+        """Deliver ordered durable events under renewable, fenced watcher leases."""
+        watcher_list = _validate_event_watchers(watchers)
+        for watcher in watcher_list:
+            if self._secret_redactor.redact_text(watcher.name) != watcher.name:
+                raise ValueError(
+                    "Event watcher name contains a workload secret and cannot be used as durable watcher authority."
+                )
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be an integer greater than or equal to 1.")
+        remaining = limit
+        results: list[EventWatcherRunResult] = []
+        for watcher in watcher_list:
+            deliveries: list[EventWatcherDelivery] = []
+            blocked_by_active_lease = False
+            watcher_error: str | None = None
+            try:
+                while remaining > 0 and len(deliveries) < watcher.batch_size:
+                    if self._event_watcher_supervisor.active(watcher.name):
+                        blocked_by_active_lease = True
+                        break
+                    state = await self._event_watcher_supervisor.store_call(
+                        self.event_watcher_store.load_state(watcher.name)
+                    )
+                    if (
+                        watcher.query.before_sequence is not None
+                        and state.cursor_sequence >= watcher.query.before_sequence
+                    ):
+                        break
+                    page_limit = min(
+                        remaining,
+                        watcher.batch_size - len(deliveries),
+                        EVENT_WATCHER_QUERY_PAGE_LIMIT,
+                    )
+                    records = await self._event_watcher_supervisor.store_call(
+                        self.session_store.query_events(
+                            event_query_after_cursor(
+                                watcher.query,
+                                state.cursor_sequence,
+                                limit=page_limit,
+                            )
+                        ),
+                    )
+                    if not records:
+                        break
+                    stop_watcher = False
+                    for record in records:
+                        outcome = await self._event_watcher_supervisor.store_call(
+                            self.event_watcher_store.claim_event(
+                                watcher_name=watcher.name,
+                                record=record,
+                                lease_seconds=watcher.lease_seconds,
+                                max_attempts=watcher.max_attempts,
+                            ),
+                        )
+                        if outcome is None:
+                            refreshed = await self._event_watcher_supervisor.store_call(
+                                self.event_watcher_store.load_state(watcher.name),
+                            )
+                            if refreshed.cursor_sequence >= record.sequence:
+                                state = refreshed
+                                continue
+                            blocked_by_active_lease = True
+                            stop_watcher = True
+                            break
+                        if (
+                            outcome.watcher_name != watcher.name
+                            or outcome.event_id != record.event.id
+                            or outcome.event_sequence != record.sequence
+                        ):
+                            raise ValueError("Watcher store returned authority for another event.")
+                        if isinstance(outcome, EventWatcherDelivery):
+                            if (
+                                outcome.status is not EventWatcherDeliveryStatus.DEAD_LETTERED
+                                or outcome.cursor_sequence != record.sequence
+                            ):
+                                raise ValueError(
+                                    "Watcher claim returned a non-dead-letter delivery."
+                                )
+                            delivery = outcome
+                        elif isinstance(outcome, EventWatcherClaim):
+                            if outcome.attempt > watcher.max_attempts:
+                                raise ValueError(
+                                    "Watcher claim exceeds the configured attempt limit."
+                                )
+                            delivery = await self._event_watcher_supervisor.run(
+                                watcher=watcher,
+                                store=self.event_watcher_store,
+                                claim=outcome,
+                                context=EventWatcherContext(
+                                    watcher_name=watcher.name,
+                                    record=self._project_persisted_event_record_for_exposure(
+                                        record
+                                    ),
+                                    attempt=outcome.attempt,
+                                ),
+                                cursor_sequence=state.cursor_sequence,
+                                redactor=self._secret_redactor,
+                            )
+                        else:
+                            raise TypeError("Watcher store returned an invalid claim result.")
+                        deliveries.append(
+                            delivery.model_copy(
+                                update={"event_id": public_event_id(delivery.event_sequence)},
+                                deep=True,
+                            )
+                        )
+                        remaining -= 1
+                        if delivery.status in {
+                            EventWatcherDeliveryStatus.SUCCEEDED,
+                            EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        }:
+                            state = state.model_copy(
+                                update={"cursor_sequence": delivery.cursor_sequence}
+                            )
+                        if delivery.status not in {
+                            EventWatcherDeliveryStatus.SUCCEEDED,
+                            EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        }:
+                            stop_watcher = True
+                            break
+                        if remaining <= 0 or len(deliveries) >= watcher.batch_size:
+                            stop_watcher = True
+                            break
+                    if stop_watcher or len(records) < page_limit:
+                        break
+            except Exception as error:
+                watcher_error = self._secret_redactor.redact_text_bounded(
+                    event_watcher_error_payload(error, redactor=self._secret_redactor),
+                    max_bytes=4096,
+                )
+            results.append(
+                EventWatcherRunResult(
+                    watcher_name=watcher.name,
+                    deliveries=deliveries,
+                    blocked_by_active_lease=blocked_by_active_lease,
+                    error=watcher_error,
+                )
+            )
+        return results
+
+    async def get_session_cost(
+        self,
+        session_id: str,
+        pricing: PriceBook,
+        *,
+        currency: str = "USD",
+    ) -> SessionCostSummary:
+        session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        snapshot = await self.session_store.read_cost_accounting(
+            EventQuery(session_id=session_id),
+            pricing,
+            currency=currency,
+            details=True,
+        )
+        summary = snapshot.details
+        if summary is None:
+            raise RuntimeError("Cost accounting store omitted requested details.")
+        return summary.model_copy(
+            update={"session_id": self.project_session_id_for_exposure(session_id)},
+            deep=True,
+        )
+
+    async def get_causal_budget_cost(
+        self,
+        causal_budget_id: str,
+        pricing: PriceBook,
+        *,
+        currency: str = "USD",
+    ) -> CausalBudgetCostSummary:
+        causal_budget_id = await self._resolve_public_causal_budget_id(causal_budget_id)
+        sessions = await self._list_all_sessions(
+            SessionQuery(
+                causal_budget_id=causal_budget_id,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        if not sessions:
+            raise KeyError("Causal budget not found") from None
+        from cayu.runtime._cost_accounting import causal_cost_summary
+
+        session_ids = list(dict.fromkeys(session.id for session in sessions))
+        snapshot = await self.session_store.read_cost_accounting(
+            EventQuery(causal_budget_id=causal_budget_id, session_ids=tuple(session_ids)),
+            pricing,
+            currency=currency,
+            details=True,
+            by_session=True,
+        )
+        summary = causal_cost_summary(snapshot, causal_budget_id, session_ids)
+        public_causal_budget_id = self.project_causal_budget_id_for_exposure(
+            causal_budget_id,
+            session_ids=(session.id for session in sessions),
+        )
+        return summary.model_copy(
+            update={
+                "causal_budget_id": public_causal_budget_id,
+                "session_ids": [
+                    self.project_session_id_for_exposure(session_id)
+                    for session_id in summary.session_ids
+                ],
+                "session_costs": tuple(
+                    session_cost.model_copy(
+                        update={
+                            "session_id": self.project_session_id_for_exposure(
+                                session_cost.session_id
+                            )
+                        },
+                        deep=True,
+                    )
+                    for session_cost in summary.session_costs
+                ),
+            },
+            deep=True,
+        )
+
+    async def emit_hook_event(
+        self,
+        *,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Event:
+        event_type = validate_public_custom_event_type(event_type)
+        event = Event(
+            type=event_type,
+            session_id=session_id,
+            payload=copy_json_value(payload or {}, "payload"),
+        )
+        emitted = await self._event_writer.emit(event)
+        return await self._project_emitted_event_for_public_api(emitted)
+
+    async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
+        if type(request) is not ForkSessionRequest:
+            raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        source_session_id: str | None = None
+        store_resolved_source_session_id: str | None = None
+        store_resolved_expected_source_causal_budget_id: str | None = None
+        expected_source_causal_budget_id: str | None = None
+        expected_source: ForkSourceSnapshot | None = None
+        private_request: ForkSessionRequest | None = None
+        events: tuple[Event, ...] | None = None
+        try:
+            (
+                source_session_id,
+                store_resolved_source_session_id,
+            ) = await self._resolve_public_session_authority(request.source_session_id)
+            expected_source = request.expected_source
+            if expected_source is not None:
+                (
+                    expected_source_causal_budget_id,
+                    store_resolved_expected_source_causal_budget_id,
+                ) = await self._resolve_fork_source_causal_budget_authority(
+                    expected_source.causal_budget_id,
+                    source_session_id=source_session_id,
+                )
+                expected_source = expected_source.model_copy(
+                    update={
+                        "source_session_id": source_session_id,
+                        "causal_budget_id": expected_source_causal_budget_id,
+                    },
+                    deep=True,
+                )
+            private_request = request.model_copy(
+                update={
+                    "source_session_id": source_session_id,
+                    "expected_source": expected_source,
+                },
+                deep=True,
+            )
+            events = await self._collect_public_fork_events(
+                private_request,
+                store_resolved_source_session_id=store_resolved_source_session_id,
+                store_resolved_expected_source_causal_budget_id=(
+                    store_resolved_expected_source_causal_budget_id
+                ),
+            )
+        finally:
+            del request
+            source_session_id = store_resolved_source_session_id = None
+            store_resolved_expected_source_causal_budget_id = None
+            expected_source_causal_budget_id = None
+            expected_source = None
+            private_request = None
+        if events is None:
+            raise RuntimeError("Session fork ended without events or a failure.")
+        for event in events:
+            yield event
+
+    async def snapshot_fork_source(self, source_session_id: str) -> ForkSourceSnapshot:
+        """Return exact public authority for one currently safe fork source."""
+
+        private_session_id = ""
+        source: Session | None = None
+        checkpoint: dict[str, Any] | None = None
+        transcript: TranscriptSnapshot | None = None
+        snapshot: ForkSourceSnapshot | None = None
+        current_source: Session | None = None
+        current_checkpoint: dict[str, Any] | None = None
+        current_transcript: TranscriptSnapshot | None = None
+        current: ForkSourceSnapshot | None = None
+        result: ForkSourceSnapshot | None = None
+        public_source_session_id = ""
+        public_causal_budget_id = ""
+        failure: BaseException | None = None
+        try:
+            private_session_id, _ = await self._resolve_public_session_authority(source_session_id)
+            await self._preflight_ordinary_fork_source(private_session_id)
+            source, checkpoint = await load_runtime_session_checkpoint_snapshot(
+                self._runtime_session_store,
+                private_session_id,
+            )
+            await self._session_engine.preflight_fork_source_checkpoint_state(source, checkpoint)
+            transcript = await self.session_store.load_transcript_snapshot(private_session_id)
+            snapshot = _fork_source_snapshot_from_material(
+                source,
+                checkpoint,
+                transcript,
+                redactor=self._secret_redactor,
+            )
+            # A terminal source may be resumed concurrently with inspection. Re-read all
+            # asserted material and fail closed instead of returning a mixed snapshot.
+            current_source, current_checkpoint = await load_runtime_session_checkpoint_snapshot(
+                self._runtime_session_store,
+                private_session_id,
+            )
+            await self._session_engine.preflight_fork_source_checkpoint_state(
+                current_source,
+                current_checkpoint,
+            )
+            current_transcript = await self.session_store.load_transcript_snapshot(
+                private_session_id
+            )
+            current = _fork_source_snapshot_from_material(
+                current_source,
+                current_checkpoint,
+                current_transcript,
+                redactor=self._secret_redactor,
+            )
+            if current != snapshot:
+                raise SessionRunFenced("Fork source changed while its exact snapshot was captured.")
+            (
+                public_source_session_id,
+                public_causal_budget_id,
+            ) = await self._project_fork_source_authority_for_exposure(
+                source_session_id=private_session_id,
+                causal_budget_id=snapshot.causal_budget_id,
+            )
+            result = snapshot.model_copy(
+                update={
+                    "source_session_id": public_source_session_id,
+                    "causal_budget_id": public_causal_budget_id,
+                },
+                deep=True,
+            )
+        except (asyncio.CancelledError, Exception) as exc:
+            failure = _detached_fork_source_snapshot_failure(
+                exc,
+                redactor=self._secret_redactor,
+            )
+        finally:
+            source_session_id = private_session_id = ""
+            source = current_source = None
+            if type(checkpoint) is dict:
+                checkpoint.clear()
+            checkpoint = None
+            if type(current_checkpoint) is dict:
+                current_checkpoint.clear()
+            current_checkpoint = None
+            transcript = current_transcript = None
+            snapshot = current = None
+            public_source_session_id = public_causal_budget_id = ""
+        if failure is not None:
+            raise failure from None
+        if result is None:  # pragma: no cover - defensive totality guard
+            raise AssertionError("Fork source snapshot capture returned no result.")
+        return result
+
+    async def _fork_session_from_runtime_context(
+        self,
+        request: ForkSessionRequest,
+        *,
+        source_session_id: str,
+    ) -> AsyncIterator[Event]:
+        """Fork a hook-owned source without granting that trust to public callers."""
+
+        if type(request) is not ForkSessionRequest:
+            raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        private_request: ForkSessionRequest | None = None
+        events: tuple[Event, ...] | None = None
+        try:
+            source_session_id = require_clean_nonblank(
+                source_session_id,
+                "runtime hook source_session_id",
+            )
+            if request.source_session_id != source_session_id:
+                raise ValueError(
+                    "Runtime hook fork source_session_id does not match its context session."
+                )
+            private_request = copy_fork_session_request(request)
+            events = await self._collect_public_fork_events(
+                private_request,
+                store_resolved_source_session_id=source_session_id,
+            )
+        finally:
+            del request
+            source_session_id = ""
+            private_request = None
+        if events is None:
+            raise RuntimeError("Runtime-hook session fork ended without events or a failure.")
+        for event in events:
+            yield event
+
+    async def _collect_public_fork_events(
+        self,
+        request: ForkSessionRequest,
+        *,
+        store_resolved_source_session_id: str | None,
+        store_resolved_expected_source_causal_budget_id: str | None = None,
+    ) -> tuple[Event, ...]:
+        """Detach fork-authority failures before they cross the public boundary."""
+
+        failure: Exception | None = None
+        projected_events: list[Event] = []
+        stream: AsyncGenerator[Event, None] | None = None
+        owned_stream: _RunFenceOwnedEventStream | None = None
+        try:
+            try:
+                session_request_boundary.require_store_resolved_or_secret_free_session_authority(
+                    request.source_session_id,
+                    store_resolved_value=store_resolved_source_session_id,
+                    field_name="source_session_id",
+                    redactor=self._secret_redactor,
+                )
+            except ValueError as exc:
+                failure = ValueError(str(exc))
+            if failure is None:
+                stream = self._fork_session_private(
+                    request,
+                    store_resolved_source_session_id=store_resolved_source_session_id,
+                    store_resolved_expected_source_causal_budget_id=(
+                        store_resolved_expected_source_causal_budget_id
+                    ),
+                )
+                async with _close_delegated_event_stream(stream) as owned_stream:
+                    async for event in owned_stream:
+                        projected_events.append(
+                            await self._project_emitted_event_for_public_api(event)
+                        )
+        except session_request_boundary.ForkSourceNotFoundError:
+            failure = KeyError("Fork source session was not found.")
+        except session_request_boundary.ForkActiveModelStageError:
+            failure = ValueError("Fork source session has an active model-completion stage.")
+        except session_request_boundary.ForkAuthorityError as exc:
+            failure = ValueError(str(exc))
+        finally:
+            del request
+            store_resolved_source_session_id = None
+            store_resolved_expected_source_causal_budget_id = None
+            stream = owned_stream = None
+        if failure is not None:
+            projected_events.clear()
+            raise failure from None
+        return tuple(projected_events)
+
+    async def _preflight_ordinary_fork_source(self, session_id: str) -> None:
+        await self._session_engine._require_ordinary_session_execution(
+            session_id,
+            admit_session=False,
+        )
+
+    async def _fork_session_private(
+        self,
+        request: ForkSessionRequest,
+        *,
+        store_resolved_source_session_id: str | None = None,
+        store_resolved_expected_source_causal_budget_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ForkSessionRequest:
+            raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        prepared = session_request_boundary.prepare_fork_session_request_with_identity(
+            request,
+            redactor=self._secret_redactor,
+            public_authority_alias_codec=self._public_authority_alias_codec,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+            store_resolved_expected_source_causal_budget_id=(
+                store_resolved_expected_source_causal_budget_id
+            ),
+        )
+        del request
+        stream = self._session_engine.fork_session(
+            request=prepared.request,
+            request_sha256=prepared.request_sha256,
+            accepted_request_sha256s=prepared.accepted_request_sha256s,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _verifier_aware_recovery_execution_outcome(
+        self,
+        *,
+        session_id: str,
+        task_id: str | None = None,
+        admit_session: bool = True,
+    ) -> tuple[bool, BaseException | None]:
+        return await self._session_engine._verifier_aware_task_execution_outcome(
+            task_id,
+            session_id=session_id,
+            admit_session=admit_session,
+        )
+
+    async def _require_ordinary_recovery_execution(
+        self,
+        *,
+        session_id: str,
+        task_id: str | None = None,
+        admit_session: bool,
+    ) -> None:
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=session_id,
+            task_id=task_id,
+            admit_session=admit_session,
+        )
+        if admission_failure is not None:
+            raise_task_store_operation_failure(admission_failure)
+        if requires_completion_decision:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+
+    async def _prepare_continuation_recovery_authority(
+        self,
+        *,
+        session_id: str,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> tuple[str | None, str | None, tuple[Event, ...] | None]:
+        task_id, session_instance_id = await self._session_engine._linked_continuation_task_id(
+            session_id=session_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+        (
+            replayed_failure,
+            replay_events,
+        ) = await self._session_engine._replay_runtime_task_failure_if_needed(
+            session_id=session_id,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+        )
+        if not replayed_failure:
+            await self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                task_id=task_id,
+                admit_session=False,
+            )
+        return task_id, session_instance_id, replay_events if replayed_failure else None
+
+    async def _require_continuation_task_authority(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str | None,
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_handoff_id: str | None = None,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> None:
+        if task_handoff_id is not None and task_worker_id is None:
+            raise RuntimeError("Task handoff authority requires a continuation worker.")
+        if task_id is None and session_instance_id is None and task_worker_id is None:
+            if task_handoff_id is not None:
+                raise RuntimeError("Workerless continuation retained task handoff authority.")
+            return
+        if task_id is None or session_instance_id is None:
+            raise RuntimeError("Attached-task continuation authority is incomplete.")
+        await self._session_engine._require_linked_continuation_task_authority(
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+
+    async def _require_continuation_recovery_execution(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str | None,
+        task_id: str | None,
+        task_worker_id: str | None,
+        admit_session: bool,
+        task_handoff_id: str | None = None,
+        enforce_task_handoff_identity: bool = False,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> None:
+        await self._require_continuation_task_authority(
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+        await self._require_ordinary_recovery_execution(
+            session_id=session_id,
+            task_id=task_id,
+            admit_session=admit_session,
+        )
+
+    async def _run_recovery_session(
+        self,
+        request: RecoverySessionRunRequest,
+    ) -> AsyncGenerator[Event, None]:
+        await self._require_continuation_task_authority(
+            session_id=request.session.id,
+            session_instance_id=(
+                request.session.instance_id if request.task_id is not None else None
+            ),
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session.id,
+            task_id=request.task_id,
+        )
+        if admission_failure is not None:
+            del request
+            raise_task_store_operation_failure(admission_failure)
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        stream = self._session_engine._run_recovery_session(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _validate_execution_profile_continuation_for_recovery(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
+        *,
+        budget_policy: BudgetPolicy | None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int | None = None,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
+        require_open_interaction: bool = True,
+        additional_profile_fingerprints: tuple[str, ...] = (),
+        record_rejection: bool = True,
+    ) -> ActiveInvocationExecutionProfile:
+        return await self._session_engine.validate_execution_profile_continuation(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_loop_policies=request_loop_policies,
+            budget_policy=copy_budget_policy(budget_policy),
+            request_budget_limits=request_budget_limits,
+            structured_output=structured_output,
+            thinking=thinking,
+            max_steps=max_steps,
+            limits=limits,
+            retry_policy=retry_policy,
+            invocation_semantics_available=invocation_semantics_available,
+            frozen_candidate_profile=frozen_candidate_profile,
+            require_open_interaction=require_open_interaction,
+            additional_profile_fingerprints=additional_profile_fingerprints,
+            record_rejection=record_rejection,
+        )
+
+    def _emit_recovery_terminal_event_with_hooks(
+        self,
+        request: RecoveryTerminalEventRequest,
+    ) -> AsyncIterator[Event]:
+        if request.terminal_event_already_durable:
+            return self._session_engine._replay_terminal_event_with_hooks(
+                event=request.event,
+                phase=request.phase,
+                session=request.session,
+                registered_agent=request.registered_agent,
+                registered_environment=request.registered_environment,
+                execution_profile=request.execution_profile,
+                invocation_context=request.invocation_context,
+                run_runtime_hooks=request.run_runtime_hooks,
+                yield_terminal_event=request.yield_durable_terminal_event,
+            )
+        return self._emit_terminal_event_with_hooks(
+            event=request.event,
+            phase=request.phase,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+            run_runtime_hooks=request.run_runtime_hooks,
+        )
+
+    async def _terminal_runtime_hooks_are_settled_for_recovery(
+        self,
+        request: RecoveryTerminalEventRequest,
+    ) -> bool:
+        if not request.terminal_event_already_durable:
+            raise ValueError("Terminal hook settlement requires a durable terminal event.")
+        return await self._session_engine.terminal_runtime_hooks_are_settled(
+            phase=request.phase,
+            session=request.session,
+            terminal_event=request.event,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+        )
+
+    def _fail_provider_operation_resolution(
+        self,
+        request: ProviderOperationFailureRequest,
+    ) -> AsyncIterator[Event]:
+        return self._session_engine.fail_provider_operation_resolution(
+            resolution_event=request.resolution_event,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+            legacy_resolution_without_profile=request.legacy_resolution_without_profile,
+            invocation_context=request.invocation_context,
+        )
+
+    def _stop_recovery_session_for_limit_reached(
+        self,
+        request: RecoveryLimitStopRequest,
+    ) -> AsyncIterator[Event]:
+        return self._stop_session_for_limit_reached(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            decision=request.decision,
+            usage_summary=request.usage_summary,
+            cost_summary=request.cost_summary,
+            messages=request.messages,
+            tool_calls=request.tool_calls,
+            completed_tool_outcomes=request.completed_tool_outcomes,
+            pending_approval_to_clear=request.pending_approval_to_clear,
+            deferred_messages=request.deferred_messages,
+            requested_approval_decision=request.requested_approval_decision,
+            approval_resolution_request_digest=request.approval_resolution_request_digest,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+        )
+
+    def _interrupt_session_for_recovery(
+        self,
+        request: RecoveryInterruptionRequest,
+    ) -> AsyncIterator[Event]:
+        return self._handle_session_interrupted(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+            run_terminal_hooks=request.run_terminal_hooks,
+            preserve_interaction_id=request.preserve_interaction_id,
+            recovery_claim_id=request.recovery_claim_id,
+        )
+
+    def _pending_session_interrupt_checkpoint_for_recovery(
+        self,
+        payload: dict[str, Any],
+        cascade_created_at: datetime,
+    ):
+        return _checkpoint_with_pending_session_interrupt(
+            payload,
+            cascade_created_at=cascade_created_at,
+        )
+
+    async def _complete_abandoned_recovery_turn(
+        self,
+        request: RecoveryAbandonedTurnRequest,
+    ) -> Session:
+        finalized, _, _ = await self._session_engine._publish_sibling_interaction_transition(
+            session=request.session,
+            invocation_context=request.invocation_context,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            to_status=SessionStatus.INTERRUPTED,
+            execution_profile=request.execution_profile,
+        )
+        if request.run_started_at is not None and request.usage_tracker is not None:
+            await self._emit_turn_completed_once(
+                session=finalized,
+                registered_agent=request.registered_agent,
+                environment_name=request.environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=request.run_started_at,
+                usage_tracker=request.usage_tracker,
+                active_run=request.active_run,
+                invocation_context=request.invocation_context,
+            )
+        return finalized
+
+    async def _resume_recovery_interaction(
+        self,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> Event | None:
+        return await self._session_engine.resume_interaction(
+            session,
+            registered_agent,
+            registered_environment,
+        )
+
+    async def resolve_user_input(
+        self,
+        response: UserInputResponse,
+    ) -> AsyncIterator[Event]:
+        if type(response) is not UserInputResponse:
+            raise TypeError("Runtime user input resolution requires a UserInputResponse.")
+        session_id = await self._resolve_public_session_id(response.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id,
+            response.review_reference,
+        )
+        response = copy_user_input_response(response).model_copy(
+            update={
+                "session_id": session_id,
+                "input_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=response.input_id,
+                    field_name="input_id",
+                ),
+            },
+        )
+        stream = self._resolve_user_input_private(response)
+        del response
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _resolve_user_input_private(
+        self,
+        response: UserInputResponse,
+    ) -> AsyncGenerator[Event, None]:
+        """Resume a session paused by ``ask_user`` with the user's answer.
+
+        The answer becomes the ``ask_user`` tool result; any other tool calls in the same
+        round (none ran before the pause) execute now, and the session continues.
+        """
+        if type(response) is not UserInputResponse:
+            raise TypeError("Runtime user input resolution requires a UserInputResponse.")
+        response = copy_user_input_response(response)
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=response.session_id,
+            task_worker_id=response.task_worker_id,
+            task_handoff_id=response.task_handoff_id,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
+        session_id = response.session_id
+        task_worker_id = response.task_worker_id
+        task_handoff_id = response.task_handoff_id
+        stream = self._recovery_coordinator.resolve_user_input(
+            response=response,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                admit_session=True,
+            ),
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
+            ),
+        )
+        del response
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+        await self._event_writer.recover_persisted_side_effects()
+
+    async def recover_user_input(
+        self,
+        request: UserInputRecoveryRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not UserInputRecoveryRequest:
+            raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id, request.review_reference
+        )
+        request = copy_user_input_recovery_request(request).model_copy(
+            update={
+                "session_id": session_id,
+                "input_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.input_id,
+                    field_name="input_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+        )
+        stream = self._recover_user_input_private(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _recover_user_input_private(
+        self,
+        request: UserInputRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Recover a user-input round stuck on `manual_recovery_required`.
+
+        A tool in the paused round started on a prior resume but recorded no terminal event
+        (a crash mid-tool), so it cannot be re-run automatically. The caller supplies the
+        externally verified outcome for that `tool_call_id`; Cayu persists it as the tool's
+        terminal result and continues the round (re-supplying `answer` in case the `ask_user`
+        result was not recorded before the crash). Cayu does not infer the outcome itself.
+        """
+        if type(request) is not UserInputRecoveryRequest:
+            raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
+        request = copy_user_input_recovery_request(request)
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
+        session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
+        stream = self._recovery_coordinator.recover_user_input_request(
+            request=request,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                admit_session=True,
+            ),
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
+            ),
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def resolve_tool_approval(
+        self,
+        request: ToolApprovalRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not ToolApprovalRequest:
+            raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id,
+            request.review_reference,
+        )
+        request = copy_tool_approval_request(request).model_copy(
+            update={
+                "session_id": session_id,
+                "approval_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.approval_id,
+                    field_name="approval_id",
+                ),
+                "tool_round_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_round_id,
+                    field_name="tool_round_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+        )
+        stream = self._resolve_tool_approval_private(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def resolve_provider_operation(
+        self,
+        request: ProviderOperationResolutionRequest,
+    ) -> AsyncIterator[Event]:
+        """Resolve unavailable provider work by explicit fallback retry or failure."""
+
+        if type(request) is not ProviderOperationResolutionRequest:
+            raise TypeError(
+                "Runtime provider-operation resolution requires a "
+                "ProviderOperationResolutionRequest."
+            )
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = copy_provider_operation_resolution_request(
+            request,
+            session_id=session_id,
+        )
+        allow_terminal_failure_replay = request.action is ProviderOperationResolutionAction.FAIL
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield await self._project_emitted_event_for_public_api(event)
+            return
+        session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
+        stream = self._recovery_coordinator.resolve_provider_operation(
+            request,
+            task_id=task_id,
+            task_handoff_id=task_handoff_id,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                admit_session=True,
+                task_handoff_id=task_handoff_id,
+                allow_terminal_failure_replay=allow_terminal_failure_replay,
+            ),
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    allow_terminal_failure_replay=allow_terminal_failure_replay,
+                )
+            ),
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _resolve_tool_approval_private(
+        self,
+        request: ToolApprovalRequest,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ToolApprovalRequest:
+            raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
+        request = _validate_tool_approval_request(request)
+        approval_failure_identity = ApprovalTaskFailureIdentity(
+            approval_id=request.approval_id,
+            tool_round_id=request.tool_round_id,
+            tool_call_id=request.tool_call_id,
+            resolution_request_digest=(
+                approval_support.approval_resolution_request_digest(request)
+            ),
+        )
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+            approval_failure_identity=approval_failure_identity,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
+        session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
+        stream = self._recovery_coordinator.resolve_tool_approval(
+            request=request,
+            task_id=task_id,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                admit_session=True,
+                approval_failure_identity=approval_failure_identity,
+            ),
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    approval_failure_identity=approval_failure_identity,
+                )
+            ),
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+        await self._event_writer.recover_persisted_side_effects()
+
+    async def recover_tool_approval(
+        self,
+        request: ToolApprovalRecoveryRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not ToolApprovalRecoveryRequest:
+            raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        await self._recovery_coordinator.require_human_review_resolution_authority(
+            session_id, request.review_reference
+        )
+        request = copy_tool_approval_recovery_request(request).model_copy(
+            update={
+                "session_id": session_id,
+                "approval_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.approval_id,
+                    field_name="approval_id",
+                ),
+                "tool_round_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_round_id,
+                    field_name="tool_round_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+        )
+        stream = self._recover_tool_approval_private(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _recover_tool_approval_private(
+        self,
+        request: ToolApprovalRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ToolApprovalRecoveryRequest:
+            raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
+        request = _validate_tool_approval_recovery_request(request)
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
+        session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
+        stream = self._recovery_coordinator.recover_tool_approval_request(
+            request=request,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                admit_session=True,
+            ),
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
+            ),
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def inspect_tool_effect(
+        self, session_id: str, *, tool_round_id: str, tool_call_id: str
+    ) -> ToolEffectReconciliationTarget:
+        """Inspect an external call without claiming work or validating a receipt.
+
+        Use round/call identifiers from public events. The snapshot may become
+        stale; submission never refreshes its versions or grants retry authority.
+        """
+        private_session_id = await self._resolve_public_session_id(session_id)
+        public_ids = {
+            "tool_round_id": require_clean_nonblank(tool_round_id, "tool_round_id"),
+            "tool_call_id": require_clean_nonblank(tool_call_id, "tool_call_id"),
+        }
+        if any(self._secret_redactor.redact_text(value) != value for value in public_ids.values()):
+            raise ToolEffectConflict("Inspection requires safe public event identifiers.")
+        private_ids = {
+            name: await self._resolve_public_action_linkage(
+                session_id=private_session_id, value=value, field_name=name
+            )
+            for name, value in public_ids.items()
+        }
+        target = await self._recovery_coordinator.inspect_tool_effect_target(
+            session_id=private_session_id, **private_ids
+        )
+        if self._secret_redactor.redact_text(target.tool_name) != target.tool_name:
+            raise ToolEffectConflict("The tool identity cannot be safely exposed.")
+        codec = self._require_public_authority_alias_codec()
+        return ToolEffectReconciliationTarget.model_validate(
+            {
+                **target.model_dump(),
+                **public_ids,
+                "session_id": self.project_session_id_for_exposure(private_session_id),
+                **{
+                    name: codec.encode(
+                        getattr(target, name), field_name=name, session_id=private_session_id
+                    )
+                    for name in ("session_instance_id", "idempotency_key")
+                },
+            }
+        )
+
+    async def reconcile_tool_effect(
+        self,
+        request: ToolEffectReconciliationRequest,
+    ) -> AsyncIterator[Event]:
+        """Validate external evidence and continue an existing uncertain tool call."""
+        if type(request) is not ToolEffectReconciliationRequest:
+            raise TypeError("Effect reconciliation requires an exact reconciliation request.")
+        request = ToolEffectReconciliationRequest(
+            **{
+                name: getattr(request, name)
+                for name in ToolEffectReconciliationRequest.model_fields
+            }
+        )
+        session_id = await self._resolve_public_session_id(request.session_id)
+        round_id = await self._resolve_public_action_linkage(
+            session_id=session_id, value=request.tool_round_id, field_name="tool_round_id"
+        )
+        call_id = await self._resolve_public_action_linkage(
+            session_id=session_id, value=request.tool_call_id, field_name="tool_call_id"
+        )
+        resolved_identities = {}
+        response = request.user_input_response
+        if response is not None:
+            if response.session_id != request.session_id or (
+                response.task_worker_id != request.task_worker_id
+                or response.task_handoff_id != request.task_handoff_id
+            ):
+                raise ToolEffectConflict(
+                    "User-input continuation has different session/task authority."
+                )
+            response = copy_user_input_response(response).model_copy(
+                update={
+                    "session_id": session_id,
+                    "input_id": await self._resolve_public_action_linkage(
+                        session_id=session_id, value=response.input_id, field_name="input_id"
+                    ),
+                }
+            )
+        aliased_fields = [
+            name
+            for name in ("session_instance_id", "idempotency_key")
+            if parse_public_authority_alias(getattr(request, name)) is not None
+        ]
+        if aliased_fields:
+            target = await self._recovery_coordinator.inspect_tool_effect_target(
+                session_id=session_id, tool_round_id=round_id, tool_call_id=call_id
+            )
+            codec = self._require_public_authority_alias_codec()
+            for name in aliased_fields:
+                if not codec.matches(
+                    getattr(request, name),
+                    getattr(target, name),
+                    field_name=name,
+                    session_id=session_id,
+                ):
+                    raise ToolEffectConflict("Effect identity alias conflicts with its call.")
+                resolved_identities[name] = getattr(target, name)
+        receipt = request.receipt
+        if receipt is not None:
+            receipt = ToolEffectReceipt.model_validate(
+                {
+                    name: call_id
+                    if name == "tool_call_id"
+                    else resolved_identities.get(name, getattr(receipt, name))
+                    for name in ToolEffectReceipt.model_fields
+                }
+            )
+        request = ToolEffectReconciliationRequest.model_validate(
+            {
+                **{
+                    name: getattr(request, name)
+                    for name in ToolEffectReconciliationRequest.model_fields
+                },
+                "session_id": session_id,
+                "tool_round_id": round_id,
+                "tool_call_id": call_id,
+                **resolved_identities,
+                "receipt": receipt,
+                "user_input_response": response,
+            }
+        )
+        stream = self._recover_tool_round_private(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def recover_tool_round(
+        self,
+        request: ToolRoundRecoveryRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not ToolRoundRecoveryRequest:
+            raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = copy_tool_round_recovery_request(request).model_copy(
+            update={
+                "session_id": session_id,
+                "round_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.round_id,
+                    field_name="tool_round_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+        )
+        stream = self._recover_tool_round_private(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _recover_tool_round_private(
+        self,
+        request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Recover a crashed ordinary tool round with an operator-verified outcome.
+
+        A tool call in a non-approval round started but recorded no terminal event
+        (a crash mid-tool), so an automatic resume would close it as an
+        unknown-outcome failure. The caller supplies the externally verified outcome
+        for that `tool_call_id`; Cayu persists it as the call's terminal result and
+        never re-runs the tool. One call per invocation: if other
+        started-but-unresolved calls remain, the session returns to INTERRUPTED with
+        `manual_recovery_required` naming the next call; otherwise the round closes
+        from the recorded outcomes and the model loop continues. A crashed round can
+        leave the session FAILED (an in-process persistence error) or in a stale live
+        status (a process kill), so FAILED and RUNNING are accepted alongside
+        INTERRUPTED. An existing INTERRUPTING transition wins rather than being
+        reopened by recovery. The in-process claim registered while this recovery
+        streams blocks duplicate work in this process, while a durable recovery
+        claim serializes other workers and fences an expired owner. If this call
+        fails after claiming a stale live session, the session closes to the
+        resumable INTERRUPTED state. When the recovered terminal event is already
+        durable, the evidence remains authoritative: do not retry the same
+        `tool_call_id` — `resume(...)` finishes the round from the persisted outcome.
+        """
+        if type(request) is ToolEffectReconciliationRequest:
+            request = ToolEffectReconciliationRequest(
+                **{
+                    name: getattr(request, name)
+                    for name in ToolEffectReconciliationRequest.model_fields
+                }
+            )
+        elif type(request) is ToolRoundRecoveryRequest:
+            request = copy_tool_round_recovery_request(request)
+        else:
+            raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
+        if type(request) is ToolEffectReconciliationRequest:
+            replay = await self._recovery_coordinator.replay_consumed_tool_effect(request)
+            if replay is not None:
+                yield replay
+                return
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
+        session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
+        stream = self._recovery_coordinator.recover_tool_round_request(
+            request=request,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                admit_session=True,
+            ),
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
+            ),
+        )
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def _emit_turn_completed_once(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        status: SessionStatus,
+        run_started_at: float,
+        usage_tracker: SessionUsageTracker,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        invocation_context: InvocationContext | None = None,
+    ) -> Event:
+        events = await self._session_engine._emit_turn_completed_once(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            status=status,
+            run_started_at=run_started_at,
+            usage_tracker=usage_tracker,
+            active_run=active_run,
+            invocation_context=invocation_context,
+        )
+        return events[-1]
+
+    async def _apply_model_step_budget_evaluation(
+        self,
+        request: ModelStepBudgetEvaluationRequest,
+    ) -> AsyncIterator[Event]:
+        stream = self._session_engine._apply_model_step_budget_evaluation(request=request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _apply_model_step_limit_evaluation(
+        self,
+        request: ModelStepLimitEvaluationRequest,
+    ) -> AsyncIterator[Event]:
+        stream = self._session_engine._apply_model_step_limit_evaluation(request=request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _stop_for_model_step_budget_reservation_failure(
+        self,
+        request: ModelStepBudgetReservationFailureRequest,
+    ) -> AsyncIterator[Event]:
+        stream = self._session_engine._stop_for_model_step_budget_reservation_failure(
+            request=request
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _apply_tool_round_limit(
+        self,
+        request: ToolRoundLimitRequest,
+    ) -> AsyncIterator[Event]:
+        stream = self._session_engine._apply_tool_round_limit(request=request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _stop_session_for_limit_reached(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        decision: StopDecision,
+        usage_summary: SessionUsageSummary,
+        cost_summary: SessionCostTotals | None,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+        pending_approval_to_clear: PendingToolApproval | None = None,
+        deferred_messages: list[Message] | None = None,
+        requested_approval_decision: ToolApprovalDecision | None = None,
+        approval_resolution_request_digest: str | None = None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: SessionUsageTracker | None = None,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
+    ) -> AsyncIterator[Event]:
+        # This adapter is owned by RecoveryCoordinator, not SessionEngine._run_session,
+        # so its terminal transition must consume the sibling cancellation handoff.
+        stream = self._session_engine._stop_session_for_limit_reached(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            decision=decision,
+            usage_summary=usage_summary,
+            cost_summary=cost_summary,
+            messages=messages,
+            tool_calls=tool_calls,
+            completed_tool_outcomes=completed_tool_outcomes,
+            pending_approval_to_clear=pending_approval_to_clear,
+            deferred_messages=deferred_messages,
+            requested_approval_decision=requested_approval_decision,
+            approval_resolution_request_digest=approval_resolution_request_digest,
+            run_started_at=run_started_at,
+            turn_usage_tracker=turn_usage_tracker,
+            active_run=active_run,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            reconcile_transition_cancellation=True,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _load_pending_session_interrupt_payload(
+        self,
+        session_id: str,
+        *,
+        default: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._session_engine._load_pending_session_interrupt_payload(
+            session_id=session_id, default=default
+        )
+
+    async def _load_pending_interruption_cascade(
+        self,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        return await self._session_engine._load_pending_interruption_cascade(session_id=session_id)
+
+    async def _claim_pending_interruption_cascade(
+        self,
+        session_id: str,
+        interrupt_payload: dict[str, Any],
+        *,
+        create_if_missing: bool = True,
+        retry_request: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return await self._session_engine._claim_pending_interruption_cascade(
+            session_id=session_id,
+            interrupt_payload=interrupt_payload,
+            create_if_missing=create_if_missing,
+            retry_request=retry_request,
+        )
+
+    async def _mark_pending_interruption_cascade_failed(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> bool:
+        return await self._session_engine._mark_pending_interruption_cascade_failed(
+            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
+        )
+
+    async def _complete_pending_interruption_cascade(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> tuple[bool, bool]:
+        return await self._session_engine._complete_pending_interruption_cascade(
+            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
+        )
+
+    async def _renew_pending_interruption_cascade_claim(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> bool:
+        return await self._session_engine._renew_pending_interruption_cascade_claim(
+            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
+        )
+
+    async def _release_pending_interruption_cascade_claim(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> None:
+        return await self._session_engine._release_pending_interruption_cascade_claim(
+            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
+        )
+
+    async def _handle_session_interrupted(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: SessionUsageTracker | None = None,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        run_terminal_hooks: bool = True,
+        preserve_interaction_id: str | None = None,
+        recovery_claim_id: str | None = None,
+    ) -> AsyncIterator[Event]:
+        stream = self._session_engine._handle_session_interrupted(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            run_started_at=run_started_at,
+            turn_usage_tracker=turn_usage_tracker,
+            active_run=active_run,
+            run_terminal_hooks=run_terminal_hooks,
+            preserve_interaction_id=preserve_interaction_id,
+            recovery_claim_id=recovery_claim_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _close_tool_round_after_interrupt(
+        self,
+        request: InterruptedToolRoundRequest,
+    ) -> AsyncGenerator[Event, None]:
+        stream = self._session_engine._close_tool_round_after_interrupt(request=request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    def scoped_event_emitter(
+        self,
+        *,
+        event_types: Iterable[EventType | str],
+    ) -> Callable[[Event], Awaitable[Event]]:
+        """Return an out-of-band emitter constrained to specific event types."""
+        allowed = frozenset(str(event_type) for event_type in event_types)
+        if not allowed:
+            raise ValueError("scoped_event_emitter requires at least one event type.")
+
+        async def emit(event: Event) -> Event:
+            if str(event.type) not in allowed:
+                raise ValueError(f"Event type {event.type!r} is not allowed for this emitter.")
+            return await self.emit_event(event)
+
+        return emit
+
+    def _workflow_event_emitter(
+        self,
+        session_id: str,
+    ) -> Callable[[list[Event]], Awaitable[list[Event]]]:
+        """Return a trusted private emitter for workflow-owned runtime internals.
+
+        Results remain private authority because workflow execution feeds them
+        back into runtime control flow. Public callers use ``emit_event`` or the
+        server projection boundary instead.
+        """
+
+        async def emit(events: list[Event]) -> list[Event]:
+            _validate_workflow_event_batch(events, allow_cayu_internal=True)
+            return await self._event_writer.emit_many(session_id, events)
+
+        return emit
+
+    def _workflow_step_reserver(
+        self,
+        session_id: str,
+        workflow_name: str,
+    ) -> Callable[[Event, str], Awaitable[bool]]:
+        """Return the atomic reservation boundary for one workflow journal."""
+
+        async def reserve(event: Event, attempt_id: str) -> bool:
+            _validate_workflow_event_batch([event], allow_cayu_internal=True)
+            if event.session_id != session_id:
+                raise ValueError("Workflow reservation event has the wrong session_id.")
+            return await self._event_writer.reserve_workflow_step_started(
+                event,
+                workflow_name=workflow_name,
+                attempt_id=attempt_id,
+            )
+
+        return reserve
+
+    async def emit_event(self, event: Event) -> Event:
+        """Publish an event to the session store and all sinks.
+
+        Low-level seam for runtime-owned out-of-band session events. Prefer
+        ``scoped_event_emitter`` when handing an emitter to a component. Redaction
+        is applied by the sinks; callers must not place raw secrets in the payload.
+        """
+        emitted = await self._emit_event_private(event)
+        return await self._project_emitted_event_for_public_api(emitted)
+
+    async def _emit_event_private(self, event: Event) -> Event:
+        if not isinstance(event, Event):
+            raise TypeError("emit_event requires an Event instance.")
+        emitted = await self._event_writer.emit(event)
+        self._session_control.queue_out_of_band_event(emitted)
+        return emitted
+
+    async def _emit_terminal_event_with_hooks(
+        self,
+        *,
+        event: Event,
+        phase: RuntimeHookPhase,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
+        run_runtime_hooks: bool = True,
+    ) -> AsyncIterator[Event]:
+        stream = self._session_engine._emit_terminal_event_with_hooks(
+            event=event,
+            phase=phase,
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            run_runtime_hooks=run_runtime_hooks,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def emit_events(self, session_id: str, events: list[Event]) -> list[Event]:
+        """Persist events for one session and fan them out to runtime sinks.
+
+        Restricted to the ``workflow.`` and ``custom.`` namespaces: runtime
+        event namespaces encode Cayu-owned lifecycle and accounting evidence,
+        so application callers must not forge them even though every accepted
+        batch uses the same durable budget/sink handoff.
+        """
+        _validate_workflow_event_batch(events, allow_cayu_internal=False)
+        emitted = await self._event_writer.emit_many(session_id, events)
+        return [await self._project_emitted_event_for_public_api(event) for event in emitted]
+
+
+def _validate_workflow_event_batch(
+    events: list[Event],
+    *,
+    allow_cayu_internal: bool,
+) -> None:
+    if type(events) is not list:
+        raise TypeError("Runtime events must be a list.")
+    for event in events:
+        if type(event) is not Event:
+            raise TypeError("Runtime events must be Event instances.")
+        event_type = str(event.type)
+        if not event_type.startswith(("workflow.", "custom.")):
+            raise ValueError(
+                "emit_events only accepts workflow. or custom. namespace "
+                f"events; got {event_type!r}."
+            )
+        if not allow_cayu_internal and event_type.startswith("custom."):
+            validate_public_custom_event_type(event_type)
+
+
+def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_records.RegisteredTool:
+    return runtime_records.RegisteredTool(
+        name=tool.name,
+        description=tool.description,
+        schema=deepcopy(tool.schema),
+        parallel_safe=tool.parallel_safe,
+        effect=tool.effect,
+        publish_arguments=tool.publish_arguments,
+        retain_arguments_for_model=tool.retain_arguments_for_model,
+        workspace_mutation=tool.workspace_mutation,
+        execution_contract=copy_json_value(
+            tool.execution_contract,
+            "registered_tool.execution_contract",
+        ),
+        execution_profile_identity=copy_execution_profile_behavior_identity(
+            tool.execution_profile_identity
+        ),
+        command_policy_execution_profile_identity=copy_execution_profile_behavior_identity(
+            tool.command_policy_execution_profile_identity
+        ),
+        tool=tool.tool,
+        execution_requirements=ToolSpec(
+            name=tool.name, execution_requirements=tool.execution_requirements
+        ).execution_requirements,
+        child_session_recovery=tool.child_session_recovery,
+        durable_tool_recovery=tool.durable_tool_recovery,
+        effect_reconciler=tool.effect_reconciler,
+    )
+
+
+def _registration_site() -> tuple[str | None, str | None]:
+    """Capture the public call site without retaining a frame or live object."""
+
+    frame = inspect.currentframe()
+    caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
+    try:
+        if caller is None:
+            return None, None
+        module = caller.f_globals.get("__name__")
+        symbol = caller.f_code.co_qualname
+        qualified = f"{module}:{symbol}" if isinstance(module, str) else symbol
+        return caller.f_code.co_filename, qualified
+    finally:
+        del frame
+        del caller
+
+
+def _snapshot_context_behavior_execution_profile_identities(
+    context_policy: ContextPolicy,
+    context_overflow_policy: ContextPolicy | None,
+    *,
+    redactor: SecretRedactor,
+) -> Mapping[int, ExecutionProfileBehaviorIdentity | None]:
+    """Copy declarations reachable through Cayu-owned context wrappers."""
+
+    from cayu.context.base import (
+        CheckpointCompactionContextPolicy,
+        ModelCompactor,
+        PromptCacheCompactor,
+        UsageTriggeredContextPolicy,
+    )
+    from cayu.memory.context import AutomaticRecallContextPolicy
+
+    snapshots: dict[int, ExecutionProfileBehaviorIdentity | None] = {}
+
+    def visit(policy: ContextPolicy, *, field_name: str) -> None:
+        policy_id = id(policy)
+        if policy_id in snapshots:
+            return
+        snapshots[policy_id] = copy_secret_free_execution_profile_behavior_identity(
+            policy.execution_profile_identity,
+            redactor=redactor,
+            field_name=f"{field_name}.execution_profile_identity",
+        )
+        if type(policy) is AutomaticRecallContextPolicy:
+            visit(policy.base_policy, field_name=f"{field_name}.base_policy")
+            return
+        if type(policy) is UsageTriggeredContextPolicy:
+            visit(policy.base_policy, field_name=f"{field_name}.base_policy")
+            visit(policy.triggered_policy, field_name=f"{field_name}.triggered_policy")
+            return
+        if type(policy) is not CheckpointCompactionContextPolicy:
+            return
+
+        visit_compactor(
+            policy.compactor,
+            field_name=f"{field_name}.compactor",
+        )
+
+    def visit_compactor(compactor: object, *, field_name: str) -> None:
+        compactor_id = id(compactor)
+        if compactor_id in snapshots:
+            return
+        snapshots[compactor_id] = copy_secret_free_execution_profile_behavior_identity(
+            getattr(compactor, "execution_profile_identity", None),
+            redactor=redactor,
+            field_name=f"{field_name}.execution_profile_identity",
+        )
+        if type(compactor) is ModelCompactor:
+            provider = compactor.provider
+            snapshots[id(provider)] = copy_secret_free_execution_profile_behavior_identity(
+                provider.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"{field_name}.provider.execution_profile_identity",
+            )
+            return
+        if type(compactor) is PromptCacheCompactor:
+            provider = compactor.provider
+            snapshots[id(provider)] = copy_secret_free_execution_profile_behavior_identity(
+                provider.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"{field_name}.provider.execution_profile_identity",
+            )
+            visit_compactor(
+                compactor._fallback,
+                field_name=f"{field_name}.fallback_compactor",
+            )
+
+    visit(context_policy, field_name="context_policy")
+    if context_overflow_policy is not None:
+        visit(context_overflow_policy, field_name="context_overflow_policy")
+    return MappingProxyType(snapshots)
+
+
+def _validate_provider_model_patterns(value: Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes):
+        raise TypeError("Provider model_patterns must be an iterable of strings.")
+    try:
+        patterns = tuple(value)
+    except TypeError as exc:
+        raise TypeError("Provider model_patterns must be an iterable of strings.") from exc
+    return tuple(
+        require_clean_nonblank(pattern, f"model_patterns[{index}]")
+        for index, pattern in enumerate(patterns)
+    )
+
+
+def _copy_refreshable_mcp_toolsets(
+    value: Iterable[McpToolset] | None,
+) -> tuple[McpToolset, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes | bytearray | Mapping):
+        raise TypeError("mcp_toolsets must be an iterable of McpToolset instances.")
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise TypeError("mcp_toolsets must be an iterable of McpToolset instances.") from exc
+    copied = tuple(islice(iterator, 10_001))
+    if len(copied) > 10_000:
+        raise ValueError("mcp_toolsets cannot contain more than 10,000 sources.")
+    for index, toolset in enumerate(copied):
+        if not isinstance(toolset, McpToolset):
+            raise TypeError(f"mcp_toolsets[{index}] must be a McpToolset.")
+    return copied
+
+
+def _mcp_refresh_source_key(toolset: McpToolset) -> int:
+    if not isinstance(toolset, McpToolset):
+        raise TypeError("toolset must be a McpToolset.")
+    return id(toolset._refresh_source)
+
+
+def _registered_agent_contains_mcp_source(
+    registered_agent: runtime_records.RegisteredAgentState,
+    source: object,
+) -> bool:
+    return any(toolset._refresh_source is source for toolset in registered_agent.mcp_toolsets)
+
+
+def _agents_contain_mcp_source(
+    agents: Mapping[str, runtime_records.RegisteredAgentState],
+    toolset: McpToolset,
+) -> bool:
+    source = toolset._refresh_source
+    return any(
+        isinstance(registered.tool, McpToolAdapter)
+        and registered.tool.toolset._refresh_source is source
+        for agent in agents.values()
+        for registered in agent.tools.values()
+    )
+
+
+def _registered_agent_after_mcp_refresh(
+    registered_agent: runtime_records.RegisteredAgentState,
+    *,
+    source: object,
+    candidate: McpToolset,
+    redactor: SecretRedactor,
+    timeout_seconds: float | None,
+) -> runtime_records.RegisteredAgentState:
+    if not _registered_agent_contains_mcp_source(registered_agent, source):
+        raise ValueError("Registered agent does not contain the refreshed MCP source.")
+    refreshed_toolsets = tuple(
+        candidate if toolset._refresh_source is source else toolset
+        for toolset in registered_agent.mcp_toolsets
+    )
+    dynamic_sources = {_mcp_refresh_source_key(toolset) for toolset in refreshed_toolsets}
+    tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
+    for name, registered in registered_agent.tools.items():
+        tool = registered.tool
+        if (
+            isinstance(tool, McpToolAdapter)
+            and _mcp_refresh_source_key(tool.toolset) in dynamic_sources
+        ):
+            continue
+        tools_by_name[name] = registered
+    for toolset in refreshed_toolsets:
+        for adapter in sorted(toolset.tools, key=lambda tool: tool.name):
+            registered = _validate_registered_tool(
+                adapter,
+                redactor=redactor,
+                timeout_seconds=timeout_seconds,
+            )
+            if registered.name in tools_by_name:
+                raise ValueError(
+                    f"Refreshed MCP tool collides with registered tool: {registered.name}"
+                )
+            previous = registered_agent.tools.get(registered.name)
+            if previous is not None and previous.effect_reconciler is not None:
+                if (
+                    not isinstance(previous.tool, McpToolAdapter)
+                    or previous.tool.toolset._refresh_source is not toolset._refresh_source
+                    or registered.effect is not ToolEffect.EXTERNAL
+                ):
+                    raise ValueError("MCP refresh conflicts with a registered effect reconciler.")
+                registered = replace(registered, effect_reconciler=previous.effect_reconciler)
+            tools_by_name[registered.name] = registered
+
+    if any(
+        previous.effect_reconciler is not None and name not in tools_by_name
+        for name, previous in registered_agent.tools.items()
+    ):
+        raise ValueError("MCP refresh removed a tool with a registered effect reconciler.")
+
+    executable_names = frozenset((*tools_by_name, *registered_agent.runtime_tools))
+    missing_workflow_tools = tuple(
+        name for name in registered_agent.spec.workflow_tool_names if name not in executable_names
+    )
+    if missing_workflow_tools:
+        raise ValueError("MCP refresh removed a configured workflow tool.")
+    exposure_policy = registered_agent.tool_exposure_policy
+    if isinstance(exposure_policy, StaticToolExposurePolicy) and any(
+        name not in tools_by_name for name in exposure_policy.tools
+    ):
+        raise ValueError("MCP refresh removed a statically exposed tool.")
+
+    descriptors_by_name = {
+        tool.name: _registered_tool_descriptor(tool) for tool in tools_by_name.values()
+    }
+    tool_catalogue = build_tool_catalog_snapshot(descriptors_by_name.values())
+    tool_capabilities = tuple(
+        RegisteredToolCapability(**descriptors_by_name[name].exposure_capability_material())
+        for name in tools_by_name
+    )
+    all_registered_tool_exposure = ResolvedToolExposure(
+        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+        catalogue_revision=tool_catalogue.revision,
+        tools=tool_capabilities,
+        registered_count=len(tool_capabilities),
+        ceiling_count=len(tool_capabilities),
+    )
+    return replace(
+        registered_agent,
+        tools=MappingProxyType(tools_by_name),
+        tool_catalogue=tool_catalogue,
+        tool_capabilities=all_registered_tool_exposure.tools,
+        all_registered_tool_exposure=all_registered_tool_exposure,
+        mcp_toolsets=refreshed_toolsets,
+    )
+
+
+def _validate_registered_tool(
+    tool: Tool,
+    *,
+    redactor: SecretRedactor,
+    framework_owned: bool = False,
+    timeout_seconds: float | None,
+) -> runtime_records.RegisteredTool:
+    spec = getattr(tool, "spec", None)
+    if type(spec) is not ToolSpec:
+        raise TypeError("Agent tools must define ToolSpec instances.")
+    raw_name = require_clean_nonblank(spec.name, "name")
+    if framework_owned:
+        if raw_name != SEARCH_TOOLS_NAME:
+            raise ValueError(f"Unsupported Cayu runtime tool: {raw_name}")
+        name = raw_name
+    else:
+        name = validate_application_tool_name(raw_name)
+    if not inspect.iscoroutinefunction(tool.run):
+        raise TypeError(
+            f"{type(tool).__name__}.run must be declared with `async def` and return a ToolResult."
+        )
+    schema = copy_json_value(tool.schema, "schema")
+    if type(schema) is not dict:
+        raise TypeError(f"{type(tool).__name__}.schema must return a JSON Schema object.")
+    publish_arguments = tool._publish_arguments
+    retain_arguments_for_model = tool.retain_arguments_for_model
+    if type(retain_arguments_for_model) is not bool:
+        raise TypeError("Tool model argument retention policy must be a bool.")
+    if type(publish_arguments) is not bool:
+        raise TypeError(f"{type(tool).__name__} argument publication policy must be a bool.")
+    validated_spec = ToolSpec(
+        name=name,
+        description=spec.description,
+        input_schema=schema,
+        parallel_safe=spec.parallel_safe,
+        effect=spec.effect,
+        workspace_mutation=spec.workspace_mutation,
+        max_terminal_payload_bytes=spec.max_terminal_payload_bytes,
+        execution_requirements=spec.execution_requirements,
+    )
+    command_policy = getattr(tool, "command_policy", None)
+    if isinstance(tool, ProcessIsolatedTool):
+        if validated_spec.workspace_mutation:
+            raise ValueError(
+                "Process-isolated tools cannot request Cayu workspace mutation authority."
+            )
+        validate_process_isolated_tool_registration(tool, redactor=redactor)
+        execution_contract = isolated_tool_execution_contract(
+            tool,
+            runtime_timeout_seconds=timeout_seconds,
+        )
+    else:
+        execution_contract = ToolExecutionContract(
+            timeout_strength=("cooperative_in_process" if timeout_seconds is not None else "none")
+        ).model_dump(mode="json")
+    execution_contract = (
+        ToolExecutionContract.model_validate(execution_contract)
+        .model_copy(
+            update={"max_terminal_payload_bytes": validated_spec.max_terminal_payload_bytes}
+        )
+        .model_dump(mode="json")
+    )
+    return runtime_records.RegisteredTool(
+        name=validated_spec.name,
+        description=validated_spec.description,
+        schema=validated_spec.input_schema,
+        parallel_safe=validated_spec.parallel_safe,
+        effect=validated_spec.effect,
+        publish_arguments=publish_arguments,
+        retain_arguments_for_model=retain_arguments_for_model,
+        workspace_mutation=validated_spec.workspace_mutation,
+        execution_contract=execution_contract,
+        execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+            tool.execution_profile_identity,
+            redactor=redactor,
+            field_name=f"tools[{name!r}].execution_profile_identity",
+        ),
+        command_policy_execution_profile_identity=(
+            copy_secret_free_execution_profile_behavior_identity(
+                None
+                if command_policy is None
+                else getattr(command_policy, "execution_profile_identity", None),
+                redactor=redactor,
+                field_name=f"tools[{name!r}].command_policy.execution_profile_identity",
+            )
+        ),
+        tool=tool,
+        execution_requirements=validated_spec.execution_requirements,
+        child_session_recovery=(
+            tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
+        ),
+        durable_tool_recovery=(tool if isinstance(tool, DurableToolRecovery) else None),
+    )
+
+
+def _registered_tool_descriptor(
+    tool: runtime_records.RegisteredTool,
+) -> ToolDescriptor:
+    """Derive one canonical callable-free descriptor from admitted registration state."""
+
+    registered_tool = tool.tool
+    if isinstance(registered_tool, McpToolAdapter):
+        binding = registered_tool._manifest_binding
+        provenance = ToolDescriptorProvenance(
+            kind="mcp",
+            source_id=registered_tool.toolset.manifest_identity,
+            source_tool_fingerprint=mcp_source_tool_fingerprint(binding.manifest_mcp_name),
+            source_contract_fingerprint=binding.manifest_contract_hash,
+        )
+    else:
+        provenance = ToolDescriptorProvenance()
+    return build_tool_descriptor(
+        name=tool.name,
+        description=tool.description,
+        input_schema=tool.schema,
+        parallel_safe=tool.parallel_safe,
+        effect=tool.effect,
+        publishes_arguments=tool.publish_arguments,
+        workspace_mutation=tool.workspace_mutation,
+        execution_contract=ToolExecutionContract.model_validate(tool.execution_contract),
+        execution_requirements=tool.execution_requirements,
+        provenance=provenance,
+    )
+
+
+def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
+    if type(spec) is not AgentSpec:
+        raise TypeError("Agent registration requires an AgentSpec.")
+    return AgentSpec(
+        name=spec.name,
+        model=spec.model,
+        provider_name=spec.provider_name,
+        system_prompt=spec.system_prompt,
+        workflow_tool_names=spec.workflow_tool_names,
+        authoring_state=spec.authoring_state,
+        metadata=copy_durable_metadata(spec.metadata),
+        provider_options=copy_json_value(spec.provider_options, "provider_options"),
+        thinking=spec.thinking,
+    )
+
+
+def _validate_environment_spec(
+    spec: EnvironmentSpec,
+    *,
+    redactor: SecretRedactor,
+) -> EnvironmentSpec:
+    if type(spec) is not EnvironmentSpec:
+        raise TypeError("Environment registration requires an EnvironmentSpec.")
+    if type(spec.name) is not str:
+        raise ValueError("`name` must be a string.")
+    return EnvironmentSpec(
+        name=spec.name,
+        metadata=copy_durable_metadata(spec.metadata),
+        execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+            spec.execution_profile_identity,
+            redactor=redactor,
+            field_name="environment_spec.execution_profile_identity",
+        ),
+        lifecycle_policy=spec.lifecycle_policy,
+        workspace_checkpoint_policy=spec.workspace_checkpoint_policy,
+    )
+
+
+def _work_contract_contains_secret_public_identity(
+    contract: WorkContract,
+    redactor: SecretRedactor,
+) -> bool:
+    public_identities = (
+        contract.contract_id,
+        contract.verifier.verifier_id,
+        contract.verifier.version,
+        contract.verifier.configuration_fingerprint,
+        contract.result_resolver.resolver_id,
+        contract.result_resolver.version,
+        contract.result_resolver.configuration_fingerprint,
+        *(criterion.criterion_id for criterion in contract.criteria),
+        *(constraint.constraint_id for constraint in contract.constraints),
+        *(requirement.requirement_id for requirement in contract.evidence_requirements),
+    )
+    return any(redactor.redact_text(value) != value for value in public_identities)
+
+
+async def _publish_public_work_contract(
+    task_store: TaskStore,
+    contract: WorkContract,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[WorkContract | None, BaseException | None]:
+    """Capture a publication conflict without exporting its sensitive store traceback."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.publish_work_contract(contract),
+        operation_name="Work-contract publication",
+        redactor=redactor,
+        mutation_store=task_store,
+        mutation_method_name="publish_work_contract",
+    )
+    if type(outcome.failure) is WorkContractConflict:
+        return None, WorkContractConflict(
+            "Task store rejected the work-contract publication because its durable identity "
+            "conflicts with existing state."
+        )
+    return outcome.result, outcome.failure
+
+
+async def _load_public_work_contract(
+    task_store: TaskStore,
+    reference: WorkContractRef,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[WorkContract | None, BaseException | None]:
+    """Capture a lookup conflict without exporting the stored contract traceback."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.load_work_contract(reference),
+        operation_name="Work-contract lookup",
+        redactor=redactor,
+    )
+    if type(outcome.failure) is WorkContractConflict:
+        return None, WorkContractConflict(
+            "Task store rejected the work-contract lookup because its durable identity "
+            "conflicts with the requested reference."
+        )
+    return outcome.result, outcome.failure
+
+
+async def _create_public_contracted_task(
+    task_store: TaskStore,
+    request: TaskCreate,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[Task | None, BaseException | None]:
+    """Capture contract-binding conflicts without exporting the task payload traceback."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.create_task(request),
+        operation_name="Contracted task creation",
+        redactor=redactor,
+        mutation_store=task_store,
+        mutation_method_name="create_task",
+    )
+    if type(outcome.failure) is WorkContractConflict:
+        return None, WorkContractConflict(
+            "Task store rejected the contracted task because its work contract conflicts "
+            "with durable state."
+        )
+    if type(outcome.failure) is WorkCompletionConflict:
+        return None, WorkCompletionConflict(
+            "Task store rejected the contracted task because its session binding conflicts "
+            "with durable work authority."
+        )
+    return outcome.result, outcome.failure
+
+
+async def _load_public_task_invocation_snapshot(
+    task_store: TaskStore,
+    task_id: str,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[TaskInvocationSnapshot | None, BaseException | None]:
+    """Read back one contracted task's durable provenance without leaking extension state."""
+
+    outcome = await capture_task_store_operation(
+        lambda: task_store.load_invocation_snapshot(task_id),
+        operation_name="Contracted task invocation lookup",
+        redactor=redactor,
+    )
+    return outcome.result, outcome.failure
+
+
+def _validated_public_work_contract(
+    draft: WorkContractDraft,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkContract]:
+    """Validate a caller-owned draft without retaining a rejected model traceback."""
+
+    return capture_sensitive_validation(
+        lambda: work_contract_from_draft(draft),
+        operation_name="Work-contract request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_contract(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkContract]:
+    """Copy one extension-returned contract behind a detached validation boundary."""
+
+    if type(value) is not WorkContract:
+        return TaskStoreOperationOutcome()
+    return capture_sensitive_validation(
+        lambda: copy_work_contract(value),
+        operation_name="Work-contract result validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_contract_ref(
+    value: WorkContractRef,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkContractRef]:
+    """Copy one caller-owned reference behind a detached validation boundary."""
+
+    return capture_sensitive_validation(
+        lambda: cast("WorkContractRef", copy_work_contract_ref(value)),
+        operation_name="Work-contract reference validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_task_create(
+    value: TaskCreate,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[TaskCreate]:
+    """Copy one caller-owned task request behind a detached validation boundary."""
+
+    return capture_sensitive_validation(
+        lambda: copy_task_create(value),
+        operation_name="Task request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_task(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[Task]:
+    """Copy one extension-returned task behind a detached validation boundary."""
+
+    if type(value) is not Task:
+        return TaskStoreOperationOutcome()
+    return capture_sensitive_validation(
+        lambda: copy_task(value),
+        operation_name="Task result validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_task_invocation_snapshot(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[TaskInvocationSnapshot]:
+    """Copy extension-returned task provenance behind a detached validation boundary."""
+
+    if type(value) is not TaskInvocationSnapshot:
+        return TaskStoreOperationOutcome()
+    return capture_sensitive_validation(
+        lambda: TaskInvocationSnapshot(
+            id=value.id,
+            session_id=value.session_id,
+            session_instance_id=value.session_instance_id,
+            invocation=value.invocation,
+        ),
+        operation_name="Task invocation result validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_attempt_source_request(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[RunRequest | ResumeRequest]:
+    """Copy one work-attempt source request behind a detached boundary."""
+
+    def copy_request() -> RunRequest | ResumeRequest:
+        if type(value) is RunRequest:
+            return _validate_run_request(value)
+        if type(value) is ResumeRequest:
+            return _validate_resume_request(value)
+        raise TypeError("Work-attempt source request must be a RunRequest or ResumeRequest.")
+
+    return capture_sensitive_validation(
+        copy_request,
+        operation_name="Work-attempt source-request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_attempt_execution_request(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkAttemptExecutionRequest]:
+    """Copy caller-owned initial or continuation execution authority safely."""
+
+    return capture_sensitive_validation(
+        lambda: copy_work_attempt_execution_request(cast("WorkAttemptExecutionRequest", value)),
+        operation_name="Work-attempt execution-request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_attempt_claim_renewal_request(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkAttemptClaimRenewalRequest]:
+    """Copy caller-owned renewal authority safely."""
+
+    return capture_sensitive_validation(
+        lambda: copy_work_attempt_claim_renewal_request(
+            cast("WorkAttemptClaimRenewalRequest", value)
+        ),
+        operation_name="Work-attempt claim-renewal request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_attempt_recovery_request(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkAttemptRecoveryRequest]:
+    """Copy caller-owned recovery authority safely."""
+
+    return capture_sensitive_validation(
+        lambda: copy_work_attempt_recovery_request(cast("WorkAttemptRecoveryRequest", value)),
+        operation_name="Work-attempt recovery-request validation",
+        redactor=redactor,
+    )
+
+
+def _copied_public_work_attempt_proposal_request(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[WorkAttemptProposalRequest]:
+    """Copy one caller-owned admitted proposal safely."""
+
+    return capture_sensitive_validation(
+        lambda: copy_work_attempt_proposal_request(cast("WorkAttemptProposalRequest", value)),
+        operation_name="Work-attempt proposal-request validation",
+        redactor=redactor,
+    )
+
+
+def _contracted_task_invocation_matches_request(
+    *,
+    task: Task,
+    request: TaskCreate,
+    invocation_snapshot: TaskInvocationSnapshot,
+    parent_invocation_snapshot: TaskInvocationSnapshot | None,
+    redactor: SecretRedactor,
+) -> bool:
+    """Authenticate durable provenance and every request-owned invocation field."""
+
+    invocation = task.invocation
+    if (
+        invocation_snapshot.id != task.id
+        or invocation_snapshot.session_id != task.session_id
+        or invocation_snapshot.session_instance_id != task.session_instance_id
+        or invocation_snapshot.invocation != invocation
+        or invocation.source
+        is not (request._runtime_invocation_source or TaskExecutionSource.SDK_TASK)
+    ):
+        return False
+    if redactor.redact_text(task.id) != task.id or invocation_contains_secret_public_identity(
+        invocation,
+        redactor,
+    ):
+        return False
+    session_binding = request._runtime_session_binding
+    if session_binding is not None:
+        matches_session = (
+            task.session_instance_id == session_binding.session_instance_id
+            and invocation_snapshot.session_instance_id == session_binding.session_instance_id
+            and invocation.origin == session_binding.invocation.origin
+            and invocation.root_invocation_id == session_binding.invocation.root_invocation_id
+            and invocation.root_session_id == session_binding.invocation.root_session_id
+        )
+        if not matches_session:
+            return False
+        if request.parent_task_id is None:
+            return True
+        return (
+            parent_invocation_snapshot is not None
+            and parent_invocation_snapshot.id == request.parent_task_id
+            and parent_invocation_snapshot.invocation.origin == invocation.origin
+            and parent_invocation_snapshot.invocation.root_invocation_id
+            == invocation.root_invocation_id
+        )
+    if request.parent_task_id is not None:
+        return (
+            parent_invocation_snapshot is not None
+            and parent_invocation_snapshot.id == request.parent_task_id
+            and parent_invocation_snapshot.invocation.origin == invocation.origin
+            and parent_invocation_snapshot.invocation.root_invocation_id
+            == invocation.root_invocation_id
+            and parent_invocation_snapshot.invocation.root_session_id == invocation.root_session_id
+        )
+    if request._verified_invocation_origin is not None:
+        expected_origin = request._verified_invocation_origin
+    elif request.invocation_origin is not None:
+        expected_origin = InvocationOrigin(
+            trust=InvocationOriginTrust.HOST_ASSERTED,
+            subject=request.invocation_origin.subject,
+            tenant=request.invocation_origin.tenant,
+        )
+    else:
+        expected_origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    return invocation.origin == expected_origin and invocation.root_session_id == request.session_id
+
+
+def _contracted_task_creation_result_matches_request(
+    *,
+    task: Task,
+    request: TaskCreate,
+    invocation_snapshot: TaskInvocationSnapshot | None,
+    parent_invocation_snapshot: TaskInvocationSnapshot | None,
+    redactor: SecretRedactor,
+) -> bool:
+    """Authenticate a custom store's contracted-create result before publication."""
+
+    if invocation_snapshot is None or not _contracted_task_invocation_matches_request(
+        task=task,
+        request=request,
+        invocation_snapshot=invocation_snapshot,
+        parent_invocation_snapshot=parent_invocation_snapshot,
+        redactor=redactor,
+    ):
+        return False
+    if request.task_id is not None and task.id != request.task_id:
+        return False
+    if (
+        task.type != request.type
+        or task.title != request.title
+        or task.description != request.description
+        or task.session_id != request.session_id
+        or task.parent_task_id != request.parent_task_id
+        or task.assigned_agent_name != request.assigned_agent_name
+        or task.available_at != request.available_at
+        or task.input != request.input
+        or task.metadata != request.metadata
+        or task.work_contract != request.work_contract
+    ):
+        return False
+    return (
+        task.status is TaskStatus.PENDING
+        and task.worker_id is None
+        and task.lease_expires_at is None
+        and task.status_reason is None
+        and task.status_payload is None
+        and task.result is None
+        and task.error is None
+        and task.started_at is None
+        and task.completed_at is None
+    )
+
+
+def _validate_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
+    return copy_tool_approval_request(request)
+
+
+def _validate_tool_approval_recovery_request(
+    request: ToolApprovalRecoveryRequest,
+) -> ToolApprovalRecoveryRequest:
+    return copy_tool_approval_recovery_request(request)
+
+
+def _recovery_task_event(request: RecoveryTaskEventRequest) -> Event:
+    return _task_event(
+        event_type=request.event_type,
+        task=request.task,
+        session=request.session,
+        registered_agent=request.registered_agent,
+        registered_environment=request.registered_environment,
+    )
+
+
+def _artifact_store(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.artifact_store
+
+
+def _validate_dispatch_handle_for_request(
+    *,
+    handle: DispatchHandle,
+    request: DispatchRequest,
+) -> None:
+    if type(handle) is not DispatchHandle:
+        raise TypeError("Dispatcher must return a DispatchHandle.")
+    mismatches = []
+    if handle.dispatch_id != request.dispatch_id:
+        mismatches.append("dispatch_id")
+    if handle.session_id != request.session_id:
+        mismatches.append("session_id")
+    if handle.task_id != request.task_id:
+        mismatches.append("task_id")
+    if mismatches:
+        fields = ", ".join(mismatches)
+        raise ValueError(f"Dispatcher returned a handle for the wrong request fields: {fields}.")
+
+
+def _validate_runtime_hooks(
+    hooks: Iterable[RuntimeHook] | None,
+    *,
+    field_name: str,
+    redactor: SecretRedactor,
+) -> tuple[runtime_records.RegisteredRuntimeHook, ...]:
+    if hooks is None:
+        return ()
+    if isinstance(hooks, str | bytes):
+        raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.")
+    try:
+        hook_list = list(hooks)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.") from exc
+    registered_hooks: list[runtime_records.RegisteredRuntimeHook] = []
+    for index, hook in enumerate(hook_list):
+        if not isinstance(hook, RuntimeHook):
+            raise TypeError(f"{field_name} must contain RuntimeHook instances.")
+        registered_hooks.append(
+            runtime_records.RegisteredRuntimeHook(
+                name=hook.name,
+                execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                    hook.execution_profile_identity,
+                    redactor=redactor,
+                    field_name=(f"{field_name}[{index}].execution_profile_identity"),
+                ),
+                hook=hook,
+            )
+        )
+    return tuple(registered_hooks)
+
+
+def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWatcher, ...]:
+    if isinstance(watchers, str | bytes):
+        raise TypeError("watchers must be an iterable of EventWatcher instances.")
+    try:
+        watcher_list = list(watchers)
+    except TypeError as exc:
+        raise TypeError("watchers must be an iterable of EventWatcher instances.") from exc
+    names: set[str] = set()
+    for watcher in watcher_list:
+        if type(watcher) is not EventWatcher:
+            raise TypeError("watchers must contain EventWatcher instances.")
+        if watcher.name in names:
+            raise ValueError("Duplicate event watcher name.")
+        names.add(watcher.name)
+    return tuple(watcher_list)

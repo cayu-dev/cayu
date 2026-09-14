@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.recall_relevance import (
+from cayu.memory.relevance import (
     APOSTROPHE_RELEVANCE_TEXT_VERSION,
     APOSTROPHE_RELEVANCE_VERSION,
     _concepts,

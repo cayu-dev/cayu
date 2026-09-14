@@ -6,19 +6,22 @@ import pytest
 from tests.core.test_mcp import _fake_tool_definitions, _fake_toolset
 from tests.core.test_tool_effect_receipts import _receipt
 
-from cayu import AgentSpec, CayuApp, ExecutionProfileBehaviorIdentity, Tool, ToolEffect, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.runtime._tool_effect_reconciliation import (
     AcceptedToolEffectReconciliation,
     project_accepted_reconciliation,
     validate_reconciliation_result,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import (
     ToolEffectReconcilerSpec,
     ToolEffectReconciliationContext,
     ToolEffectReconciliationRegistration,
     ToolEffectReconciliationResult,
 )
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tools.base import Tool, ToolEffect, ToolSpec
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class _Deployment(Tool):
@@ -233,8 +236,11 @@ def test_callback_result_must_match_exact_identity_schema_and_integrity_allowlis
 
 
 def test_reconciler_contract_participates_in_public_profile_inspection():
-    from cayu import Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.messages import Message
+    from cayu.providers.base import ModelStreamEvent
     from cayu.runtime.execution_profiles import ExecutionProfileComponentClass
+    from cayu.sessions.base import RunRequest
 
     class VersionedTool(_Deployment):
         spec = ToolSpec(

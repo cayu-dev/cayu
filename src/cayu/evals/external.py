@@ -29,8 +29,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message, MessageRole, TextPart, detach_message
+from cayu.messages import Message, MessageRole, TextPart, detach_message
 from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
@@ -41,6 +40,7 @@ from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationMode,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 EXTERNAL_PROCESS_PROTOCOL_VERSION = "cayu.external-process.v1"
 EXTERNAL_TRIAL_ENVELOPE_PREFIX = "cayu-external-trial-v1:"

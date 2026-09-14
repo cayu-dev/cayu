@@ -21,18 +21,33 @@ from tests.core.verified_worker_fixtures import (
     verified_work_postgres_dsn as verified_work_postgres_dsn,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CompletionDecisionApplicationRequest,
-    CompletionVerificationClaimRequest,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
+    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     EventQuery,
-    EventType,
-    Message,
-    PostgresSessionStore,
-    PostgresTaskStore,
     RunRequest,
     SessionStatus,
+)
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.tasks.admission import (
+    AdmittedCompletionProposalRequest,
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionActivate,
+    WorkAttemptAdmissionConflict,
+    WorkAttemptAdmissionPrepare,
+    WorkAttemptAdmissionState,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionRequest,
+    WorkAttemptProposalRequest,
+    WorkAttemptRecoveryActivate,
+    WorkAttemptRecoveryRequest,
+)
+from cayu.tasks.base import (
     Task,
     TaskClaimLost,
     TaskCreate,
@@ -40,25 +55,13 @@ from cayu import (
     TaskStatus,
     TaskTerminalizationRequest,
     TaskTerminalKind,
-    WorkAttemptAdmissionConflict,
+)
+from cayu.tasks.contracts import (
+    CompletionDecisionApplicationRequest,
+    CompletionProposalCreate,
+    CompletionVerificationClaimRequest,
     WorkAttemptCreate,
-    WorkAttemptExecutionClaimLost,
-    WorkAttemptExecutionRequest,
-    WorkAttemptProposalRequest,
-    WorkAttemptRecoveryRequest,
 )
-from cayu.runtime.sessions import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY
-from cayu.runtime.work_attempt_admission import (
-    AdmittedCompletionProposalRequest,
-    WorkAttemptAdmission,
-    WorkAttemptAdmissionActivate,
-    WorkAttemptAdmissionPrepare,
-    WorkAttemptAdmissionState,
-    WorkAttemptExecutionClaimRequest,
-    WorkAttemptRecoveryActivate,
-)
-from cayu.runtime.work_contracts import CompletionProposalCreate
-from cayu.storage.migrations import SchemaMode
 
 
 class _PostgresAdmissionLockOrderStore(PostgresTaskStore):

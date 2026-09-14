@@ -1,13 +1,5 @@
 from __future__ import annotations
 
-from cayu.runtime.workspace_mutation_attribution import (
-    DirectWorkspaceMutationCollector,
-    begin_workspace_mutation_window,
-    classify_workspace_mutation_attribution,
-    direct_workspace_mutation_payload,
-    observed_pre_window_change,
-    reconcile_direct_workspace_mutations,
-)
 from cayu.workspaces import (
     LocalWorkspace,
     WorkspaceDirectMutationReconciliation,
@@ -20,6 +12,14 @@ from cayu.workspaces import (
     WorkspaceRevisionObservationStatus,
     WorkspaceWriterIsolationEvidence,
     WorkspaceWriterIsolationStatus,
+)
+from cayu.workspaces.mutation_attribution import (
+    DirectWorkspaceMutationCollector,
+    begin_workspace_mutation_window,
+    classify_workspace_mutation_attribution,
+    direct_workspace_mutation_payload,
+    observed_pre_window_change,
+    reconcile_direct_workspace_mutations,
 )
 
 

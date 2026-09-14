@@ -59,22 +59,109 @@ from cayu._validation import (
     require_nonblank,
     safe_durable_value_error_details,
 )
-from cayu.artifacts import (
+from cayu.agents import AgentSpec
+from cayu.artifacts.attachments import (
+    MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     FileAttachment,
-    InvalidArtifactIdError,
-    copy_artifact_read_result,
     file_attachment_from_payload,
     resolved_file_attachment,
 )
-from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
-from cayu.core.agents import AgentSpec
-from cayu.core.billing import (
-    BillingIdentity,
-    copy_billing_identity,
-    resolved_billing_identity,
+from cayu.artifacts.base import InvalidArtifactIdError, copy_artifact_read_result
+from cayu.budgets.base import (
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservationRecoveryContext,
+    BudgetReservationResult,
+    budget_limits_for_session,
+    copy_request_budget_limits,
+    has_deferred_contextual_price,
 )
-from cayu.core.events import (
+from cayu.budgets.billing import BillingIdentity, copy_billing_identity, resolved_billing_identity
+from cayu.budgets.usage import (
+    ModelCompletionPurpose,
+    durable_model_completed_payload,
+    hosted_tool_usage_metrics_from_payload,
+    is_conversational_model_completion_payload,
+    normalize_usage_metrics,
+    normalize_usage_metrics_with_overflow_error,
+    usage_metrics_from_event_payload,
+    usage_metrics_payload,
+)
+from cayu.configuration import MAX_STEPS
+from cayu.context.base import (
+    _COMPACTION_ATTEMPT_ID_KEY,
+    CompactionRequest,
+    CompactionResult,
+    ContextBuildError,
+    ContextCompactionTelemetry,
+    ContextCompactor,
+    ContextInputCoverage,
+    ContextPolicy,
+    ContextPressureEstimate,
+    ContextPressureOverhead,
+    ContextRecallTelemetry,
+    ContextRequest,
+    ContextUsageState,
+    RuntimeManagedContextPolicy,
+    _attach_automatic_compaction_failure_disposition,
+    _automatic_compaction_dispatch_runner_scope,
+    _automatic_compaction_runner_scope,
+    _AutomaticCompactionDispatchDisposition,
+    _AutomaticCompactionFailureDisposition,
+    _AutomaticCompactionFailureReason,
+    _AutomaticCompactionLifecyclePhase,
+    _AutomaticCompactionRecoveryAction,
+    _AutomaticCompactionRunner,
+    _compaction_completion_publisher_scope,
+    _compaction_environment_admission_scope,
+    _compaction_model_attempt_identity_scope,
+    _context_recall_telemetry_publisher_scope,
+    _context_secret_redactor_scope,
+    _ContextCountAuthorityError,
+    _defer_billing_identity_cancellation_scope,
+    automatic_compaction_failure_disposition_payload,
+    context_build_termination_checkpoint_error,
+    context_build_termination_compaction_telemetry,
+    context_input_coverage,
+    copy_context_messages,
+    copy_context_pressure_estimate,
+    estimate_context_pressure,
+    noteify_unresolvable_prompt_files,
+    project_runtime_managed_context_checkpoint,
+    sanitize_context_build_error_checkpoint,
+    sanitize_context_build_result_checkpoint,
+    sanitize_context_compaction_telemetry,
+)
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.context.footprints import (
+    PromptContributionManifest,
+    RequestFootprint,
+    RequestFootprintConfig,
+    RequestVariant,
+    TargetedToolGrantFootprint,
+    ToolDiscoveryViewFootprint,
+    analyze_request_context_pressure,
+    analyze_request_footprint,
+    copy_request_footprint_config,
+    tool_discovery_view_footprint,
+)
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputSpec,
+    StructuredOutputStrategy,
+    StructuredOutputValidation,
+    copy_structured_output_spec,
+    require_secret_free_json_schema_keys,
+    require_secret_free_structured_output_spec,
+    structured_output_spec_payload,
+    structured_output_tool_instruction,
+    structured_output_tool_spec,
+)
+from cayu.context.thinking import ThinkingConfig, thinking_config_payload
+from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
+from cayu.environments.admission import ExecutionAdmissionError
+from cayu.events import (
     Event,
     EventType,
     copy_event,
@@ -82,7 +169,8 @@ from cayu.core.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import (
+from cayu.memory.evidence import ContextExposure, ContextExposureEvidenceKind, ContextExposureState
+from cayu.messages import (
     CitationPart,
     CitationProvenance,
     FilePart,
@@ -95,47 +183,6 @@ from cayu.core.messages import (
     ToolResultPart,
     WebSearchAction,
     detach_message,
-)
-from cayu.core.thinking import ThinkingConfig, thinking_config_payload
-from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
-from cayu.environments.admission import ExecutionAdmissionError
-from cayu.memory_evidence import (
-    ContextExposure,
-    ContextExposureEvidenceKind,
-    ContextExposureState,
-)
-from cayu.providers import (
-    InputTokenCountConfidence,
-    InputTokenCountMethod,
-    InputTokenCountResult,
-    ModelCompletion,
-    ModelContextOverflowError,
-    ModelFinishReason,
-    ModelProvider,
-    ModelProviderError,
-    ModelRequest,
-    ModelStreamEvent,
-    ModelStreamEventType,
-    ProviderOperationAdapter,
-    ProviderOperationCancellationSupport,
-    ProviderOperationConnection,
-    ProviderOperationMalformedError,
-    ProviderOperationMode,
-    ProviderOperationRecoveryMetadata,
-    ProviderOperationSnapshot,
-    ProviderOperationStartIdempotencySupport,
-    ProviderOperationStartRecoveryRequest,
-    ProviderOperationStartRequest,
-    ProviderOperationState,
-    ProviderOperationStatus,
-    UsageDialect,
-    copy_input_token_count_result,
-    copy_model_context_pressure_profile,
-    copy_model_stream_event,
-    copy_provider_operation_connection,
-    copy_provider_operation_snapshot,
-    copy_provider_operation_state,
-    normalize_model_completion,
 )
 from cayu.providers._credential_boundary import (
     _ProviderStreamCleanupOwnership,
@@ -162,17 +209,50 @@ from cayu.providers.base import (
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
+    ModelCompletion,
+    ModelContextOverflowError,
+    ModelFinishReason,
+    ModelProvider,
+    ModelProviderError,
+    ModelRequest,
     ModelStreamDeadlineError,
+    ModelStreamEvent,
+    ModelStreamEventType,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
     ToolDiscoveryProjectionResult,
+    UsageDialect,
+    copy_input_token_count_result,
     copy_model_completion,
+    copy_model_context_pressure_profile,
+    copy_model_stream_event,
+    normalize_model_completion,
 )
 from cayu.providers.deadlines import (
     ProviderStreamDeadlineAdmission,
     ProviderStreamDeadlineEvidence,
     bind_provider_deadline_admission,
     reset_provider_deadline_admission,
+)
+from cayu.providers.operations import (
+    ProviderOperationAdapter,
+    ProviderOperationCancellationSupport,
+    ProviderOperationConnection,
+    ProviderOperationMalformedError,
+    ProviderOperationMode,
+    ProviderOperationRecoveryMetadata,
+    ProviderOperationSnapshot,
+    ProviderOperationStartIdempotencySupport,
+    ProviderOperationStartRecoveryRequest,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
+    ProviderOperationStatus,
+    copy_provider_operation_connection,
+    copy_provider_operation_snapshot,
+    copy_provider_operation_state,
 )
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
@@ -252,61 +332,6 @@ from cayu.runtime._structured_output_tool_round import (
     _redact_structured_output_validation,
     _validate_structured_output_tool_round,
 )
-from cayu.runtime.budgets import (
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservationRecoveryContext,
-    BudgetReservationResult,
-    budget_limits_for_session,
-    copy_request_budget_limits,
-    has_deferred_contextual_price,
-)
-from cayu.runtime.config import MAX_STEPS
-from cayu.runtime.context import (
-    _COMPACTION_ATTEMPT_ID_KEY,
-    CompactionRequest,
-    CompactionResult,
-    ContextBuildError,
-    ContextCompactionTelemetry,
-    ContextCompactor,
-    ContextInputCoverage,
-    ContextPolicy,
-    ContextPressureEstimate,
-    ContextPressureOverhead,
-    ContextRecallTelemetry,
-    ContextRequest,
-    ContextUsageState,
-    RuntimeManagedContextPolicy,
-    _attach_automatic_compaction_failure_disposition,
-    _automatic_compaction_dispatch_runner_scope,
-    _automatic_compaction_runner_scope,
-    _AutomaticCompactionDispatchDisposition,
-    _AutomaticCompactionFailureDisposition,
-    _AutomaticCompactionFailureReason,
-    _AutomaticCompactionLifecyclePhase,
-    _AutomaticCompactionRecoveryAction,
-    _AutomaticCompactionRunner,
-    _compaction_completion_publisher_scope,
-    _compaction_environment_admission_scope,
-    _compaction_model_attempt_identity_scope,
-    _context_recall_telemetry_publisher_scope,
-    _context_secret_redactor_scope,
-    _ContextCountAuthorityError,
-    _defer_billing_identity_cancellation_scope,
-    automatic_compaction_failure_disposition_payload,
-    context_build_termination_checkpoint_error,
-    context_build_termination_compaction_telemetry,
-    context_input_coverage,
-    copy_context_messages,
-    copy_context_pressure_estimate,
-    estimate_context_pressure,
-    noteify_unresolvable_prompt_files,
-    project_runtime_managed_context_checkpoint,
-    sanitize_context_build_error_checkpoint,
-    sanitize_context_build_result_checkpoint,
-    sanitize_context_compaction_telemetry,
-)
-from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
@@ -353,18 +378,6 @@ from cayu.runtime.provider_operations import (
     provider_operation_started_event_id,
     provider_operation_unavailable_reason,
 )
-from cayu.runtime.request_footprints import (
-    PromptContributionManifest,
-    RequestFootprint,
-    RequestFootprintConfig,
-    RequestVariant,
-    TargetedToolGrantFootprint,
-    ToolDiscoveryViewFootprint,
-    analyze_request_context_pressure,
-    analyze_request_footprint,
-    copy_request_footprint_config,
-    tool_discovery_view_footprint,
-)
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -374,7 +387,8 @@ from cayu.runtime.retry_policy import (
     retry_diagnostic_payload,
     retry_event_payload,
 )
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     CheckpointTransform,
     EventOrder,
@@ -395,31 +409,13 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_mutation,
     runtime_publication_operation_record_value_digest,
 )
-from cayu.runtime.stop_policy import RunLimits
-from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputSpec,
-    StructuredOutputStrategy,
-    StructuredOutputValidation,
-    copy_structured_output_spec,
-    require_secret_free_json_schema_keys,
-    require_secret_free_structured_output_spec,
-    structured_output_spec_payload,
-    structured_output_tool_instruction,
-    structured_output_tool_spec,
-)
-from cayu.runtime.targeted_tool_projection import (
-    TargetedToolProjectionKind,
-    openai_targeted_tool_projection,
-    resolve_targeted_tool_projection,
-)
-from cayu.runtime.tool_catalogue import (
+from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,
     ToolCatalogSnapshot,
     ToolDescriptor,
 )
-from cayu.runtime.tool_discovery import (
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryMode,
     ToolDiscoveryProjectionKind,
@@ -433,7 +429,7 @@ from cayu.runtime.tool_discovery import (
     tool_discovery_record_matches_descriptor,
     tool_discovery_search_match_matches_descriptor,
 )
-from cayu.runtime.tool_exposure import (
+from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
     AllRegisteredToolsExposurePolicy,
@@ -447,23 +443,18 @@ from cayu.runtime.tool_exposure import (
     tool_capability_ceiling_from_session_metadata,
     tool_exposure_record,
 )
-from cayu.runtime.tool_gateway import (
+from cayu.tools.gateway import (
     TargetedToolGatewayProjection,
     call_tool_spec,
     targeted_tool_gateway_projection,
 )
-from cayu.runtime.tool_grants import TargetedToolGrantRecord
-from cayu.runtime.usage import (
-    ModelCompletionPurpose,
-    durable_model_completed_payload,
-    hosted_tool_usage_metrics_from_payload,
-    is_conversational_model_completion_payload,
-    normalize_usage_metrics,
-    normalize_usage_metrics_with_overflow_error,
-    usage_metrics_from_event_payload,
-    usage_metrics_payload,
+from cayu.tools.grants import TargetedToolGrantRecord
+from cayu.tools.targeted_projection import (
+    TargetedToolProjectionKind,
+    openai_targeted_tool_projection,
+    resolve_targeted_tool_projection,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
 _PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -9411,7 +9402,7 @@ class ModelStepRun:
                     "Environment-backed model execution requires frozen exposure authority."
                 )
             await self._refresh_live_model_semantics()
-            from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
+            from cayu.workspaces.checkpoint_lifecycle import ensure_workspace_checkpoint
 
             await ensure_workspace_checkpoint(
                 self._executor._session_store, self._session, self._registered_environment

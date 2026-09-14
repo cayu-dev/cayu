@@ -5,8 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_label_map
-from cayu.runtime.invocation import SessionInvocation, TaskInvocation
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     PendingActionSession,
@@ -16,7 +15,10 @@ from cayu.runtime.sessions import (
     SessionTopologyNode,
     runtime_build_provenance_from_session_metadata,
 )
-from cayu.runtime.tasks import (
+from cayu.sessions.invocation import SessionInvocation, TaskInvocation
+from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
+from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
@@ -26,9 +28,7 @@ from cayu.runtime.tasks import (
     TaskTopologyInconsistent,
     TaskTopologyNode,
 )
-from cayu.runtime.work_contracts import WorkContractRef
-from cayu.storage import _session_store_sql as session_store_sql
-from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
+from cayu.tasks.contracts import WorkContractRef
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,

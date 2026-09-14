@@ -248,11 +248,11 @@ async def test_background_recovery_retains_diagnostics_without_redispatch(
         _created,
     )
 
-    from cayu.runtime import IncompleteSessionRecoveryRequest
     from cayu.runtime.provider_operations import (
         ProviderOperationUnavailableReason,
         inspect_provider_operation,
     )
+    from cayu.sessions.base import IncompleteSessionRecoveryRequest
 
     transport = BackgroundTransport()
     response = bad_response("file")

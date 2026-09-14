@@ -20,6 +20,7 @@ from cayu._validation import (
     compact_json_utf8_size,
     json_utf8_size_within_limit,
 )
+from cayu.budgets.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.capture_policy import (
     SessionTrajectoryBounds,
@@ -126,7 +127,6 @@ from cayu.evals.trial_policy import (
     EvalSuiteTrialPolicyV1,
 )
 from cayu.failure_evidence import FailureEvidence
-from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
 PUBLISHED_EVAL_SCHEMA_VERSION = 10
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20

@@ -14,10 +14,6 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.artifacts import ArtifactStore
-from cayu.core.execution_identity import (
-    ExecutionProfileBehaviorIdentity,
-    copy_execution_profile_behavior_identity,
-)
 from cayu.environments.bindings import WorkspaceBinding
 from cayu.environments.lifecycle import (
     EnvironmentLifecyclePolicy,
@@ -26,6 +22,10 @@ from cayu.environments.lifecycle import (
 from cayu.mcp.base import McpServerSpec, copy_mcp_server_spec
 from cayu.proxies import CredentialProxy
 from cayu.runners import Runner
+from cayu.runtime.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
 from cayu.workspaces import Workspace
 from cayu.workspaces.checkpoints import WorkspaceCheckpointPolicy

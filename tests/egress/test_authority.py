@@ -11,12 +11,12 @@ from cayu.egress import (
     build_egress_authority_identity,
     compare_egress_authority,
 )
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.runtime.build_provenance import (
     RuntimeBuildArtifactKind,
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfilePolicyRequest,

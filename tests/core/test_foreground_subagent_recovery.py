@@ -7,39 +7,34 @@ import pytest
 from pydantic import SecretStr
 from tests.core.test_tool_round_execution_identities import _SequencedProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message, ToolResultPart
+from cayu.observability.hooks import BeforeToolCallDecision, RuntimeHook
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._session_control import SessionControl
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.runtime.authority import SessionRunFenced
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
-    Message,
-    PostgresSessionStore,
     ResumeRequest,
     RunRequest,
     SessionQuery,
     SessionStatus,
-    SQLiteSessionStore,
-    SubagentSpec,
-    SubagentTool,
-    ToolApprovalDecision,
 )
-from cayu.core import ToolResultPart
-from cayu.core.runtime_authority import SessionRunFenced
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import (
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
-    ToolApprovalRequest,
-    UserInputResponse,
-)
-from cayu.runtime._session_control import SessionControl
-from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.hooks import BeforeToolCallDecision, RuntimeHook
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.tool_policy import AlwaysRequireApprovalToolPolicy
 from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 
 def _identity(name):
@@ -513,7 +508,7 @@ def test_foreground_recovery_retains_mcp_only_secret_redaction_after_reconstruct
 
     from cayu.mcp.base import McpToolResult
     from cayu.mcp.tools import McpToolAdapter, McpToolset
-    from cayu.vaults import REDACTED_SECRET
+    from cayu.vaults.redaction import REDACTED_SECRET
 
     secret = "foreground-mcp-transport-only-credential"
 

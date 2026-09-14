@@ -21,7 +21,7 @@ from cayu.runners import (
     LambdaMicroVMError,
     LambdaMicroVMProtocolError,
 )
-from cayu.testing import verify_provider_credential_isolation
+from cayu.testing.base import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 SUPERVISOR_PATH = (

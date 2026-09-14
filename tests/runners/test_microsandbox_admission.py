@@ -9,27 +9,21 @@ from types import SimpleNamespace
 import pytest
 
 import cayu.runners.microsandbox as microsandbox
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    ExecutionRequirements,
-    ExecutionToolRequirement,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SearchTextTool,
-    Tool,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolSpec,
-)
-from cayu.environments import BoundWorkspace, WorkspaceBinding
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.admission import ExecutionRequirements, ExecutionToolRequirement
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.environments.factory import environment_factory_cleanup_settlement_tasks
-from cayu.runners import ExecCommand, MicrosandboxRunner
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import ExecCommand
+from cayu.runners.microsandbox import MicrosandboxRunner
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import Tool, ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
+from cayu.tools.search import SearchTextTool
 
 
 class Guest:
@@ -77,7 +71,8 @@ def test_public_admission_requires_an_executable_not_only_a_shell_builtin(
     tmp_path, monkeypatch, backend, proof, explicit
 ):
     import cayu.runners.docker as docker_module
-    from cayu.runners import DockerRunner, ExecResult
+    from cayu.runners.base import ExecResult
+    from cayu.runners.docker import DockerRunner
 
     bin_dir = tmp_path / ("bin" if proof == "absolute" else "bin with spaces")
     bin_dir.mkdir()

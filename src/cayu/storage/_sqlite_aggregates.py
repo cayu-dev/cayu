@@ -5,8 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
-from cayu.core.events import EventType
-from cayu.runtime.aggregates import (
+from cayu.budgets.aggregates import (
     _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
     _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
     AGGREGATE_IDENTITY_TRIM_CHARACTERS,
@@ -31,7 +30,8 @@ from cayu.runtime.aggregates import (
     aggregate_identity_value,
     build_aggregate_usage_metrics,
 )
-from cayu.runtime.sessions import UsageRollupQuery
+from cayu.events import EventType
+from cayu.sessions.base import UsageRollupQuery
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 
 _RESULT_SQL = """

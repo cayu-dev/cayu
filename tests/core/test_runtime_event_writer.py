@@ -7,28 +7,28 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import cayu.runtime._event_writer as event_writer_module
-import cayu.runtime.sessions as sessions_module
-from cayu.core import Event, EventType, Message
-from cayu.core.events import (
+import cayu.sessions.base as sessions_module
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetWindow, InMemoryBudgetStore
+from cayu.events import (
+    Event,
+    EventType,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
 )
-from cayu.runtime import (
-    CayuApp,
+from cayu.messages import Message
+from cayu.observability.events import EventSink
+from cayu.runtime._event_projection import public_event_id
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.sessions.base import (
+    PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+    EventQuery,
+    EventRecord,
     InMemorySessionStore,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectStatus,
     RunRequest,
     SessionIdentity,
-)
-from cayu.runtime._event_projection import public_event_id
-from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.budgets import BudgetWindow, InMemoryBudgetStore
-from cayu.runtime.event_sinks import EventSink
-from cayu.runtime.sessions import (
-    PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
-    EventQuery,
-    EventRecord,
 )
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

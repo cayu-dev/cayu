@@ -12,7 +12,6 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from cayu import CayuApp, default_price_book
-from cayu.runtime.sessions import SessionStatus
 from cayu.server import (
     AuthenticatedAccess,
     BasicAuth,
@@ -28,6 +27,7 @@ from cayu.server import (
     mount_cayu,
     mount_dashboard,
 )
+from cayu.sessions.base import SessionStatus
 
 
 def _auth(_request):

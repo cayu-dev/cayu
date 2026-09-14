@@ -149,8 +149,8 @@ async def audit_publication_fixture(backend, tmp_path, postgres_dsn):
     from psycopg import sql
     from psycopg.conninfo import make_conninfo
 
-    from cayu import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
 
     schema_name = f"browser_audit_{uuid4().hex}"
     async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:

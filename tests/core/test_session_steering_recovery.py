@@ -11,28 +11,29 @@ from tests.core.test_provider_operation_offline_recovery import (
 from tests.core.test_queued_session_messages import BlockingTool, ToolRoundProvider
 from tests.core.test_structured_output_tool_round_recovery import _answer_spec, _RecordingProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    EventType,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SessionStatus,
-    SQLiteSessionStore,
-    StopAfterCurrentToolRoundRequest,
-)
 from cayu._exception_groups import exception_cause
-from cayu.providers import ModelStreamEvent, ProviderOperationConnection, ProviderOperationStatus
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.providers.operations import ProviderOperationConnection, ProviderOperationStatus
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.provider_operations import (
     inspect_provider_operation,
     load_pending_provider_operation_disposition,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
+from cayu.sessions.base import (
+    EnqueueSessionMessageRequest,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

@@ -1022,6 +1022,7 @@ def _client_factory(response: httpx.Response) -> type:
             headers: dict[str, str],
             json: dict[str, Any],
             timeout: Any = None,
+            extensions: dict[str, Any] | None = None,
         ) -> _StreamContext:
             return _StreamContext(response)
 
@@ -2425,6 +2426,7 @@ class _CountingClient:
         headers: dict[str, str],
         json: dict[str, Any],
         timeout: Any = None,
+        extensions: dict[str, Any] | None = None,
     ) -> _StreamContext:
         return _StreamContext(_StreamingResponse(['data: {"ok": true}', "", "data: [DONE]", ""]))
 

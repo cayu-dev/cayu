@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from cayu import ToolEffect
-from cayu.testing import (
+from cayu.testing.base import (
     ProviderCredentialIsolationVerification,
     ToolEffectVerification,
     ToolEffectVerificationStatus,

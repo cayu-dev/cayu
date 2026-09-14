@@ -12,16 +12,16 @@ from configuration.settings import (  # ty: ignore[unresolved-import]
 )
 from workflows.coding_product import CodingProductApplication  # ty: ignore[unresolved-import]
 
-from cayu import (
-    DockerCodingEnvironmentFactory,
-    LocalWorkspace,
+from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import (
     PostgresBudgetLedger,
     PostgresKnowledgeStore,
     PostgresSessionStore,
     PostgresTaskStore,
-    SubagentTool,
 )
-from cayu.storage.migrations import SchemaMode
+from cayu.tools.subagents import SubagentTool
+from cayu.workspaces.local import LocalWorkspace
 from tests.qualification.repository_maintenance_budget import require_maintenance_budget
 from tests.qualification.repository_maintenance_runs import PostgresMaintenanceRunStore
 

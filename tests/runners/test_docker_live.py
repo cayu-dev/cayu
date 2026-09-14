@@ -12,17 +12,16 @@ from uuid import uuid4
 import pytest
 from examples._runner_conformance import verify_bounded_output_drain
 
-from cayu import (
+from cayu.immutable_inputs import ImmutableInputStore, inspect_local_immutable_input
+from cayu.runners.base import ExecCommand
+from cayu.runners.docker import DockerRunner
+from cayu.runners.docker_workload import (
     DockerImageIdentity,
-    DockerRunner,
     DockerTmpfsMount,
     DockerWorkloadRestrictions,
-    ExecCommand,
-    ImmutableInputStore,
-    SearchTextTool,
-    ToolContext,
-    inspect_local_immutable_input,
 )
+from cayu.tools.base import ToolContext
+from cayu.tools.search import SearchTextTool
 
 _REQUIRE_DOCKER_RUNNER_ENV_VAR = "CAYU_REQUIRE_DOCKER_RUNNER"
 _SEARCH_TEXT_IMAGE = "cayu-search-text-live:local"
@@ -505,7 +504,7 @@ def test_real_docker_native_child_completed_result_survives_cancellation(
         test_cancel_before_workspace_terminal,
     )
 
-    from cayu import ModelStreamEvent
+    from cayu.providers.base import ModelStreamEvent
 
     class ContainerProvider(_ScriptedProvider):
         async def stream(self, request):
@@ -522,6 +521,9 @@ def test_real_docker_native_child_completed_result_survives_cancellation(
                 yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     docker_path = _docker_path_or_skip()
+    # Container truncation preserves host ownership, allowing the recovery
+    # probe to replace the output with a sentinel on Linux bind mounts.
+    (tmp_path / "shell.txt").write_text("")
     runner = asyncio.run(
         DockerRunner.create(
             f"cayu-publication-{uuid4().hex[:12]}",

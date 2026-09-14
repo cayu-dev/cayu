@@ -6,16 +6,11 @@ import pytest
 from tests.core.test_foreground_child_resolution_contention import _app, _ContendedTool
 from tests.core.test_foreground_subagent_recovery import _Provider
 
-from cayu import (
-    InMemorySessionStore,
-    Message,
-    RunRequest,
-    SessionQuery,
-    SessionStatus,
-    SQLiteSessionStore,
-)
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import UserInputResponse
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionQuery, SessionStatus
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

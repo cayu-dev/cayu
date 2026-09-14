@@ -12,23 +12,24 @@ import pytest
 from pydantic import SecretStr
 from tests.core._event_projection_support import private_events_for_public_events
 
-from cayu import CHECKPOINT_SCHEMA_VERSION_KEY, SQLiteSessionStore, SQLiteTaskStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.providers import (
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-)
-from cayu.runtime import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.aggregates import AggregateUsageMetrics
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
-    CayuApp,
+    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
+    BudgetReservationIdentityConflict,
     EnqueueSessionMessageRequest,
     EventOrder,
     EventQuery,
     ForkSessionRequest,
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
+    ModelCompletionStageRequest,
+    PendingActionQuery,
     ResumeRequest,
     RunRequest,
     Session,
@@ -40,20 +41,17 @@ from cayu.runtime import (
     SessionStatus,
     TranscriptQuery,
     UsageRollupQuery,
-)
-from cayu.runtime.aggregates import AggregateUsageMetrics
-from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
-from cayu.runtime.sessions import (
-    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
-    BudgetReservationIdentityConflict,
-    ModelCompletionStageRequest,
-    PendingActionQuery,
     fork_session_invocation,
+)
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage import sqlite as sqlite_storage
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
 
 def _tool_round_identity_payload() -> dict[str, str]:
@@ -4245,7 +4243,7 @@ def _make_event(session_id: str, *, seq: int, timestamp) -> Event:
 
 
 def test_sqlite_events_reconstructed_from_columns_without_event_json(tmp_path):
-    from cayu.runtime import EventQuery
+    from cayu.sessions.base import EventQuery
 
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)

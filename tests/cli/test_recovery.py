@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import cayu.cli.recovery as recovery_cli
 from cayu.cli import main
-from cayu.runtime import (
+from cayu.sessions.recovery import (
     RecoveryPlan,
     RecoveryPlanRequest,
     RecoveryPlanSelection,

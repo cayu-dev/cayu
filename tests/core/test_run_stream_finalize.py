@@ -16,12 +16,14 @@ from typing import TYPE_CHECKING, NamedTuple
 if TYPE_CHECKING:
     import pytest
 
-from cayu.core import AgentSpec, Message
-from cayu.core.events import Event, EventType
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
 from cayu.failure_evidence import FailureEvidence
+from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.runtime._invocation_lifecycle import SettleInvocationCommand
+from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
@@ -29,7 +31,6 @@ from cayu.runtime import (
     SessionRunFenced,
     SessionStatus,
 )
-from cayu.runtime._invocation_lifecycle import SettleInvocationCommand
 
 
 class FakeProvider(ModelProvider):

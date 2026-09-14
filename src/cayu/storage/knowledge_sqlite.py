@@ -12,16 +12,16 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from cayu.knowledge_maintenance_governance import (
+    from cayu.knowledge.maintenance_governance import (
         KnowledgeMaintenanceGovernanceAuthority,
         KnowledgeMaintenanceGovernanceReceipt,
     )
-    from cayu.knowledge_maintenance_persistence import (
+    from cayu.knowledge.maintenance_persistence import (
         KnowledgeMaintenanceAcceptedPlan,
         KnowledgeMaintenanceProposalPublication,
         KnowledgeMaintenanceProposalPublicationReceipt,
     )
-    from cayu.knowledge_semantic_watch import (
+    from cayu.knowledge.semantic_watch import (
         KnowledgeSemanticWatchAuthority,
         KnowledgeSemanticWatchReceipt,
     )
@@ -1478,7 +1478,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         operation_id: str,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposalPublicationReceipt:
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationReceipt,
             copy_knowledge_maintenance_proposal_publication_receipt,
@@ -1618,7 +1618,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposalPublication | None:
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceProposalPublication,
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationOutcome,
@@ -1694,7 +1694,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceGovernanceReceipt:
-        from cayu.knowledge_maintenance_governance import (
+        from cayu.knowledge.maintenance_governance import (
             KnowledgeMaintenanceGovernanceAuthority,
             KnowledgeMaintenanceGovernanceDisposition,
             KnowledgeMaintenanceGovernanceReceipt,
@@ -1837,7 +1837,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeSemanticWatchReceipt:
-        from cayu.knowledge_semantic_watch import (
+        from cayu.knowledge.semantic_watch import (
             KnowledgeSemanticWatchAuthority,
             KnowledgeSemanticWatchConflict,
             KnowledgeSemanticWatchReceipt,
@@ -1974,7 +1974,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     publication_snapshot = publication[3]
                     governance_publication = publication
                 if KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata:
-                    from cayu.knowledge_maintenance_governance import (
+                    from cayu.knowledge.maintenance_governance import (
                         governance_authority_from_maintenance_records,
                     )
 
@@ -4257,7 +4257,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         ]
         | None
     ):
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceAcceptedPlan,
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationReceipt,
@@ -4410,7 +4410,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope,
         deny_inaccessible: bool,
     ) -> KnowledgeMaintenanceGovernanceReceipt | None:
-        from cayu.knowledge_maintenance_governance import (
+        from cayu.knowledge.maintenance_governance import (
             KnowledgeMaintenanceGovernanceDisposition,
             KnowledgeMaintenanceGovernanceReceipt,
             copy_knowledge_maintenance_governance_receipt,
@@ -4460,7 +4460,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope,
         deny_inaccessible: bool,
     ) -> KnowledgeSemanticWatchReceipt | None:
-        from cayu.knowledge_semantic_watch import (
+        from cayu.knowledge.semantic_watch import (
             KnowledgeSemanticWatchConflict,
             KnowledgeSemanticWatchReceipt,
             copy_knowledge_semantic_watch_receipt,

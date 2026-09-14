@@ -12,7 +12,7 @@ from cayu import (
     ToolPolicyDecision,
     ToolPolicyRequest,
 )
-from cayu.runtime import Session, SessionStatus
+from cayu.sessions.base import Session, SessionStatus
 
 
 def _request(tool_name: str) -> ToolPolicyRequest:

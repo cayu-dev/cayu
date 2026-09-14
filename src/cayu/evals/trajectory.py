@@ -11,8 +11,12 @@ if TYPE_CHECKING:
 from pydantic import BaseModel
 
 from cayu._validation import require_clean_nonblank
-from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
-from cayu.core.messages import Message, MessageRole, TextPart, detach_message
+from cayu.applications import CayuApp
+from cayu.budgets.usage import (
+    SessionUsageSummary,
+    combine_session_usage_summaries,
+    session_usage_summary,
+)
 from cayu.evals.capture_policy import SessionTrajectoryBounds, SessionTrajectoryErrorCode
 from cayu.evals.models import (
     Trajectory,
@@ -21,14 +25,15 @@ from cayu.evals.models import (
     _validate_trajectory_record_contract,
 )
 from cayu.evals.workflow_target import WorkflowEvalOutputEvidenceV1
-from cayu.memory_attribution import MemoryAttribution, MemoryAttributionBounds
+from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
+from cayu.memory.attribution import MemoryAttribution, MemoryAttributionBounds
+from cayu.messages import Message, MessageRole, TextPart, detach_message
 from cayu.runtime._memory_attribution import (
     MemoryAttributionCaptureBudget,
     project_memory_attribution,
 )
 from cayu.runtime._memory_evidence import memory_evidence_key
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     RunnerObservedEventIdentity,
     Session,
@@ -46,11 +51,6 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidenceLimits,
     copy_terminal_session_evidence,
     parse_session_input_contract_evidence,
-)
-from cayu.runtime.usage import (
-    SessionUsageSummary,
-    combine_session_usage_summaries,
-    session_usage_summary,
 )
 
 # Fresh evals retain descendant evidence for assertions and replay. Page the durable

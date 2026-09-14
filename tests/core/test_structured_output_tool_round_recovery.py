@@ -9,45 +9,38 @@ from tests.core._event_projection_support import private_events_for_public_event
 from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu import CayuConfig, ToolExecutionConfig
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-)
-from cayu.core.messages import ToolCallPart, ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    ResumeRequest,
-    RunLimits,
-    RunRequest,
-    Session,
-    SessionStatus,
-    StructuredOutputSpec,
-    ToolCapabilityCeiling,
-)
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
     ModelCompletionStageRequest,
+    ResumeRequest,
+    RunRequest,
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
+    Session,
+    SessionStatus,
     runtime_publication_checkpoint_mutation,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

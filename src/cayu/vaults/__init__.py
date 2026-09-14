@@ -1,56 +1,17 @@
 """Vault contracts."""
 
-from cayu.vaults.aws_secrets_manager import SecretsManagerVault
-from cayu.vaults.base import (
-    ResolvedSecret,
-    SecretEnv,
-    SecretNotFound,
-    SecretRef,
-    SecretResolver,
-    Vault,
-    VaultError,
-    copy_resolved_secret,
-    copy_secret_env,
-    copy_secret_ref,
-    resolve_secret_env,
-    secret_env_refs,
-    validate_secret_resolver,
-)
-from cayu.vaults.composite import ChainVault, RoutedVault
-from cayu.vaults.local_env import LocalEnvVault
-from cayu.vaults.redaction import (
-    REDACTED_SECRET,
-    SecretRedactionCapacityError,
-    SecretRedactionStream,
-    SecretRedactionTail,
-    SecretRedactor,
-    contains_redacted_secret,
-)
-from cayu.vaults.static import StaticVault
+from typing import Any as _Any
 
-__all__ = [
-    "REDACTED_SECRET",
-    "ChainVault",
-    "LocalEnvVault",
-    "ResolvedSecret",
-    "RoutedVault",
-    "SecretEnv",
-    "SecretNotFound",
-    "SecretRedactionCapacityError",
-    "SecretRedactionStream",
-    "SecretRedactionTail",
-    "SecretRedactor",
-    "SecretRef",
-    "SecretResolver",
-    "SecretsManagerVault",
-    "StaticVault",
-    "Vault",
-    "VaultError",
-    "contains_redacted_secret",
-    "copy_resolved_secret",
-    "copy_secret_env",
-    "copy_secret_ref",
-    "resolve_secret_env",
-    "secret_env_refs",
-    "validate_secret_resolver",
-]
+from cayu._api import resolve_export as _resolve_export
+from cayu.vaults._exports import EXPORTS as _EXPORTS
+from cayu.vaults._exports import PUBLIC_NAMES as _PUBLIC_NAMES
+
+__all__ = _PUBLIC_NAMES
+
+
+def __getattr__(name: str) -> _Any:
+    return _resolve_export(name, globals(), _EXPORTS)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))

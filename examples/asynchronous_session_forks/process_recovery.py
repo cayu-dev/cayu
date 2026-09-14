@@ -42,9 +42,9 @@ from cayu import (
     TaskStoreDispatcher,
     ToolCapabilityCeiling,
 )
-from cayu.core import TextPart
+from cayu.messages import TextPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import ModelCompletionStageResult, RuntimePublicationRequest
+from cayu.sessions.base import ModelCompletionStageResult, RuntimePublicationRequest
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 
 _MODULE = "examples.asynchronous_session_forks.process_recovery"

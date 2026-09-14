@@ -77,6 +77,33 @@ application that already owns FastAPI embeds Cayu explicitly with
 Client-IP and forwarded-header checks are not authentication; public or deployed
 mounts require `AuthenticatedAccess(...)` with application-owned authorization.
 
+## Package ownership
+
+Use the concept package when exploring a capability: `cayu.sessions` owns
+session requests and stores, `cayu.tools` owns tool contracts and policies,
+`cayu.context` owns context management, and `cayu.approvals` owns approvals and
+user input. Other owners include `cayu.tasks`, `cayu.workflows`, `cayu.memory`,
+`cayu.knowledge`, `cayu.budgets`, `cayu.snapshots`, and `cayu.delivery`.
+
+```python
+from cayu.applications import CayuApp
+from cayu.agents import AgentSpec
+from cayu.messages import Message
+from cayu.sessions import RunRequest
+from cayu.tools import Tool, ToolSpec
+```
+
+Root imports such as `from cayu import CayuApp` remain supported. Package
+`_exports.py` files identify the defining modules; matching `__init__.pyi` files
+provide static declarations. `cayu.runtime` coordinates execution. The prerelease
+migration removes legacy module aliases; use current concept paths for new
+imports and generated code. Same-build recovery remains supported; old import
+paths and cross-build execution-profile continuity are not compatibility promises.
+
+The [complete source ownership and migration map](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md)
+includes specialized modules and retained root-level concepts. This package's
+installed source and export manifests are authoritative for its version.
+
 ## Coding composition
 
 For a repository-coding application that needs the same explicit capabilities

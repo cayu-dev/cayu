@@ -6,8 +6,8 @@ import json
 import pytest
 from tests.core import test_foreground_child_parent_gate as gate_tests
 
-from cayu import CayuApp
-from cayu.vaults import SecretRedactor
+from cayu.applications import CayuApp
+from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.parametrize("kind", ["approval", "input"])

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from cayu.core.execution_identity import (
+from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )

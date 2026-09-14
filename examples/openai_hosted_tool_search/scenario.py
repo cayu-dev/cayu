@@ -19,7 +19,7 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
-from cayu.runtime.tool_discovery import (
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryViewState,
 )

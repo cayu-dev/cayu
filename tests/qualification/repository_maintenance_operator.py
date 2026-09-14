@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
-from cayu import TaskStatus
+from cayu.tasks.base import TaskStatus
 from tests.qualification.repository_maintenance_git_intake import (
     _stored_delivery,
     _stored_preparation,

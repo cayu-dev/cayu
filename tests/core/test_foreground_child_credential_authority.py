@@ -7,18 +7,14 @@ from tests.core.test_execution_profiles import IdentityConfiguredEgressEnvironme
 from tests.core.test_foreground_child_resolution_contention import _app, _ContendedTool
 from tests.core.test_foreground_subagent_recovery import _identity, _Provider
 
-from cayu import (
-    EnvironmentSpec,
-    ExecutionProfileMismatchError,
-    InMemorySessionStore,
-    Message,
-    RunRequest,
-    SessionQuery,
-    SQLiteSessionStore,
-    ToolApprovalDecision,
-)
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import ToolApprovalRequest, UserInputResponse
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.environments.base import EnvironmentSpec
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionQuery
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 class _StaticCredentialIdentityFactory(IdentityConfiguredEgressEnvironmentFactory):

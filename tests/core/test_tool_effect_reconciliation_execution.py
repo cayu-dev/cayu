@@ -6,7 +6,6 @@ import pytest
 from tests.core.test_tool_effect_reconciliation_registration import _register, _spec
 from tests.core.test_tool_effect_state import _intent, _receipt
 
-from cayu.runtime import InMemorySessionStore
 from cayu.runtime._tool_effect_reconciliation import (
     ToolEffectReconciliationOwner,
     ToolEffectReconciliationTimeout,
@@ -18,6 +17,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
+from cayu.sessions.base import InMemorySessionStore
 from cayu.tools._operation_boundary import InvocationOperationCapacityError
 from cayu.vaults.redaction import SecretRedactor
 

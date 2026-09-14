@@ -7,20 +7,15 @@ from contextlib import aclosing
 
 import pytest
 
-from cayu import (
-    CodingProductArtifactRepository,
-    DockerImageIdentity,
-    EventQuery,
-    EventType,
-    ExecutionDeadline,
-    ExecutionDeadlineExceeded,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-    SessionStatus,
-)
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.cli.project import project_context
+from cayu.coding_products import CodingProductArtifactRepository
+from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
+from cayu.events import EventType
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import EventQuery, InMemorySessionStore, SessionStatus
+from cayu.storage.memory import InMemoryKnowledgeStore
+from cayu.tasks.base import InMemoryTaskStore
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain

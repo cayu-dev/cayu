@@ -15,12 +15,12 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.runtime.browser_control import (
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY as _KEY
+from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
     BrowserControlConflict,
     closed_browser_control_successor,
 )
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY as _KEY
 
 BROWSER_CONTROL_OPERATION_PREFIX = "browser-control:"
 

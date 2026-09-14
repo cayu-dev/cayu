@@ -52,7 +52,6 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runners._cleanup import (
     RunnerCleanupPolicy,
     RunnerCleanupProgress,
@@ -67,6 +66,7 @@ from cayu.runners._diagnostics import (
     trusted_runner_error_type_name,
     trusted_runner_exception_type_name,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 if TYPE_CHECKING:
     from cayu.environments.admission import (
@@ -74,7 +74,7 @@ if TYPE_CHECKING:
         ExecutionEnvironmentAuthority,
         ExecutionRequirements,
     )
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 RunnerSystemExecutionMode = Literal["shared", "separate"]
@@ -1035,7 +1035,7 @@ class Runner(ABC):
         """
 
         from cayu.runners._redacted_output import redact_completed_exec_result
-        from cayu.vaults import SecretRedactor
+        from cayu.vaults.redaction import SecretRedactor
 
         if not isinstance(redactor, SecretRedactor):
             raise TypeError("Runner.exec_redacted redactor must be a SecretRedactor.")

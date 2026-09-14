@@ -12,7 +12,7 @@ from cayu.artifacts import (
     file_attachment_from_payload,
     resolved_file_attachments_from_options,
 )
-from cayu.core.messages import (
+from cayu.messages import (
     CitationPart,
     FilePart,
     HostedToolCallPart,

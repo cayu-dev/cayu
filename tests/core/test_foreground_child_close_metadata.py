@@ -13,24 +13,27 @@ import pytest
 from tests.core.test_foreground_child_restart import _RestartRecordingTool
 from tests.core.test_foreground_subagent_recovery import _identity, _Provider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
-    Message,
     RunRequest,
     SessionQuery,
     SessionStatus,
-    SQLiteSessionStore,
-    SubagentSpec,
-    SubagentTool,
-    ToolApprovalDecision,
 )
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import ToolApprovalRequest, UserInputResponse
-from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
-from cayu.runtime.invocation import InvocationOriginClaim
-from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
+from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.tools.user_input import UserInputTool
 
 _METADATA = {

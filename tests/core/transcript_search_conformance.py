@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.core.messages import Message, MessageRole, TextPart, ThinkingPart
-from cayu.runtime.sessions import (
+from cayu.messages import Message, MessageRole, TextPart, ThinkingPart
+from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionStore,

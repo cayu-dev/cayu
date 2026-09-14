@@ -15,7 +15,6 @@ from cayu.runtime._browser_control_frames import BrowserViewUnavailable, Private
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._browser_control_view_tickets import BrowserViewTickets
-from cayu.runtime.browser_control import BrowserControlPrincipal
 from cayu.server._browser_control_routes import (
     BrowserOperatorSessionTokens,
     create_browser_control_router,
@@ -25,6 +24,7 @@ from cayu.server._browser_viewer_routes import (
     create_browser_viewer_router,
 )
 from cayu.server.auth import BasicAuth
+from cayu.tools.browser_control import BrowserControlPrincipal
 
 
 @pytest.mark.parametrize(

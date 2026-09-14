@@ -11,19 +11,16 @@ from tests._tool_admission_fixtures import (
 from tests.core.test_runtime import FakeProvider
 from tests.core.test_structured_commands import _policy_request, _profile
 
-from cayu import (
-    AgentSpec,
-    EventType,
-    Message,
-    RunCommandTool,
-    RunRequest,
-    StructuredCommandToolPolicy,
-)
 from cayu._command_diagnostics import COMMAND_DENIAL_HINTS, CommandDenialCode
-from cayu.providers import ModelStreamEvent
+from cayu.agents import AgentSpec
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._approval_support import public_policy_denial_result
-from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
-from cayu.storage import SQLiteSessionStore
+from cayu.sessions.base import RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.tools.structured_commands import RunCommandTool, StructuredCommandToolPolicy
 
 
 @pytest.mark.parametrize(
@@ -137,8 +134,8 @@ def test_custom_policy_cannot_mark_arbitrary_text_safe(scope):
 
 
 def test_command_diagnostic_round_checkpoint_roundtrip():
+    from cayu.approvals.tools import PendingToolCallApproval, copy_pending_tool_call_approval
     from cayu.runtime._resume_ledger import policy_result_from_pending_tool_call
-    from cayu.runtime.approvals import PendingToolCallApproval, copy_pending_tool_call_approval
 
     for code in CommandDenialCode:
         checkpoint = PendingToolCallApproval(

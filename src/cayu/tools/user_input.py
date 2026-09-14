@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 ASK_USER_TOOL_NAME = "ask_user"
 

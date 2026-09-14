@@ -63,6 +63,7 @@ authoritative only where a maintained guide points to the implementation or the
 ## Architecture and implemented design records
 
 - [Architecture](architecture.md)
+- [Public concepts and source ownership](public-concepts.md)
 - [Function-call event ordering investigation](function-call-event-ordering.md)
 - [Hosted-search event ordering investigation](hosted-search-event-ordering.md)
 - [Hosted-search source diagnostics](hosted-search-source-diagnostics.md)

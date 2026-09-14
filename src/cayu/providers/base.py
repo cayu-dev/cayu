@@ -20,9 +20,9 @@ from cayu._validation import (
     require_nonblank,
 )
 from cayu.artifacts.attachments import file_attachment_from_payload
-from cayu.core.billing import BillingIdentity
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import (
+from cayu.budgets.billing import BillingIdentity
+from cayu.deadlines import current_execution_deadline
+from cayu.messages import (
     CitationPart,
     FilePart,
     HostedToolCallPart,
@@ -35,7 +35,6 @@ from cayu.core.messages import (
     ToolResultPart,
     detach_message,
 )
-from cayu.deadlines import current_execution_deadline
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
@@ -58,6 +57,7 @@ from cayu.providers.operations import (
     ProviderOperationRecoveryMetadata,
     ProviderOperationStatus,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS = frozenset(
     {

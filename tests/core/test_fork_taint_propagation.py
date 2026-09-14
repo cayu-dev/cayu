@@ -31,7 +31,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.providers import ModelStreamEvent
-from cayu.runtime.sessions import fork_session_invocation
+from cayu.sessions.base import fork_session_invocation
 
 
 class UntrustedEvidenceTool(Tool):

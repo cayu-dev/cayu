@@ -310,7 +310,7 @@ The built-in tests are full worked examples: `tests/runners/test_microsandbox.py
 `tests/runners/test_e2b.py`.
 
 For a credential-boundary regression, use
-`cayu.testing.verify_provider_credential_isolation(...)`. Install unique host
+`cayu.testing.base.verify_provider_credential_isolation(...)`. Install unique host
 canaries for provider keys, auth-store tokens and paths, account identifiers,
 and authorization headers; pass unrelated operational values and an intentional
 workload credential as positive controls; then run the probe through create and

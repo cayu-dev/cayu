@@ -12,7 +12,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageTarget,
 )
-from cayu.runtime.sessions import SessionMessageDeliveryMode, SessionStatus
+from cayu.sessions.base import SessionMessageDeliveryMode, SessionStatus
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

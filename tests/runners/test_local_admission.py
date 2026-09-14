@@ -6,20 +6,21 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.admission import (
     ExecutionCapabilityClaim,
     ExecutionRequirements,
     ExecutionToolRequirement,
-    LocalRunner,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
+)
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.local import LocalRunner
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import (
     Tool,
     ToolExecutableRequirement,
     ToolExecutionRequirement,

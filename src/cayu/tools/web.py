@@ -14,14 +14,14 @@ from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.egress._resolution import (
     InvalidResolvedAddressError,
     ProhibitedResolvedAddressError,
     resolve_destination,
     validated_resolved_address,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.web_access import (
     WebAccessEvidenceSource,
     WebAccessOutcome,
@@ -33,7 +33,7 @@ from cayu.tools.web_access import (
     classify_http_access,
     transport_access_evidence,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 MAX_WEB_FETCH_URL_LENGTH = 8192
 DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES = 2 * 1024 * 1024

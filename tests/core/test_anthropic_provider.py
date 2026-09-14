@@ -9,44 +9,43 @@ import pytest
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 import cayu.providers.anthropic as anthropic_module
-from cayu import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.attachments import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
-    AgentSpec,
-    AllowlistProxy,
-    CacheBreakpoint,
-    CachePolicy,
-    CayuApp,
-    CayuConfig,
-    EventType,
     FileAttachmentKind,
-    Message,
-    RecentTurnsContextPolicy,
-    RetryPolicy,
-    RunDefaults,
-    RunRequest,
     file_attachment,
 )
-from cayu.core.messages import FilePart, TextPart, ThinkingPart, ToolCallPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import (
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import RecentTurnsContextPolicy
+from cayu.events import EventType
+from cayu.messages import FilePart, Message, TextPart, ThinkingPart, ToolCallPart
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
+from cayu.providers.anthropic import (
     AnthropicAPIError,
     AnthropicContextOverflowError,
     AnthropicProtocolError,
     AnthropicProvider,
     HttpxAnthropicTransport,
+    anthropic_response_events,
+    anthropic_stream_events,
+    build_anthropic_payload,
+)
+from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
     ModelContextOverflowError,
     ModelRequest,
     ModelStreamEventType,
-    ProviderStreamDeadlines,
-    anthropic_response_events,
-    anthropic_stream_events,
-    build_anthropic_payload,
 )
-from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
-from cayu.providers.cache import resolve_cache_policy
-from cayu.vaults import SecretRef, StaticVault
+from cayu.providers.cache import CacheBreakpoint, CachePolicy, resolve_cache_policy
+from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.proxies.passthrough import AllowlistProxy
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.vaults.base import SecretRef
+from cayu.vaults.static import StaticVault
 
 
 class RecordingTransport:

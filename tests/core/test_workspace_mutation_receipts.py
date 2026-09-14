@@ -25,51 +25,53 @@ import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime._tool_round_recovery as tool_round_recovery_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
-from cayu import CayuConfig, ToolExecutionConfig
 from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._exception_state import set_exception_state
 from cayu._validation import canonical_durable_json_bytes
 from cayu._workspace_mutation import WorkspaceMutationSettlementError
-from cayu.artifacts import ArtifactMetadata, ArtifactScope, LocalArtifactStore
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.environments import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp, _close_delegated_event_stream
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.artifacts.base import ArtifactMetadata, ArtifactScope
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.base import InMemoryBudgetStore
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import (
     DeterministicWorkspaceBinding,
-    Environment,
-    EnvironmentFactory,
-    EnvironmentFactoryRequest,
-    EnvironmentFactoryResult,
-    EnvironmentSpec,
     GitRepositoryBinding,
     NativeBinding,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import (
+from cayu.environments.factory import (
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+)
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
-    LocalRunner,
     Runner,
     RunnerExecutionError,
     attach_cancellation_artifacts,
 )
-from cayu.runtime import (
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
+from cayu.runners.local import LocalRunner
+from cayu.runtime._environment_operation_boundary import await_environment_operation
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._model_errors import (
+    _BillingIdentityResolutionCancelled,
+    detach_billing_identity_cancellation_group,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
-    InMemoryBudgetStore,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
@@ -78,20 +80,17 @@ from cayu.runtime import (
     RuntimePublicationResult,
     SessionIdentity,
     SessionStatus,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    UserInputResponse,
+    runtime_publication_request_digest,
 )
-from cayu.runtime._environment_operation_boundary import await_environment_operation
-from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_errors import (
-    _BillingIdentityResolutionCancelled,
-    detach_billing_identity_cancellation_group,
-)
-from cayu.runtime.app import _close_delegated_event_stream
-from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
-from cayu.runtime.sessions import runtime_publication_request_digest
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.commands import ExecCommandTool
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.user_input import UserInputTool
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.local import LocalWorkspace
+from cayu.workspaces.observation_recovery import (
     WorkspaceObservationLifecycle,
     _admit_workspace_observation_intent,
     _project_workspace_observation_authority,
@@ -103,10 +102,7 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_pending_cancellation_requests,
     workspace_observations_from_checkpoint,
 )
-from cayu.tools import ExecCommandTool, UserInputTool
-from cayu.vaults import SecretRedactor, SecretRef, StaticVault
-from cayu.workspaces import (
-    LocalWorkspace,
+from cayu.workspaces.revisions import (
     WorkspaceIdentity,
     WorkspacePathRevision,
     WorkspaceRevisionDelta,

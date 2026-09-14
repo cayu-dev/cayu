@@ -16,21 +16,17 @@ from tests.core.verified_worker_fixtures import (
     verified_worker_store_factory as verified_worker_store_factory,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CompletionContinuationPolicy,
-    CompletionRejectionAction,
-    TaskCreate,
-    TaskStatus,
-    VerifiedTaskWorker,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.runtime._session_engine import SessionEngine
-from cayu.runtime.work_attempt_admission import WorkAttemptAdmissionConflict
+from cayu.runtime.verified_task_worker import VerifiedTaskWorker
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
     work_attempt_admission_authority_sha256,
 )
+from cayu.tasks.admission import WorkAttemptAdmissionConflict
+from cayu.tasks.base import TaskCreate, TaskStatus
+from cayu.tasks.contracts import CompletionContinuationPolicy, CompletionRejectionAction
 
 
 async def _wait_past(expires_at):

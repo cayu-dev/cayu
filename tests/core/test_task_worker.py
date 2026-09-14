@@ -21,44 +21,68 @@ from tests.core.task_invocation_fixtures import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-import cayu.runtime.task_worker as task_worker_module
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
+import cayu.tasks.worker as task_worker_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
+from cayu.configuration import DEFAULT_MAX_STEPS
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime._continuation_task_failure import (
+    runtime_task_terminalization_idempotency_key,
+)
+from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
+from cayu.runtime._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+from cayu.runtime.provider_operations import (
+    ProviderOperationResolutionAction,
+    ProviderOperationResolutionRequest,
+    provider_operation_resolution_request_digest,
+)
+from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    Event,
     EventQuery,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    ExecutionProfileMismatchError,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
-    InMemoryTaskStore,
-    InterruptedTaskContinuationClaimPage,
     InterruptSessionRequest,
-    Message,
-    ModelStreamEvent,
+    ModelCompletionStageDisposition,
     PendingActionQuery,
-    ProviderOperationResolutionAction,
-    ProviderOperationResolutionRequest,
     ResumeRequest,
     RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    ScriptedModelProvider,
+    SessionIdentity,
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
     SessionRunFenced,
+    SessionStatus,
     SessionStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
+    run_request_with_task_invocation,
+)
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    InterruptedTaskContinuationClaimPage,
     Task,
     TaskClaimLost,
     TaskCreate,
-    TaskHandlerOutcome,
+    TaskExecutionSource,
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
@@ -71,47 +95,21 @@ from cayu import (
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
     TaskTerminalKind,
-    Tool,
-    ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRecoveryRequest,
-    ToolApprovalRequest,
-    ToolCapabilityCeiling,
-    ToolContext,
-    ToolEffect,
-    ToolEffectReconciliationRequest,
-    ToolResult,
-    ToolRoundRecoveryRequest,
-    ToolSpec,
-    UserInputRecoveryRequest,
-    UserInputResponse,
+    interrupted_task_handoff_request,
+    task_create_with_runtime_invocation,
+)
+from cayu.tasks.worker import (
+    TaskHandlerOutcome,
     complete_managed_task,
     fail_managed_task,
-    interrupted_task_handoff_request,
     run_task_worker,
 )
-from cayu.providers import ModelProvider, ModelRequest
-from cayu.runtime import SessionStatus
-from cayu.runtime._continuation_task_failure import (
-    runtime_task_terminalization_idempotency_key,
-)
-from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
-    invocation_terminal_decision_from_checkpoint,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
-from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
-from cayu.runtime.config import DEFAULT_MAX_STEPS
-from cayu.runtime.provider_operations import provider_operation_resolution_request_digest
-from cayu.runtime.sessions import (
-    ModelCompletionStageDisposition,
-    SessionIdentity,
-    run_request_with_task_invocation,
-)
-from cayu.runtime.tasks import TaskExecutionSource, task_create_with_runtime_invocation
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.rounds import ToolRoundRecoveryRequest
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 def _build(

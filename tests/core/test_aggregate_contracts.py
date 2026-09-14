@@ -11,10 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from cayu.core import Event, EventType, Message
-from cayu.core.billing import BillingIdentity, PricingContext
-from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
-from cayu.runtime.aggregates import (
+from cayu.budgets.aggregates import (
     MAX_AGGREGATE_USAGE_COUNTER,
     MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
     AggregateAccuracy,
@@ -35,8 +32,13 @@ from cayu.runtime.aggregates import (
     estimate_usage_rollup_cost,
     estimate_usage_session_cost_breakdown,
 )
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.sessions import (
+from cayu.budgets.billing import BillingIdentity, PricingContext
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.usage import HostedToolUsageMetrics, UsageMetrics, build_aggregate_usage_metrics
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
+from cayu.sessions.base import (
     EventRecord,
     InMemorySessionStore,
     RunRequest,
@@ -48,9 +50,8 @@ from cayu.runtime.sessions import (
     SessionStore,
     UsageRollupQuery,
 )
-from cayu.runtime.tasks import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
-from cayu.runtime.usage import HostedToolUsageMetrics, UsageMetrics, build_aggregate_usage_metrics
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
 
 
 def _identity() -> SessionIdentity:
@@ -1179,7 +1180,7 @@ def test_in_memory_usage_breakdown_remains_exact_within_candidate_bound() -> Non
 
 
 def test_in_memory_usage_breakdown_samples_bounded_heavy_hitters() -> None:
-    from cayu.runtime import sessions as session_runtime
+    import cayu.sessions.base as session_runtime
 
     async def run() -> None:
         store = InMemorySessionStore()
@@ -2056,7 +2057,7 @@ def test_sqlite_session_usage_breakdown_matches_in_memory_reference(
         assert sqlite_remainder_result.model_dump(
             exclude={"as_of"}
         ) == memory_remainder_result.model_dump(exclude={"as_of"})
-        from cayu.runtime import costs as runtime_costs
+        import cayu.budgets.pricing as runtime_costs
 
         original_estimate = runtime_costs.estimate_model_step_cost
         resolution_count = 0
@@ -3301,7 +3302,7 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         assert unclean_metrics.billing_identity is not None
         assert unclean_metrics.billing_identity.request_evidence == {}
 
-        from cayu.runtime.sessions import session_query_from_aggregate_filter
+        from cayu.sessions.base import session_query_from_aggregate_filter
         from cayu.storage import _postgres_aggregates, _session_store_sql
         from cayu.storage.postgres import _SQL_DIALECT
 

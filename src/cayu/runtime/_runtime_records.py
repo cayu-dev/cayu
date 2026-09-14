@@ -7,49 +7,44 @@ from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
 from cayu._workspace_mutation import WorkspaceMutationProcessFence
-from cayu.core.agents import AgentSpec
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import (
+from cayu.agents import AgentSpec
+from cayu.context.base import ContextPolicy
+from cayu.environments.admission import ExecutionEnvironmentAuthority, ExecutionRequirements
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import BoundWorkspace
+from cayu.environments.factory import EnvironmentFactory, EnvironmentFactoryResult
+from cayu.observability.hooks import RuntimeHook
+from cayu.providers.base import ModelProvider, UsageDialect
+from cayu.providers.hosted import OpenAIWebSearch
+from cayu.runners.base import RunnerExecutionAdmissionObserver
+from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
+from cayu.runtime._environment_exposure import _EnvironmentExposure
+from cayu.runtime._policy_evidence import ToolPolicyEvidence
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools.base import (
     DurableToolRecovery,
     Tool,
     ToolEffect,
     ToolExecutionRequirement,
     ToolResult,
 )
-from cayu.environments import (
-    BoundWorkspace,
-    Environment,
-    EnvironmentFactory,
-    EnvironmentFactoryResult,
-    EnvironmentSpec,
-    ExecutionEnvironmentAuthority,
-    ExecutionRequirements,
-)
-from cayu.providers import ModelProvider, UsageDialect
-from cayu.providers.hosted import OpenAIWebSearch
-from cayu.runners.base import RunnerExecutionAdmissionObserver
-from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
-from cayu.runtime._environment_exposure import _EnvironmentExposure
-from cayu.runtime._policy_evidence import ToolPolicyEvidence
-from cayu.runtime.context import ContextPolicy
-from cayu.runtime.hooks import RuntimeHook
-from cayu.runtime.targeted_tool_projection import TargetedToolMode
-from cayu.runtime.tool_discovery import ToolDiscoveryMode
-from cayu.runtime.tool_grants import (
+from cayu.tools.discovery import ToolDiscoveryMode
+from cayu.tools.grants import (
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     RejectedTargetedToolInvocation,
     ResolvedTargetedToolInvocation,
     validate_targeted_tool_digest,
 )
-from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
+from cayu.tools.policy import ToolPolicy, ToolPolicyResult
+from cayu.tools.targeted_projection import TargetedToolMode
 
 if TYPE_CHECKING:
-    from cayu.mcp import McpToolset
+    from cayu.mcp.tools import McpToolset
     from cayu.runtime._tool_effect_reconciliation import RegisteredToolEffectReconciler
-    from cayu.runtime.child_session_context import ChildSessionContextContributor
     from cayu.runtime.loop_policies import LoopPolicy
-    from cayu.runtime.tool_catalogue import ToolCatalogSnapshot
-    from cayu.runtime.tool_exposure import (
+    from cayu.sessions.child_context import ChildSessionContextContributor
+    from cayu.tools.catalogue import ToolCatalogSnapshot
+    from cayu.tools.exposure import (
         RegisteredToolCapability,
         ResolvedToolExposure,
         ToolExposurePolicy,

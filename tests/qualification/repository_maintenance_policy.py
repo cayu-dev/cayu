@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from cayu import ParameterRule
+from cayu.tools.policy import ParameterRule
 from tests.qualification.repository_maintenance_case import ALLOWED_CHANGE_PATHS
 
 

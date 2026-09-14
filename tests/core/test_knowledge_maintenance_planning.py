@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 import cayu
-from cayu.knowledge_maintenance import (
+from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRoutedCandidate,
     KnowledgeMaintenanceRouter,
@@ -18,7 +18,7 @@ from cayu.knowledge_maintenance import (
     KnowledgeMaintenanceSignalKind,
     _candidate_payload_bytes,
 )
-from cayu.knowledge_maintenance_planning import (
+from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenanceEvaluationFinding,
     KnowledgeMaintenanceEvaluationFindingCode,
     KnowledgeMaintenanceEvaluationFindingKind,

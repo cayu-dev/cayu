@@ -7,9 +7,11 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.core import Event, EventType, Message
-from cayu.runtime.costs import ModelPrice, PriceBook, estimate_causal_budget_cost
-from cayu.runtime.sessions import (
+from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_causal_budget_cost
+from cayu.budgets.usage import causal_budget_usage_summary, session_usage_summary
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
@@ -17,7 +19,6 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     UsageRollupQuery,
 )
-from cayu.runtime.usage import causal_budget_usage_summary, session_usage_summary
 from cayu.storage import SQLiteSessionStore
 
 
@@ -263,7 +264,9 @@ def test_usage_read_has_fixed_working_set_for_one_hundred_thousand_events(monkey
     import gc
     import tracemalloc
 
-    from cayu.runtime import BudgetLimit, CayuApp, RunLimits
+    from cayu.applications import CayuApp
+    from cayu.budgets.base import BudgetLimit
+    from cayu.runtime.stop_policy import RunLimits
 
     async def run():
         store = InMemorySessionStore()
@@ -531,7 +534,8 @@ def test_notification_existence_keeps_scope_window_and_exact_identity_without_hy
 def test_run_limits_merge_inflight_usage_at_the_snapshot_boundary_without_history(monkeypatch):
     import time
 
-    from cayu.runtime import CayuApp, RunLimits
+    from cayu.applications import CayuApp
+    from cayu.runtime.stop_policy import RunLimits
 
     async def run():
         store = InMemorySessionStore()

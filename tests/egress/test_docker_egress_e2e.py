@@ -143,9 +143,9 @@ def test_shared_real_boundary_security_contract(
 
 
 async def _drive_factory() -> dict[str, object]:
-    from cayu.core.events import Event, EventType
+    from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
     from cayu.environments import EnvironmentFactoryRequest
-    from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+    from cayu.events import Event, EventType
 
     events: list[Event] = []
     authorized_seen = asyncio.Event()
@@ -224,9 +224,9 @@ def test_factory_emits_audit_events_without_secret(factory_results: dict[str, ob
 
 
 async def _drive_credentialless_factory() -> dict[str, object]:
-    from cayu.core.events import Event, EventType
+    from cayu.egress.runtime import VirtualEgressEnvironmentFactory
     from cayu.environments import EnvironmentFactoryRequest
-    from cayu.runtime.egress import VirtualEgressEnvironmentFactory
+    from cayu.events import Event, EventType
 
     endpoint_requests: list[dict[str, str]] = []
 

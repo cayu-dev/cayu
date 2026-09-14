@@ -9,14 +9,10 @@ from typing import Any
 import pytest
 from tests.environments.test_docker_coding import _completed_admission_probe_result
 
-from cayu import (
-    DockerImageIdentity,
-    DockerWorkloadRestrictions,
-    ImmutableInputStore,
-    inspect_local_immutable_input,
-)
+from cayu.immutable_inputs import ImmutableInputStore, inspect_local_immutable_input
 from cayu.runners.base import ExecResult
 from cayu.runners.docker import DockerRunner, DockerRuntimeConfigurationError
+from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 
 _IMAGE_REFERENCE = "cayu/immutable-input-test@sha256:" + ("c" * 64)
 _IMAGE_ID = "sha256:" + ("b" * 64)

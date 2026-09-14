@@ -12,26 +12,25 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
-    AgentSpec,
-    ApplyPatchTool,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.usage import session_usage_summary
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.evals.evidence import project_assertion_evidence_view
 from cayu.evals.models import Trajectory
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.usage import session_usage_summary
-from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+from cayu.sessions.base import RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.patches import ApplyPatchTool
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.local import LocalWorkspace
 
 
 @pytest.mark.parametrize(

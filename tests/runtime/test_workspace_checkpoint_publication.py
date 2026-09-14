@@ -11,12 +11,15 @@ from tests.core.test_workspace_mutation_receipts import (
     collect_events,
 )
 
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.artifacts import LocalArtifactStore
-from cayu.core import AgentSpec, EventType, Message
 from cayu.environments import Environment
-from cayu.runtime import CayuApp, EventQuery, InMemorySessionStore, RunRequest
-from cayu.runtime.workspace_checkpoints import WORKSPACE_CHECKPOINTS_KEY
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
 from cayu.workspaces import LocalWorkspace
+from cayu.workspaces.checkpoint_lifecycle import WORKSPACE_CHECKPOINTS_KEY
 from cayu.workspaces.checkpoints import WorkspaceCheckpointPolicy
 
 
@@ -110,12 +113,12 @@ def _registered_checkpoint_environment(tmp_path, generation="first"):
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_unknown_mutation_blocks_fresh_environment_and_cas_rejects_stale_epoch(tmp_path, backend):
-    from cayu.runtime.sessions import SessionIdentity
-    from cayu.runtime.workspace_checkpoints import (
+    from cayu.sessions.base import SessionIdentity
+    from cayu.storage.sqlite import SQLiteSessionStore
+    from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
         ensure_workspace_checkpoint,
     )
-    from cayu.storage.sqlite import SQLiteSessionStore
     from cayu.workspaces.checkpoints import WorkspaceCheckpointError
 
     async def run():
@@ -151,8 +154,8 @@ def test_unknown_mutation_blocks_fresh_environment_and_cas_rejects_stale_epoch(t
 
 
 def test_live_drift_is_not_silently_rolled_back_and_fresh_restore_is_verified(tmp_path):
-    from cayu.runtime.sessions import SessionIdentity
-    from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
+    from cayu.sessions.base import SessionIdentity
+    from cayu.workspaces.checkpoint_lifecycle import ensure_workspace_checkpoint
     from cayu.workspaces.checkpoints import WorkspaceCheckpointError
 
     async def run():
@@ -178,8 +181,8 @@ def test_live_drift_is_not_silently_rolled_back_and_fresh_restore_is_verified(tm
 
 
 def test_checkpoint_timeout_retains_environment_until_write_settles(tmp_path):
-    from cayu.runtime.sessions import SessionIdentity
-    from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
+    from cayu.sessions.base import SessionIdentity
+    from cayu.workspaces.checkpoint_lifecycle import ensure_workspace_checkpoint
     from cayu.workspaces.checkpoints import WorkspaceCheckpointError
 
     async def run():
@@ -211,11 +214,11 @@ def test_checkpoint_timeout_retains_environment_until_write_settles(tmp_path):
 
 def test_checkpoint_authority_is_not_imported_from_old_schema_or_generic_writes():
     from cayu.runtime._session_engine import _replace_checkpoint_preserving_runtime_state
-    from cayu.runtime.checkpoints import decode_runtime_checkpoint, runtime_checkpoint_writer_view
+    from cayu.sessions.checkpoints import decode_runtime_checkpoint, runtime_checkpoint_writer_view
 
     old = {"schema_version": 7, "workspace_checkpoints": {"forged": {}}}
     # Use the actual root schema key; caller-looking data from an older writer is dropped.
-    from cayu.runtime.checkpoints import (
+    from cayu.sessions.checkpoints import (
         CHECKPOINT_SCHEMA_VERSION_KEY,
         CURRENT_CHECKPOINT_SCHEMA_VERSION,
     )
@@ -237,14 +240,14 @@ def test_checkpoint_authority_is_not_imported_from_old_schema_or_generic_writes(
 def test_postgres_checkpoint_publication_recovers_and_rejects_stale_owner(tmp_path, postgres_dsn):
     from uuid import uuid4
 
-    from cayu.runtime.sessions import SessionIdentity
-    from cayu.runtime.workspace_checkpoints import (
+    from cayu.sessions.base import SessionIdentity
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
         complete_workspace_checkpoint_mutation,
         ensure_workspace_checkpoint,
     )
-    from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresSessionStore
 
     async def run():
         store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
@@ -283,8 +286,8 @@ def test_postgres_checkpoint_publication_recovers_and_rejects_stale_owner(tmp_pa
 
 
 def test_reacquired_exclusive_lease_can_mutate_the_verified_revision(tmp_path):
-    from cayu.runtime.sessions import SessionIdentity
-    from cayu.runtime.workspace_checkpoints import (
+    from cayu.sessions.base import SessionIdentity
+    from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
         complete_workspace_checkpoint_mutation,
         ensure_workspace_checkpoint,
@@ -323,8 +326,8 @@ def test_reacquired_exclusive_lease_can_mutate_the_verified_revision(tmp_path):
 
 
 def test_durable_directory_replacement_recovers_into_seeded_binding(tmp_path):
-    from cayu.runtime.sessions import SessionIdentity
-    from cayu.runtime.workspace_checkpoints import (
+    from cayu.sessions.base import SessionIdentity
+    from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
         complete_workspace_checkpoint_mutation,
         ensure_workspace_checkpoint,

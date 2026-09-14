@@ -38,12 +38,12 @@ from cayu import (
     TaskStatus,
     WorkCompletionConflict,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     SessionStore,
     fork_session_invocation,
     run_request_with_task_invocation,
 )
-from cayu.runtime.tasks import TaskStore
+from cayu.tasks.base import TaskStore
 
 
 @dataclass(frozen=True)

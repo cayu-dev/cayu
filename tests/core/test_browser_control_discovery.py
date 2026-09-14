@@ -10,7 +10,7 @@ from tests.core.test_browser_control_publisher import publication_fixture
 from cayu.runtime._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.runtime._browser_control_publication import BrowserControlPublication
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,
     BrowserControlRecord,

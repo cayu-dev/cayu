@@ -7,21 +7,15 @@ import pytest
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository
 
-from cayu import (
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    DockerImageIdentity,
-    InMemoryBudgetLedger,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-    ModelPrice,
-    PriceBook,
-)
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
+from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.cli.project import project_context
 from cayu.cli.scaffold import project_files
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import InMemorySessionStore
+from cayu.storage.memory import InMemoryKnowledgeStore
+from cayu.tasks.base import InMemoryTaskStore
 
 
 def denial_policy():

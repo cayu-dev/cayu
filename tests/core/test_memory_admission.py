@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.memory import (
+from cayu.memory.base import (
     AutomaticRecallContributor,
     AutomaticRecallMode,
     AutomaticRecallPolicy,
@@ -24,7 +24,7 @@ from cayu.memory import (
     RecallOffer,
     admit_recall,
 )
-from cayu.recall import (
+from cayu.memory.recall import (
     RECALL_ENGINE_VERSION,
     RecallCandidate,
     RecallEngine,
@@ -34,7 +34,7 @@ from cayu.recall import (
     RecallSourceDiagnostic,
     RecallSourceStatus,
 )
-from cayu.retrieval import (
+from cayu.memory.retrieval import (
     FusedChannelMatch,
     FusedRetrievalCandidate,
     RetrievalCandidateIdentity,

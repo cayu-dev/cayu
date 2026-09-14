@@ -14,15 +14,18 @@ from pathlib import Path
 import pytest
 from tests.core.test_agent_bundles import _portable_fixture
 
-import cayu.agent_bundle_containers as container_module
-from cayu.agent_bundle_containers import (
-    AGENT_BUNDLE_CONTAINER_MEDIA_TYPE,
-    AGENT_BUNDLE_CONTAINER_MIMETYPE_ENTRY,
-    inspect_agent_bundle_container,
-    pack_agent_bundle,
-    unpack_agent_bundle_container,
+import cayu.snapshots.containers as container_module
+from cayu.snapshots.base import (
+    AgentSnapshotAccess,
+    AgentSnapshotCaptureRequest,
+    AgentSnapshotComponentSelector,
+    AgentSnapshotCoordinator,
+    AgentSnapshotGCRequest,
+    AgentSnapshotProtection,
+    InMemoryAgentSnapshotStore,
+    SQLiteAgentSnapshotStore,
 )
-from cayu.agent_bundles import (
+from cayu.snapshots.bundles import (
     AGENT_BUNDLE_INDEX_FILENAME,
     AgentBundle,
     AgentBundleCoordinator,
@@ -34,15 +37,12 @@ from cayu.agent_bundles import (
     FileSystemAgentSnapshotObjectStore,
     _canonical_json,
 )
-from cayu.agent_snapshots import (
-    AgentSnapshotAccess,
-    AgentSnapshotCaptureRequest,
-    AgentSnapshotComponentSelector,
-    AgentSnapshotCoordinator,
-    AgentSnapshotGCRequest,
-    AgentSnapshotProtection,
-    InMemoryAgentSnapshotStore,
-    SQLiteAgentSnapshotStore,
+from cayu.snapshots.containers import (
+    AGENT_BUNDLE_CONTAINER_MEDIA_TYPE,
+    AGENT_BUNDLE_CONTAINER_MIMETYPE_ENTRY,
+    inspect_agent_bundle_container,
+    pack_agent_bundle,
+    unpack_agent_bundle_container,
 )
 
 
@@ -1409,7 +1409,7 @@ def test_container_publication_failure_leaves_no_final_file_and_retains_protecti
             raise RuntimeError("simulated final publication failure")
 
         monkeypatch.setattr(
-            "cayu.agent_bundle_containers._publish_file",
+            "cayu.snapshots.containers._publish_file",
             fail_publication,
         )
         with pytest.raises(RuntimeError, match="simulated final publication failure"):
@@ -1446,7 +1446,7 @@ def test_cancelled_container_export_retains_protection_without_a_partial_final_f
         def cancel_pack(*_args, **_kwargs):
             raise asyncio.CancelledError
 
-        monkeypatch.setattr("cayu.agent_bundle_containers.pack_agent_bundle", cancel_pack)
+        monkeypatch.setattr("cayu.snapshots.containers.pack_agent_bundle", cancel_pack)
         with pytest.raises(asyncio.CancelledError):
             await coordinator.export_container(
                 operation_id="cancelled-container-export",

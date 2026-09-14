@@ -8,34 +8,32 @@ from itertools import product
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import SyncBinding
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
-    EventType,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._environment_exposure import require_environment_exposed
+from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
     RunRequest,
-    ScriptedModelProvider,
+    SessionRunFenced,
     SessionStatus,
-    SQLiteSessionStore,
-    SyncBinding,
-    Tool,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolSpec,
 )
-from cayu.environments._finalization_disposal import checkpoint_finalization_disposal
-from cayu.runtime._environment_exposure import require_environment_exposed
-from cayu.runtime.sessions import SessionRunFenced
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
+from cayu.workspaces.local import LocalWorkspace
 
 
 @pytest.mark.parametrize(

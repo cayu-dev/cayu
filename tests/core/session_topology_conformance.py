@@ -3,11 +3,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import Event, EventType, Message
-from cayu.runtime import RunRequest, SessionIdentity, SessionStore
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
     SESSION_LINEAGE_MAX_CHILD_LIMIT,
+    RunRequest,
+    SessionIdentity,
     SessionLineageQuery,
+    SessionStore,
     SessionTopologyQuery,
     decode_session_lineage_cursor,
     decode_session_topology_cursor,

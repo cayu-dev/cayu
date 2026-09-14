@@ -14,6 +14,7 @@ from cayu.egress import (
     HttpEgressPolicy,
     SandboxEgressAdapter,
 )
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.environments import (
     DeterministicWorkspaceBinding,
     EnvironmentFactoryOperation,
@@ -28,7 +29,6 @@ from cayu.runners import (
     MicrosandboxWorkspaceCapability,
     Runner,
 )
-from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.vaults import SecretRef, StaticVault
 from cayu.workspaces import (
     E2BWorkspace,

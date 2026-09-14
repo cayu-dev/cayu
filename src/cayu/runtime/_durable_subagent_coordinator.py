@@ -8,8 +8,7 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_metadata, copy_json_value
-from cayu.core.events import Event
-from cayu.core.tools import ToolContext, ToolResult, _runtime_tool_invocation_authority
+from cayu.events import Event
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
@@ -44,27 +43,12 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_rejection_receipt_matches_seed,
 )
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
-from cayu.runtime.dispatch import (
-    DispatchHandle,
-    DispatchStatus,
-    TaskStoreDispatcher,
-    _new_prepared_subagent_dispatch_envelope,
-    _PreparedSubagentAlreadyAdmitted,
-    _QueuedDispatchAuthorityRejected,
-    _QueuedDispatchEnvelope,
-    _QueuedDispatchSettlement,
-)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.invocation import (
-    SessionExecutionSource,
-    SessionInvocationBinding,
-    inherited_session_invocation,
-)
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     InterruptSessionRequest,
     QueuedDispatchTerminalReceipt,
     RunRequest,
@@ -81,14 +65,30 @@ from cayu.runtime.sessions import (
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
 )
-from cayu.runtime.tasks import TaskStatus, TaskStore
-from cayu.runtime.tool_discovery import (
+from cayu.sessions.invocation import (
+    SessionExecutionSource,
+    SessionInvocationBinding,
+    inherited_session_invocation,
+)
+from cayu.tasks.base import TaskStatus, TaskStore
+from cayu.tasks.dispatch import (
+    DispatchHandle,
+    DispatchStatus,
+    TaskStoreDispatcher,
+    _new_prepared_subagent_dispatch_envelope,
+    _PreparedSubagentAlreadyAdmitted,
+    _QueuedDispatchAuthorityRejected,
+    _QueuedDispatchEnvelope,
+    _QueuedDispatchSettlement,
+)
+from cayu.tools.base import ToolContext, ToolResult, _runtime_tool_invocation_authority
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     current_tool_discovery_view,
     initial_tool_discovery_operation_records,
     tool_discovery_generation_id,
 )
-from cayu.runtime.tool_exposure import (
+from cayu.tools.exposure import (
     resolve_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
 )

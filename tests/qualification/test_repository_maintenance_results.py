@@ -6,7 +6,7 @@ import warnings
 
 import pytest
 
-from cayu import TaskQuery
+from cayu.tasks.base import TaskQuery
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.qualification.test_repository_maintenance_application import project as project
 from tests.qualification.test_repository_maintenance_request import consumer as consumer

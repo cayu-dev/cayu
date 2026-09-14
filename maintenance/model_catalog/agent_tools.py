@@ -18,8 +18,8 @@ from uuid import uuid4
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from cayu.artifacts.attachments import file_attachment
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.runners.base import ExecCommand
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from maintenance.model_catalog import browser, search
 from maintenance.model_catalog.security import (
     allowed_hosts,

@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from cayu.core.tools import ToolContext, ToolResult
+from cayu.tools.base import ToolContext, ToolResult
 from cayu.vaults import SecretRedactor
 
 _EMPTY_REDACTOR = SecretRedactor()

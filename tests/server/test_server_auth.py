@@ -17,21 +17,10 @@ pytest.importorskip("sse_starlette")
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InvocationOriginTrust,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeStatus,
-    SessionExecutionSource,
-)
-from cayu.core.events import Event, EventType
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.server import (
     AuthContext,
     AuthenticatedAccess,
@@ -45,7 +34,17 @@ from cayu.server import (
     mount_dashboard,
 )
 from cayu.server.auth import server_auth_dependency
-from cayu.vaults import SecretRedactor
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.storage.memory import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeStatus,
+)
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.vaults.redaction import SecretRedactor
 
 _TOKEN = "secret-token"
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
@@ -1138,8 +1137,8 @@ def test_authenticated_run_rejects_identity_that_cannot_be_persisted() -> None:
 
 
 def _approval_capture_app() -> tuple[CayuApp, list]:
-    from cayu import Message, RunRequest
-    from cayu.runtime import SessionIdentity, SessionStatus
+    from cayu.messages import Message
+    from cayu.sessions.base import RunRequest, SessionIdentity, SessionStatus
 
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -1175,7 +1174,7 @@ def _approval_capture_app() -> tuple[CayuApp, list]:
 
 
 def test_authenticated_resolution_derives_resolved_by_from_auth_context() -> None:
-    from cayu import ResolutionActorSource
+    from cayu.approvals.tools import ResolutionActorSource
 
     app, captured = _approval_capture_app()
     client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
@@ -1252,7 +1251,8 @@ def test_authenticated_resolution_rejects_body_resolved_by() -> None:
 
 
 def _resume_capture_app() -> tuple[CayuApp, list]:
-    from cayu import Message, ResumeRequest, RunRequest, SessionIdentity, SessionStatus
+    from cayu.messages import Message
+    from cayu.sessions.base import ResumeRequest, RunRequest, SessionIdentity, SessionStatus
 
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -1288,7 +1288,7 @@ def _resume_capture_app() -> tuple[CayuApp, list]:
 
 
 def test_authenticated_profile_adoption_derives_actor_from_auth_context() -> None:
-    from cayu import ResolutionActorSource
+    from cayu.approvals.tools import ResolutionActorSource
 
     app, captured = _resume_capture_app()
     client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
@@ -1343,8 +1343,9 @@ def test_authenticated_profile_adoption_rejects_body_actor() -> None:
 def _interrupt_capture_app() -> tuple[CayuApp, list]:
     import asyncio
 
-    from cayu import Event, EventType, Message, RunRequest
-    from cayu.runtime import SessionIdentity
+    from cayu.events import Event, EventType
+    from cayu.messages import Message
+    from cayu.sessions.base import RunRequest, SessionIdentity
 
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -1377,7 +1378,7 @@ def _interrupt_capture_app() -> tuple[CayuApp, list]:
 
 
 def test_authenticated_interruption_derives_requested_by_from_auth_context() -> None:
-    from cayu import ResolutionActorSource
+    from cayu.approvals.tools import ResolutionActorSource
 
     app, captured = _interrupt_capture_app()
     client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))

@@ -7,14 +7,14 @@ from cayu.runtime._browser_control_model import (
     browser_model_control_epoch,
     validate_browser_model_publication,
 )
-from cayu.runtime.browser_control import (
+from cayu.sessions.base import Session
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlCheckpoint,
     BrowserControlConflict,
     BrowserControlRecord,
 )
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
-from cayu.runtime.sessions import Session
 
 
 @pytest.mark.parametrize("epoch", [None, True, 0, 2, 1])

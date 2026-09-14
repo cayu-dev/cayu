@@ -15,7 +15,7 @@ from cayu.runtime.session_steering import (
     StopAfterCurrentToolRoundRequest,
     copy_stop_after_current_tool_round_request,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     Session,
     SessionOperationPublication,
     SessionStatus,

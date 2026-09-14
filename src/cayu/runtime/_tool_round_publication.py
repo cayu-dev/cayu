@@ -28,7 +28,8 @@ from cayu._validation import (
     copy_durable_json_object,
     require_clean_nonblank,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.events import Event, EventType, copy_event
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
@@ -48,7 +49,7 @@ from cayu.runtime._tool_round_recovery import (
     pending_tool_round_identity,
     ready_assistant_publication_message,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     RUNTIME_PUBLICATION_MAX_TOOL_CALLS,
     RuntimePublicationRequest,
@@ -59,7 +60,6 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {

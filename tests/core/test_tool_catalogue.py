@@ -25,7 +25,7 @@ from cayu import (
 )
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime.execution_profiles import ExecutionProfileComponentClass
-from cayu.runtime.tool_catalogue import mcp_source_tool_fingerprint
+from cayu.tools.catalogue import mcp_source_tool_fingerprint
 
 
 def _descriptor(

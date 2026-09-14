@@ -1,5 +1,8 @@
 # Cayu
 
+[Find public concepts](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md) ·
+[Run the example](https://github.com/cayu-dev/cayu/blob/main/examples/public_concepts/README.md)
+
 Cayu is a production agent runtime for building and operating AI agents in
 Python.
 
@@ -103,7 +106,7 @@ CayuApp and project control-plane stores backed by the built-in SQLite and
 PostgreSQL implementations into diagnostic read-only validation without creating
 or migrating them. Session history is excluded unless you
 explicitly repeat `--session`. See
-[Diagnostic support bundles](https://github.com/cayu-tech/cayu/blob/main/docs/diagnostic-support-bundles.md)
+[Diagnostic support bundles](https://github.com/cayu-dev/cayu/blob/main/docs/diagnostic-support-bundles.md)
 for the contents, redaction boundary, hard limits, and exit codes.
 
 The scaffold is credential-free and includes:
@@ -295,7 +298,7 @@ references#domain-tool`, then use `cayu generate tool`. To add workspace tools
 and command execution, see
 [`examples/local_environment_runtime.py`](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py).
 For a finite application-owned command surface, use
-[`NamedCheck` and `RunCheckTool`](https://github.com/cayu-tech/cayu/blob/main/docs/named-checks.md)
+[`NamedCheck` and `RunCheckTool`](https://github.com/cayu-dev/cayu/blob/main/docs/named-checks.md)
 instead of exposing
 model-authored shell or argv.
 
@@ -601,14 +604,14 @@ Start with the document that matches the job:
 | Deliver an approved exact patch to a new remote Git branch | [Approved remote Git delivery](https://github.com/cayu-dev/cayu/blob/main/docs/remote-git-delivery.md) |
 | Create a bound GitHub PR and observe exact-head checks/reviews | [GitHub delivery](https://github.com/cayu-dev/cayu/blob/main/docs/github-delivery.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
-| Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-tech/cayu/blob/main/docs/process-isolated-tools.md) |
+| Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-dev/cayu/blob/main/docs/process-isolated-tools.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
 | Let an agent search and read bounded public web evidence | [Web fetch and hosted search](https://github.com/cayu-dev/cayu/blob/main/docs/web-fetch.md) |
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
-| Run a first Control Plane evaluation | `cayu guide evals-first` ([source](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-first.md)) |
-| Add rubric-based AI quality evaluation | `cayu guide evals-ai-quality` ([source](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-ai-quality.md)) |
-| Evaluate production sessions, scenarios, tools, and memory | `cayu guide evals-production` ([source](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-production.md)) |
-| Look up complete Evals contracts | [Evals reference](https://github.com/cayu-tech/cayu/blob/main/docs/evals.md) |
+| Run a first Control Plane evaluation | `cayu guide evals-first` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-first.md)) |
+| Add rubric-based AI quality evaluation | `cayu guide evals-ai-quality` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-ai-quality.md)) |
+| Evaluate production sessions, scenarios, tools, and memory | `cayu guide evals-production` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/evals-production.md)) |
+| Look up complete Evals contracts | [Evals reference](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
 | Understand knowledge authorization, retrieval fusion, and memory baselines | [Memory foundation contracts](https://github.com/cayu-dev/cayu/blob/main/docs/memory-foundation.md) |
 | Reproduce bounded stateful agent evaluations | [Portable agent snapshots](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md#portable-agent-snapshots) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |

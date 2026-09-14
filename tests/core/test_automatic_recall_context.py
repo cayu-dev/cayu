@@ -9,101 +9,19 @@ from typing import Any
 
 import pytest
 
-from cayu import (
-    BeforeStopContext,
-    BeforeStopDecision,
-    CayuApp,
-    CayuConfig,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    ForkSessionRequest,
-    IncompleteSessionRecoveryRequest,
-    LoopPolicy,
-    ModelStreamEvent,
-    ResumeRequest,
-    RunDefaults,
-    ScriptedModelProvider,
-    StructuredOutputSpec,
-)
 from cayu._exception_groups import iter_exception_tree
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.agents import AgentSpec
-from cayu.core.messages import (
-    FilePart,
-    Message,
-    MessageRole,
-    TextPart,
-    copy_message,
-    copy_message_part,
-)
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.embeddings import (
-    TextEmbedding,
-    TextEmbeddingProvider,
-    TextEmbeddingRequest,
-    TextEmbeddingResult,
-)
-from cayu.memory import (
-    AutomaticRecallPolicy,
-    MemoryDeltaPolicy,
-    MemoryDeltaRefreshDisposition,
-    MemoryDeltaRefreshOutcome,
-    MemoryDeltaTriggerKind,
-    MemoryReanchorRefreshDisposition,
-)
-from cayu.memory_evidence import (
-    ContextExposureEvidenceKind,
-    ContextExposureState,
-    RecallEvidenceQuery,
-)
-from cayu.providers import (
-    ModelContextOverflowError,
-    ModelProvider,
-    ModelProviderError,
-    ModelStreamDeadlineError,
-    ProviderOperationAdapter,
-    ProviderOperationConnection,
-    ProviderOperationMode,
-    ProviderOperationSnapshot,
-    ProviderOperationStartRequest,
-    ProviderOperationState,
-    ProviderOperationStatus,
-)
-from cayu.providers.base import ModelRequest
-from cayu.providers.deadlines import (
-    ProviderDeadlineKind,
-    ProviderStreamDeadlineEvidence,
-    ProviderStreamDeadlines,
-)
-from cayu.recall import (
-    KNOWLEDGE_LEXICAL_CHANNEL,
-    KNOWLEDGE_SEMANTIC_CHANNEL,
-    TRANSCRIPT_LEXICAL_CHANNEL,
-)
-from cayu.retrieval import (
-    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
-    WeightedReciprocalRankFusionConfig,
-)
-from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
-from cayu.runtime._memory_evidence import (
-    MemoryEvidenceItemReference,
-    MemoryEvidenceKey,
-    _request_includes_exact_memory_manifests,
-    memory_evidence_key,
-    memory_evidence_key_scope,
-    recall_receipt_document_sha256,
-    recall_receipt_manifest_binding_hmac_sha256,
-    recover_context_exposure,
-)
-from cayu.runtime.budgets import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
     InMemoryBudgetLedger,
 )
-from cayu.runtime.context import (
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import (
     CheckpointCompactionContextPolicy,
     ContextBuildError,
     ContextBuildResult,
@@ -116,9 +34,27 @@ from cayu.runtime.context import (
     TranscriptDigestCompactor,
     _context_secret_redactor_scope,
 )
-from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.memory_context import (
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.memory.base import (
+    AutomaticRecallPolicy,
+    MemoryDeltaPolicy,
+    MemoryDeltaRefreshDisposition,
+    MemoryDeltaRefreshOutcome,
+    MemoryDeltaTriggerKind,
+    MemoryReanchorRefreshDisposition,
+)
+from cayu.memory.context import (
     _AUTOMATIC_RECALL_NOTICE,
     AutomaticRecallContextPolicy,
     AutomaticRecallSourceConfig,
@@ -126,10 +62,72 @@ from cayu.runtime.memory_context import (
     _redacted_locator_json,
     _render_projection,
 )
-from cayu.runtime.request_footprints import RequestFootprintConfig
+from cayu.memory.evidence import (
+    ContextExposureEvidenceKind,
+    ContextExposureState,
+    RecallEvidenceQuery,
+)
+from cayu.memory.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    TRANSCRIPT_LEXICAL_CHANNEL,
+)
+from cayu.memory.retrieval import (
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    WeightedReciprocalRankFusionConfig,
+)
+from cayu.messages import (
+    FilePart,
+    Message,
+    MessageRole,
+    TextPart,
+    copy_message,
+    copy_message_part,
+)
+from cayu.providers.base import (
+    ModelContextOverflowError,
+    ModelProvider,
+    ModelProviderError,
+    ModelRequest,
+    ModelStreamDeadlineError,
+    ModelStreamEvent,
+)
+from cayu.providers.deadlines import (
+    ProviderDeadlineKind,
+    ProviderStreamDeadlineEvidence,
+    ProviderStreamDeadlines,
+)
+from cayu.providers.operations import (
+    ProviderOperationAdapter,
+    ProviderOperationConnection,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
+    ProviderOperationStatus,
+)
+from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
+from cayu.runtime._memory_evidence import (
+    MemoryEvidenceItemReference,
+    MemoryEvidenceKey,
+    _request_includes_exact_memory_manifests,
+    memory_evidence_key,
+    memory_evidence_key_scope,
+    recall_receipt_document_sha256,
+    recall_receipt_manifest_binding_hmac_sha256,
+    recover_context_exposure,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.sessions.base import (
+    ForkSessionRequest,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+)
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import (
     InMemoryEmbeddingKnowledgeStore,
@@ -144,7 +142,8 @@ from cayu.storage.memory import (
     KnowledgeStore,
     knowledge_chunk_embedding_identity,
 )
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class _CountingKnowledgeStore(InMemoryKnowledgeStore):

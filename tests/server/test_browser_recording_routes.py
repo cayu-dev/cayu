@@ -62,7 +62,7 @@ def test_recording_playback_and_download_have_distinct_permissions(tmp_path):
 def test_recording_capability_matches_server_wiring(tmp_path):
     from fastapi.testclient import TestClient
 
-    from cayu import CayuApp
+    from cayu.applications import CayuApp
     from cayu.server import ServerConfig, create_server
 
     async def deny(principal, manifest, purpose):

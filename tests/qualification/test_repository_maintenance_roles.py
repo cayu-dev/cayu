@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import CayuApp, InMemoryTaskStore, TaskCreate, TaskStatus, complete_managed_task
+from cayu.applications import CayuApp
 from cayu.cli.project import project_context
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tasks.worker import complete_managed_task
 from tests.cli.test_worker import _running_worker, _wait_for_worker_start
 from tests.qualification.test_repository_maintenance_application import project as project
 

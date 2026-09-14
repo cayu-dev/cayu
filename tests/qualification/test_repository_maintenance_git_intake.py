@@ -7,13 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import (
-    RemoteGitDeliveryRequest,
-    RemoteGitSourceAuthority,
-    TaskQuery,
-    TaskStatus,
-    run_task_worker,
-)
+from cayu.delivery.git import RemoteGitDeliveryRequest, RemoteGitSourceAuthority
+from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
 from tests.qualification.test_repository_maintenance_delivery_configuration import authority
 from tests.qualification.test_repository_maintenance_git_configuration import arguments
 from tests.qualification.test_repository_maintenance_intake import intake as intake

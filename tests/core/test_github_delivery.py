@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from cayu.artifacts import ArtifactReadResult, LocalArtifactStore
-from cayu.github_delivery import (
+from cayu.delivery.github import (
     GitHubCheckBundle,
     GitHubCheckObservation,
     GitHubCheckPolicy,
@@ -131,6 +131,16 @@ def _request(
         ),
         limits=GitHubDeliveryLimits(max_polls=3, max_elapsed_seconds=7200),
     )
+
+
+def test_request_retains_serialized_schema_identifier():
+    request = _request()
+    payload = request.model_dump(mode="json")
+    assert payload["schema_version"] == "cayu.github_delivery.v1"
+    payload["schema_version"] = "cayu.github_delivery.v1"
+    restored = GitHubPullRequestDeliveryRequest.model_validate_json(json.dumps(payload))
+    assert restored == request
+    assert restored.fingerprint == request.fingerprint
 
 
 def _pr(request, *, number=7, state="open", head_commit=None, labels=()):
@@ -1692,7 +1702,7 @@ def test_rest_transport_never_forwards_credentials_across_redirects(tmp_path):
 def test_rest_cleanup_preserves_active_signal(
     tmp_path, monkeypatch, caplog, capsys, termination, client_failure
 ):
-    import cayu.github_delivery as module
+    import cayu.delivery.github as module
 
     secret = "github-cleanup-signal-secret"
     request = _request()

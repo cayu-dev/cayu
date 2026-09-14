@@ -8,46 +8,50 @@ from decimal import Decimal
 
 import pytest
 
-from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.core.billing import BillingIdentity, PricingContext
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import (
+    MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
+    PUBLICATION_FALLBACK_BUDGET_REASON,
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
     BudgetWindow,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    IncompleteSessionRecoveryRequest,
     InMemoryBudgetLedger,
-    InMemorySessionStore,
-    ModelCompactor,
-    ModelCompletionStageDisposition,
-    RecoveryPlanAction,
-    RecoveryPlanRequest,
-    RecoveryPlanSelection,
-    RecoveryRegistrationStatus,
-    RunRequest,
-)
-from cayu.runtime._event_projection import public_event_sequence
-from cayu.runtime.budgets import (
-    MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
-    PUBLICATION_FALLBACK_BUDGET_REASON,
     budget_reservation_payload,
 )
-from cayu.runtime.costs import (
+from cayu.budgets.billing import BillingIdentity, PricingContext
+from cayu.budgets.pricing import (
     ContextualPricingRequirement,
     ModelPrice,
     PriceBook,
     Provenance,
 )
+from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime._event_projection import public_event_sequence
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.execution_units import ModelAttemptIdentity
-from cayu.runtime.sessions import EventQuery
-from cayu.runtime.work_contracts import TaskCompletionDecisionRequired
+from cayu.sessions.base import (
+    EventQuery,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    ModelCompletionStageDisposition,
+    RunRequest,
+)
+from cayu.sessions.recovery import (
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
+    RecoveryRegistrationStatus,
+)
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tasks.contracts import TaskCompletionDecisionRequired
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class _MutableClock:

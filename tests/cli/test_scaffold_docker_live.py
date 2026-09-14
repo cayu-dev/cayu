@@ -20,20 +20,18 @@ from typing import NoReturn
 import pytest
 from packaging.requirements import Requirement
 
-from cayu import (
-    DockerCodingEnvironmentFactory,
-    EnvironmentFactoryReleaseAction,
-    EnvironmentFactoryRequest,
-    ExecCommand,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    RunCheckTool,
-    ScriptedModelProvider,
-)
 from cayu.cli import main
 from cayu.cli.project import project_context
-from cayu.core.tools import ToolContext
-from cayu.tools import EditFileTool, GitChangesTool, WriteFileTool
+from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
+from cayu.environments.factory import EnvironmentFactoryReleaseAction, EnvironmentFactoryRequest
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.runners.base import ExecCommand
+from cayu.sessions.base import InMemorySessionStore
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tools.base import ToolContext
+from cayu.tools.files import EditFileTool, WriteFileTool
+from cayu.tools.git import GitChangesTool
+from cayu.tools.named_checks import RunCheckTool
 
 _WHEEL_ENV = "CAYU_DOCKER_GENERATED_CODING_WHEEL"
 _REQUIRE_ENV = "CAYU_REQUIRE_GENERATED_DOCKER_CODING"

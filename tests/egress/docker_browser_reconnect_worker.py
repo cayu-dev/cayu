@@ -22,12 +22,12 @@ from cayu import (
     ToolResultPart,
     UserInputResponse,
 )
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.egress import CapturedResponse, EgressUpstreamOperation, HttpEgressPolicy
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.user_input import UserInputTool
 
 

@@ -8,7 +8,9 @@ from hashlib import sha256
 
 import pytest
 
-from cayu import ExecResult, LocalArtifactStore, RunCheckTool
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.runners.base import ExecResult
+from cayu.tools.named_checks import RunCheckTool
 from tests.core.test_named_checks import RecordingRunner, _policy, _run
 from tests.qualification.repository_maintenance_case import (
     EXPECTED_RESPONSES,

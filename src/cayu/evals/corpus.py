@@ -39,6 +39,7 @@ from cayu._validation import (
     require_durable_nonblank,
     require_durable_text,
 )
+from cayu.budgets.pricing import PriceBook
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.external import OpaqueExternalCaseRefV1
 from cayu.evals.json_output import parse_json_output
@@ -49,11 +50,10 @@ from cayu.evals.models import (
     EvalRunContractV2,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
-from cayu.memory_attribution import (
+from cayu.memory.attribution import (
     MEMORY_ATTRIBUTION_DEFAULT_MAX_EXPOSURES,
     MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS,
 )
-from cayu.runtime.costs import PriceBook
 
 EVAL_CORPUS_SCHEMA_VERSION = 4
 EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION = 1

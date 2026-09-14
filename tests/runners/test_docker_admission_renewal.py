@@ -18,9 +18,11 @@ from tests.environments.test_docker_coding import (
 )
 
 import cayu.runners.docker as docker_module
-from cayu import DockerWorkloadRestrictions, ExecResult, ToolExecutableRequirement
 from cayu.environments.factory import environment_factory_cleanup_settlement_task
+from cayu.runners.base import ExecResult
 from cayu.runners.docker import DockerRunner, DockerRuntimeConfigurationError
+from cayu.runners.docker_workload import DockerWorkloadRestrictions
+from cayu.tools.base import ToolExecutableRequirement
 
 _PROBE_COMPLETION_TOKEN = re.compile(r"cayu-admission-probe-complete-[0-9a-f]{32}")
 
@@ -142,7 +144,7 @@ def test_probe_completion_survives_environment_redaction(monkeypatch, status, su
     ],
 )
 def test_probe_private_completion_rejects_invalid_frame(monkeypatch, fault):
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     token = "cayu-admission-probe-complete-" + "12" * 16
     frame = f"\n{token}:0\n"
@@ -576,10 +578,12 @@ def test_final_admission_probe_retains_guest_owner_and_fences_reconnect(
     reason="requires an explicitly selected local immutable Python Docker image",
 )
 def test_live_strict_container_renews_expired_admission():
-    from cayu import DockerCodingToolchainProfile, DockerImageIdentity, ExecCommand
     from cayu.environments.docker_toolchains import (
+        DockerCodingToolchainProfile,
         ensure_docker_coding_toolchain_runner_admission,
     )
+    from cayu.runners.base import ExecCommand
+    from cayu.runners.docker_workload import DockerImageIdentity
     from cayu.tools._runner import InvocationRunnerHandle
 
     image = os.environ["CAYU_DOCKER_ADMISSION_TEST_IMAGE"]
@@ -690,19 +694,16 @@ def test_live_admission_preserves_empty_environment():
     reason="requires an explicitly selected local immutable Python Docker image",
 )
 def test_live_native_admission_through_owned_container_wrapper():
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        Environment,
-        EnvironmentSpec,
-        EventType,
-        ExecCommandTool,
-        ExecutionRequirements,
-        Message,
-        ModelStreamEvent,
-        RunRequest,
-        ScriptedModelProvider,
-    )
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.environments.admission import ExecutionRequirements
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.events import EventType
+    from cayu.messages import Message
+    from cayu.providers.base import ModelStreamEvent
+    from cayu.sessions.base import RunRequest
+    from cayu.tools.commands import ExecCommandTool
 
     class OwnedContainerWrapper(DockerRunner):
         def __init__(self, owner):

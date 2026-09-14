@@ -12,7 +12,7 @@ from tests.core.test_browser_control import identity, operator_purpose
 
 from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
-from cayu.runtime.browser_control import BrowserControlAllocation
+from cayu.tools.browser_control import BrowserControlAllocation
 
 pytestmark = pytest.mark.usefixtures("simulated_tool_executables")
 
@@ -42,23 +42,20 @@ def _run_runtime_allocation(
     from tests.core.test_browser_control_authorization import Policy
     from tests.core.test_browser_session import _browser_profile_binding, _FakeBrowserBackend, _tool
 
-    from cayu import (
-        AgentSpec,
-        CayuApp,
-        Environment,
-        EnvironmentSpec,
-        LocalArtifactStore,
-        LocalRunner,
-        Message,
-        ModelStreamEvent,
-        RunRequest,
-        ScriptedModelProvider,
-        SQLiteSessionStore,
-        run_to_completion,
-    )
-    from cayu.core.tools import ToolContext
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.artifacts.local import LocalArtifactStore
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.messages import Message
+    from cayu.providers.base import ModelStreamEvent
+    from cayu.runners.local import LocalRunner
     from cayu.runtime._browser_control_service import BrowserControlService
-    from cayu.runtime.browser_control_config import BrowserControlConfig
+    from cayu.sessions.base import RunRequest
+    from cayu.sessions.outcomes import run_to_completion
+    from cayu.storage.sqlite import SQLiteSessionStore
+    from cayu.tools.base import ToolContext
+    from cayu.tools.browser_control_config import BrowserControlConfig
     from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
 
     owner = BrowserGuestBootstrap()
@@ -93,7 +90,7 @@ def _run_runtime_allocation(
         assert service is runtime.service
         assert type(backend) is _RunnerBrowserSessionBackend
         assert len(fake_backend.calls) == 1
-        from cayu.core.tools import _runtime_tool_invocation_authority
+        from cayu.tools.base import _runtime_tool_invocation_authority
         from cayu.tools.browser_session import _durable_browser_operation_key
 
         authority = _runtime_tool_invocation_authority(context)

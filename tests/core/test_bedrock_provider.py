@@ -31,7 +31,8 @@ from cayu import (
     StructuredOutputSpec,
     file_attachment,
 )
-from cayu.core.messages import FilePart, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.messages import FilePart, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
 from cayu.providers import (
     BedrockAPIError,
     BedrockContextOverflowError,
@@ -50,7 +51,6 @@ from cayu.providers.deadlines import (
     bind_provider_deadline_controller,
     reset_provider_deadline_controller,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
 
 class FakeBedrockClient:

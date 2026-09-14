@@ -17,17 +17,16 @@ from cayu._validation import (
     copy_session_metadata,
     extract_durable_value_error,
 )
-from cayu.core.agents import AgentSpec
-from cayu.core.messages import Message
-from cayu.core.workflows import WorkflowSpec
+from cayu.agents import AgentSpec
+from cayu.approvals.tools import ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
 from cayu.embeddings import TextEmbeddingResult, TextEmbeddingUsage
 from cayu.evals.models import EvalAssertionResult
 from cayu.evals.runner import EvalCase
+from cayu.messages import Message
 from cayu.proxies.base import ProxyAuthorizationResult
-from cayu.runtime.approvals import ToolApprovalRequest
-from cayu.runtime.dispatch import DispatchRequest
 from cayu.runtime.loop_policies import BeforeStopDecision
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
     InterruptSessionRequest,
@@ -35,13 +34,14 @@ from cayu.runtime.sessions import (
     RunRequest,
     replace_session_user_metadata,
 )
-from cayu.runtime.tasks import TaskCreate
-from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
-from cayu.runtime.user_input import UserInputResponse
 from cayu.storage.knowledge_indexer import KnowledgeIndexRequest
 from cayu.storage.memory import KnowledgeChunk, KnowledgeEntry
+from cayu.tasks.base import TaskCreate
+from cayu.tasks.dispatch import DispatchRequest
+from cayu.tools.rounds import ToolRoundRecoveryRequest
 from cayu.tools.subagents import SubagentSpec
 from cayu.vaults.base import ResolvedSecret, SecretEnv, SecretRef
+from cayu.workflows.base import WorkflowSpec
 
 
 def _metadata_bytes(size: int, *, character: str = "x") -> dict[str, Any]:
@@ -148,7 +148,7 @@ def test_index_request_metadata_limit_precedes_indexing(field) -> None:
 def test_complete_metadata_merge_counts_retained_runtime_authority() -> None:
     user = _metadata_bytes(DURABLE_METADATA_LIMITS.max_bytes)
     # Use a runtime-owned prefix, not a guessed absence of a user marker.
-    from cayu.runtime.sessions import SESSION_RUNTIME_METADATA_PREFIX
+    from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX
 
     key = SESSION_RUNTIME_METADATA_PREFIX + "limit_probe"
     merged = {**user, key: ""}
@@ -254,7 +254,7 @@ def test_runtime_metadata_helpers_recheck_complete_replacement(kind) -> None:
         execution_profile_metadata_after_adoption,
         execution_profile_session_metadata,
     )
-    from cayu.runtime.tool_exposure import (
+    from cayu.tools.exposure import (
         ToolCapabilityCeiling,
         session_metadata_with_tool_capability_ceiling,
     )

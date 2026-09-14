@@ -40,54 +40,31 @@ from tests.core.verified_worker_fixtures import (
     verified_worker_store_factory as verified_worker_store_factory,
 )
 
-from cayu import (
-    AgentSpec,
-    BudgetLimit,
-    BudgetPolicy,
-    CayuApp,
-    CompletionContinuationPolicy,
-    CompletionDecisionCreate,
-    CompletionProposalCreate,
-    CompletionRejectionAction,
-    CompletionVerdict,
-    CompletionVerificationClaimRequest,
-    CompletionVerifierExecutionError,
-    CompletionVerifierExecutionRequest,
-    EventType,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    ModelPrice,
-    PriceBook,
-    RunRequest,
-    SessionStatus,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    TaskClaimLost,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-    TaskStore,
-    WorkCompletionConflict,
-)
 from cayu._exception_groups import iter_exception_tree
-from cayu.core.events import Event
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.tools import Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, BudgetPolicy
+from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.deadlines import ExecutionDeadlineExceeded
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import (
-    ModelStreamEvent,
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.hooks import RuntimeHook
+from cayu.providers.base import ModelStreamEvent
+from cayu.providers.operations import (
     ProviderOperationConnection,
     ProviderOperationSnapshot,
     ProviderOperationStartIdempotencySupport,
     ProviderOperationStatus,
 )
-from cayu.runtime import EventQuery
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._recovery_coordinator import RecoveryCoordinator
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.hooks import RuntimeHook
+from cayu.runtime.completion_verifiers import (
+    CompletionVerifierExecutionError,
+    CompletionVerifierExecutionRequest,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
 from cayu.runtime.verified_task_worker import (
     VerifiedTaskHandler,
@@ -95,7 +72,9 @@ from cayu.runtime.verified_task_worker import (
     VerifiedTaskWorker,
     VerifiedTaskWorkerDraining,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionStatus
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.admission import (
     WorkAttemptAdmissionConflict,
     WorkAttemptExecutionClaimLost,
     WorkAttemptExecutionRequest,
@@ -104,7 +83,26 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
 )
-from cayu.vaults import SecretRef, StaticVault
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    TaskClaimLost,
+    TaskCreate,
+    TaskQuery,
+    TaskStatus,
+    TaskStore,
+)
+from cayu.tasks.contracts import (
+    CompletionContinuationPolicy,
+    CompletionDecisionCreate,
+    CompletionProposalCreate,
+    CompletionRejectionAction,
+    CompletionVerdict,
+    CompletionVerificationClaimRequest,
+    WorkCompletionConflict,
+)
+from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
+from cayu.vaults.base import SecretRef
+from cayu.vaults.static import StaticVault
 
 # Process-loss recovery includes schema validation, durable replay, cleanup,
 # verification and settlement. This is a harness deadlock guard, not a runtime
@@ -122,7 +120,7 @@ class _ContinueOnceVerifier(RecordingVerifier):
 def test_documented_reference_handler_completes_through_public_worker(backend, tmp_path):
     from examples.verified_task_handler import ReferencedResultHandler
 
-    from cayu import VerifiedTaskWorker as PublicWorker
+    from cayu.runtime.verified_task_worker import VerifiedTaskWorker as PublicWorker
 
     async def scenario():
         sessions = (
@@ -388,8 +386,9 @@ class _StaticHandler(VerifiedTaskHandler):
 def test_worker_fences_queued_steering_before_input_or_interaction_publication(
     backend, delivery_mode, entrance, verified_worker_store_factory, monkeypatch
 ):
-    from cayu import EnqueueSessionMessageRequest, SessionMessageQuery
-    from cayu.runtime.work_contracts import TaskCompletionDecisionRequired
+    from cayu.runtime.session_message_lifecycle import SessionMessageQuery
+    from cayu.sessions.base import EnqueueSessionMessageRequest
+    from cayu.tasks.contracts import TaskCompletionDecisionRequired
 
     async def scenario():
         sessions, tasks = verified_worker_store_factory()
@@ -549,7 +548,8 @@ def test_worker_fences_queued_steering_before_input_or_interaction_publication(
 def test_worker_retirement_restores_ordinary_queued_steering(
     backend, delivery_mode, verified_worker_store_factory, monkeypatch
 ):
-    from cayu import EnqueueSessionMessageRequest, ResumeRequest, SessionMessageQuery
+    from cayu.runtime.session_message_lifecycle import SessionMessageQuery
+    from cayu.sessions.base import EnqueueSessionMessageRequest, ResumeRequest
 
     async def scenario():
         sessions, tasks = verified_worker_store_factory()
@@ -648,7 +648,7 @@ def test_worker_retirement_restores_ordinary_queued_steering(
 def test_worker_preserves_human_input_pause_without_proposing_completion(
     backend, pause_kind, tmp_path, verified_worker_store_factory
 ):
-    from cayu import AlwaysRequireApprovalToolPolicy
+    from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
     from cayu.tools.user_input import UserInputTool
 
     class InputProvider(_RecordingProvider):
@@ -722,8 +722,7 @@ def test_worker_preserves_human_input_pause_without_proposing_completion(
 def test_worker_requires_structured_validation_before_proposal(
     backend, strategy, outcome, verified_worker_store_factory
 ):
-    from cayu import StructuredOutputSpec
-    from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+    from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 
     specification = StructuredOutputSpec(
         strategy=strategy,
@@ -1654,11 +1653,11 @@ def test_worker_recovers_recorded_background_operation_after_process_exit(
     retrieval_failure=False,
     cancel_retrieval=False,
 ):
-    from cayu import VerifiedTaskWorker as PublicWorker
     from cayu.runtime.provider_operations import (
         load_recoverable_provider_operation,
         load_recoverable_provider_operation_start,
     )
+    from cayu.runtime.verified_task_worker import VerifiedTaskWorker as PublicWorker
 
     repository = Path(__file__).resolve().parents[2]
     factory = verified_worker_store_factory
@@ -1965,7 +1964,7 @@ class _StructuredReplayProvider(_RecordingProvider):
     async def stream(self, request):
         self.requests.append(request)
         if self.outcome.startswith("tool_"):
-            from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+            from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
             yield ModelStreamEvent.tool_call(
                 id="structured-recovery-result",
@@ -1989,7 +1988,7 @@ class _StructuredReplayHandler(_StaticHandler):
         self.max_retries = max_retries
 
     async def prepare(self, context):
-        from cayu import StructuredOutputSpec
+        from cayu.context.structured_output import StructuredOutputSpec
 
         request = await super().prepare(context)
         return request.model_copy(
@@ -3126,7 +3125,7 @@ def test_worker_recovers_preparing_source_without_repeating_handler(
 def test_worker_recovers_expired_completed_execution_without_redispatch(
     backend, outcome, competition, tmp_path, verified_worker_store_factory
 ):
-    from cayu import AlwaysRequireApprovalToolPolicy
+    from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
     from cayu.tools.user_input import UserInputTool
 
     async def scenario():
@@ -3998,7 +3997,7 @@ def test_worker_run_claims_only_contract_queue_and_completes_lifecycle(
 def test_worker_repeated_gap_uses_semantic_identity_not_prose(
     backend, change, verified_worker_store_factory
 ):
-    from cayu import VerifiedTaskWorker as PublicWorker
+    from cayu.runtime.verified_task_worker import VerifiedTaskWorker as PublicWorker
 
     class ChangingGapVerifier(RecordingVerifier):
         async def verify(self, request):
@@ -4144,7 +4143,7 @@ def test_worker_rejects_partial_store_before_claim_or_callback(missing):
 def test_worker_preserves_priced_causal_budget_across_attempts(
     backend, restart, maximum, verified_worker_store_factory
 ):
-    from cayu import BudgetReservation
+    from cayu.budgets.base import BudgetReservation
 
     class PricedProvider(_RecordingProvider):
         async def stream(self, request):

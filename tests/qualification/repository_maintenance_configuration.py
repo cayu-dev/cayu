@@ -3,17 +3,19 @@
 import json
 import os
 
-from cayu import (
-    BudgetPolicy,
+from cayu.budgets.base import BudgetPolicy
+from cayu.delivery.git import (
+    RemoteGitCommitAuthority,
+    RemoteGitDeliveryLimits,
+    RemoteGitRepositoryAuthority,
+    RemoteGitSecurityAuthority,
+)
+from cayu.delivery.github import (
     GitHubCheckPolicy,
     GitHubDeliveryLimits,
     GitHubPullRequestMetadata,
     GitHubReviewPolicy,
     GitHubSecurityAuthority,
-    RemoteGitCommitAuthority,
-    RemoteGitDeliveryLimits,
-    RemoteGitRepositoryAuthority,
-    RemoteGitSecurityAuthority,
 )
 from cayu.server import ProductPrincipal
 from tests.qualification.repository_maintenance_auth import MaintenanceAccess

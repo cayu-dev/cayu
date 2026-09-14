@@ -8,15 +8,13 @@ from tests.docker_toolchain import docker_toolchain_profile
 from tests.environments.test_docker_coding import _CONTAINER_ID, _image_identity, _inspection
 from tests.runners.test_docker_admission_renewal import _completed_probe_result
 
-from cayu import (
-    DockerCodingEnvironmentFactory,
-    DockerWorkloadRestrictions,
-    EnvironmentFactoryReleaseAction,
-    EnvironmentFactoryRequest,
-)
-from cayu.runners import DockerRunner, ExecCommand, ExecResult
+from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
+from cayu.environments.factory import EnvironmentFactoryReleaseAction, EnvironmentFactoryRequest
 from cayu.runners._creation_cleanup import settle_creation_cleanup
-from cayu.workspaces import LocalWorkspace
+from cayu.runners.base import ExecCommand, ExecResult
+from cayu.runners.docker import DockerRunner
+from cayu.runners.docker_workload import DockerWorkloadRestrictions
+from cayu.workspaces.local import LocalWorkspace
 
 
 @pytest.mark.anyio

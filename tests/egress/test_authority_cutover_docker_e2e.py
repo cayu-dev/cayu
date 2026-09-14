@@ -23,7 +23,7 @@ from cayu import (
     Message,
     ResumeRequest,
 )
-from cayu.core.events import Event, EventType
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
@@ -31,16 +31,16 @@ from cayu.egress import (
     EgressUpstreamOperation,
     HttpEgressPolicy,
 )
-from cayu.environments import EnvironmentFactoryRequest
-from cayu.runners.base import ExecCommand
-from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
-from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
-from cayu.runtime.egress_authority_transitions import (
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.egress.transitions import (
     EgressAuthorityTransitionCoordinator,
     SessionCheckpointEgressAuthorityTransitionStore,
     authorized_egress_authority_transition,
     egress_authority_owner_fingerprint,
 )
+from cayu.environments import EnvironmentFactoryRequest
+from cayu.events import Event, EventType
+from cayu.runners.base import ExecCommand
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAuthorityDecision,
     ExecutionProfileDecision,
@@ -52,7 +52,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_egress_authority_change,
     execution_profile_with_egress_authority,
 )
-from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.vaults import SecretRef, StaticVault
 
 pytest.importorskip("cryptography")

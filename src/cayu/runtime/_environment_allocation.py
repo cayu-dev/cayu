@@ -18,7 +18,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu.environments import (
+from cayu.environments.factory import (
     EnvironmentAllocationContext,
     EnvironmentAllocationIntent,
     EnvironmentAllocationScope,
@@ -30,14 +30,14 @@ from cayu.runtime._diagnostics import (
     _attach_runtime_exception_payload,
     _runtime_exception_payload,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     CheckpointTransform,
     Session,
     SessionStore,
     _initial_transcript_pending_interaction_id,
     session_fork_profile_relationship,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY = "environment_factory_allocation_owner"

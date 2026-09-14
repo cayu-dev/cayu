@@ -23,8 +23,8 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
 )
-from cayu.core.tools import ToolContext
 from cayu.tools import ProcessCommandPolicy as ToolsProcessCommandPolicy
+from cayu.tools.base import ToolContext
 
 
 def _request(

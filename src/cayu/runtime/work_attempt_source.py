@@ -8,7 +8,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     WORK_CONTRACT_TASK_MAX_BYTES,
     WORK_CONTRACT_TASK_MAX_ITEMS,
     require_bounded_work_completion_document,

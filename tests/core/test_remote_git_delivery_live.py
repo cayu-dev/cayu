@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from tests.core.test_remote_git_delivery_recovery import _case
 
-from cayu.remote_git_delivery import (
+from cayu.delivery.git import (
     RemoteGitDeliveryBroker,
     RemoteGitDeliveryConflictError,
     RemoteGitHttpCredentials,

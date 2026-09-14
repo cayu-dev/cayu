@@ -29,8 +29,8 @@ import httpx
 
 from cayu._validation import require_clean_nonblank
 from cayu._version import package_version
-from cayu.core.billing import BillingIdentity
-from cayu.core.messages import Message
+from cayu.budgets.billing import BillingIdentity
+from cayu.messages import Message
 from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
@@ -87,7 +87,7 @@ from cayu.providers.openai import (
     openai_stream_events,
     preflight_openai_native_structured_output_schema,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 _AUTH_STORE_VERSION = 1
 _AUTH_PROVIDER_KEY = "openai_subscription"

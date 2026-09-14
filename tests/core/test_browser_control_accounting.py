@@ -12,8 +12,8 @@ from tests.core.test_browser_session import (
     _tool,
 )
 
-from cayu.core.tools import _RuntimeBrowserControlAdmission
 from cayu.tools import browser_session as browser_module
+from cayu.tools.base import _RuntimeBrowserControlAdmission
 from cayu.tools.browser_session import BrowserSessionTool
 
 

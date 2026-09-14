@@ -7,16 +7,16 @@ an image exists or that its admission probes have passed.
 from hashlib import sha256
 from typing import Literal
 
-from cayu import (
+from cayu.environments.docker_toolchains import (
     DockerCodingAdmissionProbe,
     DockerCodingCommandAuthority,
     DockerCodingDependencyInput,
     DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    ExecCommand,
-    ExecutionProfileBehaviorIdentity,
-    NamedCheck,
 )
+from cayu.runners.base import ExecCommand
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools.named_checks import NamedCheck
 from tests.qualification.repository_maintenance_case import SEED_FILES, corpus_fingerprint
 from tests.qualification.repository_maintenance_probe import (
     PROBE_MODEL_PREVIEW_BYTES,

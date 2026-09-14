@@ -16,7 +16,31 @@ import pytest
 from pydantic import ValidationError
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.agent_bundles import (
+from cayu.snapshots.base import (
+    AgentSnapshotAccess,
+    AgentSnapshotAuthorizationError,
+    AgentSnapshotCaptureRequest,
+    AgentSnapshotComponentKind,
+    AgentSnapshotComponentSelector,
+    AgentSnapshotCoordinator,
+    AgentSnapshotExecutionProfileComponent,
+    AgentSnapshotExecutionProfileRef,
+    AgentSnapshotLogicalRef,
+    AgentSnapshotMaterializationError,
+    AgentSnapshotMaterializationRequest,
+    AgentSnapshotPinRequest,
+    AgentSnapshotProtection,
+    AgentSnapshotResultBinding,
+    AgentSnapshotRetentionClass,
+    AgentSnapshotStoreConflict,
+    AgentSnapshotSubject,
+    AgentSnapshotTerminalDisposition,
+    AgentSnapshotTrialBinding,
+    AgentSnapshotTrialStateMode,
+    InMemoryAgentSnapshotStore,
+    SQLiteAgentSnapshotStore,
+)
+from cayu.snapshots.bundles import (
     AGENT_BUNDLE_INDEX_FILENAME,
     AGENT_BUNDLE_MAX_OBJECT_BYTES,
     AGENT_BUNDLE_OBJECT_DIRECTORY,
@@ -46,30 +70,6 @@ from cayu.agent_bundles import (
     agent_snapshot_component_package,
     load_portable_agent_snapshot_component_providers,
     store_agent_snapshot_component_package,
-)
-from cayu.agent_snapshots import (
-    AgentSnapshotAccess,
-    AgentSnapshotAuthorizationError,
-    AgentSnapshotCaptureRequest,
-    AgentSnapshotComponentKind,
-    AgentSnapshotComponentSelector,
-    AgentSnapshotCoordinator,
-    AgentSnapshotExecutionProfileComponent,
-    AgentSnapshotExecutionProfileRef,
-    AgentSnapshotLogicalRef,
-    AgentSnapshotMaterializationError,
-    AgentSnapshotMaterializationRequest,
-    AgentSnapshotPinRequest,
-    AgentSnapshotProtection,
-    AgentSnapshotResultBinding,
-    AgentSnapshotRetentionClass,
-    AgentSnapshotStoreConflict,
-    AgentSnapshotSubject,
-    AgentSnapshotTerminalDisposition,
-    AgentSnapshotTrialBinding,
-    AgentSnapshotTrialStateMode,
-    InMemoryAgentSnapshotStore,
-    SQLiteAgentSnapshotStore,
 )
 from cayu.vaults.redaction import SecretRedactor
 

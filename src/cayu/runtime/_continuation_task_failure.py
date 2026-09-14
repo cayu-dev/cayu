@@ -19,7 +19,7 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
-from cayu.runtime.tasks import (
+from cayu.tasks.base import (
     Task,
     TaskStatus,
     TaskStore,

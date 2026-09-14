@@ -8,23 +8,23 @@ import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
 from cayu import CayuConfig, ToolExecutionConfig
-from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.core.messages import ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
-    SessionStatus,
-)
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.sessions import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
+    SessionStatus,
 )
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 
 
 class _TwoCallProvider(ModelProvider):

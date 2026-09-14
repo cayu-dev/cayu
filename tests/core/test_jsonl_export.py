@@ -6,22 +6,17 @@ import json
 
 import pytest
 
-import cayu.runtime.sessions as sessions_module
+import cayu.sessions.base as sessions_module
 import cayu.storage.jsonl_export as jsonl_export_module
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     MIN_DURABLE_JSON_INTEGER,
     DurableValueError,
 )
-from cayu.core import Event, EventType, Message
-from cayu.runtime import (
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    RunRequest,
-    SessionIdentity,
-    TaskCreate,
-)
-from cayu.runtime.checkpoints import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
@@ -34,6 +29,7 @@ from cayu.storage.jsonl_export import (
     import_sessions,
     import_tasks,
 )
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
 
 
 def _identity() -> SessionIdentity:

@@ -7,36 +7,32 @@ import pytest
 from tests.core.test_foreground_subagent_recovery import _identity, _Provider
 from tests.core.test_tool_round_execution_identities import _RecordingTool
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._event_projection import public_event_id
+from cayu.runtime._invocation_lifecycle import (
+    InvocationLifecycleCommandConflict,
+    RebindInvocationCommand,
+)
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    Message,
-    PostgresSessionStore,
+    PersistedEventSideEffectStatus,
     RunRequest,
     SessionQuery,
-    SessionStatus,
-    SQLiteSessionStore,
-    SubagentSpec,
-    SubagentTool,
-    ToolApprovalDecision,
-)
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import (
-    IncompleteSessionRecoveryRequest,
-    InvocationLifecycleCommandConflict,
-    ToolApprovalRequest,
-    UserInputResponse,
-)
-from cayu.runtime._event_projection import public_event_id
-from cayu.runtime._invocation_lifecycle import RebindInvocationCommand
-from cayu.runtime.sessions import (
-    PersistedEventSideEffectStatus,
     SessionRuntimePublicationConflict,
+    SessionStatus,
     SessionStatusConflict,
 )
-from cayu.runtime.tool_policy import AlwaysRequireApprovalToolPolicy
 from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.tools.user_input import UserInputTool
 
 

@@ -52,51 +52,51 @@ from cayu._workspace_mutation import (
     workspace_mutation_task_settlement_probe,
 )
 from cayu.capabilities import CapabilityState
-from cayu.core.events import (
-    Event,
-    EventType,
-    copy_event,
-    event_with_runtime_envelope_authority,
-    event_with_runtime_generated_id,
-    event_with_runtime_payload_authority,
+from cayu.configuration import DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS
+from cayu.egress.transitions import (
+    _EGRESS_AUTHORITY_PARKED_OUTCOME,
+    EgressAuthorityAdoptionHandler,
+    _complete_egress_authority_allocation_parking,
+    _discard_egress_authority_allocation_parking_reservation,
+    _reserve_egress_authority_allocation_parking,
 )
-from cayu.environments import (
-    BoundWorkspace,
-    DockerCodingWorkspaceBinding,
-    Environment,
-    EnvironmentAllocationScope,
-    EnvironmentAllocationState,
-    EnvironmentFactoryOperation,
-    EnvironmentFactoryReleaseAction,
-    EnvironmentFactoryRequest,
-    EnvironmentFactoryResult,
+from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionAdmissionDecision,
     ExecutionAdmissionError,
     ExecutionCapabilityEvidence,
     ExecutionEnvironmentAuthority,
-    WorkspaceBinding,
-    WorkspaceInstructions,
-    WorkspaceSnapshot,
-    copy_environment,
-    copy_workspace_snapshot,
-    evaluate_execution_admission,
-    load_workspace_instructions,
-)
-from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
-from cayu.environments.admission import (
     ExecutionExecutableEvidenceState,
     ExecutionRequirements,
     _copy_execution_admission_candidate,
     _structured_execution_refusal,
+    evaluate_execution_admission,
+)
+from cayu.environments.base import (
+    Environment,
+    WorkspaceInstructions,
+    copy_environment,
+    load_workspace_instructions,
 )
 from cayu.environments.bindings import (
+    BoundWorkspace,
     SyncBinding,
+    WorkspaceBinding,
+    WorkspaceSnapshot,
     _EnvironmentLifecycleBindAttempt,
     _runtime_owned_workspace_observer_name,
+    copy_workspace_snapshot,
 )
+from cayu.environments.docker_coding import DockerCodingWorkspaceBinding
 from cayu.environments.factory import (
+    EnvironmentAllocationScope,
+    EnvironmentAllocationState,
     EnvironmentFactory,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryReleaseAction,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     attach_environment_factory_cleanup_settlement_task,
     combine_environment_factory_cleanup_settlement_tasks,
     environment_factory_cleanup_retry_available,
@@ -119,7 +119,15 @@ from cayu.environments.lifecycle import (
     _set_environment_lifecycle_progress_reporter,
     environment_lifecycle_progress_from_event,
 )
-from cayu.runners import Runner, RunnerExecutionAdmissionObserver
+from cayu.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
+from cayu.runners.base import Runner, RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
@@ -185,14 +193,6 @@ from cayu.runtime._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
-from cayu.runtime.config import DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS
-from cayu.runtime.egress_authority_transitions import (
-    _EGRESS_AUTHORITY_PARKED_OUTCOME,
-    EgressAuthorityAdoptionHandler,
-    _complete_egress_authority_allocation_parking,
-    _discard_egress_authority_allocation_parking_reservation,
-    _reserve_egress_authority_allocation_parking,
-)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
@@ -200,7 +200,7 @@ from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     CheckpointTransform,
     EventOrder,
@@ -224,7 +224,9 @@ from cayu.runtime.sessions import (
     _session_run_operation_from_checkpoint,
     session_user_metadata,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     _WORKSPACE_OBSERVATION_OBSERVER_ALIAS_FIELD,
     _WORKSPACE_OBSERVATION_WORKSPACE_ALIAS_FIELD,
     _project_workspace_observation_authority,
@@ -232,20 +234,16 @@ from cayu.runtime.workspace_observation_recovery import (
     restore_workspace_observation_cancellation_requests,
     retain_workspace_observation_pending_cancellation_requests,
 )
-from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
-from cayu.vaults import SecretRedactor
-from cayu.workspaces import (
+from cayu.workspaces.revisions import (
     WorkspaceIdentity,
     WorkspaceMutationAttributionConfidence,
     WorkspacePathRevision,
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimitExceeded,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
     compare_workspace_revisions,
-)
-from cayu.workspaces.revisions import (
-    WorkspaceRevisionObservationLimitExceeded,
     copy_bounded_workspace_revision_observation,
 )
 
@@ -4518,7 +4516,7 @@ class EnvironmentLifecycle:
             )
             return result
         if result.error is None and result.registered_environment is not None:
-            from cayu.runtime.workspace_checkpoints import ensure_workspace_checkpoint
+            from cayu.workspaces.checkpoint_lifecycle import ensure_workspace_checkpoint
 
             try:
                 await ensure_workspace_checkpoint(

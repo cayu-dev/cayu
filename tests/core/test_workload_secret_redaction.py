@@ -23,48 +23,32 @@ from tests.runner_cancellation import cancelled_error_with_artifacts
 
 import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.runtime.execution_profiles as execution_profiles_module
-import cayu.runtime.sessions as sessions_module
-from cayu import (
-    CayuConfig,
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeIndexer,
-    KnowledgeIndexRequest,
-    ListKnowledgeTool,
-    LocalRunner,
-    LocalWorkspace,
-    ReadFileTool,
-    SearchKnowledgeTool,
-    ToolExecutionConfig,
-)
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    MessageRole,
-    ToolCallPart,
-)
-from cayu.core.messages import FilePart, ProviderStatePart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.environments import (
-    Environment,
+import cayu.sessions.base as sessions_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.context.structured_output import StructuredOutputSpec
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
 )
-from cayu.providers import ModelStreamEvent
-from cayu.runners import (
+from cayu.events import Event, EventType
+from cayu.messages import FilePart, Message, MessageRole, ProviderStatePart, ToolCallPart
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
     RunnerExecutionError,
     attach_cancellation_artifacts,
 )
-from cayu.runtime import (
-    CayuApp,
+from cayu.runners.local import LocalRunner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -73,23 +57,24 @@ from cayu.runtime import (
     Session,
     SessionIdentity,
     SessionStatus,
-    StructuredOutputSpec,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolCapabilityCeiling,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
 )
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.storage import SQLiteSessionStore
-from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+from cayu.storage.knowledge_indexer import KnowledgeIndexer, KnowledgeIndexRequest
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.files import ReadFileTool
+from cayu.tools.knowledge import ListKnowledgeTool, SearchKnowledgeTool
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.local import LocalWorkspace
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
@@ -144,7 +129,7 @@ def _assert_cayu_traceback_does_not_retain_text(error: BaseException, text: str)
 def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
     secret_checkpoint: dict[str, Any],
 ) -> None:
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         ContextBuildResult,
         ContextRequest,
         RuntimeManagedContextPolicy,
@@ -219,7 +204,7 @@ def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
 
 
 def test_runtime_managed_context_cannot_observe_private_lifecycle_receipts() -> None:
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         ContextBuildResult,
         ContextRequest,
         RuntimeManagedContextPolicy,
@@ -273,7 +258,7 @@ def test_runtime_managed_context_cannot_observe_private_lifecycle_receipts() -> 
 def test_runtime_managed_context_rejects_secret_checkpoint_event_payload_before_publication(
     secret_location: str,
 ) -> None:
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         ContextBuildResult,
         ContextRequest,
         RuntimeManagedContextPolicy,
@@ -369,7 +354,7 @@ def test_runtime_managed_context_rejects_secret_checkpoint_event_payload_before_
 def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure(
     failure_checkpoint: dict[str, Any],
 ) -> None:
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         ContextBuildError,
         ContextRequest,
         RuntimeManagedContextPolicy,
@@ -429,7 +414,7 @@ def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure(
 
 
 def test_context_failure_checkpoint_event_preserves_typed_keys_for_short_secret() -> None:
-    from cayu.runtime.context import (
+    from cayu.context.base import (
         ContextBuildError,
         sanitize_context_build_error_checkpoint,
     )
@@ -1150,7 +1135,7 @@ def test_scalar_fatal_environment_failure_without_cancellation_is_unchanged() ->
 
 
 def test_binding_cleanup_handoff_survives_real_cancellation_without_retaining_secrets() -> None:
-    from cayu.environments import BoundWorkspace, WorkspaceBinding
+    from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
     from cayu.runtime._binding_cleanup import binding_cleanup_status, record_binding_cleanup_failure
 
     secret = "cancelled-binding-cleanup-secret-canary"
@@ -1233,7 +1218,7 @@ def test_binding_cleanup_handoff_survives_real_cancellation_without_retaining_se
 
 
 def test_factory_backed_binding_cancellation_does_not_retain_raw_failure() -> None:
-    from cayu.environments import BoundWorkspace, WorkspaceBinding
+    from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 
     secret = "factory-binding-attempt-secret-canary"
 
@@ -1310,7 +1295,7 @@ def test_factory_backed_binding_cancellation_does_not_retain_raw_failure() -> No
 def test_factory_backed_sync_bind_cancellation_hides_resource_keys_from_traceback(
     tmp_path,
 ) -> None:
-    from cayu.environments import SyncBinding
+    from cayu.environments.bindings import SyncBinding
 
     secret = "sync-binding-resource-key-secret-canary"
     source_started = asyncio.Event()
@@ -1403,7 +1388,7 @@ def test_factory_backed_sync_bind_cancellation_hides_resource_keys_from_tracebac
 
 
 def test_scalar_cancellation_preserves_binding_cleanup_handoff_and_retry() -> None:
-    from cayu.environments import BoundWorkspace, WorkspaceBinding
+    from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
     from cayu.runtime._binding_cleanup import binding_cleanup_status, record_binding_cleanup_failure
 
     secret = "scalar-cancellation-cleanup-secret-canary"
@@ -1483,7 +1468,7 @@ def test_scalar_cancellation_preserves_binding_cleanup_handoff_and_retry() -> No
 
 
 def test_child_cancellation_preserves_binding_cleanup_handoff_and_retry() -> None:
-    from cayu.environments import BoundWorkspace, WorkspaceBinding
+    from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
     from cayu.runtime._binding_cleanup import record_binding_cleanup_failure
 
     secret = "child-cancellation-cleanup-secret-canary"
@@ -1814,7 +1799,7 @@ def _structured_output_spec_with_secret(
 def test_run_rejects_secret_bearing_structured_output_before_session_creation(
     secret_location: str,
 ) -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "run-structured-output-schema-secret-canary"
     session_id = "sess_run_structured_output_schema_secret"
@@ -1855,7 +1840,7 @@ def test_run_rejects_secret_bearing_structured_output_before_session_creation(
 def test_resume_rejects_secret_bearing_structured_output_before_session_claim(
     secret_location: str,
 ) -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "resume-structured-output-schema-secret-canary"
     session_id = "sess_resume_structured_output_schema_secret"
@@ -1910,7 +1895,7 @@ def test_resume_rejects_secret_bearing_structured_output_before_session_claim(
 def test_cayu_app_rejects_every_secret_bearing_message_linkage_authority(
     authority_field: str,
 ) -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = f"secret-message-{authority_field}-authority-canary"
     part = (
@@ -1953,7 +1938,7 @@ def test_cayu_app_rejects_every_secret_bearing_message_linkage_authority(
 def test_resume_rejects_legacy_secret_linkage_before_claiming_session(
     authority_field: str,
 ) -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = f"legacy-resume-{authority_field}-authority-canary"
     session_id = f"sess_legacy_resume_{authority_field}_authority"
@@ -2029,7 +2014,7 @@ def test_resume_rejects_legacy_secret_linkage_before_claiming_session(
 
 
 def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-resume-post-claim-authority-canary"
     session_id = "sess_legacy_resume_post_claim_authority"
@@ -2120,7 +2105,7 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
 
 
 def test_cayu_app_redacts_direct_vault_secrets_for_the_whole_tool_invocation() -> None:
-    from cayu.vaults import REDACTED_SECRET
+    from cayu.vaults.redaction import REDACTED_SECRET
 
     secret_value = "direct-vault-invocation-secret-canary"
 
@@ -3020,7 +3005,7 @@ def test_tool_failure_redacts_dynamically_resolved_secret_before_diagnostic_boun
 
 def test_short_secret_in_message_argument_key_fails_closed() -> None:
     from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "k9"
     message = Message.tool_call(
@@ -3038,7 +3023,7 @@ def test_short_secret_in_message_argument_key_fails_closed() -> None:
 
 
 def test_short_secret_substring_in_typed_attachment_key_remains_valid() -> None:
-    from cayu.artifacts import FileAttachment, FileAttachmentKind
+    from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
     from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     attachment = FileAttachment(
@@ -3077,8 +3062,8 @@ def test_short_secret_substring_in_typed_attachment_key_remains_valid() -> None:
 def test_attachment_schema_key_exemption_is_scoped_to_typed_attachment(
     secret: str,
 ) -> None:
-    from cayu.artifacts import FileAttachment, FileAttachmentKind
-    from cayu.core.messages import ToolResultPart
+    from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
+    from cayu.messages import ToolResultPart
     from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     attachment = FileAttachment(
@@ -3124,7 +3109,7 @@ def test_attachment_schema_key_exemption_is_scoped_to_typed_attachment(
 def test_runtime_result_schema_key_exemption_rejects_untyped_lookalike(
     secret: str,
 ) -> None:
-    from cayu.core.messages import ToolResultPart
+    from cayu.messages import ToolResultPart
     from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     message = Message(
@@ -3147,7 +3132,7 @@ def test_runtime_result_schema_key_exemption_rejects_untyped_lookalike(
 
 
 def test_invalid_terminal_control_is_treated_as_untrusted_tool_data() -> None:
-    from cayu.core.messages import ToolResultPart
+    from cayu.messages import ToolResultPart
     from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     message = Message(
@@ -3280,7 +3265,7 @@ def test_approval_denial_schema_keys_do_not_block_model_continuation(secret: str
 
 
 def test_short_secret_in_attachment_metadata_key_fails_closed() -> None:
-    from cayu.artifacts import FileAttachment, FileAttachmentKind
+    from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
     from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     secret = "k9"
@@ -3306,7 +3291,7 @@ def test_short_secret_in_attachment_metadata_key_fails_closed() -> None:
 
 
 def test_short_secret_in_model_tool_schema_key_blocks_provider_dispatch() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "k9"
 
@@ -3514,8 +3499,8 @@ def test_legacy_json_schema_keywords_allow_provider_dispatch(
 
 
 def test_short_secret_in_dispatch_metadata_key_fails_closed() -> None:
-    from cayu.runtime.dispatch import DispatchRequest, redact_dispatch_request
-    from cayu.vaults import SecretRedactor
+    from cayu.tasks.dispatch import DispatchRequest, redact_dispatch_request
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "k9"
     request = DispatchRequest(
@@ -3533,9 +3518,9 @@ def test_short_secret_in_dispatch_metadata_key_fails_closed() -> None:
 
 
 def test_short_secret_substring_in_typed_dispatch_key_remains_valid() -> None:
-    from cayu.core.thinking import ThinkingConfig
-    from cayu.runtime.dispatch import DispatchRequest, redact_dispatch_request
-    from cayu.vaults import SecretRedactor
+    from cayu.context.thinking import ThinkingConfig
+    from cayu.tasks.dispatch import DispatchRequest, redact_dispatch_request
+    from cayu.vaults.redaction import SecretRedactor
 
     redacted = redact_dispatch_request(
         DispatchRequest(
@@ -3554,9 +3539,9 @@ def test_short_secret_substring_in_typed_dispatch_key_remains_valid() -> None:
 def test_dispatch_rejects_secret_pricing_dimension_key() -> None:
     from decimal import Decimal
 
-    from cayu.runtime.budgets import BudgetLimit
-    from cayu.runtime.costs import ModelPrice, PriceBook
-    from cayu.runtime.dispatch import DispatchRequest, redact_dispatch_request
+    from cayu.budgets.base import BudgetLimit
+    from cayu.budgets.pricing import ModelPrice, PriceBook
+    from cayu.tasks.dispatch import DispatchRequest, redact_dispatch_request
 
     secret = "dispatch-budget-dimension-secret-canary"
     price = ModelPrice.fixed(
@@ -3589,7 +3574,7 @@ def test_dispatch_rejects_secret_pricing_dimension_key() -> None:
 def test_cayu_app_refuses_to_fork_legacy_secret_bearing_source_state(
     contaminated_state: str,
 ) -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = f"legacy-fork-{contaminated_state}-secret-canary"
     source_id = f"sess_legacy_fork_{contaminated_state}_source"
@@ -3660,7 +3645,7 @@ def test_cayu_app_refuses_to_fork_legacy_secret_bearing_source_state(
 
 
 def test_cayu_app_can_fork_without_copying_contaminated_legacy_checkpoint() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-fork-ignored-checkpoint-secret-canary"
     store = InMemorySessionStore()
@@ -3854,7 +3839,7 @@ def test_atomic_fork_profile_recheck_does_not_retain_changed_checkpoint(
 
 
 def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-fork-excluded-operation-history-secret-canary"
     source_id = "sess_legacy_operation_history_source"
@@ -3919,7 +3904,7 @@ def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
 
 
 def test_fork_failure_does_not_retain_excluded_legacy_checkpoint_secret() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-fork-excluded-checkpoint-traceback-canary"
     source_id = "sess_legacy_excluded_checkpoint_failure_source"
@@ -3968,7 +3953,7 @@ def test_fork_failure_does_not_retain_excluded_legacy_checkpoint_secret() -> Non
 
 
 def test_fork_validates_concurrently_added_transcript_inside_atomic_store_copy() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-fork-concurrent-transcript-secret-canary"
     source_id = "sess_legacy_concurrent_transcript_source"
@@ -4033,7 +4018,7 @@ def test_fork_validates_concurrently_added_transcript_inside_atomic_store_copy()
 
 
 def test_fork_cursor_excluded_secret_is_not_retained_by_later_failure() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-fork-excluded-transcript-traceback-canary"
     source_id = "sess_legacy_excluded_transcript_source"
@@ -4609,7 +4594,7 @@ def test_runtime_event_rejects_secret_in_event_type_owned_payload_authority(
     authority_field: str,
 ) -> None:
     from cayu.runtime._event_writer import prepare_runtime_event
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = f"event-{authority_field}-secret-canary"
     event = Event(
@@ -4675,7 +4660,7 @@ def test_runtime_event_rejects_secret_interaction_authority() -> None:
 
 def test_runtime_tool_event_cannot_restore_secret_linkage_control() -> None:
     from cayu.runtime._event_writer import prepare_runtime_event
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "runtime-tool-linkage-secret-canary"
     event = Event(
@@ -4696,9 +4681,9 @@ def test_runtime_tool_event_cannot_restore_secret_linkage_control() -> None:
 
 
 def test_interaction_lifecycle_schema_keys_survive_secret_name_collisions() -> None:
-    from cayu.runtime import InteractionStatus, InteractionSummaryEvidence
     from cayu.runtime._event_writer import prepare_runtime_event
-    from cayu.vaults import SecretRedactor
+    from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+    from cayu.vaults.redaction import SecretRedactor
 
     now = datetime.now(UTC)
     evidence = InteractionSummaryEvidence(
@@ -4751,7 +4736,7 @@ def test_interaction_lifecycle_schema_keys_survive_secret_name_collisions() -> N
 def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() -> None:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "pending-round-authority-secret-canary"
     tool_calls = [
@@ -4798,9 +4783,9 @@ def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() 
 
 
 def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> None:
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-approval-authority-secret-canary"
     pending = PendingToolApproval(
@@ -4830,9 +4815,9 @@ def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> N
 
 
 def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_input() -> None:
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-approval-key-secret-canary"
     secret_key = f"prefix-{secret}-suffix"
@@ -4869,13 +4854,13 @@ def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_in
 
 
 def test_legacy_pending_user_input_rejects_secret_authority_before_recovery() -> None:
-    from cayu.runtime.approvals import PendingToolCallApproval
-    from cayu.runtime.user_input import (
+    from cayu.approvals.tools import PendingToolCallApproval
+    from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         PendingUserInput,
         pending_user_input_from_checkpoint,
     )
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-user-input-authority-secret-canary"
     pending = PendingUserInput(
@@ -4910,13 +4895,13 @@ def test_legacy_pending_user_input_rejects_secret_authority_before_recovery() ->
 
 
 def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_input() -> None:
-    from cayu.runtime.approvals import PendingToolCallApproval
-    from cayu.runtime.user_input import (
+    from cayu.approvals.tools import PendingToolCallApproval
+    from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         PendingUserInput,
         pending_user_input_from_checkpoint,
     )
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-user-input-key-secret-canary"
     secret_key = f"prefix-{secret}-suffix"
@@ -4956,10 +4941,10 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
 
 
 def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() -> None:
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
     from cayu.runtime import _session_engine as session_engine
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-compaction-pending-secret-canary"
     pending = PendingToolApproval(
@@ -4995,10 +4980,10 @@ def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() 
 def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback_retention() -> (
     None
 ):
-    from cayu.runtime import CompactSessionRequest
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-    from cayu.vaults import SecretRedactor
+    from cayu.sessions.base import CompactSessionRequest
+    from cayu.vaults.redaction import SecretRedactor
 
     async def run() -> None:
         secret = "legacy-compaction-public-flow-secret-canary"
@@ -5066,7 +5051,7 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
 
 def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
     from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     assert not durable_value_contains_secret(
         {
@@ -5293,7 +5278,7 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
 
 def test_active_invocation_profile_unknown_extension_remains_secret_scanned() -> None:
     from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "active-profile-extension-secret"
     checkpoint = {
@@ -5311,10 +5296,10 @@ def test_active_invocation_profile_unknown_extension_remains_secret_scanned() ->
 
 
 def test_approval_resolution_digest_is_typed_private_checkpoint_state() -> None:
+    from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
     from cayu.runtime import _approval_support as approval_support
     from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
-    from cayu.runtime.approvals import ToolApprovalDecision, ToolApprovalRequest
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     request = ToolApprovalRequest(
         session_id="session-1",
@@ -5352,12 +5337,12 @@ def test_malformed_legacy_pending_checkpoint_is_rejected_without_traceback_secre
     checkpoint_kind: str,
     consume_on_rejection: bool,
 ) -> None:
-    from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.runtime.user_input import (
+    from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         pending_user_input_from_checkpoint,
     )
+    from cayu.runtime import _approval_support as approval_support
+    from cayu.runtime import _tool_round_recovery as tool_round_recovery
 
     secret = "model"
     if checkpoint_kind == "approval":
@@ -5398,8 +5383,8 @@ def test_malformed_legacy_pending_checkpoint_is_rejected_without_traceback_secre
 
 
 def test_short_secret_substring_in_typed_thinking_key_does_not_block_provider() -> None:
-    from cayu.core.thinking import ThinkingConfig
-    from cayu.vaults import SecretRedactor
+    from cayu.context.thinking import ThinkingConfig
+    from cayu.vaults.redaction import SecretRedactor
 
     provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
     app = CayuApp(
@@ -5426,10 +5411,10 @@ def test_short_secret_substring_in_typed_thinking_key_does_not_block_provider() 
 
 
 def test_short_secret_substring_in_typed_structured_output_key_allows_pending_round() -> None:
+    from cayu.context.structured_output import StructuredOutputStrategy
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.runtime.structured_output import StructuredOutputStrategy
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
         None,
@@ -5459,10 +5444,10 @@ def test_short_secret_substring_in_typed_structured_output_key_allows_pending_ro
 
 
 def test_json_schema_keyword_overlap_allows_pending_round_checkpoint_and_reload() -> None:
+    from cayu.context.structured_output import StructuredOutputStrategy
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.runtime.structured_output import StructuredOutputStrategy
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     redactor = SecretRedactor("typ")
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
@@ -5505,7 +5490,7 @@ def test_json_schema_keyword_overlap_allows_pending_round_checkpoint_and_reload(
 def test_schema_aware_checkpoint_still_rejects_data_owned_schema_keys() -> None:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     with pytest.raises(ValueError, match="contains a workload secret"):
         tool_round_recovery.checkpoint_with_pending_tool_round(
@@ -5536,7 +5521,7 @@ def test_schema_aware_checkpoint_still_rejects_data_owned_schema_keys() -> None:
 def test_short_secret_substring_in_tool_round_id_key_allows_pending_round() -> None:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     identity = tool_round_identity()
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
@@ -5562,14 +5547,14 @@ def test_short_secret_substring_in_tool_round_id_key_allows_pending_round() -> N
 
 
 def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exposure() -> None:
-    from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime.business_approvals import (
+    from cayu.approvals.business import (
         BusinessApprovalOutcome,
         business_approval_routing_metadata,
         resolve_business_approval,
     )
-    from cayu.vaults import SecretRedactor
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
+    from cayu.runtime import _approval_support as approval_support
+    from cayu.vaults.redaction import SecretRedactor
 
     async def run() -> None:
         secret = "legacy-business-approval-routing-secret-canary"

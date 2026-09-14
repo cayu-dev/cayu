@@ -10,12 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import (
+from cayu.delivery.github import (
     GitHubPullRequestDeliveryRequest,
     GitHubRepositoryAuthority,
     GitHubSourceAuthority,
-    TaskQuery,
 )
+from cayu.tasks.base import TaskQuery
 from tests.qualification.test_repository_maintenance_intake import intake as intake
 
 

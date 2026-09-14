@@ -16,26 +16,27 @@ from typing import Literal
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    EventQuery,
-    ResolutionActor,
-    ResolutionActorSource,
-    RunRequest,
-    SessionIdentity,
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
     SessionMessageAccessDenied,
     SessionMessageAccessPolicy,
     SessionMessageActionRequest,
     SessionMessageConflict,
-    SessionMessageDeliveryMode,
     SessionMessageQuery,
-    SessionStatus,
-    SQLiteSessionStore,
 )
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.vaults import SecretRedactor
+from cayu.sessions.base import (
+    EnqueueSessionMessageRequest,
+    EventQuery,
+    RunRequest,
+    SessionIdentity,
+    SessionMessageDeliveryMode,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.vaults.redaction import SecretRedactor
 
 _SESSION = "process-queue-target"
 _CONTEXT = SessionMessageAccessContext(subject="queue-operator", tenant="tenant-a")

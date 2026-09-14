@@ -28,9 +28,9 @@ from cayu import (
 )
 from cayu.egress import HttpEgressPolicy
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAuthorityDecision,
     ExecutionProfileMismatchError,

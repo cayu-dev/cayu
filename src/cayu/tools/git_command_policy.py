@@ -6,8 +6,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from cayu._validation import require_clean_nonblank
-from cayu.core.tools import ToolContext
 from cayu.runners.base import is_same_or_child
+from cayu.tools.base import ToolContext
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
     CommandPolicy,

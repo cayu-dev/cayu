@@ -17,12 +17,20 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     unescape_json_pointer_segment,
 )
-from cayu.artifacts import (
+from cayu.artifacts.attachments import (
     FileAttachmentKind,
     file_attachment_from_payload,
     resolved_file_attachments_from_options,
 )
-from cayu.core.messages import (
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+    TextEmbeddingUsage,
+    copy_text_embedding_request,
+)
+from cayu.messages import (
     CitationPart,
     FilePart,
     HostedToolCallPart,
@@ -36,14 +44,6 @@ from cayu.core.messages import (
     WebSearchAction,
     WebSearchAPISource,
     WebSearchSource,
-)
-from cayu.embeddings import (
-    TextEmbedding,
-    TextEmbeddingProvider,
-    TextEmbeddingRequest,
-    TextEmbeddingResult,
-    TextEmbeddingUsage,
-    copy_text_embedding_request,
 )
 from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._config import positive_finite_seconds
@@ -154,7 +154,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
     copy_provider_operation_state,
 )
-from cayu.vaults import REDACTED_SECRET
+from cayu.vaults.redaction import REDACTED_SECRET
 
 if TYPE_CHECKING:
     import httpx

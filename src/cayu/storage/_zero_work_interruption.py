@@ -6,8 +6,8 @@ import json
 from itertools import islice
 from typing import TYPE_CHECKING
 
-from cayu.core.events import Event
-from cayu.core.messages import Message
+from cayu.events import Event
+from cayu.messages import Message
 from cayu.runtime._zero_work_interruption import (
     MAX_EVIDENCE_ITEMS,
     ZeroWorkInterruptionPublication,
@@ -16,7 +16,7 @@ from cayu.runtime._zero_work_interruption import (
 )
 
 if TYPE_CHECKING:
-    from cayu.runtime.sessions import InMemorySessionStore
+    from cayu.sessions.base import InMemorySessionStore
     from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 

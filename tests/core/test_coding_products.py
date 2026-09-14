@@ -7,6 +7,7 @@ import pytest
 
 import cayu.coding_products as coding_products
 from cayu._validation import canonical_durable_json_bytes
+from cayu.applications import CayuApp
 from cayu.artifacts import ArtifactMetadata, ArtifactReadResult, ArtifactScope, LocalArtifactStore
 from cayu.coding_products import (
     CODING_PRODUCT_EVIDENCE_KIND,
@@ -28,11 +29,10 @@ from cayu.coding_products import (
     collect_coding_product_events,
     compile_coding_product_candidate,
 )
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import InMemorySessionStore, RunRequest, session_input_messages_sha256
-from cayu.runtime.work_contracts import (
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import InMemorySessionStore, RunRequest, session_input_messages_sha256
+from cayu.tasks.contracts import (
     CompletionResultReference,
     CompletionVerdict,
     WorkEvidenceReference,

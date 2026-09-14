@@ -11,7 +11,6 @@ from typing import Any
 
 from cayu._task_wait import unexpected_child_cancellation_error
 from cayu._validation import canonical_bounded_durable_json_bytes
-from cayu.core.tools import ToolEffect
 from cayu.runtime._tool_effect_state import ToolEffectConflict, ToolEffectRecord, _copy_model
 from cayu.runtime.tool_effects import (
     ToolEffectReceipt,
@@ -25,7 +24,8 @@ from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     await_invocation_operation,
 )
-from cayu.vaults import SecretRedactor
+from cayu.tools.base import ToolEffect
+from cayu.vaults.redaction import SecretRedactor
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,7 +370,7 @@ def reconciliation_request_digest(request: ToolEffectReconciliationRequest) -> s
     copied = ToolEffectReconciliationRequest(
         **{name: getattr(request, name) for name in ToolEffectReconciliationRequest.model_fields}
     )
-    from cayu.runtime.user_input import user_input_resolution_request_digest
+    from cayu.approvals.user_input import user_input_resolution_request_digest
 
     document = copied.model_dump(mode="json", exclude={"user_input_response"})
     document["user_input_response"] = (

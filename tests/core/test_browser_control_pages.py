@@ -15,7 +15,6 @@ from tests.core.test_browser_control_publisher import publication_fixture
 from cayu.runtime._browser_control_channel import BoundBrowserGuest, BrowserGuestCommandOwner
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._browser_control_service import BrowserControlService
-from cayu.runtime.browser_control import BrowserControlPrincipal
 from cayu.server._browser_control_routes import (
     BrowserOperatorSessionTokens,
     create_browser_control_router,
@@ -23,6 +22,7 @@ from cayu.server._browser_control_routes import (
 from cayu.server.auth import BasicAuth
 from cayu.tools._browser_control_guest import GuestControlChannel
 from cayu.tools._browser_guest import _InteractiveDaemon, _InteractivePage
+from cayu.tools.browser_control import BrowserControlPrincipal
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

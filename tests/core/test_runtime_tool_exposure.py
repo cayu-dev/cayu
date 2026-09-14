@@ -6,16 +6,34 @@ from collections.abc import AsyncIterator
 import pytest
 
 import cayu.runtime.execution_profiles as execution_profiles
-from cayu import CayuConfig, RunDefaults, SQLiteSessionStore
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.events import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import UserInputResponse
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import RecentTurnsContextPolicy
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import (
+    Event,
+    EventType,
     event_with_runtime_envelope_authority,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import (
+from cayu.messages import Message, ToolResultPart
+from cayu.observability.hooks import (
+    BeforeToolCallHookContext,
+    RuntimeHook,
+    ToolCallHookContext,
+)
+from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
@@ -25,46 +43,6 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime import (
-    AllRegisteredToolsExposurePolicy,
-    CayuApp,
-    ContextCountingConfig,
-    ContextCountingMode,
-    EventQuery,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileComponentClass,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    RecentTurnsContextPolicy,
-    RequestFootprintConfig,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RetryPolicy,
-    RunRequest,
-    Session,
-    SessionIdentity,
-    SessionInvocationAdmission,
-    SessionRunFenced,
-    SessionStatus,
-    StaticToolExposurePolicy,
-    StructuredOutputSpec,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolCapabilityCeiling,
-    ToolExposure,
-    ToolExposureDecision,
-    ToolExposurePolicy,
-    ToolExposurePolicyRequest,
-    UserInputResponse,
-)
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._invocation_lifecycle import (
     ReleaseInvocationCommand,
@@ -72,21 +50,51 @@ from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
     prepare_rebind_invocation_command,
 )
-from cayu.runtime.hooks import (
-    BeforeToolCallHookContext,
-    RuntimeHook,
-    ToolCallHookContext,
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
 )
-from cayu.runtime.sessions import InteractionTransitionSpec
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.runtime.tool_policy import (
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import (
+    EventQuery,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    InteractionTransitionSpec,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionInvocationAdmission,
+    SessionRunFenced,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import (
+    AllRegisteredToolsExposurePolicy,
+    StaticToolExposurePolicy,
+    ToolCapabilityCeiling,
+    ToolExposure,
+    ToolExposureDecision,
+    ToolExposurePolicy,
+    ToolExposurePolicyRequest,
+)
+from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
 )
-from cayu.tools import UserInputTool
-from cayu.vaults import SecretRedactor, StaticVault
+from cayu.tools.user_input import UserInputTool
+from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.static import StaticVault
 
 
 class _RecordingTool(Tool):

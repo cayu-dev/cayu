@@ -41,16 +41,16 @@ from cayu.embeddings import (
 )
 
 if TYPE_CHECKING:
-    from cayu.knowledge_maintenance_governance import (
+    from cayu.knowledge.maintenance_governance import (
         KnowledgeMaintenanceGovernanceAuthority,
         KnowledgeMaintenanceGovernanceReceipt,
     )
-    from cayu.knowledge_maintenance_persistence import (
+    from cayu.knowledge.maintenance_persistence import (
         KnowledgeMaintenanceAcceptedPlan,
         KnowledgeMaintenanceProposalPublication,
         KnowledgeMaintenanceProposalPublicationReceipt,
     )
-    from cayu.knowledge_semantic_watch import (
+    from cayu.knowledge.semantic_watch import (
         KnowledgeSemanticWatchAuthority,
         KnowledgeSemanticWatchReceipt,
     )
@@ -5190,7 +5190,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         operation_id: str,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposalPublicationReceipt:
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationReceipt,
             copy_knowledge_maintenance_proposal_publication_receipt,
@@ -5327,7 +5327,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposalPublication | None:
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceProposalPublication,
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationOutcome,
@@ -6363,7 +6363,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceGovernanceReceipt:
-        from cayu.knowledge_maintenance_governance import (
+        from cayu.knowledge.maintenance_governance import (
             KnowledgeMaintenanceGovernanceAuthority,
             KnowledgeMaintenanceGovernanceDisposition,
             KnowledgeMaintenanceGovernanceReceipt,
@@ -6454,7 +6454,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceGovernanceReceipt | None:
-        from cayu.knowledge_maintenance_governance import (
+        from cayu.knowledge.maintenance_governance import (
             KnowledgeMaintenanceGovernanceReceipt,
             copy_knowledge_maintenance_governance_receipt,
         )
@@ -6481,7 +6481,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeSemanticWatchReceipt:
-        from cayu.knowledge_semantic_watch import (
+        from cayu.knowledge.semantic_watch import (
             KnowledgeSemanticWatchAuthority,
             KnowledgeSemanticWatchConflict,
             KnowledgeSemanticWatchReceipt,
@@ -6553,7 +6553,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeSemanticWatchReceipt | None:
-        from cayu.knowledge_semantic_watch import (
+        from cayu.knowledge.semantic_watch import (
             KnowledgeSemanticWatchConflict,
             KnowledgeSemanticWatchReceipt,
             copy_knowledge_semantic_watch_receipt,
@@ -6621,7 +6621,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
             publication_snapshot = snapshot
         if KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata:
-            from cayu.knowledge_maintenance_governance import (
+            from cayu.knowledge.maintenance_governance import (
                 governance_authority_from_maintenance_records,
             )
 

@@ -39,11 +39,11 @@ from cayu import (
     write_trajectory_json,
 )
 from cayu._validation import DURABLE_DOCUMENT_LIMITS, compact_json_utf8_size
-from cayu.core.events import (
+from cayu.evals.trajectory import _build_child_trajectories, _CaptureState, _IncompleteFlag
+from cayu.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
-from cayu.evals.trajectory import _build_child_trajectories, _CaptureState, _IncompleteFlag
 from cayu.storage.migrations import SchemaMode
 
 pytestmark = pytest.mark.postgres

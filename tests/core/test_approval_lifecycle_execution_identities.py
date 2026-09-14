@@ -7,15 +7,9 @@ from typing import Any
 import pytest
 from tests.core._execution_profile_fixtures import rebind_test_invocation
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Event,
-    EventType,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    Message,
-    ModelStreamEvent,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
     PendingToolApproval,
     PendingToolApprovalEventView,
     ResolutionActor,
@@ -23,25 +17,25 @@ from cayu import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolResult,
-    ToolSpec,
 )
-from cayu.core.tools import Tool, ToolContext
-from cayu.evals import ScriptedModelProvider
-from cayu.runtime import (
-    EventSink,
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.events import EventSink
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     PendingActionQuery,
     RunRequest,
     SessionStatus,
 )
-from cayu.runtime.execution_profiles import (
-    active_invocation_execution_profile_from_checkpoint,
-)
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 
 
 class _RecordingTool(Tool):

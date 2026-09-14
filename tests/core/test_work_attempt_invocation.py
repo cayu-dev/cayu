@@ -19,20 +19,10 @@ from tests.core.test_work_attempt_admission import (
     _prepare_request,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    SecretRedactor,
-    SessionStatus,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    TaskCreate,
-    TaskStatus,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message
 from cayu.runtime._invocation_lifecycle import (
     PreparedInvocationBinding,
     _authenticated_invocation_context,
@@ -43,8 +33,10 @@ from cayu.runtime._work_attempt_invocation import (
     _authenticated_work_attempt_invocation,
 )
 from cayu.runtime.execution_profiles import ActiveInvocationExecutionProfile
-from cayu.runtime.tool_exposure import ToolCapabilityCeiling
-from cayu.runtime.work_attempt_admission import (
+from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+from cayu.sessions.base import InMemorySessionStore, SessionStatus
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionActivate,
     WorkAttemptExecutionClaimLost,
@@ -52,7 +44,9 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
 )
-from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled", "abandoned"])

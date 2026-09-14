@@ -9,7 +9,8 @@ import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 
-from cayu.core import AgentSpec, Message, TextPart
+from cayu.agents import AgentSpec
+from cayu.context.base import CompactionRequest, ContextRequest
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -18,6 +19,7 @@ from cayu.embeddings import (
     TextEmbeddingUsage,
 )
 from cayu.evals import ScriptedModelProvider
+from cayu.messages import Message, TextPart
 from cayu.providers import (
     AnthropicProvider,
     CacheBreakpoint,
@@ -30,15 +32,8 @@ from cayu.providers import (
 )
 from cayu.proxies import AllowlistProxy
 from cayu.runners import ExecCommand
-from cayu.runtime import (
-    CompactionRequest,
-    ContextRequest,
-    DispatchRequest,
-    ResumeRequest,
-    RunLimits,
-    RunRequest,
-    Session,
-)
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import ResumeRequest, RunRequest, Session
 from cayu.storage import (
     InMemoryEmbeddingKnowledgeStore,
     KnowledgeAccessScope,
@@ -46,6 +41,7 @@ from cayu.storage import (
     KnowledgeQuery,
     KnowledgeSearchMode,
 )
+from cayu.tasks.dispatch import DispatchRequest
 from cayu.tools import CommandRequest
 from cayu.vaults import SecretRef, StaticVault
 

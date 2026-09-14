@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 import cayu
+from cayu.applications import CayuApp
 from cayu.cli.project import (
     CayuProject as ConsoleProject,
 )
@@ -18,7 +19,6 @@ from cayu.cli.project import (
     project_context,
     resolve_project,
 )
-from cayu.runtime.app import CayuApp
 
 
 def add_console_parser(subparsers: Any) -> None:

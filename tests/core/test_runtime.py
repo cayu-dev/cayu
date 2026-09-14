@@ -50,6 +50,9 @@ from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 from tests.provider_traceback_assertions import is_cayu_source_filename
 from tests.runner_cancellation import cancelled_error_with_artifacts
 
+import cayu.applications as runtime_app_module
+import cayu.budgets.base as budgets_module
+import cayu.context.base as runtime_context_module
 import cayu.providers._credential_boundary as credential_boundary_module
 import cayu.providers.deadlines as provider_deadlines_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -60,13 +63,9 @@ import cayu.runtime._run_limits as run_limits_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
-import cayu.runtime.app as runtime_app_module
-import cayu.runtime.budgets as budgets_module
-import cayu.runtime.context as runtime_context_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
-import cayu.runtime.sessions as sessions_module
-from cayu import CayuConfig, OperationsConfig, RunDefaults, ToolExecutionConfig
+import cayu.sessions.base as sessions_module
 from cayu._exception_groups import (
     exception_cause,
     exception_context,
@@ -75,51 +74,121 @@ from cayu._exception_groups import (
     iter_exception_tree,
 )
 from cayu._validation import canonical_durable_json_bytes
-from cayu.artifacts import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.business import BusinessApprovalResolutionState, business_approval_audit
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    PendingToolApprovalEventView,
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import UserInputResponse
+from cayu.artifacts.attachments import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     FileAttachmentKind,
-    LocalArtifactStore,
     file_attachment,
 )
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    MessageRole,
-    TextPart,
-    ToolCallPart,
-    ToolResultPart,
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.base import (
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    BudgetWindow,
+    InMemoryBudgetLedger,
+    InMemoryBudgetStore,
+    budget_settlement_id,
 )
-from cayu.core.messages import FilePart, ProviderStatePart
-from cayu.core.tools import (
-    _POLICY_DENIAL_TEXT_MAX_BYTES,
-    _POLICY_DENIAL_TRUNCATION_MARKER,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-    _bound_policy_denial_text,
+from cayu.budgets.billing import BillingIdentity, PricingContext
+from cayu.budgets.pricing import (
+    ContextualPricingRequirement,
+    ModelPrice,
+    PriceBook,
+    PriceSchedule,
+    PriceTier,
+    Provenance,
+    TieredPricing,
 )
-from cayu.environments import (
+from cayu.configuration import CayuConfig, OperationsConfig, RunDefaults, ToolExecutionConfig
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    CompactionPrompt,
+    CompactionRequest,
+    CompactionResult,
+    ContextBuildError,
+    ContextBuildResult,
+    ContextCompactor,
+    ContextPolicy,
+    ContextPressureEstimate,
+    ContextPressureOverhead,
+    ContextRequest,
+    ContextUsageState,
+    DefaultContextPolicy,
+    MessageWindowContextPolicy,
+    ModelCompactor,
+    ObservedDeltaContextEstimator,
+    PromptCacheCompactor,
+    RecentTurnsContextPolicy,
+    RuntimeManagedContextPolicy,
+    TranscriptDigestCompactor,
+    UsageTriggeredContextPolicy,
+    project_runtime_managed_context_checkpoint,
+    strip_old_file_attachments,
+    trim_context_messages,
+    trim_context_turns,
+    validate_context_messages,
+)
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.context.footprints import (
+    PromptContributionManifest,
+    RequestFootprint,
+    RequestFootprintConfig,
+    RequestVariant,
+)
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    NativeStructuredOutputUnsupported,
+    StructuredOutputSpec,
+)
+from cayu.environments.base import Environment, EnvironmentSpec, WorkspaceInstructionsConfig
+from cayu.environments.bindings import (
     BoundWorkspace,
-    Environment,
+    SyncBinding,
+    WorkspaceBinding,
+    WorkspaceSnapshot,
+)
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
-    SyncBinding,
-    WorkspaceBinding,
-    WorkspaceInstructionsConfig,
-    WorkspaceSnapshot,
 )
-from cayu.providers import (
-    BedrockProvider,
-    ChatCompletionsProvider,
+from cayu.events import Event, EventType
+from cayu.messages import (
+    FilePart,
+    Message,
+    MessageRole,
+    ProviderStatePart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
+from cayu.observability.events import EventSink, InMemoryEventSink
+from cayu.observability.hooks import (
+    AfterToolCallDecision,
+    BeforeToolCallDecision,
+    BeforeToolCallHookContext,
+    RuntimeHook,
+    RuntimeHookContext,
+    RuntimeHookPhase,
+    ToolCallHookContext,
+)
+from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
@@ -132,169 +201,28 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
-    OpenAIProvider,
+    UsageDialect,
+)
+from cayu.providers.bedrock import (
+    BedrockProvider,
+    bedrock_billing_identity,
+    completed_bedrock_billing_identity,
+)
+from cayu.providers.cache import CacheBreakpoint, CachePolicy, RequestCacheProjection
+from cayu.providers.chat_completions import ChatCompletionsProvider
+from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.providers.openai import OpenAIProvider
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationSnapshot,
     ProviderOperationStartRequest,
     ProviderOperationState,
-    UsageDialect,
-    bedrock_billing_identity,
-    completed_bedrock_billing_identity,
 )
-from cayu.providers.cache import CacheBreakpoint, CachePolicy, RequestCacheProjection
-from cayu.providers.deadlines import ProviderStreamDeadlines
-from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
-from cayu.runners import (
-    DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
-    ExecCommand,
-    ExecResult,
-    Runner,
-)
-from cayu.runtime import (
-    EXECUTION_PROFILE_FINGERPRINT_FIELD,
-    TAINT_LABELS_METADATA_KEY,
-    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
-    AfterToolCallDecision,
-    AllowAllToolPolicy,
-    AllowlistRule,
-    BeforeStopContext,
-    BeforeStopDecision,
-    BeforeToolCallDecision,
-    BeforeToolCallHookContext,
-    BillingIdentity,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    BudgetWindow,
-    BusinessApprovalResolutionState,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactionPrompt,
-    CompactionRequest,
-    CompactionResult,
-    ContextCompactor,
-    ContextCountingConfig,
-    ContextCountingMode,
-    ContextPolicy,
-    ContextPressureEstimate,
-    ContextPressureOverhead,
-    ContextRequest,
-    ContextualPricingRequirement,
-    ContextUsageState,
-    DefaultContextPolicy,
-    Dispatcher,
-    DispatchHandle,
-    DispatchRequest,
-    DispatchStatus,
-    EventOrder,
-    EventQuery,
-    EventRecord,
-    EventSink,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAdoptionRejected,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileComponentClass,
-    ExecutionProfileMismatchError,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    ForkSystemPromptPolicy,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
-    InMemoryBudgetLedger,
-    InMemoryBudgetStore,
-    InMemoryEventSink,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InterruptSessionRequest,
-    InvocationOriginTrust,
-    LoopPolicy,
-    MessageWindowContextPolicy,
-    ModelCompactor,
-    ModelCompletionManualRecoveryRequest,
-    ModelCompletionManualRecoveryRequired,
-    ModelPrice,
-    ModelTarget,
-    NativeStructuredOutputUnsupported,
-    ObservedDeltaContextEstimator,
-    ParameterConstrainedToolPolicy,
-    PendingToolApproval,
-    PendingToolApprovalEventView,
-    PriceBook,
-    PriceSchedule,
-    PriceTier,
-    PricingContext,
-    PromptCacheCompactor,
-    PromptContributionManifest,
-    Provenance,
-    RecentTurnsContextPolicy,
-    RecoveryBlockerCode,
-    RecoveryDecision,
-    RecoveryExecutionRequest,
-    RecoveryItemExecutionStatus,
-    RecoveryPlanAction,
-    RecoveryPlanRequest,
-    RecoveryPlanSelection,
-    RequestFootprint,
-    RequestFootprintConfig,
-    RequestVariant,
-    RequiredAllowlistRule,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
-    RuntimeHookPhase,
-    Session,
-    SessionExecutionSource,
-    SessionIdentity,
-    SessionQuery,
-    SessionRunFenced,
-    SessionRuntimePublicationConflict,
-    SessionStatus,
-    SessionStatusConflict,
-    SessionStore,
-    StaticToolPolicy,
-    StructuredOutputSpec,
-    TaintAwareToolPolicy,
-    TargetedToolGrant,
-    TaskClaimLost,
-    TaskCreate,
-    TaskStatus,
-    TaskTerminalizationRequest,
-    TieredPricing,
-    ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRecoveryRequest,
-    ToolApprovalRequest,
-    ToolCallHookContext,
-    ToolCapabilityCeiling,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolRoundIdentity,
-    ToolRoundRecoveryRequest,
-    TranscriptDigestCompactor,
-    TranscriptQuery,
-    UsageTriggeredContextPolicy,
-    UserInputResponse,
-    business_approval_audit,
-    session_prompt_anatomy_transition,
-    strip_old_file_attachments,
-    system_prompt_messages_sha256,
-    trim_context_messages,
-    trim_context_turns,
-)
+from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
+from cayu.proxies.passthrough import PassthroughProxy
+from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, ExecResult, Runner
 from cayu.runtime import _approval_support as approval_support_module
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
@@ -317,9 +245,57 @@ from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
     detach_billing_identity_cancellation_group,
 )
+from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime._session_engine import _require_native_structured_output_support
-from cayu.runtime.budgets import budget_settlement_id
-from cayu.runtime.checkpoints import (
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAdoptionRejected,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+)
+from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    EventOrder,
+    EventQuery,
+    EventRecord,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    ForkSystemPromptPolicy,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ModelCompletionManualRecoveryRequest,
+    ModelTarget,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionQuery,
+    SessionRunFenced,
+    SessionRuntimePublicationConflict,
+    SessionStatus,
+    SessionStatusConflict,
+    SessionStore,
+    TranscriptQuery,
+    _checkpoint_with_session_run_operation,
+    _reserve_completion_result_event_publication,
+    fork_session_invocation,
+    session_prompt_anatomy_transition,
+    system_prompt_messages_sha256,
+)
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -329,42 +305,73 @@ from cayu.runtime.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
-from cayu.runtime.context import (
-    ContextBuildError,
-    ContextBuildResult,
-    RuntimeManagedContextPolicy,
-    project_runtime_managed_context_checkpoint,
-    validate_context_messages,
+from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.sessions.recovery import (
+    RecoveryBlockerCode,
+    RecoveryDecision,
+    RecoveryExecutionRequest,
+    RecoveryItemExecutionStatus,
+    RecoveryPlanAction,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
 )
-from cayu.runtime.sessions import (
-    _checkpoint_with_session_run_operation,
-    _reserve_completion_result_event_publication,
-    fork_session_invocation,
+from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    TaskClaimLost,
+    TaskCreate,
+    TaskStatus,
+    TaskTerminalizationRequest,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.storage import (
-    InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    SQLiteBudgetLedger,
-    SQLiteSessionStore,
-)
-from cayu.tools import (
-    ExecCommandTool,
-    SubagentExecutionMode,
-    SubagentResultTool,
-    SubagentSpec,
-    SubagentTool,
+from cayu.tasks.dispatch import Dispatcher, DispatchHandle, DispatchRequest, DispatchStatus
+from cayu.tools.base import (
+    _POLICY_DENIAL_TEXT_MAX_BYTES,
+    _POLICY_DENIAL_TRUNCATION_MARKER,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    _bound_policy_denial_text,
 )
 from cayu.tools.commands import (
     CommandPolicy,
     CommandPolicyDecision,
     CommandPolicyResult,
     CommandRequest,
+    ExecCommandTool,
+)
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.grants import TargetedToolGrant
+from cayu.tools.policy import (
+    TAINT_LABELS_METADATA_KEY,
+    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
+    AllowAllToolPolicy,
+    AllowlistRule,
+    ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
+    StaticToolPolicy,
+    TaintAwareToolPolicy,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
+from cayu.tools.rounds import ToolRoundRecoveryRequest
+from cayu.tools.subagents import (
+    SubagentExecutionMode,
+    SubagentResultTool,
+    SubagentSpec,
+    SubagentTool,
 )
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import REDACTED_SECRET, ResolvedSecret, SecretRedactor, SecretRef, StaticVault
-from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.vaults.base import ResolvedSecret, SecretRef
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.static import StaticVault
+from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.workspaces.local import LocalWorkspace
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
@@ -1709,7 +1716,7 @@ def _interaction_started_event(
     interaction_id: str,
     agent_name: str,
 ) -> Event:
-    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
     event_id = f"{session_id}:interaction-started"
     started_at = datetime.now(UTC)
@@ -3685,7 +3692,7 @@ def test_cayu_app_passes_environment_knowledge_store_to_tools() -> None:
 
 
 def test_cayu_app_redacts_tool_results_before_events_transcript_and_context() -> None:
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "sk-runtime-secret-value"
 
@@ -3770,7 +3777,7 @@ def test_cayu_app_redacts_tool_results_before_events_transcript_and_context() ->
 
 
 def test_cayu_app_redacts_proxy_resolved_secrets_from_tool_results() -> None:
-    from cayu.vaults import REDACTED_SECRET
+    from cayu.vaults.redaction import REDACTED_SECRET
 
     secret_value = "sk-proxy-resolved-secret"
 
@@ -3869,7 +3876,7 @@ def test_cayu_app_redacts_proxy_resolved_secrets_from_tool_results() -> None:
 
 
 def test_cayu_app_emits_redacted_proxy_authorization_events() -> None:
-    from cayu.vaults import REDACTED_SECRET
+    from cayu.vaults.redaction import REDACTED_SECRET
 
     secret_value = "sk-authorized-proxy-secret"
 
@@ -4106,7 +4113,7 @@ def test_cayu_app_records_original_proxy_authorization_metadata() -> None:
 def test_cayu_app_redacts_proxy_secret_after_tool_mutates_resolved_secret() -> None:
     from pydantic import SecretStr
 
-    from cayu.vaults import REDACTED_SECRET
+    from cayu.vaults.redaction import REDACTED_SECRET
 
     secret_value = "sk-mutated-proxy-secret"
 
@@ -4380,7 +4387,7 @@ def test_cayu_app_rejects_invalid_proxy_resolve_scope_before_delegation() -> Non
 
 
 def test_cayu_app_rejects_invalid_proxy_authorization_metadata_before_delegation() -> None:
-    from cayu import DurableValueError
+    from cayu._validation import DurableValueError
 
     delegated: list[str] = []
     validation_codes: list[str] = []
@@ -4478,7 +4485,7 @@ def test_cayu_app_rejects_invalid_proxy_authorization_metadata_before_delegation
 
 
 def test_cayu_app_redacts_blocked_tool_result_event_payload() -> None:
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "BOUNDARY_SECRET_policy_value"
     raw_reason = "a" * 4050 + secret_value
@@ -4558,7 +4565,7 @@ def test_cayu_app_redacts_blocked_tool_result_event_payload() -> None:
 
 
 def test_cayu_app_bounds_policy_denial_after_secret_redaction_expands_it() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret_value = "qz"
     raw_reason = secret_value * 3000
@@ -4615,7 +4622,7 @@ def test_cayu_app_bounds_policy_denial_after_secret_redaction_expands_it() -> No
 
 
 def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() -> None:
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret_values = [
         "reason",
@@ -4713,7 +4720,7 @@ def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() 
 
 
 def test_command_policy_redacts_proxy_resolved_secret_before_bounding_denial() -> None:
-    from cayu.vaults import REDACTED_SECRET
+    from cayu.vaults.redaction import REDACTED_SECRET
 
     secret_value = "BOUNDARY_DYNAMIC_PROXY_SECRET"
     raw_prefix = "a" * 4050
@@ -5642,7 +5649,7 @@ def test_cayu_app_environment_factory_failure_fails_session_before_start_event(t
     assert provider.requests == []
     assert [record.message for record in transcript.records] == [Message.text("user", "run")]
     assert transcript.records[0].interaction_id is not None
-    from cayu.runtime.interactions import InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionSummaryEvidence
 
     evidence = InteractionSummaryEvidence.model_validate(lifecycle[0].event.payload)
     assert evidence.source_transcript_start == 0
@@ -5715,7 +5722,7 @@ def test_cayu_app_resume_factory_failure_retains_atomic_source_input(tmp_path):
         Message.text("user", "exact resume request")
     ]
     assert latest.event.type is EventType.INTERACTION_FAILED
-    from cayu.runtime.interactions import InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionSummaryEvidence
 
     evidence = InteractionSummaryEvidence.model_validate(latest.event.payload)
     assert evidence.source_transcript_start == transcript.records[0].index
@@ -8595,7 +8602,7 @@ def test_cayu_app_does_not_publish_fatal_only_bind_group_as_ordinary_failure():
 
 def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
     from cayu.runtime._binding_cleanup import BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "binding-finalize-secret"
     raw_message = f"finalize failed: {secret}: {'界' * 300}"
@@ -25266,7 +25273,7 @@ def test_unmodified_call_is_authorized_once_without_reauth_marker():
 
 
 def test_after_tool_call_hook_sees_redacted_arguments():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "sk-arg-secret"
     seen: dict[str, object] = {}
@@ -25347,7 +25354,7 @@ def test_after_tool_call_hook_sees_redacted_arguments():
 
 
 def test_composed_after_hook_never_sees_prior_hooks_raw_secret_result():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "sk-x"
     seen: dict[str, object] = {}
@@ -25775,7 +25782,7 @@ def test_after_tool_call_hooks_compose_app_then_agent_scope():
 
 
 def test_after_tool_call_modification_is_redacted():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "sk-injected-by-hook"
 
@@ -25890,7 +25897,7 @@ def test_tool_call_hooks_apply_to_subagent_tool_calls():
 
 
 def test_after_tool_call_hook_sees_redacted_result():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "sk-leaked-to-hook"
     seen: dict[str, object] = {}
@@ -27230,7 +27237,7 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
     ]
     assert transcript[1].content[0].type == "tool_call"
     assert transcript[1].content[0].tool_call_id == "call_successful_attempt"
-    from cayu.runtime.interactions import InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionSummaryEvidence
 
     evidence = InteractionSummaryEvidence.model_validate(interaction.payload)
     assert evidence.model_step_count == 3
@@ -29912,7 +29919,7 @@ def test_recovery_plan_keeps_ambiguous_external_effect_for_receipt_reconciliatio
 
 @pytest.mark.parametrize("effect", ["none", "idempotent"])
 def test_recovery_plan_preserves_manual_disposition_for_replay_safe_tools(effect) -> None:
-    from cayu import ToolEffect
+    from cayu.tools.base import ToolEffect
 
     # Calls are instrumentation. The pure variant only computes a result; the
     # mutating variant's fake downstream collapses writes by the runtime key.
@@ -33894,7 +33901,7 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
 
 @pytest.mark.parametrize("effect", ["none", "external"])
 def test_cayu_app_recover_tool_round_taints_follow_up_rounds(effect):
-    from cayu import ToolEffect
+    from cayu.tools.base import ToolEffect
 
     class RecordingTaintSourceTool(_TaintSourceTool):
         # The NONE variant computes a fixed untrusted result for manual recovery;
@@ -34101,7 +34108,7 @@ def test_cayu_app_recovery_does_not_complete_abandoned_end_turn_false_step():
 
 
 def test_cayu_app_recovery_terminalizes_the_original_durable_interaction():
-    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
     store = InMemorySessionStore()
     started_at = datetime.now(UTC) - timedelta(seconds=5)
@@ -34178,7 +34185,7 @@ def test_cayu_app_recovery_terminalizes_the_original_durable_interaction():
 
 
 def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch):
-    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
     monotonic = {"value": 10.0}
     wall = {"value": datetime(2026, 7, 27, tzinfo=UTC)}
@@ -34231,7 +34238,7 @@ def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch
 
 
 def test_interaction_summary_pages_more_than_5000_usage_events_without_failing():
-    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
@@ -36949,7 +36956,7 @@ def test_cayu_app_recover_incomplete_sessions_skips_unregistered_agent_and_conti
 
 
 def test_cayu_app_recover_incomplete_sessions_isolates_mid_batch_failure(monkeypatch):
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "batch-recovery-diagnostic-canary"
     store = InMemorySessionStore()
@@ -37615,8 +37622,8 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
 
 
 def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
+    from cayu.approvals.tools import PendingToolCallApproval
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.runtime.approvals import PendingToolCallApproval
     from cayu.runtime.execution_units import new_model_step_identity
 
     class BlockingApprovalClaimStore(InMemorySessionStore):
@@ -37744,7 +37751,7 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
 
 def test_tool_approval_resolution_rejects_partial_identity_without_mutation():
     from cayu.runtime import _approval_support as approval_support
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     async def run() -> None:
         session_id = "sess_approval_identity_mismatch"
@@ -38055,10 +38062,10 @@ def test_tool_approval_publication_acknowledgement_loss_preserves_atomic_pair():
 
 
 def test_tool_approval_requested_audit_metadata_is_bounded_and_redacted():
-    from cayu.runtime import PendingActionKind, PendingActionQuery
+    from cayu.approvals.tools import PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime.approvals import PendingToolCallApproval
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.sessions.base import PendingActionKind, PendingActionQuery
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "approval-audit-secret"
 
@@ -38627,7 +38634,7 @@ def test_resolution_actor_rejects_reserved_subject_for_request_sources():
         ResolutionActor(subject="cayu:approval-expiry")
     with pytest.raises(ValidationError, match="reserved for system actors"):
         ResolutionActor(subject="cayu:anything", source=ResolutionActorSource.REQUEST)
-    from cayu.runtime.approvals import EXPIRY_RESOLUTION_ACTOR_SUBJECT
+    from cayu.approvals.tools import EXPIRY_RESOLUTION_ACTOR_SUBJECT
 
     system_actor = ResolutionActor(
         subject=EXPIRY_RESOLUTION_ACTOR_SUBJECT,
@@ -42002,7 +42009,7 @@ def test_tool_approval_recovery_can_target_non_gating_call_in_same_round():
 
 
 def test_approval_continuation_redacts_metadata_before_next_tool_round_checkpoint():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "approval-continuation-metadata-secret"
     store = InMemorySessionStore()
@@ -42078,7 +42085,7 @@ def test_approval_continuation_redacts_metadata_before_next_tool_round_checkpoin
 
 
 def test_cayu_app_redacts_manual_tool_approval_recovery_result():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "manual-recovery-secret"
     store = FailingTerminalToolEventStore()
@@ -44346,7 +44353,7 @@ def test_observed_delta_context_estimator_counts_only_overhead_delta_after_ancho
 
 def test_observed_delta_context_estimator_uses_provider_specific_image_floor():
     estimator = ObservedDeltaContextEstimator(chars_per_token=5)
-    from cayu.core.messages import FilePart
+    from cayu.messages import FilePart
 
     user_image_message = Message(
         role="user",
@@ -44420,11 +44427,10 @@ def test_observed_delta_context_estimator_uses_adaptive_text_density():
         "Credentials stay outside the sandbox boundary. " * 100
     )
     dense_json = (
-        '{"path":"src/cayu/runtime/context.py","line":123,'
-        '"value":"x_y-z.abc/def","ok":true}\n' * 100
+        '{"path":"src/cayu/context/base.py","line":123,"value":"x_y-z.abc/def","ok":true}\n' * 100
     )
     pretty_json = (
-        '{\n  "path": "src/cayu/runtime/context.py",\n  "line": 123,\n'
+        '{\n  "path": "src/cayu/context/base.py",\n  "line": 123,\n'
         '  "value": "x_y-z.abc/def",\n  "ok": true\n}\n' * 100
     )
     logs = (
@@ -51608,9 +51614,7 @@ def test_automatic_compaction_predispatch_failure_does_not_charge_budget(monkeyp
         del request, kwargs
         raise ValueError("prompt construction failed")
 
-    monkeypatch.setattr(
-        "cayu.runtime.context._bounded_default_compaction_prompt", fail_before_request
-    )
+    monkeypatch.setattr("cayu.context.base._bounded_default_compaction_prompt", fail_before_request)
 
     app = CayuApp(
         budget_policy=BudgetPolicy(
@@ -58418,7 +58422,7 @@ def test_cayu_app_accepts_structured_output_final_tool_call():
 
 
 def test_cayu_app_redacts_structured_output_tool_result_before_transcript():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "sk-live-structured-output-secret"
     store = InMemorySessionStore()
@@ -58556,7 +58560,7 @@ def test_cayu_app_retries_invalid_structured_output_final_tool_call():
 
 
 def test_cayu_app_redacts_structured_output_tool_validation_errors():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "structured-output-error-secret"
     store = InMemorySessionStore()
@@ -58963,7 +58967,7 @@ def test_cayu_app_retries_invalid_native_structured_output_final_text():
 
 
 def test_cayu_app_redacts_native_structured_output_repair_prompt_errors():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "native-structured-output-error-secret"
     store = InMemorySessionStore()
@@ -59507,7 +59511,7 @@ def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
     assert "Validation errors:" in repair_message
     assert provider.requests[1].messages[-1].role == "user"
     assert provider.requests[1].messages[-1].content[0].text == repair_message
-    from cayu.runtime.interactions import InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionSummaryEvidence
 
     evidence = InteractionSummaryEvidence.model_validate(interaction_record.event.payload)
     assert evidence.model_step_count == 2
@@ -61992,7 +61996,7 @@ def test_cancelled_runner_cleanup_diagnostics_are_preserved_without_tool_termina
 
 
 def test_cancelled_runner_cleanup_diagnostics_are_redacted_in_tool_result():
-    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret_value = "cleanup-secret-token"
     cleanup_artifact = {
@@ -64372,7 +64376,7 @@ def test_tool_call_times_out_and_session_continues():
 
 def test_run_tool_does_not_mislabel_tool_raised_timeout_error():
     from cayu.runtime._tool_execution import run_tool
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     class TimeoutRaisingTool(Tool):
         spec = ToolSpec(
@@ -64992,12 +64996,12 @@ def test_cayu_config_validates_tool_execution_settings(kwargs):
 # max_steps, retry policy) so resolving does not restart with fresh defaults.
 # --------------------------------------------------------------------------- #
 def test_policy_denial_checkpoint_reasons_are_bounded_without_changing_approval_prompts():
+    from cayu.approvals.tools import PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
     from cayu.runtime import _resume_ledger as resume_ledger
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.runtime.approvals import PendingToolCallApproval
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import SecretRedactor
 
     secret = "BOUNDARY_SECRET_checkpoint_value"
     oversized = "a" * 4050 + secret
@@ -65055,7 +65059,7 @@ def test_policy_denial_checkpoint_reasons_are_bounded_without_changing_approval_
 
 
 def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
-    from cayu.runtime.approvals import (
+    from cayu.approvals.tools import (
         PendingToolApproval,
         PendingToolCallApproval,
         copy_pending_tool_approval,
@@ -65097,7 +65101,7 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
 
 
 def test_pending_tool_approval_loads_checkpoint_without_run_config():
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
 
     legacy = PendingToolApproval(
         approval_id="appr_legacy",
@@ -65125,7 +65129,7 @@ def test_pending_tool_approval_loads_checkpoint_without_run_config():
 def test_pending_tool_approval_rejects_checkpoint_without_explicit_publication_authority(
     authority: object,
 ):
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
 
     pending = PendingToolApproval(
         approval_id="appr_missing_publication_authority",

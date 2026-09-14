@@ -21,7 +21,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import (
+from cayu.events import (
     Event,
     EventType,
     event_with_runtime_envelope_authority,
@@ -51,7 +51,7 @@ from cayu.runtime.completion_result_resolvers import (
     CompletionResultUnavailable,
     copy_completion_result_resolution_request,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     Session,
     SessionStore,
     _complete_completion_result_event_publication,
@@ -59,8 +59,8 @@ from cayu.runtime.sessions import (
     _renew_completion_result_event_publication,
     _reserve_completion_result_event_publication,
 )
-from cayu.runtime.tasks import CompletionDecisionApplicationReceipt, Task
-from cayu.runtime.work_contracts import (
+from cayu.tasks.base import CompletionDecisionApplicationReceipt, Task
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionProposal,
@@ -70,10 +70,10 @@ from cayu.runtime.work_contracts import (
     WorkContract,
     completion_decision_application_request_sha256,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
 )
-from cayu.vaults import SecretRedactor
 
 _MAX_ACTIVE_RESULT_RESOLVERS = 64
 _PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)

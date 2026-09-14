@@ -9,22 +9,25 @@ from uuid import uuid4
 import pytest
 from worker_harness import BackendConfig, RecoveryHarness
 
-from cayu.core import EventType, ToolResultPart
-from cayu.runtime import CHECKPOINT_SCHEMA_VERSION_KEY, SessionStatus, TaskStatus
+from cayu.events import EventType
+from cayu.messages import ToolResultPart
 from cayu.runtime._event_projection import public_event_linkage_sequence
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
 )
-from cayu.runtime.checkpoints import (
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions.base import SessionStatus
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
-from cayu.runtime.execution_profiles import (
-    active_invocation_execution_profile_from_checkpoint,
-)
+from cayu.tasks.base import TaskStatus
 
 pytestmark = [
     pytest.mark.process,

@@ -10,10 +10,11 @@ import httpx
 
 from cayu import SQLiteSessionStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
+from cayu.approvals.user_input import PendingUserInput
 from cayu.cli import main
-from cayu.core import (
-    Event,
-    EventType,
+from cayu.events import Event, EventType
+from cayu.messages import (
     Message,
     MessageRole,
     ProviderStatePart,
@@ -21,16 +22,8 @@ from cayu.core import (
     ThinkingPart,
     ToolCallPart,
 )
-from cayu.runtime import (
-    InteractionStatus,
-    InteractionSummaryEvidence,
-    PendingToolApproval,
-    RunRequest,
-    SessionIdentity,
-    SessionStatus,
-)
-from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.user_input import PendingUserInput
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStatus
+from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
 
 def _budget_limit_id(value: int) -> str:
@@ -1614,8 +1607,8 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     monkeypatch,
     capsys,
 ) -> None:
+    import cayu.sessions.base as session_runtime
     from cayu.cli import session as session_cli
-    from cayu.runtime import sessions as session_runtime
 
     database = _write_project(tmp_path)
 
@@ -2101,7 +2094,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
 
 def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() -> None:
     from cayu.cli.session import _tool_call_rows, _tool_inspection_record
-    from cayu.runtime import EventRecord
+    from cayu.sessions.base import EventRecord
 
     records: list[EventRecord] = []
     sequence = 1
@@ -2153,7 +2146,7 @@ def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() ->
 
 def test_session_tool_rows_do_not_guess_missing_execution_identity() -> None:
     from cayu.cli.session import _tool_call_rows, _tool_inspection_record
-    from cayu.runtime import EventRecord
+    from cayu.sessions.base import EventRecord
 
     records = [
         _tool_inspection_record(

@@ -8,21 +8,21 @@ import pytest
 from pydantic import ValidationError
 
 import cayu
-import cayu.runtime.tool_exposure as exposure_contracts
-from cayu import (
+import cayu.tools.exposure as exposure_contracts
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.runtime import _execution_profile_admission as execution_profile_admission
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.tools.base import ToolEffect
+from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     TOOL_EXPOSURE_METADATA_MAX_BYTES,
-    AgentSpec,
     AllRegisteredToolsExposurePolicy,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
     RegisteredToolCapability,
-    RetryPolicy,
-    RunLimits,
-    SearchTextTool,
     StaticToolExposurePolicy,
     ToolCapabilityCeiling,
-    ToolEffect,
     ToolExposure,
     ToolExposureDecision,
     ToolExposurePolicy,
@@ -30,7 +30,7 @@ from cayu import (
     resolve_tool_capability_ceiling,
     resolve_tool_exposure,
 )
-from cayu.runtime import _execution_profile_admission as execution_profile_admission
+from cayu.tools.search import SearchTextTool
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
 

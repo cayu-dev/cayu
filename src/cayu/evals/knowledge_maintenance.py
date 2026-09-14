@@ -22,14 +22,14 @@ from cayu._validation import (
     require_durable_nonblank,
     require_finite,
 )
-from cayu.knowledge_maintenance import (
+from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRouter,
     KnowledgeMaintenanceRouterConfig,
     KnowledgeMaintenanceRoutingRequest,
     KnowledgeMaintenanceSignalKind,
 )
-from cayu.knowledge_maintenance_persistence import (
+from cayu.knowledge.maintenance_persistence import (
     KnowledgeMaintenanceProposalPublication,
     KnowledgeMaintenanceProposalPublicationOutcome,
     KnowledgeMaintenanceProposalPublisher,
@@ -37,7 +37,7 @@ from cayu.knowledge_maintenance_persistence import (
     copy_knowledge_maintenance_proposal_publication,
     copy_knowledge_maintenance_proposal_publication_receipt,
 )
-from cayu.knowledge_maintenance_planning import (
+from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenanceEvaluationFinding,
     KnowledgeMaintenanceEvaluationFindingCode,
     KnowledgeMaintenanceEvaluationFindingKind,
@@ -56,7 +56,7 @@ from cayu.knowledge_maintenance_planning import (
     KnowledgeMaintenanceRelationDraft,
     KnowledgeMaintenanceReplacementDraft,
 )
-from cayu.recall import (
+from cayu.memory.recall import (
     RECALL_MAX_QUERY_BYTES,
     KnowledgeRecallSource,
     RecallRecord,

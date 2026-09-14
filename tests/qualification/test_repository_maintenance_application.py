@@ -15,28 +15,24 @@ from hashlib import sha256
 import httpx
 import pytest
 
-from cayu import (
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.cli.project import project_context
+from cayu.coding_products import (
     CodingProductArtifactRepository,
     CodingProductState,
     CodingSettlementPolicy,
-    DockerImageIdentity,
-    EventQuery,
-    EventType,
-    ExecResult,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-    ModelPrice,
-    ModelStreamEvent,
-    PriceBook,
-    ScriptedModelProvider,
 )
-from cayu.cli.project import project_context
-from cayu.storage import SQLiteBudgetLedger
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import ExecResult
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import EventQuery, InMemorySessionStore
+from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.memory import InMemoryKnowledgeStore
+from cayu.tasks.base import InMemoryTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_application import maintenance_project_files

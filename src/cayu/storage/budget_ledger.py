@@ -16,8 +16,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_nonblank,
 )
-from cayu.core.billing import BillingIdentity, copy_billing_identity
-from cayu.runtime.budgets import (
+from cayu.budgets.base import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
     BudgetLimit,
@@ -48,6 +47,7 @@ from cayu.runtime.budgets import (
     copy_budget_settlement_fallback,
     new_budget_reservation_id,
 )
+from cayu.budgets.billing import BillingIdentity, copy_billing_identity
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     copy_model_attempt_identity,

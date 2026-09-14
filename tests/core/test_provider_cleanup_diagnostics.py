@@ -8,19 +8,17 @@ from pathlib import Path
 import httpx
 import pytest
 
-from cayu.core import AgentSpec, EventType, Message
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     copy_provider_cancellation_failures,
     provider_cancellation_failures,
 )
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    EventQuery,
-    IncompleteSessionRecoveryRequest,
-    RunRequest,
-)
+from cayu.sessions.base import EventQuery, IncompleteSessionRecoveryRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 CANARY = "secret-url-header-prompt-credential"

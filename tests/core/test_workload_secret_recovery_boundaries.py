@@ -15,26 +15,25 @@ from tests.core._workload_secret_support import (
 
 import cayu.runtime.execution_profiles as execution_profiles_module
 from cayu import CHECKPOINT_SCHEMA_VERSION_KEY
-from cayu.core import AgentSpec, EventType, Message
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    InMemorySessionStore,
-    RunRequest,
-    SessionStatus,
-    StructuredOutputSpec,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.checkpoints import (
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
+from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

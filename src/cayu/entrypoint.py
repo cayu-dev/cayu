@@ -7,9 +7,11 @@ import asyncio
 import sys
 from collections.abc import Callable
 
-from cayu.core import Message
-from cayu.runtime import CayuApp, RunRequest, run_to_completion
-from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.applications import CayuApp
+from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.messages import Message
+from cayu.sessions.base import RunRequest
+from cayu.sessions.outcomes import run_to_completion
 
 
 def run_project_entrypoint(

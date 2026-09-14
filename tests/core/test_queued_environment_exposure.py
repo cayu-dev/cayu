@@ -4,22 +4,18 @@ import asyncio
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    Environment,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
-    EventType,
-    Message,
-    ModelProvider,
-    RunRequest,
-    SessionMessageDeliveryMode,
 )
-from cayu.providers import ModelRequest, ModelStreamEvent
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.sessions.base import EnqueueSessionMessageRequest, RunRequest, SessionMessageDeliveryMode
 
 
 class _QueuedProvider(ModelProvider):
@@ -178,24 +174,21 @@ def test_queued_search_tool_preserves_exact_admission(
 ):
     from datetime import UTC, datetime, timedelta
 
-    from cayu import (
+    from cayu.environments.admission import (
         ExecutionAdmissionCandidate,
         ExecutionCapabilityEvidence,
-        InMemorySessionStore,
-        ResumeRequest,
-        SearchTextTool,
-        SQLiteSessionStore,
-        StopAfterCurrentToolRoundRequest,
-        ToolExecutableRequirement,
-    )
-    from cayu.environments.admission import (
         ExecutionExecutableEvidence,
         ExecutionToolRequirementEvidence,
     )
-    from cayu.runners import Runner
+    from cayu.runners.base import Runner
     from cayu.runtime import _environment_lifecycle
     from cayu.runtime._environment_exposure import require_environment_exposed
     from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+    from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
+    from cayu.sessions.base import InMemorySessionStore, ResumeRequest
+    from cayu.storage.sqlite import SQLiteSessionStore
+    from cayu.tools.base import ToolExecutableRequirement
+    from cayu.tools.search import SearchTextTool
 
     class EvidenceRunner(Runner):
         def __init__(self):

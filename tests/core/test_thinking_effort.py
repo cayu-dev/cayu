@@ -20,7 +20,7 @@ from cayu import (
     RunRequest,
     ThinkingConfig,
 )
-from cayu.core.thinking import ThinkingEffort
+from cayu.context.thinking import ThinkingEffort
 from cayu.providers import ModelRequest, ModelStreamEventType
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.bedrock import BedrockProvider, build_bedrock_converse_payload
@@ -42,8 +42,8 @@ def request(model: str, effort: str, **options) -> ModelRequest:
 
 @pytest.mark.parametrize("effort", EFFORTS)
 def test_effort_owned_public_and_durable_round_trips(effort) -> None:
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime.dispatch import DispatchRequest, copy_dispatch_request
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
+    from cayu.tasks.dispatch import DispatchRequest, copy_dispatch_request
 
     config = ThinkingConfig(effort=effort, include_in_transcript=False)
     values = [
@@ -289,7 +289,7 @@ def test_raw_neutral_options_cannot_bypass_contradictory_validation(builder) -> 
 def test_run_override_reaches_model_request(effort) -> None:
     from tests.core.test_thinking import _run
 
-    from cayu.core.thinking import thinking_config_payload
+    from cayu.context.thinking import thinking_config_payload
 
     provider, _events, _transcript = asyncio.run(
         _run(

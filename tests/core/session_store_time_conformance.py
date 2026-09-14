@@ -6,9 +6,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import cayu.sessions.base as sessions_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core import Event, Message
-from cayu.runtime import (
+from cayu.events import Event
+from cayu.messages import Message
+from cayu.sessions.base import (
     EventQuery,
     RunRequest,
     SessionIdentity,
@@ -18,7 +20,6 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
-from cayu.runtime import sessions as sessions_module
 
 
 async def assert_session_store_time_conformance(

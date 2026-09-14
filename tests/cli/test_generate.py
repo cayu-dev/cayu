@@ -19,7 +19,7 @@ from cayu.cli.generate import (
     plan_slice,
     plan_tool,
 )
-from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
+from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION
 
 
 def test_generator_plan_models_round_trip_the_current_schema_version() -> None:

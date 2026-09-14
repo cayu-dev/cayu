@@ -10,9 +10,15 @@ import pytest
 from pydantic import ValidationError
 
 from cayu import CayuApp, CayuConfig, OperationsConfig
-from cayu.core.messages import Message
+from cayu.messages import Message
 from cayu.runtime._recovery_coordinator import _run_recovery_cleanup_steps
-from cayu.runtime.recovery_cleanup import (
+from cayu.sessions.base import (
+    CheckpointTransform,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+)
+from cayu.sessions.cleanup import (
     RecoveryCleanupCapacityExceeded,
     RecoveryCleanupDeadlineExceeded,
     RecoveryCleanupDeadlineScope,
@@ -20,12 +26,6 @@ from cayu.runtime.recovery_cleanup import (
     RecoveryCleanupStep,
     RecoveryCleanupStepInput,
     RecoveryCleanupSupervisor,
-)
-from cayu.runtime.sessions import (
-    CheckpointTransform,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
 )
 
 
@@ -969,7 +969,7 @@ def test_recovery_cleanup_reports_late_failure_from_sequential_retained_owner(
         assert snapshot.completed_after_timeout == 0
         assert snapshot.failed_after_timeout == 1
 
-    with caplog.at_level("WARNING", logger="cayu.runtime.recovery_cleanup"):
+    with caplog.at_level("WARNING", logger="cayu.sessions.cleanup"):
         asyncio.run(scenario())
     messages = [record.getMessage() for record in caplog.records]
     assert any(

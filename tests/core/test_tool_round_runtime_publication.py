@@ -17,18 +17,24 @@ from tests.core._workload_secret_support import (
     collect_resume_events,
 )
 
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ToolResultPart,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.base import ContextPolicy, ContextRequest, validate_context_messages
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolResultPart
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    model_step_publication_from_checkpoint,
 )
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
+from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -38,25 +44,15 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
-from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    model_step_publication_from_checkpoint,
-)
-from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
-from cayu.runtime.context import ContextPolicy, ContextRequest, validate_context_messages
-from cayu.runtime.execution_profiles import (
-    active_invocation_execution_profile_from_checkpoint,
-)
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class _FailingTerminalToolEventStore(InMemorySessionStore):
@@ -99,8 +95,8 @@ class _EchoTool(Tool):
 def test_cancellation_publishes_completed_stage_without_reexecuting_tool(
     tmp_path, unfinished_sibling, backend, effect
 ):
-    from cayu.core.tools import ToolEffect
     from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+    from cayu.tools.base import ToolEffect
 
     class PausedTerminalMixin:
         def __init__(self, *args):

@@ -8,13 +8,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from cayu._validation import require_durable_clean_nonblank
+from cayu.agents import AgentSpec
 from cayu.browser_profiles import BrowserProfileBinding
-from cayu.core.agents import AgentSpec
-from cayu.core.execution_identity import (
-    ExecutionProfileBehaviorIdentity,
-    copy_execution_profile_behavior_identity,
-)
-from cayu.core.tools import ToolContext, ToolResult
 from cayu.environments import Environment, EnvironmentFactory
 from cayu.environments.admission import (
     ExecutionEnvironmentAuthority,
@@ -26,6 +21,11 @@ from cayu.runners import (
     PINNED_BROWSER_FETCH_WORKLOAD,
     PINNED_BROWSER_SESSION_WORKLOAD,
 )
+from cayu.runtime.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
+from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.browser import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     BROWSER_FETCH_PROTOCOL_VERSION,
@@ -50,7 +50,7 @@ from cayu.tools.web import (
 from cayu.vaults import SecretRef, copy_secret_ref
 
 if TYPE_CHECKING:
-    from cayu.runtime.app import CayuApp
+    from cayu.applications import CayuApp
     from cayu.tools.web_access import WebAccessRoutePolicy, WebBridgeRoute
 
 DEFAULT_WEBBRIDGE_BROWSER_IMAGE = PINNED_BROWSER_FETCH_WORKLOAD.image
@@ -494,7 +494,7 @@ class WebBridge:
     ) -> AgentSpec:
         """Validate this bridge against an app environment, then register its agent."""
 
-        from cayu.runtime.app import CayuApp
+        from cayu.applications import CayuApp
 
         if not isinstance(app, CayuApp):
             raise TypeError("app must be a CayuApp.")

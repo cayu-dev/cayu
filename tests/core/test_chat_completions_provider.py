@@ -10,53 +10,51 @@ import pytest
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 import cayu.providers.chat_completions as chat_completions_module
-from cayu import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.artifacts.attachments import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
-    ChatCompletionsProvider,
-    Event,
-    EventType,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
     FileAttachmentKind,
-    InMemorySessionStore,
-    Message,
-    RecentTurnsContextPolicy,
-    ResolutionActor,
-    ResolutionActorSource,
-    ResumeRequest,
-    RetryPolicy,
-    RunDefaults,
-    RunRequest,
     file_attachment,
 )
-from cayu.core.messages import FilePart, MessageRole, ProviderStatePart, TextPart, ToolCallPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import (
-    ChatCompletionsAPIError,
-    ChatCompletionsContextOverflowError,
-    ChatCompletionsProtocolError,
-    HttpxChatCompletionsTransport,
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import RecentTurnsContextPolicy
+from cayu.events import Event, EventType
+from cayu.messages import FilePart, Message, MessageRole, ProviderStatePart, TextPart, ToolCallPart
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
+from cayu.providers._sse import aiter_sse_json_events
+from cayu.providers.base import (
     ModelContextOverflowError,
     ModelFinishReason,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
-    ProviderStreamDeadlines,
     UsageDialect,
-    build_chat_completions_payload,
 )
-from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
-from cayu.providers._sse import aiter_sse_json_events
-from cayu.providers.chat_completions import chat_completions_stream_events
-from cayu.tools import ListArtifactsTool, ListFilesTool, ReadFileTool
+from cayu.providers.chat_completions import (
+    ChatCompletionsAPIError,
+    ChatCompletionsContextOverflowError,
+    ChatCompletionsProtocolError,
+    ChatCompletionsProvider,
+    HttpxChatCompletionsTransport,
+    build_chat_completions_payload,
+    chat_completions_stream_events,
+)
+from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+)
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.files import ListArtifactsTool, ListFilesTool, ReadFileTool
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -3190,6 +3188,7 @@ async def test_chat_completions_transport_classifies_gemini_context_too_long(
             headers: dict[str, str],
             json: dict[str, Any],
             timeout: Any = None,
+            extensions: dict[str, Any] | None = None,
         ) -> ResponseContext:
             return ResponseContext()
 
@@ -3313,6 +3312,7 @@ async def test_chat_transport_rejects_conflicting_http_context_identity(monkeypa
             headers: dict[str, str],
             json: dict[str, Any],
             timeout: Any = None,
+            extensions: dict[str, Any] | None = None,
         ) -> ResponseContext:
             del method, url, headers, json, timeout
             return ResponseContext()
@@ -3378,6 +3378,7 @@ async def test_chat_completions_transport_does_not_classify_quota_exhausted(
             headers: dict[str, str],
             json: dict[str, Any],
             timeout: Any = None,
+            extensions: dict[str, Any] | None = None,
         ) -> ResponseContext:
             return ResponseContext()
 

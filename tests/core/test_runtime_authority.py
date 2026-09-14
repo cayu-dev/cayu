@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.core.runtime_authority import (
+from cayu.runtime.authority import (
     CheckpointValueAuthority,
     checkpoint_value_authority,
 )

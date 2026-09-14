@@ -10,13 +10,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._exception_groups import exception_group_children
-from cayu._knowledge_publication_owner import (
-    KnowledgePublicationCapacityExhausted,
-    KnowledgePublicationLifecycle,
-    KnowledgePublicationOperationConflict,
-    KnowledgePublicationOwnerClosed,
-    RetainedKnowledgePublicationOwner,
-)
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_json_value,
@@ -27,8 +20,14 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.knowledge_governance import (
+from cayu.knowledge._publication import (
+    KnowledgePublicationCapacityExhausted,
+    KnowledgePublicationLifecycle,
+    KnowledgePublicationOperationConflict,
+    KnowledgePublicationOwnerClosed,
+    RetainedKnowledgePublicationOwner,
+)
+from cayu.knowledge.governance import (
     REVIEWED_ROUTING_POLICY_IDENTITY,
     REVIEWED_ROUTING_POLICY_VERSION,
     KnowledgeActivationPolicy,
@@ -96,7 +95,8 @@ from cayu.tools._redaction import (
     record_ambiguous_secret_output,
     unstable_secret_redaction_result,
 )
-from cayu.vaults import SecretRedactor
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_KNOWLEDGE_TOOL_LIMIT = DEFAULT_KNOWLEDGE_LIMIT
 MAX_KNOWLEDGE_TOOL_LIMIT = 25

@@ -7,9 +7,11 @@ import warnings
 
 import pytest
 
-from cayu import LocalArtifactStore, RemoteGitHttpCredentials
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.cli.project import project_context
-from cayu.vaults import LocalEnvVault, SecretRef
+from cayu.delivery.git import RemoteGitHttpCredentials
+from cayu.vaults.base import SecretRef
+from cayu.vaults.local_env import LocalEnvVault
 from tests.qualification.test_repository_maintenance_application import project as project
 from tests.qualification.test_repository_maintenance_delivery_configuration import authority
 

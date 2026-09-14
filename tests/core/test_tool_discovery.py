@@ -7,14 +7,13 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import AgentSpec, EventType, ExecutionProfileBehaviorIdentity, Message
-from cayu.core.tools import (
-    DurableToolOperationConflict,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.context.base import MessageWindowContextPolicy
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.observability.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
 from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
@@ -22,22 +21,19 @@ from cayu.providers.base import (
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     ToolDiscoveryProjectionResult,
 )
-from cayu.runtime import (
-    CayuApp,
-    ForkSessionRequest,
-    InMemorySessionStore,
-    MessageWindowContextPolicy,
-    ResumeRequest,
-    RetryPolicy,
-    RunRequest,
-    StaticToolExposurePolicy,
-    TargetedToolGrant,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import ForkSessionRequest, InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import (
+    DurableToolOperationConflict,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
 )
-from cayu.runtime.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
-from cayu.runtime.tool_catalogue import build_tool_catalog_snapshot, build_tool_descriptor
-from cayu.runtime.tool_discovery import (
+from cayu.tools.catalogue import build_tool_catalog_snapshot, build_tool_descriptor
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryMode,
     ToolDiscoveryProjectionKind,
@@ -49,15 +45,15 @@ from cayu.runtime.tool_discovery import (
     search_tool_descriptors,
     search_tools_spec,
 )
-from cayu.runtime.tool_exposure import ToolCapabilityCeiling
-from cayu.runtime.tool_gateway import call_tool_spec
-from cayu.runtime.tool_policy import (
+from cayu.tools.exposure import StaticToolExposurePolicy, ToolCapabilityCeiling
+from cayu.tools.gateway import call_tool_spec
+from cayu.tools.grants import TargetedToolGrant
+from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
 )
-from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

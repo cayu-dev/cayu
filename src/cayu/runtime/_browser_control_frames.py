@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 
 from cayu.runtime._browser_control_channel import BoundBrowserGuest
-from cayu.runtime.browser_control import BrowserControlConflict, BrowserControlPage
+from cayu.tools.browser_control import BrowserControlConflict, BrowserControlPage
 
 MAX_BROWSER_FRAME_BYTES = 2 * 1024 * 1024
 MAX_BROWSER_FRAME_HEADER_BYTES = 4096

@@ -14,16 +14,16 @@ from cayu import (
     ReadKnowledgeTool,
     ToolContext,
 )
-from cayu.core.messages import Message
-from cayu.memory import AutomaticRecallMode, admit_recall
-from cayu.providers.base import ModelRequest
-from cayu.runtime._memory_evidence import _provider_representation_hashes
-from cayu.runtime.memory_context import (
+from cayu.memory.base import AutomaticRecallMode, admit_recall
+from cayu.memory.context import (
     _contribution_projection,
     _provider_projection,
     _render_projection,
     _serialize_provider_value,
 )
+from cayu.messages import Message
+from cayu.providers.base import ModelRequest
+from cayu.runtime._memory_evidence import _provider_representation_hashes
 from cayu.vaults import SecretRedactor
 
 
@@ -145,7 +145,7 @@ def test_offer_description_resolves_exact_revision_through_read_tool():
 def test_preview_ticket_rejects_description_tampering():
     import pytest
 
-    from cayu.memory import RecallOffer
+    from cayu.memory.base import RecallOffer
 
     contribution = _fixture()
     payload = contribution.offer.model_dump(mode="json")

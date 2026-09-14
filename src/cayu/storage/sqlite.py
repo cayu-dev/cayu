@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
 
+from cayu.budgets.pricing import PriceBook
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime.costs import PriceBook
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConditions,
@@ -26,7 +26,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
     session_message_rejection,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageInspection,
 )
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
-    from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
 
 from pydantic import ValidationError
 
@@ -51,16 +51,15 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu.core.events import (
+from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
+from cayu.budgets.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
+from cayu.events import (
     EVENT_ID_MAX_CHARS,
     Event,
     EventType,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import Message, MessageRole
-from cayu.core.runtime_authority import CheckpointValueAuthority
-from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
-from cayu.memory_evidence import (
+from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
     ContextExposurePage,
@@ -86,6 +85,7 @@ from cayu.memory_evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
+from cayu.messages import Message, MessageRole
 from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleOccurrence,
@@ -106,8 +106,7 @@ from cayu.runtime._work_attempt_lifecycle_policy import (
     plan_work_attempt_lifecycle_settlement,
     plan_work_attempt_preparation_hold,
 )
-from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
-from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
+from cayu.runtime.authority import CheckpointValueAuthority
 from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
@@ -126,11 +125,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileRejectionResult,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
-from cayu.runtime.interactions import (
-    INTERACTION_LIFECYCLE_EVENT_TYPES,
-    INTERACTION_TERMINAL_EVENT_TYPES,
-)
-from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
 from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptAuthority,
     LocalExecutionAttemptConflict,
@@ -153,7 +147,15 @@ from cayu.runtime.local_execution_attempts import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
-from cayu.runtime.sessions import (
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    copy_work_attempt_lifecycle_settlement,
+    copy_work_attempt_preparation_hold,
+    work_attempt_lifecycle_settlement_sha256,
+    work_attempt_preparation_hold_sha256,
+)
+from cayu.sessions.base import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
@@ -483,7 +485,45 @@ from cayu.runtime.sessions import (
     transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
-from cayu.runtime.tasks import (
+from cayu.sessions.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+)
+from cayu.sessions.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
+from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import _sqlite_aggregates as sqlite_aggregates
+from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import migrations as schema
+from cayu.tasks.admission import (
+    WORK_ATTEMPT_RENEWABLE_STATES,
+    AdmittedCompletionProposalRequest,
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionActivate,
+    WorkAttemptAdmissionConflict,
+    WorkAttemptAdmissionPrepare,
+    WorkAttemptAdmissionState,
+    WorkAttemptContinuationContext,
+    WorkAttemptExecutionClaim,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionEntryDisposition,
+    WorkAttemptExecutionEntryRequest,
+    WorkAttemptExecutionEntryResult,
+    WorkAttemptExecutionStopRequest,
+    WorkAttemptRecoveryActivate,
+    copy_admitted_completion_proposal_request,
+    copy_work_attempt_admission_activate,
+    copy_work_attempt_admission_prepare,
+    copy_work_attempt_execution_claim_request,
+    copy_work_attempt_execution_entry_request,
+    copy_work_attempt_execution_stop_request,
+    copy_work_attempt_recovery_activate,
+    renewed_work_attempt_execution_claim,
+    work_attempt_admission_prepare_matches_sha256,
+    work_attempt_admission_prepare_sha256,
+    work_attempt_execution_claim_request_sha256,
+)
+from cayu.tasks.base import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -600,77 +640,7 @@ from cayu.runtime.tasks import (
     prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
 )
-from cayu.runtime.tool_exposure import ToolCapabilityCeiling
-from cayu.runtime.tool_grants import (
-    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
-    TARGETED_TOOL_GRANT_MAX_REQUESTS,
-    TARGETED_TOOL_REFERENCE_FIELD_NAME,
-    TargetedToolGrantIssueOutcome,
-    TargetedToolGrantIssueResult,
-    TargetedToolGrantReconstructionResult,
-    TargetedToolGrantRecord,
-    TargetedToolGrantStateSnapshot,
-    TargetedToolUseBinding,
-    TargetedToolUseDisposition,
-    TargetedToolUseRejectionReason,
-    TargetedToolUseRequest,
-    TargetedToolUseResult,
-    copy_targeted_tool_grant_record,
-    targeted_tool_grant_event,
-    targeted_tool_grant_reconstruction_rejection_reason,
-    targeted_tool_grant_with_active_reference,
-    targeted_tool_unresolved_rejection_event,
-    targeted_tool_use_binding,
-    targeted_tool_use_rejection_event,
-    targeted_tool_use_rejection_reason,
-    targeted_tool_use_scope_rejection_reason,
-    validate_targeted_tool_grant_batch_evidence,
-    validate_targeted_tool_grant_issuance_evidence,
-    validate_targeted_tool_grant_lifecycle_event,
-    validate_targeted_tool_grant_reference,
-    validate_targeted_tool_grant_revocation_evidence,
-    validate_targeted_tool_grant_revocation_reason,
-    validate_targeted_tool_unresolved_rejection_evidence,
-    validate_targeted_tool_use_rejection_evidence,
-)
-from cayu.runtime.work_attempt_admission import (
-    WORK_ATTEMPT_RENEWABLE_STATES,
-    AdmittedCompletionProposalRequest,
-    WorkAttemptAdmission,
-    WorkAttemptAdmissionActivate,
-    WorkAttemptAdmissionConflict,
-    WorkAttemptAdmissionPrepare,
-    WorkAttemptAdmissionState,
-    WorkAttemptContinuationContext,
-    WorkAttemptExecutionClaim,
-    WorkAttemptExecutionClaimLost,
-    WorkAttemptExecutionClaimRequest,
-    WorkAttemptExecutionEntryDisposition,
-    WorkAttemptExecutionEntryRequest,
-    WorkAttemptExecutionEntryResult,
-    WorkAttemptExecutionStopRequest,
-    WorkAttemptRecoveryActivate,
-    copy_admitted_completion_proposal_request,
-    copy_work_attempt_admission_activate,
-    copy_work_attempt_admission_prepare,
-    copy_work_attempt_execution_claim_request,
-    copy_work_attempt_execution_entry_request,
-    copy_work_attempt_execution_stop_request,
-    copy_work_attempt_recovery_activate,
-    renewed_work_attempt_execution_claim,
-    work_attempt_admission_prepare_matches_sha256,
-    work_attempt_admission_prepare_sha256,
-    work_attempt_execution_claim_request_sha256,
-)
-from cayu.runtime.work_attempt_lifecycle import (
-    WorkAttemptLifecycleSettlement,
-    WorkAttemptPreparationHold,
-    copy_work_attempt_lifecycle_settlement,
-    copy_work_attempt_preparation_hold,
-    work_attempt_lifecycle_settlement_sha256,
-    work_attempt_preparation_hold_sha256,
-)
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionDecisionCreate,
@@ -705,10 +675,40 @@ from cayu.runtime.work_contracts import (
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
 )
-from cayu.storage import _session_store_sql as session_store_sql
-from cayu.storage import _sqlite_aggregates as sqlite_aggregates
-from cayu.storage import _sqlite_support as sqlite_support
-from cayu.storage import migrations as schema
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.grants import (
+    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    TARGETED_TOOL_GRANT_MAX_REQUESTS,
+    TARGETED_TOOL_REFERENCE_FIELD_NAME,
+    TargetedToolGrantIssueOutcome,
+    TargetedToolGrantIssueResult,
+    TargetedToolGrantReconstructionResult,
+    TargetedToolGrantRecord,
+    TargetedToolGrantStateSnapshot,
+    TargetedToolUseBinding,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
+    TargetedToolUseResult,
+    copy_targeted_tool_grant_record,
+    targeted_tool_grant_event,
+    targeted_tool_grant_reconstruction_rejection_reason,
+    targeted_tool_grant_with_active_reference,
+    targeted_tool_unresolved_rejection_event,
+    targeted_tool_use_binding,
+    targeted_tool_use_rejection_event,
+    targeted_tool_use_rejection_reason,
+    targeted_tool_use_scope_rejection_reason,
+    validate_targeted_tool_grant_batch_evidence,
+    validate_targeted_tool_grant_issuance_evidence,
+    validate_targeted_tool_grant_lifecycle_event,
+    validate_targeted_tool_grant_reference,
+    validate_targeted_tool_grant_revocation_evidence,
+    validate_targeted_tool_grant_revocation_reason,
+    validate_targeted_tool_unresolved_rejection_evidence,
+    validate_targeted_tool_use_rejection_evidence,
+)
+from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
@@ -1627,7 +1627,7 @@ def _insert_event_rows_in_transaction(
     activity_at: datetime,
 ) -> None:
     """Insert prepared events after the transaction owner has authorized them."""
-    from cayu.runtime.pending_actions import pending_action_event_storage_values
+    from cayu.sessions.pending_actions import pending_action_event_storage_values
 
     _publish_budget_reservation_identities(connection, list(events))
     rows = []
@@ -3583,7 +3583,7 @@ class SQLiteSessionStore(SessionStore):
         result_checkpoint_transform: CheckpointTransform | None = None,
         operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         request = copy_run_request(request)
         identity = copy_session_identity(identity)
@@ -4192,7 +4192,7 @@ class SQLiteSessionStore(SessionStore):
                         ),
                     )
                 if events:
-                    from cayu.runtime.pending_actions import pending_action_event_storage_values
+                    from cayu.sessions.pending_actions import pending_action_event_storage_values
 
                     _touch_session_activity(self._connection, fork.id, self._ownership_clock())
                     rows = []
@@ -5233,7 +5233,7 @@ class SQLiteSessionStore(SessionStore):
         expected_latest_interaction_event_id: str | None = None,
         require_no_active_model_completion_dispatch: bool = False,
     ) -> Session:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -5701,7 +5701,7 @@ class SQLiteSessionStore(SessionStore):
         decision: ExecutionProfileDecision | None = None,
         expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
     ) -> ExecutionProfileRejectionResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         (
             session_id,
@@ -6147,7 +6147,7 @@ class SQLiteSessionStore(SessionStore):
         terminalization_only: bool = False,
         terminalization_plan_ownership: Any = None,
     ) -> InteractionTransitionResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         expected_invocation_authority_state = (
             _validate_interaction_transition_invocation_authority_parameters(
@@ -7110,7 +7110,7 @@ class SQLiteSessionStore(SessionStore):
         workflow_name: str,
         attempt_id: str,
     ) -> bool:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id, copied_event, workflow_name, attempt_id = _copy_workflow_step_reservation(
             session_id,
@@ -7237,7 +7237,7 @@ class SQLiteSessionStore(SessionStore):
         baseline_updates: dict[str, McpManifestBaseline],
         events: list[Event],
     ) -> McpManifestPublicationResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id, expected, updates, copied_events = _copy_mcp_manifest_publication(
             session_id,
@@ -7936,7 +7936,7 @@ class SQLiteSessionStore(SessionStore):
         request = copy_enqueue_session_message_request(request)
 
         def statement(connection: sqlite3.Connection) -> EnqueueSessionMessageResult:
-            from cayu.runtime.pending_actions import pending_action_event_storage_values
+            from cayu.sessions.pending_actions import pending_action_event_storage_values
 
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -8178,7 +8178,7 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
 
         def statement(connection: sqlite3.Connection) -> SessionMessageDeliveryBatch:
-            from cayu.runtime.pending_actions import pending_action_event_storage_values
+            from cayu.sessions.pending_actions import pending_action_event_storage_values
 
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -9945,7 +9945,7 @@ class SQLiteSessionStore(SessionStore):
         *,
         _model_completion_stage: _ModelCompletionStagePromotionContext | None = None,
     ) -> RuntimePublicationResult:
-        from cayu.runtime.pending_actions import (
+        from cayu.sessions.pending_actions import (
             pending_action_event_storage_values,
             pending_action_lookup_key,
         )
@@ -10617,7 +10617,7 @@ class SQLiteSessionStore(SessionStore):
         expected_transcript_cursor: int | None,
         preserve_completion_result_publications: bool,
     ) -> Session:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id, copied_events = _copy_session_event_batch(session_id, events)
         transform_count = sum(
@@ -10899,7 +10899,7 @@ class SQLiteSessionStore(SessionStore):
         *,
         limits: SessionExportLimits | None = None,
     ) -> SessionExportSnapshot | None:
-        from cayu.runtime.exports import SESSION_EXPORT_PAGE_SIZE, SessionExportBuilder
+        from cayu.sessions.exports import SESSION_EXPORT_PAGE_SIZE, SessionExportBuilder
 
         session_id = require_clean_nonblank(session_id, "session_id")
         from cayu.storage._session_export_sql import export_size_statement
@@ -11015,7 +11015,7 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         input_id: str,
     ) -> list[Event]:
-        from cayu.runtime.pending_actions import pending_action_lookup_key
+        from cayu.sessions.pending_actions import pending_action_lookup_key
 
         session_id = require_clean_nonblank(session_id, "session_id")
         input_id = require_clean_nonblank(input_id, "input_id")
@@ -11049,7 +11049,7 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         tool_call_ids: list[str] | tuple[str, ...],
     ) -> list[Event]:
-        from cayu.runtime.pending_actions import pending_action_lookup_key
+        from cayu.sessions.pending_actions import pending_action_lookup_key
 
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
@@ -11091,7 +11091,7 @@ class SQLiteSessionStore(SessionStore):
         *,
         tool_round_identity: ToolRoundIdentity,
     ) -> list[Event]:
-        from cayu.runtime.pending_actions import pending_action_lookup_key
+        from cayu.sessions.pending_actions import pending_action_lookup_key
 
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
@@ -13159,7 +13159,7 @@ class SQLiteSessionStore(SessionStore):
         *,
         checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> PendingActionListResult:
-        from cayu.runtime.pending_actions import (
+        from cayu.sessions.pending_actions import (
             pending_action_from_records,
             pending_action_matches_query,
             pending_action_source_is_invalid,

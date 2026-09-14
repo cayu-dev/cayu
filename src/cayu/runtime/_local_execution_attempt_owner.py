@@ -50,8 +50,8 @@ from cayu.runtime.local_execution_attempts import (
 )
 
 if TYPE_CHECKING:
-    from cayu.runtime.app import CayuApp
-    from cayu.runtime.tasks import TaskStore
+    from cayu.applications import CayuApp
+    from cayu.tasks.base import TaskStore
 
 
 _MEMFD_CLOEXEC = 0x0001
@@ -668,7 +668,7 @@ async def _prepare_current_local_execution_attempt(
 ) -> tuple[LocalExecutionAttemptAuthority, LocalExecutionAttemptRecord]:
     """Bind preparation to a current claim without crossing task lineage."""
 
-    from cayu.runtime.tasks import TaskClaimLost
+    from cayu.tasks.base import TaskClaimLost
 
     original = authority
     current = authority

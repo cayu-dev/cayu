@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_durable_metadata, copy_json_value, require_clean_nonblank
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message, MessageRole, copy_message
+from cayu.messages import Message, MessageRole, copy_message
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 if TYPE_CHECKING:
     from cayu.runtime.model_steps import AssistantStepResult, StepClassification
-    from cayu.runtime.sessions import Session
+    from cayu.sessions.base import Session
 
 
 class BeforeStopAction(StrEnum):

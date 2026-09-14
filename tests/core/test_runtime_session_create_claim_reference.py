@@ -6,19 +6,23 @@ from dataclasses import dataclass
 
 import pytest
 
+import cayu.sessions.base as sessions_module
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core import Event, EventType, Message
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.runtime import _session_request_boundary as session_request_boundary
-from cayu.runtime import sessions as sessions_module
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     SESSION_CREATE_CLAIM_METADATA_KEY,
     DeferredInteractionInput,
+    InMemorySessionStore,
+    RunRequest,
     RuntimeSessionCreateClaimAuthenticationDisposition,
     RuntimeSessionCreateClaimReference,
     RuntimeSessionCreateClaimReferenceKey,
     Session,
     SessionExecutionSource,
+    SessionIdentity,
+    SessionStatus,
     authenticate_runtime_session_create_claim_reference,
     bind_runtime_session_create_claim,
     copy_run_request,

@@ -22,17 +22,18 @@ from tests.core._session_operation_fault_harness import (
     SessionOperationSelector,
 )
 
-from cayu.core import Event, EventType
-from cayu.core.tools import DurableToolOperationConflict
-from cayu.runtime import RunRequest, SessionIdentity
-from cayu.runtime.sessions import (
+from cayu.events import Event, EventType
+from cayu.sessions.base import (
     INTERACTION_TRANSITION_OPERATION_KEY_PREFIX,
     INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
+    RunRequest,
+    SessionIdentity,
     SessionOperationPublication,
     SessionStore,
 )
+from cayu.tools.base import DurableToolOperationConflict
 
 
 def _identity() -> SessionIdentity:

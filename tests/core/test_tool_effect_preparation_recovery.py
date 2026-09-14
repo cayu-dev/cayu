@@ -8,39 +8,39 @@ import pytest
 from pydantic import SecretStr
 from tests.core.test_workspace_mutation_receipts import _portable_environment_spec
 
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
+from cayu._exception_groups import exception_cause
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.environments.base import Environment
+from cayu.environments.bindings import DeterministicWorkspaceBinding
+from cayu.messages import Message, ToolResultPart
+from cayu.providers.base import ModelProvider, ModelStreamEvent
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
-    Message,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+)
+from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     RecoveryPlanAction,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
-    ResumeRequest,
-    RunRequest,
-    StaticToolExposurePolicy,
-    TargetedToolGrant,
-    Tool,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolResult,
-    ToolSpec,
 )
-from cayu._exception_groups import exception_cause
-from cayu.core import ToolResultPart
-from cayu.environments import DeterministicWorkspaceBinding, Environment
-from cayu.providers import ModelProvider, ModelStreamEvent
-from cayu.runtime import InMemorySessionStore, UserInputResponse
-from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.workspace_observation_recovery import workspace_observations_from_checkpoint
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolResult, ToolSpec
+from cayu.tools.exposure import StaticToolExposurePolicy
+from cayu.tools.grants import TargetedToolGrant
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import SecretRedactor
-from cayu.workspaces import LocalWorkspace
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.local import LocalWorkspace
+from cayu.workspaces.observation_recovery import workspace_observations_from_checkpoint
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

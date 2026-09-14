@@ -15,6 +15,11 @@ export default defineConfig({
     },
   },
   build: {
+    modulePreload: {
+      // Traversal order can differ across build platforms. Preload order does
+      // not control module evaluation; keep the packaged bytes reproducible.
+      resolveDependencies: (_filename, dependencies) => [...dependencies].sort(),
+    },
     // Emit the licenses for modules that actually survive bundling. The
     // post-build finalizer adds CSS and registry-generated source that Vite's
     // JavaScript module graph cannot discover.

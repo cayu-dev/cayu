@@ -9,13 +9,13 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from cayu import (
+from cayu.environments.docker_toolchains import (
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    LocalWorkspace,
     verify_docker_coding_toolchain_dependencies,
 )
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.workspaces.local import LocalWorkspace
 from tests.qualification.repository_maintenance_case import SEED_FILES
 from tests.qualification.repository_maintenance_probe import PROBE_PROGRAM_PATH, probe_program
 from tests.qualification.repository_maintenance_toolchain import (

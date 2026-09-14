@@ -8,23 +8,16 @@ import pytest
 from tests.core.test_builtin_tools import TINY_PNG_BYTES, AttachmentTool
 from tests.core.test_foreground_subagent_recovery import _app, _identity, _Provider
 
-from cayu import (
-    ArtifactScope,
-    Environment,
-    EnvironmentSpec,
-    ExecutionProfileMismatchError,
-    InMemorySessionStore,
-    LocalArtifactStore,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    SessionQuery,
-    SQLiteSessionStore,
-    SubagentTool,
-)
-from cayu.core import ToolResultPart
-from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.runtime import UserInputResponse
+from cayu.approvals.user_input import UserInputResponse
+from cayu.artifacts.base import ArtifactScope
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.messages import Message, ToolResultPart
+from cayu.providers.base import ModelRequest, ModelStreamEvent
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionQuery
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.subagents import SubagentTool
 from cayu.tools.user_input import UserInputTool
 
 

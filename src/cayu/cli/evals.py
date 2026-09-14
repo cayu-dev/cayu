@@ -9,54 +9,56 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
+from cayu.applications import CayuApp
 from cayu.cli._output import add_output_options
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
-from cayu.evals import (
-    CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
-    EVAL_RESULT_REPORT_MAX_BYTES,
-    MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
-    CapturedEvaluationResultV1,
-    CorpusExecutionResult,
-    CorpusTarget,
+from cayu.evals._admission import LaunchAdmission, admission_scope
+from cayu.evals.corpus import (
     EvalCorpusDocument,
-    EvalPlan,
-    EvalRun,
-    EvalStatus,
-    EvalSuite,
-    MemoryExperimentReport,
-    WorkflowEvalTarget,
-    build_memory_experiment_report,
-    captured_evaluation_result_from_json,
-    compare_eval_results,
-    compare_eval_runs,
-    comparison_to_json,
+    eval_corpus_inspection_to_json,
+    inspect_eval_corpus,
+    load_eval_corpus,
+    merge_eval_corpus_files,
+)
+from cayu.evals.execution import CorpusExecutionResult, CorpusTarget, WorkflowEvalTarget
+from cayu.evals.execution_comparison import compare_eval_results
+from cayu.evals.execution_reporting import (
+    CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
     corpus_execution_comparison_to_json,
     corpus_execution_result_to_json,
-    eval_corpus_inspection_to_json,
-    eval_result_report_from_json,
     eval_result_report_to_json,
-    eval_run_to_json,
-    inspect_eval_corpus,
     load_corpus_execution_result,
-    load_eval_corpus,
-    load_eval_run,
-    memory_experiment_report_from_json,
-    memory_experiment_report_to_json,
-    memory_experiment_request_from_json,
-    merge_eval_corpus_files,
-    present_eval_result,
-    render_comparison_html,
     render_corpus_execution_comparison_html,
     render_corpus_execution_html,
     render_eval_result_html,
-    render_html_report,
-    render_memory_experiment_report_html,
-    run_eval_plan,
 )
-from cayu.evals._admission import LaunchAdmission, admission_scope
+from cayu.evals.memory_reporting import (
+    MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
+    MemoryExperimentReport,
+    build_memory_experiment_report,
+    memory_experiment_report_from_json,
+    memory_experiment_report_to_json,
+    memory_experiment_request_from_json,
+    render_memory_experiment_report_html,
+)
+from cayu.evals.models import EvalRun, EvalStatus
+from cayu.evals.reporting import (
+    compare_eval_runs,
+    comparison_to_json,
+    eval_run_to_json,
+    load_eval_run,
+    render_comparison_html,
+    render_html_report,
+)
+from cayu.evals.result_presentation import (
+    EVAL_RESULT_REPORT_MAX_BYTES,
+    eval_result_report_from_json,
+    present_eval_result,
+)
+from cayu.evals.results import CapturedEvaluationResultV1, captured_evaluation_result_from_json
+from cayu.evals.runner import EvalPlan, EvalSuite, run_eval_plan
 from cayu.runtime._process_workers import positive_process_count
-from cayu.runtime.app import CayuApp
 
 
 def add_eval_parser(subparsers: Any) -> None:

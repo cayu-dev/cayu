@@ -14,37 +14,31 @@ from pathlib import Path
 
 import pytest
 
-import cayu.runtime.sessions as sessions_runtime
-import cayu.runtime.tasks as tasks_runtime
+import cayu.sessions.base as sessions_runtime
 import cayu.support_bundles as support_bundles
-from cayu import (
-    CayuApp,
-    CayuConfig,
-    Environment,
+import cayu.tasks.base as tasks_runtime
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.configuration import CayuConfig, OperationsConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.lifecycle import (
     EnvironmentLifecycleOperation,
     EnvironmentLifecyclePhase,
     EnvironmentLifecycleProgress,
     EnvironmentLifecycleProgressStatus,
-    EnvironmentSpec,
-    Event,
-    EventType,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-    McpManifestPolicy,
-    McpServerSpec,
-    OperationsConfig,
+)
+from cayu.events import Event, EventType
+from cayu.mcp.base import McpServerSpec
+from cayu.runtime.checks import check_manifest
+from cayu.runtime.mcp_manifest_policy import McpManifestPolicy
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.cleanup import (
     RecoveryCleanupDeadlineScope,
     RecoveryCleanupPolicy,
     RecoveryCleanupRetainedTaskSnapshot,
     RecoveryCleanupSupervisorSnapshot,
-    RunRequest,
-    SecretRedactor,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    TaskCreate,
 )
-from cayu.runtime.checks import check_manifest
-from cayu.runtime.sessions import InMemorySessionStore, SessionIdentity
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.support_bundles import (
     ArtifactAvailabilityEvidence,
     CollectorDisposition,
@@ -72,6 +66,8 @@ from cayu.support_bundles import (
     validate_support_bundle_archive,
     write_support_bundle_atomic,
 )
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.vaults.redaction import SecretRedactor
 
 
 def _context(

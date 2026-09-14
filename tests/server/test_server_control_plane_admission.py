@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from cayu import CayuApp, PostgresSessionStore, SQLiteSessionStore
-from cayu.runtime import InMemorySessionStore, SessionStore
 from cayu.server import ServerConfig, create_server
 from cayu.server.routes import (
     InterruptSessionBody,
@@ -25,6 +24,7 @@ from cayu.server.routes import (
     UserInputRecoveryBody,
     UserInputResolveBody,
 )
+from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.storage.migrations import SchemaMode
 
 CONTROL_PLANE_PROMPT_MAX_BYTES = 64 * 1024

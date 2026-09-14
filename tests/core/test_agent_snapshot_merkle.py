@@ -39,7 +39,7 @@ from cayu import (
     InMemoryAgentSnapshotStore,
     SQLiteAgentSnapshotStore,
 )
-from cayu.agent_snapshots import _verify_snapshot_nodes
+from cayu.snapshots.base import _verify_snapshot_nodes
 
 
 def _digest(value: str) -> str:

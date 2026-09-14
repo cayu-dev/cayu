@@ -8,39 +8,12 @@ from pathlib import Path
 
 from pydantic import SecretStr
 
-from cayu.agent_snapshots import (
-    AgentSnapshot,
-    AgentSnapshotAuthorityRef,
-    AgentSnapshotCaptureRequest,
-    AgentSnapshotCompleteness,
-    AgentSnapshotComponentCapture,
-    AgentSnapshotComponentKind,
-    AgentSnapshotComponentProvider,
-    AgentSnapshotComponentRef,
-    AgentSnapshotComponentSelector,
-    AgentSnapshotConsistency,
-    AgentSnapshotCoordinator,
-    AgentSnapshotExecutionProfileRef,
-    AgentSnapshotLearningDisposition,
-    AgentSnapshotLogicalRef,
-    AgentSnapshotMaterialization,
-    AgentSnapshotMaterializationCapability,
-    AgentSnapshotMaterializationOperation,
-    AgentSnapshotMaterializationRequest,
-    AgentSnapshotMaterializedComponent,
-    AgentSnapshotOverlayKind,
-    AgentSnapshotOverlayRef,
-    AgentSnapshotRedaction,
-    AgentSnapshotSubject,
-    AgentSnapshotTrialBinding,
-    AgentSnapshotTrialStateMode,
-    MemoryStateRef,
-    SQLiteAgentSnapshotStore,
-    execution_profile_snapshot_ref,
-)
-from cayu.core.agents import AgentSpec
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.core.messages import Message
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLedger
+from cayu.budgets.usage import session_usage_summary_payload
+from cayu.context.base import CheckpointCompactionContextPolicy, TranscriptDigestCompactor
+from cayu.context.footprints import RequestFootprintConfig
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -104,8 +77,12 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import SessionTrajectoryError, trajectory_from_session
-from cayu.memory import AutomaticRecallMode, AutomaticRecallPolicy
-from cayu.memory_intervention_execution import (
+from cayu.memory.base import AutomaticRecallMode, AutomaticRecallPolicy
+from cayu.memory.context import (
+    AutomaticRecallContextPolicy,
+    AutomaticRecallSourceConfig,
+)
+from cayu.memory.execution import (
     CayuMemoryInterventionRuntimeRunner,
     MemoryInterventionEvaluator,
     MemoryInterventionExecutionConflict,
@@ -123,7 +100,7 @@ from cayu.memory_intervention_execution import (
     MemoryInterventionTrialRequest,
     SQLiteMemoryInterventionExecutionStore,
 )
-from cayu.memory_interventions import (
+from cayu.memory.interventions import (
     MemoryInterventionBounds,
     MemoryInterventionChangeKind,
     MemoryInterventionEffectReceiptRef,
@@ -137,27 +114,50 @@ from cayu.memory_interventions import (
     MemoryInterventionReceipt,
     MemoryInterventionSpec,
 )
-from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.recall import (
+from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     TRANSCRIPT_LEXICAL_CHANNEL,
 )
-from cayu.retrieval import (
+from cayu.memory.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.budgets import BudgetLedger
-from cayu.runtime.context import CheckpointCompactionContextPolicy, TranscriptDigestCompactor
+from cayu.messages import Message
+from cayu.providers import ModelRequest, ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.manifest import AppManifest
-from cayu.runtime.memory_context import (
-    AutomaticRecallContextPolicy,
-    AutomaticRecallSourceConfig,
+from cayu.sessions.base import RunRequest, SessionStore
+from cayu.snapshots.base import (
+    AgentSnapshot,
+    AgentSnapshotAuthorityRef,
+    AgentSnapshotCaptureRequest,
+    AgentSnapshotCompleteness,
+    AgentSnapshotComponentCapture,
+    AgentSnapshotComponentKind,
+    AgentSnapshotComponentProvider,
+    AgentSnapshotComponentRef,
+    AgentSnapshotComponentSelector,
+    AgentSnapshotConsistency,
+    AgentSnapshotCoordinator,
+    AgentSnapshotExecutionProfileRef,
+    AgentSnapshotLearningDisposition,
+    AgentSnapshotLogicalRef,
+    AgentSnapshotMaterialization,
+    AgentSnapshotMaterializationCapability,
+    AgentSnapshotMaterializationOperation,
+    AgentSnapshotMaterializationRequest,
+    AgentSnapshotMaterializedComponent,
+    AgentSnapshotOverlayKind,
+    AgentSnapshotOverlayRef,
+    AgentSnapshotRedaction,
+    AgentSnapshotSubject,
+    AgentSnapshotTrialBinding,
+    AgentSnapshotTrialStateMode,
+    MemoryStateRef,
+    SQLiteAgentSnapshotStore,
+    execution_profile_snapshot_ref,
 )
-from cayu.runtime.request_footprints import RequestFootprintConfig
-from cayu.runtime.sessions import RunRequest, SessionStore
-from cayu.runtime.usage import session_usage_summary_payload
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,

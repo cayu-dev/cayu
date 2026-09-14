@@ -37,9 +37,9 @@ from cayu import (
     business_approval_audit,
     resolve_business_approval,
 )
-from cayu.core.events import EventType
 from cayu.evals import ScriptedModelProvider
-from cayu.runtime import InMemorySessionStore
+from cayu.events import EventType
+from cayu.sessions.base import InMemorySessionStore
 
 CHAIN = ("area", "national", "corporate")
 

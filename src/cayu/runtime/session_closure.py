@@ -29,9 +29,9 @@ from cayu._validation import (
     copy_durable_metadata,
 )
 from cayu.artifacts import ArtifactScope
-from cayu.memory_evidence import RecallEvidenceQuery
-from cayu.runtime.sessions import SessionQuery
-from cayu.runtime.tasks import TaskQuery, TaskStatus
+from cayu.memory.evidence import RecallEvidenceQuery
+from cayu.sessions.base import SessionQuery
+from cayu.tasks.base import TaskQuery, TaskStatus
 
 SESSION_CLOSURE_SCHEMA_VERSION = 1
 SESSION_CLOSURE_DEFAULT_MAX_RECORDS = 10_000
@@ -947,7 +947,7 @@ class SessionClosureCoordinator:
         records: dict[str, Any] = {}
         load_snapshot = getattr(self._session_store, "load_session_export_snapshot", None)
         if manifest.complete and load_snapshot is not None:
-            from cayu.runtime.exports import SessionExportLimits
+            from cayu.sessions.exports import SessionExportLimits
 
             snapshot = await load_snapshot(
                 session_id,

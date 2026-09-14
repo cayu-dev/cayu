@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from cayu.cli.session import _tool_call_rows, _tool_inspection_record
-from cayu.core import Event, EventType, ToolResult
-from cayu.runtime import EventRecord
+from cayu.events import Event, EventType
+from cayu.sessions.base import EventRecord
+from cayu.tools.base import ToolResult
 
 
 def _identity() -> dict[str, str]:

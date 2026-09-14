@@ -26,14 +26,17 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
-from cayu.artifacts import (
+from cayu.applications import CayuApp
+from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactMetadata,
     ArtifactScope,
     copy_artifact_read_result,
 )
-from cayu.core.events import Event, EventType, event_durable_sequence
-from cayu.core.messages import Message
+from cayu.budgets.usage import (
+    SessionUsageSummary,
+    session_usage_summary_payload,
+)
 from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
 from cayu.evals._admission import admission_scope, current_launch_admission
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
@@ -133,17 +136,18 @@ from cayu.evals.workflow_target import (
     workflow_eval_output_sha256,
     workflow_eval_trial_session_id,
 )
+from cayu.events import Event, EventType, event_durable_sequence
 from cayu.failure_evidence import FailureEvidence, exception_evidence
-from cayu.memory_attribution import (
+from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
 )
+from cayu.messages import Message
 from cayu.runtime._memory_evidence import memory_evidence_key
-from cayu.runtime.app import CayuApp
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     EventQuery,
     EventRecord,
@@ -157,10 +161,6 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidenceLimits,
     copy_run_request,
 )
-from cayu.runtime.usage import (
-    SessionUsageSummary,
-    session_usage_summary_payload,
-)
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     InvocationOperationCapacityError,
@@ -168,12 +168,9 @@ from cayu.tools._operation_boundary import (
     await_invocation_operation,
     retained_invocation_operation_outcome_if_done,
 )
-from cayu.workflows import (
-    WORKFLOW_ATTEMPT_EVENT_TYPE,
-    WORKFLOW_JOURNAL_PROVIDER,
-    WorkflowSupersededError,
-)
-from cayu.workspaces import WorkspaceReadResult
+from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE, WORKFLOW_JOURNAL_PROVIDER
+from cayu.workflows.workflow import WorkflowSupersededError
+from cayu.workspaces.base import WorkspaceReadResult
 
 TrialRequestTransform = Callable[[str, str, int, RunRequest], RunRequest]
 TrialCompletionCallback = Callable[

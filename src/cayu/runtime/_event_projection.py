@@ -12,8 +12,14 @@ from cayu._validation import (
     collision_safe_json_object,
     copy_durable_json_value,
 )
+from cayu.approvals.tools import ResolutionActorSource
 from cayu.artifacts.settlement import ArtifactWriteSettlementEvidence
-from cayu.core.events import (
+from cayu.egress.authority import (
+    EgressAuthorityChangeKind,
+    EgressAuthorityCutoverStrategy,
+    EgressAuthorityTransitionState,
+)
+from cayu.events import (
     Event,
     EventType,
     copy_event,
@@ -21,19 +27,6 @@ from cayu.core.events import (
     event_id_is_runtime_generated,
     event_nested_payload_authority_is_runtime_generated,
     event_payload_authority_is_runtime_generated,
-)
-from cayu.core.tools import (
-    _COMMAND_POLICY_DENIAL_SOURCE,
-    _POLICY_DENIAL_TRUNCATION_MARKER,
-    _TOOL_POLICY_DENIAL_SOURCE,
-    ToolEffect,
-    ToolResult,
-)
-from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
-from cayu.egress.authority import (
-    EgressAuthorityChangeKind,
-    EgressAuthorityCutoverStrategy,
-    EgressAuthorityTransitionState,
 )
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.providers.base import ModelFinishReason
@@ -53,7 +46,6 @@ from cayu.runtime._web_access_results import (
     WEB_ACCESS_RESULT_EVENT_SCHEMA_PATHS,
     restore_attested_event_result,
 )
-from cayu.runtime.approvals import ResolutionActorSource
 from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -64,17 +56,25 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     parse_public_authority_alias,
 )
-from cayu.runtime.tool_catalogue import SEARCH_TOOLS_NAME
-from cayu.runtime.tool_discovery import minimized_tool_discovery_result
-from cayu.runtime.tool_result_projection import (
+from cayu.tools.base import (
+    _COMMAND_POLICY_DENIAL_SOURCE,
+    _POLICY_DENIAL_TRUNCATION_MARKER,
+    _TOOL_POLICY_DENIAL_SOURCE,
+    ToolEffect,
+    ToolResult,
+)
+from cayu.tools.catalogue import SEARCH_TOOLS_NAME
+from cayu.tools.discovery import minimized_tool_discovery_result
+from cayu.tools.result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
     reestimate_tool_result_projection_tokens,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
+from cayu.workspaces.observation_recovery import (
     WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
     WorkspaceObservationArtifactState,
 )
-from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.revisions import (
     _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
     _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
@@ -4612,7 +4612,7 @@ def _restore_publication_safe_request_fingerprints(
         raw_manifest = source_payload.get("prompt_contribution_manifest")
         if raw_manifest is None:
             return
-        from cayu.runtime.request_footprints import PromptContributionManifest
+        from cayu.context.footprints import PromptContributionManifest
 
         try:
             manifest = PromptContributionManifest.model_validate(raw_manifest)
@@ -4688,7 +4688,7 @@ def _restore_publication_safe_tool_footprints(
         redacted_payload.pop("tool_discovery_projection", None)
         return
 
-    from cayu.runtime.request_footprints import (
+    from cayu.context.footprints import (
         TargetedToolGrantFootprint,
         ToolDiscoveryProjectionFootprint,
         ToolDiscoveryViewFootprint,
@@ -5011,7 +5011,7 @@ def _publication_safe_request_fingerprint(
     redactor: SecretRedactor,
     reject_malformed: bool,
 ) -> dict[str, Any]:
-    from cayu.runtime.request_footprints import (
+    from cayu.context.footprints import (
         RequestFingerprint,
         RequestFingerprintAvailability,
     )
@@ -5289,7 +5289,7 @@ def _public_authority_is_trusted(
         if type(value) is not str:
             return False
         try:
-            from cayu.runtime.tool_catalogue import (
+            from cayu.tools.catalogue import (
                 validate_canonical_tool_id,
                 validate_tool_descriptor_version,
             )
@@ -5478,7 +5478,7 @@ def _validate_budget_payload_schema(event: Event) -> None:
     if event.type == EventType.BUDGET_RESERVED:
         identity = event.payload.get("billing_identity")
         if identity is not None:
-            from cayu.core.billing import BillingIdentity
+            from cayu.budgets.billing import BillingIdentity
 
             BillingIdentity.model_validate(identity)
         return
@@ -5486,7 +5486,7 @@ def _validate_budget_payload_schema(event: Event) -> None:
         EventType.BUDGET_RECONCILED,
         EventType.BUDGET_RESERVATION_RELEASED,
     }:
-        from cayu.runtime.budgets import budget_reconciliation_from_payload
+        from cayu.budgets.base import budget_reconciliation_from_payload
 
         settlement = {
             field_name: event.payload.get(field_name)
@@ -5499,7 +5499,7 @@ def _validate_budget_payload_schema(event: Event) -> None:
     settlements = event.payload["budget_settlements"]
     if type(settlements) is not list:
         raise TypeError("event.payload.budget_settlements must be a list.")
-    from cayu.runtime.budgets import budget_reconciliation_from_payload
+    from cayu.budgets.base import budget_reconciliation_from_payload
 
     for settlement in settlements:
         budget_reconciliation_from_payload(settlement)

@@ -7,12 +7,12 @@ from hashlib import sha256
 from typing import Any, Literal, cast
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_value
-from cayu.core.events import (
+from cayu.events import (
     Event,
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import ToolResult
+from cayu.tools.base import ToolResult
 from cayu.tools.shared_artifacts import (
     MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME,
     PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME,

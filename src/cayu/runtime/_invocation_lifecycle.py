@@ -34,13 +34,14 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
-from cayu.core.events import (
+from cayu.budgets.base import BudgetPolicy
+from cayu.events import (
     Event,
     EventType,
     copy_event,
     event_envelope_authority_is_runtime_generated,
 )
-from cayu.core.messages import Message, detach_message
+from cayu.messages import Message, detach_message
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._invocation_terminal_decision import (
@@ -50,19 +51,10 @@ from cayu.runtime._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
-from cayu.runtime.budgets import BudgetPolicy
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     copy_runtime_build_provenance,
     legacy_runtime_build_provenance,
-)
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-    INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
-    INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION,
-    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -81,10 +73,9 @@ from cayu.runtime.execution_profiles import (
     execution_profile_provider_target_component,
     execution_profile_runtime_component,
 )
-from cayu.runtime.invocation import SessionInvocationBinding
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     ExecutionProfileRejectionResult,
     InteractionTransitionResult,
     InteractionTransitionSpec,
@@ -113,16 +104,25 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_mutation,
     session_user_metadata,
 )
-from cayu.runtime.tool_discovery import (
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
+    INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+)
+from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.tools.discovery import (
     ToolDiscoveryViewInitialization,
     initial_tool_discovery_operation_records_from_initialization,
 )
-from cayu.runtime.tool_exposure import (
+from cayu.tools.exposure import (
     ToolCapabilityCeiling,
     copy_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
 )
-from cayu.runtime.tool_grants import PreparedTargetedToolGrant
+from cayu.tools.grants import PreparedTargetedToolGrant
 
 INVOCATION_LIFECYCLE_COMMAND_VERSION = 1
 INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS = 128

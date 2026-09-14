@@ -6,10 +6,11 @@ import pytest
 from pydantic import ValidationError
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 
-import cayu.runtime.sessions as sessions_module
-from cayu.core import Event, EventType, Message
-from cayu.runtime import (
-    CayuApp,
+import cayu.sessions.base as sessions_module
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     EventRecord,

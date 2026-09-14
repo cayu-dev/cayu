@@ -5,16 +5,16 @@ import asyncio
 import pytest
 from tests.core.test_tool_effect_state import _intent
 
-from cayu.core import EventType
-from cayu.runtime import InMemorySessionStore
+from cayu.budgets.base import InMemoryBudgetStore
+from cayu.events import EventType
+from cayu.observability.events import EventSink
 from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_effect_diagnostics import persist_cleanup_diagnostics
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.budgets import InMemoryBudgetStore
-from cayu.runtime.event_sinks import EventSink
+from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

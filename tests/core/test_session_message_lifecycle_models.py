@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu.core import Message
-from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.messages import Message
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConditions,
@@ -19,7 +19,7 @@ from cayu.runtime.session_message_lifecycle import (
     copy_session_message_conditions,
     session_message_rejection,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     InMemorySessionStore,
     RunRequest,

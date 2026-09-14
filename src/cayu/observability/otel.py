@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
-from cayu.core.events import Event, EventType, copy_event, event_durable_sequence
+from cayu.events import Event, EventType, copy_event, event_durable_sequence
+from cayu.observability.events import EventSink, _EventSinkDelivery
 from cayu.runtime._event_projection import project_runtime_event, public_event_sequence
-from cayu.runtime.event_sinks import EventSink, _EventSinkDelivery
-from cayu.runtime.tool_result_projection import (
+from cayu.tools.result_projection import (
     tool_result_projection_suppresses_result_content,
 )
 from cayu.vaults.redaction import SecretRedactor

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.runtime.aggregates import AGGREGATE_IDENTITY_TRIM_CHARACTERS
+from cayu.budgets.aggregates import AGGREGATE_IDENTITY_TRIM_CHARACTERS
 from cayu.storage import _session_store_sql as session_sql
 
 if TYPE_CHECKING:
@@ -101,7 +101,7 @@ def changed_cost_groups_statement(
     dialect: session_sql.SessionStoreSqlDialect,
     extra_clauses: Sequence[session_sql.SqlClause] = (),
 ) -> tuple[str, tuple[object, ...]]:
-    from cayu.runtime.sessions import copy_event_query
+    from cayu.sessions.base import copy_event_query
 
     assert read.previous is not None
     previous = read.previous.through_sequence
@@ -163,7 +163,7 @@ def changed_cost_groups_statement(
 
 
 def cost_boundary_statement(query, *, dialect, extra_clauses=()):
-    from cayu.runtime.sessions import EventQuery
+    from cayu.sessions.base import EventQuery
 
     session_id = query.session_id or (query.session_ids[0] if len(query.session_ids) == 1 else None)
     plan = session_sql.build_accounting_event_query_sql(

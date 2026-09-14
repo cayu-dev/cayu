@@ -19,23 +19,11 @@ if TYPE_CHECKING:
         SettleInvocationCommand,
     )
     from cayu.runtime.execution_profiles import ExecutionProfileRejectionResult
-    from cayu.runtime.sessions import InteractionTransitionResult
+    from cayu.sessions.base import InteractionTransitionResult
 
 from cayu._validation import copy_durable_json_object
-from cayu.runtime.checkpoints import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    decode_runtime_checkpoint,
-    runtime_checkpoint_writer_view,
-    validate_runtime_checkpoint_root_projection,
-)
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     CheckpointTransform,
     ProfiledSessionForkResult,
@@ -54,6 +42,18 @@ from cayu.runtime.sessions import (
     _replace_checkpoint_preserving_completion_result_event_publications,
     _runtime_publication_checkpoint_codec_scope,
     runtime_publication_checkpoint_value_digest,
+)
+from cayu.sessions.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
+    decode_runtime_checkpoint,
+    runtime_checkpoint_writer_view,
+    validate_runtime_checkpoint_root_projection,
 )
 
 _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(

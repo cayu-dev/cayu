@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from cayu.storage import (
+from cayu.storage.memory import (
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,

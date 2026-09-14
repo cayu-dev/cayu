@@ -5,29 +5,31 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.runtime import (
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import Event, EventType
+from cayu.exceptions import TerminalEventPublicationUncertain
+from cayu.messages import Message
+from cayu.observability.hooks import RuntimeHookPhase
+from cayu.runtime._terminal_evidence import (
+    require_interruption_event_matches_pending_marker,
+)
+from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
-    RuntimeHookPhase,
     SessionIdentity,
     SessionRunFenced,
     SessionStatus,
-    TerminalEventPublicationUncertain,
+    _checkpoint_with_session_run_operation,
 )
-from cayu.runtime._terminal_evidence import (
-    require_interruption_event_matches_pending_marker,
-)
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
-from cayu.runtime.sessions import _checkpoint_with_session_run_operation
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 @pytest.mark.parametrize(

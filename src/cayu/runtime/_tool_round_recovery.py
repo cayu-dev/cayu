@@ -13,10 +13,22 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_text,
 )
-from cayu.core.events import Event, EventType, copy_event
-from cayu.core.messages import Message, detach_message
-from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import ToolResult
+from cayu.approvals.tools import (
+    PendingToolCallApproval,
+    ToolPolicyEvidence,
+    copy_distinct_pending_tool_call_approvals,
+)
+from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.configuration import MAX_STEPS
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputSpec,
+    StructuredOutputValidation,
+    copy_structured_output_spec,
+)
+from cayu.context.thinking import ThinkingConfig
+from cayu.events import Event, EventType, copy_event
+from cayu.messages import Message, detach_message
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
@@ -37,35 +49,23 @@ from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
 )
-from cayu.runtime.approvals import (
-    PendingToolCallApproval,
-    ToolPolicyEvidence,
-    copy_distinct_pending_tool_call_approvals,
-)
-from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
-from cayu.runtime.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
-from cayu.runtime.config import MAX_STEPS
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    StructuredOutputSpec,
-    StructuredOutputValidation,
-    copy_structured_output_spec,
-)
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
-from cayu.runtime.tool_exposure import (
+from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
+from cayu.tools.base import ToolResult
+from cayu.tools.catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
+from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
 )
-from cayu.runtime.tool_policy import ToolPolicyResult
-from cayu.vaults import SecretRedactor, contains_redacted_secret
+from cayu.tools.policy import ToolPolicyResult
+from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
 
 if TYPE_CHECKING:
-    from cayu.runtime.user_input import PendingUserInput
+    from cayu.approvals.user_input import PendingUserInput
 
 PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
@@ -479,7 +479,7 @@ def checkpoint_with_assistant_publication_snapshot(
 
     # User-input pauses move the same round-owned projection into their single
     # pending checkpoint. Import lazily to keep the schema modules acyclic.
-    from cayu.runtime.user_input import (
+    from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         PendingUserInput,
     )
@@ -558,7 +558,7 @@ def checkpoint_with_assistant_publication_redactor(
         copied_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY] = updated_round.model_dump(mode="json")
         return copied_checkpoint
 
-    from cayu.runtime.user_input import (
+    from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         PendingUserInput,
     )
@@ -1185,7 +1185,7 @@ def _checkpoint_staged_terminal_owner(
 ) -> tuple[str, PendingToolRound | PendingUserInput]:
     identity = copy_tool_round_identity(tool_round_identity)
     pending_round = pending_tool_round_from_checkpoint(checkpoint)
-    from cayu.runtime.user_input import (
+    from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         user_input_lifecycle_authority_from_checkpoint,
     )

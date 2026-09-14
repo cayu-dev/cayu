@@ -2,14 +2,14 @@
 
 from typing import TYPE_CHECKING
 
-from cayu.core.tools import ToolResult
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
-from cayu.runtime.sessions import MAX_SESSION_ID_BYTES
 from cayu.runtime.tool_effects import _bounded_text
+from cayu.sessions.base import MAX_SESSION_ID_BYTES
+from cayu.tools.base import ToolResult
 
 if TYPE_CHECKING:
     from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
-    from cayu.runtime.sessions import Session
+    from cayu.sessions.base import Session
 
 
 async def project_authenticated_child_result(

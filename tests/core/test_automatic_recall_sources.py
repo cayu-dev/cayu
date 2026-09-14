@@ -25,10 +25,14 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
 )
-from cayu.memory_evidence import ContextExposureState, RecallEvidenceQuery
-from cayu.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL, RecallSituation
+from cayu.context.base import ContextBuildError
+from cayu.memory.evidence import ContextExposureState, RecallEvidenceQuery
+from cayu.memory.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    RecallSituation,
+)
 from cayu.runtime._memory_evidence import MemoryEvidenceKey, memory_evidence_key_scope
-from cayu.runtime.context import ContextBuildError
 
 
 def _descriptor(**updates):
@@ -168,7 +172,7 @@ def test_policy_rejects_unbounded_registration_input_and_unqualified_deltas():
 def test_disabled_builtin_names_and_channels_remain_reserved(updates):
     from test_automatic_recall_context import _admission, _fusion
 
-    from cayu.recall import TRANSCRIPT_LEXICAL_CHANNEL
+    from cayu.memory.recall import TRANSCRIPT_LEXICAL_CHANNEL
 
     registration = _registration(**updates)
     with pytest.raises(ValueError, match="reserved built-in"):

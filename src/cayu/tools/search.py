@@ -15,7 +15,14 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
-from cayu.core.tools import (
+from cayu.runners.base import ExecCommand, ExecResult, RunnerUnavailableError
+from cayu.tools._errors import (
+    reject_unknown_tool_arguments,
+    structured_invalid_arguments,
+    tool_argument_validation,
+)
+from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
+from cayu.tools.base import (
     Tool,
     ToolContext,
     ToolEffect,
@@ -25,14 +32,7 @@ from cayu.core.tools import (
     ToolRunnerCapabilityRequirement,
     ToolSpec,
 )
-from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
-from cayu.tools._errors import (
-    reject_unknown_tool_arguments,
-    structured_invalid_arguments,
-    tool_argument_validation,
-)
-from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_SEARCH_LIMIT = 100
 MAX_SEARCH_LIMIT = 500

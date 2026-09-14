@@ -26,13 +26,13 @@ from cayu.evals.models import (
     _model_instance_python_input,
     _validate_trajectory_record_contract,
 )
-from cayu.memory_attribution import (
+from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
 )
-from cayu.runtime.sessions import SessionStatus
+from cayu.sessions.base import SessionStatus
 
 
 def _trajectory_sources(

@@ -17,10 +17,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, NoRetur
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu.budgets.pricing import PriceBook
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime.costs import PriceBook
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConditions,
@@ -29,22 +29,22 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
     session_message_rejection,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageInspection,
 )
 
 if TYPE_CHECKING:
-    from cayu.knowledge_maintenance_governance import (
+    from cayu.knowledge.maintenance_governance import (
         KnowledgeMaintenanceGovernanceAuthority,
         KnowledgeMaintenanceGovernanceReceipt,
     )
-    from cayu.knowledge_maintenance_persistence import (
+    from cayu.knowledge.maintenance_persistence import (
         KnowledgeMaintenanceAcceptedPlan,
         KnowledgeMaintenanceProposalPublication,
         KnowledgeMaintenanceProposalPublicationReceipt,
     )
-    from cayu.knowledge_semantic_watch import (
+    from cayu.knowledge.semantic_watch import (
         KnowledgeSemanticWatchAuthority,
         KnowledgeSemanticWatchReceipt,
     )
@@ -52,7 +52,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
-    from cayu.runtime.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
 
 try:
     from psycopg import AsyncConnection, sql
@@ -83,69 +83,13 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu.core.billing import BillingIdentity, copy_billing_identity
-from cayu.core.events import (
-    EVENT_ID_MAX_CHARS,
-    Event,
-    EventType,
-    event_with_runtime_payload_authority,
-)
-from cayu.core.messages import Message, MessageRole
-from cayu.core.runtime_authority import CheckpointValueAuthority
-from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
-from cayu.embeddings import (
-    TextEmbeddingProvider,
-    TextEmbeddingRequest,
-    copy_text_embedding_result,
-)
-from cayu.memory_evidence import (
-    MAX_RECALL_RECEIPT_ITEMS,
-    ContextExposure,
-    ContextExposurePage,
-    ContextExposureTransitionConflict,
-    ContextExposureTransitionRequest,
-    RecallEvidenceConflict,
-    RecallEvidenceQuery,
-    RecallItemExposure,
-    RecallReceipt,
-    RecallReceiptPage,
-    append_context_exposure_transition,
-    context_exposure_creation_matches,
-    context_exposure_transition_replays,
-    copy_context_exposure,
-    copy_recall_item_exposure,
-    copy_recall_receipt,
-    decode_recall_evidence_cursor,
-    encode_recall_evidence_cursor,
-    memory_evidence_document_bytes,
-    recall_item_exposure_matches_receipt_item,
-    require_memory_evidence_id,
-    require_memory_evidence_session_id,
-    validate_context_exposure_receipt_scope,
-    validate_new_context_exposure,
-)
-from cayu.runtime import _verified_work_policy as verified_work_support
-from cayu.runtime._child_session_notifications import (
-    ChildSessionLifecycleOccurrence,
-    ChildSessionLifecycleOccurrenceSource,
-    ChildSessionLifecyclePage,
-    ChildSessionLifecycleQuery,
-    child_session_notification_stage_binding,
-    child_session_notification_storage_key,
-)
-from cayu.runtime._invocation_terminal_decision import InvocationTerminalDecision
-from cayu.runtime._provider_operation_cancellation_claim import (
-    active_provider_operation_cancellation_claim_from_checkpoint,
-)
-from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
-from cayu.runtime._task_lease_authority import managed_task_lease_mutation
-from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
-from cayu.runtime.approvals import (
+from cayu.approvals.tools import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
     ResolutionActor,
     resolution_actor_payload,
 )
-from cayu.runtime.budgets import (
+from cayu.budgets.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
+from cayu.budgets.base import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
     BudgetLimit,
@@ -175,7 +119,46 @@ from cayu.runtime.budgets import (
     copy_budget_settlement_fallback,
     new_budget_reservation_id,
 )
-from cayu.runtime.event_watchers import (
+from cayu.budgets.billing import BillingIdentity, copy_billing_identity
+from cayu.embeddings import (
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    copy_text_embedding_result,
+)
+from cayu.events import (
+    EVENT_ID_MAX_CHARS,
+    Event,
+    EventType,
+    event_with_runtime_payload_authority,
+)
+from cayu.memory.evidence import (
+    MAX_RECALL_RECEIPT_ITEMS,
+    ContextExposure,
+    ContextExposurePage,
+    ContextExposureTransitionConflict,
+    ContextExposureTransitionRequest,
+    RecallEvidenceConflict,
+    RecallEvidenceQuery,
+    RecallItemExposure,
+    RecallReceipt,
+    RecallReceiptPage,
+    append_context_exposure_transition,
+    context_exposure_creation_matches,
+    context_exposure_transition_replays,
+    copy_context_exposure,
+    copy_recall_item_exposure,
+    copy_recall_receipt,
+    decode_recall_evidence_cursor,
+    encode_recall_evidence_cursor,
+    memory_evidence_document_bytes,
+    recall_item_exposure_matches_receipt_item,
+    require_memory_evidence_id,
+    require_memory_evidence_session_id,
+    validate_context_exposure_receipt_scope,
+    validate_new_context_exposure,
+)
+from cayu.messages import Message, MessageRole
+from cayu.observability.watchers import (
     EventWatcherClaim,
     EventWatcherDeadLetter,
     EventWatcherDelivery,
@@ -190,12 +173,28 @@ from cayu.runtime.event_watchers import (
     replay_event_watcher_settlement,
     settle_event_watcher_transition,
 )
-from cayu.runtime.event_watchers import (
+from cayu.observability.watchers import (
     _clean_error as clean_watcher_error,
 )
-from cayu.runtime.event_watchers import (
+from cayu.observability.watchers import (
     _validate_max_attempts as validate_watcher_max_attempts,
 )
+from cayu.runtime import _verified_work_policy as verified_work_support
+from cayu.runtime._child_session_notifications import (
+    ChildSessionLifecycleOccurrence,
+    ChildSessionLifecycleOccurrenceSource,
+    ChildSessionLifecyclePage,
+    ChildSessionLifecycleQuery,
+    child_session_notification_stage_binding,
+    child_session_notification_storage_key,
+)
+from cayu.runtime._invocation_terminal_decision import InvocationTerminalDecision
+from cayu.runtime._provider_operation_cancellation_claim import (
+    active_provider_operation_cancellation_claim_from_checkpoint,
+)
+from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
+from cayu.runtime._task_lease_authority import managed_task_lease_mutation
+from cayu.runtime.authority import CheckpointValueAuthority
 from cayu.runtime.evidence_spool import EvidenceSpool
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
@@ -209,11 +208,6 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_tool_round_identity,
 )
-from cayu.runtime.interactions import (
-    INTERACTION_LIFECYCLE_EVENT_TYPES,
-    INTERACTION_TERMINAL_EVENT_TYPES,
-)
-from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
 from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptAuthority,
     LocalExecutionAttemptConflict,
@@ -236,7 +230,7 @@ from cayu.runtime.local_execution_attempts import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
@@ -564,153 +558,11 @@ from cayu.runtime.sessions import (
     transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
-from cayu.runtime.tasks import (
-    _TASK_CANCELLATION_REQUESTED_REASON,
-    _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
-    _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
-    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    InterruptedTaskContinuationClaimPage,
-    Task,
-    TaskAggregateFilter,
-    TaskCancellationReconciliationRequest,
-    TaskCancellationReconciliationResult,
-    TaskClaimLost,
-    TaskCreate,
-    TaskInterruptedHandoffConflict,
-    TaskInterruptedHandoffReceipt,
-    TaskInterruptedHandoffRequest,
-    TaskInvocationSnapshot,
-    TaskOperationalSnapshot,
-    TaskOrder,
-    TaskQuery,
-    TaskRetryCancellationReconciliationRequest,
-    TaskRetrySeriesDisposition,
-    TaskRetrySettlementRequest,
-    TaskRetrySettlementResult,
-    TaskStatus,
-    TaskStatusCounts,
-    TaskStore,
-    TaskTerminalizationConflict,
-    TaskTerminalizationReceipt,
-    TaskTerminalizationRequest,
-    TaskTopologyInconsistent,
-    TaskTopologyNode,
-    TaskTopologyQuery,
-    TaskTopologyStoreResult,
-    _allocate_task_topology_branch_limits,
-    _bounded_optional_task_topology_parent_id,
-    _can_attach_claimed_task_state,
-    _cancelled_task_retry_settlement,
-    _claimed_task_retry_attempt_elapsed,
-    _copy_optional_session_binding,
-    _copy_optional_status_payload,
-    _copy_optional_status_reason,
-    _copy_required_session_binding,
-    _copy_task_cancellation_reconciliation_result,
-    _elapsed_claimed_task_retry_settlement,
-    _ensure_can_hold_task,
-    _ensure_can_resume_task,
-    _ensure_can_transition,
-    _ensure_claim_query_supported,
-    _ensure_exact_owned_active_task_lease,
-    _ensure_owned_active_task_lease,
-    _ensure_recovered_attached_task_failure_authority,
-    _ensure_recovered_attached_task_session,
-    _ensure_retry_series_queue_attempt,
-    _ensure_task_handoff_authority,
-    _ensure_task_terminalization_lease_authority,
-    _expired_dispatched_task_cancellation,
-    _expired_task_retry_settlement,
-    _interrupted_task_continuation_handoff_id_sha256,
-    _raise_task_claim_attach_error,
-    _reconciled_task_cancellation,
-    _reconciled_task_retry_cancellation,
-    _rejected_task_cancellation_reconciliation,
-    _rejected_task_retry_cancellation_reconciliation,
-    _replay_interrupted_task_handoff_receipt,
-    _replay_task_cancellation_reconciliation,
-    _replay_task_cancellation_reconciliation_rejection,
-    _replay_task_retry_cancellation_reconciliation,
-    _replay_task_retry_cancellation_reconciliation_rejection,
-    _replay_task_retry_settlement,
-    _replay_task_terminalization_receipt,
-    _require_active_attached_task_worker,
-    _require_direct_attached_task_resume,
-    _require_interrupted_task_handoff_authority,
-    _running_task_from_create,
-    _settled_task_retry_attempt,
-    _task_cancellation_reconciliation_conflict,
-    _task_cancellation_reconciliation_rejection_record,
-    _task_cancellation_requested,
-    _task_cancellation_requested_task,
-    _task_from_create,
-    _task_invocation_for_attachment,
-    _task_matches_claim_filter,
-    _task_retry_cancellation_reconciliation_conflict,
-    _task_retry_cancellation_reconciliation_rejection_record,
-    _task_retry_cancellation_requested_task,
-    _task_retry_events,
-    _task_retry_reconciliation_identity_is_bounded,
-    _task_session_id_for_start,
-    _task_session_instance_for_attachment,
-    _TaskCancellationReconciliationRejectionRecord,
-    _TaskRetryCancellationReconciliationRejectionRecord,
-    _validate_ordinary_task_terminalization_against_cancellation,
-    _validate_task_topology_ancestry,
-    _validated_task_cancellation,
-    _validated_task_retry_cancellation,
-    _validated_task_retry_terminal_accounting,
-    build_task_topology_result,
-    copy_task_aggregate_filter,
-    copy_task_create,
-    copy_task_query,
-    decode_task_topology_cursor,
-    prepare_interrupted_task_continuation_claim_page,
-    prepare_interrupted_task_handoff,
-    prepare_interrupted_task_handoff_candidate_page,
-    prepare_interrupted_task_handoff_receipt_lookup,
-    prepare_task_cancellation_reconciliation,
-    prepare_task_retry_cancellation_reconciliation,
-    prepare_task_retry_settlement,
-    prepare_task_terminalization,
-    prepare_task_terminalization_receipt_lookup,
-    task_query_from_aggregate_filter,
+from cayu.sessions.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
 )
-from cayu.runtime.tool_exposure import ToolCapabilityCeiling
-from cayu.runtime.tool_grants import (
-    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
-    TARGETED_TOOL_GRANT_MAX_REQUESTS,
-    TARGETED_TOOL_REFERENCE_FIELD_NAME,
-    TargetedToolGrantIssueOutcome,
-    TargetedToolGrantIssueResult,
-    TargetedToolGrantReconstructionResult,
-    TargetedToolGrantRecord,
-    TargetedToolGrantStateSnapshot,
-    TargetedToolUseBinding,
-    TargetedToolUseDisposition,
-    TargetedToolUseRejectionReason,
-    TargetedToolUseRequest,
-    TargetedToolUseResult,
-    copy_targeted_tool_grant_record,
-    targeted_tool_grant_event,
-    targeted_tool_grant_reconstruction_rejection_reason,
-    targeted_tool_grant_with_active_reference,
-    targeted_tool_unresolved_rejection_event,
-    targeted_tool_use_binding,
-    targeted_tool_use_rejection_event,
-    targeted_tool_use_rejection_reason,
-    targeted_tool_use_scope_rejection_reason,
-    validate_targeted_tool_grant_batch_evidence,
-    validate_targeted_tool_grant_issuance_evidence,
-    validate_targeted_tool_grant_lifecycle_event,
-    validate_targeted_tool_grant_reference,
-    validate_targeted_tool_grant_revocation_evidence,
-    validate_targeted_tool_grant_revocation_reason,
-    validate_targeted_tool_unresolved_rejection_evidence,
-    validate_targeted_tool_use_rejection_evidence,
-)
-from cayu.runtime.work_attempt_admission import WorkAttemptExecutionClaimLost
-from cayu.runtime.work_contracts import WorkCompletionConflict
+from cayu.sessions.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
@@ -924,6 +776,153 @@ from cayu.storage.memory import (
     prepare_knowledge_publication,
     prepare_knowledge_relations,
 )
+from cayu.tasks.admission import WorkAttemptExecutionClaimLost
+from cayu.tasks.base import (
+    _TASK_CANCELLATION_REQUESTED_REASON,
+    _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    InterruptedTaskContinuationClaimPage,
+    Task,
+    TaskAggregateFilter,
+    TaskCancellationReconciliationRequest,
+    TaskCancellationReconciliationResult,
+    TaskClaimLost,
+    TaskCreate,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
+    TaskInvocationSnapshot,
+    TaskOperationalSnapshot,
+    TaskOrder,
+    TaskQuery,
+    TaskRetryCancellationReconciliationRequest,
+    TaskRetrySeriesDisposition,
+    TaskRetrySettlementRequest,
+    TaskRetrySettlementResult,
+    TaskStatus,
+    TaskStatusCounts,
+    TaskStore,
+    TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
+    TaskTerminalizationRequest,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+    TaskTopologyQuery,
+    TaskTopologyStoreResult,
+    _allocate_task_topology_branch_limits,
+    _bounded_optional_task_topology_parent_id,
+    _can_attach_claimed_task_state,
+    _cancelled_task_retry_settlement,
+    _claimed_task_retry_attempt_elapsed,
+    _copy_optional_session_binding,
+    _copy_optional_status_payload,
+    _copy_optional_status_reason,
+    _copy_required_session_binding,
+    _copy_task_cancellation_reconciliation_result,
+    _elapsed_claimed_task_retry_settlement,
+    _ensure_can_hold_task,
+    _ensure_can_resume_task,
+    _ensure_can_transition,
+    _ensure_claim_query_supported,
+    _ensure_exact_owned_active_task_lease,
+    _ensure_owned_active_task_lease,
+    _ensure_recovered_attached_task_failure_authority,
+    _ensure_recovered_attached_task_session,
+    _ensure_retry_series_queue_attempt,
+    _ensure_task_handoff_authority,
+    _ensure_task_terminalization_lease_authority,
+    _expired_dispatched_task_cancellation,
+    _expired_task_retry_settlement,
+    _interrupted_task_continuation_handoff_id_sha256,
+    _raise_task_claim_attach_error,
+    _reconciled_task_cancellation,
+    _reconciled_task_retry_cancellation,
+    _rejected_task_cancellation_reconciliation,
+    _rejected_task_retry_cancellation_reconciliation,
+    _replay_interrupted_task_handoff_receipt,
+    _replay_task_cancellation_reconciliation,
+    _replay_task_cancellation_reconciliation_rejection,
+    _replay_task_retry_cancellation_reconciliation,
+    _replay_task_retry_cancellation_reconciliation_rejection,
+    _replay_task_retry_settlement,
+    _replay_task_terminalization_receipt,
+    _require_active_attached_task_worker,
+    _require_direct_attached_task_resume,
+    _require_interrupted_task_handoff_authority,
+    _running_task_from_create,
+    _settled_task_retry_attempt,
+    _task_cancellation_reconciliation_conflict,
+    _task_cancellation_reconciliation_rejection_record,
+    _task_cancellation_requested,
+    _task_cancellation_requested_task,
+    _task_from_create,
+    _task_invocation_for_attachment,
+    _task_matches_claim_filter,
+    _task_retry_cancellation_reconciliation_conflict,
+    _task_retry_cancellation_reconciliation_rejection_record,
+    _task_retry_cancellation_requested_task,
+    _task_retry_events,
+    _task_retry_reconciliation_identity_is_bounded,
+    _task_session_id_for_start,
+    _task_session_instance_for_attachment,
+    _TaskCancellationReconciliationRejectionRecord,
+    _TaskRetryCancellationReconciliationRejectionRecord,
+    _validate_ordinary_task_terminalization_against_cancellation,
+    _validate_task_topology_ancestry,
+    _validated_task_cancellation,
+    _validated_task_retry_cancellation,
+    _validated_task_retry_terminal_accounting,
+    build_task_topology_result,
+    copy_task_aggregate_filter,
+    copy_task_create,
+    copy_task_query,
+    decode_task_topology_cursor,
+    prepare_interrupted_task_continuation_claim_page,
+    prepare_interrupted_task_handoff,
+    prepare_interrupted_task_handoff_candidate_page,
+    prepare_interrupted_task_handoff_receipt_lookup,
+    prepare_task_cancellation_reconciliation,
+    prepare_task_retry_cancellation_reconciliation,
+    prepare_task_retry_settlement,
+    prepare_task_terminalization,
+    prepare_task_terminalization_receipt_lookup,
+    task_query_from_aggregate_filter,
+)
+from cayu.tasks.contracts import WorkCompletionConflict
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.grants import (
+    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    TARGETED_TOOL_GRANT_MAX_REQUESTS,
+    TARGETED_TOOL_REFERENCE_FIELD_NAME,
+    TargetedToolGrantIssueOutcome,
+    TargetedToolGrantIssueResult,
+    TargetedToolGrantReconstructionResult,
+    TargetedToolGrantRecord,
+    TargetedToolGrantStateSnapshot,
+    TargetedToolUseBinding,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
+    TargetedToolUseResult,
+    copy_targeted_tool_grant_record,
+    targeted_tool_grant_event,
+    targeted_tool_grant_reconstruction_rejection_reason,
+    targeted_tool_grant_with_active_reference,
+    targeted_tool_unresolved_rejection_event,
+    targeted_tool_use_binding,
+    targeted_tool_use_rejection_event,
+    targeted_tool_use_rejection_reason,
+    targeted_tool_use_scope_rejection_reason,
+    validate_targeted_tool_grant_batch_evidence,
+    validate_targeted_tool_grant_issuance_evidence,
+    validate_targeted_tool_grant_lifecycle_event,
+    validate_targeted_tool_grant_reference,
+    validate_targeted_tool_grant_revocation_evidence,
+    validate_targeted_tool_grant_revocation_reason,
+    validate_targeted_tool_unresolved_rejection_evidence,
+    validate_targeted_tool_use_rejection_evidence,
+)
 from cayu.work_context import (
     AgentRecallCheckpoint,
     AgentRecallCheckpointKey,
@@ -996,6 +995,7 @@ from cayu.work_context import (
     validate_agent_recall_subscription_publication,
     validate_agent_work_context_publication,
 )
+from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 # A fixed 63-bit advisory-lock key. Every Cayu store sharing a database takes this
 # lock before touching schema, so concurrent creators/migrators (the production
@@ -15259,7 +15259,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         staged_by: str,
         evaluated_at: datetime,
     ) -> AgentRecallSubscriptionEvaluation:
-        from cayu.recall_processing import AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingResult
 
         claim = copy_agent_recall_subscription_claim(claim)
         if type(result) is not AgentRecallProcessingResult:
@@ -17924,7 +17924,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         operation_id: str,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposalPublicationReceipt:
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationReceipt,
             copy_knowledge_maintenance_proposal_publication_receipt,
@@ -18112,7 +18112,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposalPublication | None:
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceProposalPublication,
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationOutcome,
@@ -18194,7 +18194,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceGovernanceReceipt:
-        from cayu.knowledge_maintenance_governance import (
+        from cayu.knowledge.maintenance_governance import (
             KnowledgeMaintenanceGovernanceAuthority,
             KnowledgeMaintenanceGovernanceDisposition,
             KnowledgeMaintenanceGovernanceReceipt,
@@ -18362,7 +18362,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeSemanticWatchReceipt:
-        from cayu.knowledge_semantic_watch import (
+        from cayu.knowledge.semantic_watch import (
             KnowledgeSemanticWatchAuthority,
             KnowledgeSemanticWatchConflict,
             KnowledgeSemanticWatchReceipt,
@@ -18529,7 +18529,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         publication_snapshot = publication[3]
                         governance_publication = publication
                     if KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata:
-                        from cayu.knowledge_maintenance_governance import (
+                        from cayu.knowledge.maintenance_governance import (
                             governance_authority_from_maintenance_records,
                         )
 
@@ -20974,7 +20974,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         ]
         | None
     ):
-        from cayu.knowledge_maintenance_persistence import (
+        from cayu.knowledge.maintenance_persistence import (
             KnowledgeMaintenanceAcceptedPlan,
             KnowledgeMaintenanceProposalPublicationConflict,
             KnowledgeMaintenanceProposalPublicationReceipt,
@@ -21131,7 +21131,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         access_scope: KnowledgeAccessScope,
         deny_inaccessible: bool,
     ) -> KnowledgeMaintenanceGovernanceReceipt | None:
-        from cayu.knowledge_maintenance_governance import (
+        from cayu.knowledge.maintenance_governance import (
             KnowledgeMaintenanceGovernanceDisposition,
             KnowledgeMaintenanceGovernanceReceipt,
             copy_knowledge_maintenance_governance_receipt,
@@ -21181,7 +21181,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         access_scope: KnowledgeAccessScope,
         deny_inaccessible: bool,
     ) -> KnowledgeSemanticWatchReceipt | None:
-        from cayu.knowledge_semantic_watch import (
+        from cayu.knowledge.semantic_watch import (
             KnowledgeSemanticWatchConflict,
             KnowledgeSemanticWatchReceipt,
             copy_knowledge_semantic_watch_receipt,
@@ -26454,7 +26454,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         result_checkpoint_transform: CheckpointTransform | None = None,
         operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         request = copy_run_request(request)
         identity = copy_session_identity(identity)
@@ -27016,7 +27016,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             _checkpoint_row_values(fork.id, copied_checkpoint, fork.updated_at),
                         )
                     if events:
-                        from cayu.runtime.pending_actions import pending_action_event_storage_values
+                        from cayu.sessions.pending_actions import (
+                            pending_action_event_storage_values,
+                        )
 
                         activity_at = await self._session_store_now(cur)
                         await cur.execute(
@@ -28097,7 +28099,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_latest_interaction_event_id: str | None = None,
         require_no_active_model_completion_dispatch: bool = False,
     ) -> Session:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -28538,7 +28540,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         decision: ExecutionProfileDecision | None = None,
         expected_active_invocation_profile_authority: CheckpointValueAuthority | None = None,
     ) -> ExecutionProfileRejectionResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         (
             session_id,
@@ -28745,7 +28747,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         terminalization_only: bool = False,
         terminalization_plan_ownership: Any = None,
     ) -> InteractionTransitionResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         expected_invocation_authority_state = (
             _validate_interaction_transition_invocation_authority_parameters(
@@ -29926,7 +29928,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         activity_at: datetime,
     ) -> None:
         """Insert prepared events after their transaction owner assigns order."""
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         copied_events = list(events)
         await self._register_event_public_authorities(cur, session_id, copied_events)
@@ -30146,7 +30148,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         workflow_name: str,
         attempt_id: str,
     ) -> bool:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id, copied_event, workflow_name, attempt_id = _copy_workflow_step_reservation(
             session_id,
@@ -30304,7 +30306,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         baseline_updates: dict[str, McpManifestBaseline],
         events: list[Event],
     ) -> McpManifestPublicationResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id, expected, updates, copied_events = _copy_mcp_manifest_publication(
             session_id,
@@ -31225,7 +31227,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         request = copy_enqueue_session_message_request(request)
         await self._ensure_ready()
@@ -31472,7 +31474,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         interaction_started_event: Event | None = None,
         profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> SessionMessageDeliveryBatch:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id = require_clean_nonblank(session_id, "session_id")
         delivery_id = (
@@ -33244,7 +33246,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         _model_completion_stage: _ModelCompletionStagePromotionContext | None = None,
     ) -> RuntimePublicationResult:
-        from cayu.runtime.pending_actions import (
+        from cayu.sessions.pending_actions import (
             pending_action_event_storage_values,
             pending_action_lookup_key,
         )
@@ -33958,7 +33960,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_transcript_cursor: int | None,
         preserve_completion_result_publications: bool,
     ) -> Session:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
+        from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         session_id, copied_events = _copy_session_event_batch(session_id, events)
         transform_count = sum(
@@ -34271,7 +34273,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         limits: SessionExportLimits | None = None,
     ) -> SessionExportSnapshot | None:
-        from cayu.runtime.exports import SESSION_EXPORT_PAGE_SIZE, SessionExportBuilder
+        from cayu.sessions.exports import SESSION_EXPORT_PAGE_SIZE, SessionExportBuilder
 
         session_id = require_clean_nonblank(session_id, "session_id")
         from cayu.storage._session_export_sql import export_size_statement
@@ -34395,7 +34397,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         input_id: str,
     ) -> list[Event]:
-        from cayu.runtime.pending_actions import pending_action_lookup_key
+        from cayu.sessions.pending_actions import pending_action_lookup_key
 
         session_id = require_clean_nonblank(session_id, "session_id")
         input_id = require_clean_nonblank(input_id, "input_id")
@@ -34431,7 +34433,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         tool_call_ids: list[str] | tuple[str, ...],
     ) -> list[Event]:
-        from cayu.runtime.pending_actions import pending_action_lookup_key
+        from cayu.sessions.pending_actions import pending_action_lookup_key
 
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
@@ -34473,7 +34475,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         tool_round_identity: ToolRoundIdentity,
     ) -> list[Event]:
-        from cayu.runtime.pending_actions import pending_action_lookup_key
+        from cayu.sessions.pending_actions import pending_action_lookup_key
 
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
@@ -36359,7 +36361,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> PendingActionListResult:
-        from cayu.runtime.pending_actions import (
+        from cayu.sessions.pending_actions import (
             pending_action_from_records,
             pending_action_matches_query,
             pending_action_source_is_invalid,
@@ -42471,7 +42473,7 @@ def _checkpoint_row_values(
     checkpoint: dict[str, Any],
     updated_at: datetime,
 ) -> tuple[object, ...]:
-    from cayu.runtime.pending_actions import pending_action_checkpoint_metrics
+    from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
 
     checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)

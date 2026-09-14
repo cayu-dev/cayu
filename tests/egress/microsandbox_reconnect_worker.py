@@ -20,18 +20,18 @@ from tests.egress_e2e_support import (
 )
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
-from cayu.core.events import Event
 from cayu.egress import CapturedRequest, HttpEgressPolicy
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.environments import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
     EnvironmentSpec,
 )
+from cayu.events import Event
+from cayu.observability.events import EventSink
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import ExecCommand
-from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
-from cayu.runtime.event_sinks import EventSink
 from cayu.storage import SQLiteSessionStore
 from cayu.vaults import SecretRef, StaticVault
 

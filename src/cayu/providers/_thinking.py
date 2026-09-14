@@ -11,7 +11,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from cayu.core.thinking import ThinkingConfig
+from cayu.context.thinking import ThinkingConfig
 
 _STANDARD = frozenset({"low", "medium", "high"})
 _OPENAI_MODELS = {

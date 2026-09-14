@@ -13,13 +13,13 @@ from cayu.runtime._browser_control_authorization import BrowserControlRevisionCh
 from cayu.runtime._browser_control_channel import BoundBrowserGuest, BrowserGuestCommandOwner
 from cayu.runtime._browser_control_frames import BrowserViewUnavailable
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
-from cayu.runtime.browser_control import (
+from cayu.tools._browser_control_guest import GuestControlChannel, GuestControlFence
+from cayu.tools._browser_guest import _InteractiveDaemon, _InteractivePage
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPage,
     BrowserControlPrincipal,
 )
-from cayu.tools._browser_control_guest import GuestControlChannel, GuestControlFence
-from cayu.tools._browser_guest import _InteractiveDaemon, _InteractivePage
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

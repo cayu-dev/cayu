@@ -29,25 +29,13 @@ from tests.core.test_human_review import (
     resolve,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EnvironmentSpec,
-    EventType,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-)
-from cayu.runtime import (
-    AdmitInvocationCommand,
-    ResumeRequest,
-    SessionRunFenced,
-    SessionStatus,
-    ToolPolicyDecision,
-    ToolPolicyResult,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _invocation_lifecycle as lifecycle
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
 from cayu.runtime._browser_control_checkpoint import (
@@ -56,10 +44,14 @@ from cayu.runtime._browser_control_checkpoint import (
 )
 from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime.browser_control import BrowserControlCheckpoint
-from cayu.runtime.browser_control_config import BrowserControlConfig
-from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.runtime._invocation_lifecycle import AdmitInvocationCommand
+from cayu.sessions.base import ResumeRequest, RunRequest, SessionRunFenced, SessionStatus
+from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.browser_control import BrowserControlCheckpoint
+from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
+from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.tools.user_input import UserInputTool
 
 pytestmark = pytest.mark.usefixtures("simulated_tool_executables")

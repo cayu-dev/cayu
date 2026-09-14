@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.recall_relevance import (
+from cayu.memory.relevance import (
     TOPIC_RELEVANCE_TEXT_VERSION,
     TOPIC_RELEVANCE_VERSION,
     query_concept_eligibility,
@@ -203,15 +203,11 @@ def test_factual_schema_terms_reach_real_backend_admission(
 
     from test_memory_admission import _policy
 
-    from cayu.memory import admit_recall
-    from cayu.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
-    from cayu.retrieval import WeightedReciprocalRankFusionConfig
-    from cayu.storage import (
-        InMemoryKnowledgeStore,
-        KnowledgeAccessScope,
-        KnowledgeEntry,
-        SQLiteKnowledgeStore,
-    )
+    from cayu.memory.base import admit_recall
+    from cayu.memory.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
+    from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
+    from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
+    from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 
     async def check():
         scope = KnowledgeAccessScope.for_namespace("default")

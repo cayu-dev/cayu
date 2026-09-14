@@ -7,7 +7,16 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from cayu._validation import require_nonblank, require_unicode_scalar_text
-from cayu.core.tools import (
+from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerUnavailableError
+from cayu.runners.local import LocalRunner
+from cayu.tools._errors import (
+    reject_unknown_tool_arguments,
+    structured_invalid_arguments,
+    tool_argument_validation,
+)
+from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
+from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools.base import (
     Tool,
     ToolContext,
     ToolEffect,
@@ -16,16 +25,9 @@ from cayu.core.tools import (
     ToolResult,
     ToolSpec,
 )
-from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
-from cayu.tools._errors import (
-    reject_unknown_tool_arguments,
-    structured_invalid_arguments,
-    tool_argument_validation,
-)
-from cayu.tools._execution_requirements import with_intrinsic_execution_requirements
-from cayu.tools._runner import InvocationRunnerHandle
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
-from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.workspaces.base import RunnerBoundWorkspace
+from cayu.workspaces.local import LocalWorkspace
 
 DEFAULT_GIT_CHANGES_LIMIT = 50
 MAX_GIT_CHANGES_LIMIT = 200

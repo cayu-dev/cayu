@@ -9,10 +9,22 @@ from uuid import UUID
 
 import pytest
 
-import cayu.runtime.budgets as budgets_module
+import cayu.budgets.base as budgets_module
 from cayu import CayuConfig, RunDefaults
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
+from cayu.budgets.pricing import ModelPrice, PriceBook, Provenance
+from cayu.context.base import (
+    ContextBuildResult,
+    ContextRecallTelemetry,
+    ContextRequest,
+    RecentTurnsContextPolicy,
+    RuntimeManagedContextPolicy,
+)
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers import (
     ModelContextOverflowError,
     ModelProvider,
@@ -20,31 +32,10 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime import (
-    AlwaysRequireApprovalToolPolicy,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    CayuApp,
-    InMemoryBudgetLedger,
-    InMemorySessionStore,
-    ModelPrice,
-    PriceBook,
-    RecentTurnsContextPolicy,
-    RetryPolicy,
-    RunRequest,
-    SessionStatus,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-)
-from cayu.runtime.context import (
-    ContextBuildResult,
-    ContextRecallTelemetry,
-    ContextRequest,
-    RuntimeManagedContextPolicy,
-)
-from cayu.runtime.costs import Provenance
-from cayu.runtime.sessions import SessionRunFenced
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionRunFenced, SessionStatus
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

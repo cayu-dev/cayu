@@ -46,7 +46,7 @@ from cayu import (
     TaskTerminalizationRetryPolicy,
     TaskTerminalizationUncertain,
 )
-from cayu.knowledge_enrichment import _parse_failure_payload, _result_from_task
+from cayu.knowledge.enrichment import _parse_failure_payload, _result_from_task
 from cayu.storage.migrations import SchemaMode
 
 _NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)

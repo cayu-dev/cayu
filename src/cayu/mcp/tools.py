@@ -13,7 +13,6 @@ from threading import Lock
 from typing import Any, NoReturn
 
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.mcp._jsonrpc import McpProtocolError
 from cayu.mcp._transport import (
     credential_safe_mcp_fatal_signal,
@@ -40,6 +39,7 @@ from cayu.mcp.base import (
 )
 from cayu.mcp.http import HttpMcpClient, HttpMcpSession
 from cayu.mcp.stdio import StdioMcpClient, StdioMcpSession
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults import SecretRedactor
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")

@@ -12,96 +12,40 @@ import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
 
 import cayu.runtime._session_engine as session_engine_module
-from cayu import (
-    EXECUTION_PROFILE_METADATA_KEY,
-    AgentSpec,
-    BeforeStopContext,
-    BeforeStopDecision,
-    BeforeToolCallHookContext,
-    BudgetLimit,
-    BudgetPolicy,
-    CayuApp,
-    CayuConfig,
-    CheckpointCompactionContextPolicy,
-    ContextCountingConfig,
-    ContextCountingMode,
-    ContextPolicy,
-    ContextRequest,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventQuery,
-    EventType,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAdoptionRejected,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileBehaviorIdentity,
-    ExecutionProfileComponentClass,
-    ExecutionProfileDecision,
-    ExecutionProfileDecisionKind,
-    ExecutionProfileMismatchError,
-    ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
-    ForkExecutionProfileSelection,
-    ForkSessionRequest,
-    ForkSystemPromptPolicy,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
-    InMemorySessionStore,
-    InteractionStatus,
-    InteractionSummaryEvidence,
-    LocalWorkspace,
-    LoopPolicy,
-    Message,
-    MessageWindowContextPolicy,
-    ModelCompactor,
-    ModelPrice,
-    ModelStreamEvent,
-    ModelTarget,
-    PriceBook,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
     ResolutionActor,
     ResolutionActorSource,
-    ResumeRequest,
-    RetryPolicy,
-    RunDefaults,
-    RunLimits,
-    RunRequest,
-    RuntimeBuildProvenance,
-    RuntimeHook,
-    RuntimeHookContext,
-    ScriptedModelProvider,
-    SessionIdentity,
-    SessionQuery,
-    SessionRunFenced,
-    SessionStatus,
-    SessionStatusConflict,
-    SQLiteSessionStore,
-    Tool,
     ToolApprovalDecision,
     ToolApprovalRequest,
-    ToolCallHookContext,
-    ToolCapabilityCeiling,
-    ToolContext,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolResult,
-    ToolSpec,
-    UsageTriggeredContextPolicy,
-    UserInputResponse,
-    session_fork_profile_relationship,
-    session_prompt_anatomy_transition,
 )
-from cayu.core.events import event_with_runtime_envelope_authority
+from cayu.approvals.user_input import UserInputResponse, pending_user_input_from_checkpoint
+from cayu.budgets.base import BudgetLimit, BudgetPolicy
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    ContextPolicy,
+    ContextRequest,
+    MessageWindowContextPolicy,
+    ModelCompactor,
+    UsageTriggeredContextPolicy,
+)
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.factory import register_environment_factory_cleanup_retry
-from cayu.providers import (
-    ModelProvider,
-    ModelProviderError,
-    ModelRequest,
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType, event_with_runtime_envelope_authority
+from cayu.messages import Message
+from cayu.observability.hooks import (
+    BeforeToolCallHookContext,
+    RuntimeHook,
+    RuntimeHookContext,
+    ToolCallHookContext,
+)
+from cayu.providers.base import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -110,26 +54,32 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime import (
+from cayu.runtime import _approval_support, _tool_round_recovery
+from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
-    InteractionTransitionSpec,
     InvocationContext,
-    SessionStore,
     SettleInvocationCommand,
-    _approval_support,
-    _tool_round_recovery,
+    invocation_checkpoint_state_sha256,
 )
-from cayu.runtime._invocation_lifecycle import invocation_checkpoint_state_sha256
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_coordinator import RecoverySessionRunRequest
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    CheckpointCompatibilityError,
-)
+from cayu.runtime.build_provenance import RuntimeBuildProvenance
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAdoptionRejected,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
+    ExecutionProfileMismatchError,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
     changed_execution_profile_components,
@@ -138,10 +88,45 @@ from cayu.runtime.execution_profiles import (
     execution_profile_decision_payload,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.sessions import _invocation_lifecycle_authority_mutation_scope
-from cayu.runtime.user_input import pending_user_input_from_checkpoint
+from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    EventQuery,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
+    ForkSystemPromptPolicy,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+    InMemorySessionStore,
+    InteractionTransitionSpec,
+    ModelTarget,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionQuery,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStatusConflict,
+    SessionStore,
+    _invocation_lifecycle_authority_mutation_scope,
+    session_fork_profile_relationship,
+    session_prompt_anatomy_transition,
+)
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    CheckpointCompatibilityError,
+)
+from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.local import LocalWorkspace
 
 
 class RecordingExternalTool(Tool):
@@ -506,7 +491,7 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             from_statuses={SessionStatus.PENDING},
             to_status=SessionStatus.RUNNING,
         )
-        from cayu.runtime.tool_exposure import session_metadata_with_tool_capability_ceiling
+        from cayu.tools.exposure import session_metadata_with_tool_capability_ceiling
 
         session = session.model_copy(
             update={
@@ -2961,8 +2946,8 @@ def test_approval_continuation_reconstructs_profile_once_in_postgres(
     postgres_dsn: str,
 ) -> None:
     async def scenario() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         store = PostgresSessionStore(
             postgres_dsn,
@@ -3710,8 +3695,8 @@ def test_profile_adoption_waits_for_terminal_hook_release_in_postgres(
     postgres_dsn: str,
 ) -> None:
     async def scenario() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         store = PostgresSessionStore(
             postgres_dsn,
@@ -3926,8 +3911,8 @@ def test_provider_retry_keeps_process_local_resolution_after_mutation_in_postgre
     postgres_dsn: str,
 ) -> None:
     async def scenario() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         store = PostgresSessionStore(
             postgres_dsn,
@@ -5166,8 +5151,8 @@ def test_snapshot_only_restart_profile_boundary_in_postgres(
     restart_state: str,
 ) -> None:
     async def scenario() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         store = PostgresSessionStore(
             postgres_dsn,
@@ -5612,8 +5597,8 @@ def test_crashed_model_operation_rejects_invalid_restart_in_postgres(
     invalid_restart: str,
 ) -> None:
     async def scenario() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         store = PostgresSessionStore(
             postgres_dsn,

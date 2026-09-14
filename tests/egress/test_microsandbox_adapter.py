@@ -30,6 +30,7 @@ from cayu.egress import (
 )
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 from cayu.egress.proxy_exposure import MICROSANDBOX_HOST, ExposedProxy
+from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.environments import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
@@ -42,7 +43,6 @@ from cayu.environments.factory import (
     retry_environment_factory_cleanup_settlement_task,
 )
 from cayu.runners import MicrosandboxRunner
-from cayu.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.vaults import SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace
 

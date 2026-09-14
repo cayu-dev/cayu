@@ -26,16 +26,16 @@ from cayu._validation import (
     copy_json_value,
     require_durable_clean_nonblank,
 )
-from cayu.core.agents import AgentAuthoringState
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.environments import ExecutionRequirements
-from cayu.runtime.config import CayuConfigSource
-from cayu.runtime.request_footprints import (
+from cayu.agents import AgentAuthoringState
+from cayu.configuration import CayuConfigSource
+from cayu.context.footprints import (
     REQUEST_FOOTPRINT_CANONICALIZATION_VERSION,
     REQUEST_FOOTPRINT_SCHEMA_VERSION,
 )
-from cayu.runtime.tool_catalogue import ToolExecutionContract
-from cayu.runtime.tool_policy import (
+from cayu.environments.admission import ExecutionRequirements
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tools.catalogue import ToolExecutionContract
+from cayu.tools.policy import (
     AllowAllToolPolicy,
     AllowlistRule,
     AlwaysRequireApprovalToolPolicy,
@@ -48,7 +48,7 @@ from cayu.runtime.tool_policy import (
     ToolPolicy,
     ToolPolicyDecision,
 )
-from cayu.runtime.tool_result_projection import (
+from cayu.tools.result_projection import (
     ArtifactExternalizingToolResultPolicy,
     ToolResultProjectionPolicy,
 )
@@ -60,8 +60,8 @@ from cayu.workspaces.branches import (
 )
 
 if TYPE_CHECKING:
+    from cayu.applications import CayuApp
     from cayu.runtime import _runtime_records as runtime_records
-    from cayu.runtime.app import CayuApp
 
 APP_MANIFEST_SCHEMA_VERSION = "17"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"

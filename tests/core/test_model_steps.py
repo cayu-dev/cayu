@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import Message, MessageRole, ProviderStatePart, TextPart
+from cayu.messages import Message, MessageRole, ProviderStatePart, TextPart
 from cayu.providers import (
     ModelCompletion,
     ModelFinishReason,

@@ -7,7 +7,6 @@ from hashlib import sha256
 import pytest
 
 import cayu.build_provenance as build_provenance_module
-from cayu.agent_snapshots import execution_profile_snapshot_ref
 from cayu.build_provenance import (
     RUNTIME_BUILD_PROVENANCE_ENV,
     RUNTIME_BUILD_PROVENANCE_STRICT_ENV,
@@ -27,7 +26,8 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     changed_execution_profile_components,
 )
-from cayu.runtime.sessions import runtime_build_provenance_from_session_metadata
+from cayu.sessions.base import runtime_build_provenance_from_session_metadata
+from cayu.snapshots.base import execution_profile_snapshot_ref
 
 
 def _artifact_provenance(
@@ -117,9 +117,9 @@ def test_wheel_record_projection_covers_code_and_distribution_metadata() -> None
     class Distribution:
         def __init__(self, metadata_hash: str) -> None:
             self.files = (
-                WheelFile("cayu/runtime/app.py", "code-hash", 123),
+                WheelFile("cayu/applications.py", "code-hash", 123),
                 WheelFile(
-                    "cayu/runtime/__pycache__/app.cpython-314.pyc",
+                    "cayu/__pycache__/applications.cpython-314.pyc",
                     None,
                     234,
                 ),
@@ -161,7 +161,7 @@ def test_wheel_record_projection_covers_hashed_runtime_bytecode() -> None:
         def __init__(self, bytecode_hash: str) -> None:
             self.files = (
                 WheelFile(
-                    "cayu/runtime/__pycache__/app.cpython-314.pyc",
+                    "cayu/__pycache__/applications.cpython-314.pyc",
                     bytecode_hash,
                     234,
                 ),
@@ -187,7 +187,7 @@ def test_wheel_record_projection_rejects_uncovered_unhashed_bytecode() -> None:
         size = 234
 
         def __str__(self) -> str:
-            return "cayu/runtime/__pycache__/app.cpython-314.pyc"
+            return "cayu/__pycache__/applications.cpython-314.pyc"
 
     class Distribution:
         files = (WheelFile(),)
@@ -223,7 +223,7 @@ def test_wheel_record_projection_rejects_uncovered_behavior_files(
         files = (
             WheelFile("cayu/__init__.py", WheelHash("sha256", "covered"), 10),
             WheelFile(
-                "cayu/runtime/app.py",
+                "cayu/applications.py",
                 (None if uncovered_hash is None else WheelHash("sha512", "not-authoritative")),
                 20,
             ),

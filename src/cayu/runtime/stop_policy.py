@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.runtime.usage import SessionUsageSummary
+from cayu.budgets.usage import SessionUsageSummary
 
 
 class StopLimit(StrEnum):

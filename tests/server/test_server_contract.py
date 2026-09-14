@@ -12,21 +12,16 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import (
-    CayuApp,
-    Environment,
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.pricing import default_price_book
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentSpec,
-    InMemoryKnowledgeStore,
-    InMemoryTaskStore,
-    KnowledgeAccessScope,
-    LocalArtifactStore,
-    default_price_book,
 )
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
-from cayu.runtime import InMemorySessionStore
+from cayu.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.server import (
     AuthContext,
     DashboardConfig,
@@ -52,6 +47,9 @@ from cayu.server.sse import (
     event_to_sse_message,
     parse_last_event_id,
 )
+from cayu.sessions.base import InMemorySessionStore
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
+from cayu.tasks.base import InMemoryTaskStore
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):

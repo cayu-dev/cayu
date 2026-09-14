@@ -6,53 +6,44 @@ from typing import Any
 
 import pytest
 
-from cayu import (
-    BROWSER_FETCH_PLAYWRIGHT_VERSION,
-    BROWSER_FETCH_PROTOCOL_VERSION,
-    BROWSER_FETCH_WORKER_VERSION,
-    ApprovedEgressDestination,
-    BrowserEgressPolicy,
-    CayuApp,
-    CredentialProxy,
-    ExaWebAdapter,
-    ExecutionProfileBehaviorIdentity,
-    LocalArtifactStore,
-    Message,
-    RunRequest,
-    ScriptedModelProvider,
-    SecretRedactor,
-    SecretRef,
-    VirtualEgressEnvironmentFactory,
-    WebAccessRoutePolicy,
-    WebBridge,
-    WebBridgeCredentialAuthority,
-    WebBridgeProfileKind,
-    WebBridgeRoute,
-    WebSearchRestrictions,
-)
-from cayu.core import AgentSpec, ToolContext, ToolResult
-from cayu.environments import (
-    Environment,
-    EnvironmentSpec,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.egress.destinations import ApprovedEgressDestination
+from cayu.egress.policy import BrowserEgressPolicy
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionEnvironmentAuthority,
 )
-from cayu.proxies import ProxyAuthorizationResult
-from cayu.runners import (
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
+from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerWorkloadAuthority
+from cayu.runners.workloads import (
     BROWSER_FETCH_WORKLOAD_NAME,
     BROWSER_SESSION_WORKLOAD_NAME,
     PINNED_BROWSER_FETCH_WORKLOAD,
     PINNED_BROWSER_SESSION_WORKLOAD,
-    ExecCommand,
-    ExecResult,
-    Runner,
-    RunnerWorkloadAuthority,
 )
-from cayu.tools import WebFetchAdapterRequest, WebSearchAdapterRequest
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import RunRequest
 from cayu.tools._runner import InvocationRunnerHandle
-from cayu.vaults import ResolvedSecret
+from cayu.tools.base import ToolContext, ToolResult
+from cayu.tools.browser import (
+    BROWSER_FETCH_PLAYWRIGHT_VERSION,
+    BROWSER_FETCH_PROTOCOL_VERSION,
+    BROWSER_FETCH_WORKER_VERSION,
+)
+from cayu.tools.exa import ExaWebAdapter
+from cayu.tools.web import WebFetchAdapterRequest, WebSearchAdapterRequest, WebSearchRestrictions
+from cayu.tools.web_access import WebAccessRoutePolicy, WebBridgeRoute
+from cayu.tools.webbridge import WebBridge, WebBridgeCredentialAuthority, WebBridgeProfileKind
+from cayu.vaults.base import ResolvedSecret, SecretRef
+from cayu.vaults.redaction import SecretRedactor
 
 _BROWSER_ENVIRONMENT_AUTHORITY = ExecutionEnvironmentAuthority(
     identity="browser-test-environment",

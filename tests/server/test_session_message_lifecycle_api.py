@@ -19,15 +19,12 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from cayu import (
-    CayuApp,
-    EnqueueSessionMessageRequest,
-    InMemorySessionStore,
-    Message,
-    ResolutionActor,
-    ResolutionActorSource,
-    RunRequest,
-    SessionIdentity,
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
     SessionMessageAccessDenied,
     SessionMessageAccessPolicy,
@@ -38,12 +35,17 @@ from cayu import (
     SessionMessageQuery,
     SessionMessageTarget,
 )
-from cayu.core.events import Event, EventType
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.sessions import EventQuery, SessionStatus
 from cayu.server import AuthContext, ServerConfig, create_server
-from cayu.storage import SQLiteSessionStore
-from cayu.vaults import SecretRedactor
+from cayu.sessions.base import (
+    EnqueueSessionMessageRequest,
+    EventQuery,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.vaults.redaction import SecretRedactor
 
 CONTEXT = SessionMessageAccessContext(subject="alice", tenant="tenant-a")
 HEADERS = {"Authorization": "Bearer alice"}

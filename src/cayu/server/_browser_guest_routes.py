@@ -19,8 +19,8 @@ from cayu.runtime._browser_control_coordinator import (
 )
 from cayu.runtime._browser_control_frames import MAX_BROWSER_FRAME_MESSAGE_BYTES
 from cayu.runtime._browser_control_service import BrowserControlService
-from cayu.runtime.browser_control import BrowserControlConflict
 from cayu.tools._browser_control_transport import CONTROL_MESSAGE_BYTES, CONTROL_SUBPROTOCOL
+from cayu.tools.browser_control import BrowserControlConflict
 
 
 class _GuestSocket:

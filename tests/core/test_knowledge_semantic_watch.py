@@ -9,7 +9,7 @@ import pytest
 from examples.knowledge_semantic_watch import main as semantic_watch_example
 
 import cayu
-from cayu.knowledge_semantic_watch import (
+from cayu.knowledge.semantic_watch import (
     MAX_KNOWLEDGE_SEMANTIC_WATCH_POLICY_REQUEST_BYTES,
     KnowledgeSemanticWatchAuthority,
     KnowledgeSemanticWatchConfig,
@@ -23,7 +23,7 @@ from cayu.knowledge_semantic_watch import (
     knowledge_semantic_watch_request_fingerprint,
     prepare_knowledge_semantic_watch_invocation,
 )
-from cayu.recall import (
+from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     RECALL_MAX_KNOWLEDGE_GROUPED_ASPECT_BYTES,
@@ -32,7 +32,7 @@ from cayu.recall import (
     RecallSituation,
     RecallSource,
 )
-from cayu.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,

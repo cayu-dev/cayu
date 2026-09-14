@@ -13,28 +13,25 @@ import pytest
 from tests.core.test_foreground_child_restart import _RestartRecordingTool
 from tests.core.test_foreground_subagent_recovery import _identity, _Provider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    InMemorySessionStore,
-    Message,
-    RunRequest,
-    SessionQuery,
-    SQLiteSessionStore,
-    SubagentSpec,
-    SubagentTool,
-    ToolApprovalDecision,
-)
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import ToolApprovalRequest, UserInputResponse
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
+    InMemorySessionStore,
     PendingActionQuery,
+    RunRequest,
+    SessionQuery,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
 )
-from cayu.runtime.tool_policy import AlwaysRequireApprovalToolPolicy
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
+from cayu.tools.subagents import SubagentSpec, SubagentTool
 from cayu.tools.user_input import UserInputTool
 
 
@@ -209,7 +206,7 @@ def _run_case(
                     child.id for child in children
                 }
             if stop_parent:
-                from cayu.runtime import InterruptSessionRequest
+                from cayu.sessions.base import InterruptSessionRequest
 
                 owner = app._recovery_coordinator._foreground_gate_policy_owner
                 assert owner._wait_policies if parent_gate == "none" else owner._policies

@@ -21,7 +21,7 @@ from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     queued_dispatch_terminal_event_id,
 )
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )

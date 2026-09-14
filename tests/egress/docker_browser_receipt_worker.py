@@ -10,16 +10,19 @@ from pathlib import Path
 
 from tests.egress.docker_browser_reconnect_worker import Site, identity, persist
 
-from cayu import ApprovedEgressDestination, BrowserSessionTool, LocalArtifactStore, ToolContext
-from cayu.core.tools import _bind_runtime_tool_invocation_authority
-from cayu.egress import HttpEgressPolicy
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.egress.destinations import ApprovedEgressDestination
 from cayu.egress.docker_adapter import DockerEgressAdapter
-from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
-from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
+from cayu.egress.policy import HttpEgressPolicy
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
+from cayu.environments.factory import EnvironmentFactoryOperation, EnvironmentFactoryRequest
+from cayu.runners.base import ExecCommand
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
-from cayu.vaults import SecretRedactor
+from cayu.tools.base import ToolContext, _bind_runtime_tool_invocation_authority
+from cayu.tools.browser_session import BrowserSessionTool
+from cayu.vaults.redaction import SecretRedactor
 
 
 async def main(mode, root):

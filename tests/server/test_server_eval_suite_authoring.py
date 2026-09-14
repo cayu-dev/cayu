@@ -18,13 +18,7 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import (
-    EvalExecutionProfilePolicyV1,
-    ModelPrice,
-    ModelStreamEvent,
-    PriceBook,
-    ScriptedModelProvider,
-)
+from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.evals.corpus import (
     ArtifactAssertionSpec,
     CorpusUserMessageSpec,
@@ -37,6 +31,7 @@ from cayu.evals.corpus import (
     ToolArgumentsContainAssertionSpec,
     ToolResultContainsAssertionSpec,
 )
+from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.suite_authoring import (
     EvalCaseDraftV1,
     EvalCaseDraftV2,
@@ -48,6 +43,8 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDraftV3,
     EvalSuiteTrialRequestDraftV3,
 )
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.providers.base import ModelStreamEvent
 from cayu.server import DashboardConfig, EvalsConfig, ServerConfig, create_server
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 

@@ -18,66 +18,26 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from cayu import (
-    CayuConfig,
-    Environment,
-    EnvironmentFactory,
-    EnvironmentFactoryRequest,
-    EnvironmentFactoryResult,
-    EnvironmentSpec,
-    ToolExecutionConfig,
-)
 from cayu._validation import DurableValueError, copy_bounded_durable_json_value
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ToolResultPart,
-)
-from cayu.core.isolated_tools import (
-    ProcessIsolatedTool,
-    ProcessIsolatedToolContext,
-    ProcessIsolatedToolContextProjection,
-    ProcessIsolatedToolFactoryRef,
-    ProcessIsolatedToolLimits,
-)
-from cayu.core.tools import (
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-    _bind_runtime_tool_invocation_authority,
-)
-from cayu.evals.testing import ScriptedModelProvider
-from cayu.providers import ModelStreamEvent
-from cayu.runtime import (
-    AlwaysRequireApprovalToolPolicy,
-    BeforeToolCallDecision,
-    BeforeToolCallHookContext,
-    CayuApp,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InterruptSessionRequest,
-    PublicAuthorityAliasKeyring,
-    ResumeRequest,
-    RunRequest,
-    RuntimeHook,
-    SessionStatus,
-    Task,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import (
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRequest,
-    ToolEffectConflict,
-    ToolExecutionContract,
-    ToolRoundRecoveryRequest,
-    run_task_worker,
 )
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolResultPart
+from cayu.observability.hooks import BeforeToolCallDecision, BeforeToolCallHookContext, RuntimeHook
+from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _isolated_tool_process as isolated_process
 from cayu.runtime import _isolated_tool_supervisor as isolated_supervisor
 from cayu.runtime import _tool_execution as tool_execution
@@ -98,15 +58,45 @@ from cayu.runtime._isolated_tool_protocol import (
     decode_isolated_tool_response,
     encode_isolated_tool_success,
 )
-from cayu.runtime.tool_policy import (
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasKeyring
+from cayu.runtime.tool_effects import ToolEffectConflict
+from cayu.server import ServerConfig, create_server
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    SessionStatus,
+)
+from cayu.tasks.base import InMemoryTaskStore, Task, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
+from cayu.tools.base import (
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    _bind_runtime_tool_invocation_authority,
+)
+from cayu.tools.catalogue import ToolExecutionContract
+from cayu.tools.isolated import (
+    ProcessIsolatedTool,
+    ProcessIsolatedToolContext,
+    ProcessIsolatedToolContextProjection,
+    ProcessIsolatedToolFactoryRef,
+    ProcessIsolatedToolLimits,
+)
+from cayu.tools.policy import (
+    AlwaysRequireApprovalToolPolicy,
     StaticToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
 )
-from cayu.server import ServerConfig, create_server
-from cayu.vaults import SecretRedactor
+from cayu.tools.rounds import ToolRoundRecoveryRequest
+from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -142,7 +132,7 @@ def _factory_ref(
     implementation_version: str = "1",
 ) -> ProcessIsolatedToolFactoryRef:
     return ProcessIsolatedToolFactoryRef(
-        module="cayu.testing_isolated_tools",
+        module="cayu.testing.isolated_tools",
         qualname="build_deterministic_isolated_tool",
         identity=ExecutionProfileBehaviorIdentity(
             name="cayu:testing:deterministic-isolated-tool",
@@ -1945,7 +1935,7 @@ def test_terminal_response_cannot_race_past_buffered_stdout_overflow(
     monkeypatch.setattr(
         isolated_process,
         "_WORKER_MODULE",
-        "cayu.testing_isolated_worker_faults",
+        "cayu.testing.isolated_worker_faults",
     )
 
     with pytest.raises(IsolatedToolFailure) as caught:
@@ -1979,7 +1969,7 @@ def test_real_malformed_child_protocol_is_typed_and_bounded(
     monkeypatch.setattr(
         isolated_process,
         "_WORKER_MODULE",
-        "cayu.testing_isolated_worker_faults",
+        "cayu.testing.isolated_worker_faults",
     )
 
     with pytest.raises(IsolatedToolInvalidOutput) as caught:
@@ -2006,7 +1996,7 @@ def test_malformed_child_output_is_detached_from_every_diagnostic_channel(
     monkeypatch.setattr(
         isolated_process,
         "_WORKER_MODULE",
-        "cayu.testing_isolated_worker_faults",
+        "cayu.testing.isolated_worker_faults",
     )
     tool = _tool(mode="secret_invalid_wire", deadline_seconds=10)
     arguments = {"text": "hello"}
@@ -5119,7 +5109,7 @@ def test_parallel_isolated_process_groups_settle_independently(tmp_path: Path) -
 
 @pytest.mark.process
 def test_isolated_worker_receives_runtime_execution_deadline() -> None:
-    from cayu import ExecutionDeadline, execution_deadline_scope
+    from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
 
     async def run():
         boundary = ExecutionDeadline.after(30, source="test", scope="workflow")
@@ -5136,7 +5126,7 @@ def test_isolated_worker_receives_runtime_execution_deadline() -> None:
 
 @pytest.mark.process
 def test_public_runtime_propagates_execution_deadline_to_isolated_worker() -> None:
-    from cayu import ExecutionDeadline, execution_deadline_scope
+    from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
 
     async def run():
         boundary = ExecutionDeadline.after(30, source="test", scope="workflow")

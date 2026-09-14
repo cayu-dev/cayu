@@ -23,13 +23,13 @@ from cayu import (
     write_eval_run_json,
     write_trajectory_json,
 )
-from cayu.core.events import Event, EventType
 from cayu.evals.operation_outcomes import (
     HttpOperationOutcomeV1,
     OperationOutcomeSummary,
     summarize_operation_outcomes,
     trajectory_operation_outcomes,
 )
+from cayu.events import Event, EventType
 from cayu.runners import LocalRunner
 from cayu.tools.commands import ExecCommandTool
 

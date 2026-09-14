@@ -24,7 +24,8 @@ from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_publisher import BrowserControlPublicationPending
 from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._browser_control_view_tickets import BrowserViewTickets
-from cayu.runtime.browser_control import (
+from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,
     BrowserHandbackIntent,
@@ -35,7 +36,6 @@ from cayu.runtime.browser_control import (
     BrowserTextInputIntent,
     BrowserViewIntent,
 )
-from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 
 _BODY_LIMIT = 32 * 1024
 _TOKEN_DOMAIN = b"cayu.browser.operator-session.v1\x00"

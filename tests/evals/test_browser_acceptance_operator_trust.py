@@ -22,7 +22,7 @@ from cayu.evals.internal.browser_acceptance import (
     build,
 )
 from cayu.evals.internal.browser_acceptance_operator import OperatorFixtureBinding
-from cayu.runtime.browser_control_config import BrowserControlConfig
+from cayu.tools.browser_control_config import BrowserControlConfig
 
 
 def certificate_and_key():

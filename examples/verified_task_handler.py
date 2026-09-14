@@ -12,16 +12,15 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-from cayu import (
-    CompletionProposalCreate,
-    CompletionResultReference,
-    Message,
-    RunRequest,
+from cayu.messages import Message
+from cayu.runtime.verified_task_worker import (
     VerifiedTaskHandler,
     VerifiedTaskHandlerReport,
     VerifiedTaskPreparationContext,
     VerifiedTaskProposalContext,
 )
+from cayu.sessions.base import RunRequest
+from cayu.tasks.contracts import CompletionProposalCreate, CompletionResultReference
 
 
 class ReferencedResultHandler(VerifiedTaskHandler):

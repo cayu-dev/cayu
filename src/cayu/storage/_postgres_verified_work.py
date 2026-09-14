@@ -34,23 +34,16 @@ from cayu.runtime.completion_verifier_profiles import (
     copy_completion_verifier_profile_record,
     require_completion_verifier_profile_transition,
 )
-from cayu.runtime.tasks import (
-    CompletionDecisionApplicationReceipt,
-    Task,
-    TaskAggregateFilter,
-    TaskClaimLost,
-    TaskQuery,
-    TaskStatus,
-    TaskTopologyInconsistent,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
-    _ensure_exact_owned_active_task_lease,
-    _task_invocation_for_attachment,
-    _task_session_instance_for_attachment,
-    _work_attempt_discovery_query,
-    copy_task,
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    copy_work_attempt_lifecycle_settlement,
+    copy_work_attempt_preparation_hold,
+    work_attempt_lifecycle_settlement_sha256,
+    work_attempt_preparation_hold_sha256,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.storage import _postgres_support as pg_support
+from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,
@@ -79,15 +72,23 @@ from cayu.runtime.work_attempt_admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.runtime.work_attempt_lifecycle import (
-    WorkAttemptLifecycleSettlement,
-    WorkAttemptPreparationHold,
-    copy_work_attempt_lifecycle_settlement,
-    copy_work_attempt_preparation_hold,
-    work_attempt_lifecycle_settlement_sha256,
-    work_attempt_preparation_hold_sha256,
+from cayu.tasks.base import (
+    CompletionDecisionApplicationReceipt,
+    Task,
+    TaskAggregateFilter,
+    TaskClaimLost,
+    TaskQuery,
+    TaskStatus,
+    TaskTopologyInconsistent,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
+    _ensure_exact_owned_active_task_lease,
+    _task_invocation_for_attachment,
+    _task_session_instance_for_attachment,
+    _work_attempt_discovery_query,
+    copy_task,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionDecisionCreate,
@@ -122,7 +123,6 @@ from cayu.runtime.work_contracts import (
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
 )
-from cayu.storage import _postgres_support as pg_support
 
 _T = TypeVar("_T")
 _POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS = 1.0

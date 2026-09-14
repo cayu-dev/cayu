@@ -11,7 +11,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from cayu import (
+from cayu.delivery.github import (
     GitHubCheckPolicy,
     GitHubCheckState,
     GitHubDeliveryLimits,
@@ -21,15 +21,14 @@ from cayu import (
     GitHubRestTransport,
     GitHubReviewPolicy,
     GitHubSecurityAuthority,
-    SecretRef,
-    StaticVault,
-    TaskQuery,
-    TaskStatus,
     approve_github_delivery,
     github_connector_behavior_fingerprint,
     github_pull_request_delivery_request,
-    run_task_worker,
 )
+from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
+from cayu.vaults.base import SecretRef
+from cayu.vaults.static import StaticVault
 
 
 async def exercise_github_delivery(

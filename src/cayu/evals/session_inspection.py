@@ -8,8 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cayu.core.events import Event, EventType
-from cayu.runtime.sessions import EventOrder, EventQuery, SessionLineageQuery, SessionStore
+from cayu.events import Event, EventType
+from cayu.sessions.base import EventOrder, EventQuery, SessionLineageQuery, SessionStore
 
 
 class EvalDiagnosticV1(BaseModel):

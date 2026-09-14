@@ -18097,8 +18097,17 @@
       },
       "FailureEvidence": {
         "additionalProperties": false,
-        "description": "Portable evidence, never a certificate that external effects have stopped.\n\n``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session\nevents and the existing IncompleteSessionRecoveryResult contract. Missing\nevidence is unknown, including for old durable events.",
+        "description": "Bounded failure snapshot with flat, ordered parallel branch evidence.\n\nBranches carry the same diagnostic fields but cannot recursively contain\nbranches. Nested fan-outs are flattened in submission order, up to 16 leaves.\nSettlement is always unknown, including when a deadline is retained.",
         "properties": {
+          "branch_failures": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/_FailureEvidenceFields"
+            },
+            "maxItems": 16,
+            "title": "Branch Failures",
+            "type": "array"
+          },
           "classification": {
             "default": "unknown",
             "enum": [
@@ -35695,6 +35704,114 @@
           "digest_state"
         ],
         "title": "WorkspaceStructuralEvidenceV1",
+        "type": "object"
+      },
+      "_FailureEvidenceFields": {
+        "additionalProperties": false,
+        "description": "Portable evidence, never a certificate that external effects have stopped.\n\n``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session\nevents and the existing IncompleteSessionRecoveryResult contract. Missing\nevidence is unknown, including for old durable events.",
+        "properties": {
+          "classification": {
+            "default": "unknown",
+            "enum": [
+              "deadline",
+              "timeout",
+              "interruption",
+              "failure",
+              "unknown"
+            ],
+            "title": "Classification",
+            "type": "string"
+          },
+          "deadline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionDeadline"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deadline_phase": {
+            "anyOf": [
+              {
+                "enum": [
+                  "admission",
+                  "in_flight"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deadline Phase"
+          },
+          "exception_types": {
+            "default": [],
+            "items": {
+              "maxLength": 128,
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Exception Types",
+            "type": "array"
+          },
+          "run_epoch": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Epoch"
+          },
+          "secondary_failures": {
+            "default": false,
+            "title": "Secondary Failures",
+            "type": "boolean"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "settlement": {
+            "const": "unknown",
+            "default": "unknown",
+            "title": "Settlement",
+            "type": "string"
+          },
+          "terminal_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Event Id"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "title": "_FailureEvidenceFields",
         "type": "object"
       }
     }

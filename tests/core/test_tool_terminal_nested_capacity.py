@@ -5,13 +5,16 @@ import asyncio
 import pytest
 from tests.core.test_runtime import FakeProvider, collect_events
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest, Tool, ToolEffect, ToolResult, ToolSpec
-from cayu.core.events import EventType
-from cayu.providers import ModelStreamEvent
-from cayu.runtime.sessions import InMemorySessionStore, SessionQuery
-from cayu.runtime.tool_terminal_publication import ToolTerminalPublicationGovernor
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionQuery
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.subagents import SubagentSpec, SubagentTool
+from cayu.tools.terminal_publication import ToolTerminalPublicationGovernor
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

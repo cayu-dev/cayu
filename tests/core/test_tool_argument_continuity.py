@@ -11,15 +11,11 @@ from types import SimpleNamespace
 import pytest
 from tests.core.test_tool_execution import _collect, _ScriptedProvider, _TestKnowledgeStore
 
-from cayu.core import AgentSpec, EventType, ExecutionProfileBehaviorIdentity, Message, ToolCallPart
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.runtime import (
-    CayuApp,
-    ForkSessionRequest,
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import EventType
+from cayu.messages import Message, ToolCallPart
 from cayu.runtime._argument_continuity import (
     MAX_CALL_BYTES,
     MAX_ROUNDS,
@@ -33,10 +29,12 @@ from cayu.runtime._argument_continuity import (
     require_private_key_access,
 )
 from cayu.runtime._runtime_records import ToolCallRequest
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import ForkSessionRequest, InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.knowledge import RememberKnowledgeTool
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])
@@ -345,8 +343,8 @@ def test_audit_and_model_argument_policies_are_independent(
 def test_later_vault_discovery_redacts_all_private_calls_in_the_round():
     from pydantic import SecretStr
 
-    from cayu.core.tools import Tool, ToolResult, ToolSpec
-    from cayu.vaults import ResolvedSecret, SecretRef, Vault
+    from cayu.tools.base import Tool, ToolResult, ToolSpec
+    from cayu.vaults.base import ResolvedSecret, SecretRef, Vault
 
     secret = "late-discovered-continuity-secret"
 
@@ -518,7 +516,7 @@ def test_unsupported_store_stops_only_when_retention_is_needed(case):
 )
 def test_private_materialization_requires_exact_retained_authority(boundary):
     async def run():
-        from cayu.storage import KnowledgeAccessScope
+        from cayu.storage.memory import KnowledgeAccessScope
 
         session = SimpleNamespace(id="session", instance_id="incarnation")
         message, continuity = _private_fixture()
@@ -576,7 +574,7 @@ def test_private_materialization_requires_exact_retained_authority(boundary):
 @pytest.mark.parametrize("retain", [False, True])
 @pytest.mark.parametrize("redact", [False, True])
 def test_private_arguments_reach_native_openai_payload_without_changing_audit(retain, redact):
-    from cayu.core import ProviderStatePart
+    from cayu.messages import ProviderStatePart
     from cayu.providers.base import ModelRequest
     from cayu.providers.openai import build_openai_payload
 
@@ -644,7 +642,7 @@ def test_private_arguments_reach_native_openai_payload_without_changing_audit(re
     ["provider", "name", "call_id", "type", "arguments", "other_message", "malformed_id"],
 )
 def test_private_provider_projection_requires_same_message_and_exact_call(mismatch):
-    from cayu.core import ProviderStatePart
+    from cayu.messages import ProviderStatePart
 
     async def run():
         session = SimpleNamespace(id="session", instance_id="incarnation")
@@ -796,8 +794,8 @@ def test_unsealed_secret_scope_discards_private_continuity():
 
 @pytest.mark.parametrize("compact", [False, True])
 def test_generic_tool_continuity_is_materialized_after_context_selection(compact):
-    from cayu.core.tools import Tool, ToolResult, ToolSpec
-    from cayu.runtime.context import ContextPolicy
+    from cayu.context.base import ContextPolicy
+    from cayu.tools.base import Tool, ToolResult, ToolSpec
 
     class PrivateTool(Tool):
         spec = ToolSpec(
@@ -849,7 +847,7 @@ def test_generic_tool_continuity_is_materialized_after_context_selection(compact
         assert "context-selection-canary" not in repr(events)
         assert "context-selection-canary" not in repr(await store.load_transcript("selection"))
         if not compact:
-            from cayu.runtime.request_footprints import analyze_request_context_pressure
+            from cayu.context.footprints import analyze_request_context_pressure
 
             actual = provider.requests[1]
             public = actual.model_copy(

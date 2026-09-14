@@ -18,8 +18,44 @@ from tests.core.task_invocation_fixtures import unattributed_session_invocation_
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._completion_verifier_coordinator as verifier_coordinator_module
-from cayu import (
-    CayuApp,
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.runtime._diagnostics import (
+    MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
+    MAX_DIAGNOSTIC_UTF8_BYTES,
+)
+from cayu.runtime.completion_verifier_profiles import (
+    COMPLETION_VERIFIER_PROFILE_COMPONENT_MAX_ITEMS,
+    COMPLETION_VERIFIER_PROFILE_TEXT_MAX_CHARS,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfileComponentDeclaration,
+    CompletionVerifierProfilePolicy,
+    CompletionVerifierProfilePolicyRequest,
+    build_completion_verifier_execution_profile,
+    changed_completion_verifier_profile_components,
+)
+from cayu.runtime.completion_verifiers import (
+    CompletionVerifierExecutionError,
+    CompletionVerifierExecutionRequest,
+    CompletionVerifierRequest,
+    CompletionVerifierUnavailable,
+    DeterministicCompletionVerifier,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyResult,
+)
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.contracts import (
+    WORK_COMPLETION_OUTCOME_MAX_EVIDENCE_REFERENCES,
+    WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES,
+    WORK_CONTRACT_MAX_CRITERIA,
+    WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
     CompletionContinuationPolicy,
     CompletionCriterionOutcome,
     CompletionDecision,
@@ -35,56 +71,20 @@ from cayu import (
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
     CompletionVerifierDecision,
-    CompletionVerifierExecutionError,
-    CompletionVerifierExecutionRequest,
     CompletionVerifierKind,
-    CompletionVerifierProfileAdoptionDecision,
-    CompletionVerifierProfileComponentDeclaration,
-    CompletionVerifierProfilePolicy,
-    CompletionVerifierProfilePolicyRequest,
     CompletionVerifierRef,
-    CompletionVerifierRequest,
-    CompletionVerifierUnavailable,
     CriterionOutcomeStatus,
-    DeterministicCompletionVerifier,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileBehaviorIdentity,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyResult,
-    InMemoryTaskStore,
-    ResolutionActor,
-    ResolutionActorSource,
-    SecretRedactor,
-    SQLiteTaskStore,
-    TaskCreate,
     WorkAttemptCreate,
     WorkCompletionConflict,
     WorkContract,
     WorkContractDraft,
     WorkContractRef,
     WorkCriterion,
-    work_contract_from_draft,
-)
-from cayu.runtime._diagnostics import (
-    MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
-    MAX_DIAGNOSTIC_UTF8_BYTES,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    COMPLETION_VERIFIER_PROFILE_COMPONENT_MAX_ITEMS,
-    COMPLETION_VERIFIER_PROFILE_TEXT_MAX_CHARS,
-    build_completion_verifier_execution_profile,
-    changed_completion_verifier_profile_components,
-)
-from cayu.runtime.execution_profiles import EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS
-from cayu.runtime.work_contracts import (
-    WORK_COMPLETION_OUTCOME_MAX_EVIDENCE_REFERENCES,
-    WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES,
-    WORK_CONTRACT_MAX_CRITERIA,
-    WORK_CONTRACT_MAX_EVIDENCE_REFERENCES,
     completion_decision_request_sha256,
     completion_gap_fingerprint,
+    work_contract_from_draft,
 )
+from cayu.vaults.redaction import SecretRedactor
 
 
 def _digest(value: str) -> str:

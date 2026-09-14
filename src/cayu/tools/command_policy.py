@@ -5,8 +5,8 @@ import re
 from collections.abc import Iterable, Mapping
 
 from cayu._validation import require_clean_nonblank
-from cayu.core.tools import ToolContext
 from cayu.runners.base import is_same_or_child
+from cayu.tools.base import ToolContext
 from cayu.tools.commands import (
     MAX_TIMEOUT_SECONDS,
     CommandPolicy,

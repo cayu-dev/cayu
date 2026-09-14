@@ -28,7 +28,7 @@ from cayu import (
     RecallSituation,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL
+from cayu.memory.recall import KNOWLEDGE_LEXICAL_CHANNEL, KNOWLEDGE_SEMANTIC_CHANNEL
 
 _ACCESS_POLICY_SHA256 = "a" * 64
 _OTHER_ACCESS_POLICY_SHA256 = "b" * 64

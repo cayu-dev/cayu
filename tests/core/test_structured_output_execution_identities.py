@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
-from cayu.runtime import CayuApp, RetryPolicy, RunRequest, StructuredOutputSpec
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import RunRequest
 
 
 class _ScriptedStructuredOutputProvider(ModelProvider):

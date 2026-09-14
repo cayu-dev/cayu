@@ -10,20 +10,19 @@ from time import process_time
 import pytest
 from tests.core.test_verified_work_contracts import _contract
 
-from cayu import (
-    CayuApp,
-    DurableWorkerMetrics,
+from cayu.applications import CayuApp
+from cayu.runtime._durable_worker_loop import DurableWorkerDemandPolicy, DurableWorkerMetrics
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import (
     InMemoryTaskStore,
-    SQLiteTaskStore,
     Task,
     TaskCreate,
     TaskQuery,
     TaskRetryAttemptDisposition,
     TaskRetryPolicy,
     TaskRetrySettlementRequest,
-    run_task_worker,
 )
-from cayu.runtime._durable_worker_loop import DurableWorkerDemandPolicy
+from cayu.tasks.worker import run_task_worker
 
 
 @pytest.mark.anyio

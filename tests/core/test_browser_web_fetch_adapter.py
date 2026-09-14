@@ -17,26 +17,29 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
-from cayu import (
+from cayu.environments.admission import (
+    ExecutionAdmissionCandidate,
+    ExecutionCapabilityClaim,
+    ExecutionCapabilityEvidence,
+)
+from cayu.runners.base import ExecCommand, ExecResult, RunnerExecutionError, RunnerUnavailableError
+from cayu.tools import _browser_guest as guest
+from cayu.tools.base import ToolContext
+from cayu.tools.browser import (
     BROWSER_FETCH_PLAYWRIGHT_VERSION,
     BROWSER_FETCH_PROTOCOL_VERSION,
     BROWSER_FETCH_WORKER_VERSION,
+    DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
+    MAX_BROWSER_FETCH_MAX_DOM_NODES,
+    MAX_BROWSER_FETCH_MAX_REQUESTS,
+    BrowserWebFetchAdapter,
+)
+from cayu.tools.browser_session import (
     BROWSER_SESSION_PROTOCOL_VERSION,
     BROWSER_SESSION_WORKER_VERSION,
-    DEFAULT_BROWSER_FETCH_MAX_DOM_NODES,
-    BrowserWebFetchAdapter,
-    ExecCommand,
-    ExecutionCapabilityClaim,
-    ExecutionCapabilityEvidence,
-    ToolContext,
-    WebAccessOutcome,
-    WebFetchTool,
 )
-from cayu.environments.admission import ExecutionAdmissionCandidate
-from cayu.runners import ExecResult, RunnerExecutionError, RunnerUnavailableError
-from cayu.tools import MAX_BROWSER_FETCH_MAX_DOM_NODES, MAX_BROWSER_FETCH_MAX_REQUESTS
-from cayu.tools import _browser_guest as guest
-from cayu.tools.web_access import web_destination_fingerprint
+from cayu.tools.web import WebFetchTool
+from cayu.tools.web_access import WebAccessOutcome, web_destination_fingerprint
 
 
 def _candidate(

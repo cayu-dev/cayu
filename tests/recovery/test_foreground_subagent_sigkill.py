@@ -7,7 +7,7 @@ import signal
 import pytest
 from worker_harness import BackendConfig, RecoveryHarness
 
-from cayu.core import ToolResultPart
+from cayu.messages import ToolResultPart
 
 pytestmark = [
     pytest.mark.process,

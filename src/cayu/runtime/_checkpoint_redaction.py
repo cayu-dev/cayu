@@ -4,9 +4,20 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_durable_record
+from cayu.context.structured_output import json_schema_contains_secret
 from cayu.runtime._shared_artifact_results import persisted_shared_artifact_control_paths
 from cayu.runtime._web_access_results import persisted_web_access_control_paths
-from cayu.runtime.checkpoints import (
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ExecutionProfileIdentity,
+    execution_profile_from_session_metadata,
+)
+from cayu.sessions.base import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    Session,
+    runtime_build_provenance_from_session_metadata,
+)
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -16,24 +27,13 @@ from cayu.runtime.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_METADATA_KEY,
-    ExecutionProfileIdentity,
-    execution_profile_from_session_metadata,
-)
-from cayu.runtime.sessions import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
-    Session,
-    runtime_build_provenance_from_session_metadata,
-)
-from cayu.runtime.structured_output import json_schema_contains_secret
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_exposure import (
+from cayu.tools.catalogue import CALL_TOOL_NAME
+from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,
     tool_capability_ceiling_from_session_metadata,
 )
-from cayu.runtime.tool_grants import ResolvedTargetedToolInvocation, validate_targeted_tool_digest
-from cayu.vaults import SecretRedactor
+from cayu.tools.grants import ResolvedTargetedToolInvocation, validate_targeted_tool_digest
+from cayu.vaults.redaction import SecretRedactor
 
 _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
     {

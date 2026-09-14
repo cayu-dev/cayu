@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from cayu.core.events import Event, EventType
-from cayu.runtime.event_sinks import EventSink
-from cayu.runtime.tool_result_projection import (
+from cayu.events import Event, EventType
+from cayu.observability.events import EventSink
+from cayu.tools.result_projection import (
     tool_result_projection_suppresses_result_content,
 )
 from cayu.vaults import SecretRedactor

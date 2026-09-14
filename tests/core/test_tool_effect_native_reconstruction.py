@@ -7,23 +7,20 @@ from tests.core.test_structured_commands import _AdmittedRunner, _profile
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider
 
-from cayu import (
-    AgentSpec,
-    ApplyPatchTool,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ResumeRequest,
-    RunRequest,
-)
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import ModelStreamEvent
-from cayu.runners import ExecResult, Runner
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import ExecResult, Runner
 from cayu.runtime._tool_effect_state import ToolEffectRecord
-from cayu.runtime.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.structured_commands import RunCommandTool
-from cayu.workspaces import LocalWorkspace
+from cayu.workspaces.local import LocalWorkspace
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

@@ -11,31 +11,34 @@ import pytest
 from tests._session_provenance import fixture_session_invocation
 
 import cayu.tools.structured_commands as structured_commands
-from cayu import (
-    AgentSpec,
-    DockerCodingCommandAuthority,
-    DockerCodingDependencyInput,
-    DockerCodingToolchainProfile,
-    DockerImageIdentity,
-    ExecResult,
+from cayu.agents import AgentSpec
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionExecutableEvidence,
     ExecutionToolRequirementEvidence,
-    LocalWorkspace,
-    RunCommandTool,
-    SecretRedactor,
-    StructuredCommandToolPolicy,
-    ToolContext,
-    ToolExecutableRequirement,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
 )
-from cayu.core.tools import DurableToolRecoveryAuthority, _bind_runtime_tool_invocation_authority
-from cayu.runtime import Session, SessionStatus
+from cayu.environments.docker_toolchains import (
+    DockerCodingCommandAuthority,
+    DockerCodingDependencyInput,
+    DockerCodingToolchainProfile,
+)
+from cayu.runners.base import ExecResult
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import Session, SessionStatus
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import InvocationWorkspaceHandle
+from cayu.tools.base import (
+    DurableToolRecoveryAuthority,
+    ToolContext,
+    ToolExecutableRequirement,
+    _bind_runtime_tool_invocation_authority,
+)
+from cayu.tools.policy import ToolPolicyDecision, ToolPolicyRequest
+from cayu.tools.structured_commands import RunCommandTool, StructuredCommandToolPolicy
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.local import LocalWorkspace
 
 
 def _digest(content: bytes) -> str:
@@ -1208,7 +1211,7 @@ def test_structured_command_durable_recovery_reconstructs_terminal_result(
 def test_command_terminal_evidence_requires_positive_settlement(
     status, settlement, cleanup_uncertain, expected
 ):
-    from cayu.core.tools import ToolResult
+    from cayu.tools.base import ToolResult
     from cayu.tools.structured_commands import _command_terminal_recovery_evidence
 
     structured = {"status": status}

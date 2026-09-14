@@ -6,9 +6,9 @@ import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 
-from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.usage import session_usage_summary
 from cayu.evals.corpus import (
     EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
     ChildStatusAssertionSpec,
@@ -28,10 +28,10 @@ from cayu.evals.published import (
 )
 from cayu.evals.result_presentation import _present_assertion
 from cayu.evals.runner import EvalCase, EvalSuite, run_eval_suite
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelStreamEvent
-from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import RunRequest, Session, SessionStatus
-from cayu.runtime.usage import session_usage_summary
+from cayu.sessions.base import RunRequest, Session, SessionStatus
 
 
 def _session(session_id: str, status: SessionStatus, *, parent_id: str | None = None) -> Session:

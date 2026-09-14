@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from cayu.runtime._session_control import SessionControl
-from cayu.runtime.sessions import InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
 
 
 def test_control_ownership_excludes_only_the_current_control_task():

@@ -14,32 +14,26 @@ from tests.core.test_user_input import (
     _ScriptedProvider,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    Tool,
-    ToolEffect,
-    ToolEffectConflict,
-    ToolResult,
-    ToolSpec,
-)
-from cayu.core import EventType, ToolResultPart
-from cayu.core.thinking import ThinkingConfig
-from cayu.runtime import SessionRuntimePublicationConflict, UserInputResponse
-from cayu.runtime.hooks import AfterToolCallDecision, RuntimeHook
-from cayu.runtime.human_review import HumanReviewContext, HumanReviewReference
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.review import HumanReviewContext, HumanReviewReference
+from cayu.approvals.user_input import UserInputResponse
+from cayu.context.thinking import ThinkingConfig
+from cayu.events import EventType
+from cayu.messages import Message, ToolResultPart
+from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.tool_effects import (
+    ToolEffectConflict,
     ToolEffectReceipt,
     ToolEffectReconciliationRegistration,
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
+from cayu.sessions.base import ResumeRequest, RunRequest, SessionRuntimePublicationConflict
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.user_input import UserInputTool
 
 
@@ -332,9 +326,11 @@ def test_user_input_sibling_receipt_recovers_without_repeating_external_effect(
             )
             app = await rebuild_app()
             if lookup_control == "abandon_validated_recovery":
-                from cayu import (
+                from cayu.sessions.base import (
                     IncompleteSessionRecoveryAction,
                     IncompleteSessionRecoveryRequest,
+                )
+                from cayu.sessions.recovery import (
                     RecoveryBlockerCode,
                     RecoveryPlanAction,
                     RecoveryPlanRequest,

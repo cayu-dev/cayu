@@ -8,23 +8,23 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core import EventType
-from cayu.runtime.aggregates import (
+from cayu.budgets.aggregates import (
     AggregateUsageMetrics,
     add_aggregate_usage,
     build_aggregate_usage_metrics,
     summary_usage_metrics_from_event_payload,
 )
-from cayu.runtime.usage import (
+from cayu.budgets.usage import (
     USAGE_BEARING_EVENT_TYPES,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
     combine_session_usage_summaries,
     session_usage_summary,
 )
+from cayu.events import EventType
 
 if TYPE_CHECKING:
-    from cayu.runtime.sessions import EventQuery, EventRecord
+    from cayu.sessions.base import EventQuery, EventRecord
 
 USAGE_ACCOUNTING_PAGE_SIZE = 256
 
@@ -54,7 +54,7 @@ class UsageAccountingSnapshot(BaseModel):
 
 
 def usage_accounting_query(query: EventQuery) -> EventQuery:
-    from cayu.runtime.sessions import EventOrder, copy_event_query
+    from cayu.sessions.base import EventOrder, copy_event_query
 
     query = copy_event_query(query)
     if query.event_type is not None or query.event_types or query.exclude_event_types:

@@ -42,10 +42,15 @@ from tests.evals.test_structured_model_judge import (
 )
 
 import cayu.evals.memory_reporting as memory_reporting
-from cayu.agent_snapshots import (
-    AgentSnapshotCoordinator,
-    AgentSnapshotResultBinding,
-    execution_profile_snapshot_ref,
+from cayu.budgets.quality import (
+    CostQualityAttemptOperation,
+    CostQualityComparisonStatus,
+    QualityEvidenceStatus,
+)
+from cayu.budgets.usage import (
+    SessionUsageSummary,
+    build_aggregate_usage_metrics,
+    session_usage_summary_payload,
 )
 from cayu.cli import main
 from cayu.evals._memory_attribution import (
@@ -136,18 +141,13 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.evals.store import EvalRunInvocation
-from cayu.memory_intervention_execution import (
+from cayu.memory.execution import (
     InMemoryMemoryInterventionExecutionStore,
     MemoryInterventionExecutionPhase,
     MemoryInterventionExecutionRecord,
     MemoryInterventionExecutionStatus,
 )
-from cayu.memory_interventions import MemoryInterventionTrialBinding
-from cayu.runtime.cost_quality import (
-    CostQualityAttemptOperation,
-    CostQualityComparisonStatus,
-    QualityEvidenceStatus,
-)
+from cayu.memory.interventions import MemoryInterventionTrialBinding
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileComponentIdentity,
@@ -155,12 +155,12 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentityStrength,
     execution_profile_with_component,
 )
-from cayu.runtime.usage import (
-    SessionUsageSummary,
-    build_aggregate_usage_metrics,
-    session_usage_summary_payload,
-)
 from cayu.server.evals_registry import explicit_eval_target_registry
+from cayu.snapshots.base import (
+    AgentSnapshotCoordinator,
+    AgentSnapshotResultBinding,
+    execution_profile_snapshot_ref,
+)
 
 _CASE_ID = "memory-case"
 _EXPERIMENT_ID = "memory-experiment"

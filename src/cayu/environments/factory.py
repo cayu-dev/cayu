@@ -20,8 +20,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
-from cayu.artifacts import ArtifactStore
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.artifacts.base import ArtifactStore
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionEnvironmentAuthority,
@@ -29,6 +28,7 @@ from cayu.environments.admission import (
 )
 from cayu.environments.base import Environment, copy_environment
 from cayu.runners.base import RunnerWorkloadAuthority
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 if TYPE_CHECKING:
     from cayu.egress.authority import EgressAuthorityIdentity

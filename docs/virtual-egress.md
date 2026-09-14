@@ -162,7 +162,7 @@ execution_requirements = ExecutionRequirements.untrusted(
 )
 ```
 
-Lower-level extension points live under `cayu.egress` and `cayu.runtime.egress`:
+Lower-level extension points live under `cayu.egress` and `cayu.egress.runtime`:
 custom `EgressPolicy` implementations, `SandboxEgressAdapter` registrations,
 proxy exposure adapters, and the broker/proxy contracts used by adapters. Each
 egress adapter also creates its matching runner, so enforcement cannot be
@@ -199,7 +199,7 @@ generic `SSL_CERT_FILE` or `REQUESTS_CA_BUNDLE` variables.
 ## Runtime integration (CayuApp)
 
 `virtual_egress` is a first-class, session-lifecycle-managed mode via
-`VirtualEgressEnvironmentFactory` (`cayu.runtime.egress`). Register it as an
+`VirtualEgressEnvironmentFactory` (`cayu.egress.runtime`). Register it as an
 environment factory; per session it mints grants, stands up the broker plus the
 explicitly selected enforced runner, and tears everything down at session end
 (the workspace binding's
@@ -941,7 +941,7 @@ Enable reconnect explicitly on every worker using the same **private host-local*
 state directory and the same factory execution-profile declaration:
 
 ```python
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.egress.docker_adapter import DockerEgressAdapter
 
 adapter = DockerEgressAdapter(

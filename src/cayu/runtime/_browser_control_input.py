@@ -12,7 +12,7 @@ from cayu.runtime._browser_control_authorization import (
     BrowserControlInputRejected,
     BrowserControlPermissionDenied,
 )
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,
     BrowserControlRecord,

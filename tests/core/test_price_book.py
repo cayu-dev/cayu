@@ -28,9 +28,9 @@ from cayu import (
     default_price_book,
     estimate_session_cost,
 )
-from cayu.core.billing import resolved_billing_identity
+from cayu.budgets.base import budget_check_from_events
+from cayu.budgets.billing import resolved_billing_identity
 from cayu.providers import bedrock_billing_identity
-from cayu.runtime.budgets import budget_check_from_events
 
 _PROVENANCE = Provenance(
     source="official",

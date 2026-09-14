@@ -15,7 +15,8 @@ from cayu._validation import (
     inspect_bounded_durable_json,
     require_durable_clean_nonblank,
 )
-from cayu.core.isolated_tools import (
+from cayu.tools.base import ToolResult
+from cayu.tools.isolated import (
     ISOLATED_TOOL_PROTOCOL_NAME,
     ISOLATED_TOOL_PROTOCOL_VERSION,
     MAX_ISOLATED_TOOL_JSON_NODES,
@@ -24,7 +25,6 @@ from cayu.core.isolated_tools import (
     ProcessIsolatedToolFactoryRef,
     ProcessIsolatedToolLimits,
 )
-from cayu.core.tools import ToolResult
 
 _SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _TERMINAL_FRAME_MAGIC = b"CIT1"

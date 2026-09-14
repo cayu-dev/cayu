@@ -7,8 +7,7 @@ from collections.abc import Awaitable
 from typing import Any, TypeVar
 
 from cayu._task_wait import await_shielded_task_outcome
-from cayu.runtime._durable_worker_loop import run_durable_lease_heartbeat
-from cayu.runtime.event_watchers import (
+from cayu.observability.watchers import (
     EventWatcher,
     EventWatcherClaim,
     EventWatcherContext,
@@ -21,6 +20,7 @@ from cayu.runtime.event_watchers import (
     event_watcher_error_payload,
     run_event_watcher_handler,
 )
+from cayu.runtime._durable_worker_loop import run_durable_lease_heartbeat
 from cayu.vaults import SecretRedactor
 
 _T = TypeVar("_T")

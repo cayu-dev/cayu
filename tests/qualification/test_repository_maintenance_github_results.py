@@ -6,14 +6,14 @@ import os
 
 import pytest
 
-from cayu import (
+from cayu.delivery.github import (
     GitHubCheckState,
     GitHubDeliveryState,
     GitHubPullRequestDeliveryRequest,
     GitHubReviewState,
-    TaskQuery,
     approve_github_delivery,
 )
+from cayu.tasks.base import TaskQuery
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr
 from tests.qualification.test_repository_maintenance_github_intake import enqueue
 from tests.qualification.test_repository_maintenance_github_intake import (

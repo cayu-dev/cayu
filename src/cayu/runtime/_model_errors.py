@@ -22,7 +22,7 @@ from cayu._validation import (
     require_durable_text,
     safe_durable_value_error_details,
 )
-from cayu.core.billing import (
+from cayu.budgets.billing import (
     BillingIdentity,
     completed_billing_identity,
     copy_billing_identity,
@@ -42,12 +42,12 @@ from cayu.providers.deadlines import (
     ProviderProgressKind,
     ProviderStreamDeadlineEvidence,
 )
-from cayu.runtime.workspace_observation_recovery import (
-    copy_workspace_observation_pending_cancellation_requests,
-)
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     InvocationOperationCapacityError,
+)
+from cayu.workspaces.observation_recovery import (
+    copy_workspace_observation_pending_cancellation_requests,
 )
 
 _PROVIDER_STREAM_DEADLINE_PAYLOAD_KEYS = frozenset(

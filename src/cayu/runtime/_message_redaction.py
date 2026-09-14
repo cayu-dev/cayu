@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import Any, cast
 
 from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
-from cayu.core.messages import Message
+from cayu.messages import Message
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _web_access_results as web_access_results
-from cayu.runtime.tool_result_projection import (
+from cayu.tools.result_projection import (
     _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
     TOOL_RESULT_ARTIFACT_TYPE,
     _validate_builtin_tool_result_artifact_reference,

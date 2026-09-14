@@ -17,7 +17,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.messages import Message
 from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowAttemptAnchor
 from cayu.evals.corpus import (
     AssertionSpec,
@@ -51,6 +50,7 @@ from cayu.evals.workflow_recovery import (
     _read_workflow_attempt_root,
 )
 from cayu.evals.workflow_target import WorkflowEvalFailure, WorkflowEvalResult
+from cayu.messages import Message
 from cayu.runtime.evidence_spool import (
     EvidenceSpool,
     IncrementalEvidenceAdmission,
@@ -58,7 +58,7 @@ from cayu.runtime.evidence_spool import (
     IncrementalEvidenceLimits,
     _settled_evidence_reads,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EventQueryResultTooLarge,
     SessionStatus,
     TerminalSessionEvidenceError,

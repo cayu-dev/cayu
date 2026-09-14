@@ -14,7 +14,7 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import Event, EventType, event_with_runtime_envelope_authority
+from cayu.events import Event, EventType, event_with_runtime_envelope_authority
 from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._invocation_terminal_decision import (
     InvocationTerminalDecision,
@@ -31,7 +31,7 @@ from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     ActiveModelCompletionStage,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
@@ -220,7 +220,7 @@ async def terminalize_dispatched_model(
         # Paired terminal evidence and exact release are authenticated by the
         # existing invocation cleanup boundary, including commit-before-ack.
         from cayu.runtime._invocation_lifecycle import require_released_invocation_command_authority
-        from cayu.runtime.sessions import _activate_owned_session_run_fence
+        from cayu.sessions.base import _activate_owned_session_run_fence
 
         if session.run_epoch == prior.settlement_run_epoch:
             owner = _activate_owned_session_run_fence(session)
@@ -337,7 +337,7 @@ async def terminalize_dispatched_model(
         if confirmed != active:
             raise SessionRunFenced("Active model stage changed during terminalization claim.")
         assert decision is not None
-        from cayu.runtime.sessions import (
+        from cayu.sessions.base import (
             _incomplete_recovery_claim_from_checkpoint,
             _invocation_lifecycle_authority_mutation_scope,
         )

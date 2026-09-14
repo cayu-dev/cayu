@@ -8,19 +8,8 @@ from contextlib import suppress
 import pytest
 
 import cayu.providers.deadlines as provider_deadlines_module
-from cayu import Message
-from cayu.providers import (
-    AnthropicProvider,
-    BedrockProvider,
-    ChatCompletionsProtocolError,
-    ChatCompletionsProvider,
-    OpenAIProtocolError,
-    OpenAIProvider,
-    OpenAISubscriptionProvider,
-    ProviderOperationState,
-    VertexProvider,
-    chat_completions_stream_events,
-)
+from cayu.messages import Message
+from cayu.providers.anthropic import AnthropicProvider
 from cayu.providers.base import (
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     ModelProvider,
@@ -30,6 +19,12 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     ToolDiscoveryProjectionRequest,
+)
+from cayu.providers.bedrock import BedrockProvider
+from cayu.providers.chat_completions import (
+    ChatCompletionsProtocolError,
+    ChatCompletionsProvider,
+    chat_completions_stream_events,
 )
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
@@ -41,15 +36,20 @@ from cayu.providers.deadlines import (
     reset_provider_deadline_controller,
 )
 from cayu.providers.openai import (
+    OpenAIProtocolError,
+    OpenAIProvider,
     _openai_background_stream_events,
     openai_stream_events,
 )
+from cayu.providers.openai_subscription import OpenAISubscriptionProvider
+from cayu.providers.operations import ProviderOperationState
+from cayu.providers.vertex import VertexProvider
 from cayu.runtime._model_errors import (
     copy_provider_exception_control,
     model_provider_error_from_payload,
 )
-from cayu.runtime.tool_discovery import search_tools_spec
-from cayu.runtime.tool_gateway import call_tool_spec
+from cayu.tools.discovery import search_tools_spec
+from cayu.tools.gateway import call_tool_spec
 
 
 class _DeadlineProvider(ModelProvider):

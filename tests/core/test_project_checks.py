@@ -30,8 +30,8 @@ from cayu import (
     WriteFileTool,
     check_manifest,
 )
-from cayu.runtime import BUILTIN_DIAGNOSTIC_CODES, PublicServiceManifest
-from cayu.runtime.checks import ProjectControlPlaneCheckEvidence
+from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES, ProjectControlPlaneCheckEvidence
+from cayu.runtime.service_manifest import PublicServiceManifest
 
 
 class _ExternalTool(Tool):

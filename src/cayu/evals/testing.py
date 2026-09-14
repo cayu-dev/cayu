@@ -7,12 +7,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cayu._validation import copy_json_value
-from cayu.core.messages import Message
-from cayu.providers import (
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.messages import Message
+from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    _preflight_provider_portable_messages,
+    copy_model_stream_event,
+)
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationCancellationSupport,
     ProviderOperationConnection,
@@ -22,10 +27,7 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
-    copy_model_stream_event,
 )
-from cayu.providers.base import _preflight_provider_portable_messages
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
 
 @dataclass

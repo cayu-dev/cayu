@@ -40,17 +40,18 @@ def cases():
 
 
 # Fixed fingerprints include 300-second idle defaults, text progress v2,
-# and semantic cleanup policy v1.
+# semantic cleanup policy v1, and HTTP cleanup observation policy v1.
+# Captured against current main before checking the concept migration.
 _BASE_MATERIAL_SHA256 = {
-    "anthropic": "c4292274f58f832f7f29291c9dbf972e843488bf0e682ad0e3b801f63f4c782d",
-    "anthropic-tokens": "1175e0534936e52740a06703a041d22d23d2927850efa811843e57633da2e2d7",
-    "bedrock": "bc83166b1ce8ee51eeba8ae2d06581c48fcb7fe570b794ad9da1f8c678a2e888",
-    "bedrock-route": "239ae134fa3556d80111abc93903136c219b9f7c20086fbaa3db08449a142592",
-    "chat": "ef06fc7b45743da89ce0afb48035b7462f635d9fbe822ce46f1eb2077a9f5d33",
-    "openai": "91f0102224946afe1b65b1e1c5f1bfa8852f7958b73c07afe74e804671bd2a82",
-    "openai-background": "12d4c2badb4988320ae573ffd75f602ffb46a1fe444b82901966b28789cd9b4a",
-    "openai-search": "902b8510f3b60f4d5b22c831fe4d592656390b7f0c64146134a6551a554a7014",
-    "openrouter": "238bdd76b4e6cbead2f89ed3462935c660a7f8445dd439acc34f267ff5cb7312",
+    "anthropic": "cc868ed1d23c846c0ca4eb2662b46fdea1ef8388fa1e9805b03e750fdcc992b8",
+    "anthropic-tokens": "725b7e11c5a592e9e53ece501a973e4d7c2cb4eb2badcef88651234f75de5ac8",
+    "bedrock": "369bf7120cf10c9212db958362187d33b99808531a11d3c564b97d27ae902390",
+    "bedrock-route": "3527dc6dba95186eb5a71bc8e76b400945959c4aa5e937d6ada8bb757732ab85",
+    "chat": "d50e4dab344cc06426827e645bf50e85bdb39ca8b3c99d8930c7178b8db029ef",
+    "openai": "6eb9e24f4030fdaafd474a737c8626a3242a24ce81216bceaa48fafb84764f27",
+    "openai-background": "23a3d61609b86ddd06a8e26240b43a3ddbd52ec7b1a235ea92d78def886f21db",
+    "openai-search": "6a35bfd929b5e74d1923e92bf9b08d1952d1158e9b1174d8c14c6b7624c0943b",
+    "openrouter": "a793fc4ae759234dbd792c85bc6a3e6131f3ddfec706298d251d9d824f58fff5",
     "scripted": "06548d202a0bac8275f5b0440ef995d442f547383da12717e99a84d23d30e803",
     "scripted-background": "019d2934ee5f333b455cd092d2adb2ca99d8c7d399253444befad745921ada5a",
 }

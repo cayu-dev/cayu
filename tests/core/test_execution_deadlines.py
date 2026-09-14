@@ -9,25 +9,28 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.deadlines import (
     ExecutionDeadline,
     ExecutionDeadlineExceeded,
-    Message,
-    ModelStreamEvent,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    SQLiteSessionStore,
-    WorkflowBase,
-    WorkflowSpec,
     current_execution_deadline,
     execution_deadline_scope,
 )
-from cayu.runtime import InMemorySessionStore, SessionIdentity, SessionStatus
-from cayu.workflows import StepRunOptions, parallel, step
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.workflow import StepRunOptions, WorkflowBase, parallel, step
 
 
 @pytest.fixture
@@ -350,7 +353,7 @@ def test_process_roundtrip_uses_absolute_expiry():
 
 @pytest.mark.parametrize("kind", ["run", "resume", "fork"])
 def test_deadline_metadata_cannot_be_forged_in_request(kind):
-    from cayu import ForkSessionRequest
+    from cayu.sessions.base import ForkSessionRequest
 
     metadata = {"cayu:execution_deadline": {}}
     with pytest.raises(ValueError, match="deadline"):
@@ -406,7 +409,7 @@ def test_observed_wall_expiry_stays_expired_after_clock_rollback(clock):
 
 
 def test_no_new_tools_or_models_when_wall_expiry_is_observed(clock):
-    from cayu import Tool, ToolResult, ToolSpec
+    from cayu.tools.base import Tool, ToolResult, ToolSpec
 
     calls = []
 
@@ -456,9 +459,10 @@ def test_no_new_tools_or_models_when_wall_expiry_is_observed(clock):
 def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
     clock, tmp_path, store_kind, entrypoint, tool_count
 ):
-    from cayu import CayuConfig, Tool, ToolExecutionConfig, ToolResult, ToolSpec
+    from cayu.configuration import CayuConfig, ToolExecutionConfig
     from cayu.deadlines import _TIMERS
-    from cayu.workflows import StepError
+    from cayu.tools.base import Tool, ToolResult, ToolSpec
+    from cayu.workflows.models import StepError
 
     seen = []
 
@@ -590,7 +594,7 @@ def test_inflight_tool_keeps_context_and_cleanup_after_expiry(
 
 
 def test_failed_step_retry_does_not_receive_a_fresh_child_duration(clock):
-    from cayu.workflows import StepError
+    from cayu.workflows.models import StepError
 
     async def run():
         provider = ScriptedModelProvider(
@@ -680,8 +684,8 @@ def test_isolated_context_projection_carries_only_portable_deadline():
 
     from tests.core.test_process_isolated_tools import _tool
 
-    from cayu import ToolContext
     from cayu.runtime._isolated_tool_process import _project_context
+    from cayu.tools.base import ToolContext
 
     boundary = ExecutionDeadline.after(60)
     projected = _project_context(
@@ -693,7 +697,7 @@ def test_isolated_context_projection_carries_only_portable_deadline():
     assert "monotonic" not in json.dumps(payload)
     assert "remaining_seconds" not in json.dumps(payload)
     code = (
-        "import sys; from cayu.core.isolated_tools import ProcessIsolatedToolContext; "
+        "import sys; from cayu.tools.isolated import ProcessIsolatedToolContext; "
         "from cayu.deadlines import bind_execution_deadline; from cayu import RunRequest; "
         "ctx=ProcessIsolatedToolContext.model_validate_json(sys.argv[1]); "
         "scope=bind_execution_deadline(ctx.execution_deadline); scope.__enter__(); "
@@ -710,7 +714,7 @@ def test_isolated_context_projection_carries_only_portable_deadline():
 
 
 def test_model_retry_uses_live_original_deadline(clock):
-    from cayu import RetryPolicy
+    from cayu.runtime.retry_policy import RetryPolicy
 
     seen = []
 
@@ -771,8 +775,8 @@ def test_timeout_retains_secondary_cleanup_failure_and_expiry():
 
 
 def test_postgres_deadline_parent_composition_and_reopen(postgres_dsn):
-    from cayu import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
 
     async def run():
         store = PostgresSessionStore(
@@ -810,7 +814,7 @@ def test_postgres_deadline_parent_composition_and_reopen(postgres_dsn):
 
 
 def test_fork_inherits_tighter_scope_and_replays_committed_result_after_expiry(clock):
-    from cayu import ForkSessionRequest
+    from cayu.sessions.base import ForkSessionRequest
 
     async def run():
         app, provider = _app()
@@ -867,8 +871,8 @@ def test_child_cannot_extend_local_parent_after_wall_clock_rollback(clock):
 
 
 def test_unbounded_requests_and_process_context_keep_legacy_serialized_shape():
-    from cayu import ToolContext
-    from cayu.core.isolated_tools import ProcessIsolatedToolContext
+    from cayu.tools.base import ToolContext
+    from cayu.tools.isolated import ProcessIsolatedToolContext
 
     assert "execution_deadline" not in RunRequest(agent_name="worker", messages=[]).model_dump(
         mode="json"

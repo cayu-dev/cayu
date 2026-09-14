@@ -12,14 +12,14 @@ from tests.core.test_browser_control_publisher import publication_fixture
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._browser_control_service import BrowserControlService
-from cayu.runtime.browser_control import (
-    BrowserControlPrincipal,
-    BrowserSensitiveEntryIntent,
-    BrowserTextInputIntent,
-)
 from cayu.server._browser_input_routes import (
     OPERATOR_INPUT_SUBPROTOCOL,
     create_browser_input_router,
+)
+from cayu.tools.browser_control import (
+    BrowserControlPrincipal,
+    BrowserSensitiveEntryIntent,
+    BrowserTextInputIntent,
 )
 
 

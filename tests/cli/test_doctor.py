@@ -20,10 +20,11 @@ from pathlib import Path
 import pytest
 
 import cayu.cli.doctor as doctor_cli
-from cayu import Event, RunRequest, SQLiteSessionStore, SQLiteTaskStore
 from cayu.cli import main
 from cayu.cli.doctor import _run_bounded_worker
-from cayu.runtime.sessions import MAX_SESSION_ID_BYTES, SessionIdentity
+from cayu.events import Event
+from cayu.sessions.base import MAX_SESSION_ID_BYTES, RunRequest, SessionIdentity
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.support_bundles import (
     DEFAULT_SUPPORT_BUNDLE_LIMITS,
     CollectorDisposition,
@@ -989,7 +990,7 @@ def test_store_failure_returns_partial_bundle_and_preserves_safe_sections(
     _write_project(
         tmp_path,
         """from cayu import CayuApp
-from cayu.runtime.sessions import InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
 
 
 class FailingSnapshotStore(InMemorySessionStore):

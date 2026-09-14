@@ -11,10 +11,11 @@ import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core._workload_secret_support import FakeProvider
 
-from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message, MessageRole, ProviderStatePart, TextPart
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.events import Event, EventType
+from cayu.messages import Message, MessageRole, ProviderStatePart, TextPart
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
@@ -22,29 +23,11 @@ from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleState,
     ChildSessionNotificationFreshness,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.child_session_context import (
-    ChildSessionContextContribution,
-    ChildSessionContextContributor,
-    ChildSessionContextCoverage,
-    ChildSessionContextCoverageState,
-    ChildSessionContextEntry,
-    ChildSessionContextOccurrence,
-    ChildSessionContextProjection,
-    ChildSessionContextTruncationReason,
-    ChildSessionResultReference,
-)
-from cayu.runtime.child_session_results import (
-    ChildSessionResultProjection,
-    ChildSessionResultUnavailable,
-    project_terminal_child_session_result,
-)
-from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
     ChildSessionLifecycleQuery,
     InMemorySessionStore,
@@ -59,8 +42,25 @@ from cayu.runtime.sessions import (
     SessionStore,
     TranscriptTextReadLimitExceeded,
 )
+from cayu.sessions.child_context import (
+    ChildSessionContextContribution,
+    ChildSessionContextContributor,
+    ChildSessionContextCoverage,
+    ChildSessionContextCoverageState,
+    ChildSessionContextEntry,
+    ChildSessionContextOccurrence,
+    ChildSessionContextProjection,
+    ChildSessionContextTruncationReason,
+    ChildSessionResultReference,
+)
+from cayu.sessions.child_results import (
+    ChildSessionResultProjection,
+    ChildSessionResultUnavailable,
+    project_terminal_child_session_result,
+)
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.child_sessions import ChildSessionResultTool
 
 

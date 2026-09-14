@@ -11,45 +11,39 @@ from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.core.test_verified_work_contracts import _contract
 from tests.environments.sync_ownership_assertions import assert_sync_resources_owned
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import SyncBinding
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.events import InMemoryEventSink
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime import _environment_lifecycle as lifecycle_module
+from cayu.runtime._environment_lifecycle import pending_completion_finalization_from_checkpoint
+from cayu.runtime.verified_task_worker import VerifiedTaskHandler, VerifiedTaskWorker
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventType,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    ModelStreamEvent,
     RunRequest,
-    ScriptedModelProvider,
     SessionMessageDeliveryMode,
+    SessionStatus,
     SessionStatusConflict,
-    SyncBinding,
-    TaskCreate,
-    TaskStatus,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
-    VerifiedTaskHandler,
-    VerifiedTaskWorker,
 )
-from cayu.runtime import InMemoryEventSink, SessionStatus
-from cayu.runtime import _environment_lifecycle as lifecycle_module
-from cayu.runtime._environment_lifecycle import pending_completion_finalization_from_checkpoint
-from cayu.runtime.work_attempt_admission import (
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.admission import (
     WorkAttemptExecutionRequest,
     WorkAttemptRecoveryRequest,
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
 )
-from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
-from cayu.workspaces import LocalWorkspace, WorkspaceMutationResult
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.workspaces.base import WorkspaceMutationResult
+from cayu.workspaces.local import LocalWorkspace
 
 
 class FailOnceWriteWorkspace(LocalWorkspace):

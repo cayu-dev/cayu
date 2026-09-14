@@ -13,7 +13,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import copy_durable_record
-from cayu.core.messages import Message, detach_message
+from cayu.messages import Message, detach_message
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._diagnostics import (
     credential_safe_runtime_exception,
@@ -27,8 +27,7 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.runtime.invocation import SessionInvocationBinding
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     DeferredInteractionInput,
     EventRecord,
     Session,
@@ -37,7 +36,8 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_interaction_id,
     copy_session,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,
     WorkAttemptExecutionStopReason,
@@ -50,7 +50,7 @@ from cayu.vaults import SecretRedactor
 _ResultT = TypeVar("_ResultT")
 
 if TYPE_CHECKING:
-    from cayu.runtime.tasks import TaskStore
+    from cayu.tasks.base import TaskStore
 
 
 async def record_work_attempt_execution_stop(

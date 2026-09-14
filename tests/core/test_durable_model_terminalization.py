@@ -10,7 +10,7 @@ from tests.core.test_model_completion_recovery import (
 )
 
 from cayu import CayuApp, EventQuery, EventType
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     InMemorySessionStore,
     ModelCompletionManualRecoveryRequest,
     SessionStatus,
@@ -136,7 +136,7 @@ def test_recovery_plan_executes_terminalization_without_registrations(tmp_path):
 )
 def test_terminalization_rejects_invalid_authority_without_mutation(mismatch):
     from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
-    from cayu.runtime.sessions import SessionRunFenced
+    from cayu.sessions.base import SessionRunFenced
 
     async def exercise():
         store = InMemorySessionStore()
@@ -199,7 +199,7 @@ def test_terminalization_conservatively_settles_budget_and_retries_partial_failu
         PriceBook,
         SQLiteBudgetLedger,
     )
-    from cayu.runtime.budgets import (
+    from cayu.budgets.base import (
         BudgetReservationRecoveryContext,
         budget_reservation_authority_sha256,
     )

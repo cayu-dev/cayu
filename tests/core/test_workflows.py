@@ -22,11 +22,15 @@ from cayu import (
     ScriptedModelProvider,
     WorkflowSpec,
 )
-from cayu.core.events import Event
-from cayu.core.messages import Message
+from cayu.context.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputSpec,
+    StructuredOutputStrategy,
+)
+from cayu.events import Event
+from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import ModelTarget, RunRequest, StructuredOutputSpec, StructuredOutputStrategy
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.sessions.base import ModelTarget, RunRequest
 from cayu.workflows import (
     GateOutcome,
     ParallelResult,

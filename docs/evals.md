@@ -14,7 +14,7 @@ transcripts, tool calls, usage, workspaces, and artifacts.
 
 Acceptance fixtures and reference campaigns load only when their supported
 `cayu.evals` exports or implementation entry points are requested. Importing a
-core contract such as `cayu.core.events.Event` does not initialize these optional
+core contract such as `cayu.events.Event` does not initialize these optional
 features; their public imports remain available from the installed wheel.
 
 Ordinary and scenario trials share the scheduler that owns recovered slots,

@@ -24,7 +24,12 @@ from cayu import (
     SQLiteSessionStore,
 )
 from cayu._validation import canonical_durable_json_bytes
-from cayu.runtime import InMemorySessionStore
+from cayu.approvals.user_input import (
+    AmbiguousUserInputPauseAuthorityError,
+    ambiguous_pending_user_input_from_checkpoint,
+    pending_user_input_from_checkpoint,
+)
+from cayu.context.base import _compaction_checkpoint
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _session_engine as session_engine
@@ -38,7 +43,8 @@ from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_event_id,
 )
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
-from cayu.runtime.checkpoints import (
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
@@ -50,13 +56,8 @@ from cayu.runtime.checkpoints import (
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
-from cayu.runtime.context import _compaction_checkpoint
-from cayu.runtime.user_input import (
-    AmbiguousUserInputPauseAuthorityError,
-    ambiguous_pending_user_input_from_checkpoint,
-    pending_user_input_from_checkpoint,
-)
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     WorkspaceObservationArtifact,
     WorkspaceObservationArtifactState,
     WorkspaceObservationEvidenceState,
@@ -64,7 +65,6 @@ from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationPhase,
     workspace_observations_from_checkpoint,
 )
-from cayu.vaults import SecretRedactor
 
 _FROZEN_VERSIONLESS_ROOT_CHECKPOINTS = {
     "approval": {

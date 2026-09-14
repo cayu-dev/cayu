@@ -12,8 +12,8 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import Event, EventType, event_with_runtime_envelope_authority
-from cayu.core.messages import Message
+from cayu.events import Event, EventType, event_with_runtime_envelope_authority
+from cayu.messages import Message
 from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._invocation_lifecycle import (
     ReleaseInvocationCommand,
@@ -25,10 +25,8 @@ from cayu.runtime._invocation_terminal_decision import (
     checkpoint_after_invocation_terminal_decision,
     invocation_terminal_decision_from_checkpoint,
 )
-from cayu.runtime.checkpoints import decode_runtime_checkpoint
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     ZERO_WORK_INTERRUPTION_OPERATION_KEY,
     InteractionTransitionSpec,
     Session,
@@ -41,6 +39,8 @@ from cayu.runtime.sessions import (
     _load_interaction_transition_receipt,
     _load_invocation_terminal_event_receipt,
 )
+from cayu.sessions.checkpoints import decode_runtime_checkpoint
+from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 
 RECEIPT_KEY = ZERO_WORK_INTERRUPTION_OPERATION_KEY
 MAX_EVIDENCE_ITEMS = 16

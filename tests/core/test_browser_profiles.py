@@ -15,10 +15,12 @@ import pytest
 from pydantic import ValidationError
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
+from cayu.browser_profiles import (
+    BROWSER_PROFILE_MAX_RECEIPTS,
     AESGCMBrowserProfileKeyAuthority,
     BrowserProfileAccess,
     BrowserProfileBinding,
+    BrowserProfileCheckpointPlan,
     BrowserProfileCheckpointPolicy,
     BrowserProfileCookie,
     BrowserProfileDestinationPolicy,
@@ -34,10 +36,6 @@ from cayu import (
     BrowserProfileUnavailable,
     InMemoryBrowserProfileStore,
     SQLiteBrowserProfileStore,
-)
-from cayu.browser_profiles import (
-    BROWSER_PROFILE_MAX_RECEIPTS,
-    BrowserProfileCheckpointPlan,
     validate_browser_profile_state,
 )
 

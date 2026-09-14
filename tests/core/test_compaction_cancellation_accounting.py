@@ -6,13 +6,13 @@ from contextlib import suppress
 import pytest
 
 from cayu._validation import DurableValueError
-from cayu.providers.base import ModelProviderError
-from cayu.runtime.context import (
+from cayu.context.base import (
     _await_owned_compaction_provider_stream,
     _CompactionCompletionObservationError,
     _CompactionCompletionValueError,
     _CompactionToolCallError,
 )
+from cayu.providers.base import ModelProviderError
 
 
 @pytest.mark.parametrize(

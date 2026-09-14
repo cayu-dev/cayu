@@ -18,8 +18,8 @@ from tests.core.test_session_store_shared_conformance import (
     conformance_postgres_dsn as conformance_postgres_dsn,
 )
 
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConditions,
@@ -28,7 +28,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageTarget,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     RunRequest,
     SessionMessageDeliveryMode,
@@ -1362,17 +1362,18 @@ def test_empty_queue_checkpoint_publication_retains_epoch_and_rejects_pending(
 
     from tests.core.test_queued_session_messages import BlockingTwoTurnProvider
 
-    from cayu.core import AgentSpec
-    from cayu.environments import Environment, EnvironmentSpec, SyncBinding
-    from cayu.runtime import CayuApp
-    from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
-    from cayu.runtime.sessions import (
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.environments.base import Environment, EnvironmentSpec
+    from cayu.environments.bindings import SyncBinding
+    from cayu.sessions.base import (
         PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
         SessionRunFenced,
         SessionRuntimePublicationConflict,
         runtime_publication_checkpoint_value_digest,
     )
-    from cayu.workspaces import LocalWorkspace
+    from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+    from cayu.workspaces.local import LocalWorkspace
 
     async def run():
         store = await _open_store(lifecycle_case)

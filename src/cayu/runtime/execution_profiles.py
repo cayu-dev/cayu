@@ -27,17 +27,17 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
-from cayu.core.events import Event, copy_event, event_with_runtime_payload_authority
+from cayu.approvals.tools import (
+    ResolutionActor,
+    copy_resolution_actor,
+    resolution_actor_payload,
+)
 from cayu.egress.authority import (
     EgressAuthorityChangeKind,
     EgressAuthorityIdentity,
     compare_egress_authority,
 )
-from cayu.runtime.approvals import (
-    ResolutionActor,
-    copy_resolution_actor,
-    resolution_actor_payload,
-)
+from cayu.events import Event, copy_event, event_with_runtime_payload_authority
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceAvailability,
@@ -45,8 +45,8 @@ from cayu.runtime.build_provenance import (
     legacy_runtime_build_provenance,
     runtime_build_provenance_identity,
 )
-from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
-from cayu.runtime.tool_catalogue import (
+from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+from cayu.tools.catalogue import (
     TOOL_CATALOGUE_MAX_TOOLS,
     validate_canonical_tool_id,
     validate_tool_catalogue_revision,

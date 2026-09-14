@@ -11,7 +11,10 @@ from pathlib import Path
 from types import MappingProxyType
 
 from cayu._validation import require_durable_clean_nonblank, require_unicode_scalar_text
-from cayu.core.agents import AgentSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, budget_pricing_preflight_error
+from cayu.budgets.pricing import PriceBook
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import JudgePrivacyPolicyV1
@@ -32,15 +35,6 @@ from cayu.evals.execution_profiles import (
 )
 from cayu.evals.store import EvalRunInvocation, EvalStore
 from cayu.project_control_plane import ProjectEvalJudgeConfiguration
-from cayu.runtime.app import CayuApp
-from cayu.runtime.budgets import BudgetLimit, budget_pricing_preflight_error
-from cayu.runtime.costs import PriceBook
-from cayu.runtime.invocation import SessionExecutionSource
-from cayu.runtime.sessions import (
-    RunRequest,
-    copy_run_request,
-    run_request_with_runtime_invocation,
-)
 from cayu.runtime.stop_policy import RunLimits
 from cayu.server.config import (
     DEFAULT_EVAL_LEASE_SECONDS,
@@ -57,6 +51,12 @@ from cayu.server.contracts import (
     EvalTargetCatalogEntry,
     EvalTargetCatalogResponse,
 )
+from cayu.sessions.base import (
+    RunRequest,
+    copy_run_request,
+    run_request_with_runtime_invocation,
+)
+from cayu.sessions.invocation import SessionExecutionSource
 
 DEFAULT_EVAL_PROFILE_ID = "default"
 _EXPLICIT_EVAL_PROFILE_ID = "explicit"

@@ -10,11 +10,20 @@ import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.artifacts import file_attachment
-from cayu.core import (
-    AgentSpec,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    CompactionRequest,
+    CompactionResult,
+    ContextBuildResult,
+    ContextCompactor,
+    ContextRequest,
+    ModelCompactor,
+)
+from cayu.events import EventType
+from cayu.messages import (
     FilePart,
     Message,
     MessageRole,
@@ -22,25 +31,18 @@ from cayu.core import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.observability.events import InMemoryEventSink
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactionRequest,
-    CompactionResult,
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import (
     CompactSessionRequest,
-    ContextCompactor,
-    ContextRequest,
     EventQuery,
-    InMemoryEventSink,
     InMemorySessionStore,
-    ModelCompactor,
     RunRequest,
     SessionStatus,
-    ToolCapabilityCeiling,
     TranscriptSnapshot,
 )
-from cayu.runtime.context import ContextBuildResult
+from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 

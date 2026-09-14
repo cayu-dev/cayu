@@ -6,13 +6,13 @@ from datetime import UTC, datetime
 from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_value
-from cayu.core.events import Event, EventType, event_with_runtime_generated_id
+from cayu.events import Event, EventType, event_with_runtime_generated_id
 from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_effect_state import ToolEffectRecord
-from cayu.runtime.sessions import EventQuery, SessionStore
 from cayu.runtime.tool_effects import ToolEffectConflict
-from cayu.vaults import SecretRedactor
+from cayu.sessions.base import EventQuery, SessionStore
+from cayu.vaults.redaction import SecretRedactor
 
 
 async def persist_cleanup_diagnostics(

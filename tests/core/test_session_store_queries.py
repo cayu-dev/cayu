@@ -17,14 +17,19 @@ from tests.core.session_store_time_conformance import (
 )
 
 from cayu import (
+    Event,
     EventOrder,
     EventQuery,
+    EventType,
+    Message,
     SessionOrder,
     SessionQuery,
     SQLiteSessionStore,
+    ThinkingPart,
+    ToolCallPart,
     TranscriptQuery,
 )
-from cayu.core import Event, EventType, Message, ThinkingPart, ToolCallPart
+from cayu.approvals.tools import PendingToolCallApproval
 from cayu.runtime import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     EventRecord,
@@ -40,13 +45,7 @@ from cayu.runtime import (
     SessionStore,
 )
 from cayu.runtime import _resume_ledger as resume_ledger
-from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.pending_actions import (
-    pending_action_event_storage_values,
-    pending_action_lookup_key,
-    project_pending_action_event_record,
-)
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_SESSION_ID_BYTES,
     MAX_SESSION_LIST_CURSOR_BYTES,
@@ -57,6 +56,11 @@ from cayu.runtime.sessions import (
     event_summary_from_records,
     fork_session_invocation,
     session_outcome_from_records,
+)
+from cayu.sessions.pending_actions import (
+    pending_action_event_storage_values,
+    pending_action_lookup_key,
+    project_pending_action_event_record,
 )
 from cayu.storage import _session_store_sql as session_store_sql
 

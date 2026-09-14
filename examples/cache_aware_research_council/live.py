@@ -7,7 +7,7 @@ from pathlib import Path
 from examples._advanced_support import ScenarioResult, live_provider
 from examples.cache_aware_research_council.scenario import run_scenario
 
-from cayu.runtime import load_price_book
+from cayu.budgets.pricing import load_price_book
 
 
 async def run(root: Path, provider_name: str | None = None) -> ScenarioResult:

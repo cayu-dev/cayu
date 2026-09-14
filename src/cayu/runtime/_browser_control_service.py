@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from cayu.core.tools import ToolContext, _runtime_tool_invocation_authority
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
 from cayu.runtime._browser_control_channel import (
     BoundBrowserGuest,
@@ -18,7 +17,9 @@ from cayu.runtime._browser_control_frames import PrivateBrowserFrame
 from cayu.runtime._browser_control_pages import BrowserPageDescriptors
 from cayu.runtime._browser_viewer_delivery import BrowserViewerDelivery
 from cayu.runtime._invocation_secrets import InvocationPublicationSnapshot
-from cayu.runtime.browser_control import (
+from cayu.tools._browser_control_transport import validate_control_endpoint
+from cayu.tools.base import ToolContext, _runtime_tool_invocation_authority
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlConflict,
     BrowserControlIdentity,
@@ -29,7 +30,6 @@ from cayu.runtime.browser_control import (
     BrowserPagesIntent,
     BrowserTextInputIntent,
 )
-from cayu.tools._browser_control_transport import validate_control_endpoint
 from cayu.tools.browser_session import _RunnerBrowserSessionBackend
 from cayu.vaults.redaction import SecretRedactor
 

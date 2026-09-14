@@ -3,7 +3,7 @@
 These tests pin the *complete, ordered* list of runtime event types emitted by
 ``CayuApp`` for a handful of core flows (a full multi-tool-round run, the two
 durable pause/resume flows, and the run-limit / budget interruption paths). They
-exist to protect the CayuApp decomposition (``src/cayu/runtime/app.py`` ->
+exist to protect the CayuApp decomposition (``src/cayu/applications.py`` ->
 single-concern collaborators): the whole point of asserting the *entire* ordered
 sequence — rather than windows, membership, or ``any()`` — is that any future
 extraction that reorders, drops, or inserts an emission makes these fail loudly.
@@ -15,7 +15,7 @@ non-negotiable invariants), and only re-baseline after confirming the new order
 is intended.
 
 Black-box by construction: only the public ``cayu`` API plus a test-local
-scripted provider are used. Nothing is imported from ``cayu.runtime.app``. The
+scripted provider are used. Nothing is imported from ``cayu.applications``. The
 expected sequences were derived from observed current behavior and cross-checked
 against the documented ordering guarantees (``context.counted`` before
 ``model.started``; ``turn.completed`` before every terminal session event).
@@ -29,8 +29,15 @@ from decimal import Decimal
 
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.budgets.base import BudgetLimit, BudgetWindow
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.context.counting import ContextCountingConfig, ContextCountingMode
+from cayu.events import Event, EventType
+from cayu.messages import Message
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -39,28 +46,16 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime import (
-    BudgetLimit,
-    BudgetWindow,
-    CayuApp,
-    ContextCountingConfig,
-    ContextCountingMode,
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
-    ModelPrice,
-    PriceBook,
     ResumeRequest,
-    RunLimits,
     RunRequest,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
     TranscriptQuery,
-    UserInputResponse,
 )
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.tools.user_input import UserInputTool
 
 _UNASSOCIATED_INTERACTION_EVENT_TYPES = {
@@ -373,7 +368,7 @@ def test_g2a_user_input_pause_then_resume() -> None:
             )
         )
     )
-    from cayu.runtime import InteractionSummaryEvidence
+    from cayu.sessions.interactions import InteractionSummaryEvidence
 
     paused_evidence = InteractionSummaryEvidence.model_validate(paused_records[-1].event.payload)
     assert paused_evidence.wall_duration_ms is None

@@ -13,7 +13,7 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu.runtime._durable_worker_loop import run_durable_lease_heartbeat
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,

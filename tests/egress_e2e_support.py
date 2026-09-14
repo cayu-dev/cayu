@@ -22,13 +22,13 @@ from cayu.egress import (
     VirtualCredentialGrant,
     VirtualEgressRunnerRequest,
 )
-from cayu.environments import EnvironmentFactoryRequest
-from cayu.runners.base import ExecCommand, Runner
-from cayu.runtime.egress import (
+from cayu.egress.runtime import (
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
     VirtualEgressWorkspaceFactory,
 )
+from cayu.environments import EnvironmentFactoryRequest
+from cayu.runners.base import ExecCommand, Runner
 from cayu.vaults import SecretRef, StaticVault
 from tests.egress_conformance import (
     EgressConformanceRegistration,

@@ -947,6 +947,9 @@ def test_http_json_error_message_limit_has_an_exact_boundary(
             limits=_limits(
                 max_message_bytes=max_message_bytes,
                 max_response_bytes=len(error_body),
+                # This checks byte limits, not scheduling latency on a busy runner.
+                idle_timeout_s=10.0,
+                total_call_timeout_s=20.0,
             ),
         )
         try:

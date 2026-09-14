@@ -16,11 +16,11 @@ from cayu._validation import (
     revalidate_model_input,
     revalidate_model_inputs,
 )
-from cayu.core.execution_identity import (
+from cayu.approvals.tools import ResolutionActor, copy_resolution_actor
+from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.runtime.approvals import ResolutionActor, copy_resolution_actor
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
     ExecutionProfileAdoptionIntent,
@@ -29,7 +29,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     copy_execution_profile_adoption_intent,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionVerifierRef,
     FrozenWorkContractModel,
     WorkCompletionConflict,

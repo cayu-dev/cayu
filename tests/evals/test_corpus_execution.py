@@ -37,6 +37,10 @@ from cayu import (
     ToolSpec,
     WorkspaceBranchRequest,
 )
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.context.footprints import RequestFootprintConfig
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -99,25 +103,21 @@ from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
 from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.runner import EvalPlan, _blocked_assertion_results, run_eval_plan
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
-from cayu.memory import AutomaticRecallPolicy
-from cayu.memory_evidence import ContextExposureState
-from cayu.recall import (
+from cayu.memory.base import AutomaticRecallPolicy
+from cayu.memory.context import (
+    AutomaticRecallContextPolicy,
+    AutomaticRecallSourceConfig,
+)
+from cayu.memory.evidence import ContextExposureState
+from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     TRANSCRIPT_LEXICAL_CHANNEL,
 )
-from cayu.retrieval import (
+from cayu.memory.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.budgets import BudgetLimit
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.memory_context import (
-    AutomaticRecallContextPolicy,
-    AutomaticRecallSourceConfig,
-)
-from cayu.runtime.request_footprints import RequestFootprintConfig
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.revisions import (

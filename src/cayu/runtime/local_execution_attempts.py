@@ -33,11 +33,11 @@ from cayu._validation import (
 )
 from cayu.capabilities import CapabilityClaim, CapabilityEvidence
 from cayu.runners._subprocess import copy_runner_env
-from cayu.runtime.invocation import copy_task_invocation
+from cayu.sessions.invocation import copy_task_invocation
 
 if TYPE_CHECKING:
-    from cayu.runtime.app import CayuApp
-    from cayu.runtime.tasks import Task, TaskStore
+    from cayu.applications import CayuApp
+    from cayu.tasks.base import Task, TaskStore
 
 
 LOCAL_EXECUTION_ATTEMPT_SCHEMA_VERSION = 1

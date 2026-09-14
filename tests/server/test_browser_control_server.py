@@ -9,11 +9,11 @@ from pydantic import SecretBytes, ValidationError
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 
-from cayu.runtime.app import CayuApp
-from cayu.runtime.browser_control_config import BrowserControlConfig
+from cayu.applications import CayuApp
 from cayu.server import AuthenticatedAccess, OpenAccess, ServerConfig, create_server
 from cayu.server._browser_control_config import BrowserControlServerConfig
 from cayu.server.auth import BasicAuth
+from cayu.tools.browser_control_config import BrowserControlConfig
 
 
 def transport():

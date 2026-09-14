@@ -13,8 +13,8 @@ from hashlib import sha256
 from typing import Protocol, TypeVar
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.messages import Message
 from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
+from cayu.messages import Message
 from cayu.runtime._completion_verifier_coordinator import CompletionVerifierOwnedExecution
 from cayu.runtime._invocation_lifecycle import retire_released_invocation_context
 from cayu.runtime._task_store_operation_boundary import (
@@ -29,16 +29,13 @@ from cayu.runtime.completion_verifiers import (
     copy_completion_verifier_execution_request,
 )
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
-from cayu.runtime.sessions import ResumeRequest
-from cayu.runtime.tasks import (
-    CompletionDecisionApplicationReceipt,
-    Task,
-    TaskStatus,
-    TaskStore,
-    WorkAttemptLifecycleReceipt,
-    copy_task,
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    work_attempt_admission_authority_sha256,
+    work_attempt_lifecycle_settlement_sha256,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.sessions.base import ResumeRequest
+from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,
@@ -46,12 +43,15 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptRecoveryRequired,
     require_work_attempt_admission_result,
 )
-from cayu.runtime.work_attempt_lifecycle import (
-    WorkAttemptLifecycleSettlement,
-    work_attempt_admission_authority_sha256,
-    work_attempt_lifecycle_settlement_sha256,
+from cayu.tasks.base import (
+    CompletionDecisionApplicationReceipt,
+    Task,
+    TaskStatus,
+    TaskStore,
+    WorkAttemptLifecycleReceipt,
+    copy_task,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionProposal,
@@ -62,7 +62,7 @@ from cayu.runtime.work_contracts import (
     copy_completion_proposal,
     validate_work_completion_linked_id,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")
 

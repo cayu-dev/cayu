@@ -15,7 +15,7 @@ from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._browser_control_view_tickets import BrowserViewTickets
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPolicyResult,
     BrowserControlPrincipal,

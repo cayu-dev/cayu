@@ -15,7 +15,7 @@ from tests.core.test_openai_search_ordering import (
     run_sse,
 )
 
-from cayu import EventType
+from cayu.events import EventType
 from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers._openai_search_trace import (
     ResponseStructureTrace,
@@ -211,8 +211,7 @@ async def test_decoded_objects_preserved_and_boundary_change_is_visible():
     import httpx
     from tests.providers._responses_sse import ChunkedSSE
 
-    from cayu.providers import HttpxOpenAITransport
-    from cayu.providers.openai import openai_stream_events
+    from cayu.providers.openai import HttpxOpenAITransport, openai_stream_events
 
     raw = [created(), added(), lifecycle()]
     transport = HttpxOpenAITransport()

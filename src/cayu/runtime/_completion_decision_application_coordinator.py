@@ -41,14 +41,14 @@ from cayu.runtime.completion_verifier_profiles import (
     completion_verifier_profile_preparation_request_sha256,
     copy_completion_verifier_profile_record,
 )
-from cayu.runtime.tasks import (
+from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
     Task,
     TaskStatus,
     TaskStore,
     copy_task,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionProposal,
@@ -66,11 +66,11 @@ from cayu.runtime.work_contracts import (
     copy_work_attempt,
     copy_work_contract,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.vaults import SecretRedactor
+from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,
 )
-from cayu.vaults import SecretRedactor
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 

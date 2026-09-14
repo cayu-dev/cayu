@@ -12,13 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    CayuApp,
+from cayu._exception_groups import exception_cause, iter_exception_tree
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.storage import migrations as schema_migrations
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import (
     InMemoryTaskStore,
-    ResolutionActor,
-    ResolutionActorSource,
-    SecretRedactor,
-    SQLiteTaskStore,
     TaskClaimLost,
     TaskCreate,
     TaskRetryAttemptDisposition,
@@ -36,17 +37,13 @@ from cayu import (
     TaskRetrySettlementResult,
     TaskStatus,
     TaskTerminalizationConflict,
-    run_task_worker,
-    settle_task_retry_attempt_with_retry,
-)
-from cayu._exception_groups import exception_cause, iter_exception_tree
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.runtime.tasks import (
     _legacy_task_retry_settlement_request_sha256,
     _task_retry_settlement_request_matches_sha256,
     prepare_task_retry_settlement,
+    settle_task_retry_attempt_with_retry,
 )
-from cayu.storage import migrations as schema_migrations
+from cayu.tasks.worker import run_task_worker
+from cayu.vaults.redaction import SecretRedactor
 
 
 class _MutableClock:
@@ -3150,7 +3147,7 @@ def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cayu.runtime._task_lease_authority import TaskLeaseAuthority
-    from cayu.runtime.task_worker import (
+    from cayu.tasks.worker import (
         _renew_task_lease_before_deadline,
         _settle_task_retry_request_with_lease_authority,
     )

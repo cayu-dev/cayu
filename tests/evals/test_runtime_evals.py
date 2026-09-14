@@ -14,96 +14,54 @@ import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 
-from cayu import (
-    EVAL_SCHEMA_VERSION,
-    TRAJECTORY_SCHEMA_VERSION,
-    AgentSpec,
-    ArtifactCreated,
-    CayuApp,
-    ChildSessionCompleted,
-    Environment,
-    EnvironmentSpec,
-    EvalAssertion,
-    EvalAssertionResult,
-    EvalCase,
-    EvalCaseResult,
-    EvalContext,
-    EvalExecutionCapacity,
-    EvalOutcome,
-    EvalRun,
-    EvalStatus,
-    EvalSuite,
-    EvalSuiteTrialPolicyV1,
-    EvalTrialResult,
-    Event,
-    EventNotOccurred,
-    EventOccurred,
-    EventType,
-    FinalOutputContains,
-    LocalWorkspace,
-    MaxEstimatedCost,
-    MaxModelSteps,
-    MaxToolCalls,
-    MaxTotalTokens,
-    Message,
+from cayu._exception_groups import iter_exception_tree
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, extract_durable_value_error
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.base import ArtifactListResult, ArtifactMetadata, ArtifactScope
+from cayu.budgets.pricing import (
     ModelInfo,
     ModelPrice,
     PriceBook,
     PriceSchedule,
     PriceTier,
     Provenance,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionCompleted,
-    SessionFailed,
-    SubagentSpec,
-    SubagentTool,
     TieredPricing,
-    Tool,
-    ToolArgsContain,
-    ToolCalled,
-    ToolCallPart,
-    ToolContext,
-    ToolNotCalled,
-    ToolResult,
-    ToolResultContains,
-    ToolsCalledInOrder,
-    ToolSpec,
-    Trajectory,
-    TrajectoryProbes,
-    WorkspaceFileContains,
-    WorkspaceReadResult,
-    compare_eval_runs,
-    comparison_to_json,
-    eval_run_to_json,
-    extract_durable_value_error,
-    load_eval_run,
-    render_comparison_html,
-    render_html_report,
-    run_eval_suite,
-    write_eval_run_json,
-    write_html_report,
 )
-from cayu._exception_groups import iter_exception_tree
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactScope
+from cayu.budgets.usage import SessionUsageSummary, build_aggregate_usage_metrics
 from cayu.cli import main
-from cayu.core.events import event_with_runtime_payload_authority
-from cayu.evals import (
-    LLMJudge,
-    WorkspaceFileExists,
-    evaluate_assertions,
-    load_trajectory,
-    run_eval_case,
-    write_trajectory_json,
-)
+from cayu.context.footprints import RequestFootprintConfig
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
+from cayu.evals.assertions import (
+    ArtifactCreated,
+    ChildSessionCompleted,
+    EvalAssertion,
+    EventNotOccurred,
+    EventOccurred,
+    FinalOutputContains,
+    MaxEstimatedCost,
+    MaxModelSteps,
+    MaxToolCalls,
+    MaxTotalTokens,
+    SessionCompleted,
+    SessionFailed,
+    ToolArgsContain,
+    ToolCalled,
+    ToolNotCalled,
+    ToolResultContains,
+    ToolsCalledInOrder,
+    WorkspaceFileContains,
+    WorkspaceFileExists,
+)
+from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import (
     EvaluationEvidencePolicySpec,
     MemoryAttributionAssertionSpec,
 )
+from cayu.evals.judges import LLMJudge
 from cayu.evals.memory_attribution import (
     EvalMemoryAttributionEvidenceV1,
     EvalMemoryAttributionSourceV1,
@@ -114,15 +72,53 @@ from cayu.evals.memory_attribution import (
     eval_memory_source_alias,
     standard_eval_memory_attribution_bounds,
 )
-from cayu.evals.models import ArtifactContentProbe, WorkspaceFileProbe, WorkspaceStructuralProbe
+from cayu.evals.models import (
+    EVAL_SCHEMA_VERSION,
+    TRAJECTORY_SCHEMA_VERSION,
+    ArtifactContentProbe,
+    EvalAssertionResult,
+    EvalCaseResult,
+    EvalContext,
+    EvalOutcome,
+    EvalRun,
+    EvalStatus,
+    EvalTrialResult,
+    Trajectory,
+    TrajectoryProbes,
+    WorkspaceFileProbe,
+    WorkspaceStructuralProbe,
+)
 from cayu.evals.portable_assertions import compile_assertion_spec
-from cayu.evals.runner import _blocked_assertion_results, _build_child_trajectories
-from cayu.memory_attribution import (
+from cayu.evals.reporting import (
+    compare_eval_runs,
+    comparison_to_json,
+    eval_run_to_json,
+    load_eval_run,
+    load_trajectory,
+    render_comparison_html,
+    render_html_report,
+    write_eval_run_json,
+    write_html_report,
+    write_trajectory_json,
+)
+from cayu.evals.runner import (
+    EvalCase,
+    EvalSuite,
+    _blocked_assertion_results,
+    _build_child_trajectories,
+    evaluate_assertions,
+    run_eval_case,
+    run_eval_suite,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
 )
-from cayu.memory_evidence import (
+from cayu.memory.evidence import (
     ContextExposure,
     ContextExposureEvidenceKind,
     ContextExposurePage,
@@ -131,28 +127,31 @@ from cayu.memory_evidence import (
     KeyedEvidenceFingerprint,
     KeyedEvidenceFingerprintDomain,
 )
-from cayu.providers import (
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
+from cayu.messages import Message, ToolCallPart
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.operations import (
     ProviderOperationMode,
     ProviderOperationStartRequest,
     ProviderOperationStatus,
 )
-from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime._memory_evidence import memory_evidence_key
-from cayu.runtime.request_footprints import RequestFootprintConfig
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    RunRequest,
     Session,
+    SessionIdentity,
     SessionLineageNode,
     SessionLineageOrigin,
     SessionStatus,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
-from cayu.runtime.usage import SessionUsageSummary, build_aggregate_usage_metrics
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.subagents import SubagentSpec, SubagentTool
+from cayu.workspaces.base import WorkspaceReadResult
+from cayu.workspaces.local import LocalWorkspace
 
 
 def _session(
@@ -4571,7 +4570,7 @@ def test_integration_eval_against_gemini(tmp_path):
     # Integration mode: run the normal eval path against a REAL provider + real workspace, and
     # assert over the runtime-native surface rather than model prose.
     # Credential-gated (skips without GEMINI_API_KEY), like the Docker-gated Postgres suite.
-    from cayu.providers import ChatCompletionsProvider
+    from cayu.providers.chat_completions import ChatCompletionsProvider
 
     (tmp_path / "README.md").write_text("Installation\n", encoding="utf-8")
     app = CayuApp(enable_logging=False)
@@ -5174,7 +5173,7 @@ def test_interrupted_fresh_revalidation_preserves_contradictory_lineage():
         _CaptureState,
         _revalidate_fresh_capture,
     )
-    from cayu.runtime.sessions import (
+    from cayu.sessions.base import (
         EventQuery,
         RunnerObservedEventIdentity,
         TerminalSessionEvidenceLimits,

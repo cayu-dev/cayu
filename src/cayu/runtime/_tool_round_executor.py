@@ -51,12 +51,41 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu._workspace_mutation import workspace_mutation_task_settlement_probe
-from cayu.artifacts import ArtifactScope, LocalArtifactStore
+from cayu.agents import AgentSpec
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolPolicyEvidence,
+    copy_pending_tool_approval,
+)
+from cayu.approvals.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    PendingUserInput,
+    copy_pending_user_input,
+    event_with_pending_user_input_authority,
+    pending_user_input_digest,
+    pending_user_input_identity,
+    public_pending_user_input_event_payload,
+    public_pending_user_input_prompt,
+    user_input_lifecycle_authority_from_checkpoint,
+)
+from cayu.artifacts.base import ArtifactScope
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementObserver,
 )
-from cayu.core.agents import AgentSpec
-from cayu.core.events import (
+from cayu.budgets.base import (
+    BudgetLimit,
+    _copy_budget_limit_definition,
+    copy_request_budget_limits,
+)
+from cayu.context.structured_output import (
+    StructuredOutputSpec,
+    copy_structured_output_spec,
+)
+from cayu.context.thinking import ThinkingConfig
+from cayu.environments.bindings import BoundWorkspace, _runtime_owned_workspace_observer_name
+from cayu.events import (
     Event,
     EventType,
     copy_event,
@@ -69,23 +98,21 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
     validate_event_envelope,
 )
-from cayu.core.messages import Message
-from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import (
-    _TOOL_POLICY_DENIAL_SOURCE,
-    DurableToolOperationConflict,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    _bind_runtime_tool_invocation_authority,
-    _bound_policy_denial_result,
-    _bound_policy_denial_text,
-    _RuntimeBrowserAllocationAuthority,
-)
-from cayu.environments import BoundWorkspace
-from cayu.environments.bindings import _runtime_owned_workspace_observer_name
 from cayu.failure_evidence import FailureEvidence
-from cayu.mcp import McpToolAdapter, McpToolset
+from cayu.mcp.tools import McpToolAdapter, McpToolset
+from cayu.messages import Message
+from cayu.observability.hooks import (
+    AfterToolCallDecision,
+    BeforeToolCallDecision,
+    BeforeToolCallHookContext,
+    RuntimeHookPhase,
+    RuntimeHookRuntime,
+    ToolCallHookContext,
+    _runtime_hook_supports_phase,
+)
+from cayu.observability.hooks import (
+    _runtime_hook_event as _build_runtime_hook_event,
+)
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
     pop_runner_cancellation_failure,
@@ -155,17 +182,6 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectTerminal,
     is_command_policy_refusal_terminal,
 )
-from cayu.runtime.approvals import (
-    PendingToolApproval,
-    PendingToolCallApproval,
-    ToolPolicyEvidence,
-    copy_pending_tool_approval,
-)
-from cayu.runtime.budgets import (
-    BudgetLimit,
-    _copy_budget_limit_definition,
-    copy_request_budget_limits,
-)
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,
     ExecutionProfileIdentity,
@@ -178,18 +194,6 @@ from cayu.runtime.execution_units import (
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
-from cayu.runtime.hooks import (
-    AfterToolCallDecision,
-    BeforeToolCallDecision,
-    BeforeToolCallHookContext,
-    RuntimeHookPhase,
-    RuntimeHookRuntime,
-    ToolCallHookContext,
-    _runtime_hook_supports_phase,
-)
-from cayu.runtime.hooks import (
-    _runtime_hook_event as _build_runtime_hook_event,
-)
 from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
     McpManifestPolicyAction,
@@ -199,7 +203,8 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     INHERIT_INTERACTION,
     EventQuery,
@@ -219,17 +224,40 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.runtime.structured_output import (
-    StructuredOutputSpec,
-    copy_structured_output_spec,
+from cayu.tools._operation_boundary import (
+    BoundedInvocationOperationRegistry,
+    await_invocation_operation,
 )
-from cayu.runtime.tool_catalogue import (
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._resources import (
+    InvocationWorkspaceMutationOwner,
+    WorkspaceMutationSettlementError,
+    invocation_artifact_store_handle,
+    invocation_workspace_handle,
+)
+from cayu.tools._runner import (
+    invocation_runner_handle,
+    is_current_runner_cancellation_group,
+    sanitize_runner_failure,
+    sanitize_runner_failure_group,
+)
+from cayu.tools.base import (
+    _TOOL_POLICY_DENIAL_SOURCE,
+    DurableToolOperationConflict,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    _bind_runtime_tool_invocation_authority,
+    _bound_policy_denial_result,
+    _bound_policy_denial_text,
+    _RuntimeBrowserAllocationAuthority,
+)
+from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,
     ToolExecutionContract,
 )
-from cayu.runtime.tool_discovery import (
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_REFERENCE_PREFIX,
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryProjectionKind,
@@ -242,7 +270,7 @@ from cayu.runtime.tool_discovery import (
     tool_discovery_record_matches_descriptor,
     tool_discovery_reference_rejection_reason,
 )
-from cayu.runtime.tool_exposure import (
+from cayu.tools.exposure import (
     NOT_EXPOSED_IN_REQUEST_REASON,
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
@@ -250,7 +278,7 @@ from cayu.runtime.tool_exposure import (
     unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
 )
-from cayu.runtime.tool_gateway import (
+from cayu.tools.gateway import (
     CallToolEnvelope,
     dynamic_tool_reference_rejection,
     rejected_targeted_tool_invocation,
@@ -259,10 +287,10 @@ from cayu.runtime.tool_gateway import (
     unresolved_gateway_rejection_event,
     validate_effective_tool_arguments,
 )
-from cayu.runtime.tool_gateway import (
+from cayu.tools.gateway import (
     arguments_sha256 as targeted_arguments_sha256,
 )
-from cayu.runtime.tool_grants import (
+from cayu.tools.grants import (
     TARGETED_TOOL_REFERENCE_FIELD_NAME,
     TargetedToolUseDisposition,
     TargetedToolUseRejectionReason,
@@ -271,7 +299,7 @@ from cayu.runtime.tool_grants import (
     targeted_tool_use_rejection_reason,
     targeted_tool_view_generation_id,
 )
-from cayu.runtime.tool_policy import (
+from cayu.tools.policy import (
     TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     TaintAwareToolPolicy,
@@ -282,7 +310,7 @@ from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
-from cayu.runtime.tool_result_projection import (
+from cayu.tools.result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
     ToolResultProjectionPolicy,
     ToolResultProjectionRequest,
@@ -291,28 +319,19 @@ from cayu.runtime.tool_result_projection import (
     safe_projection_failure_type,
     validate_tool_result_projection,
 )
-from cayu.runtime.tool_terminal_publication import (
+from cayu.tools.terminal_publication import (
     TOOL_TERMINAL_PUBLICATION_SLICE_BYTES,
     ToolTerminalPublicationGovernor,
     ToolTerminalPublicationMetricsSnapshot,
 )
-from cayu.runtime.user_input import (
-    PENDING_USER_INPUT_CHECKPOINT_KEY,
-    PendingUserInput,
-    copy_pending_user_input,
-    event_with_pending_user_input_authority,
-    pending_user_input_digest,
-    pending_user_input_identity,
-    public_pending_user_input_event_payload,
-    public_pending_user_input_prompt,
-    user_input_lifecycle_authority_from_checkpoint,
-)
-from cayu.runtime.workspace_checkpoints import (
+from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces.checkpoint_lifecycle import (
     begin_workspace_checkpoint_mutation,
     complete_workspace_checkpoint_mutation,
     ensure_workspace_checkpoint,
 )
-from cayu.runtime.workspace_mutation_attribution import (
+from cayu.workspaces.local import LocalWorkspace
+from cayu.workspaces.mutation_attribution import (
     DirectWorkspaceMutationCollector,
     WorkspaceMutationWindow,
     begin_workspace_mutation_window,
@@ -321,7 +340,7 @@ from cayu.runtime.workspace_mutation_attribution import (
     observed_pre_window_change,
     reconcile_direct_workspace_mutations,
 )
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.workspaces.observation_recovery import (
     WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
     WorkspaceObservationArtifact,
     WorkspaceObservationArtifactState,
@@ -341,26 +360,9 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_terminal_from_delta_status,
     workspace_observations_from_checkpoint,
 )
-from cayu.tools._operation_boundary import (
-    BoundedInvocationOperationRegistry,
-    await_invocation_operation,
-)
-from cayu.tools._redaction import InvocationRedactorSnapshot
-from cayu.tools._resources import (
-    InvocationWorkspaceMutationOwner,
-    WorkspaceMutationSettlementError,
-    invocation_artifact_store_handle,
-    invocation_workspace_handle,
-)
-from cayu.tools._runner import (
-    invocation_runner_handle,
-    is_current_runner_cancellation_group,
-    sanitize_runner_failure,
-    sanitize_runner_failure_group,
-)
-from cayu.vaults import SecretRedactor
-from cayu.workspaces import (
-    LocalWorkspace,
+from cayu.workspaces.revisions import (
+    _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
+    _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
     WorkspaceDirectMutationReconciliation,
     WorkspaceIdentity,
     WorkspaceMutationAttribution,
@@ -368,15 +370,11 @@ from cayu.workspaces import (
     WorkspaceRevisionDelta,
     WorkspaceRevisionDeltaStatus,
     WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimitExceeded,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
     WorkspaceWriterIsolationEvidence,
     compare_workspace_revisions,
-)
-from cayu.workspaces.revisions import (
-    _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
-    _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
-    WorkspaceRevisionObservationLimitExceeded,
     copy_bounded_workspace_revision_observation,
     unsupported_workspace_revision,
 )
@@ -4604,7 +4602,7 @@ class ToolRoundExecutor:
                         )
                     published_checkpoint = {} if checkpoint is None else dict(checkpoint)
                     if control_mutation is not None:
-                        from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+                        from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 
                         published_checkpoint[BROWSER_CONTROLS_CHECKPOINT_KEY] = (
                             control_mutation.desired.model_dump(mode="json")
@@ -4727,7 +4725,7 @@ class ToolRoundExecutor:
                     with browser_control_checkpoint_read_scope(session.id):
                         checkpoint = await self._session_store.load_checkpoint(session.id)
                     if checkpoint is not None and "browser_controls" in checkpoint:
-                        from cayu.runtime.browser_control import (
+                        from cayu.tools.browser_control import (
                             BrowserControlCheckpoint,
                             BrowserControlIdentity,
                             rebound_browser_control_successor,

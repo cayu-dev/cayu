@@ -59,7 +59,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     CheckpointTransform,
     Session,
     session_fork_profile_relationship,

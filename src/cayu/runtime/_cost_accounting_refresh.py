@@ -8,7 +8,8 @@ from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
-from cayu.core import Event
+from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts, copy_price_book
+from cayu.events import Event
 from cayu.runtime._cost_accounting import (
     COST_EVENT_TYPES,
     CostAccountingCursor,
@@ -17,10 +18,9 @@ from cayu.runtime._cost_accounting import (
     CostGroupKey,
     cost_group_key,
 )
-from cayu.runtime.costs import PriceBook, SessionCostTotals, add_cost_amounts, copy_price_book
 
 if TYPE_CHECKING:
-    from cayu.runtime.sessions import EventQuery, EventRecord
+    from cayu.sessions.base import EventQuery, EventRecord
 
 
 class CostAccountingAuthority:
@@ -118,7 +118,7 @@ class CostAccountingRead:
         through_sequence: int = 0,
         authority: CostAccountingAuthority | None = None,
     ) -> None:
-        from cayu.runtime.sessions import copy_event_query
+        from cayu.sessions.base import copy_event_query
 
         if type(details) is not bool or type(by_session) is not bool:
             raise TypeError("Cost accounting output flags must be bools.")
@@ -214,7 +214,7 @@ class CostAccountingRead:
         )
 
     def _matches(self, record: EventRecord, query: EventQuery) -> bool:
-        from cayu.runtime.sessions import _event_record_matches
+        from cayu.sessions.base import _event_record_matches
 
         return _event_record_matches(
             record, query, frozenset(str(kind) for kind in COST_EVENT_TYPES), frozenset()
@@ -226,7 +226,7 @@ class CostAccountingRead:
         return tuple(self._pending)
 
     def add(self, sequence: int, event: Event) -> None:
-        from cayu.runtime.sessions import EventRecord
+        from cayu.sessions.base import EventRecord
 
         if self._cold is not None:
             self._cold.add(sequence, event)

@@ -6,16 +6,16 @@ from importlib.metadata import version
 from typing import Any
 from uuid import uuid4
 
-from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType, event_with_runtime_envelope_authority
-from cayu.core.execution_identity import (
-    ExecutionProfileBehaviorIdentity,
-    copy_execution_profile_behavior_identity,
-)
-from cayu.core.messages import Message
-from cayu.core.thinking import ThinkingConfig, thinking_config_payload
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit, request_budget_limits_for_session
+from cayu.configuration import DEFAULT_MAX_STEPS
+from cayu.context.structured_output import StructuredOutputSpec
+from cayu.context.thinking import ThinkingConfig, thinking_config_payload
 from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType, event_with_runtime_envelope_authority
+from cayu.messages import Message
+from cayu.observability.hooks import RuntimeHook
 from cayu.providers import ModelProvider
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _session_engine as session_engine_module
@@ -33,16 +33,11 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_checkpoint_state_sha256,
     prepare_rebind_invocation_command,
 )
-from cayu.runtime.app import CayuApp
-from cayu.runtime.budgets import BudgetLimit, request_budget_limits_for_session
 from cayu.runtime.build_provenance import current_runtime_build_provenance
-from cayu.runtime.checkpoints import (
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-    decode_runtime_checkpoint,
+from cayu.runtime.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
 )
-from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     ActiveInvocationExecutionProfile,
@@ -52,10 +47,10 @@ from cayu.runtime.execution_profiles import (
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.sessions import (
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions.base import (
     RunRequest,
     Session,
     SessionIdentity,
@@ -66,14 +61,19 @@ from cayu.runtime.sessions import (
     run_request_with_runtime_session_instance_authority,
     runtime_publication_checkpoint_mutation,
 )
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tool_exposure import (
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    decode_runtime_checkpoint,
+)
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.exposure import (
     ToolCapabilityCeiling,
     ToolExposurePolicy,
     tool_capability_ceiling_from_session_metadata,
 )
-from cayu.runtime.tool_policy import ToolPolicy
+from cayu.tools.policy import ToolPolicy
 from cayu.vaults import SecretRedactor
 
 

@@ -24,8 +24,8 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_metadata,
 )
-from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
-from cayu.core.tools import ToolResult
+from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
@@ -46,8 +46,8 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
-from cayu.runtime.pending_actions import pending_action_evidence_round_from_checkpoint
-from cayu.runtime.sessions import (
+from cayu.runtime.tool_effects import _bounded_text
+from cayu.sessions.base import (
     MAX_SESSION_ID_BYTES,
     EventOrder,
     EventQuery,
@@ -58,8 +58,8 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
-from cayu.runtime.tool_effects import _bounded_text
-from cayu.runtime.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
+from cayu.tools.base import ToolResult
 
 FOREGROUND_CHILD_WAIT_KEY = "foreground_child_wait"
 FOREGROUND_CHILD_TERMINAL_KEY = "foreground_child_terminal"

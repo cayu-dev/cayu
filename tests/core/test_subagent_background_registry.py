@@ -7,10 +7,10 @@ import logging
 
 import pytest
 
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
-from cayu.core.tools import ToolContext
-from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.tools.base import ToolContext
 from cayu.tools.subagents import (
     BACKGROUND_SUBAGENT_FAILURE_ARTIFACT_TYPE,
     BackgroundSubagentTaskRegistry,

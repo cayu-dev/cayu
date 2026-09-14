@@ -14,9 +14,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from cayu.core.tools import ToolContext, ToolResult
 from cayu.proxies import ProxyAuthorizationResult
 from cayu.tools._redaction import active_secret_redactor
+from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.web import (
     MAX_WEB_FETCH_TITLE_BYTES,
     MAX_WEB_SEARCH_QUERY_BYTES,

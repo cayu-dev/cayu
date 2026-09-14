@@ -14,7 +14,7 @@ from cayu.runtime._browser_control_authorization import (
 from cayu.runtime._browser_control_channel import BoundBrowserGuest, BrowserGuestCommandOwner
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,
     BrowserHandbackIntent,

@@ -5,7 +5,8 @@ from operations.maintenance_requests import (  # ty: ignore[unresolved-import]
     capture_accepted_request,
 )
 
-from cayu import CodingProductArtifactRepository, TaskStatus
+from cayu.coding_products import CodingProductArtifactRepository
+from cayu.tasks.base import TaskStatus
 from tests.qualification.repository_maintenance_identity import copy_identity
 from tests.qualification.repository_maintenance_intake import load_owned_coding_task
 from tests.qualification.repository_maintenance_request import decode_request

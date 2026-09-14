@@ -8,15 +8,14 @@ from datetime import UTC, datetime
 
 import pytest
 
-from cayu import (
+from cayu.delivery.github import (
     GitHubCheckBundle,
     GitHubCheckObservation,
     GitHubDeliveryApproval,
-    TaskQuery,
-    TaskStatus,
     github_connector_behavior_fingerprint,
-    run_task_worker,
 )
+from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr
 from tests.qualification.test_repository_maintenance_github_intake import configuration, enqueue
 from tests.qualification.test_repository_maintenance_github_intake import (

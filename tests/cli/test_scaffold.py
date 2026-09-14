@@ -16,28 +16,25 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    CayuApp,
-    ChatCompletionsProvider,
-    DockerCodingEnvironmentFactory,
-    DockerImageIdentity,
-    EvalStatus,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    StructuredCommandToolPolicy,
-    load_eval_run,
-    run_to_completion,
-)
-from cayu import __version__ as cayu_version
+from cayu._version import __version__ as cayu_version
+from cayu.applications import CayuApp
 from cayu.cli import main
 from cayu.cli._bounded_command import BoundedCommandResult
 from cayu.cli.project import project_context
+from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
+from cayu.evals.models import EvalStatus
+from cayu.evals.reporting import load_eval_run
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.providers.chat_completions import ChatCompletionsProvider
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.outcomes import run_to_completion
+from cayu.storage.memory import InMemoryKnowledgeStore
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tools.structured_commands import StructuredCommandToolPolicy
+from cayu.workspaces.local import LocalWorkspace
 
 _RESERVED_TEMPLATE_TOKENS = (
     "__PROJECT_NAME__",

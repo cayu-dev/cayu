@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cayu.core.messages import (
+from cayu.messages import (
     Message,
     MessageRole,
     ProviderStatePart,

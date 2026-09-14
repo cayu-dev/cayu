@@ -16,9 +16,23 @@ from uuid import uuid4
 import pytest
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
-from cayu import (
-    PostgresSessionStore,
-    PostgresTaskStore,
+from cayu.cli import main
+from cayu.cli import storage as storage_cli
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import (
+    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
+    EventOrder,
+    EventQuery,
+    RunRequest,
+    SessionIdentity,
+)
+from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import migrations as schema
+from cayu.storage import postgres as postgres_storage
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.tasks.base import (
     TaskCreate,
     TaskQuery,
     TaskStatus,
@@ -26,15 +40,6 @@ from cayu import (
     TaskTerminalKind,
     interrupted_task_handoff_request,
 )
-from cayu.cli import main
-from cayu.cli import storage as storage_cli
-from cayu.core import Event, EventType, Message
-from cayu.runtime import EventOrder, EventQuery, RunRequest, SessionIdentity
-from cayu.runtime.sessions import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
-from cayu.storage import _session_store_sql as session_store_sql
-from cayu.storage import migrations as schema
-from cayu.storage import postgres as postgres_storage
-from cayu.storage.migrations import SchemaMode
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 

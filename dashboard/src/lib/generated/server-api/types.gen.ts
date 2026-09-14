@@ -8881,13 +8881,17 @@ export type ExternalTrialIdentityV1 = {
 /**
  * FailureEvidence
  *
- * Portable evidence, never a certificate that external effects have stopped.
+ * Bounded failure snapshot with flat, ordered parallel branch evidence.
  *
- * ``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session
- * events and the existing IncompleteSessionRecoveryResult contract. Missing
- * evidence is unknown, including for old durable events.
+ * Branches carry the same diagnostic fields but cannot recursively contain
+ * branches. Nested fan-outs are flattened in submission order, up to 16 leaves.
+ * Settlement is always unknown, including when a deadline is retained.
  */
 export type FailureEvidence = {
+    /**
+     * Branch Failures
+     */
+    branch_failures?: Array<FailureEvidenceFields>;
     /**
      * Classification
      */
@@ -18048,6 +18052,55 @@ export type WorkspaceStructuralEvidenceV1 = {
      * Total Bytes
      */
     total_bytes?: number | null;
+};
+
+/**
+ * _FailureEvidenceFields
+ *
+ * Portable evidence, never a certificate that external effects have stopped.
+ *
+ * ``session_id``/``run_epoch``/``terminal_event_id`` reference Runtime session
+ * events and the existing IncompleteSessionRecoveryResult contract. Missing
+ * evidence is unknown, including for old durable events.
+ */
+export type FailureEvidenceFields = {
+    /**
+     * Classification
+     */
+    classification?: 'deadline' | 'timeout' | 'interruption' | 'failure' | 'unknown';
+    deadline?: ExecutionDeadline | null;
+    /**
+     * Deadline Phase
+     */
+    deadline_phase?: 'admission' | 'in_flight' | null;
+    /**
+     * Exception Types
+     */
+    exception_types?: Array<string>;
+    /**
+     * Run Epoch
+     */
+    run_epoch?: number | null;
+    /**
+     * Secondary Failures
+     */
+    secondary_failures?: boolean;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    /**
+     * Settlement
+     */
+    settlement?: 'unknown';
+    /**
+     * Terminal Event Id
+     */
+    terminal_event_id?: string | null;
+    /**
+     * Truncated
+     */
+    truncated?: boolean;
 };
 
 export type ListAgentsApiAgentsGetData = {

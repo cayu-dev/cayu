@@ -435,7 +435,7 @@ overflow rebuilding, typed provider outcomes, cancellation, and durable
 background recovery advance the original attempt lifecycles conservatively.
 
 `runtime_evidence(...)` schema 4 and standalone trajectory schema 4 now expose
-the same bounded `cayu.memory_attribution.v1` read model. It correlates receipts,
+the same bounded `cayu.memory.attribution.v1` read model. It correlates receipts,
 exposures, item links, and lifecycle truth through session-scoped HMAC aliases
 without publishing raw memory identity or content. Global count and byte bounds,
 lower-bound omission counts, and distinct unavailable, redacted, truncated,

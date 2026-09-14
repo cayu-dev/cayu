@@ -422,7 +422,7 @@ def test_cli_blocks_inherited_enum_execution_before_app_import(
     [
         "from abc import ABC as Root",
         "from cayu import Tool as Root",
-        "from cayu.core.tools import Tool as Root",
+        "from cayu.tools.base import Tool as Root",
     ],
 )
 def test_reviewed_external_roots_propagate_inheritance_safety(tmp_path: Path, binding: str) -> None:

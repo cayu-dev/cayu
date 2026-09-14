@@ -34,7 +34,16 @@ from cayu import (
     build_request_footprint,
 )
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION, file_attachment
-from cayu.core.messages import FilePart, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
+from cayu.context.footprints import (
+    analyze_request_context_pressure,
+    analyze_request_footprint,
+)
+from cayu.context.structured_output import (
+    structured_output_spec_payload,
+    structured_output_tool_instruction,
+    structured_output_tool_spec,
+)
+from cayu.messages import FilePart, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
@@ -44,18 +53,9 @@ from cayu.providers.base import (
     TargetedToolProjectionRequest,
 )
 from cayu.providers.openai import build_openai_payload
-from cayu.runtime.request_footprints import (
-    analyze_request_context_pressure,
-    analyze_request_footprint,
-)
-from cayu.runtime.structured_output import (
-    structured_output_spec_payload,
-    structured_output_tool_instruction,
-    structured_output_tool_spec,
-)
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_discovery import TOOL_DISCOVERY_ONLY_PROFILE_ID, search_tools_spec
-from cayu.runtime.tool_gateway import call_tool_spec
+from cayu.tools.catalogue import CALL_TOOL_NAME
+from cayu.tools.discovery import TOOL_DISCOVERY_ONLY_PROFILE_ID, search_tools_spec
+from cayu.tools.gateway import call_tool_spec
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
 

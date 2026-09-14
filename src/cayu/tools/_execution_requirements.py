@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cayu.core.tools import ToolExecutionRequirement, ToolSpec
+from cayu.tools.base import ToolExecutionRequirement, ToolSpec
 
 
 def with_intrinsic_execution_requirements(

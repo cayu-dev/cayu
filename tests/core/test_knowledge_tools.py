@@ -9,9 +9,22 @@ from typing import Any, cast
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from cayu import (
-    Environment,
-    EnvironmentSpec,
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
+from cayu.environments.base import Environment, EnvironmentSpec, copy_environment
+from cayu.runtime._invocation_secrets import InvocationSecretTracker
+from cayu.runtime._tool_execution import run_tool
+from cayu.storage.knowledge_indexer import (
+    KnowledgeIndexer,
+    KnowledgeIndexRequest,
+    content_knowledge_entry_id,
+    knowledge_source_hash,
+)
+from cayu.storage.memory import (
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeAccessDenied,
@@ -25,40 +38,25 @@ from cayu import (
     KnowledgeEntry,
     KnowledgeGovernanceConfig,
     KnowledgeGovernanceMode,
-    KnowledgeIndexer,
-    KnowledgeIndexRequest,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    prepare_knowledge_publication,
+)
+from cayu.tools import knowledge as knowledge_module
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.knowledge import (
     ListKnowledgeTool,
     ReadKnowledgeTool,
     RememberKnowledgePolicy,
     RememberKnowledgeTool,
     SearchKnowledgeTool,
-    SecretRedactor,
-    ToolContext,
-    ToolSpec,
-    prepare_knowledge_publication,
 )
-from cayu.core.tools import Tool, ToolEffect, ToolResult
-from cayu.embeddings import (
-    TextEmbedding,
-    TextEmbeddingProvider,
-    TextEmbeddingRequest,
-    TextEmbeddingResult,
-)
-from cayu.environments import copy_environment
-from cayu.runtime._invocation_secrets import InvocationSecretTracker
-from cayu.runtime._tool_execution import run_tool
-from cayu.storage.knowledge_indexer import (
-    content_knowledge_entry_id,
-    knowledge_source_hash,
-)
-from cayu.tools import knowledge as knowledge_module
-from cayu.vaults import ResolvedSecret
+from cayu.vaults.base import ResolvedSecret
+from cayu.vaults.redaction import SecretRedactor
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 

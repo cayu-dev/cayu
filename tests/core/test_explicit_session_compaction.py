@@ -19,86 +19,70 @@ from tests.core._execution_profile_fixtures import (
 )
 
 import cayu.runtime._session_engine as session_engine_module
-from cayu import (
-    CayuConfig,
-    ScriptedModelProvider,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolExecutionConfig,
-    ToolResult,
-    ToolSpec,
-)
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.artifacts import FileAttachmentKind, file_attachment
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    Message,
-    ToolCallPart,
-    ToolResultPart,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ResolutionActor
+from cayu.artifacts.attachments import FileAttachmentKind, file_attachment
+from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
+from cayu.budgets.billing import BillingIdentity
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.context.base import (
+    CheckpointCompactionContextPolicy,
+    CompactionRequest,
+    CompactionResult,
+    ContextBuildError,
+    ContextCompactor,
+    ContextRequest,
+    ModelCompactor,
+    PromptCacheCompactor,
 )
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.providers import (
+from cayu.context.footprints import RequestFootprint, RequestFootprintConfig, RequestVariant
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart, ToolResultPart
+from cayu.observability.events import EventSink, InMemoryEventSink
+from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     UsageDialect,
-    bedrock_billing_identity,
-    completed_bedrock_billing_identity,
 )
-from cayu.runtime import (
-    BillingIdentity,
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
-    CayuApp,
-    CheckpointCompactionContextPolicy,
-    CompactionRequest,
-    CompactionResult,
-    CompactSessionRequest,
-    ContextCompactor,
-    ContextRequest,
-    EventQuery,
-    EventSink,
-    ExecutionProfileComponentClass,
-    ExecutionProfileMismatchError,
-    ForkSessionRequest,
-    InMemoryBudgetLedger,
-    InMemoryEventSink,
-    InMemorySessionStore,
-    ModelCompactor,
-    ModelPrice,
-    PriceBook,
-    PromptCacheCompactor,
-    RequestFootprint,
-    RequestFootprintConfig,
-    RequestVariant,
-    ResolutionActor,
-    ResumeRequest,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    SessionIdentity,
-    SessionRunFenced,
-    SessionStatus,
-    ToolCapabilityCeiling,
-)
+from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     public_event_id,
     public_event_sequence,
 )
 from cayu.runtime._run_limits import BudgetReservationLeaseLost
-from cayu.runtime.checkpoints import (
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileMismatchError,
+)
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    CompactSessionRequest,
+    EventQuery,
+    ForkSessionRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionRunFenced,
+    SessionStatus,
+)
+from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
-from cayu.runtime.context import ContextBuildError
-from cayu.storage import SQLiteSessionStore
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class RecordingCompactor(ContextCompactor):
@@ -3441,7 +3425,7 @@ def test_compact_session_redacts_instructions_before_provider_and_durable_bounda
 
 
 def test_compact_session_rejects_secret_policy_checkpoint_before_publication() -> None:
-    from cayu.runtime.context import ContextBuildResult
+    from cayu.context.base import ContextBuildResult
 
     secret = "explicit-policy-checkpoint-secret-canary"
 
@@ -3534,7 +3518,7 @@ def test_compact_session_rejects_secret_policy_checkpoint_before_publication() -
 def test_compact_session_rejects_secret_checkpoint_event_payload_before_publication(
     secret_location: str,
 ) -> None:
-    from cayu.runtime.context import ContextBuildResult
+    from cayu.context.base import ContextBuildResult
 
     secret = (
         "checkpoint"
@@ -3948,8 +3932,8 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
 
 
 def test_compact_session_replays_legacy_terminal_record_before_later_pending_state() -> None:
+    from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
 
     async def run() -> None:
         store = InMemorySessionStore()

@@ -7,33 +7,20 @@ from pathlib import Path
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalWorkspace,
-    Message,
-    ModelStreamEvent,
-    ReadFileTool,
-    RecoveryPlanAction,
-    RecoveryPlanRequest,
-    RecoveryPlanSelection,
-    ResumeRequest,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionStatus,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    Task,
-    TaskCreate,
-    TaskHandlerOutcome,
-    TaskStatus,
-    run_task_worker,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionStatus
+from cayu.sessions.recovery import RecoveryPlanAction, RecoveryPlanRequest, RecoveryPlanSelection
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, Task, TaskCreate, TaskStatus
+from cayu.tasks.worker import TaskHandlerOutcome, run_task_worker
+from cayu.tools.files import ReadFileTool
+from cayu.workspaces.local import LocalWorkspace
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -220,7 +207,8 @@ def test_direct_task_recovery_rejects_incomplete_or_changed_evidence(
     from datetime import UTC, datetime
     from uuid import uuid4
 
-    from cayu import RecoveryBlockerCode, TaskClaimLost
+    from cayu.sessions.recovery import RecoveryBlockerCode
+    from cayu.tasks.base import TaskClaimLost
 
     async def scenario() -> None:
         path = tmp_path / "state.sqlite"

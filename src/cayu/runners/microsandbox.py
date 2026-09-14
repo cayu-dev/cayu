@@ -80,7 +80,7 @@ from cayu.runners.base import (
     copy_exec_command,
     runner_execution_error,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 DEFAULT_MICROSANDBOX_IMAGE = "python:3.13"
 DEFAULT_MICROSANDBOX_CWD = "/workspace"

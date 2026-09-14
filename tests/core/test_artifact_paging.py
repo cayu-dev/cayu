@@ -7,13 +7,16 @@ import pytest
 from tests.core.test_tool_result_projection import _collect, _ReadbackProvider, _ResultTool
 
 from cayu import ArtifactScope, Environment, EnvironmentSpec, SecretRedactor
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.artifacts import ArtifactStore, LocalArtifactStore
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.tools import ToolContext, ToolResult
+from cayu.events import EventType
+from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import CayuApp, RunRequest
-from cayu.runtime.tool_result_projection import ArtifactExternalizingToolResultPolicy
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import ToolContext, ToolResult
 from cayu.tools.files import ReadFileTool
+from cayu.tools.result_projection import ArtifactExternalizingToolResultPolicy
 
 
 def _page_text(result):

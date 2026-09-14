@@ -10,22 +10,21 @@ from dataclasses import replace
 import pytest
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.cli import main
+from cayu.cli.project import project_context
+from cayu.coding_products import (
     CodingProductAdmissionError,
     CodingProductArtifactRepository,
     CodingProductState,
-    DockerImageIdentity,
-    ExecutionProfileBehaviorIdentity,
-    LocalArtifactStore,
-    LocalWorkspace,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
 )
-from cayu.cli import main
-from cayu.cli.project import project_context
-from cayu.environments import Environment, EnvironmentSpec
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.workspaces.local import LocalWorkspace
 
 
 def test_generated_workflow_recovers_settled_publication(tmp_path, monkeypatch):

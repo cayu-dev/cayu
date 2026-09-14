@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from cayu.runtime._browser_control_authorization import BrowserControlRevisionChanged
 from cayu.runtime._browser_control_evidence import browser_read_evidence_matches
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPage,
     BrowserControlPrincipal,

@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import Event, EventType
 from cayu.environments.lifecycle import (
     DEFAULT_ENVIRONMENT_PHASE_TIMEOUT_SECONDS,
     MAX_ENVIRONMENT_PROGRESS_COUNTER,
@@ -25,6 +24,7 @@ from cayu.environments.lifecycle import (
     environment_lifecycle_progress_from_event,
     environment_lifecycle_transition_from_event,
 )
+from cayu.events import Event, EventType
 
 
 class _Clock:

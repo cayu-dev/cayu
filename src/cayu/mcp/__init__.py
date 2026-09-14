@@ -1,125 +1,17 @@
 """MCP integration contracts."""
 
-from cayu.mcp._jsonrpc import (
-    DEFAULT_MCP_CLIENT_NAME,
-    DEFAULT_MCP_CLIENT_VERSION,
-    DEFAULT_MCP_MAX_LIST_ITEMS,
-    DEFAULT_MCP_MAX_LIST_PAGES,
-    DEFAULT_MCP_REQUEST_TIMEOUT_S,
-    MCP_MODERN_PROTOCOL_VERSION,
-    MCP_PROTOCOL_VERSION,
-    SUPPORTED_MCP_PROTOCOL_VERSIONS,
-    McpProtocolError,
-)
-from cayu.mcp._protocol import McpProtocolEra
-from cayu.mcp._stdio_process import (
-    DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S,
-    DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S,
-    DEFAULT_MCP_CONTAINMENT_TERM_TIMEOUT_S,
-    StdioMcpProcessLifetime,
-)
-from cayu.mcp._transport import (
-    DEFAULT_MCP_MAX_MESSAGE_BYTES,
-    DEFAULT_MCP_MAX_RESPONSE_BYTES,
-    McpCallDeadlineExceededError,
-    McpIdleTimeoutError,
-    McpMessageTooLargeError,
-    McpPeerClosedError,
-    McpResponseTooLargeError,
-    McpTransportLimits,
-)
-from cayu.mcp.base import (
-    McpClient,
-    McpInitializeResult,
-    McpResourceDefinition,
-    McpResourceResult,
-    McpServerSpec,
-    McpSession,
-    McpToolDefinition,
-    McpToolResult,
-)
-from cayu.mcp.http import (
-    DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S,
-    DEFAULT_HTTP_MCP_TIMEOUT_S,
-    HttpMcpClient,
-    HttpMcpSession,
-)
-from cayu.mcp.stdio import (
-    DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S,
-    DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-    DEFAULT_MCP_WRITE_TIMEOUT_S,
-    StdioMcpClient,
-    StdioMcpSession,
-)
-from cayu.mcp.tools import (
-    McpToolAdapter,
-    McpToolset,
-    McpToolsetManifestDiff,
-    McpToolsetRefreshBlocked,
-    McpToolsetRefreshResult,
-    McpToolsetRefreshState,
-    McpToolsetUnavailable,
-    connect_mcp_toolset,
-    mcp_cayu_tool_name,
-    mcp_tool_manifest_hash,
-    mcp_tool_manifest_identity,
-    mcp_tool_manifest_server_hash,
-    mcp_tool_manifest_tools,
-    mcp_toolset_manifest_diff,
-)
+from typing import Any as _Any
 
-__all__ = [
-    "DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S",
-    "DEFAULT_HTTP_MCP_TIMEOUT_S",
-    "DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S",
-    "DEFAULT_MCP_CLIENT_NAME",
-    "DEFAULT_MCP_CLIENT_VERSION",
-    "DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S",
-    "DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S",
-    "DEFAULT_MCP_CONTAINMENT_TERM_TIMEOUT_S",
-    "DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S",
-    "DEFAULT_MCP_MAX_LIST_ITEMS",
-    "DEFAULT_MCP_MAX_LIST_PAGES",
-    "DEFAULT_MCP_MAX_MESSAGE_BYTES",
-    "DEFAULT_MCP_MAX_RESPONSE_BYTES",
-    "DEFAULT_MCP_REQUEST_TIMEOUT_S",
-    "DEFAULT_MCP_WRITE_TIMEOUT_S",
-    "MCP_MODERN_PROTOCOL_VERSION",
-    "MCP_PROTOCOL_VERSION",
-    "SUPPORTED_MCP_PROTOCOL_VERSIONS",
-    "HttpMcpClient",
-    "HttpMcpSession",
-    "McpCallDeadlineExceededError",
-    "McpClient",
-    "McpIdleTimeoutError",
-    "McpInitializeResult",
-    "McpMessageTooLargeError",
-    "McpPeerClosedError",
-    "McpProtocolEra",
-    "McpProtocolError",
-    "McpResourceDefinition",
-    "McpResourceResult",
-    "McpResponseTooLargeError",
-    "McpServerSpec",
-    "McpSession",
-    "McpToolAdapter",
-    "McpToolDefinition",
-    "McpToolResult",
-    "McpToolset",
-    "McpToolsetManifestDiff",
-    "McpToolsetRefreshBlocked",
-    "McpToolsetRefreshResult",
-    "McpToolsetRefreshState",
-    "McpToolsetUnavailable",
-    "McpTransportLimits",
-    "StdioMcpClient",
-    "StdioMcpProcessLifetime",
-    "StdioMcpSession",
-    "connect_mcp_toolset",
-    "mcp_cayu_tool_name",
-    "mcp_tool_manifest_hash",
-    "mcp_tool_manifest_identity",
-    "mcp_tool_manifest_server_hash",
-    "mcp_tool_manifest_tools",
-    "mcp_toolset_manifest_diff",
-]
+from cayu._api import resolve_export as _resolve_export
+from cayu.mcp._exports import EXPORTS as _EXPORTS
+from cayu.mcp._exports import PUBLIC_NAMES as _PUBLIC_NAMES
+
+__all__ = _PUBLIC_NAMES
+
+
+def __getattr__(name: str) -> _Any:
+    return _resolve_export(name, globals(), _EXPORTS)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))

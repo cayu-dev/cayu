@@ -6,11 +6,9 @@ from workflows.maintenance_delivery import (  # ty: ignore[unresolved-import]
     run_verified_git_delivery,
 )
 
-from cayu import (
-    LocalArtifactStore,
-    RemoteGitDeliveryBroker,
-    complete_managed_task,
-)
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.delivery.git import RemoteGitDeliveryBroker
+from cayu.tasks.worker import complete_managed_task
 from tests.qualification.repository_maintenance_git_intake import (
     _configured_git_request,
     load_claimed_git_delivery,

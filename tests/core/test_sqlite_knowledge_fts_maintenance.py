@@ -12,17 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from cayu.runtime import RunRequest, SessionIdentity
-from cayu.storage import (
-    KnowledgeAccessScope,
-    KnowledgeChunk,
-    KnowledgeEntry,
-    KnowledgeQuery,
-    SQLiteKnowledgeStore,
-    SQLiteSessionStore,
-)
+from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
+from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
+from cayu.storage.memory import KnowledgeAccessScope, KnowledgeChunk, KnowledgeEntry, KnowledgeQuery
+from cayu.storage.sqlite import SQLiteSessionStore
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 

@@ -4,24 +4,23 @@ import json
 from dataclasses import dataclass
 from hashlib import sha256
 
-from cayu import (
+from cayu.artifacts.base import ArtifactStore, copy_artifact_read_result
+from cayu.coding_products import (
     CODING_PRODUCT_EVIDENCE_KIND,
-    ArtifactStore,
     CodingArtifactReference,
     CodingProductArtifactRepository,
     CodingProductRequest,
-    CompletionResultReference,
-    CompletionVerdict,
-    DockerCodingToolchainProfile,
-    PublicAuthorityAliasCodec,
-    WorkEvidenceReference,
-    Workspace,
+    coding_product_completion_decision,
+)
+from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.tasks.contracts import CompletionResultReference, CompletionVerdict, WorkEvidenceReference
+from cayu.workspaces.base import Workspace
+from cayu.workspaces.revisions import (
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationStatus,
-    coding_product_completion_decision,
-    copy_artifact_read_result,
+    observe_deterministic_workspace,
 )
-from cayu.workspaces.revisions import observe_deterministic_workspace
 from tests.qualification.repository_maintenance_case import (
     ALLOWED_CHANGE_PATHS,
     SEED_BASE_REVISION,

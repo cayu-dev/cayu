@@ -55,13 +55,13 @@ from cayu import (
     TaskStatus,
     WorkCompletionConflict,
 )
-from cayu.runtime.sessions import (
+from cayu.sessions.base import (
     CheckpointTransform,
     SessionStore,
     StoreTimeCheckpointTransform,
     run_request_with_task_invocation,
 )
-from cayu.runtime.tasks import CompletionDecisionApplicationReceipt, TaskStore
+from cayu.tasks.base import CompletionDecisionApplicationReceipt, TaskStore
 from cayu.vaults import SecretRedactor
 
 

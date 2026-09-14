@@ -13,13 +13,13 @@ from cayu.runtime._browser_control_publication import (
     BrowserControlPublication,
 )
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
-from cayu.runtime.browser_control import (
+from cayu.sessions.base import SessionStatus
+from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,
     BrowserSensitiveEntryIntent,
     BrowserTextInputIntent,
 )
-from cayu.runtime.sessions import SessionStatus
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -117,7 +117,7 @@ def test_terminal_cleanup_preserves_exact_pending_evidence(
 def test_cleanup_publication_cannot_change_control_epoch():
     from tests.core.test_browser_control import identity, request
 
-    from cayu.runtime.browser_control import BrowserControlCheckpoint, BrowserControlRecord
+    from cayu.tools.browser_control import BrowserControlCheckpoint, BrowserControlRecord
 
     source = BrowserControlRecord(
         identity=identity(), request=request(), revision=2, state="takeover_requested"

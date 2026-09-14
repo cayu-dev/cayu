@@ -23,7 +23,7 @@ from cayu import (
     TextPart,
     file_attachment,
 )
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.budgets.usage import normalize_usage_metrics
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -35,7 +35,7 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
-from cayu.runtime.usage import normalize_usage_metrics
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from tests.providers.conformance import (
     CapabilityClaim,
     ProviderCapabilities,

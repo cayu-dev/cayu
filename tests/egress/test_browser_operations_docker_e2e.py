@@ -22,6 +22,7 @@ from cayu import (
 )
 from cayu.egress import HttpEgressPolicy, HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.evals.browser_acceptance import BrowserAcceptanceFaultScenario
 from cayu.evals.browser_acceptance_fixture import _fixture_address
@@ -31,7 +32,6 @@ from cayu.evals.internal.browser_acceptance import (
     _install_browser_crash_fault,
 )
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import SecretRedactor

@@ -13,33 +13,24 @@ import pytest
 from tests.core._execution_profile_fixtures import rebind_test_invocation
 
 import cayu.runtime._invocation_secrets as invocation_secrets
+import cayu.sessions.base as sessions_module
 from cayu._exception_groups import iter_exception_tree
-from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.events import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.base import BudgetLimit
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.events import (
+    Event,
+    EventType,
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import RunnerExecutionError, attach_cancellation_artifacts
-from cayu.runtime import (
-    AfterToolCallDecision,
-    BudgetLimit,
-    CayuApp,
-    InMemorySessionStore,
-    ModelPrice,
-    PriceBook,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    RuntimeHook,
-    Session,
-    SessionStatus,
-    ToolCallHookContext,
-)
+from cayu.messages import Message
+from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook, ToolCallHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners.base import RunnerExecutionError, attach_cancellation_artifacts
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _web_access_results as web_access_results
-from cayu.runtime import sessions as sessions_module
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._run_limits import RunLimitGate
@@ -61,18 +52,22 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
-from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
-from cayu.runtime.tool_exposure import (
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
+from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.tools._runner import sanitize_runner_failure_group
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
     unexposed_tool_result,
 )
-from cayu.runtime.tool_grants import (
+from cayu.tools.grants import (
     ResolvedTargetedToolInvocation,
     tool_reference_use_id,
 )
-from cayu.tools._runner import sanitize_runner_failure_group
 from cayu.tools.web import WebFetchTool
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
 
@@ -1553,7 +1548,7 @@ def test_closing_interrupted_round_observes_nested_stream_teardown(
 def test_outer_close_finishes_nested_tool_stream_before_return(monkeypatch, stop_event):
     from contextlib import aclosing
 
-    from cayu import ScriptedModelProvider
+    from cayu.evals.testing import ScriptedModelProvider
 
     async def scenario():
         app = CayuApp(enable_logging=False)

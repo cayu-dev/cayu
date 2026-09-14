@@ -13,46 +13,21 @@ import psycopg
 import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
+import cayu.applications as runtime_app_module
 import cayu.runtime._session_engine as session_engine_module
-import cayu.runtime.app as runtime_app_module
-from cayu import CayuConfig, ToolExecutionConfig
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ToolContext,
-    ToolResult,
-)
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.observability.hooks import (
     AfterToolCallDecision,
     BeforeToolCallDecision,
     BeforeToolCallHookContext,
-    CayuApp,
-    DispatchRequest,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    InterruptSessionRequest,
-    ResumeRequest,
-    RunRequest,
-    RuntimeBuildArtifactKind,
-    RuntimeBuildProvenance,
-    RuntimeBuildProvenanceOrigin,
     RuntimeHook,
-    SessionQuery,
-    SessionStatus,
-    TaskClaimLost,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-    TaskStoreDispatcher,
 )
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._durable_subagent_coordinator import DurableSubagentCoordinator
 from cayu.runtime._durable_subagents import (
     DurableSubagentAuthority,
@@ -70,26 +45,47 @@ from cayu.runtime._durable_subagents import (
     new_durable_subagent_submission_seed,
     require_durable_subagent_intent_matches_seed,
 )
-from cayu.runtime.dispatch import _queued_dispatch_request_sha256
-from cayu.runtime.tool_discovery import (
+from cayu.runtime.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    SessionQuery,
+    SessionStatus,
+)
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskClaimLost, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.dispatch import (
+    DispatchRequest,
+    TaskStoreDispatcher,
+    _queued_dispatch_request_sha256,
+)
+from cayu.tools.base import ToolContext, ToolResult
+from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryViewState,
 )
-from cayu.storage import (
-    PostgresSessionStore,
-    PostgresTaskStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-)
-from cayu.storage.migrations import SchemaMode
-from cayu.tools import (
+from cayu.tools.subagents import (
     SubagentExecutionMode,
     SubagentResultTool,
     SubagentSpec,
     SubagentTool,
     project_terminal_subagent_result,
 )
-from cayu.vaults import SecretRedactor, SecretRef, StaticVault
+from cayu.vaults.base import SecretRef
+from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.static import StaticVault
 
 _DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="tests:durable-subagent-tool",

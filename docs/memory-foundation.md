@@ -15,7 +15,7 @@ knowledge, transcript episodes, artifact-derived documents, and other typed
 sources, fuse them, select a bounded context contribution, and record exposure.
 
 The current `KnowledgeStore` is therefore one memory source. `SessionStore`
-transcript search is another. The WRRF types in `cayu.retrieval` are
+transcript search is another. The WRRF types in `cayu.memory.retrieval` are
 source-neutral and do not turn transcripts or artifacts into knowledge.
 
 ## Durable agent work context and recall checkpoints
@@ -537,7 +537,7 @@ for operations that explicitly publish it through this contract.
 ## Bounded public memory attribution
 
 `runtime_evidence(...)` projects receipts, context exposures, item links, and exposure
-lifecycle into the versioned `cayu.memory_attribution.v1` contract. Consumers do not
+lifecycle into the versioned `cayu.memory.attribution.v1` contract. Consumers do not
 scan raw events or the private store. `trajectory_from_session(...)` promotes the same
 typed section through a read-only path; it does not run application, provider, tool,
 environment, hook, or recovery behavior.

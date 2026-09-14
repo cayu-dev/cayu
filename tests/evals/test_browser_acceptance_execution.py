@@ -22,58 +22,40 @@ from urllib.parse import urlsplit
 import pytest
 import scripts.run_browser_acceptance as command
 
-from cayu import (
+from cayu._validation import freeze_json_value
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.browser_profiles import (
     AESGCMBrowserProfileKeyAuthority,
-    AgentSpec,
-    ApprovedEgressDestination,
-    BrowserEgressPolicy,
     BrowserProfileBinding,
     BrowserProfileCheckpointPolicy,
     BrowserProfileDestinationPolicy,
     BrowserProfileScope,
-    BudgetLimit,
-    BudgetReservation,
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    LocalArtifactStore,
-    Message,
-    ModelPrice,
-    PriceBook,
-    RunLimits,
-    RunRequest,
-    ScriptedModelProvider,
     SQLiteBrowserProfileStore,
-    Tool,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolResult,
-    ToolSpec,
-    VirtualEgressEnvironmentFactory,
-    WebBridge,
 )
-from cayu._validation import freeze_json_value
-from cayu.egress import (
-    EgressAuthorityCutoverStrategy,
-    EgressBinding,
-    HttpxUpstream,
-    RunnerFinalizationResult,
-    SandboxEgressAdapter,
-)
-from cayu.environments import (
+from cayu.budgets.base import BudgetLimit, BudgetReservation
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.egress.adapter import EgressBinding, RunnerFinalizationResult, SandboxEgressAdapter
+from cayu.egress.authority import EgressAuthorityCutoverStrategy
+from cayu.egress.broker import HttpxUpstream
+from cayu.egress.destinations import ApprovedEgressDestination
+from cayu.egress.policy import BrowserEgressPolicy
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionExecutableEvidence,
     ExecutionToolRequirementEvidence,
 )
-from cayu.evals import (
-    AssertionEvidenceView,
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals import browser_acceptance as acceptance_module
+from cayu.evals.assertions import SessionCompleted
+from cayu.evals.browser_acceptance import (
     BrowserAcceptanceCaseCategory,
     BrowserAcceptanceCaseV1,
     BrowserAcceptanceFaultScenario,
-    BrowserAcceptanceFixtureV1,
     BrowserAcceptanceLimitsV1,
     BrowserAcceptanceManifestV1,
     BrowserAcceptanceMode,
@@ -81,31 +63,35 @@ from cayu.evals import (
     BrowserAcceptanceSemanticOracle,
     BrowserAcceptanceState,
     BrowserAcceptanceTrialReceiptV1,
-    EvalCase,
-    EvalPlan,
-    EvalSuite,
-    EvaluationEvidencePolicySpec,
-    SessionCompleted,
-    deterministic_browser_acceptance_manifest,
     inspect_browser_acceptance_runtime_identity,
-    project_assertion_evidence_view,
     project_browser_acceptance_diagnostic,
     project_browser_acceptance_trial,
     run_browser_acceptance,
 )
-from cayu.evals import browser_acceptance as acceptance_module
-from cayu.evals.corpus import _content_revision
+from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
+from cayu.evals.browser_acceptance_manifests import deterministic_browser_acceptance_manifest
+from cayu.evals.corpus import EvaluationEvidencePolicySpec, _content_revision
+from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
 from cayu.evals.internal import browser_acceptance as internal_acceptance
 from cayu.evals.internal.browser_acceptance import build as build_internal_browser_acceptance
-from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.runners import (
-    PINNED_BROWSER_SESSION_WORKLOAD,
-    ExecCommand,
-    ExecResult,
-    Runner,
-    RunnerWorkloadAuthority,
-)
+from cayu.evals.runner import EvalCase, EvalPlan, EvalSuite
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelRequest, ModelStreamEvent
+from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerWorkloadAuthority
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime._event_projection import public_event_id, public_event_sequence
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import (
+    Tool,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolSpec,
+)
+from cayu.tools.webbridge import WebBridge
 
 
 class _ProtocolBrowserRunner(Runner):

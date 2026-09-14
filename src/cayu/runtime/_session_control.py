@@ -8,10 +8,10 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.core.events import Event, EventType, copy_event
+from cayu.events import Event, EventType, copy_event
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
-from cayu.runtime.sessions import EventOrder, EventQuery, SessionStatus, SessionStore
+from cayu.sessions.base import EventOrder, EventQuery, SessionStatus, SessionStore
 
 INTERRUPT_REQUESTED_SESSION_STATUSES = {
     SessionStatus.INTERRUPTING,

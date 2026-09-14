@@ -1900,7 +1900,7 @@ _INERT_METACLASS_BASE_IMPORTS = frozenset(
     {
         ("abc", "ABC"),
         ("cayu", "Tool"),
-        ("cayu.core.tools", "Tool"),
+        ("cayu.tools.base", "Tool"),
         ("pydantic", "BaseModel"),
         ("http.server", "ThreadingHTTPServer"),
         ("http.server", "BaseHTTPRequestHandler"),

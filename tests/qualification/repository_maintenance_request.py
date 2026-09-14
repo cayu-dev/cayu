@@ -4,7 +4,7 @@ import json
 
 from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 
-from cayu import CodingSettlementPolicy
+from cayu.coding_products import CodingSettlementPolicy
 
 
 def invalid_request() -> ValueError:

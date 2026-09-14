@@ -10,7 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import UTC, datetime
 
-from cayu.runtime.tasks import (
+from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
     Task,
     TaskClaimLost,
@@ -20,7 +20,7 @@ from cayu.runtime.tasks import (
     _ensure_can_transition,
     _task_cancellation_requested,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionProposal,

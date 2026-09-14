@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import SecretStr, ValidationError
 
-import cayu.runtime.sessions as sessions_module
+import cayu.sessions.base as sessions_module
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
@@ -30,99 +30,44 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
-from cayu import (
-    REDACTED_SECRET,
-    AgentSpec,
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
+from cayu.artifacts.base import (
+    ArtifactListResult,
+    ArtifactMetadata,
+    ArtifactReadResult,
     ArtifactScope,
-    BillingIdentity,
-    CayuApp,
-    CompletionResultResolverRef,
-    CompletionVerifierRef,
-    Environment,
+    ArtifactStore,
+)
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.base import InMemoryBudgetStore
+from cayu.budgets.billing import BillingIdentity
+from cayu.budgets.pricing import default_price_book
+from cayu.budgets.usage import CacheUsageMetrics, UsageMetrics
+from cayu.configuration import DEFAULT_MAX_STEPS
+from cayu.context.base import CheckpointCompactionContextPolicy, TranscriptDigestCompactor
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import WorkspaceBinding
+from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    EnvironmentLifecyclePolicy,
-    EnvironmentSpec,
-    InMemoryKnowledgeStore,
-    InMemoryTaskStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeRevisionConflict,
-    KnowledgeStatus,
-    LocalArtifactStore,
-    LocalWorkspace,
-    Message,
-    MessageRole,
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
-    SecretRedactor,
-    SQLiteSessionStore,
-    Task,
-    TaskCreate,
-    TaskRetryAttemptDisposition,
-    TaskRetryPolicy,
-    TaskRetrySettlementRequest,
-    TaskStatus,
-    TextPart,
-    ThinkingPart,
-    UserInputTool,
-    WorkContractDraft,
-    WorkCriterion,
-    WorkspaceBinding,
-    WorkspaceBranch,
-    WorkspaceBranchCapabilities,
-    WorkspaceBranchRequest,
-    default_price_book,
-    work_contract_from_draft,
 )
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
-from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
-from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
-from cayu.core.events import (
+from cayu.environments.lifecycle import EnvironmentLifecyclePolicy
+from cayu.events import (
     EVENT_ID_MAX_CHARS,
     Event,
     EventType,
     event_with_durable_sequence,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import FilePart, ProviderStatePart
-from cayu.providers import (
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    UsageDialect,
-    bedrock_billing_identity,
-    completed_bedrock_billing_identity,
-)
-from cayu.runtime import (
-    CheckpointCompactionContextPolicy,
-    Dispatcher,
-    DispatchHandle,
-    DispatchRequest,
-    DispatchStatus,
-    EventQuery,
-    EventRecord,
-    ForkSessionRequest,
-    InMemoryEventSink,
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    ModelTarget,
-    PendingActionIssue,
-    PendingActionIssueCode,
-    PendingActionListResult,
-    PendingActionQuery,
-    PersistedEventSideEffectStatus,
-    RecoveryExecutionRequest,
-    RecoveryPlan,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionListResult,
-    SessionStatus,
-    TerminalEventPublicationUncertain,
-    TranscriptDigestCompactor,
-)
+from cayu.exceptions import TerminalEventPublicationUncertain
+from cayu.messages import FilePart, Message, MessageRole, ProviderStatePart, TextPart, ThinkingPart
+from cayu.observability.events import InMemoryEventSink
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
+from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
@@ -132,14 +77,10 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
-from cayu.runtime.budgets import InMemoryBudgetStore
-from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
-from cayu.runtime.config import DEFAULT_MAX_STEPS
 from cayu.runtime.provider_operations import (
     PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES,
 )
-from cayu.runtime.sessions import run_request_with_runtime_generated_authority
-from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.server import (
     DashboardConfig,
     OpenAccess,
@@ -166,7 +107,61 @@ from cayu.server.sse import (
     SSE_REPLAY_PAGE_EVENTS,
     SSE_SEND_TIMEOUT_SECONDS,
 )
-from cayu.tools import ExecCommandTool
+from cayu.sessions.base import (
+    EventQuery,
+    EventRecord,
+    ForkSessionRequest,
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ModelTarget,
+    PendingActionIssue,
+    PendingActionIssueCode,
+    PendingActionListResult,
+    PendingActionQuery,
+    PersistedEventSideEffectStatus,
+    ResumeRequest,
+    RunRequest,
+    SessionIdentity,
+    SessionListResult,
+    SessionStatus,
+    run_request_with_runtime_generated_authority,
+)
+from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.sessions.recovery import RecoveryExecutionRequest, RecoveryPlan
+from cayu.storage.memory import (
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeRevisionConflict,
+    KnowledgeStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    Task,
+    TaskCreate,
+    TaskRetryAttemptDisposition,
+    TaskRetryPolicy,
+    TaskRetrySettlementRequest,
+    TaskStatus,
+)
+from cayu.tasks.contracts import (
+    CompletionResultResolverRef,
+    CompletionVerifierRef,
+    WorkContractDraft,
+    WorkCriterion,
+    work_contract_from_draft,
+)
+from cayu.tasks.dispatch import Dispatcher, DispatchHandle, DispatchRequest, DispatchStatus
+from cayu.tools.commands import ExecCommandTool
+from cayu.tools.user_input import UserInputTool
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
+from cayu.workspaces.branches import (
+    WorkspaceBranch,
+    WorkspaceBranchCapabilities,
+    WorkspaceBranchRequest,
+)
+from cayu.workspaces.local import LocalWorkspace
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
@@ -3968,7 +3963,7 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
         invocation_lifecycle_command_version = 1
 
         async def aggregate_usage(self, query):
-            from cayu.runtime.aggregates import UsageRollupStoreResult
+            from cayu.budgets.aggregates import UsageRollupStoreResult
 
             return UsageRollupStoreResult.model_validate({})
 
@@ -5721,7 +5716,7 @@ def test_server_pending_actions_returns_413_for_oversized_page() -> None:
 
         async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
             del checkpoint_root_guard
-            from cayu.runtime.sessions import PendingActionResultTooLarge
+            from cayu.sessions.base import PendingActionResultTooLarge
 
             raise PendingActionResultTooLarge(2 * 1024 * 1024)
 
@@ -8922,7 +8917,7 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
 
 
 def test_server_resolves_provider_operation_with_bounded_audited_request() -> None:
-    from cayu import ResolutionActorSource
+    from cayu.approvals.tools import ResolutionActorSource
 
     app = CayuApp()
 
@@ -9587,7 +9582,7 @@ def test_action_linkage_disambiguates_legacy_raw_values_from_public_aliases() ->
 
 
 def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> None:
-    from cayu import ResolutionActorSource
+    from cayu.approvals.tools import ResolutionActorSource
 
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -12147,7 +12142,7 @@ def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
 
 
 def _authorized_message_endpoint():
-    from cayu import SessionMessageAccessPolicy
+    from cayu.runtime.session_message_lifecycle import SessionMessageAccessPolicy
     from cayu.server import AuthContext
 
     class MessagePolicy(SessionMessageAccessPolicy):

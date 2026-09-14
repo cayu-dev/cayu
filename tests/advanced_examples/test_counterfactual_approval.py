@@ -6,7 +6,7 @@ from pathlib import Path
 from examples.counterfactual_approval.deployment import DeploymentState, DeployServiceTool
 from examples.counterfactual_approval.deterministic import run
 
-from cayu import ToolEffect
+from cayu.tools.base import ToolEffect
 
 
 def test_counterfactual_deployment_effect_matches_its_stable_receipt_contract(tmp_path) -> None:

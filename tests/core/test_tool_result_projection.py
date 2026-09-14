@@ -18,70 +18,64 @@ from tests.core.tool_result_projection_conformance import (
 )
 
 import cayu.artifacts.local as local_artifacts
-from cayu import (
-    MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES,
-    MAX_TOOL_RESULT_ARTIFACT_REFERENCE_BYTES,
-    MAX_TOOL_RESULT_PREVIEW_BYTES,
-    AgentSpec,
-    ArtifactExternalizingToolResultPolicy,
-    ArtifactStoreUnavailableError,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.base import ArtifactStoreUnavailableError
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.artifacts.settlement import (
     ArtifactWriteSettlementEvidence,
     ArtifactWriteSettlementFailureCode,
     ArtifactWriteSettlementObservation,
     ArtifactWriteSettlementPhase,
     ArtifactWriteSettlementStatus,
-    CayuApp,
-    CayuConfig,
-    Environment,
-    EnvironmentSpec,
-    Event,
-    EventRecord,
-    EventType,
-    LocalArtifactStore,
+    artifact_store_identity_sha256,
+    record_artifact_write_settlement,
+    register_artifact_write_operation,
+)
+from cayu.configuration import CayuConfig, ToolExecutionConfig
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType, event_with_runtime_nested_payload_authority
+from cayu.mcp.base import (
     McpInitializeResult,
     McpResourceResult,
     McpServerSpec,
     McpSession,
     McpToolDefinition,
     McpToolResult,
-    McpToolset,
-    Message,
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
-    ReadFileTool,
-    ResumeRequest,
-    RunRequest,
-    SQLiteSessionStore,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolExecutionConfig,
-    ToolResult,
-    ToolResultProjection,
-    ToolResultProjectionPolicy,
-    ToolResultProjectionRecord,
-    ToolResultProjectionRequest,
-    ToolResultProjectionStatus,
-    ToolSpec,
-    artifact_store_identity_sha256,
-    record_artifact_write_settlement,
-    register_artifact_write_operation,
 )
-from cayu.core.events import event_with_runtime_nested_payload_authority
-from cayu.runtime import (
+from cayu.mcp.tools import McpToolset
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+)
+from cayu.sessions.base import (
+    EventRecord,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionIdentity,
     SessionStatus,
 )
-from cayu.runtime.public_authority import (
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.files import ReadFileTool
+from cayu.tools.result_projection import (
+    MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES,
+    MAX_TOOL_RESULT_ARTIFACT_REFERENCE_BYTES,
+    MAX_TOOL_RESULT_PREVIEW_BYTES,
+    ArtifactExternalizingToolResultPolicy,
+    ToolResultProjection,
+    ToolResultProjectionPolicy,
+    ToolResultProjectionRecord,
+    ToolResultProjectionRequest,
+    ToolResultProjectionStatus,
 )
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 class _FakeProvider(ModelProvider):
@@ -1358,7 +1352,7 @@ def test_valid_projection_re_redacts_content_under_rotated_event_registry() -> N
 
 def test_blocked_projection_restores_reference_after_denial_postprocessing() -> None:
     from cayu.runtime._event_writer import prepare_runtime_event
-    from cayu.runtime.tool_result_projection import (
+    from cayu.tools.result_projection import (
         redact_tool_result_projection_content,
     )
 
@@ -1484,7 +1478,7 @@ def test_non_externalized_projection_resynchronizes_rotated_event_evidence(
 
 
 def test_application_artifact_cannot_claim_runtime_projection_ownership() -> None:
-    from cayu.core import MessageRole, ToolResultPart
+    from cayu.messages import MessageRole, ToolResultPart
     from cayu.runtime._message_redaction import (
         redact_runtime_message_for_boundary,
         redact_untrusted_message_for_boundary,
@@ -1536,7 +1530,7 @@ def test_application_artifact_cannot_claim_runtime_projection_ownership() -> Non
 
 
 def test_application_result_cannot_claim_runtime_execution_control_ownership() -> None:
-    from cayu.core import MessageRole, ToolResultPart
+    from cayu.messages import MessageRole, ToolResultPart
     from cayu.runtime._message_redaction import (
         redact_runtime_message_for_boundary,
         redact_untrusted_message_for_boundary,
@@ -1580,18 +1574,15 @@ def test_application_result_cannot_claim_runtime_execution_control_ownership() -
 def test_public_tool_result_cannot_claim_execution_controls_after_registry_rotation(
     result_source: str,
 ) -> None:
-    from cayu import (
-        AfterToolCallDecision,
-        BeforeToolCallDecision,
+    from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+    from cayu.observability.hooks import AfterToolCallDecision, BeforeToolCallDecision, RuntimeHook
+    from cayu.runtime.execution_profiles import (
         ExecutionProfileAdoptionIntent,
         ExecutionProfileAuthorityDecision,
         ExecutionProfilePolicy,
         ExecutionProfilePolicyAction,
         ExecutionProfilePolicyRequest,
         ExecutionProfilePolicyResult,
-        ResolutionActor,
-        ResolutionActorSource,
-        RuntimeHook,
     )
 
     class AdoptCurrentProfile(ExecutionProfilePolicy):
@@ -1763,7 +1754,7 @@ def test_public_tool_result_cannot_claim_execution_controls_after_registry_rotat
 
 
 def test_partial_hook_control_is_not_promoted_during_public_event_projection() -> None:
-    from cayu import AfterToolCallDecision, RuntimeHook
+    from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook
 
     secret = "application_partial_terminal_outcome"
     session_id = "sess_partial_hook_control"
@@ -1869,7 +1860,7 @@ def test_partial_recovery_control_survives_without_runtime_authority_overlay() -
 
 
 def test_partial_hook_control_cannot_poison_runtime_timeout_boundary() -> None:
-    from cayu import AfterToolCallDecision, RuntimeHook
+    from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook
 
     session_id = "sess_partial_hook_timeout_boundary"
     session_store = InMemorySessionStore()
@@ -1979,7 +1970,7 @@ def test_hook_result_is_sanitized_before_secondary_publication_failure(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from cayu import AfterToolCallDecision, BeforeToolCallDecision, RuntimeHook
+    from cayu.observability.hooks import AfterToolCallDecision, BeforeToolCallDecision, RuntimeHook
 
     class FailingHookPublicationStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
@@ -2112,7 +2103,7 @@ def test_hook_result_is_sanitized_before_secondary_publication_failure(
 
 
 def test_application_result_cannot_claim_web_access_control_ownership() -> None:
-    from cayu.core import MessageRole, ToolResultPart
+    from cayu.messages import MessageRole, ToolResultPart
     from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 
     secret = "application-web-control-secret"
@@ -2150,7 +2141,7 @@ def test_application_result_cannot_claim_web_access_control_ownership() -> None:
 
 
 def test_valid_projection_re_redacts_content_under_rotated_message_registry() -> None:
-    from cayu.core import MessageRole, ToolResultPart
+    from cayu.messages import MessageRole, ToolResultPart
     from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 
     secret = "rotated-message-secret"
@@ -2194,7 +2185,7 @@ def test_valid_projection_re_redacts_content_under_rotated_message_registry() ->
 
 
 def test_rotated_secret_expansion_keeps_projected_content_bounded() -> None:
-    from cayu.runtime.tool_result_projection import (
+    from cayu.tools.result_projection import (
         redact_tool_result_projection_content,
     )
 

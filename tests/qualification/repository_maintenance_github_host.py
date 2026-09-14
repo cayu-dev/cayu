@@ -9,8 +9,13 @@ from configuration.maintenance import (  # ty: ignore[unresolved-import]
 )
 from integrations.github import build_github_connector  # ty: ignore[unresolved-import]
 
-from cayu import GitHubCredentials, GitHubRepositoryConfig, github_connector_behavior_fingerprint
-from cayu.vaults import LocalEnvVault, SecretRef
+from cayu.delivery.github import (
+    GitHubCredentials,
+    GitHubRepositoryConfig,
+    github_connector_behavior_fingerprint,
+)
+from cayu.vaults.base import SecretRef
+from cayu.vaults.local_env import LocalEnvVault
 
 
 def configured_github_repository():

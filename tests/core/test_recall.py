@@ -10,14 +10,13 @@ from itertools import repeat
 import pytest
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.messages import Message
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.recall import (
+from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     TRANSCRIPT_LEXICAL_CHANNEL,
@@ -33,14 +32,15 @@ from cayu.recall import (
     RecallSourceUnavailable,
     TranscriptRecallSource,
 )
-from cayu.retrieval import (
+from cayu.memory.retrieval import (
     WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     RankedRetrievalChannel,
     RankedRetrievalHit,
     RetrievalCandidateIdentity,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.runtime.sessions import (
+from cayu.messages import Message
+from cayu.sessions.base import (
     MAX_SESSION_ID_BYTES,
     InMemorySessionStore,
     RunRequest,

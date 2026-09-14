@@ -16,74 +16,64 @@ from tests.core._execution_profile_fixtures import (
     rebind_test_invocation,
 )
 
-from cayu.core import (
-    AgentSpec,
-    Event,
-    EventType,
-    Message,
-    ToolResultPart,
+import cayu.sessions.base as sessions_module
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalRecoveryOutcome
+from cayu.approvals.user_input import (
+    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+    AmbiguousUserInputPauseAuthorityError,
+    UserInputPauseState,
+    UserInputRecoveryRequest,
+    UserInputResponse,
+    user_input_answer_request_digest,
+    user_input_resolution_request_digest,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    BudgetLimit,
-    BudgetPolicy,
-    CayuApp,
-    EventQuery,
+from cayu.budgets.base import BudgetLimit, BudgetPolicy
+from cayu.budgets.pricing import ModelPrice, PriceBook, default_price_book
+from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputStrategy
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolResultPart
+from cayu.observability.hooks import RuntimeHook, ToolCallHookContext
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
+from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    EventQuery,
     ForkSessionRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
-    RetryPolicy,
-    RunLimits,
     RunRequest,
-    RuntimeHook,
     Session,
     SessionRuntimePublicationConflict,
     SessionStatus,
-    StructuredOutputSpec,
-    StructuredOutputStrategy,
-    ToolApprovalRecoveryOutcome,
-    ToolCallHookContext,
-    ToolCapabilityCeiling,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolRoundIdentity,
-    UserInputRecoveryRequest,
-    UserInputResponse,
-    default_price_book,
 )
-from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime import sessions as sessions_module
-from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
-from cayu.runtime.checkpoints import (
+from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
     decode_runtime_checkpoint,
 )
-from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.execution_profiles import (
-    active_invocation_execution_profile_from_checkpoint,
-)
-from cayu.runtime.user_input import (
-    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
-    AmbiguousUserInputPauseAuthorityError,
-    UserInputPauseState,
-    user_input_answer_request_digest,
-    user_input_resolution_request_digest,
-)
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import SecretRedactor, StaticVault
+from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.static import StaticVault
 
 
 class _ScriptedProvider(ModelProvider):
@@ -1595,7 +1585,7 @@ def test_resolve_user_input_aclose_surfaces_precleanup_fence_release_failure() -
 
 
 def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
-    from cayu import ResolutionActor, ResolutionActorSource
+    from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 
     app, store = _build(
         [("call_1", "ask_user", {"question": "Which env?"})],
@@ -4457,8 +4447,8 @@ def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
 def test_recorded_round_outcomes_anchors_from_recovered_interrupted_event() -> None:
     # Direct round identity scopes retry evidence even when the awaiting event was
     # never durably appended after checkpoint publication.
+    from cayu.approvals.tools import PendingToolCallApproval
     from cayu.runtime._approval_support import recorded_round_tool_outcomes
-    from cayu.runtime.approvals import PendingToolCallApproval
 
     pending_calls = [PendingToolCallApproval(tool_call_id="call_1", tool_name="count")]
     model_step_id = f"mstep_{'1' * 32}"
@@ -4524,7 +4514,9 @@ async def _drain(stream: AsyncIterator[Event]) -> list[Event]:
 
 @pytest.mark.parametrize("missing_recorded_steps", [False, True])
 def test_sqlite_input_recovery_uses_recorded_config_after_restart(tmp_path, missing_recorded_steps):
-    from cayu import CayuConfig, ExecutionProfileBehaviorIdentity, RunDefaults, SQLiteSessionStore
+    from cayu.configuration import CayuConfig, RunDefaults
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+    from cayu.storage.sqlite import SQLiteSessionStore
 
     identity = ExecutionProfileBehaviorIdentity(
         name="tests:configured-input",

@@ -53,7 +53,22 @@ from cayu._validation import (
     require_durable_json_text,
     require_unicode_scalar_text,
 )
-from cayu.artifacts import (
+from cayu.approvals.review import (
+    HumanReviewContext,
+    HumanReviewDenied,
+    HumanReviewReference,
+    HumanReviewView,
+)
+from cayu.approvals.tools import (
+    ResolutionActor,
+    ResolutionActorSource,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+)
+from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
+from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactScope,
     ArtifactStore,
@@ -61,15 +76,26 @@ from cayu.artifacts import (
     InvalidArtifactIdError,
     copy_artifact_read_result,
 )
-from cayu.core.events import (
-    Event,
-    EventType,
-    event_durable_sequence,
-    event_id_is_runtime_generated,
-    event_with_runtime_payload_authority,
+from cayu.budgets.aggregates import (
+    UsageRollupInconsistent,
+    UsageRollupResultTooLarge,
+    UsageRollupStoreResult,
+    estimate_usage_rollup_cost,
+    estimate_usage_session_cost_breakdown,
 )
-from cayu.core.messages import Message, MessageRole
-from cayu.core.thinking import ThinkingConfig
+from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.budgets.pricing import (
+    CausalBudgetCostSummary,
+    PriceBook,
+    SessionCostSummary,
+)
+from cayu.budgets.usage import (
+    CausalBudgetUsageSummary,
+    SessionUsageSummary,
+)
+from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.context.structured_output import StructuredOutputSpec
+from cayu.context.thinking import ThinkingConfig
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
@@ -224,6 +250,15 @@ from cayu.evals.trajectory import (
     trajectory_from_session,
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
+from cayu.events import (
+    Event,
+    EventType,
+    event_durable_sequence,
+    event_id_is_runtime_generated,
+    event_with_runtime_payload_authority,
+)
+from cayu.exceptions import TerminalEventPublicationUncertain
+from cayu.messages import Message, MessageRole
 from cayu.project_control_plane import ResolvedProjectControlPlaneContext
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime._event_projection import (
@@ -232,48 +267,7 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
-from cayu.runtime.aggregates import (
-    UsageRollupInconsistent,
-    UsageRollupResultTooLarge,
-    UsageRollupStoreResult,
-    estimate_usage_rollup_cost,
-    estimate_usage_session_cost_breakdown,
-)
-from cayu.runtime.approvals import (
-    ResolutionActor,
-    ResolutionActorSource,
-    ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRecoveryRequest,
-    ToolApprovalRequest,
-)
-from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
-from cayu.runtime.checkpoints import CheckpointCompatibilityError
-from cayu.runtime.config import DEFAULT_MAX_STEPS, MAX_STEPS
-from cayu.runtime.costs import (
-    CausalBudgetCostSummary,
-    PriceBook,
-    SessionCostSummary,
-)
-from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
-from cayu.runtime.human_review import (
-    HumanReviewContext,
-    HumanReviewDenied,
-    HumanReviewReference,
-    HumanReviewView,
-)
-from cayu.runtime.interactions import (
-    INTERACTION_LIFECYCLE_EVENT_TYPES,
-    INTERACTION_TERMINAL_EVENT_TYPES,
-    InteractionSummaryEvidence,
-)
-from cayu.runtime.invocation import (
-    InvocationOrigin,
-    InvocationOriginTrust,
-    SessionExecutionSource,
-    TaskExecutionSource,
-)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -292,78 +286,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageSource,
 )
-from cayu.runtime.sessions import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
-    SESSION_MESSAGE_CONTENT_MAX_BYTES,
-    CompactSessionRequest,
-    EnqueueSessionMessageRequest,
-    EventOrder,
-    EventQuery,
-    EventRecord,
-    InterruptSessionRequest,
-    LabelSelectorOperator,
-    LabelSelectorRequirement,
-    ModelTarget,
-    PendingActionKind,
-    PendingActionQuery,
-    PendingActionRecord,
-    PendingActionResultTooLarge,
-    PendingActionSession,
-    ResumeRequest,
-    RunRequest,
-    Session,
-    SessionDebugState,
-    SessionMessageActionResult,
-    SessionMessageDeliveryMode,
-    SessionMessageInspection,
-    SessionOrder,
-    SessionOutcome,
-    SessionQuery,
-    SessionStatus,
-    SessionTopologyCycle,
-    SessionTopologyDepthExceeded,
-    SessionTopologyNode,
-    SessionTopologyQuery,
-    SessionTopologyStoreResult,
-    TerminalSessionEvidenceErrorCode,
-    TranscriptQuery,
-    UsageRollupQuery,
-    _with_runtime_resume_transport_metadata,
-    decode_session_cursor,
-    decode_session_topology_cursor,
-    run_request_with_runtime_generated_authority,
-    run_request_with_runtime_invocation,
-)
 from cayu.runtime.stop_policy import RunLimits
-from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tasks import (
-    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
-    Task,
-    TaskCreate,
-    TaskOrder,
-    TaskQuery,
-    TaskStatus,
-    TaskTopologyCycle,
-    TaskTopologyInconsistent,
-    TaskTopologyNode,
-    TaskTopologyQuery,
-    TaskTopologyStoreResult,
-    TaskTopologyTraversalLimitExceeded,
-    decode_task_topology_cursor,
-    task_create_with_runtime_invocation,
-)
-from cayu.runtime.tool_discovery import (
-    TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
-    ToolDiscoveryViewInconsistentError,
-    ToolDiscoveryViewInspection,
-    ToolDiscoveryViewNotEnabledError,
-)
-from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
-from cayu.runtime.usage import (
-    CausalBudgetUsageSummary,
-    SessionUsageSummary,
-)
-from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
@@ -502,18 +425,95 @@ from cayu.server.sse import (
     parse_last_event_id,
     sse_message_data_bytes,
 )
-from cayu.storage import (
+from cayu.sessions.base import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    SESSION_MESSAGE_CONTENT_MAX_BYTES,
+    CompactSessionRequest,
+    EnqueueSessionMessageRequest,
+    EventOrder,
+    EventQuery,
+    EventRecord,
+    InterruptSessionRequest,
+    LabelSelectorOperator,
+    LabelSelectorRequirement,
+    ModelTarget,
+    PendingActionKind,
+    PendingActionQuery,
+    PendingActionRecord,
+    PendingActionResultTooLarge,
+    PendingActionSession,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionDebugState,
+    SessionMessageActionResult,
+    SessionMessageDeliveryMode,
+    SessionMessageInspection,
+    SessionOrder,
+    SessionOutcome,
+    SessionQuery,
+    SessionStatus,
+    SessionTopologyCycle,
+    SessionTopologyDepthExceeded,
+    SessionTopologyNode,
+    SessionTopologyQuery,
+    SessionTopologyStoreResult,
+    TerminalSessionEvidenceErrorCode,
+    TranscriptQuery,
+    UsageRollupQuery,
+    _with_runtime_resume_transport_metadata,
+    decode_session_cursor,
+    decode_session_topology_cursor,
+    run_request_with_runtime_generated_authority,
+    run_request_with_runtime_invocation,
+)
+from cayu.sessions.checkpoints import CheckpointCompatibilityError
+from cayu.sessions.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+    InteractionSummaryEvidence,
+)
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    TaskExecutionSource,
+)
+from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+from cayu.storage.memory import (
     MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
     KnowledgeActivationConflict,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListItem,
     KnowledgeReviewApproval,
-    KnowledgeReviewWorkflow,
     KnowledgeRevisionConflict,
     KnowledgeVisibility,
 )
-from cayu.vaults import REDACTED_SECRET
+from cayu.tasks.base import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    Task,
+    TaskCreate,
+    TaskOrder,
+    TaskQuery,
+    TaskStatus,
+    TaskTopologyCycle,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+    TaskTopologyQuery,
+    TaskTopologyStoreResult,
+    TaskTopologyTraversalLimitExceeded,
+    decode_task_topology_cursor,
+    task_create_with_runtime_invocation,
+)
+from cayu.tools.discovery import (
+    TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    ToolDiscoveryViewInconsistentError,
+    ToolDiscoveryViewInspection,
+    ToolDiscoveryViewNotEnabledError,
+)
+from cayu.tools.rounds import ToolRoundRecoveryRequest
+from cayu.vaults.redaction import REDACTED_SECRET
 
 logger = logging.getLogger(__name__)
 
@@ -3213,8 +3213,10 @@ def _workspace_instruction_summary(value: Any) -> str | None:
 
 
 def _workspace_branch_capabilities(cayu_app: Any, value: Any) -> dict[str, Any]:
-    from cayu.workspaces import WorkspaceBranchCapabilities
-    from cayu.workspaces.branches import _copy_workspace_branch_capabilities
+    from cayu.workspaces.branches import (
+        WorkspaceBranchCapabilities,
+        _copy_workspace_branch_capabilities,
+    )
 
     inspect_capabilities = getattr(value, "branch_capabilities", None)
     if not callable(inspect_capabilities):
@@ -3248,8 +3250,10 @@ def _workspace_branch_capabilities(cayu_app: Any, value: Any) -> dict[str, Any]:
 
 
 def _workspace_branch_lifecycle(value: Any) -> dict[str, Any]:
-    from cayu.workspaces import WorkspaceBranchLifecycleSummary
-    from cayu.workspaces.branches import _copy_workspace_branch_lifecycle_summary
+    from cayu.workspaces.branches import (
+        WorkspaceBranchLifecycleSummary,
+        _copy_workspace_branch_lifecycle_summary,
+    )
 
     unavailable = WorkspaceBranchLifecycleSummary(
         attached_count=0,

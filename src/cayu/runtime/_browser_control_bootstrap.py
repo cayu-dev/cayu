@@ -16,9 +16,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.tools import ToolContext, _runtime_tool_invocation_authority
 from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
-from cayu.runtime.browser_control import BrowserControlAllocation, BrowserOperatorPurpose
+from cayu.tools.base import ToolContext, _runtime_tool_invocation_authority
+from cayu.tools.browser_control import BrowserControlAllocation, BrowserOperatorPurpose
 
 
 @dataclass(frozen=True, slots=True, repr=False)

@@ -25,24 +25,19 @@ from tests.core.verified_worker_fixtures import (
     verified_worker_store_factory as verified_worker_store_factory,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CompletionContinuationPolicy,
-    CompletionRejectionAction,
-    Message,
-    RunRequest,
-    TaskCreate,
-    TaskStatus,
-    VerifiedTaskWorker,
-)
-from cayu.runtime.sessions import copy_run_request
-from cayu.runtime.work_attempt_admission import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.messages import Message
+from cayu.runtime.verified_task_worker import VerifiedTaskWorker
+from cayu.sessions.base import RunRequest, copy_run_request
+from cayu.tasks.admission import (
     WorkAttemptAdmissionState,
     WorkAttemptExecutionEntryDisposition,
     WorkAttemptExecutionEntryRequest,
     require_work_attempt_execution_entry_result,
 )
+from cayu.tasks.base import TaskCreate, TaskStatus
+from cayu.tasks.contracts import CompletionContinuationPolicy, CompletionRejectionAction
 
 
 def _crash_prepared_expiry(

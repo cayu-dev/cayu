@@ -19,7 +19,7 @@ from cayu._validation import (
 )
 from cayu.environments.admission import ExecutionAdmissionDecision, ExecutionAdmissionError
 from cayu.failure_evidence import FailureEvidence, exception_evidence
-from cayu.proxies import (
+from cayu.proxies.base import (
     CredentialProxy,
     ProxyAuthorizationResult,
     copy_proxy_authorization_result,
@@ -27,14 +27,8 @@ from cayu.proxies import (
 from cayu.runners._cleanup import pop_runner_cancellation_failure
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.tools._redaction import InvocationRedactorSnapshot
-from cayu.vaults import (
-    ResolvedSecret,
-    SecretRedactor,
-    SecretRef,
-    Vault,
-    copy_resolved_secret,
-    copy_secret_ref,
-)
+from cayu.vaults.base import ResolvedSecret, SecretRef, Vault, copy_resolved_secret, copy_secret_ref
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.tools.webbridge import WebBridgeCredentialAuthority

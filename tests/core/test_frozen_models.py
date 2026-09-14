@@ -15,7 +15,7 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
-from cayu.core.messages import (
+from cayu.messages import (
     Message,
     MessageRole,
     ProviderStatePart,
@@ -27,8 +27,8 @@ from cayu.core.messages import (
     copy_message_part,
     detach_message,
 )
-from cayu.core.tools import ToolContext, ToolResult
 from cayu.runtime.retry_policy import RetryDecision, RetryPolicy, copy_retry_policy
+from cayu.tools.base import ToolContext, ToolResult
 
 
 def test_message_and_parts_reject_attribute_assignment() -> None:

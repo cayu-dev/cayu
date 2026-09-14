@@ -8,9 +8,9 @@ from contextlib import asynccontextmanager
 
 from cayu._exception_groups import exception_cause, exception_tree_contains, set_exception_cause
 from cayu._task_wait import capture_awaitable_outcome, unexpected_child_cancellation_error
-from cayu.core.events import Event
-from cayu.runtime.sessions import _SessionRunFenceContext
-from cayu.runtime.workspace_observation_recovery import (
+from cayu.events import Event
+from cayu.sessions.base import _SessionRunFenceContext
+from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,
 )

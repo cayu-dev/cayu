@@ -17,7 +17,7 @@ from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_
 from cayu.runtime._browser_control_model import browser_model_control_admission
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlConflict,
     BrowserControlPrincipal,

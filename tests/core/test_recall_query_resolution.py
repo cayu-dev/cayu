@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from cayu.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
-from cayu.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.memory.recall import KnowledgeRecallSource, RecallEngine, RecallSituation
+from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 
@@ -17,7 +17,7 @@ from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, Kn
         "New topic: taxes",
         "Atlas",
         "#1417",
-        "src/cayu/recall.py",
+        "src/cayu/memory/recall.py",
         "How should we configure deployment rollback safeguards?",
         "Météo demain ?",
         "明天天气\uff1f",
@@ -138,8 +138,8 @@ def test_generated_policy_binds_resolution_version(tmp_path):
 
 
 def test_capture_reports_clipping_and_skips_verbose_assistant():
-    from cayu.core.messages import Message
-    from cayu.runtime.memory_context import _recent_conversation
+    from cayu.memory.context import _recent_conversation
+    from cayu.messages import Message
 
     history = [
         Message.text("user", "rollback safeguards"),

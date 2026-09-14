@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from cayu.core import Event, EventType, ToolResult
-from cayu.runtime import _approval_support as approval_support
-from cayu.runtime import _resume_ledger as resume_ledger
-from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.approvals import (
+from cayu.approvals.tools import (
     PendingToolApproval,
     PendingToolCallApproval,
     ToolApprovalDecision,
 )
+from cayu.events import Event, EventType
+from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _resume_ledger as resume_ledger
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.tools.base import ToolResult
 
 
 def _identity() -> ToolRoundIdentity:

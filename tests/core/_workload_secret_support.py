@@ -7,21 +7,14 @@ from typing import cast
 
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
-from cayu.core import Event, ExecutionProfileBehaviorIdentity
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalRecoveryRequest, ToolApprovalRequest
+from cayu.events import Event
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import (
-    CayuApp,
-    ForkSessionRequest,
-    ResumeRequest,
-    RunRequest,
-    ToolApprovalRecoveryRequest,
-    ToolApprovalRequest,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-)
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import ForkSessionRequest, ResumeRequest, RunRequest
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 
 
 class FakeProvider(ModelProvider):

@@ -5,8 +5,8 @@ from uuid import uuid4
 
 import pytest
 
-import cayu.runtime.egress_authority_transitions as transition_module
-from cayu.core.events import Event, EventType
+import cayu.egress.transitions as transition_module
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.egress import (
     EgressAuthorityBindingIdentity,
     EgressAuthorityCutoverNeedsAttention,
@@ -25,19 +25,12 @@ from cayu.egress import (
     build_egress_authority_identity,
 )
 from cayu.egress.authority import _build_adapter_verified_egress_authority_cutover_receipt
-from cayu.environments.admission import ExecutionEnvironmentAuthority
-from cayu.runners.base import ExecCommand, ExecResult, Runner
-from cayu.runtime._event_projection import (
-    prepare_new_runtime_event,
-    project_persisted_runtime_event,
-)
-from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
-from cayu.runtime.egress import (
+from cayu.egress.runtime import (
     _EgressAuditBridge,
     _EgressAuthorityRevoker,
     _EgressManagedRunner,
 )
-from cayu.runtime.egress_authority_transitions import (
+from cayu.egress.transitions import (
     EgressAuthorityTransitionConflict,
     EgressAuthorityTransitionCoordinator,
     SessionCheckpointEgressAuthorityTransitionStore,
@@ -45,6 +38,13 @@ from cayu.runtime.egress_authority_transitions import (
     authorized_egress_authority_transition,
     egress_authority_owner_fingerprint,
     egress_authority_transition_events,
+)
+from cayu.environments.admission import ExecutionEnvironmentAuthority
+from cayu.events import Event, EventType
+from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.runtime._event_projection import (
+    prepare_new_runtime_event,
+    project_persisted_runtime_event,
 )
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAuthorityDecision,
@@ -57,7 +57,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_egress_authority_change,
     execution_profile_with_egress_authority,
 )
-from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import SecretRedactor, SecretRef, StaticVault
 

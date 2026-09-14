@@ -1033,7 +1033,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
         staged_by: str,
         evaluated_at: datetime,
     ) -> AgentRecallSubscriptionEvaluation:
-        from cayu.recall_processing import AgentRecallProcessingResult
+        from cayu.memory.processing import AgentRecallProcessingResult
 
         claim = copy_agent_recall_subscription_claim(claim)
         if type(result) is not AgentRecallProcessingResult:

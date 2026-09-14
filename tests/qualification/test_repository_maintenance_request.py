@@ -7,16 +7,14 @@ from dataclasses import replace
 
 import pytest
 
-from cayu import (
-    DockerImageIdentity,
-    InMemoryKnowledgeStore,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    LocalArtifactStore,
-    LocalWorkspace,
-)
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.cli.project import project_context
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.sessions.base import InMemorySessionStore
+from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.workspaces.local import LocalWorkspace
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository

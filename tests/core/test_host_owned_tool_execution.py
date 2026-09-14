@@ -13,9 +13,7 @@ from typing import Any
 
 import pytest
 
-from cayu import SQLiteSessionStore
-from cayu.core import AgentSpec, Event, EventType, Message, ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu import AgentSpec, Event, EventType, Message, SQLiteSessionStore, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -26,6 +24,7 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 
 
 @dataclass

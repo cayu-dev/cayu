@@ -27,7 +27,7 @@ from cayu import (
     load_knowledge_maintenance_governance_receipt,
     prepare_knowledge_maintenance_governance_request,
 )
-from cayu.knowledge_maintenance_governance import maintenance_decision_from_governance
+from cayu.knowledge.maintenance_governance import maintenance_decision_from_governance
 
 
 class MaintenanceGovernancePolicy:

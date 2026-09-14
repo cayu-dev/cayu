@@ -48,9 +48,10 @@ from cayu._validation import (
     revalidate_model_input,
 )
 from cayu.browser_profiles import BrowserProfileInspection, BrowserProfileStatus
+from cayu.budgets.pricing import PriceBook
+from cayu.budgets.usage import SessionUsageSummary
 from cayu.build_provenance import RuntimeBuildProvenance, current_runtime_build_provenance
-from cayu.core.events import EventType
-from cayu.egress import EgressAuthorityIdentity
+from cayu.egress.authority import EgressAuthorityIdentity
 from cayu.evals.browser_acceptance_authenticated import BrowserAcceptanceAuthenticatedConfigV1
 from cayu.evals.browser_acceptance_authentication import (
     BrowserAcceptanceAuthenticationCollector,
@@ -71,10 +72,9 @@ from cayu.evals.evidence import (
 from cayu.evals.models import EvalStatus, EvalTrialResult
 from cayu.evals.runner import EvalPlan, EvalSuite, _run_eval_suite, run_eval_suite
 from cayu.evals.testing import ScriptedModelProvider
-from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.browser_control import BrowserControlRecord, BrowserControlState
-from cayu.runtime.costs import PriceBook
-from cayu.runtime.usage import SessionUsageSummary
+from cayu.events import EventType
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.tools.browser_control import BrowserControlRecord, BrowserControlState
 from cayu.tools.browser_session import BrowserSessionTool
 from cayu.tools.browser_visual import VISUAL_FAILURE_CODES
 from cayu.tools.webbridge import WebBridge, WebBridgeProfileKind
@@ -932,8 +932,8 @@ async def _case_operator_evidence(
     if "required_operator_inputs" not in case.oracle_parameters:
         return None
     from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
-    from cayu.runtime.browser_control import BrowserControlCheckpoint
-    from cayu.runtime.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+    from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+    from cayu.tools.browser_control import BrowserControlCheckpoint
 
     session = None if trial.trajectory is None else trial.trajectory.session
     if session is None or trial.session_id is None or session.id != trial.session_id:
@@ -1868,7 +1868,7 @@ class BrowserAcceptanceScenarioExecutionV1:
     recovered_tool_calls: tuple[ToolCallEvidenceV1, ...] = ()
 
     def __post_init__(self) -> None:
-        from cayu.runtime.app import CayuApp
+        from cayu.applications import CayuApp
 
         if not isinstance(self.app, CayuApp):
             raise TypeError("scenario execution app must be a CayuApp.")
@@ -1965,7 +1965,7 @@ class BrowserAcceptancePlanV1:
         if type(self.case_bridges) is not tuple:
             raise TypeError("case_bridges must be an immutable tuple of case bindings.")
         case_ids = {case.id for case in self.eval_plan.suite.cases}
-        from cayu.runtime.app import CayuApp
+        from cayu.applications import CayuApp
 
         if type(self.case_apps) is not tuple:
             raise TypeError("case_apps must be an immutable tuple of case bindings.")

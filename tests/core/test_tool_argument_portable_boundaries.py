@@ -24,7 +24,7 @@ from cayu import (
     extract_durable_value_error,
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
-from cayu.testing import verify_tool_effect
+from cayu.testing.base import verify_tool_effect
 
 ArgumentBoundary = Literal[
     "before_decision",

@@ -9,18 +9,21 @@ from pydantic import SecretStr
 from tests.core._workload_secret_support import FakeProvider, collect_events
 
 from cayu import LocalArtifactStore, LocalWorkspace
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.artifacts import ArtifactStoreUnavailableError
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.events import EventType
+from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.tools._resources import (
     InvocationResourceReadError,
     invocation_artifact_store_handle,
     invocation_workspace_handle,
 )
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
 from cayu.workspaces import WorkspaceReadResult
 

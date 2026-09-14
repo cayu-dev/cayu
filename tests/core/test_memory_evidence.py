@@ -24,8 +24,8 @@ from cayu import (
     RetrievalCandidateIdentity,
     keyed_evidence_fingerprint,
 )
-from cayu.memory import _RecallOfferReason
-from cayu.memory_evidence import (
+from cayu.memory.base import _RecallOfferReason
+from cayu.memory.evidence import (
     MAX_MEMORY_EVIDENCE_SESSION_ID_BYTES,
     MAX_RECALL_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_RECALL_KNOWLEDGE_CHUNK_INDEX,
@@ -34,7 +34,7 @@ from cayu.memory_evidence import (
     decode_recall_evidence_cursor,
     encode_recall_evidence_cursor,
 )
-from cayu.runtime.sessions import MAX_SESSION_ID_BYTES
+from cayu.sessions.base import MAX_SESSION_ID_BYTES
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,

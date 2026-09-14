@@ -13,7 +13,6 @@ import pytest
 
 from cayu import FileAttachment, FileAttachmentKind, Message, ResolvedFileAttachment
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION
-from cayu.core.messages import FilePart, MessageRole, TextPart
 from cayu.evals.external import (
     EXTERNAL_PROCESS_PROTOCOL_VERSION,
     ExternalBodyReleaseV1,
@@ -32,6 +31,7 @@ from cayu.evals.external_container import (
     _DockerResult,
     external_container_environment_revision,
 )
+from cayu.messages import FilePart, MessageRole, TextPart
 from cayu.providers import ModelRequest
 from cayu.providers.operations import (
     ProviderOperationStartRecoveryRequest,

@@ -33,78 +33,57 @@ from tests.core.test_verified_work_contracts import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CompletionDecisionApplicationRequest,
-    CompletionResultResolutionRequest,
-    CompletionResultResolver,
-    CompletionResultResolverRequest,
-    CompletionVerificationClaimRequest,
-    Event,
-    EventType,
-    ForkSessionRequest,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
-    PostgresSessionStore,
-    ResumeRequest,
-    RunRequest,
-    SecretRedactor,
-    Session,
-    SessionIdentity,
-    SessionStatus,
-    SessionStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
-    Task,
-    TaskClaimLost,
-    TaskCompletionDecisionRequired,
-    TaskCreate,
-    TaskStatus,
-    TaskStore,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-    WorkAttemptClaimRenewalRequest,
-    WorkAttemptCreate,
-    WorkAttemptExecutionRequest,
-    WorkAttemptProposalRequest,
-    WorkAttemptRecoveryRequest,
-    WorkCompletionConflict,
-    WorkEvidenceReference,
-)
+import cayu.sessions.base as sessions_module
 from cayu._validation import canonical_durable_json_bytes
-from cayu.core.events import event_with_runtime_envelope_authority
-from cayu.runtime import (
-    CheckpointTransform,
-    DeferredInteractionInput,
-    EventQuery,
-    EventRecord,
-    EventSink,
-    InMemoryEventSink,
-    InteractionTransitionSpec,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.events import Event, EventType, event_with_runtime_envelope_authority
+from cayu.messages import Message
+from cayu.observability.events import EventSink, InMemoryEventSink
+from cayu.runtime._invocation_lifecycle import (
     ReleaseInvocationCommand,
     SettleInvocationCommand,
-)
-from cayu.runtime import sessions as sessions_module
-from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
 )
 from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.runtime.checkpoints import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+from cayu.runtime.completion_result_resolvers import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+    CompletionResultResolverRequest,
 )
-from cayu.runtime.config import CayuConfig, RunDefaults
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.work_attempt_admission import (
+from cayu.sessions.base import (
+    CheckpointTransform,
+    DeferredInteractionInput,
+    EventQuery,
+    EventRecord,
+    ForkSessionRequest,
+    InMemorySessionStore,
+    InteractionTransitionSpec,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionStatus,
+    SessionStore,
+)
+from cayu.sessions.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+)
+from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,
@@ -112,22 +91,41 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptAdmissionConflict,
     WorkAttemptAdmissionPrepare,
     WorkAttemptAdmissionState,
+    WorkAttemptClaimRenewalRequest,
     WorkAttemptExecutionClaim,
     WorkAttemptExecutionClaimLost,
     WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionRequest,
+    WorkAttemptProposalRequest,
     WorkAttemptRecoveryActivate,
+    WorkAttemptRecoveryRequest,
     WorkAttemptRecoveryRequired,
     work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.base import (
+    InMemoryTaskStore,
+    Task,
+    TaskClaimLost,
+    TaskCreate,
+    TaskStatus,
+    TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+)
+from cayu.tasks.contracts import (
     WORK_COMPLETION_DECISION_MAX_BYTES,
+    CompletionDecisionApplicationRequest,
     CompletionProposal,
     CompletionProposalCreate,
+    CompletionVerificationClaimRequest,
+    TaskCompletionDecisionRequired,
+    WorkAttemptCreate,
+    WorkCompletionConflict,
+    WorkEvidenceReference,
 )
-from cayu.storage import _sqlite_support as sqlite_support
-from cayu.storage.migrations import SchemaMode
+from cayu.vaults.redaction import SecretRedactor
 
 
 class _LoseFirstAdmissionPreparationAcknowledgement(InMemoryTaskStore):
@@ -1069,8 +1067,8 @@ def _prepare_request(
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_admission_run_semantics_are_durable_exact_authority(backend: str, tmp_path) -> None:
-    from cayu.runtime.work_attempt_admission import require_work_attempt_preparation_result
     from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
+    from cayu.tasks.admission import require_work_attempt_preparation_result
 
     async def scenario() -> None:
         store = (

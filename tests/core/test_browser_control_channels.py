@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from cayu.runtime._browser_control_channels import BrowserGuestChannels
-from cayu.runtime.browser_control import BrowserControlConflict
+from cayu.tools.browser_control import BrowserControlConflict
 
 
 def test_shutdown_retains_live_cleanup_until_positive_completion():

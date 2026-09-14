@@ -33,9 +33,9 @@ from cayu import (
     compare_eval_runs,
     run_eval_suite,
 )
+from cayu.budgets.usage import SessionUsageSummary, session_usage_summary_payload
 from cayu.evals import EvalAssertionResult, run_eval_case
 from cayu.providers import ModelStreamEvent
-from cayu.runtime.usage import SessionUsageSummary, session_usage_summary_payload
 
 
 def _app() -> CayuApp:

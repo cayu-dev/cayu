@@ -12,24 +12,20 @@ from uuid import uuid4
 import pytest
 
 import cayu.runners.docker as docker_module
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    DockerImageIdentity,
-    DockerRunner,
-    DockerWorkloadRestrictions,
-    Environment,
-    EnvironmentSpec,
-    EventType,
-    ExecCommand,
-    Message,
-    MicrosandboxRunner,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SearchTextTool,
-    ToolExecutableRequirement,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import ExecCommand
+from cayu.runners.docker import DockerRunner
+from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
+from cayu.runners.microsandbox import MicrosandboxRunner
+from cayu.sessions.base import RunRequest
+from cayu.tools.base import ToolExecutableRequirement
+from cayu.tools.search import SearchTextTool
 
 pytestmark = pytest.mark.process
 

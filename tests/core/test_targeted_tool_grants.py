@@ -15,58 +15,24 @@ import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
-from cayu import (
-    AgentSpec,
-    AlwaysRequireApprovalToolPolicy,
-    CayuApp,
-    CayuConfig,
-    Event,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    ForkSessionRequest,
-    InMemorySessionStore,
-    InMemoryTaskStore,
-    Message,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.approvals.user_input import UserInputResponse
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import RecentTurnsContextPolicy
+from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import (
+    ModelContextOverflowError,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
-    PostgresSessionStore,
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
-    RecentTurnsContextPolicy,
-    ResumeRequest,
-    RetryPolicy,
-    RunDefaults,
-    RunRequest,
-    SessionRunFenced,
-    StaticToolExposurePolicy,
-    StructuredOutputSpec,
-    TargetedToolGrant,
-    TargetedToolGrantInspection,
-    TargetedToolGrantRecord,
-    TargetedToolGrantStateSnapshot,
-    TargetedToolUseDisposition,
-    TargetedToolUseRejectionReason,
-    TargetedToolUseRequest,
-    TaskCreate,
-    Tool,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolContext,
-    ToolEffect,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-    ToolResult,
-    ToolSpec,
-    UserInputResponse,
-    UserInputTool,
 )
-from cayu.providers import (
-    ModelContextOverflowError,
-    ModelProviderError,
-    OpenAIProvider,
+from cayu.providers.openai import OpenAIProvider
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -75,16 +41,39 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.runtime.tool_gateway import (
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions.base import (
+    ForkSessionRequest,
+    InMemorySessionStore,
+    ResumeRequest,
+    RunRequest,
+    SessionRunFenced,
+)
+from cayu.storage.jsonl_export import export_sessions, import_sessions
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.tools.exposure import StaticToolExposurePolicy
+from cayu.tools.gateway import (
     TargetedToolGatewayGrant,
     TargetedToolGatewayProjection,
     gateway_lifecycle_matches_outer_call,
     validate_effective_tool_arguments,
 )
-from cayu.runtime.tool_grants import (
+from cayu.tools.grants import (
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     PreparedTargetedToolGrant,
+    TargetedToolGrant,
+    TargetedToolGrantInspection,
+    TargetedToolGrantRecord,
+    TargetedToolGrantStateSnapshot,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
     build_targeted_tool_grant_record,
     copy_targeted_tool_grant_record,
     targeted_tool_grant_event,
@@ -95,10 +84,15 @@ from cayu.runtime.tool_grants import (
     validate_targeted_tool_unresolved_rejection_evidence,
     validate_targeted_tool_use_rejection_evidence,
 )
-from cayu.storage import SQLiteSessionStore
-from cayu.storage.jsonl_export import export_sessions, import_sessions
-from cayu.storage.migrations import SchemaMode
-from cayu.vaults import SecretRedactor
+from cayu.tools.policy import (
+    AlwaysRequireApprovalToolPolicy,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
+from cayu.tools.user_input import UserInputTool
+from cayu.vaults.redaction import SecretRedactor
 
 
 class _Provider(ModelProvider):

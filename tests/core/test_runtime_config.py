@@ -6,25 +6,26 @@ import math
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import AgentSpec, Message, ThinkingConfig
-from cayu.evals.testing import ScriptedModelProvider
-from cayu.runtime import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.configuration import (
     DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     DEFAULT_MAX_PARALLEL_TOOL_CALLS,
     DEFAULT_MAX_STEPS,
     MAX_STEPS,
-    CayuApp,
     CayuConfig,
-    EffectiveRunConfiguration,
     EvalConfig,
-    RetryPolicy,
     RunDefaults,
-    RunLimits,
-    RunRequest,
     ToolExecutionConfig,
     copy_cayu_config,
 )
-from cayu.runtime.sessions import copy_run_request
+from cayu.context.thinking import ThinkingConfig
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.messages import Message
+from cayu.runtime.config_inspection import EffectiveRunConfiguration
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import RunRequest, copy_run_request
 
 
 def test_zero_configuration_uses_canonical_runtime_defaults() -> None:
@@ -170,7 +171,7 @@ def test_app_manifest_exposes_effective_config_ownership_and_source() -> None:
 
     assert configuration.values["run"]["max_steps"] == 96
     assert provenance["run.max_steps"].source == "application"
-    assert provenance["run.max_steps"].owner == "cayu.runtime.config.RunDefaults"
+    assert provenance["run.max_steps"].owner == "cayu.configuration.RunDefaults"
     assert provenance["run.limits"].source == "framework"
 
 
@@ -266,4 +267,4 @@ def test_eval_configuration_is_detached_and_inspectable() -> None:
     assert manifest.values["evals"]["max_concurrency"] == 100
     provenance = {item.path: item for item in manifest.provenance}
     assert provenance["evals.max_concurrency"].source == "application"
-    assert provenance["evals.max_concurrency"].owner == "cayu.runtime.config.EvalConfig"
+    assert provenance["evals.max_concurrency"].owner == "cayu.configuration.EvalConfig"

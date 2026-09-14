@@ -50,21 +50,38 @@ from tests.workspaces.test_durable_local_workspace_branches import (
     assert_durable_workspace_branch_store_conformance,
 )
 
-from cayu import CayuApp, ExecutionProfileComponentClass, LocalArtifactStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.core import Event, EventType, Message
-from cayu.providers import ProviderOperationStatus
-from cayu.runtime import (
+from cayu.applications import CayuApp
+from cayu.approvals.user_input import PendingUserInput
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.operations import ProviderOperationStatus
+from cayu.runtime._durable_operation_ownership import (
+    DurableOperationOwnership,
+    DurableOperationOwnershipAction,
+    DurableOperationOwnershipDisposition,
+    DurableOperationOwnershipResult,
+    DurableOperationOwnershipTransition,
+    transition_durable_operation_ownership,
+)
+from cayu.runtime.checks import check_manifest
+from cayu.runtime.execution_profiles import ExecutionProfileComponentClass
+from cayu.runtime.provider_operations import ProviderOperationResolutionAction
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+)
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
     EventOrder,
     EventQuery,
-    InvocationOriginClaim,
-    InvocationOriginTrust,
-    PendingUserInput,
-    RunLimits,
+    EventQueryResultTooLarge,
+    PendingActionKind,
+    PendingActionQuery,
     RunRequest,
     Session,
     SessionDebugState,
-    SessionExecutionSource,
     SessionIdentity,
     SessionLineageQuery,
     SessionOperationPublication,
@@ -75,27 +92,13 @@ from cayu.runtime import (
     SessionTopologyCycle,
     SessionTopologyQuery,
     TranscriptQuery,
-)
-from cayu.runtime._durable_operation_ownership import (
-    DurableOperationOwnership,
-    DurableOperationOwnershipAction,
-    DurableOperationOwnershipDisposition,
-    DurableOperationOwnershipResult,
-    DurableOperationOwnershipTransition,
-    transition_durable_operation_ownership,
-)
-from cayu.runtime.checks import check_manifest
-from cayu.runtime.provider_operations import ProviderOperationResolutionAction
-from cayu.runtime.public_authority import (
-    PublicAuthorityAliasCodec,
-    PublicAuthorityAliasKeyring,
-)
-from cayu.runtime.sessions import (
-    EventQueryResultTooLarge,
-    PendingActionKind,
-    PendingActionQuery,
     _McpManifestBaselineEvidenceInvalid,
     fork_session_invocation,
+)
+from cayu.sessions.invocation import (
+    InvocationOriginClaim,
+    InvocationOriginTrust,
+    SessionExecutionSource,
 )
 from cayu.support_bundles import (
     CollectorDisposition,
@@ -218,8 +221,8 @@ async def _truncate(dsn: str) -> None:
 
 
 def _new_store(dsn: str):
-    from cayu import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
 
     # Tests own a throwaway database and (re)create the schema each run.
     return PostgresSessionStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
@@ -230,8 +233,8 @@ def test_postgres_deferred_input_accepts_textual_jsonb_loader(postgres_dsn: str)
         from psycopg.types.json import set_json_loads
         from psycopg_pool import AsyncConnectionPool
 
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         await _truncate(postgres_dsn)
         source = Message.text("user", "textual JSONB remains supported")
@@ -302,7 +305,7 @@ async def _issue_targeted_grant_record(
     session_id: str,
     interaction_id: str,
 ):
-    from cayu.runtime.tool_grants import (
+    from cayu.tools.grants import (
         PreparedTargetedToolGrant,
         TargetedToolGrant,
         build_targeted_tool_grant_record,
@@ -485,8 +488,8 @@ def test_postgres_terminal_session_fails_closed_with_active_provider_operation(
 
 def test_postgres_budgeted_offline_provider_operation_recovery(postgres_dsn: str) -> None:
     async def ops(store) -> None:
-        from cayu import PostgresBudgetLedger
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresBudgetLedger
 
         ledger = PostgresBudgetLedger(
             postgres_dsn,
@@ -626,8 +629,8 @@ def test_postgres_public_authority_aliases_are_indexed_and_durable(
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         await _truncate(postgres_dsn)
         codec = _public_authority_codec()
@@ -869,8 +872,8 @@ def test_postgres_already_open_codec_less_writer_is_fenced_after_key_initializat
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         await _truncate(postgres_dsn)
         stale = PostgresSessionStore(
@@ -910,8 +913,8 @@ def test_postgres_public_authority_alias_startup_backfills_every_identity_source
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         await _truncate(postgres_dsn)
         session_id = "legacy-session"
@@ -993,8 +996,8 @@ def test_postgres_public_authority_rotation_backfills_targeted_references(
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         await _truncate(postgres_dsn)
         first_codec = _public_authority_codec(active_key_id="first", key_byte=41)
@@ -1056,8 +1059,8 @@ def test_postgres_targeted_grant_reads_reject_indexed_state_corruption(
     async def runner() -> None:
         import psycopg
 
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         await _truncate(postgres_dsn)
         codec = _public_authority_codec()
@@ -2100,8 +2103,8 @@ def test_postgres_session_store_uses_database_time_for_stalled_run_takeover(
     async def ops(store):
         import psycopg
 
-        from cayu import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
 
         session_id = "sess_pg_store_time_takeover"
         await store.create(

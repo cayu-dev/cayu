@@ -38,19 +38,15 @@ from cayu.runtime._task_store_operation_boundary import (
 )
 from cayu.runtime._verified_task_decision_coordinator import verified_task_operation_id
 from cayu.runtime.completion_verifiers import CompletionVerifierExecutionRequest
-from cayu.runtime.sessions import RunRequest, SessionStatus
-from cayu.runtime.tasks import (
-    Task,
-    TaskAggregateFilter,
-    TaskClaimLost,
-    TaskQuery,
-    TaskStatus,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
-    copy_task,
-    copy_task_query,
+from cayu.runtime.work_attempt_lifecycle import (
+    WorkAttemptLifecycleSettlement,
+    WorkAttemptPreparationHold,
+    WorkAttemptStopReason,
+    runtime_stop_reason_for_execution_stop,
+    work_attempt_admission_authority_sha256,
 )
-from cayu.runtime.work_attempt_admission import (
+from cayu.sessions.base import RunRequest, SessionStatus
+from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,
     WorkAttemptAdmission,
     WorkAttemptAdmissionConflict,
@@ -64,14 +60,18 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptRunRequest,
     require_work_attempt_admission_result,
 )
-from cayu.runtime.work_attempt_lifecycle import (
-    WorkAttemptLifecycleSettlement,
-    WorkAttemptPreparationHold,
-    WorkAttemptStopReason,
-    runtime_stop_reason_for_execution_stop,
-    work_attempt_admission_authority_sha256,
+from cayu.tasks.base import (
+    Task,
+    TaskAggregateFilter,
+    TaskClaimLost,
+    TaskQuery,
+    TaskStatus,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
+    copy_task,
+    copy_task_query,
 )
-from cayu.runtime.work_contracts import (
+from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionProposal,
     CompletionProposalCreate,
@@ -88,7 +88,7 @@ from cayu.runtime.work_contracts import (
 )
 
 if TYPE_CHECKING:
-    from cayu.runtime.app import CayuApp
+    from cayu.applications import CayuApp
 
 _T = TypeVar("_T")
 _VERIFIER_LEASE_SECONDS = 300

@@ -6,23 +6,23 @@ import json
 from hashlib import sha256
 from pathlib import Path
 
-from cayu.agent_bundle_containers import (
-    inspect_agent_bundle_container,
-    pack_agent_bundle,
-    unpack_agent_bundle_container,
-)
-from cayu.agent_bundles import (
-    AgentBundleCoordinator,
-    AgentBundleError,
-    AgentSnapshotProfile,
-    FileSystemAgentSnapshotObjectStore,
-)
-from cayu.agent_snapshots import (
+from cayu.snapshots.base import (
     AgentSnapshotAccess,
     AgentSnapshotRef,
     AgentSnapshotRetentionClass,
     AgentSnapshotSubject,
     SQLiteAgentSnapshotStore,
+)
+from cayu.snapshots.bundles import (
+    AgentBundleCoordinator,
+    AgentBundleError,
+    AgentSnapshotProfile,
+    FileSystemAgentSnapshotObjectStore,
+)
+from cayu.snapshots.containers import (
+    inspect_agent_bundle_container,
+    pack_agent_bundle,
+    unpack_agent_bundle_container,
 )
 
 _SUBJECT_DOCUMENT_MAX_BYTES = 64 * 1024

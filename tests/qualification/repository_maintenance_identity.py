@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, StrictStr, field_validator, model_validator
 
-from cayu import ExecutionDeadline
+from cayu.deadlines import ExecutionDeadline
 
 
 def _invalid() -> ValueError:

@@ -11,14 +11,15 @@ from tests.core.test_explicit_session_compaction import (
 )
 from tests.core.test_targeted_tool_grants import _codec
 
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime import (
-    CayuApp,
-    CheckpointCompactionContextPolicy,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.events import EventType
+from cayu.messages import Message
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import (
     CompactSessionRequest,
     InMemorySessionStore,
-    ModelCompactor,
     RunRequest,
     SessionIdentity,
     SessionStatus,

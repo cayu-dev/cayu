@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     from pydantic.config import ExtraValues
 
 from cayu._validation import require_clean_nonblank
-from cayu.runtime.sessions import SessionStatus
 from cayu.server.auth import BasicAuth
 from cayu.server.config import (
     DEFAULT_DASHBOARD_PATH,
@@ -62,6 +61,7 @@ from cayu.server.config import (
     ServerLifecycleConfig,
 )
 from cayu.server.contracts import SERVER_API_PREFIX
+from cayu.sessions.base import SessionStatus
 
 __all__ = [
     "CorsSettings",

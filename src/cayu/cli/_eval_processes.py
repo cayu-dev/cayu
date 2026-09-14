@@ -14,7 +14,6 @@ from pathlib import Path
 from uuid import uuid4
 
 from cayu.build_provenance import current_runtime_build_provenance
-from cayu.evals import EvalPlan, EvalRun, EvalSuite, eval_run_to_json
 from cayu.evals._admission import (
     LaunchAdmission,
     LaunchScheduling,
@@ -24,8 +23,9 @@ from cayu.evals._admission import (
 from cayu.evals._inspection_documents import write_process_document as _write_json
 from cayu.evals._process_progress import ProcessEvalProgress
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
-from cayu.evals.models import aggregate_eval_score, aggregate_eval_status
-from cayu.evals.runner import run_eval_suite, run_workflow_eval_suite
+from cayu.evals.models import EvalRun, aggregate_eval_score, aggregate_eval_status
+from cayu.evals.reporting import eval_run_to_json
+from cayu.evals.runner import EvalPlan, EvalSuite, run_eval_suite, run_workflow_eval_suite
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.runtime._process_workers import (
     ProcessWorkerCommand,

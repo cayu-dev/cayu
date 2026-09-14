@@ -45,6 +45,18 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "Workspace",
     "DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS",
     "MicrosandboxCleanupError",
+    "WorkspaceCheckpointError",
+    "WorkspaceCheckpointManifest",
+    "WorkspaceCheckpointPolicy",
+    "capture_workspace_checkpoint",
+    "load_workspace_checkpoint",
+    "pin_workspace_checkpoint",
+    "release_workspace_checkpoint",
+    "restore_workspace_checkpoint",
+    "ExecutionDeadline",
+    "ExecutionDeadlineExceeded",
+    "current_execution_deadline",
+    "execution_deadline_scope",
 )
 
 MANIFEST_TOP_LEVEL_EXPORTS = (
@@ -80,6 +92,20 @@ MANIFEST_RUNTIME_ONLY_EXPORTS = (
 def test_required_names_are_importable_from_top_level() -> None:
     for name in REQUIRED_TOP_LEVEL_EXPORTS:
         assert hasattr(cayu, name), f"cayu.{name} is not exported from the top level"
+
+
+def test_execution_deadline_exports_remain_discoverable_from_root_and_runtime() -> None:
+    from cayu import deadlines
+
+    for name in (
+        "ExecutionDeadline",
+        "ExecutionDeadlineExceeded",
+        "current_execution_deadline",
+        "execution_deadline_scope",
+    ):
+        for package in (cayu, cayu_runtime):
+            assert name in package.__all__
+            assert getattr(package, name) is getattr(deadlines, name)
 
 
 def test_verified_task_worker_exports_share_the_runtime_owner() -> None:
@@ -140,7 +166,7 @@ def test_manifest_api_keeps_structural_types_out_of_the_root_namespace() -> None
 def test_readme_recovery_snippet_imports_and_constructs() -> None:
     # The exact snippet printed in README.md (worker crash-recovery). It must run
     # verbatim as documented.
-    from cayu import IncompleteSessionsRecoveryRequest, SessionStatus
+    from cayu.sessions.base import IncompleteSessionsRecoveryRequest, SessionStatus
 
     request = IncompleteSessionsRecoveryRequest(statuses={SessionStatus.INTERRUPTING})
     assert SessionStatus.INTERRUPTING in request.statuses

@@ -14,9 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import (
-    CayuApp,
-    InMemoryTaskStore,
+from cayu.applications import CayuApp
+from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptCoordinator,
     LocalExecutionAttemptEffectOutcome,
     LocalExecutionAttemptLimits,
@@ -26,17 +25,15 @@ from cayu import (
     LocalExecutionAttemptStart,
     LocalExecutionEffectPolicy,
     LocalExecutionProcessIdentity,
-    SQLiteTaskStore,
-    TaskCreate,
     build_local_execution_attempt_authority,
-    local_execution_parent_death_containment_platform_candidate,
-)
-from cayu.runtime.local_execution_attempts import (
     local_execution_attempt_receipt_sha256,
     local_execution_boot_id,
     local_execution_host_identity,
+    local_execution_parent_death_containment_platform_candidate,
 )
-from cayu.vaults import SecretRedactor
+from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = [
     pytest.mark.process,

@@ -13,7 +13,7 @@ from cayu.runtime._cost_accounting import COST_EVENT_TYPES, CostGroupKey, cost_g
 
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-    from cayu.runtime.sessions import EventRecord
+    from cayu.sessions.base import EventRecord
 
 TimeEntry = tuple[datetime, int, CostGroupKey, "EventRecord"]
 

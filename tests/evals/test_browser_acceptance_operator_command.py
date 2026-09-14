@@ -19,7 +19,7 @@ from cayu.evals.internal.browser_acceptance_operator import (
     OperatorFixtureBinding,
     OperatorFixtureSetup,
 )
-from cayu.runtime.browser_control_config import BrowserControlConfig
+from cayu.tools.browser_control_config import BrowserControlConfig
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])

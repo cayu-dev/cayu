@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from cayu._knowledge_publication_owner import RetainedKnowledgePublicationOwner
+from cayu.knowledge._publication import RetainedKnowledgePublicationOwner
 
 _SHUTDOWN_PROGRAM = r"""
 import asyncio

@@ -6,31 +6,14 @@ from uuid import uuid4
 import pytest
 
 from cayu import EXECUTION_PROFILE_METADATA_KEY, SQLiteSessionStore
-from cayu.core import Event, EventType
-from cayu.core.events import event_with_runtime_envelope_authority
-from cayu.runtime import (
-    AdmitInvocationCommand,
-    CreateInvocationCommand,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileDecision,
-    ExecutionProfileDecisionKind,
-    InMemorySessionStore,
-    InteractionTransitionSpec,
-    ReleaseInvocationCommand,
-    ResolutionActor,
-    ResolutionActorSource,
-    RunRequest,
-    SessionIdentity,
-    SessionInvocationAdmission,
-    SessionRunFenced,
-    SessionStatus,
-    SessionStatusConflict,
-    SessionStore,
-    SettleInvocationCommand,
-    ToolCapabilityCeiling,
-)
+from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.events import Event, EventType, event_with_runtime_envelope_authority
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    CreateInvocationCommand,
+    ReleaseInvocationCommand,
+    SettleInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
     invocation_checkpoint_state_sha256,
 )
@@ -41,13 +24,28 @@ from cayu.runtime.build_provenance import (
 )
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
+    ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
     execution_profile_decision_payload,
 )
-from cayu.runtime.sessions import run_request_with_runtime_session_instance_authority
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    InteractionTransitionSpec,
+    RunRequest,
+    SessionIdentity,
+    SessionInvocationAdmission,
+    SessionRunFenced,
+    SessionStatus,
+    SessionStatusConflict,
+    SessionStore,
+    run_request_with_runtime_session_instance_authority,
+)
+from cayu.tools.exposure import ToolCapabilityCeiling
 
 
 def _profile(*, tool_name: str) -> ExecutionProfileIdentity:

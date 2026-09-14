@@ -22,12 +22,12 @@ import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.tools.browser_session as browser_session_module
-from cayu import (
-    TAINT_LABELS_METADATA_KEY,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.artifacts.base import ArtifactReadResult, ArtifactScope
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.browser_profiles import (
     AESGCMBrowserProfileKeyAuthority,
-    AgentSpec,
-    ArtifactReadResult,
-    ArtifactScope,
     BrowserProfileBinding,
     BrowserProfileCheckpointPolicy,
     BrowserProfileCookie,
@@ -38,36 +38,31 @@ from cayu import (
     BrowserProfileStorageEntry,
     BrowserProfileStore,
     BrowserProfileTerminalOutcome,
-    CayuApp,
-    Event,
-    EventType,
     InMemoryBrowserProfileStore,
-    LocalArtifactStore,
-    Message,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
     SQLiteBrowserProfileStore,
-    WebAccessEvidence,
-    WebAccessEvidenceSource,
-    WebAccessOutcome,
-    WebAccessSignal,
-    run_to_completion,
 )
-from cayu.core import ToolContext
-from cayu.core.tools import ToolResult, _bind_runtime_tool_invocation_authority
-from cayu.environments import (
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
 )
-from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD, ExecCommand, ExecResult
-from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError
-from cayu.runtime import SessionIdentity, SessionStatus
-from cayu.runtime.sessions import SessionOperationPublication
-from cayu.storage import SQLiteSessionStore
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelStreamEvent
+from cayu.runners.base import ExecCommand, ExecResult, RunnerExecutionError, RunnerUnavailableError
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.sessions.base import (
+    RunRequest,
+    SessionIdentity,
+    SessionOperationPublication,
+    SessionStatus,
+)
+from cayu.sessions.outcomes import run_to_completion
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools import _browser_guest
 from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools.base import ToolContext, ToolResult, _bind_runtime_tool_invocation_authority
 from cayu.tools.browser_session import (
     BrowserArtifactPayload,
     BrowserBackendFailure,
@@ -84,8 +79,15 @@ from cayu.tools.browser_session import (
     BrowserSessionBackend,
     BrowserSessionTool,
 )
-from cayu.tools.web_access import web_destination_fingerprint
-from cayu.vaults import SecretRedactor
+from cayu.tools.policy import TAINT_LABELS_METADATA_KEY
+from cayu.tools.web_access import (
+    WebAccessEvidence,
+    WebAccessEvidenceSource,
+    WebAccessOutcome,
+    WebAccessSignal,
+    web_destination_fingerprint,
+)
+from cayu.vaults.redaction import SecretRedactor
 
 _IDENTITY = BrowserBackendIdentity(
     backend="playwright",
@@ -1401,7 +1403,7 @@ def _durable_context(
     browser_control_epoch: Any | None = None,
     session_store: SQLiteSessionStore | None = None,
 ) -> ToolContext:
-    from cayu.core.tools import _RuntimeBrowserAllocationAuthority
+    from cayu.tools.base import _RuntimeBrowserAllocationAuthority
 
     ctx = _context(tmp_path, artifact_store=artifact_store).model_copy(
         update={
@@ -1467,7 +1469,7 @@ def _durable_context(
         return redacted
 
     async def control_admission(browser_session_id, operation):
-        from cayu.core.tools import _RuntimeBrowserControlAdmission
+        from cayu.tools.base import _RuntimeBrowserControlAdmission
 
         value = await browser_control_epoch(browser_session_id, operation)
         return _RuntimeBrowserControlAdmission(value) if type(value) is int else value
@@ -5874,7 +5876,7 @@ def test_browser_session_refuses_binary_artifacts_from_secret_bearing_runner(
     tmp_path: Path,
     operation: str,
 ) -> None:
-    from cayu import BrowserVisualPolicy
+    from cayu.tools.browser_visual import BrowserVisualPolicy
 
     class _SecretBearingRunner(_WireRunner):
         calls = 0
@@ -7214,7 +7216,7 @@ def test_browser_session_refuses_artifacts_when_secret_authority_appears_during_
     tmp_path: Path,
     operation: str,
 ) -> None:
-    from cayu import BrowserVisualPolicy
+    from cayu.tools.browser_visual import BrowserVisualPolicy
 
     class _Tracker:
         revision = 0

@@ -5,8 +5,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 
+from cayu.applications import CayuApp
 from cayu.artifacts import ArtifactScope
-from cayu.core.events import EventType
+from cayu.budgets.pricing import PriceBook, copy_price_book
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
     _MODEL_JUDGE_RESULT_METADATA_KEY,
@@ -66,8 +67,7 @@ from cayu.evals.models import (
     ProbeRequirements,
 )
 from cayu.evals.portable_evaluation import _evaluate_validated_assertion_spec
-from cayu.runtime.app import CayuApp
-from cayu.runtime.costs import PriceBook, copy_price_book
+from cayu.events import EventType
 from cayu.runtime.manifest import AppManifest
 
 MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 3

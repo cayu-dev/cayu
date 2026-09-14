@@ -23,8 +23,8 @@ from cayu.runtime._browser_control_publication import (
     BrowserControlFencePublication,
     BrowserControlPublication,
 )
-from cayu.runtime.browser_control import BrowserControlConflict, BrowserControlRecord
-from cayu.runtime.sessions import SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.tools.browser_control import BrowserControlConflict, BrowserControlRecord
 
 
 class BrowserControlPublicationPending(RuntimeError):

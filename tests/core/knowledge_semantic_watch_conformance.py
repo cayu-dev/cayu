@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import TypedDict
 
-from cayu.knowledge_semantic_watch import (
+from cayu.knowledge.semantic_watch import (
     KnowledgeSemanticWatchConfig,
     KnowledgeSemanticWatchConflict,
     KnowledgeSemanticWatchDecision,
@@ -12,13 +12,13 @@ from cayu.knowledge_semantic_watch import (
     KnowledgeSemanticWatchReceipt,
     KnowledgeSemanticWatchRequest,
 )
-from cayu.recall import (
+from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     KnowledgeRecallSource,
     RecallEngine,
 )
-from cayu.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.memory import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,

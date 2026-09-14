@@ -37,9 +37,9 @@ from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
-from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
 from cayu.server._browser_control_config import BrowserControlServerConfig
 from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
+from cayu.sessions.base import IncompleteSessionsRecoveryRequest, SessionStatus
 
 DEFAULT_SERVER_DEPLOYMENT_NAME = "development"
 DEFAULT_SERVER_TITLE = "Cayu"

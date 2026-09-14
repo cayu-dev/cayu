@@ -11,20 +11,21 @@ from pathlib import Path
 import pytest
 from tests.docker_toolchain import docker_toolchain_profile
 
-from cayu import (
+from cayu.environments.admission import ExecutionRequirements
+from cayu.environments.docker_coding import (
     DockerCodingEnvironmentFactory,
     DockerCodingWorkspaceBinding,
-    DockerImageIdentity,
+)
+from cayu.environments.factory import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
-    ExecCommand,
-    ExecutionRequirements,
-    ImmutableInputStore,
-    LocalWorkspace,
-    inspect_local_immutable_input,
 )
+from cayu.immutable_inputs import ImmutableInputStore, inspect_local_immutable_input
+from cayu.runners.base import ExecCommand
+from cayu.runners.docker_workload import DockerImageIdentity
+from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,

@@ -8,16 +8,14 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, SupportsIndex
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
-from cayu.environments import (
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionAdmissionDecision,
     ExecutionAdmissionError,
     ExecutionEnvironmentAuthority,
-    evaluate_execution_admission,
-)
-from cayu.environments.admission import (
     _copy_execution_admission_candidate,
     _structured_execution_refusal,
+    evaluate_execution_admission,
 )
 from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
@@ -28,13 +26,13 @@ from cayu.environments.factory import (
 )
 from cayu.runners.base import RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
     from cayu.runtime.execution_profiles import ExecutionProfileIdentity
-    from cayu.runtime.sessions import Session
+    from cayu.sessions.base import Session
 
 
 _ENVIRONMENT_EXPOSURE_AUTHORITY_TOKEN = object()
@@ -102,7 +100,7 @@ def expose_registered_environment(
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
     from cayu.runtime.execution_profiles import ExecutionProfileIdentity
-    from cayu.runtime.sessions import Session
+    from cayu.sessions.base import Session
 
     if type(registered_environment) is not runtime_records.RegisteredEnvironment:
         raise TypeError("registered_environment must be a RegisteredEnvironment.")
@@ -184,7 +182,7 @@ def _environment_exposure(
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
     from cayu.runtime.execution_profiles import ExecutionProfileIdentity
-    from cayu.runtime.sessions import Session
+    from cayu.sessions.base import Session
 
     if registered_environment is None:
         if invocation_context.registered_environment is not None:

@@ -8,7 +8,7 @@ import json
 import httpx
 import pytest
 
-from cayu import Message
+from cayu.messages import Message
 from cayu.providers.base import (
     ModelRequest,
     ModelStreamDeadlineError,
@@ -191,8 +191,13 @@ async def test_semantic_timing_separates_consumer_pause_and_resets(monkeypatch):
 
 @pytest.mark.anyio
 async def test_semantic_timing_survives_sqlite_readback(tmp_path):
-    from cayu import AgentSpec, CayuApp, EventType, RetryPolicy, RunRequest, SQLiteSessionStore
+    from cayu.agents import AgentSpec
+    from cayu.applications import CayuApp
+    from cayu.events import EventType
     from cayu.providers.base import ModelProvider
+    from cayu.runtime.retry_policy import RetryPolicy
+    from cayu.sessions.base import RunRequest
+    from cayu.storage.sqlite import SQLiteSessionStore
 
     class Provider(ModelProvider):
         name = "synthetic"

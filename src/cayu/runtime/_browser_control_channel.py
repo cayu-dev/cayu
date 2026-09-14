@@ -24,7 +24,7 @@ from cayu.runtime._browser_control_authorization import (
 from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
 from cayu.runtime._browser_control_input import PendingBrowserText, dispatch_browser_text
 from cayu.runtime._browser_control_pages import BrowserPageDescriptors, read_browser_pages
-from cayu.runtime.browser_control import (
+from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlConflict,
     BrowserControlIdentity,

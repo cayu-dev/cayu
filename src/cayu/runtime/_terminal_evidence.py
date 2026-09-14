@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu._validation import copy_durable_json_object, require_clean_nonblank
-from cayu.core.events import Event, EventType
+from cayu.events import Event, EventType
 
 TERMINAL_EVIDENCE_QUERY_LIMIT = 2
 SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = "session_run_operation_id"

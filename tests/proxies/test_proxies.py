@@ -11,8 +11,8 @@ from cayu import (
     ProxyAuthorizationResult,
     WebBridgeCredentialAuthority,
 )
-from cayu.core.tools import ToolContext
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
+from cayu.tools.base import ToolContext
 from cayu.vaults import SecretNotFound, SecretRef, StaticVault
 
 

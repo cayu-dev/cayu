@@ -8,14 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from cayu import (
-    CayuApp,
-    Environment,
-    EnvironmentSpec,
-    ExecutionProfileBehaviorIdentity,
-    LocalRunner,
-)
+from cayu.applications import CayuApp
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.runners import local
+from cayu.runners.local import LocalRunner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from tests.core.test_environment_allocation_recovery import _FakeRemoteFactory
 
 

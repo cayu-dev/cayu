@@ -6,16 +6,11 @@ from decimal import Decimal
 
 import pytest
 
-from cayu import (
-    Event,
-    EventType,
-    Message,
-    ModelPrice,
-    PriceBook,
-    RunRequest,
-    SessionIdentity,
-    TaskQuery,
-)
+from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.tasks.base import TaskQuery
 from tests.qualification.test_repository_maintenance_http import _A, _B, _BODY, _OP, client
 from tests.qualification.test_repository_maintenance_http import host as host
 from tests.qualification.test_repository_maintenance_request import consumer as consumer
@@ -269,7 +264,9 @@ def test_cost_captures_pricing_before_accounting_and_identifies_repricing(host, 
             )
 
             async def replace_policy(causal_id, captured, **kwargs):
-                app.budget_policy.limits[0].pricing = changed
+                replacement = app.budget_policy
+                replacement.limits[0].pricing = changed
+                app.budget_policy = replacement
                 assert captured is not changed
                 return await original(causal_id, captured, **kwargs)
 

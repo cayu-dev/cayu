@@ -13,63 +13,42 @@ import pytest
 
 import cayu.environments.admission as admission_module
 import cayu.runners.docker as docker_module
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
-    DockerCodingCommandAuthority,
-    DockerCodingToolchainProfile,
-    Environment,
-    EnvironmentFactory,
-    EnvironmentFactoryOperation,
-    EnvironmentFactoryReleaseAction,
-    EnvironmentFactoryRequest,
-    EnvironmentFactoryResult,
-    EnvironmentLifecyclePolicy,
-    EnvironmentSpec,
-    Event,
-    EventType,
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.configuration import CayuConfig, OperationsConfig
+from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionAdmissionError,
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionEnvironmentAuthority,
-    ExecutionProfileBehaviorIdentity,
     ExecutionRequirements,
     ExecutionToolRequirement,
-    InMemorySessionStore,
-    LocalRunner,
-    Message,
-    NamedCheck,
-    OperationsConfig,
-    PostgresSessionStore,
-    ProcessCommandPolicy,
-    ResumeRequest,
-    RunCheckTool,
-    RunCommandTool,
-    RunRequest,
-    SearchTextTool,
-    SQLiteSessionStore,
-    Tool,
-    ToolCapabilityCeiling,
-    ToolContext,
-    ToolExecutableRequirement,
-    ToolExecutionRequirement,
-    ToolResult,
-    ToolSpec,
-    Workspace,
-    WorkspaceSnapshot,
-    environment_lifecycle_transition_from_event,
 )
-from cayu.environments import BoundWorkspace, WorkspaceBinding
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding, WorkspaceSnapshot
+from cayu.environments.docker_toolchains import (
+    DockerCodingCommandAuthority,
+    DockerCodingToolchainProfile,
+)
 from cayu.environments.factory import (
+    EnvironmentFactory,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryReleaseAction,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     attach_environment_factory_cleanup_settlement_task,
     register_environment_factory_cleanup_retry,
 )
-from cayu.providers import (
-    ModelProvider,
-    ModelRequest,
-    ModelStreamEvent,
+from cayu.environments.lifecycle import (
+    EnvironmentLifecyclePolicy,
+    environment_lifecycle_transition_from_event,
+)
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -77,18 +56,35 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
 )
-from cayu.runners import (
+from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
-    DockerImageIdentity,
-    DockerRunner,
-    DockerWorkloadRestrictions,
     ExecCommand,
     ExecResult,
     Runner,
     RunnerExecutionAdmissionObserver,
 )
-from cayu.runtime import CheckpointCompactionContextPolicy, ModelCompactor
+from cayu.runners.docker import DockerRunner
+from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
+from cayu.runners.local import LocalRunner
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import (
+    Tool,
+    ToolContext,
+    ToolExecutableRequirement,
+    ToolExecutionRequirement,
+    ToolResult,
+    ToolSpec,
+)
+from cayu.tools.command_policy import ProcessCommandPolicy
+from cayu.tools.exposure import ToolCapabilityCeiling
+from cayu.tools.named_checks import NamedCheck, RunCheckTool
+from cayu.tools.search import SearchTextTool
+from cayu.tools.structured_commands import RunCommandTool
+from cayu.workspaces.base import Workspace
 
 _DOCKER_PROBE_COMPLETION_TOKEN = re.compile(r"cayu-admission-probe-complete-[0-9a-f]{32}")
 
@@ -1192,7 +1188,8 @@ def test_unobserved_remote_runner_fails_closed_only_for_required_dependencies(
 ):
     from types import SimpleNamespace
 
-    from cayu.runners import E2BRunner, LambdaMicroVMRunner
+    from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner
+    from cayu.runners.e2b import E2BRunner
 
     class PythonOnlyTool(Tool):
         spec = ToolSpec(name="python_only", input_schema={"type": "object"})
@@ -2201,7 +2198,7 @@ def test_expired_exposure_refuses_model_authored_tool_before_its_effect(
 ) -> None:
     from tests.core._workload_secret_support import RequireApprovalPolicy
 
-    from cayu.runtime.approvals import ToolApprovalDecision, ToolApprovalRequest
+    from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 
     storage_error_secret = "admission-storage-error-secret-canary"
 
@@ -4122,7 +4119,7 @@ def test_binding_failure_progress_preserves_real_caller_cancellation(
         assert releases == [EnvironmentFactoryReleaseAction.PRESERVE]
         assert provider.requests == []
         if release_fails:
-            from cayu.core.runtime_authority import SessionRunFenced
+            from cayu.runtime.authority import SessionRunFenced
 
             with pytest.raises(SessionRunFenced, match="previous invocation still owns"):
                 async for _event in app.resume(

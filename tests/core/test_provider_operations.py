@@ -8,24 +8,23 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from cayu import CayuConfig, RunDefaults
 from cayu._exception_groups import exception_cause, set_exception_cause
-from cayu.core import (
-    AgentSpec,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ThinkingConfig,
-    ToolCallPart,
-)
-from cayu.core.billing import BillingIdentity
-from cayu.core.events import Event
-from cayu.providers import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.budgets.billing import BillingIdentity
+from cayu.configuration import CayuConfig, RunDefaults
+from cayu.context.base import RecentTurnsContextPolicy
+from cayu.context.thinking import ThinkingConfig
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolCallPart
+from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProvider,
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+)
+from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationCancellationSupport,
     ProviderOperationConnection,
@@ -37,22 +36,6 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime import (
-    CayuApp,
-    EventQuery,
-    EventRecord,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    PersistedEventSideEffectClaim,
-    RecentTurnsContextPolicy,
-    RetryPolicy,
-    RunLimits,
-    RunRequest,
-    SessionIdentity,
-    SessionRunFenced,
-    SessionStatus,
-)
 from cayu.runtime._model_step_executor import (
     _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
     MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
@@ -63,6 +46,7 @@ from cayu.runtime._model_step_executor import (
     _raise_terminal_model_attempt_failure,
 )
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationAccountingStatus,
     ProviderOperationCancellationStatus,
@@ -70,9 +54,24 @@ from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
 )
-from cayu.runtime.sessions import ModelCompletionStageRequest, ModelCompletionStageResult
-from cayu.storage import SQLiteSessionStore
-from cayu.vaults import SecretRedactor
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions.base import (
+    EventQuery,
+    EventRecord,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    InterruptSessionRequest,
+    ModelCompletionStageRequest,
+    ModelCompletionStageResult,
+    PersistedEventSideEffectClaim,
+    RunRequest,
+    SessionIdentity,
+    SessionRunFenced,
+    SessionStatus,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.vaults.redaction import SecretRedactor
 
 
 class _ReconnectableAdapter(ProviderOperationAdapter):

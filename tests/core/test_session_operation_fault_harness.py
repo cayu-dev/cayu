@@ -29,10 +29,15 @@ from tests.core.session_operation_fault_conformance import (
     assert_session_operation_fault_conformance,
 )
 
-from cayu.core import Event, EventType
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
-from cayu.runtime.sessions import SessionOperationPublication, SessionStore
-from cayu.storage import SQLiteSessionStore
+from cayu.events import Event, EventType
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    SessionOperationPublication,
+    SessionStore,
+)
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 def _identity() -> SessionIdentity:

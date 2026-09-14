@@ -19,7 +19,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.providers import ChatCompletionsProvider
-from cayu.runtime import SessionStatus
+from cayu.sessions.base import SessionStatus
 from cayu.storage import SQLiteSessionStore
 
 

@@ -4,10 +4,10 @@ import pytest
 from tests.core.test_browser_control import operator_purpose
 from tests.core.test_browser_control_authorization import Policy
 
-from cayu.runtime.app import CayuApp
-from cayu.runtime.browser_control_config import BrowserControlConfig
-from cayu.runtime.sessions import InMemorySessionStore
+from cayu.applications import CayuApp
+from cayu.sessions.base import InMemorySessionStore
 from cayu.tools._browser_control_transport import BrowserControlTransportUnavailable
+from cayu.tools.browser_control_config import BrowserControlConfig
 
 
 def test_application_browser_control_owns_one_coordinator_and_service():

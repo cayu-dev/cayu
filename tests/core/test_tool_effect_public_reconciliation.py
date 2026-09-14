@@ -13,31 +13,9 @@ from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider, _tool_call_response
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    ExecutionProfileBehaviorIdentity,
-    Message,
-    ResumeRequest,
-    RunRequest,
-    RuntimeEvidenceRequest,
-    Tool,
-    ToolEffect,
-    ToolEffectConflict,
-    ToolResult,
-    ToolSpec,
-    runtime_evidence,
-)
-from cayu.core.tools import DurableToolRecoveryEvidence
-from cayu.environments import Environment, EnvironmentSpec
-from cayu.environments.factory import EnvironmentFactoryOperation
-from cayu.providers import ModelStreamEvent
-from cayu.runtime._event_projection import project_persisted_runtime_event
-from cayu.runtime._tool_effect_reconciliation import ToolEffectReconciliationTimeout
-from cayu.runtime._tool_effect_state import ToolEffectRecord
-from cayu.runtime.approvals import ToolApprovalDecision, ToolApprovalRequest
-from cayu.runtime.hooks import AfterToolCallDecision, RuntimeHook
-from cayu.runtime.human_review import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.review import (
     HumanReviewConflict,
     HumanReviewContext,
     HumanReviewDenied,
@@ -45,15 +23,29 @@ from cayu.runtime.human_review import (
     HumanReviewField,
     HumanReviewPolicy,
 )
+from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import EnvironmentFactoryOperation
+from cayu.messages import Message
+from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._event_projection import project_persisted_runtime_event
+from cayu.runtime._tool_effect_reconciliation import ToolEffectReconciliationTimeout
+from cayu.runtime._tool_effect_state import ToolEffectRecord
+from cayu.runtime.evidence import RuntimeEvidenceRequest, runtime_evidence
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.tool_effects import (
+    ToolEffectConflict,
     ToolEffectReceipt,
     ToolEffectReconciliationRegistration,
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
     tool_effect_receipt_digest,
 )
+from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import DurableToolRecoveryEvidence, Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -893,9 +885,11 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
             # fresh decision and must neither revalidate nor redispatch.
             app = build_app()
             if fault_phase == "validation-plan-repair":
-                from cayu import (
+                from cayu.sessions.base import (
                     IncompleteSessionRecoveryAction,
                     IncompleteSessionRecoveryRequest,
+                )
+                from cayu.sessions.recovery import (
                     RecoveryBlockerCode,
                     RecoveryPlanAction,
                     RecoveryPlanRequest,

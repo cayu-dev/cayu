@@ -7,8 +7,8 @@ from uuid import uuid4
 import pytest
 from tests.core.test_tool_effect_state import _event, _intent, _receipt, _terminal
 
-from cayu.runtime import InMemorySessionStore
 from cayu.runtime._tool_effect_state import ToolEffectConflict, ToolEffectStateOwner
+from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

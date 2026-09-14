@@ -5,54 +5,16 @@ from collections.abc import Callable
 
 import pytest
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    CayuConfig,
-    ChildSessionCompleted,
-    CorpusComparisonReason,
-    EvalCase,
-    EvalConfig,
-    EvalPlan,
-    EvalStatus,
-    EvalSuite,
-    ExecutionProfileBehaviorIdentity,
-    FinalOutputContains,
-    Message,
-    MessageRole,
-    ModelStreamEvent,
-    RunRequest,
-    ScriptedModelProvider,
-    SessionStore,
-    SQLiteSessionStore,
-    Tool,
-    ToolCalled,
-    ToolContext,
-    ToolResult,
-    ToolsCalledInOrder,
-    ToolSpec,
-    WorkflowBase,
-    WorkflowEvalExecution,
-    WorkflowEvalInstanceScope,
-    WorkflowEvalResult,
-    WorkflowEvalTarget,
-    WorkflowSpec,
-    compare_corpus_execution_results,
-    corpus_execution_result_from_json,
-    corpus_execution_result_to_json,
-    evaluate_assertions,
-    load_eval_run,
-    load_trajectory,
-    parallel,
-    render_corpus_execution_html,
-    render_html_report,
-    run_workflow_eval_suite,
-    step,
-    workflow_eval_trial_session_id,
-    write_eval_run_json,
-    write_trajectory_json,
-)
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
 from cayu.cli import main
+from cayu.configuration import CayuConfig, EvalConfig
+from cayu.evals.assertions import (
+    ChildSessionCompleted,
+    FinalOutputContains,
+    ToolCalled,
+    ToolsCalledInOrder,
+)
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -66,8 +28,49 @@ from cayu.evals.corpus import (
     ToolCalledAssertionSpec,
     TrialRequestSpec,
 )
-from cayu.evals.execution import _run_compiled_corpus_suite, compile_corpus_suite, run_corpus_suite
+from cayu.evals.execution import (
+    WorkflowEvalTarget,
+    _run_compiled_corpus_suite,
+    compile_corpus_suite,
+    run_corpus_suite,
+)
+from cayu.evals.execution_comparison import CorpusComparisonReason, compare_corpus_execution_results
+from cayu.evals.execution_reporting import (
+    corpus_execution_result_from_json,
+    corpus_execution_result_to_json,
+    render_corpus_execution_html,
+)
+from cayu.evals.models import EvalStatus
+from cayu.evals.reporting import (
+    load_eval_run,
+    load_trajectory,
+    render_html_report,
+    write_eval_run_json,
+    write_trajectory_json,
+)
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
+from cayu.evals.runner import (
+    EvalCase,
+    EvalPlan,
+    EvalSuite,
+    evaluate_assertions,
+    run_workflow_eval_suite,
+)
+from cayu.evals.testing import ScriptedModelProvider
+from cayu.evals.workflow_target import (
+    WorkflowEvalExecution,
+    WorkflowEvalInstanceScope,
+    WorkflowEvalResult,
+    workflow_eval_trial_session_id,
+)
+from cayu.messages import Message, MessageRole
+from cayu.providers.base import ModelStreamEvent
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions.base import RunRequest, SessionStore
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.workflows.base import WorkflowSpec
+from cayu.workflows.workflow import WorkflowBase, parallel, step
 
 _REVISION = "sha256:" + "1" * 64
 _SECOND_REVISION = "sha256:" + "2" * 64
@@ -579,8 +582,8 @@ def test_workflow_eval_runs_against_sqlite_session_store(tmp_path) -> None:
 def test_workflow_eval_runs_against_postgres_session_store(postgres_dsn) -> None:
     from tests.core.postgres_contention_support import drop_cayu_tables
 
-    from cayu import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
 
     async def run() -> None:
         await drop_cayu_tables(postgres_dsn)

@@ -3,16 +3,11 @@
 import asyncio
 import importlib
 
-from cayu import (
-    CodingProductArtifactRepository,
-    CodingProductRunner,
-    EventQuery,
-    EventType,
-    SessionStatus,
-    TaskQuery,
-    TaskStatus,
-    run_task_worker,
-)
+from cayu.coding_products import CodingProductArtifactRepository, CodingProductRunner
+from cayu.events import EventType
+from cayu.sessions.base import EventQuery, SessionStatus
+from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.worker import run_task_worker
 
 
 async def exercise_coding_worker(

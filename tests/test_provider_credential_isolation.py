@@ -10,8 +10,8 @@ from typing import Any
 import pytest
 
 from cayu import CayuApp
-from cayu.core.messages import Message
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.messages import Message
 from cayu.providers._http import (
     credential_safe_error_event,
     credential_safe_provider_exception,
@@ -35,7 +35,7 @@ from cayu.providers.openai_subscription import (
 from cayu.providers.vertex import VertexProvider
 from cayu.proxies import PassthroughProxy
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
-from cayu.testing import (
+from cayu.testing.base import (
     ProviderCredentialIsolationViolation,
     verify_provider_credential_isolation,
 )

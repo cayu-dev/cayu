@@ -38,8 +38,8 @@ from cayu import (
 )
 from cayu.evals.runner import final_output_text
 from cayu.providers import ModelProvider
-from cayu.runtime.tool_catalogue import build_tool_catalog_snapshot, build_tool_descriptor
-from cayu.runtime.tool_discovery import search_tool_descriptors
+from cayu.tools.catalogue import build_tool_catalog_snapshot, build_tool_descriptor
+from cayu.tools.discovery import search_tool_descriptors
 
 _PROVIDER_NAME = "tool-discovery-validation"
 _MODEL = "fixture-model"

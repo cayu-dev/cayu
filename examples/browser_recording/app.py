@@ -10,28 +10,26 @@ from pathlib import Path
 
 import uvicorn
 
-from cayu import (
-    AgentSpec,
-    ApprovedEgressDestination,
-    BrowserRecordingConfig,
-    BrowserRecordingPolicy,
-    BrowserRecordingStore,
-    BrowserSessionTool,
-    CayuApp,
-    EnvironmentSpec,
-    LocalArtifactStore,
-    SQLiteSessionStore,
-    ToolResultPart,
-)
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.egress import CapturedResponse, EgressUpstreamOperation, HttpEgressPolicy
+from cayu._browser_recording_store import BrowserRecordingStore
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.review import HumanReviewDisclosure, HumanReviewField, HumanReviewPolicy
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.browser_recording import BrowserRecordingConfig, BrowserRecordingPolicy
+from cayu.egress.broker import CapturedResponse, EgressUpstreamOperation
+from cayu.egress.destinations import ApprovedEgressDestination
 from cayu.egress.docker_adapter import DockerEgressAdapter
-from cayu.providers import ModelProvider, ModelStreamEvent
-from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
-from cayu.runtime.human_review import HumanReviewDisclosure, HumanReviewField, HumanReviewPolicy
+from cayu.egress.policy import HttpEgressPolicy
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
+from cayu.environments.base import EnvironmentSpec
+from cayu.messages import ToolResultPart
+from cayu.providers.base import ModelProvider, ModelStreamEvent
+from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.server import BasicAuth, DashboardConfig, ServerConfig, create_server
 from cayu.server.browser_recording import BrowserRecordingServer
+from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools.browser_session import BrowserSessionTool
 from cayu.tools.user_input import UserInputTool
 
 ROOT = Path(os.environ["CAYU_RECORDING_DEMO_STATE"])

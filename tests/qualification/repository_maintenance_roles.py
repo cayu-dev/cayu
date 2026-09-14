@@ -17,7 +17,8 @@ from operations.maintenance_github import (  # ty: ignore[unresolved-import]
 )
 from operations.maintenance_worker import handle_coding_task  # ty: ignore[unresolved-import]
 
-from cayu import TaskQuery, run_task_worker
+from cayu.tasks.base import TaskQuery
+from cayu.tasks.worker import run_task_worker
 from tests.qualification.repository_maintenance_deployment import bind_maintenance_deployment
 from tests.qualification.repository_maintenance_lifetime import (
     close_deployment,

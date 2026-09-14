@@ -20,25 +20,24 @@ from tests.core.test_human_review import (
     resolve,
 )
 
-from cayu import (
-    AgentSpec,
-    CayuApp,
-    EventType,
-    ExecutionProfileBehaviorIdentity,
-    IncompleteSessionRecoveryRequest,
-    SQLiteSessionStore,
-    ToolApprovalRecoveryOutcome,
-    ToolApprovalRecoveryRequest,
-    UserInputRecoveryRequest,
-    UserInputResponse,
-)
 from cayu._validation import canonical_durable_json_bytes
-from cayu.runtime.human_review import (
+from cayu.agents import AgentSpec
+from cayu.applications import CayuApp
+from cayu.approvals.review import (
     HumanReviewConflict,
     HumanReviewDenied,
     HumanReviewDisclosure,
     HumanReviewField,
 )
+from cayu.approvals.tools import ToolApprovalRecoveryOutcome, ToolApprovalRecoveryRequest
+from cayu.approvals.user_input import (
+    UserInputRecoveryRequest,
+    UserInputResponse,
+    user_input_answer_request_digest,
+    user_input_resolution_request_digest,
+)
+from cayu.events import EventType
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.tool_effects import (
     ToolEffectReceipt,
@@ -47,10 +46,8 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.runtime.user_input import (
-    user_input_answer_request_digest,
-    user_input_resolution_request_digest,
-)
+from cayu.sessions.base import IncompleteSessionRecoveryRequest
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
 
 

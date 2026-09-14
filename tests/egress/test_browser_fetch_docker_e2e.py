@@ -17,32 +17,28 @@ from typing import Any
 
 import pytest
 
-from cayu import (
-    ApprovedEgressDestination,
-    BrowserEgressPolicy,
-    BrowserPopupPolicy,
-    BrowserSessionTool,
-    BrowserWebFetchAdapter,
-    ExecCommand,
-    LocalArtifactStore,
-    ScreenshotPageTool,
-    ToolContext,
-    WebFetchTool,
-)
-from cayu.egress import (
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.egress.broker import (
     CapturedRequest,
     EgressUpstreamLimits,
     EgressUpstreamOperation,
     HttpxUpstream,
 )
+from cayu.egress.destinations import ApprovedEgressDestination
 from cayu.egress.docker_adapter import DockerEgressAdapter
-from cayu.environments import EnvironmentFactoryRequest
+from cayu.egress.policy import BrowserEgressPolicy
+from cayu.egress.runtime import VirtualEgressEnvironmentFactory
+from cayu.environments.factory import EnvironmentFactoryRequest
+from cayu.runners.base import ExecCommand
 from cayu.runners.docker import DockerRunner
 from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.egress import VirtualEgressEnvironmentFactory
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
-from cayu.vaults import SecretRedactor
+from cayu.tools.base import ToolContext
+from cayu.tools.browser import BrowserWebFetchAdapter, ScreenshotPageTool
+from cayu.tools.browser_session import BrowserPopupPolicy, BrowserSessionTool
+from cayu.tools.web import WebFetchTool
+from cayu.vaults.redaction import SecretRedactor
 
 _BROWSER_IMAGE = os.environ.get(
     "CAYU_BROWSER_FETCH_IMAGE",
