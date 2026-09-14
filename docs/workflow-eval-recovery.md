@@ -85,6 +85,14 @@ terminal reference. The trial remains an execution error with no final output,
 workflow completion anchor, retained successful output or score. Its assertions are
 unavailable and are not executed, including model-backed assertions.
 
+A typed `StepError` preserves its child's evidence, including the session, run epoch,
+terminal event, deadline phase, secondary failures and unknown settlement. A
+`ParallelStepError` adds `failure_evidence.branch_failures`: ordered, flat diagnostic
+snapshots for up to 16 branches. Nested fan-outs are flattened in submission order;
+omitted evidence sets `truncated=true`. The aggregate never adopts a parallel
+sibling's session as its sole identity. Missing branch evidence remains `unknown`.
+Exception prose and branch payloads are not copied into these snapshots.
+
 `failure_capture` preserves observations from the original store before the target's
 close callback. It never invokes a workflow, projector, provider, tool, judge or
 recovery operation. Capture has its own bounded read interval using the target's

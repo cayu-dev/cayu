@@ -466,3 +466,136 @@ def test_cli_failed_workflow_writes_inspectable_report(tmp_path, monkeypatch):
     assert trial.execution_status == "failed"
     assert trial.failure_capture.model_calls == 2
     assert trial.usage_summary["usage"]["total_tokens"] == 10
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 20])
+def test_typed_workflow_failures_survive_eval_report(tmp_path, count):
+    from cayu import (
+        ExecutionDeadline,
+        FailureEvidence,
+        ParallelStepError,
+        StepError,
+        load_eval_run,
+        write_eval_run_json,
+    )
+    from cayu.workflows.models import StepFailure
+
+    children = [
+        FailureEvidence(
+            classification="deadline" if i % 2 == 0 else "failure",
+            deadline=ExecutionDeadline.after(0, scope="child") if i % 2 == 0 else None,
+            deadline_phase="in_flight" if i % 2 == 0 else None,
+            session_id=f"child-{i}",
+            run_epoch=i + 1,
+            terminal_event_id=f"terminal-{i}",
+            secondary_failures=i == 1,
+        )
+        for i in range(max(1, count))
+    ]
+
+    class TypedFailure(WorkflowBase):
+        spec = WorkflowSpec(name="typed-failure")
+
+        async def run(self, session_id):
+            yield await self.context(session_id).start()
+            if count == 0:
+                raise StepError("private error", evidence=children[0])
+            raise ParallelStepError(
+                [
+                    StepFailure(error="private error", error_type="StepError", evidence=evidence)
+                    for evidence in children
+                ]
+            )
+
+    async def scenario():
+        app = _register_app([])
+        result = await run_workflow_eval_suite(_target(app, TypedFailure), _suite())
+        trial = result.cases[0].trials[0]
+        evidence = trial.failure_evidence
+        if count == 0:
+            assert evidence.classification == "deadline"
+            assert evidence.session_id == "child-0"
+            assert evidence.deadline == children[0].deadline
+            assert not evidence.secondary_failures
+        else:
+            assert evidence.session_id is None
+            assert len(evidence.branch_failures) == min(count, 16)
+            for observed, expected in zip(evidence.branch_failures, children, strict=False):
+                assert observed.model_dump() == expected.model_dump(exclude={"branch_failures"})
+            assert evidence.truncated == (count > 16)
+            assert evidence.secondary_failures == (count > 1)
+        assert evidence.settlement == "unknown"
+        assert "private error" not in evidence.model_dump_json()
+        path = tmp_path / "typed.json"
+        write_eval_run_json(result, path)
+        assert (
+            load_eval_run(path).cases[0].trials[0].failure_evidence.model_dump()
+            == evidence.model_dump()
+        )
+        assert not app.get_provider("scripted").requests
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("chain", ["none", "cause", "context"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_parallel_secondary_failures_survive_eval_report(tmp_path, chain, nested):
+    from cayu import (
+        ExecutionDeadline,
+        FailureEvidence,
+        ParallelStepError,
+        load_eval_run,
+        write_eval_run_json,
+    )
+    from cayu.failure_evidence import exception_evidence
+    from cayu.workflows.models import StepFailure
+
+    child = FailureEvidence(
+        classification="deadline",
+        deadline=ExecutionDeadline.after(0, scope="child"),
+        deadline_phase="in_flight",
+        session_id="child",
+        run_epoch=1,
+        terminal_event_id="terminal",
+    )
+    failure = ParallelStepError([StepFailure("private", "StepError", evidence=child)])
+    if nested:
+        failure = ParallelStepError(
+            [StepFailure("private", "ParallelStepError", evidence=exception_evidence(failure))]
+        )
+
+    class TypedFailure(WorkflowBase):
+        spec = WorkflowSpec(name="parallel-secondary")
+
+        async def run(self, session_id):
+            yield await self.context(session_id).start()
+            try:
+                raise failure
+            except ParallelStepError as exc:
+                if chain == "none":
+                    raise
+                if chain == "cause":
+                    raise RuntimeError("private additional failure") from exc
+                raise RuntimeError("private additional failure")  # noqa: B904 - test implicit context
+
+    async def scenario():
+        app = _register_app([])
+        result = await run_workflow_eval_suite(_target(app, TypedFailure), _suite())
+        evidence = result.cases[0].trials[0].failure_evidence
+        assert evidence.secondary_failures == (chain != "none")
+        assert evidence.session_id is None
+        assert evidence.settlement == "unknown"
+        assert len(evidence.branch_failures) == 1
+        assert evidence.branch_failures[0].session_id == "child"
+        assert not evidence.branch_failures[0].secondary_failures
+        assert evidence.branch_failures[0].deadline.model_dump() == child.deadline.model_dump()
+        assert "private" not in evidence.model_dump_json()
+        path = tmp_path / "parallel-secondary.json"
+        write_eval_run_json(result, path)
+        assert (
+            load_eval_run(path).cases[0].trials[0].failure_evidence.model_dump()
+            == evidence.model_dump()
+        )
+        assert not app.get_provider("scripted").requests
+
+    asyncio.run(scenario())

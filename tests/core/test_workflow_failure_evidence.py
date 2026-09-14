@@ -765,3 +765,57 @@ def test_native_retained_cleanup_is_uncertain_after_sqlite_replay(tmp_path, clea
             await store.close()
 
     asyncio.run(run())
+
+
+def test_typed_projection_preserves_unknown_nested_branches_and_secondary_failure():
+    from cayu.failure_evidence import exception_evidence
+    from cayu.workflows.models import StepFailure
+
+    unknown = exception_evidence(StepError("private"))
+    assert unknown.classification == "unknown"
+    assert unknown.session_id is None
+    deadline = FailureEvidence(
+        classification="deadline",
+        deadline=ExecutionDeadline.after(0),
+        deadline_phase="admission",
+        session_id="child",
+        run_epoch=2,
+        terminal_event_id="terminal",
+        exception_types=("ExecutionDeadlineExceeded",),
+    )
+    typed = StepError("private", evidence=deadline)
+    wrapper = RuntimeError("private wrapper failure")
+    wrapper.__cause__ = typed
+    observed = exception_evidence(wrapper)
+    assert observed.secondary_failures
+    assert observed.session_id == "child"
+    assert "ExecutionDeadlineExceeded" in observed.exception_types
+    inner = exception_evidence(
+        ParallelStepError(
+            [
+                StepFailure("private", "StepError", evidence=deadline),
+                StepFailure("private", "StepError"),
+            ]
+        )
+    )
+    outer = exception_evidence(
+        ParallelStepError(
+            [
+                StepFailure("private", "ParallelStepError", evidence=inner),
+                StepFailure("private", "StepError", evidence=deadline),
+            ]
+        )
+    )
+    assert outer.session_id is None
+    assert [branch.classification for branch in outer.branch_failures] == [
+        "deadline",
+        "unknown",
+        "deadline",
+    ]
+    assert all(branch.settlement == "unknown" for branch in outer.branch_failures)
+
+    class Untrusted(Exception):
+        evidence = deadline
+        failures = (StepFailure("private", "StepError", evidence=deadline),)
+
+    assert exception_evidence(Untrusted()).session_id is None
