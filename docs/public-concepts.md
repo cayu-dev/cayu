@@ -4,7 +4,13 @@ Import Cayu capabilities by the concept you are working with. The public
 packages own their implementations; the former flat and core/runtime module
 paths have been removed in this prerelease migration.
 
-Start with the runnable [application example](../examples/public_concepts/app.py):
+To build an application, start with the [canonical application
+example](../examples/application/README.md), which uses `cayu new` and the generated
+project structure. See [application anatomy](../src/cayu/guides/application-anatomy.md)
+for the factory and lifecycle contract.
+
+For a focused demonstration of the public imports below, see the
+[public-import demonstration](../examples/public_concepts/README.md):
 
 ```python
 from cayu.applications import CayuApp
@@ -17,8 +23,10 @@ from cayu.providers import ModelStreamEvent
 from cayu.evals import ScriptedModelProvider
 ```
 
-The example runs a real session locally with a deterministic provider. It needs
-no provider credentials. Run it with `uv run python -m examples.public_concepts.app`.
+The import demonstration runs a real session locally with a deterministic
+provider. It needs no provider credentials. Run it from the repository root with
+`uv run python -m examples.public_concepts.app`. Its single-file layout illustrates
+API imports; use the generated project above as the application authoring example.
 
 ## Source map
 

@@ -1,4 +1,8 @@
-# Public concepts in a working application
+# Public-import demonstration
+
+For the canonical application structure, start with the
+[`cayu new` application example](../application/README.md). This single-file
+demonstration focuses on public imports and runtime execution.
 
 [app.py](app.py) imports application composition, agents, messages, events,
 context policy, and session state from their named public modules. It runs the

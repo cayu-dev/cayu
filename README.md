@@ -1,7 +1,7 @@
 # Cayu
 
 [Find public concepts](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md) ·
-[Run the example](https://github.com/cayu-dev/cayu/blob/main/examples/public_concepts/README.md)
+[Run the example](https://github.com/cayu-dev/cayu/blob/main/examples/application/README.md)
 
 Cayu is a production agent runtime for building and operating AI agents in
 Python.
