@@ -482,6 +482,8 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.cleanup import (
+    RecoveryCleanupOwner,
+    RecoveryCleanupSessionSnapshot,
     RecoveryCleanupSupervisor,
     RecoveryCleanupSupervisorSnapshot,
     copy_recovery_cleanup_policy,
@@ -2080,6 +2082,29 @@ class CayuApp:
         """Return content-free process-local cleanup supervision state."""
 
         return self._recovery_cleanup_supervisor.snapshot()
+
+    def session_recovery_cleanup_status(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str,
+        run_epoch: int,
+    ) -> RecoveryCleanupSessionSnapshot:
+        """Inspect exact local run cleanup; this does not authorize recovery or prove settlement."""
+        return self._recovery_cleanup_supervisor.session_snapshot(
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            run_epoch=run_epoch,
+        )
+
+    async def drain_session_recovery_cleanups(
+        self,
+        owner: RecoveryCleanupOwner,
+        *,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Await only an observed local owner. New work and remote effects remain independent."""
+        return await self._recovery_cleanup_supervisor.drain_session(owner, timeout_s=timeout_s)
 
     def tool_terminal_publication_status(self) -> ToolTerminalPublicationMetricsSnapshot:
         """Return content-free staged-terminal backlog and fairness measurements."""

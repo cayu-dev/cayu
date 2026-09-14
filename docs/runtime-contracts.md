@@ -3597,6 +3597,33 @@ grace deadline instead of treating its first task snapshot as final. A retained
 owner that later settles with failure increments `failed_after_timeout` and is
 logged by operation and error type without exposing the exception message.
 
+For one exact invocation, use `app.session_recovery_cleanup_status(session_id=...,
+session_instance_id=..., run_epoch=...)`, taking the incarnation and epoch from
+the admitted `Session`. Its immutable `RecoveryCleanupSessionSnapshot` includes
+an exact `RecoveryCleanupOwner`, active/retained counts, and task observations
+with `active`, `retained`, `completed`, or `failed` status. The global snapshot
+also exposes these task observations. One task can execute a sequential cleanup
+group; its operation names the group's first step, and any failed step makes
+the completed task observation failed.
+
+`await app.drain_session_recovery_cleanups(snapshot.owner, timeout_s=10)` waits
+only for that process's exact session incarnation and run, including retained
+successors. It does not cancel sibling work or drain the whole application.
+A handle from another supervisor or a restarted process is rejected. A successful
+scoped drain means only that the current local supervisor has no remaining
+matching tasks at that instant; it neither prevents new work nor proves durable
+or remote effect settlement. Keep using the typed recovery plan and existing
+admission gates for those decisions.
+
+Completed/failed observation history retains at most 256 tasks application-wide;
+`history_truncated` reports eviction. Pending observations are bounded by the
+supervisor's admission capacity. `unattributed_tasks` counts currently supervised
+work that has no admitted session identity and therefore cannot be assigned to
+this child. An empty history, zero local counts, or a fresh process does not
+prove prior cleanup succeeded: `cross_process_settlement` remains `unknown`.
+Previously returned snapshots never change after late completion. Observations
+contain identifiers, operation labels, and status only, without exception data.
+
 The typed publication-uncertainty error above is the public
 `TerminalEventPublicationUncertain` contract. “Preserving the run-operation
 marker” means preserving any existing marker: initial runs intentionally have

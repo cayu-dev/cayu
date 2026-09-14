@@ -577,6 +577,10 @@ class SessionModelCompletionStageIncomplete(RuntimeError):
     """A logical model step was prepared but has no durable terminal completion."""
 
 
+_SESSION_CLEANUP_IDENTITIES: ContextVar[dict[str, tuple[str, int]] | None] = ContextVar(
+    "cayu_session_cleanup_identities",
+    default=None,
+)
 _SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
     "cayu_session_run_fence",
     default=None,
@@ -864,6 +868,7 @@ class _SessionRunFenceContext:
     """Carry one stream's task-local runtime ownership across task boundaries."""
 
     def __init__(self) -> None:
+        self._cleanup_identities = _SESSION_CLEANUP_IDENTITIES.get()
         fences = _SESSION_RUN_FENCES.get()
         self._fences = None if fences is None else dict(fences)
         fence_owners = _SESSION_RUN_FENCE_OWNERS.get()
@@ -914,6 +919,7 @@ class _SessionRunFenceContext:
             return
         fences = None if self._fences is None else dict(self._fences)
         fence_token = _SESSION_RUN_FENCES.set(fences)
+        cleanup_identity_token = _SESSION_CLEANUP_IDENTITIES.set(self._cleanup_identities)
         fence_owners = None if self._fence_owners is None else dict(self._fence_owners)
         fence_owner_token = _SESSION_RUN_FENCE_OWNERS.set(fence_owners)
         interaction_ids = None if self._interaction_ids is None else dict(self._interaction_ids)
@@ -956,6 +962,7 @@ class _SessionRunFenceContext:
         try:
             yield
         finally:
+            self._cleanup_identities = _SESSION_CLEANUP_IDENTITIES.get()
             current = _SESSION_RUN_FENCES.get()
             self._fences = None if current is None else dict(current)
             current_fence_owners = _SESSION_RUN_FENCE_OWNERS.get()
@@ -1009,15 +1016,19 @@ class _SessionRunFenceContext:
             _SESSION_INTERACTION_STARTED_AT.reset(interaction_started_at_token)
             _SESSION_INTERACTION_IDS.reset(interaction_id_token)
             _SESSION_RUN_FENCE_OWNERS.reset(fence_owner_token)
+            _SESSION_CLEANUP_IDENTITIES.reset(cleanup_identity_token)
             _SESSION_RUN_FENCES.reset(fence_token)
 
 
 class _SessionRunFenceOwnership:
     """One transferable, exactly retired process-local run-fence owner."""
 
-    __slots__ = ("_retired", "run_epoch", "session_id")
+    __slots__ = ("_retired", "run_epoch", "session_id", "session_instance_id")
 
-    def __init__(self, *, session_id: str, run_epoch: int) -> None:
+    def __init__(
+        self, *, session_id: str, run_epoch: int, session_instance_id: str | None = None
+    ) -> None:
+        self.session_instance_id = session_instance_id
         self.session_id = session_id
         self.run_epoch = run_epoch
         self._retired = False
@@ -1036,10 +1047,16 @@ class _SessionRunFenceOwnership:
         owners = _SESSION_RUN_FENCE_OWNERS.get()
         current_owner = None if owners is None else owners.get(self.session_id)
         current_epoch = None if fences is None else fences.get(self.session_id)
-        if current_owner is self and current_epoch == self.run_epoch:
+        if (
+            current_owner is self
+            and current_epoch == self.run_epoch
+            and fences is not None
+            and next(reversed(fences)) == self.session_id
+        ):
             yield
             return
         updated_fences = dict(fences or {})
+        updated_fences.pop(self.session_id, None)
         updated_fences[self.session_id] = self.run_epoch
         fence_token = _SESSION_RUN_FENCES.set(updated_fences)
         updated_owners = dict(owners or {})
@@ -1099,7 +1116,12 @@ def _current_session_run_epoch(session_id: str) -> int | None:
 
 
 def _activate_session_run_fence(session: Session) -> None:
+    identities = dict(_SESSION_CLEANUP_IDENTITIES.get() or {})
+    identities.pop(session.id, None)
+    identities[session.id] = (session.instance_id, session.run_epoch)
+    _SESSION_CLEANUP_IDENTITIES.set(identities)
     fences = dict(_SESSION_RUN_FENCES.get() or {})
+    fences.pop(session.id, None)
     fences[session.id] = session.run_epoch
     _SESSION_RUN_FENCES.set(fences)
     owners = _SESSION_RUN_FENCE_OWNERS.get()
@@ -1114,6 +1136,7 @@ def _activate_owned_session_run_fence(session: Session) -> _SessionRunFenceOwner
     ownership = _SessionRunFenceOwnership(
         session_id=session.id,
         run_epoch=session.run_epoch,
+        session_instance_id=session.instance_id,
     )
     owners = dict(_SESSION_RUN_FENCE_OWNERS.get() or {})
     owners[session.id] = ownership
@@ -1121,7 +1144,28 @@ def _activate_owned_session_run_fence(session: Session) -> _SessionRunFenceOwner
     return ownership
 
 
+def _current_recovery_cleanup_identity() -> tuple[str, str, int] | None:
+    """Project the innermost admitted identity without granting recovery authority."""
+    identities = _SESSION_CLEANUP_IDENTITIES.get() or {}
+    fences = _SESSION_RUN_FENCES.get() or {}
+    owners = _SESSION_RUN_FENCE_OWNERS.get() or {}
+    if not fences:
+        return None
+    session_id = next(reversed(fences))
+    epoch = fences[session_id]
+    owner = owners.get(session_id)
+    if owner is not None and owner.session_instance_id is not None and owner.run_epoch == epoch:
+        return session_id, owner.session_instance_id, epoch
+    identity = identities.get(session_id)
+    if identity is None or identity[1] != epoch:
+        return None
+    return session_id, identity[0], epoch
+
+
 def _deactivate_session_run_fence(session_id: str) -> None:
+    identities = dict(_SESSION_CLEANUP_IDENTITIES.get() or {})
+    identities.pop(session_id, None)
+    _SESSION_CLEANUP_IDENTITIES.set(identities or None)
     fences = _SESSION_RUN_FENCES.get()
     if fences is not None and session_id in fences:
         remaining = dict(fences)

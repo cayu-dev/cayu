@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import Context, copy_context
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
 from typing import Literal, cast
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
@@ -189,6 +191,43 @@ class RecoveryCleanupRetainedTaskSnapshot(BaseModel):
         return _require_positive_finite_seconds(value, "timeout_seconds")
 
 
+class RecoveryCleanupOwner(BaseModel):
+    """Exact process-local observation identity; never recovery authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    supervisor_id: str = Field(min_length=1, max_length=64)
+    session_id: str = Field(min_length=1, max_length=2048)
+    session_instance_id: str = Field(min_length=1, max_length=512)
+    run_epoch: StrictInt = Field(ge=0)
+
+
+class RecoveryCleanupTaskSnapshot(BaseModel):
+    """Immutable bounded observation of a supervised task, with no exception data."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    task_id: str
+    owner: RecoveryCleanupOwner | None
+    operation: str
+    status: Literal["active", "retained", "completed", "failed"]
+
+
+class RecoveryCleanupSessionSnapshot(BaseModel):
+    """Local observations only; absence never proves remote or durable settlement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    owner: RecoveryCleanupOwner
+    tasks: tuple[RecoveryCleanupTaskSnapshot, ...]
+    active_tasks: int
+    retained_tasks: int
+    history_truncated: bool
+    unattributed_tasks: int
+    # A fresh supervisor cannot attest to work from a previous process.
+    cross_process_settlement: Literal["unknown"] = "unknown"
+
+
 class RecoveryCleanupSupervisorSnapshot(BaseModel):
     """Content-free process-local cleanup supervision state."""
 
@@ -202,6 +241,8 @@ class RecoveryCleanupSupervisorSnapshot(BaseModel):
     retained_after_cancellation: StrictInt = Field(ge=0)
     capacity_exhausted_steps: StrictInt = Field(ge=0)
     retained: tuple[RecoveryCleanupRetainedTaskSnapshot, ...] = ()
+    tasks: tuple[RecoveryCleanupTaskSnapshot, ...] = ()
+    history_truncated: bool = False
 
 
 class RecoveryCleanupCapacityExceeded(RuntimeError):
@@ -254,6 +295,7 @@ class _SequentialCleanupProgress:
     started_at: float
     failures: list[BaseException | None]
     abort_after_current: bool = False
+    cleanup_failed: bool = False
     caller_cancellation: asyncio.CancelledError | None = None
     caller_cancellation_forwarded_ordinal: int | None = None
 
@@ -288,6 +330,11 @@ class RecoveryCleanupSupervisor:
         self._failed_after_timeout = 0
         self._retained_after_cancellation = 0
         self._capacity_exhausted_steps = 0
+        self._supervisor_id = str(uuid4())
+        self._task_observations: dict[asyncio.Task, RecoveryCleanupTaskSnapshot] = {}
+        self._task_progress: dict[asyncio.Task, _SequentialCleanupProgress] = {}
+        self._history: deque[RecoveryCleanupTaskSnapshot] = deque(maxlen=256)
+        self._history_truncated = False
 
     @property
     def policy(self) -> RecoveryCleanupPolicy:
@@ -296,6 +343,8 @@ class RecoveryCleanupSupervisor:
     def snapshot(self) -> RecoveryCleanupSupervisorSnapshot:
         self._harvest_completed()
         return RecoveryCleanupSupervisorSnapshot(
+            tasks=self._observations(),
+            history_truncated=self._history_truncated,
             active_tasks=len(self._active_tasks) + len(self._continuation_tasks),
             retained_tasks=len(self._retained_tasks),
             timed_out_steps=self._timed_out_steps,
@@ -317,7 +366,95 @@ class RecoveryCleanupSupervisor:
             ),
         )
 
+    def _observe_task(self, task: asyncio.Task, operation: str, context: Context) -> None:
+        from cayu.sessions.base import _current_recovery_cleanup_identity
+
+        identity = context.run(_current_recovery_cleanup_identity)
+        owner = (
+            None
+            if identity is None
+            else RecoveryCleanupOwner(
+                supervisor_id=self._supervisor_id,
+                session_id=identity[0],
+                session_instance_id=identity[1],
+                run_epoch=identity[2],
+            )
+        )
+        self._task_observations[task] = RecoveryCleanupTaskSnapshot(
+            task_id=str(uuid4()),
+            owner=owner,
+            operation=operation,
+            status="active",
+        )
+        task.add_done_callback(self._complete_observation)
+
+    def _complete_observation(self, task: asyncio.Task) -> None:
+        if (
+            task in self._active_tasks
+            or task in self._retained_tasks
+            or task in self._continuation_tasks
+        ):
+            return
+        observation = self._task_observations.pop(task, None)
+        if observation is None:
+            return
+        failure = self._completed_task_failure(task)
+        progress = self._task_progress.pop(task, None)
+        failed = failure is not None or (progress is not None and progress.cleanup_failed)
+        if len(self._history) == self._history.maxlen:
+            self._history_truncated = True
+        self._history.append(
+            observation.model_copy(update={"status": "failed" if failed else "completed"})
+        )
+
+    def _observations(self) -> tuple[RecoveryCleanupTaskSnapshot, ...]:
+        return (
+            *self._history,
+            *(
+                observation.model_copy(
+                    update={"status": "retained" if task in self._retained_tasks else "active"}
+                )
+                for task, observation in self._task_observations.items()
+            ),
+        )
+
+    def session_snapshot(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str,
+        run_epoch: int,
+    ) -> RecoveryCleanupSessionSnapshot:
+        self._harvest_completed()
+        owner = RecoveryCleanupOwner(
+            supervisor_id=self._supervisor_id,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            run_epoch=run_epoch,
+        )
+        tasks = tuple(item for item in self._observations() if item.owner == owner)
+        return RecoveryCleanupSessionSnapshot(
+            owner=owner,
+            tasks=tasks,
+            active_tasks=sum(item.status == "active" for item in tasks),
+            retained_tasks=sum(item.status == "retained" for item in tasks),
+            history_truncated=self._history_truncated,
+            unattributed_tasks=sum(
+                item.owner is None and item.status in {"active", "retained"}
+                for item in self._observations()
+            ),
+        )
+
+    async def drain_session(self, owner: RecoveryCleanupOwner, *, timeout_s: float) -> bool:
+        """Wait only for this observation owner; stale process identities fail closed."""
+        if type(owner) is not RecoveryCleanupOwner or owner.supervisor_id != self._supervisor_id:
+            raise ValueError("Cleanup owner belongs to a different supervisor.")
+        return await self._drain(timeout_s=timeout_s, owner=owner)
+
     async def drain(self, *, timeout_s: float) -> bool:
+        return await self._drain(timeout_s=timeout_s, owner=None)
+
+    async def _drain(self, *, timeout_s: float, owner: RecoveryCleanupOwner | None) -> bool:
         """Wait boundedly for supervised work without cancelling retained owners."""
 
         timeout_s = _require_positive_finite_seconds(
@@ -329,7 +466,14 @@ class RecoveryCleanupSupervisor:
         while True:
             self._harvest_completed()
             pending = tuple(
-                self._active_tasks | self._retained_tasks.keys() | self._continuation_tasks
+                task
+                for task in self._active_tasks
+                | self._retained_tasks.keys()
+                | self._continuation_tasks
+                if owner is None
+                or (
+                    task in self._task_observations and self._task_observations[task].owner == owner
+                )
             )
             if not pending:
                 return True
@@ -482,6 +626,8 @@ class RecoveryCleanupSupervisor:
                     context=segment_context,
                 )
                 self._active_tasks.add(task)
+                self._observe_task(task, phase[0].operation, segment_context)
+                self._task_progress[task] = progress
                 deadline_scope = RecoveryCleanupDeadlineScope.STEP
                 while not task.done():
                     observed_ordinal = progress.phase_ordinal
@@ -623,6 +769,7 @@ class RecoveryCleanupSupervisor:
                     context=step_context,
                 )
                 self._active_tasks.add(task)
+                self._observe_task(task, step.operation, step_context)
                 phase_states.append(
                     _RunningCleanupStep(
                         phase_ordinal=phase_ordinal,
@@ -820,6 +967,7 @@ class RecoveryCleanupSupervisor:
                 context=step_context,
             )
             self._active_tasks.add(task)
+            self._observe_task(task, step.operation, step_context)
             admitted.append(
                 _RunningCleanupStep(
                     phase_ordinal=phase_ordinal,
@@ -895,6 +1043,7 @@ class RecoveryCleanupSupervisor:
                 ):
                     current_failure = None
                 if current_failure is not None:
+                    progress.cleanup_failed = True
                     progress.failures[phase_ordinal] = current_failure
             if progress.abort_after_current:
                 return settlement_failure
@@ -1088,6 +1237,9 @@ class RecoveryCleanupSupervisor:
         for task in tuple(self._continuation_tasks):
             if task.done():
                 self._harvest_continuation(task)
+        for task in tuple(self._task_observations):
+            if task.done():
+                self._complete_observation(task)
 
     def _harvest_task(self, task: asyncio.Task[BaseException | None]) -> None:
         retained = self._retained_tasks.pop(task, None)
@@ -1135,6 +1287,7 @@ class RecoveryCleanupSupervisor:
             context=barrier.context,
         )
         self._continuation_tasks.add(task)
+        self._observe_task(task, first_operation, barrier.context.copy())
         task.add_done_callback(self._harvest_continuation)
 
     async def _run_background_continuation(

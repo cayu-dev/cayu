@@ -1098,3 +1098,187 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("session_id", ["first", "s" * 2048], ids=["short-id", "maximum-id"])
+def test_session_cleanup_observations_are_exact_and_scoped(fails, session_id):
+    from cayu.sessions.base import _SessionRunFenceOwnership
+
+    async def scenario():
+        app = CayuApp(
+            config=CayuConfig(
+                operations=OperationsConfig(
+                    recovery_cleanup_policy=RecoveryCleanupPolicy(
+                        step_timeout_seconds=0.02,
+                        overall_timeout_seconds=0.1,
+                    )
+                )
+            ),
+            enable_logging=False,
+        )
+        supervisor = app._recovery_cleanup_supervisor
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def delayed():
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            if fails:
+                raise RuntimeError("private failure")
+
+        async def run():
+            with _SessionRunFenceOwnership(
+                session_id=session_id, session_instance_id="incarnation", run_epoch=2
+            ).activate():
+                await supervisor.run_steps(
+                    steps=(("delayed", delayed),), shield_caller_cancellation=True
+                )
+
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(entered.wait(), 10)
+        active = app.session_recovery_cleanup_status(
+            session_id=session_id, session_instance_id="incarnation", run_epoch=2
+        )
+        assert active.active_tasks == 1
+        await asyncio.wait_for(task, 10)
+        pending = app.session_recovery_cleanup_status(
+            session_id=session_id, session_instance_id="incarnation", run_epoch=2
+        )
+        assert pending.retained_tasks == 1
+        frozen = pending.model_dump_json()
+        for other_session_id, instance, epoch in [
+            ("second", "incarnation", 2),
+            (session_id, "replacement", 2),
+            (session_id, "incarnation", 3),
+        ]:
+            other = app.session_recovery_cleanup_status(
+                session_id=other_session_id, session_instance_id=instance, run_epoch=epoch
+            )
+            assert other.active_tasks == other.retained_tasks == 0
+            assert await app.drain_session_recovery_cleanups(other.owner, timeout_s=0.1)
+        assert not await app.drain_session_recovery_cleanups(pending.owner, timeout_s=0.01)
+        replacement = CayuApp(enable_logging=False)
+        with pytest.raises(ValueError, match="different supervisor"):
+            await replacement.drain_session_recovery_cleanups(pending.owner)
+        release.set()
+        assert await app.drain_session_recovery_cleanups(pending.owner, timeout_s=10)
+        settled = app.session_recovery_cleanup_status(
+            session_id=session_id, session_instance_id="incarnation", run_epoch=2
+        )
+        assert settled.active_tasks == settled.retained_tasks == 0
+        assert [item.status for item in settled.tasks] == ["failed" if fails else "completed"]
+        assert settled.cross_process_settlement == "unknown"
+        assert pending.model_dump_json() == frozen
+        assert "private failure" not in settled.model_dump_json()
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_history_is_bounded_and_scoped_drain_excludes_siblings():
+    from cayu.sessions.base import _SessionRunFenceOwnership
+
+    async def scenario():
+        supervisor = RecoveryCleanupSupervisor()
+        release = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def sibling_cleanup():
+            entered.set()
+            await release.wait()
+
+        async def sibling():
+            with _SessionRunFenceOwnership(
+                session_id="sibling", session_instance_id="one", run_epoch=1
+            ).activate():
+                await supervisor.run_steps(
+                    steps=(("sibling", sibling_cleanup),), shield_caller_cancellation=True
+                )
+
+        async def done():
+            pass
+
+        task = asyncio.create_task(sibling())
+        await asyncio.wait_for(entered.wait(), 10)
+        with _SessionRunFenceOwnership(
+            session_id="selected", session_instance_id="two", run_epoch=1
+        ).activate():
+            for _ in range(260):
+                await supervisor.run_steps(steps=(("done", done),), shield_caller_cancellation=True)
+        selected = supervisor.session_snapshot(
+            session_id="selected", session_instance_id="two", run_epoch=1
+        )
+        assert selected.history_truncated
+        assert len(selected.tasks) == 256
+        assert all(item.status == "completed" for item in selected.tasks)
+        assert await supervisor.drain_session(selected.owner, timeout_s=0.01)
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, 10)
+        assert await supervisor.drain(timeout_s=10)
+        assert len(supervisor.snapshot().tasks) == 256
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.anyio
+async def test_runtime_cancellation_cleanup_has_admitted_session_identity(monkeypatch):
+    from cayu import AgentSpec, EventType, ModelStreamEvent, ScriptedModelProvider
+
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [[ModelStreamEvent.text_delta("ready"), ModelStreamEvent.completed({})]]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="worker", model="test"))
+    reached = asyncio.Event()
+    append = app.session_store.append_event
+
+    async def pause(session_id, event):
+        result = await append(session_id, event)
+        if event.type == EventType.MODEL_TEXT_DELTA:
+            reached.set()
+            await asyncio.Event().wait()
+        return result
+
+    monkeypatch.setattr(app.session_store, "append_event", pause)
+
+    async def run():
+        async for _ in app.run(
+            RunRequest(
+                agent_name="worker", session_id="admitted", messages=[Message.text("user", "go")]
+            )
+        ):
+            pass
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(reached.wait(), 10)
+    session = await app.session_store.load("admitted")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert await app.drain_recovery_cleanups(timeout_s=10)
+    snapshot = app.session_recovery_cleanup_status(
+        session_id=session.id, session_instance_id=session.instance_id, run_epoch=session.run_epoch
+    )
+    assert snapshot.tasks
+    assert all(item.owner.session_id == session.id for item in snapshot.tasks)
+    assert any(item.operation == "cancelled tool-round finalization" for item in snapshot.tasks)
+
+
+def test_nested_cleanup_owner_reactivation_uses_exact_innermost_run():
+    from cayu.sessions.base import _current_recovery_cleanup_identity, _SessionRunFenceOwnership
+
+    parent = _SessionRunFenceOwnership(session_id="parent", session_instance_id="one", run_epoch=1)
+    child = _SessionRunFenceOwnership(session_id="child", session_instance_id="two", run_epoch=2)
+    with parent.activate(), child.activate():
+        assert _current_recovery_cleanup_identity() == ("child", "two", 2)
+        with parent.activate():
+            assert _current_recovery_cleanup_identity() == ("parent", "one", 1)
+        assert _current_recovery_cleanup_identity() == ("child", "two", 2)
