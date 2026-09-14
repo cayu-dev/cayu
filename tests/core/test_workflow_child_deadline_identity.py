@@ -553,3 +553,113 @@ async def test_deadline_after_native_completion_retains_terminal(
         reopened = SQLiteSessionStore(tmp_path / "completed.db")
         assert terminal.id in {e.id for e in await reopened.load_events(child_id)}
         await reopened.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("publication", [EventType.TURN_COMPLETED, EventType.SESSION_COMPLETED])
+async def test_native_deadline_reconciles_completion_publication(
+    tmp_path, monkeypatch, backend, publication, request
+):
+    import cayu.deadlines as deadlines
+    from cayu.workflows.workflow import StepRunOptions
+
+    path = tmp_path / "native-completion.db"
+    if backend == "postgres":
+        from cayu.storage.migrations import SchemaMode
+        from cayu.storage.postgres import PostgresSessionStore
+
+        dsn = request.getfixturevalue("postgres_dsn")
+        store = PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE)
+    else:
+        store = SQLiteSessionStore(path) if backend == "sqlite" else InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    provider = ScriptedModelProvider(
+        [[ModelStreamEvent.text_delta("settled"), ModelStreamEvent.completed({})]]
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker", model="test"))
+    parent_id = f"parent-{backend}-{publication.value}"
+    ctx = Verifiers(app).context(parent_id)
+    await ctx.start()
+    timers = {}
+    invocation_task = None
+    scope = deadlines.execution_deadline_scope
+
+    @contextlib.asynccontextmanager
+    async def tracked_scope(deadline):
+        async with scope(deadline) as timer:
+            task_timers = timers.setdefault(asyncio.current_task(), [])
+            task_timers.append(timer)
+            try:
+                yield timer
+            finally:
+                task_timers.pop()
+
+    monkeypatch.setattr(deadlines, "execution_deadline_scope", tracked_scope)
+    append = store.append_event
+    paused = False
+    child_id = None
+
+    async def lose_ack(session_id, event):
+        nonlocal paused, child_id
+        result = await append(session_id, event)
+        if event.type == publication == EventType.TURN_COMPLETED and not paused:
+            paused = True
+            child_id = session_id
+            timers[invocation_task][-1].reschedule(asyncio.get_running_loop().time())
+            await asyncio.Event().wait()
+        return result
+
+    terminal_stream = app._session_engine._emit_terminal_event_with_hooks
+
+    async def pause_terminal(**kwargs):
+        nonlocal paused, child_id
+        async with contextlib.aclosing(terminal_stream(**kwargs)) as stream:
+            async for event in stream:
+                if event.type == publication == EventType.SESSION_COMPLETED and not paused:
+                    paused = True
+                    child_id = event.session_id
+                    timers[invocation_task][-1].reschedule(asyncio.get_running_loop().time())
+                    await asyncio.Event().wait()
+                yield event
+
+    monkeypatch.setattr(app._session_engine, "_emit_terminal_event_with_hooks", pause_terminal)
+    monkeypatch.setattr(store, "append_event", lose_ack)
+
+    async def invoke():
+        nonlocal invocation_task
+        invocation_task = asyncio.current_task()
+        return await step(
+            ctx,
+            agent="worker",
+            step_id="check",
+            prompt="go",
+            run_options=StepRunOptions(execution_deadline=ExecutionDeadline.after(60)),
+        )
+
+    failure = None
+    try:
+        await asyncio.wait_for(invoke(), 10)
+    except StepError as error:
+        failure = error
+    assert paused, "publication barrier was not reached"
+    assert failure is not None, "deadline was swallowed after publication"
+    evidence = failure.evidence
+    events = await store.load_events(child_id)
+    terminals = [e for e in events if e.type == EventType.SESSION_COMPLETED]
+    assert len(terminals) == 1
+    assert evidence.terminal_event_id == terminals[0].id
+    assert evidence.session_id == child_id
+    assert evidence.classification == "deadline"
+    assert evidence.settlement == "unknown"
+    replay_ctx = Verifiers(app).context(parent_id)
+    await replay_ctx.start()
+    result = await step(replay_ctx, agent="worker", step_id="check", prompt="go")
+    assert result.text == "settled"
+    assert len(provider.requests) == 1
+    if backend != "memory":
+        await store.close()
+        reopened = PostgresSessionStore(dsn) if backend == "postgres" else SQLiteSessionStore(path)
+        assert await reopened.load_events(child_id) == events
+        await reopened.close()

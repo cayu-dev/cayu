@@ -1253,15 +1253,28 @@ async def _run_step(
     except Exception as exc:
         if capture_structured_output:
             ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
-        if generated_child_ownership is _GeneratedChildOwnership.UNCREATED:
+        reconcile_deadline = exception_evidence(exc).classification == "deadline"
+        if generated_child_ownership is _GeneratedChildOwnership.UNCREATED or reconcile_deadline:
             reconciliation_evidence = observed_child_failure_evidence(exc)
 
             async def reconcile_child_failure(signal: Exception) -> None:
                 nonlocal reconciliation_evidence
                 try:
-                    await recover_authenticated_unacknowledged_child(
-                        reason="workflow_step_create_acknowledgement_lost"
-                    )
+                    if generated_child_ownership is _GeneratedChildOwnership.UNCREATED:
+                        await recover_authenticated_unacknowledged_child(
+                            reason="workflow_step_create_acknowledgement_lost"
+                        )
+                    elif reconcile_deadline:
+                        # Native stream timeouts arrive as ordinary exceptions.
+                        # Reuse owned recovery to reconcile completion publication
+                        # before collecting the exact invocation's terminal ID.
+                        await ctx.app.recover_incomplete_session(
+                            IncompleteSessionRecoveryRequest(
+                                session_id=child_session_id,
+                                reason="workflow_step_deadline",
+                                metadata={"workflow": ctx.workflow_name, "step_id": step_id},
+                            )
+                        )
                 finally:
                     # Authentication may establish identity before recovery fails.
                     # Keep lookup inside the shield, including repeated cancellation.
