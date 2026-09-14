@@ -13251,6 +13251,7 @@ class SQLiteSessionStore(SessionStore):
         candidate_select_sql = f"""
             SELECT
                 cayu_sessions.id,
+                cayu_sessions.instance_id,
                 cayu_sessions.agent_name,
                 cayu_sessions.provider_name,
                 cayu_sessions.model,

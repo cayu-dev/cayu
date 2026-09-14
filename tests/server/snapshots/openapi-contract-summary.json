@@ -1411,6 +1411,17 @@
           ],
           "title": "Arguments"
         },
+        "attention_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Attention Id"
+        },
         "delegated_action": {
           "anyOf": [
             {

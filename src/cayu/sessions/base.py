@@ -75,6 +75,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     StrictStr,
+    computed_field,
     field_serializer,
     field_validator,
     model_validator,
@@ -7315,6 +7316,7 @@ class PendingActionSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    instance_id: str | None = None
     agent_name: str
     provider_name: str
     model: str
@@ -7335,6 +7337,7 @@ class PendingActionSession(BaseModel):
     def from_session(cls, session: Session) -> PendingActionSession:
         return cls(
             id=session.id,
+            instance_id=session.instance_id,
             agent_name=session.agent_name,
             provider_name=session.provider_name,
             model=session.model,
@@ -7362,7 +7365,7 @@ class PendingActionSession(BaseModel):
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("parent_session_id", "environment_name", "runtime_version")
+    @field_validator("instance_id", "parent_session_id", "environment_name", "runtime_version")
     @classmethod
     def validate_optional_nonblank_fields(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -7423,6 +7426,47 @@ class PendingActionRecord(BaseModel):
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None
     delegated_action: DelegatedActionReference | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_cached_attention_identity(cls, value: Any) -> Any:
+        # A serialized read projection can be reconstructed normally. Recompute
+        # this read-only field from canonical identities, never from a cached ID.
+        if isinstance(value, dict) and "attention_id" in value:
+            return {key: item for key, item in value.items() if key != "attention_id"}
+        return value
+
+    @computed_field
+    @property
+    def attention_id(self) -> str | None:
+        """Stable notification identity; never execution or resolution authority.
+
+        Delegated rows are navigation only. Query the child-owned action.
+        Legacy/custom projections without an incarnation remain unavailable.
+        """
+        if self.session.instance_id is None or self.kind is PendingActionKind.DELEGATED_ACTION:
+            return None
+        if self.kind is PendingActionKind.USER_INPUT:
+            discriminator = self.input_id
+        elif self.kind is PendingActionKind.TOOL_APPROVAL:
+            discriminator = self.approval_id
+        else:
+            discriminator = self.round_id or self.id
+        if discriminator is None:
+            return None
+        identity = [
+            self.session.id,
+            self.session.instance_id,
+            self.kind.value,
+            discriminator,
+            self.tool_call_id if self.kind is PendingActionKind.MANUAL_RECOVERY else None,
+        ]
+        return (
+            "attention_"
+            + hashlib.sha256(
+                json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
 
     @model_validator(mode="after")
     def delegated_action_is_discovery_only(self) -> Self:

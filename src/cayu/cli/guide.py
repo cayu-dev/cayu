@@ -37,6 +37,10 @@ _GUIDES = {
         "evals-production.md",
         "Production sessions, scenarios, tools, process behavior, and memory.",
     ),
+    "human-attention": (
+        "human-attention.md",
+        "Durable notifications over canonical pending actions.",
+    ),
     "providers": (
         "providers.md",
         "Primary integrations and compatible Chat Completions endpoints.",
@@ -68,8 +72,14 @@ _RELATED = {
         "references",
     ),
     "diagnostics": ("anatomy", "authoring"),
-    "durable-operations": ("tool-effects", "references", "durable-service-tools"),
+    "durable-operations": (
+        "tool-effects",
+        "references",
+        "durable-service-tools",
+        "human-attention",
+    ),
     "durable-service-tools": ("durable-operations", "references", "anatomy"),
+    "human-attention": ("durable-operations", "references", "anatomy"),
     "evals-ai-quality": ("evals-first", "evals-production", "authoring"),
     "evals-first": ("evals-ai-quality", "evals-production", "authoring"),
     "evals-production": ("evals-first", "evals-ai-quality", "durable-operations"),

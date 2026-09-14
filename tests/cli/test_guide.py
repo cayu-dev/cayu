@@ -636,3 +636,15 @@ def test_package_shipped_provider_guide_is_short_and_agent_discoverable(capsys) 
     compatible = capsys.readouterr().out
     assert compatible.startswith("## Compatible Chat Completions")
     assert "OpenCode Go" in compatible
+
+
+def test_human_attention_guide_discovery_and_public_contracts(capsys) -> None:
+    assert main(["guide", "human-attention", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["package_source"] == "cayu.guides/human-attention.md"
+    assert "get_human_attention_state" in result["content"]
+    assert "HumanAttentionRequest.from_pending_action" in result["content"]
+    assert "session_instance" not in result["content"] or "incarnation" in result["content"]
+    assert "unavailable" in result["content"] and "next_cursor" in result["content"]
+    assert main(["guide", "human-attention#one-underlying-action"]) == 0
+    assert "attention_id" in capsys.readouterr().out

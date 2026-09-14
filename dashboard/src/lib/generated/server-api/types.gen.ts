@@ -960,6 +960,10 @@ export type ApiPendingAction = {
     arguments?: {
         [key: string]: unknown;
     } | null;
+    /**
+     * Attention Id
+     */
+    attention_id?: string | null;
     delegated_action?: DelegatedActionReference | null;
     /**
      * Detail

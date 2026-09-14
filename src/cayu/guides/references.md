@@ -247,3 +247,8 @@ Advanced authority, isolation, caching, speculation, and recovery strategies
 compose only when their evidence boundaries are explicit. Preserve stable
 operation identity, fail closed on unknown policy coverage, and verify live
 capabilities separately from a structural manifest.
+
+## Human-attention notifications
+
+Use `cayu guide human-attention` for the canonical EventSink, pending-action,
+durable destination, and restart-reconciliation integration.

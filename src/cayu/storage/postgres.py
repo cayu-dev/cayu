@@ -36460,7 +36460,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         )
         session_columns += (
             ", cayu_sessions.metadata -> 'cayu:runtime_build_provenance' "
-            "AS runtime_build_provenance"
+            "AS runtime_build_provenance, cayu_sessions.instance_id"
         )
         candidate_select_sql = cast(
             "LiteralString",

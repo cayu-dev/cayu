@@ -2993,6 +2993,9 @@ from cayu.runtime.execution_units import copy_model_attempt_identity as copy_mod
 from cayu.runtime.execution_units import copy_model_step_identity as copy_model_step_identity
 from cayu.runtime.execution_units import copy_tool_round_identity as copy_tool_round_identity
 from cayu.runtime.execution_units import new_model_step_identity as new_model_step_identity
+from cayu.runtime.human_attention import HumanAttentionObservation as HumanAttentionObservation
+from cayu.runtime.human_attention import HumanAttentionReference as HumanAttentionReference
+from cayu.runtime.human_attention import HumanAttentionRequest as HumanAttentionRequest
 from cayu.runtime.local_execution_attempts import (
     LOCAL_EXECUTION_ATTEMPT_SCHEMA_VERSION as LOCAL_EXECUTION_ATTEMPT_SCHEMA_VERSION,
 )

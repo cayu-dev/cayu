@@ -2434,7 +2434,7 @@ def _serialize_pending_action(
             exclude={"session", "event"},
         ),
         "pending_action",
-        preserve_string_fields={"kind", "policy_evidence"},
+        preserve_string_fields={"kind", "policy_evidence", "attention_id"},
         untrusted_container_fields={"arguments"},
     )
     payload["id"] = f"{public_event_id(action.event.sequence)}:{action.kind.value}"

@@ -926,6 +926,15 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         "conformance_duplicate_terminal",
     }
 
+    from cayu import HumanAttentionRequest
+
+    for action in manual.actions:
+        attention = HumanAttentionRequest.from_pending_action(action)
+        assert action.session.instance_id == (await store.load(action.session.id)).instance_id
+        assert attention is not None and attention.reference.kind == "manual_recovery"
+        assert attention.summary == "Manual recovery required."
+        assert "arguments" not in attention.model_dump_json()
+
     # Resumed tool events carry both their call id and the pause id. Once the
     # pause checkpoint is cleared, the surviving round must still discover its
     # ledger through the call identity.

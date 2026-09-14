@@ -39,6 +39,7 @@ only when the requested behavior requires it.
 | Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | `cayu guide providers`, `cayu guide structured-output` |
 | A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | `cayu guide references#domain-tool` |
 | Replay or mutation semantics | `ToolEffect`, idempotency keys | `cayu guide tool-effects` |
+| Notify a person about a durable pause | pending actions, attention identity, durable sink handoff, reconciliation | `cayu guide human-attention` |
 | Durable operational changes | proposal, policy-bound approval, action receipt, verification, recovery | `cayu guide durable-operations` |
 | Rebuild service-backed tools after a restart | component behavior identities, injected or environment-bound knowledge | `cayu guide durable-service-tools` |
 | Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
@@ -82,7 +83,7 @@ mounts require `AuthenticatedAccess(...)` with application-owned authorization.
 Use the concept package when exploring a capability: `cayu.sessions` owns
 session requests and stores, `cayu.tools` owns tool contracts and policies,
 `cayu.context` owns context management, and `cayu.approvals` owns approvals and
-user input. Other owners include `cayu.tasks`, `cayu.workflows`, `cayu.memory`,
+user input. Other owners include `cayu.tasks`, `cayu.workflows`, `cayu.memory.base`,
 `cayu.knowledge`, `cayu.budgets`, `cayu.snapshots`, and `cayu.delivery`.
 
 ```python

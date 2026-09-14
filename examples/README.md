@@ -20,6 +20,7 @@ corresponding credentials or service.
 
 ## Tools and providers
 
+- [`human_attention/`](human_attention/) — durable notification acceptance, fresh-process repair, and exact-action resolution.
 - [`durable_service_tools/`](durable_service_tools/) — credential-free fresh-process
   resume, stable service identities, scoped knowledge, and approval recovery.
 

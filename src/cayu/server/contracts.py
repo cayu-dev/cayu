@@ -2252,6 +2252,7 @@ class SessionsSummaryResponse(ApiBaseModel):
 
 
 class ApiPendingAction(ApiBaseModel):
+    attention_id: str | None = None
     id: str
     kind: Literal["tool_approval", "user_input", "manual_recovery", "delegated_action"]
     session: ApiSessionBase

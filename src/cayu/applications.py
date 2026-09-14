@@ -341,6 +341,11 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
     unavailable_execution_profile_components,
 )
+from cayu.runtime.human_attention import (
+    HumanAttentionObservation,
+    HumanAttentionReference,
+    observe_human_attention,
+)
 from cayu.runtime.loop_policies import (
     LoopPolicy,
     validate_loop_policies,
@@ -2158,6 +2163,17 @@ class CayuApp:
         await self._recovery_coordinator.require_human_review_resolution_authority(
             session_id, reference
         )
+
+    async def get_human_attention_state(
+        self,
+        reference: HumanAttentionReference,
+    ) -> HumanAttentionObservation:
+        """Read exact attention state; notification acknowledgement cannot resume work.
+
+        SDK callers must independently authorize access to the referenced session.
+        Unavailable reads or missing terminal evidence never imply resolution.
+        """
+        return await observe_human_attention(self._runtime_session_store, reference)
 
     async def inspect_human_review(
         self,

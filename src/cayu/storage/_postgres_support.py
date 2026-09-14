@@ -765,6 +765,7 @@ def pending_action_session_from_row(
 ) -> PendingActionSession:
     return PendingActionSession(
         id=row[0],
+        instance_id=row[13],
         agent_name=row[1],
         provider_name=row[2],
         model=row[3],

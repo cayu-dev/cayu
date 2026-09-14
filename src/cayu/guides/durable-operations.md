@@ -598,3 +598,6 @@ arguments in a product API.
 - **Verification by narration:** a successful action receipt is not post-action
   verification. Use a separate read-only observation and retain pass, fail, or
   inconclusive evidence tied to the same stable `action_id`.
+
+For restart-safe notification of questions, approvals, and manual-recovery gates,
+see `cayu guide human-attention`. Notification acceptance never grants execution.

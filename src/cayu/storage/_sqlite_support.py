@@ -11274,6 +11274,7 @@ def pending_action_session_from_row(
 ) -> PendingActionSession:
     return PendingActionSession(
         id=row["id"],
+        instance_id=row["instance_id"],
         agent_name=row["agent_name"],
         provider_name=row["provider_name"],
         model=row["model"],

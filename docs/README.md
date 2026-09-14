@@ -6,6 +6,7 @@ authoritative only where a maintained guide points to the implementation or the
 
 ## Current user guides
 
+- [Human-attention notifications](../src/cayu/guides/human-attention.md) (`cayu guide human-attention`)
 - [Durable service-backed tools](../src/cayu/guides/durable-service-tools.md) (`cayu guide durable-service-tools`)
 
 - [Advanced runtime examples](advanced-runtime-examples.md)

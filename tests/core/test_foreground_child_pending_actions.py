@@ -241,6 +241,12 @@ def _check_delegated_discovery(
                     if event.type == "session.interrupted"
                 ],
             )
+            from cayu import HumanAttentionRequest
+
+            assert action.attention_id is None
+            assert HumanAttentionRequest.from_pending_action(action) is None
+            assert child_action.attention_id is not None
+            assert HumanAttentionRequest.from_pending_action(child_action) is not None
             assert action.input_id is None and action.approval_id is None
             assert action.question is None and action.arguments is None
             public = action.model_dump(mode="json")
