@@ -14644,11 +14644,26 @@ the provider actually received its content. Losing the user anchor still
 suppresses delivery; runtime corrections still reuse the existing frame.
 
 This extension augments at least one built-in source; it does not replace the
-built-in knowledge/transcript implementations. Custom sources combined with
-`MemoryDeltaPolicy` are rejected for now: generic factories have no declared
-knowledge-frontier snapshot/change-feed contract, so the runtime must not claim
-delta coverage for them. Source inspection tools and backend-specific retrieval
-remain application code, not runtime special cases.
+built-in knowledge/transcript implementations. Custom sources still cannot use
+knowledge-change refresh: generic factories have no declared knowledge-frontier
+snapshot/change-feed contract, so the runtime must not claim delta coverage for
+them. They can opt into **canonical knowledge recovery only**:
+
+```python
+MemoryDeltaPolicy(
+    refresh_on_knowledge_change=False,
+    reanchor_on_projection_loss=True,
+)
+```
+
+The built-in knowledge source must remain enabled. Recovery never reruns a custom
+factory, polls its backend, or treats its locator as an authoritative read. Only
+previously exposed knowledge entry/chunk representations that the current scoped
+KnowledgeStore can reproduce exactly can be restored. Opaque external record types,
+custom summaries, changed bytes, stale revisions and unrelated evidence are not
+restored. Custom source versions remain part of the frozen configuration identity.
+Source inspection tools and backend-specific retrieval remain application code,
+not runtime special cases.
 
 The four admission modes are `off`, `offer`, `strong_matches`, and
 `offer_and_strong_matches`. Strong matches must meet `minimum_inject_score` and
@@ -14844,6 +14859,14 @@ provider composition links the base receipt and every rendered delta receipt thr
 `ContextExposure`; each item keeps its own receipt ordinal and exact provider
 representation hash.
 
+Version 3 of `MemoryDeltaPolicy` separates the two triggers.
+`refresh_on_knowledge_change=True` remains the default; setting it to false disables
+intra-interaction change/readiness polling and new-revision deltas without disabling
+projection recovery. At least one trigger must remain enabled. Frontier reads still
+occur when capturing the initial frame and when revalidating a lost projection.
+Both settings are validated booleans and participate in the policy/configuration
+fingerprints; version-2 policy documents are not silently interpreted as version 3.
+
 `MemoryDeltaPolicy(reanchor_on_projection_loss=True)` additionally allows exact
 projection restoration after the wrapped context policy removes the original base/delta
 anchor. It does not react to elapsed time, context length, prompt position, or an inferred
@@ -14861,9 +14884,16 @@ attempt. It then performs a fresh knowledge-only recall for those exact revision
 current accessible knowledge/readiness frontier and admits only a current calibrated
 strong match to the compacted task. A superseded, archived, deleted, expired,
 inaccessible, changed-representation, incomplete, or irrelevant item is not re-emitted.
-Restoration always applies `cayu.query_concepts.v2` before score admission, independently of
-the base recall relevance policy. This conservative lexical concept check can omit relevant
-paraphrases; it does not establish general semantic relevance. Complete individual items
+Restoration defaults to `cayu.query_concepts.v2` before score admission, independently of
+the base recall relevance policy. `MemoryDeltaPolicy.reanchor_relevance_policy` can
+explicitly select the existing validated query-concept policies v2–v5. Rank-only
+admission and v1 are not permitted for recovery. The selected policy and its relevance
+text version are fingerprinted in the recovery configuration and receipt; changing
+the setting invalidates the old frozen configuration. The default preserves the
+previous conservative check. In particular, v2 can reject a relevant short procedure
+when a compaction summary adds framing or other topics; v3–v5 support validated phrase
+matching. These checks can still omit relevant paraphrases and do not establish
+general semantic relevance. Complete individual items
 may be selected from a bounded, truncated retrieval head. Lexical-only stores are supported;
 semantic timeout, failure, or partial index readiness prevents restoration. Item-evidence
 reads run in batches of at most eight, with cancellation and failure draining the batch.

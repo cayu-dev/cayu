@@ -45,7 +45,7 @@ from cayu.memory.retrieval import FusedChannelMatch, RetrievalCandidateIdentity
 AUTOMATIC_RECALL_POLICY_VERSION = "cayu.automatic_recall_policy.v1"
 AUTOMATIC_RECALL_CONTRIBUTION_VERSION = "cayu.automatic_recall_contribution.v1"
 MEMORY_FOCUS_VERSION = "cayu.memory_focus.v1"
-MEMORY_DELTA_POLICY_VERSION = "cayu.memory_delta_policy.v2"
+MEMORY_DELTA_POLICY_VERSION = "cayu.memory_delta_policy.v3"
 MEMORY_DELTA_REFRESH_OUTCOME_VERSION = "cayu.memory_delta_refresh_outcome.v1"
 MEMORY_REANCHOR_REFRESH_OUTCOME_VERSION = "cayu.memory_reanchor_refresh_outcome.v1"
 MEMORY_DELTA_TRIGGER_VERSION = "cayu.memory_delta_trigger.v2"
@@ -264,7 +264,8 @@ class MemoryDeltaPolicy(BaseModel):
         validate_default=True,
     )
 
-    policy_version: Literal["cayu.memory_delta_policy.v2"] = MEMORY_DELTA_POLICY_VERSION
+    policy_version: Literal["cayu.memory_delta_policy.v3"] = MEMORY_DELTA_POLICY_VERSION
+    refresh_on_knowledge_change: bool = True
     max_refreshes_per_interaction: int = 8
     max_deltas_per_interaction: int = 4
     max_items_per_delta: int = 3
@@ -276,6 +277,12 @@ class MemoryDeltaPolicy(BaseModel):
     change_page_limit: int = 32
     readiness_page_limit: int = 32
     reanchor_on_projection_loss: bool = False
+    reanchor_relevance_policy: Literal[
+        "cayu.query_concepts.v2",
+        "cayu.query_concepts.v3",
+        "cayu.query_concepts.v4",
+        "cayu.query_concepts.v5",
+    ] = "cayu.query_concepts.v2"
     max_reanchor_refreshes_per_interaction: int = 4
     max_reanchors_per_item: int = 2
     max_items_per_reanchor: int = 3
@@ -285,11 +292,11 @@ class MemoryDeltaPolicy(BaseModel):
     max_context_exposures_inspected: int = 32
     max_context_exposure_bytes: int = 1_000_000
 
-    @field_validator("reanchor_on_projection_loss", mode="before")
+    @field_validator("refresh_on_knowledge_change", "reanchor_on_projection_loss", mode="before")
     @classmethod
-    def validate_reanchor_enabled(cls, value: Any) -> bool:
+    def validate_refresh_enabled(cls, value: Any, info: Any) -> bool:
         if type(value) is not bool:
-            raise ValueError("`reanchor_on_projection_loss` must be a boolean.")
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
         return value
 
     @field_validator(
@@ -360,6 +367,8 @@ class MemoryDeltaPolicy(BaseModel):
 
     @model_validator(mode="after")
     def validate_policy(self) -> MemoryDeltaPolicy:
+        if not self.refresh_on_knowledge_change and not self.reanchor_on_projection_loss:
+            raise ValueError("At least one memory-delta trigger must be enabled.")
         if self.max_deltas_per_interaction > self.max_refreshes_per_interaction:
             raise ValueError(
                 "`max_deltas_per_interaction` cannot exceed `max_refreshes_per_interaction`."

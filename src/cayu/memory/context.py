@@ -352,8 +352,12 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             raise ValueError(
                 "Custom recall sources cannot use reserved built-in names or channels."
             )
-        if copied_custom and delta_policy is not None:
-            raise ValueError("Custom automatic recall sources do not support memory deltas.")
+        if copied_custom and delta_policy is not None and delta_policy.refresh_on_knowledge_change:
+            raise ValueError(
+                "Custom automatic recall sources do not support memory deltas from knowledge "
+                "changes. Disable refresh_on_knowledge_change and enable "
+                "reanchor_on_projection_loss for canonical knowledge recovery only."
+            )
         expected_channels = _configured_channels(copied_sources)
         expected_channels.update(
             channel for item in copied_custom for channel in item.descriptor.channel_names
@@ -498,7 +502,11 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         return AutomaticRecallPolicy.model_validate(
             {
                 **self._delta_admission_policy().model_dump(mode="python"),
-                "relevance_policy": "cayu.query_concepts.v2",
+                "relevance_policy": (
+                    "cayu.query_concepts.v2"
+                    if self.delta_policy is None
+                    else self.delta_policy.reanchor_relevance_policy
+                ),
                 "relevance_text_version": None,
             }
         )
@@ -1097,7 +1105,11 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         policy = self.delta_policy
         delta_state = state.get("delta_state")
-        if policy is None or type(delta_state) is not dict:
+        if (
+            policy is None
+            or not policy.refresh_on_knowledge_change
+            or type(delta_state) is not dict
+        ):
             return state, None
         if (
             delta_state["original_projection_suppressed"]
