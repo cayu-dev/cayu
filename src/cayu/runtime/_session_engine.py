@@ -25879,6 +25879,9 @@ class SessionEngine:
                 ):
                     pass
 
+            # Exception targets are cleared when their handler exits. Retained
+            # cleanup needs only the safe deadline evidence, not the exception.
+            native_admission_deadline = provider_cancellation_admission_deadline(cancellation)
             cancellation_terminal_event: Event | None = None
             deadline_expired = expired_execution_deadline() is not None
 
@@ -25906,9 +25909,7 @@ class SessionEngine:
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
                             provider_cancellation_failures=(provider_cancellation_diagnostics),
-                            native_admission_deadline=provider_cancellation_admission_deadline(
-                                cancellation
-                            ),
+                            native_admission_deadline=native_admission_deadline,
                             execution_profile=execution_profile,
                             invocation_context=invocation_context,
                         )
