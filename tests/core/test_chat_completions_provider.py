@@ -3314,7 +3314,7 @@ async def test_chat_transport_rejects_conflicting_http_context_identity(monkeypa
             timeout: Any = None,
             extensions: dict[str, Any] | None = None,
         ) -> ResponseContext:
-            del method, url, headers, json, timeout
+            del method, url, headers, json, timeout, extensions
             return ResponseContext()
 
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", FailingClient)

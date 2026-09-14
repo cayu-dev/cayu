@@ -506,6 +506,10 @@ def test_real_docker_native_child_completed_result_survives_cancellation(
 
     from cayu.providers.base import ModelStreamEvent
 
+    host_ownership = (
+        f" && chown {os.getuid()}:{os.getgid()} shell.txt" if os.name == "posix" else ""
+    )
+
     class ContainerProvider(_ScriptedProvider):
         async def stream(self, request):
             self.requests += 1
@@ -513,7 +517,15 @@ def test_real_docker_native_child_completed_result_survives_cancellation(
                 yield ModelStreamEvent.tool_call(
                     id="call-shell",
                     name="exec_command",
-                    arguments={"argv": ["sh", "-c", "printf created > shell.txt"]},
+                    # Give the exact bind-mounted file back to the host test
+                    # identity, which overwrites it to detect stale replay.
+                    arguments={
+                        "argv": [
+                            "sh",
+                            "-c",
+                            "printf created > shell.txt" + host_ownership,
+                        ]
+                    },
                 )
                 yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
             else:

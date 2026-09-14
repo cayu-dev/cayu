@@ -6355,28 +6355,24 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
         from cayu.storage.postgres import PostgresKnowledgeStore
 
         await _drop_all(postgres_dsn)
-        creator = PostgresKnowledgeStore(
+        # Build the actual predecessor schema, including its index predicates,
+        # rather than relabeling a current database as revision 66.
+        await _initialize_historical_schema(postgres_dsn, through_revision=66)
+        await _insert_pre_revision_65_entry(
             postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.CREATE,
-            access_scope=_ACCESS_SCOPE,
+            KnowledgeEntry(
+                id="revision-66-entry",
+                text="Preserve this exact revision.",
+            ),
         )
-        try:
-            await creator.ensure_schema()
-            await creator.create_entry(
-                KnowledgeEntry(
-                    id="revision-66-entry",
-                    text="Preserve this exact revision.",
-                )
-            )
-        finally:
-            await creator.close()
-        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 67")
-            await connection.commit()
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (66,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_maintenance_proposals')")
+            assert await cursor.fetchone() == (None,)
 
         migrator = PostgresKnowledgeStore(
             postgres_dsn,

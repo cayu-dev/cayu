@@ -36,6 +36,11 @@ from cayu._validation import (
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage._knowledge_closure import (
+    KnowledgeClosureInventory,
+    KnowledgeClosureQuery,
+    copy_knowledge_closure_query,
+)
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -2273,6 +2278,76 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 deny_inaccessible=False,
             )
         return None if record is None else copy_knowledge_maintenance_decision_receipt(record[2])
+
+    async def inspect_closure_sources(self, query: KnowledgeClosureQuery) -> dict[str, object]:
+        query = copy_knowledge_closure_query(query)
+        inventory = KnowledgeClosureInventory(query)
+        revisions: set[tuple[str, int]] = set()
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                for start in range(0, max(len(query.sources), len(query.source_uris)), 100):
+                    batch = query.sources[start : start + 100]
+                    uri_batch = query.source_uris[start : start + 100]
+                    predicates = " OR ".join(
+                        ["(source_type = ? AND source_id = ?)"] * len(batch)
+                        + ["(source_type = ? AND source_uri = ?)"] * len(uri_batch)
+                    )
+                    params = tuple(value for pair in (*batch, *uri_batch) for value in pair)
+                    sizes = self._connection.execute(
+                        "SELECT COUNT(*), MAX("
+                        "length(CAST(locator_json AS BLOB)) + length(CAST(metadata_json AS BLOB))"
+                        ") FROM cayu_knowledge_evidence WHERE " + predicates,
+                        params,
+                    ).fetchone()
+                    if sizes[0] > query.max_records or (sizes[1] or 0) > query.max_bytes:
+                        raise ValueError("Knowledge closure inventory exceeds its bounds.")
+                    cursor = self._connection.execute(
+                        "SELECT * FROM cayu_knowledge_evidence WHERE "
+                        + predicates
+                        + " ORDER BY id LIMIT ?",
+                        (*params, query.max_records + 1),
+                    )
+                    try:
+                        for row in cursor:
+                            if (
+                                len(row["locator_json"].encode())
+                                + len(row["metadata_json"].encode())
+                                > query.max_bytes
+                            ):
+                                raise ValueError(
+                                    "Knowledge closure evidence exceeds its byte bound."
+                                )
+                            revisions.add(inventory.add_evidence(_evidence_from_row(row)))
+                    finally:
+                        cursor.close()
+                    cursor = self._connection.execute(
+                        "SELECT entry_id, revision, source_type, source_id, source_uri, source_hash "
+                        "FROM cayu_knowledge_revisions WHERE "
+                        + predicates
+                        + " ORDER BY entry_id, revision LIMIT ?",
+                        (*params, query.max_records + 1),
+                    )
+                    try:
+                        for row in cursor:
+                            revisions.add(inventory.add_revision(*tuple(row)))
+                    finally:
+                        cursor.close()
+                ordered_revisions = sorted(revisions)
+                for start in range(0, len(ordered_revisions), 100):
+                    batch = ordered_revisions[start : start + 100]
+                    predicates = " OR ".join(["(entry_id = ? AND entry_revision = ?)"] * len(batch))
+                    cursor = self._connection.execute(
+                        "SELECT * FROM cayu_knowledge_index_readiness_events WHERE "
+                        + predicates
+                        + " ORDER BY sequence LIMIT ?",
+                        (*[value for pair in batch for value in pair], query.max_records + 1),
+                    )
+                    try:
+                        for row in cursor:
+                            inventory.add_readiness(_index_readiness_from_row(row))
+                    finally:
+                        cursor.close()
+                return inventory.document()
 
     async def read_evidence(
         self,

@@ -75,6 +75,33 @@ def test_read_only_session_store_does_not_create_missing_database(tmp_path) -> N
     assert not missing.parent.exists()
 
 
+def test_sqlite_session_closure_progress_survives_reopen(tmp_path) -> None:
+    db_path = tmp_path / "closure-progress.sqlite"
+    progress = {
+        "schema_version": 1,
+        "root_session_id": "root",
+        "plan_id": "a" * 64,
+        "policy_digest": "b" * 64,
+        "max_records": 1000,
+        "max_bytes": 1000000,
+        "phase": "recursive",
+        "descendants": [{"session_id": "child", "parent_session_id": "root"}],
+        "completed": ["child"],
+    }
+
+    async def run() -> None:
+        first = SQLiteSessionStore(db_path)
+        await first.save_session_closure_progress(progress)
+        await first.close()
+        reopened = SQLiteSessionStore(db_path)
+        try:
+            assert await reopened.load_session_closure_progress("root", "a" * 64) == progress
+        finally:
+            await reopened.close()
+
+    asyncio.run(run())
+
+
 def test_sqlite_workflow_replay_query_uses_step_and_attempt_indexes(tmp_path) -> None:
     db_path = tmp_path / "workflow-replay.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -3336,6 +3363,9 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (83, 83),
         (84, 84),
         (85, 85),
+        (86, 85),
+        (87, 87),
+        (88, 88),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3432,7 +3462,10 @@ def test_sqlite_task_store_validation_requires_revision_seventy_six(tmp_path) ->
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 84"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_TASK_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,

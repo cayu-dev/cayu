@@ -25,6 +25,7 @@ from cayu._validation import (
     require_nonblank,
     thaw_json_value,
 )
+from cayu.artifacts._closure import ArtifactClosureClaim
 
 _ARTIFACT_CONTENT_TYPE_MAX_LENGTH = 1024
 
@@ -410,6 +411,41 @@ class ArtifactStore(ABC):
         Implementations should raise ``ArtifactStoreUnavailableError`` for
         operational backend failures.
         """
+
+    @property
+    def supports_session_closure_claims(self) -> bool:
+        """Whether closure fences publication and retains an exact durable set."""
+        return False
+
+    async def load_session_closure_claim(self, session_id: str) -> ArtifactClosureClaim | None:
+        """Load a retained claim without acquiring authority or mutating artifacts."""
+        raise NotImplementedError("Artifact store does not support closure claims.")
+
+    async def claim_session_closure(
+        self, session_id: str, plan_id: str, *, max_records: int, max_bytes: int
+    ) -> ArtifactClosureClaim:
+        """Fence a session and durably capture its complete artifact set.
+
+        Claim acquisition must serialize with every session-scoped publication.
+        An accepted claim proves earlier writes have settled and blocks later
+        writes, including after process restart. Uncertain external mutations
+        cannot be treated as quiescent. Exact replay returns the original set,
+        including artifacts already deleted; a different plan is a conflict.
+        The claim remains durable after the last artifact is deleted.
+        """
+        raise NotImplementedError("Artifact store does not support closure claims.")
+
+    async def delete_session_closure_artifact(
+        self, claim: ArtifactClosureClaim, artifact_id: str
+    ) -> None:
+        """Delete only an item authenticated by the exact retained claim.
+
+        Validate the complete claim, item membership, session ownership, and
+        immutable metadata digest before mutation. An absent claimed item is
+        idempotent success; a replacement under the same ID is a conflict.
+        Cancellation does not release an in-flight deletion's ownership.
+        """
+        raise NotImplementedError("Artifact store does not support claimed deletion.")
 
     @property
     def supports_pins(self) -> bool:

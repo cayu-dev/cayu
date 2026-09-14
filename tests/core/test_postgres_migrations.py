@@ -215,6 +215,75 @@ def test_revision_seventy_six_builds_bounded_continuation_index_concurrently() -
     assert postgres_storage._required_concurrent_indexes(76)[-1] == generation_index
 
 
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_pending_action_index_upgrade_preserves_exact_replacement_contract(
+    postgres_dsn: str, conflicting: bool
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        old = next(
+            index
+            for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+            if index.index_name == "idx_cayu_events_pending_action_lookup"
+        )
+        statement = old.transactional_create_statement()
+        if conflicting:
+            statement = statement.replace("'session.interrupted'", "'custom.unrelated'")
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+                await cur.execute(statement)
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 86")
+            await conn.commit()
+
+        migrated = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            if conflicting:
+                with pytest.raises(RuntimeError, match="conflicts with the required"):
+                    await migrated.ensure_schema()
+                return
+            await migrated.ensure_schema()
+        finally:
+            await migrated.close()
+        reopened = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            await reopened.ensure_schema()
+        finally:
+            await reopened.close()
+
+    asyncio.run(runner())
+
+
+def test_closure_revisions_preserve_health_and_defer_pending_action_index() -> None:
+    assert "idx_cayu_side_effect_health" in " ".join(postgres_storage._MIGRATION_STEPS[86])
+    assert "cayu_session_closure_tombstones" in " ".join(postgres_storage._MIGRATION_STEPS[87])
+    assert "cayu_task_session_closure_claims" in " ".join(postgres_storage._MIGRATION_STEPS[88])
+    original = next(
+        index
+        for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+        if index.index_name == "idx_cayu_events_pending_action_lookup"
+    )
+    effective = next(
+        index
+        for index in postgres_storage._required_concurrent_indexes(88)
+        if index.index_name == "idx_cayu_events_pending_action_lookup"
+    )
+    assert effective == original
+
+
 def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg
@@ -1042,6 +1111,12 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    latest_breaking = max(
+        revision.revision
+        for revision in schema.REVISIONS
+        if revision.kind is schema.RevisionKind.BREAKING
+    )
+
     async def prepare() -> None:
         import psycopg
 
@@ -1053,8 +1128,8 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
             await creator.close()
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             await conn.execute(
-                "DELETE FROM cayu_schema_migrations WHERE revision = %s",
-                (schema.LATEST_REVISION,),
+                "DELETE FROM cayu_schema_migrations WHERE revision IN (%s, %s)",
+                (latest_breaking, schema.LATEST_REVISION),
             )
             await conn.commit()
 
@@ -1096,7 +1171,7 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
                 postgres_dsn,
                 "--waive-backup",
                 "--acknowledge-breaking",
-                str(schema.LATEST_REVISION),
+                str(latest_breaking),
             ]
         )
         == 1
@@ -2605,6 +2680,8 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
                 await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
                 await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade")
+                # Rebuild the index from its historical revision-17 definition.
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
@@ -2654,6 +2731,8 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
                 await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
                 await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP INDEX idx_cayu_events_session_sequence")
+                # Rebuild this later index from its actual historical revision.
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)

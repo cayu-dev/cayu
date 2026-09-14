@@ -28,6 +28,15 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.artifacts._closure import ArtifactClosureClaim, copy_artifact_closure_claim
+from cayu.artifacts._listing import BoundedArtifactListing
+from cayu.artifacts._local_closure import (
+    claim_session,
+    closure_lock,
+    delete_claimed_artifact,
+    load_claim,
+    require_publication_open,
+)
 from cayu.artifacts._settlement import (
     _absent_artifact_write,
     _ArtifactWritePhaseReporter,
@@ -286,6 +295,44 @@ class LocalArtifactStore(ArtifactStore):
             ) from exc
 
     @property
+    def supports_session_closure_claims(self) -> bool:
+        return _supports_durable_publication()
+
+    async def load_session_closure_claim(self, session_id: str) -> ArtifactClosureClaim | None:
+        return await asyncio.to_thread(
+            load_claim, self.root, self._root_identity, self.id, session_id
+        )
+
+    async def claim_session_closure(
+        self, session_id: str, plan_id: str, *, max_records: int, max_bytes: int
+    ) -> ArtifactClosureClaim:
+        return await asyncio.to_thread(
+            claim_session,
+            self.root,
+            self._root_identity,
+            self.id,
+            session_id,
+            plan_id,
+            max_records,
+            max_bytes,
+        )
+
+    async def delete_session_closure_artifact(
+        self, claim: ArtifactClosureClaim, artifact_id: str
+    ) -> None:
+        claim = copy_artifact_closure_claim(claim)
+        if claim.store_id != self.id:
+            raise ValueError("Artifact closure store conflicts.")
+        await asyncio.to_thread(
+            _delete_artifact,
+            self.root,
+            self._root_identity,
+            artifact_id,
+            closure_claim=claim,
+            store_id=self.id,
+        )
+
+    @property
     def supports_pins(self) -> bool:
         return _supports_durable_publication()
 
@@ -389,10 +436,13 @@ def _artifact_lock_key(artifact_id: str) -> str:
 def _artifact_ownership_lock(root: Path, artifact_id: str) -> Iterator[None]:
     """Serialize one artifact through a bounded cross-process lock namespace."""
 
-    with cooperative_path_lock(
-        root,
-        _artifact_lock_key(artifact_id),
-        lock_directory_name=_ARTIFACT_LOCK_DIRECTORY_NAME,
+    with (
+        cooperative_path_lock(
+            root,
+            _artifact_lock_key(artifact_id),
+            lock_directory_name=_ARTIFACT_LOCK_DIRECTORY_NAME,
+        ),
+        closure_lock(root),
     ):
         yield
 
@@ -842,6 +892,7 @@ def _write_generated_artifact(
     try:
         with _artifact_ownership_lock(root, artifact.id):
             try:
+                require_publication_open(root, root_identity, artifact)
                 published_identity = _write_artifact(
                     root,
                     root_identity,
@@ -892,6 +943,7 @@ def _put_deterministic_artifact(
     report_phase: Callable[[ArtifactWriteSettlementPhase], None],
 ) -> ArtifactMetadata:
     with _artifact_ownership_lock(root, artifact.id):
+        require_publication_open(root, root_identity, artifact)
         for attempt in range(3):
             try:
                 _write_artifact(
@@ -1187,16 +1239,27 @@ def _list_artifacts(
     environment_name: str | None,
     limit: int | None,
 ) -> ArtifactListResult:
-    artifacts: list[ArtifactMetadata] = []
-    with _open_store_root(root, root_identity) as root_fd:
-        names = os.listdir(root_fd) if root_fd is not None else os.listdir(root)
-        for name in names:
+    inventory = BoundedArtifactListing(limit)
+    with (
+        _open_store_root(root, root_identity) as root_fd,
+        os.scandir(root_fd if root_fd is not None else root) as entries,
+    ):
+        for entry in entries:
+            name = entry.name
             if _ARTIFACT_ID_PATTERN.fullmatch(name) is None:
                 continue
             try:
                 artifact = _load_metadata(root / name, parent_fd=root_fd)
-            except (FileNotFoundError, ValueError):
-                continue
+            except FileNotFoundError:
+                # Only a disappeared entry is absent. Missing files inside a
+                # surviving artifact cannot prove a complete ownership inventory.
+                try:
+                    _stat_directory_entry(root / name, parent_fd=root_fd)
+                except FileNotFoundError:
+                    continue
+                raise ValueError(
+                    "Local artifact inventory contains an incomplete artifact."
+                ) from None
             if scope is not None and artifact.scope != scope:
                 continue
             if session_id is not None and artifact.session_id != session_id:
@@ -1205,30 +1268,28 @@ def _list_artifacts(
                 continue
             if environment_name is not None and artifact.environment_name != environment_name:
                 continue
-            artifacts.append(artifact)
-
-    artifacts.sort(key=lambda artifact: artifact.created_at, reverse=True)
-    total_count = len(artifacts)
-    truncated = limit is not None and total_count > limit
-    if limit is not None:
-        artifacts = artifacts[:limit]
-    return ArtifactListResult(
-        artifacts=tuple(artifacts),
-        total_count=total_count,
-        truncated=truncated,
-    )
+            inventory.add(artifact)
+    return inventory.result()
 
 
 def _delete_artifact(
     root: Path,
     root_identity: tuple[int, int],
     artifact_id: str,
+    *,
+    closure_claim: ArtifactClosureClaim | None = None,
+    store_id: str | None = None,
 ) -> None:
     target = _artifact_dir(root, artifact_id)
     with (
         _artifact_ownership_lock(root, target.name),
         _open_store_root(root, root_identity) as root_fd,
     ):
+        if closure_claim is not None:
+            delete_claimed_artifact(
+                root, root_identity, root_fd, store_id, closure_claim, artifact_id
+            )
+            return
         try:
             with _open_artifact_directory(target, parent_fd=root_fd) as (
                 directory_fd,
@@ -1452,6 +1513,8 @@ def _write_artifact_file(
     directory_identity: tuple[int, int],
     filename: str,
     content: bytes,
+    *,
+    on_created: Callable[[tuple[int, int]], None] | None = None,
 ) -> None:
     flags = (
         os.O_WRONLY
@@ -1466,6 +1529,8 @@ def _write_artifact_file(
     else:
         file_fd = os.open(directory_path / filename, flags, 0o600)
     try:
+        if on_created is not None:
+            on_created(_stat_identity(os.fstat(file_fd)))
         _require_directory_identity(
             directory_fd,
             directory_path,

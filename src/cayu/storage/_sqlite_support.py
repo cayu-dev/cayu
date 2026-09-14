@@ -4160,6 +4160,63 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
             PRIMARY KEY (session_id, plan_id)
         );
     """,
+    87: """
+        CREATE TABLE IF NOT EXISTS cayu_session_closure_tombstones (
+            root_session_id TEXT COLLATE BINARY NOT NULL,
+            plan_id TEXT COLLATE BINARY NOT NULL CHECK (
+                length(plan_id) = 64 AND plan_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            child_session_id TEXT COLLATE BINARY NOT NULL,
+            original_parent_session_id TEXT COLLATE BINARY NOT NULL,
+            detached_at TEXT NOT NULL,
+            tombstone_json TEXT NOT NULL CHECK (
+                json_valid(tombstone_json)
+                AND json_type(tombstone_json) = 'object'
+                AND length(CAST(tombstone_json AS BLOB)) BETWEEN 1 AND 32768
+            ),
+            PRIMARY KEY (root_session_id, plan_id, child_session_id)
+        );
+    """,
+    88: """
+        CREATE TABLE IF NOT EXISTS cayu_task_session_closure_claims (
+            session_id TEXT COLLATE BINARY PRIMARY KEY,
+            plan_id TEXT COLLATE BINARY NOT NULL CHECK (
+                length(plan_id) = 64 AND plan_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            claim_json TEXT NOT NULL CHECK (
+                json_valid(claim_json) AND json_type(claim_json) = 'object'
+                AND length(CAST(claim_json AS BLOB)) BETWEEN 1 AND 16777216
+            )
+        );
+        CREATE TRIGGER IF NOT EXISTS cayu_task_closure_insert_guard
+        BEFORE INSERT ON cayu_tasks
+        WHEN EXISTS (
+            SELECT 1 FROM cayu_task_session_closure_claims WHERE session_id = NEW.session_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task session is owned by closure.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS cayu_task_closure_update_guard
+        BEFORE UPDATE ON cayu_tasks
+        WHEN EXISTS (
+            SELECT 1 FROM cayu_task_session_closure_claims
+            WHERE session_id IN (OLD.session_id, NEW.session_id)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task session is owned by closure.');
+        END;
+        CREATE TABLE IF NOT EXISTS cayu_session_closure_progress (
+            root_session_id TEXT COLLATE BINARY NOT NULL,
+            plan_id TEXT COLLATE BINARY NOT NULL CHECK (
+                length(plan_id) = 64 AND plan_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            progress_json TEXT NOT NULL CHECK (
+                json_valid(progress_json) AND json_type(progress_json) = 'object'
+                AND length(CAST(progress_json AS BLOB)) BETWEEN 1 AND 384000
+            ),
+            PRIMARY KEY (root_session_id, plan_id)
+        );
+    """,
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY
@@ -6223,6 +6280,8 @@ def reconcile_schema(
         _validate_revision_78_knowledge_semantic_watch_schema(connection)
     if current.revision >= 79:
         _validate_revision_79_child_lifecycle_schema(connection)
+    if current.revision >= 88:
+        _validate_revision_88_closure_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
@@ -8468,6 +8527,22 @@ def _validate_revision_78_knowledge_semantic_watch_schema(
             f"{table!r} conflicts with Cayu's semantic-watch receipt contract. "
             "Run schema_mode=MIGRATE to install revision 78 or recreate the database."
         )
+
+
+def _validate_revision_88_closure_schema(connection: sqlite3.Connection) -> None:
+    for statement in _iter_statements(_MIGRATION_STEPS[88]):
+        match = re.match(r"CREATE (TABLE|TRIGGER) IF NOT EXISTS (\w+)", statement)
+        if match is None:
+            raise RuntimeError("Unrecognized closure schema definition.")
+        object_type, name = match.groups()
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type.lower(), name),
+        ).fetchone()
+        if row is None or _normalize_sqlite_schema_definition(row[0]) != (
+            _normalize_sqlite_schema_definition(statement)
+        ):
+            raise RuntimeError("SQLite closure schema is missing or conflicts with its contract.")
 
 
 def _validate_revision_79_child_lifecycle_schema(connection: sqlite3.Connection) -> None:
@@ -10878,6 +10953,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_78_knowledge_semantic_watch_schema(connection)
         if rev.revision == 79:
             _validate_revision_79_child_lifecycle_schema(connection)
+        if rev.revision == 88:
+            _validate_revision_88_closure_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

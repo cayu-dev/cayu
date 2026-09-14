@@ -12,6 +12,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+from itertools import chain
 from math import sqrt
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from uuid import uuid4
@@ -38,6 +39,11 @@ from cayu.embeddings import (
     TextEmbeddingProvider,
     TextEmbeddingRequest,
     copy_text_embedding_result,
+)
+from cayu.storage._knowledge_closure import (
+    KnowledgeClosureInventory,
+    KnowledgeClosureQuery,
+    copy_knowledge_closure_query,
 )
 
 if TYPE_CHECKING:
@@ -4024,6 +4030,15 @@ class KnowledgeChangeConsumerState(BaseModel):
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
+    async def inspect_closure_sources(self, query: KnowledgeClosureQuery) -> dict[str, object]:
+        """Inventory retained evidence and projections for exact source identities.
+
+        This administrative seam does not expose source payloads, knowledge
+        content, metadata, or vectors. Unsupported stores must refuse rather
+        than acknowledge an empty inventory.
+        """
+        raise NotImplementedError("Knowledge store does not support closure source inventory.")
+
     _default_access_scope: KnowledgeAccessScope | None = None
 
     def bound_access_scope(self) -> KnowledgeAccessScope | None:
@@ -4595,6 +4610,74 @@ class KnowledgeStore(ABC):
 
 class InMemoryKnowledgeStore(KnowledgeStore):
     """In-memory knowledge store for tests, demos, and single-process apps."""
+
+    async def inspect_closure_sources(self, query: KnowledgeClosureQuery) -> dict[str, object]:
+        query = copy_knowledge_closure_query(query)
+        inventory = KnowledgeClosureInventory(query)
+        sources = frozenset(query.sources)
+        source_uris = frozenset(query.source_uris)
+        revisions: set[tuple[str, int]] = set()
+        for entry_id, versions in self._entries.items():
+            for revision, entry in versions.items():
+                if (
+                    type(entry) is not KnowledgeEntry
+                    or (entry.source_type is not None and type(entry.source_type) is not str)
+                    or (entry.source_id is not None and type(entry.source_id) is not str)
+                    or (entry.source_uri is not None and type(entry.source_uri) is not str)
+                ):
+                    raise ValueError("Knowledge closure revision source is malformed.")
+                if (entry.source_type, entry.source_id) not in sources and (
+                    entry.source_type,
+                    entry.source_uri,
+                ) not in source_uris:
+                    continue
+                if inventory.add_revision(
+                    entry.id,
+                    entry.revision,
+                    entry.source_type,
+                    entry.source_id,
+                    entry.source_uri,
+                    entry.source_hash,
+                ) != (entry_id, revision):
+                    raise ValueError("Knowledge closure revision ownership conflicts.")
+                revisions.add((entry_id, revision))
+        for revision, records in self._evidence.items():
+            for evidence in records:
+                # Validate decision-bearing scalars before hashing or membership
+                # lookup; do not serialize an extension-mutated model.
+                if (
+                    type(evidence) is not KnowledgeEvidence
+                    or type(evidence.source_type) is not str
+                    or (evidence.source_id is not None and type(evidence.source_id) is not str)
+                    or (evidence.source_uri is not None and type(evidence.source_uri) is not str)
+                ):
+                    raise ValueError("Knowledge closure source evidence is malformed.")
+                if (evidence.source_type, evidence.source_id) not in sources and (
+                    evidence.source_type,
+                    evidence.source_uri,
+                ) not in source_uris:
+                    continue
+                if inventory.add_evidence(evidence) != revision:
+                    raise ValueError("Knowledge closure revision ownership conflicts.")
+                revisions.add(revision)
+        self._add_closure_projections(inventory, revisions)
+        for readiness in self._index_readiness:
+            if (
+                type(readiness) is not KnowledgeIndexReadiness
+                or type(readiness.identity) is not KnowledgeEmbeddingIdentity
+                or type(readiness.identity.entry_id) is not str
+                or type(readiness.identity.entry_revision) is not int
+            ):
+                raise ValueError("Knowledge closure readiness identity is malformed.")
+            if (readiness.identity.entry_id, readiness.identity.entry_revision) in revisions:
+                inventory.add_readiness(readiness)
+        return inventory.document()
+
+    def _add_closure_projections(
+        self, inventory: KnowledgeClosureInventory, revisions: set[tuple[str, int]]
+    ) -> None:
+        # Keyword-only memory has no stored embedding projections.
+        return None
 
     def __init__(
         self,
@@ -7687,6 +7770,26 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
     keeps vectors in memory and does not persist them. Durable production vector
     search should use a store with a real vector index.
     """
+
+    def _add_closure_projections(
+        self, inventory: KnowledgeClosureInventory, revisions: set[tuple[str, int]]
+    ) -> None:
+        # Historical attempts remain real stored derivatives. Current/history
+        # overlap is identity-deduplicated by the inventory collector.
+        for history in chain((self._chunk_embeddings,), self._chunk_embedding_history.values()):
+            for stored in history.values():
+                identity = copy_knowledge_embedding_identity(stored["identity"])
+                if (identity.entry_id, identity.entry_revision) not in revisions:
+                    continue
+                inventory.add(
+                    "knowledge_projections",
+                    {
+                        "identity": identity.model_dump(mode="json"),
+                        "attempt_id": stored["attempt_id"],
+                        "readiness_sequence": stored["readiness_sequence"],
+                        "vector_sha256": stored["vector_sha256"],
+                    },
+                )
 
     def __init__(
         self,

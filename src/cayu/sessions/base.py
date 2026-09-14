@@ -9826,6 +9826,9 @@ class SessionStore(ABC):
     # after the session row has been removed.  Stores opt in only when they can
     # persist that receipt as part of their deletion/recovery boundary.
     supports_session_closure_receipts: ClassVar[bool] = False
+    supports_session_closure_detachment: ClassVar[bool] = False
+    supports_session_closure_recursive_deletion: ClassVar[bool] = False
+    supports_session_closure_progress: ClassVar[bool] = False
     supports_completion_result_event_publication_reservations: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
     supports_recall_evidence: ClassVar[bool] = False
@@ -12296,6 +12299,24 @@ class SessionStore(ABC):
         snapshot before any pending state is interpreted.
         """
 
+    async def validate_session_closure_admission(self, session_id: str) -> None:
+        """Check every native active-operation/deletion guard without mutation.
+
+        Read the guards in one store snapshot. This preflight is not an
+        ownership claim and does not replace final atomic deletion checks.
+        """
+        raise NotImplementedError("This SessionStore does not support closure admission.")
+
+    async def load_session_closure_records(
+        self, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        """Return a bounded native closure snapshot with per-class counts/bytes.
+
+        Read all included classes under one store snapshot. Exceeding a bound
+        must return no partial records. Unsupported stores must fail explicitly.
+        """
+        raise NotImplementedError("This SessionStore does not support closure record snapshots.")
+
     async def delete_session(
         self,
         session_id: str,
@@ -12310,17 +12331,64 @@ class SessionStore(ABC):
         budget reservations has no fully delivered terminal settlement audit event.
         Durable subagent children must be settled and deleted before their parent so
         deletion cannot erase queue-admission authority while child work still exists.
+        When ``closure_receipt`` is supplied, reject every remaining child edge
+        in the deletion transaction, including non-subagent children. Closure
+        callers must detach or delete those edges explicitly before finalization.
         Idempotent: deleting a session that does not exist is a no-op.
 
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.
         """
         raise NotImplementedError("This SessionStore does not support delete_session.")
 
+    async def detach_session_children(
+        self,
+        parent_session_id: str,
+        child_session_ids: tuple[str, ...],
+        *,
+        closure_receipt: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically detach children and retain auditable lineage tombstones.
+
+        Replay binds the root/plan, original parent and exact unordered child
+        set. A conflicting replay or invalid child must mutate no batch member.
+        """
+        raise NotImplementedError("This SessionStore does not support child detachment.")
+
+    async def load_session_closure_tombstones(
+        self, root_session_id: str, plan_id: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Load durable lineage tombstones for one closure operation."""
+        raise NotImplementedError("This SessionStore does not support closure tombstones.")
+
     async def load_session_closure_receipt(
         self, session_id: str, plan_id: str
     ) -> dict[str, Any] | None:
         """Load an exact durable closure receipt, if this store supports them."""
         raise NotImplementedError("This SessionStore does not support session closure receipts.")
+
+    async def load_session_closure_progress(
+        self, session_id: str, plan_id: str
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError("This SessionStore does not support closure progress.")
+
+    async def save_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        raise NotImplementedError("This SessionStore does not support closure progress.")
+
+    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        """Atomically validate and reserve a recursive plan's current lineage.
+
+        Verify the complete recursive edge set, not just the listed edges,
+        including plans with no descendants. Reject unexplained additions before
+        publishing ownership. Creation must serialize with this admission and
+        reject destinations retired by retained closure claims or receipts.
+        Validate every target's native inventory against progress max_records
+        and max_bytes in that transaction, before publishing any claim. Replay
+        must preserve these admitted limits as part of the exact plan.
+        Retain ownership across failures and restart. Detachment and competing
+        deletion must reject claimed sessions; only exact closure deletion may
+        consume them. No lease expiry may release a still-live cleanup owner.
+        """
+        raise NotImplementedError("This SessionStore does not support closure lineage claims.")
 
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         """Replace a session's labels (full replacement, not a merge) and return it.
@@ -12702,10 +12770,229 @@ class _InMemoryMessageDeliveryRecord:
     reject_only: bool = False
 
 
+def _validate_session_closure_detach_replay(
+    tombstones: tuple[dict[str, Any], ...],
+    *,
+    root_id: str,
+    plan_id: str,
+    parent_session_id: str,
+    child_session_ids: tuple[str, ...],
+) -> None:
+    if (
+        len(tombstones) != len(child_session_ids)
+        or {item.get("child_session_id") for item in tombstones} != set(child_session_ids)
+        or any(
+            item.get("root_session_id") != root_id
+            or item.get("plan_id") != plan_id
+            or item.get("original_parent_session_id") != parent_session_id
+            for item in tombstones
+        )
+    ):
+        raise ValueError("Closure detachment replay identity conflict.")
+
+
+def _closure_progress_targets(progress: dict[str, Any]) -> set[str]:
+    return {progress["root_session_id"], *(item["session_id"] for item in progress["descendants"])}
+
+
+def _check_closure_lineage_owner(
+    progress: dict[str, Any], session_ids: Iterable[str], receipt: dict[str, Any] | None = None
+) -> None:
+    """Only the exact recursive owner may delete a claimed session."""
+    from cayu.runtime.session_closure import session_closure_target_plan_id
+
+    for session_id in set(session_ids) & _closure_progress_targets(progress):
+        root_id, plan_id = progress["root_session_id"], progress["plan_id"]
+        expected_plan = (
+            plan_id
+            if session_id == root_id
+            else session_closure_target_plan_id(plan_id, session_id)
+        )
+        if receipt is None or receipt.get("plan_id") != expected_plan:
+            raise ValueError("Session lineage is owned by an unfinished recursive closure.")
+        if session_id != root_id and (
+            receipt.get("root_session_id") != root_id
+            or receipt.get("target_session_id") != session_id
+            or receipt.get("operation") != "recursive"
+        ):
+            raise ValueError("Recursive closure deletion owner conflicts.")
+
+
+def _validate_closure_progress_update(existing: dict[str, Any], proposed: dict[str, Any]) -> None:
+    for key in (
+        "schema_version",
+        "root_session_id",
+        "plan_id",
+        "policy_digest",
+        "max_records",
+        "max_bytes",
+        "phase",
+        "descendants",
+    ):
+        if existing.get(key) != proposed.get(key):
+            raise ValueError("Closure progress identity conflict.")
+    if not set(existing["completed"]) <= set(proposed["completed"]):
+        raise ValueError("Closure progress cannot forget completed descendants.")
+
+
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
     supports_session_closure_receipts: ClassVar[bool] = True
+    supports_session_closure_detachment: ClassVar[bool] = True
+    supports_session_closure_recursive_deletion: ClassVar[bool] = True
+    supports_session_closure_progress: ClassVar[bool] = True
+
+    async def load_session_closure_records(
+        self, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        async with self._lock:
+            return self._load_session_closure_records_unlocked(
+                session_id, max_records=max_records, max_bytes=max_bytes
+            )
+
+    def _load_session_closure_records_unlocked(
+        self, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        from cayu.runtime._session_closure_records import ClosureRecordsBuilder
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        builder = ClosureRecordsBuilder(max_records=max_records, max_bytes=max_bytes)
+        session = self._sessions.get(session_id)
+        builder.add_class(
+            "session",
+            ()
+            if session is None
+            else (
+                {
+                    name: getattr(session, name)
+                    for name in type(session).model_fields
+                    if name not in {"labels", "metadata"}
+                },
+            ),
+        )
+        builder.add_class(
+            "labels",
+            ()
+            if session is None
+            else ({"key": key, "value": value} for key, value in session.labels.items()),
+        )
+        builder.add_class("metadata", () if session is None else (session.metadata,))
+        builder.add_class(
+            "recall_receipts",
+            (
+                self._recall_receipts[receipt_id]
+                for _, receipt_id in self._recall_receipt_page_keys_by_session.get(session_id, ())
+            ),
+        )
+        builder.add_class(
+            "context_exposures",
+            (
+                self._context_exposures[exposure_id]
+                for _, exposure_id in self._context_exposure_page_keys_by_session.get(
+                    session_id, ()
+                )
+            ),
+        )
+        builder.add_class(
+            "recall_item_exposures",
+            (
+                item
+                for _, exposure_id in self._context_exposure_page_keys_by_session.get(
+                    session_id, ()
+                )
+                for item in self._recall_item_exposures[exposure_id]
+            ),
+        )
+        builder.add_class("events", self._session_event_records.get(session_id, ()))
+        builder.add_class(
+            "transcript",
+            (
+                {
+                    "transcript_index": index,
+                    "message": message,
+                    "interaction_id": self._transcript_interaction_ids[session_id][index],
+                }
+                for index, message in enumerate(self._transcripts.get(session_id, ()))
+            ),
+        )
+        checkpoint = self._checkpoints.get(session_id)
+        builder.add_class("checkpoint", () if checkpoint is None else (checkpoint,))
+        builder.add_class(
+            "queued_messages",
+            (
+                {
+                    "message": message,
+                    "terminal": self._session_message_terminal_receipts.get(
+                        (session_id, message.queue_id)
+                    ),
+                }
+                for message in self._queued_session_messages_by_idempotency.get(
+                    session_id, {}
+                ).values()
+            ),
+        )
+        builder.add_class(
+            "session_operations",
+            (
+                {"idempotency_key": key, "record": value}
+                for key, value in self._session_operation_records.get(session_id, {}).items()
+            ),
+        )
+        builder.add_class(
+            "event_side_effect_deliveries",
+            (
+                delivery
+                for record in self._session_event_records.get(session_id, ())
+                if (
+                    delivery := self._persisted_event_side_effect_deliveries.get(
+                        (session_id, record.event.id)
+                    )
+                )
+                is not None
+            ),
+        )
+        builder.add_class(
+            "queue_deliveries",
+            (
+                {
+                    "delivery_id": key,
+                    "session_id": value.session_id,
+                    "include_on_idle": value.include_on_idle,
+                    "requested_eligible_through": value.requested_eligible_through,
+                    "eligible_through": value.batch.eligible_through,
+                    "batch_limit": value.limit,
+                    "has_more": value.batch.has_more,
+                    "interaction_id": value.interaction_id,
+                    "interaction_started_event": value.interaction_started_event,
+                    "queue_ids": [message.queue_id for message in value.batch.messages],
+                    "events": value.batch.events,
+                    "reject_only": value.reject_only,
+                }
+                for key, value in self._session_message_delivery_records.items()
+                if value.session_id == session_id
+            ),
+        )
+        deferred = self._deferred_interaction_inputs.get(session_id)
+        builder.add_class("deferred_interaction_inputs", () if deferred is None else (deferred,))
+        builder.add_class(
+            "targeted_tool_grants",
+            (
+                targeted_tool_grant_with_active_reference(
+                    self._targeted_tool_grants[grant_id], self.public_authority_alias_codec
+                )
+                for grant_id in self._targeted_tool_grant_ids_by_session.get(session_id, ())
+            ),
+        )
+        builder.add_class(
+            "targeted_tool_grant_uses",
+            (
+                use
+                for grant_id in self._targeted_tool_grant_ids_by_session.get(session_id, ())
+                for use in self._targeted_tool_uses.get(grant_id, {}).values()
+            ),
+        )
+        return builder.finish()
 
     async def load_session_closure_receipt(
         self, session_id: str, plan_id: str
@@ -12715,6 +13002,145 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             receipt = self._session_closure_receipts.get((session_id, plan_id))
             return None if receipt is None else deepcopy(receipt)
+
+    async def load_session_closure_progress(self, session_id: str, plan_id: str):
+        async with self._lock:
+            value = self._session_closure_progress.get((session_id, plan_id))
+            return None if value is None else deepcopy(value)
+
+    async def save_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        root_id = progress.get("root_session_id")
+        plan_id = progress.get("plan_id")
+        if type(root_id) is not str or type(plan_id) is not str:
+            raise ValueError("Closure progress is missing identity.")
+        async with self._lock:
+            existing = self._session_closure_progress.get((root_id, plan_id))
+            if existing is not None:
+                _validate_closure_progress_update(existing, progress)
+            self._session_closure_progress[(root_id, plan_id)] = deepcopy(progress)
+
+    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        progress = deepcopy(progress)
+        async with self._lock:
+            key = (progress["root_session_id"], progress["plan_id"])
+            existing = self._session_closure_progress.get(key)
+            if existing is not None:
+                _validate_closure_progress_update(existing, progress)
+                return
+            targets = _closure_progress_targets(progress)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, targets)
+            if progress["root_session_id"] not in self._sessions:
+                raise ValueError("Closure root disappeared before lineage admission.")
+            for item in progress["descendants"]:
+                child = self._sessions.get(item["session_id"])
+                if child is None or child.parent_session_id != item["parent_session_id"]:
+                    raise ValueError("Child lineage changed before closure admission.")
+            if progress["phase"] in {"recursive", "reject"}:
+                expected = {
+                    (item["session_id"], item["parent_session_id"])
+                    for item in progress["descendants"]
+                }
+                observed = set()
+                for parent_id in targets:
+                    for _, child_id in self._child_session_keys_by_parent.get(parent_id, ()):
+                        edge = (child_id, parent_id)
+                        if edge not in expected:
+                            raise ValueError("Child lineage changed before closure admission.")
+                        observed.add(edge)
+                if observed != expected:
+                    raise ValueError("Child lineage changed before closure admission.")
+            for target_id in targets:
+                self._require_session_erasure_quiescence_unlocked(self._sessions[target_id])
+                self._load_session_closure_records_unlocked(
+                    target_id, max_records=progress["max_records"], max_bytes=progress["max_bytes"]
+                )
+            self._session_closure_progress[key] = progress
+
+    def _require_available_closure_identity_unlocked(self, session_id: str) -> None:
+        for owner in self._session_closure_progress.values():
+            _check_closure_lineage_owner(owner, (session_id,))
+        if any(target == session_id for target, _plan in self._session_closure_receipts):
+            raise ValueError("Session identity was retired by closure.")
+
+    async def load_session_closure_tombstones(
+        self, root_session_id: str, plan_id: str
+    ) -> tuple[dict[str, Any], ...]:
+        require_clean_nonblank(root_session_id, "root_session_id")
+        require_clean_nonblank(plan_id, "plan_id")
+        async with self._lock:
+            return tuple(
+                deepcopy(value)
+                for (root_id, stored_plan, _child_id), value in sorted(
+                    self._session_closure_tombstones.items()
+                )
+                if root_id == root_session_id and stored_plan == plan_id
+            )
+
+    async def detach_session_children(
+        self,
+        parent_session_id: str,
+        child_session_ids: tuple[str, ...],
+        *,
+        closure_receipt: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        parent_session_id = require_clean_nonblank(parent_session_id, "parent_session_id")
+        child_session_ids = tuple(
+            require_clean_nonblank(child_id, "child_session_id") for child_id in child_session_ids
+        )
+        if len(set(child_session_ids)) != len(child_session_ids):
+            raise ValueError("Detached child session IDs must be unique.")
+        root_id = closure_receipt.get("root_session_id")
+        plan_id = closure_receipt.get("plan_id")
+        if type(root_id) is not str or type(plan_id) is not str:
+            raise ValueError("Closure detachment receipt is missing identity.")
+        async with self._lock:
+            existing = tuple(
+                deepcopy(value)
+                for (stored_root, stored_plan, _child_id), value in sorted(
+                    self._session_closure_tombstones.items()
+                )
+                if stored_root == root_id and stored_plan == plan_id
+            )
+            if existing:
+                _validate_session_closure_detach_replay(
+                    existing,
+                    root_id=root_id,
+                    plan_id=plan_id,
+                    parent_session_id=parent_session_id,
+                    child_session_ids=child_session_ids,
+                )
+                return existing
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, child_session_ids)
+            parent = self._sessions.get(parent_session_id)
+            if parent is None:
+                raise KeyError(parent_session_id)
+            tombstones: list[dict[str, Any]] = []
+            prepared = []
+            detached_at = self._ownership_clock()
+            for child_id in child_session_ids:
+                child = self._sessions.get(child_id)
+                if child is None or child.parent_session_id != parent_session_id:
+                    raise ValueError("Child lineage changed before detachment.")
+                tombstone = {
+                    "root_session_id": root_id,
+                    "plan_id": plan_id,
+                    "child_session_id": child_id,
+                    "original_parent_session_id": parent_session_id,
+                    "detached_at": detached_at.isoformat(),
+                }
+                detached = child.model_copy(
+                    update={"parent_session_id": None, "updated_at": detached_at}
+                )
+                prepared.append((child_id, child, detached, deepcopy(tombstone)))
+                tombstones.append(tombstone)
+            for child_id, child, detached, tombstone in prepared:
+                self._remove_session_parent_index_unlocked(child)
+                self._sessions[child_id] = detached
+                self._refresh_child_lifecycle_candidate_unlocked(detached)
+                self._session_closure_tombstones[(root_id, plan_id, child_id)] = tombstone
+            return tuple(tombstones)
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
@@ -12777,6 +13203,8 @@ class InMemorySessionStore(SessionStore):
         self._lock = asyncio.Lock()
         self._sessions: dict[str, Session] = {}
         self._session_closure_receipts: dict[tuple[str, str], dict[str, Any]] = {}
+        self._session_closure_progress: dict[tuple[str, str], dict[str, Any]] = {}
+        self._session_closure_tombstones: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._public_authority_aliases: dict[tuple[str, str, str], str] = {}
         self._targeted_tool_grants: dict[str, TargetedToolGrantRecord] = {}
         self._targeted_tool_grant_ids_by_session: dict[str, list[str]] = {}
@@ -14078,6 +14506,8 @@ class InMemorySessionStore(SessionStore):
                     event_record.event,
                 )
                 return copy_targeted_tool_grant_record(record)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             uses = self._targeted_tool_uses.get(record.grant_id, {})
             if any(binding.bound_at > revoked_at for binding in uses.values()):
                 raise ValueError("revoked_at cannot precede a bound targeted tool use.")
@@ -14284,6 +14714,7 @@ class InMemorySessionStore(SessionStore):
             raise TypeError("result_checkpoint_transform must be callable.")
         async with self._lock:
             session_id = request.session_id or str(uuid4())
+            self._require_available_closure_identity_unlocked(session_id)
             admission = _copy_optional_interaction_admission(
                 session_id,
                 interaction_started_event,
@@ -14304,6 +14735,9 @@ class InMemorySessionStore(SessionStore):
                 if request.parent_session_id is None
                 else self._sessions[request.parent_session_id]
             )
+            if parent_session is not None:
+                for owner in self._session_closure_progress.values():
+                    _check_closure_lineage_owner(owner, (parent_session.id,))
             now = self._ownership_clock()
             session = Session(
                 id=session_id,
@@ -14569,6 +15003,9 @@ class InMemorySessionStore(SessionStore):
         )
         fork = fork.model_copy(update={"instance_id": str(uuid4())})
         async with self._lock:
+            self._require_available_closure_identity_unlocked(fork.id)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (source_session_id,))
             source_session = _validate_session_fork_source(
                 source_session=self._sessions.get(source_session_id),
                 source_session_id=source_session_id,
@@ -14815,6 +15252,123 @@ class InMemorySessionStore(SessionStore):
             to_status=status,
         )
 
+    def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
+        """Shared admission for closure and final deletion; no mutations."""
+        from cayu.runtime._session_closure_records import require_terminal_protected_effect
+
+        session_id = session.id
+        for key, raw in self._session_operation_records.get(session_id, {}).items():
+            if key.startswith("tool-effect:"):
+                require_terminal_protected_effect(session_id, session.instance_id, key, raw)
+        if session.status in DELETE_BLOCKED_SESSION_STATUSES:
+            raise ValueError("Session closure requires a non-running target.")
+        if any(
+            delivery.session_id == session_id
+            and delivery.status is PersistedEventSideEffectStatus.LEASED
+            for delivery in self._persisted_event_side_effect_deliveries.values()
+        ):
+            raise ValueError("Session closure requires settled event side-effect deliveries.")
+        checkpoint = self._checkpoints.get(session_id)
+        deletion_now = self._ownership_clock()
+        active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+            checkpoint,
+            now=deletion_now,
+        )
+        if active_recovery_claim_id is not None:
+            raise ValueError(
+                "Cannot delete a session while incomplete-session recovery claim "
+                f"{active_recovery_claim_id} is active: {session_id}"
+            )
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        if run_operation is not None:
+            raise ValueError(
+                "Cannot delete a session while terminal publication "
+                f"{run_operation.operation_id} is incomplete: {session_id}"
+            )
+        queued_terminal_receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+        if queued_terminal_receipts:
+            raise ValueError(
+                "Cannot delete a session while queued dispatch terminal "
+                f"acknowledgement is incomplete: {session_id}"
+            )
+        evidence_events: list[Event] = []
+        for record in reversed(self._session_event_records.get(session_id, [])):
+            if record.event.type not in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES:
+                continue
+            evidence_events.append(record.event)
+            if len(evidence_events) == _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT:
+                break
+        terminal_publication_block = _terminal_publication_delete_block_reason(
+            session=session,
+            checkpoint=checkpoint,
+            evidence_events=evidence_events,
+        )
+        if terminal_publication_block is not None:
+            raise ValueError(
+                f"Cannot delete a session while {terminal_publication_block}: {session_id}"
+            )
+        active_operation_id = _active_unexpired_session_operation_id(
+            checkpoint,
+            now=deletion_now,
+        )
+        if active_operation_id is not None:
+            raise ValueError(
+                "Cannot delete a session while durable operation "
+                f"{active_operation_id} is active: {session_id}"
+            )
+        completion_result_publication_block = (
+            _completion_result_event_publication_delete_block_reason(
+                checkpoint,
+                now=deletion_now,
+            )
+        )
+        if completion_result_publication_block is not None:
+            raise ValueError(
+                f"Cannot delete a session while {completion_result_publication_block}: {session_id}"
+            )
+        if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in self._session_operation_records.get(
+            session_id, {}
+        ):
+            raise ValueError(
+                f"Cannot delete a session while a model-completion stage is active: {session_id}"
+            )
+        owned_reservation_ids = {
+            reservation_id
+            for reservation_id, ownership in self._budget_reservation_identities.items()
+            if ownership[0] == session_id
+        }
+        for reservation_id in owned_reservation_ids:
+            terminal_events = [
+                event
+                for event in self._events.get(session_id, [])
+                if event.type
+                in {
+                    EventType.BUDGET_RECONCILED,
+                    EventType.BUDGET_RESERVATION_RELEASED,
+                }
+                and event.payload.get("reservation_id") == reservation_id
+            ]
+            delivery = (
+                None
+                if len(terminal_events) != 1
+                else self._persisted_event_side_effect_deliveries.get(
+                    (session_id, terminal_events[0].id)
+                )
+            )
+            if delivery is None or delivery.status is not PersistedEventSideEffectStatus.DELIVERED:
+                raise ValueError(
+                    "Cannot delete a session while a budget settlement audit "
+                    f"event is pending: {session_id}"
+                )
+
+    async def validate_session_closure_admission(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ValueError("Closure target is unavailable.")
+            self._require_session_erasure_quiescence_unlocked(session)
+
     async def delete_session(
         self,
         session_id: str,
@@ -14826,6 +15380,12 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 return  # idempotent: deleting a missing session is a no-op
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,), closure_receipt)
+            if closure_receipt is not None and closure_receipt.get("operation") == "recursive":
+                expected_parent = closure_receipt.get("original_parent_session_id")
+                if type(expected_parent) is not str or session.parent_session_id != expected_parent:
+                    raise ValueError("Recursive closure child parent identity conflict.")
             if session.status in DELETE_BLOCKED_SESSION_STATUSES:
                 raise ValueError(
                     f"Cannot delete a session while it is {session.status}; "
@@ -14835,107 +15395,13 @@ class InMemorySessionStore(SessionStore):
                 child = self._sessions.get(child_id)
                 if child is None or child.parent_session_id != session_id:
                     raise RuntimeError("Inconsistent in-memory session topology index.")
+                for owner in self._session_closure_progress.values():
+                    _check_closure_lineage_owner(owner, (child_id,))
+                if closure_receipt is not None:
+                    raise ValueError("Closure deletion requires no remaining child edges.")
                 if _is_durable_subagent_child(child):
                     raise ValueError(_durable_subagent_parent_delete_block_reason(child.id))
-            checkpoint = self._checkpoints.get(session_id)
-            deletion_now = self._ownership_clock()
-            active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                checkpoint,
-                now=deletion_now,
-            )
-            if active_recovery_claim_id is not None:
-                raise ValueError(
-                    "Cannot delete a session while incomplete-session recovery claim "
-                    f"{active_recovery_claim_id} is active: {session_id}"
-                )
-            run_operation = _session_run_operation_from_checkpoint(checkpoint)
-            if run_operation is not None:
-                raise ValueError(
-                    "Cannot delete a session while terminal publication "
-                    f"{run_operation.operation_id} is incomplete: {session_id}"
-                )
-            queued_terminal_receipts = _queued_dispatch_terminal_receipts_from_checkpoint(
-                checkpoint
-            )
-            if queued_terminal_receipts:
-                raise ValueError(
-                    "Cannot delete a session while queued dispatch terminal "
-                    f"acknowledgement is incomplete: {session_id}"
-                )
-            evidence_events: list[Event] = []
-            for record in reversed(self._session_event_records.get(session_id, [])):
-                if record.event.type not in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES:
-                    continue
-                evidence_events.append(record.event)
-                if len(evidence_events) == _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT:
-                    break
-            terminal_publication_block = _terminal_publication_delete_block_reason(
-                session=session,
-                checkpoint=checkpoint,
-                evidence_events=evidence_events,
-            )
-            if terminal_publication_block is not None:
-                raise ValueError(
-                    f"Cannot delete a session while {terminal_publication_block}: {session_id}"
-                )
-            active_operation_id = _active_unexpired_session_operation_id(
-                checkpoint,
-                now=deletion_now,
-            )
-            if active_operation_id is not None:
-                raise ValueError(
-                    "Cannot delete a session while durable operation "
-                    f"{active_operation_id} is active: {session_id}"
-                )
-            completion_result_publication_block = (
-                _completion_result_event_publication_delete_block_reason(
-                    checkpoint,
-                    now=deletion_now,
-                )
-            )
-            if completion_result_publication_block is not None:
-                raise ValueError(
-                    "Cannot delete a session while "
-                    f"{completion_result_publication_block}: {session_id}"
-                )
-            if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in self._session_operation_records.get(
-                session_id, {}
-            ):
-                raise ValueError(
-                    "Cannot delete a session while a model-completion stage is active: "
-                    f"{session_id}"
-                )
-            owned_reservation_ids = {
-                reservation_id
-                for reservation_id, ownership in self._budget_reservation_identities.items()
-                if ownership[0] == session_id
-            }
-            for reservation_id in owned_reservation_ids:
-                terminal_events = [
-                    event
-                    for event in self._events.get(session_id, [])
-                    if event.type
-                    in {
-                        EventType.BUDGET_RECONCILED,
-                        EventType.BUDGET_RESERVATION_RELEASED,
-                    }
-                    and event.payload.get("reservation_id") == reservation_id
-                ]
-                delivery = (
-                    None
-                    if len(terminal_events) != 1
-                    else self._persisted_event_side_effect_deliveries.get(
-                        (session_id, terminal_events[0].id)
-                    )
-                )
-                if (
-                    delivery is None
-                    or delivery.status is not PersistedEventSideEffectStatus.DELIVERED
-                ):
-                    raise ValueError(
-                        "Cannot delete a session while a budget settlement audit "
-                        f"event is pending: {session_id}"
-                    )
+            self._require_session_erasure_quiescence_unlocked(session)
             self._remove_session_parent_index_unlocked(session)
             targeted_grant_ids = {
                 grant_id
@@ -15146,6 +15612,8 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             now = self._ownership_clock()
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             updated = session.model_copy(update={"labels": new_labels, "updated_at": now})
             from cayu.runtime._invocation_lifecycle import (
                 require_invocation_lifecycle_release_capacity,
@@ -15166,6 +15634,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             new_metadata = replace_session_user_metadata(session.metadata, user_metadata)
             now = self._ownership_clock()
             updated = session.model_copy(update={"metadata": new_metadata, "updated_at": now})
@@ -15196,6 +15666,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
@@ -15278,6 +15750,8 @@ class InMemorySessionStore(SessionStore):
                         f"Execution-profile rejection id was reused: {copied_event.id}"
                     )
                 return ExecutionProfileRejectionResult(event=existing, replayed=True)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             self._sessions[session_id] = self._append_events_unlocked(
                 session,
                 [copied_event],
@@ -15353,6 +15827,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
@@ -15579,6 +16055,8 @@ class InMemorySessionStore(SessionStore):
                 raise SessionQueuedMessagesPending(
                     f"Session has durable queued messages: {session_id}"
                 )
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             now = self._ownership_clock()
             checkpoint = (
                 None
@@ -15709,6 +16187,8 @@ class InMemorySessionStore(SessionStore):
                 )
             if existing_terminal is not None:
                 raise RuntimeError("Terminal session event exists without its interaction receipt.")
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             current_checkpoint = self._checkpoints.get(session_id)
             if terminalization_only:
                 from cayu.runtime._durable_model_terminalization import (
@@ -16112,6 +16592,8 @@ class InMemorySessionStore(SessionStore):
                 is not None
             ):
                 return None
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             transformed = checkpoint_transform(
                 session.model_copy(deep=True),
                 _copy_checkpoint_for_transform(current, session_id=session_id),
@@ -16150,6 +16632,8 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(f"Session status cannot be fenced: {session.status}")
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             current = self._checkpoints.get(session_id)
             _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                 current,
@@ -16357,6 +16841,8 @@ class InMemorySessionStore(SessionStore):
             _assert_session_run_epoch(publication_session_id, session)
             existing = self._budget_reservation_identities.get(reservation_id)
             if existing is None:
+                for owner in self._session_closure_progress.values():
+                    _check_closure_lineage_owner(owner, (publication_session_id,))
                 self._budget_reservation_identities[reservation_id] = (
                     publication_session_id,
                     publication_id,
@@ -16726,6 +17212,9 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            if copied_events:
+                for owner in self._session_closure_progress.values():
+                    _check_closure_lineage_owner(owner, (session_id,))
             self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
 
     async def append_tool_effect_conflict(self, request: object) -> Event:
@@ -16745,6 +17234,8 @@ class InMemorySessionStore(SessionStore):
             existing = self._event_records_by_id.get((session_id, event.id))
             if existing is not None:
                 return reconcile_tool_effect_conflict_event(event, existing.event)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             prepared = self._prepare_event_append_unlocked(session, [event])
             self._sessions[session_id] = self._apply_event_append_unlocked(
                 session, prepared, activity_at=session.last_activity_at
@@ -16774,6 +17265,8 @@ class InMemorySessionStore(SessionStore):
                 return False
             if (session_id, copied_event.id) in self._event_records_by_id:
                 return False
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             self._sessions[session_id] = self._append_events_unlocked(session, [copied_event])
             return True
 
@@ -16838,6 +17331,8 @@ class InMemorySessionStore(SessionStore):
                 baseline_updates=updates,
                 events=copied_events,
             )
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
             for key, baseline in updates.items():
                 self._mcp_manifest_baselines[key] = baseline.model_copy(deep=True)
@@ -16871,7 +17366,14 @@ class InMemorySessionStore(SessionStore):
                 self._persisted_event_side_effect_deliveries.values(),
                 key=lambda delivery: delivery.event_sequence,
             )
+            closure_targets = {
+                target
+                for owner in self._session_closure_progress.values()
+                for target in _closure_progress_targets(owner)
+            }
             for delivery in deliveries:
+                if delivery.session_id in closure_targets:
+                    continue
                 if session_id is not None and (
                     delivery.session_id != session_id or delivery.event_id != event_id
                 ):
@@ -17390,6 +17892,8 @@ class InMemorySessionStore(SessionStore):
                     event=replay,
                     replayed=True,
                 )
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session.id,))
             if (
                 raw_revision(raw) != request.expected_revision
                 or message.status != SessionMessageQueueStatus.QUEUED
@@ -17512,6 +18016,8 @@ class InMemorySessionStore(SessionStore):
                     event=record.event,
                     replayed=True,
                 )
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (request.session_id,))
             if session.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
                 raise SessionStatusConflict(
                     "Session messages may be enqueued only while a session is pending or running."
@@ -18116,6 +18622,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             if allowed_statuses is not None and session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status is not eligible for checkpoint publication: {session.status}"
@@ -18367,6 +18875,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             if allowed_statuses is not None and session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status is not eligible for checkpoint publication: {session.status}"
@@ -19069,6 +19579,9 @@ class InMemorySessionStore(SessionStore):
                 receipt=receipt,
                 replayed=True,
             )
+
+        for owner in self._session_closure_progress.values():
+            _check_closure_lineage_owner(owner, (session_id,))
 
         mutated_operation_records = (
             operation_records
@@ -20540,6 +21053,8 @@ class InMemorySessionStore(SessionStore):
             _assert_session_run_epoch(session_id, session)
             if not copied_messages:
                 return
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             if interaction_id is not None:
                 self._register_private_authority_alias_unlocked(
                     interaction_id,
@@ -20569,6 +21084,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             current = self._checkpoints.get(session_id)
             transformed = checkpoint_transform(
                 session.model_copy(deep=True),
@@ -20611,6 +21128,8 @@ class InMemorySessionStore(SessionStore):
             deferred = self._deferred_interaction_inputs.get(session_id)
             if deferred is None or deferred.interaction_id != interaction_id:
                 raise RuntimeError("Deferred interaction input changed before finalization.")
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             require_deferred_initial_transcript_replacement(
                 deferred,
                 expected_messages=expected,
@@ -20682,6 +21201,8 @@ class InMemorySessionStore(SessionStore):
                 return False
             if deferred.interaction_id != interaction_id:
                 raise RuntimeError("Deferred interaction input belongs to another interaction.")
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             messages = deferred.source_messages
             self._transcripts[session_id].extend(messages)
             self._extend_transcript_search_unlocked(session_id, messages)
@@ -20728,6 +21249,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             current = self._checkpoints.get(session_id)
             transformed = checkpoint_transform(
                 session.model_copy(deep=True),
@@ -21070,6 +21593,8 @@ class InMemorySessionStore(SessionStore):
                 return copy_recall_receipt(current)
             if copied.session_id not in self._sessions:
                 raise KeyError(f"Session not found: {copied.session_id}")
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (copied.session_id,))
             self._recall_receipts[copied.receipt_id] = copied
             self._recall_receipt_ids_by_session.setdefault(copied.session_id, set()).add(
                 copied.receipt_id
@@ -21206,6 +21731,8 @@ class InMemorySessionStore(SessionStore):
                 return copy_context_exposure(current)
             if copied.session_id not in self._sessions:
                 raise KeyError(f"Session not found: {copied.session_id}")
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (copied.session_id,))
 
             attempt_key = copied.session_id, copied.model_attempt_id
             conflicting_exposure_id = self._context_exposure_by_model_attempt.get(attempt_key)
@@ -21399,6 +21926,8 @@ class InMemorySessionStore(SessionStore):
                         copied_request.transition_id,
                     )
                 return copy_context_exposure(exposure)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             updated = append_context_exposure_transition(exposure, copied_request)
             self._context_exposures[exposure_id] = updated
             return copy_context_exposure(updated)
@@ -21412,6 +21941,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             self._store_checkpoint_unlocked(
                 session_id,
                 _replace_checkpoint_preserving_completion_result_event_publications(
@@ -21437,6 +21968,8 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            for owner in self._session_closure_progress.values():
+                _check_closure_lineage_owner(owner, (session_id,))
             current = self._checkpoints.get(session_id)
             transformed = checkpoint_transform(
                 session.model_copy(deep=True),
@@ -32075,6 +32608,12 @@ def _terminal_publication_delete_block_reason(
     descending session-sequence order, bounded by
     ``_TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT``.
     """
+
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if active_profile is not None and not active_invocation_execution_profile_is_released(
+        active_profile, session_id=session.id, run_epoch=session.run_epoch
+    ):
+        return "invocation terminal hooks or trailing cleanup still own the run fence"
 
     expected_event_type = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(session.status)
     if expected_event_type is None:

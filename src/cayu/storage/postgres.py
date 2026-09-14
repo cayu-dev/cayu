@@ -9,6 +9,7 @@ import math
 import re
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -38,6 +39,10 @@ from cayu.runtime.session_message_lifecycle import (
 from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageInspection,
+    _check_closure_lineage_owner,
+    _closure_progress_targets,
+    _validate_closure_progress_update,
+    _validate_session_closure_detach_replay,
 )
 
 if TYPE_CHECKING:
@@ -68,6 +73,7 @@ try:
         ForeignKeyViolation,
         UniqueViolation,
     )
+    from psycopg.types.json import Jsonb
     from psycopg_pool import AsyncConnectionPool
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without the extra
     raise RuntimeError(
@@ -577,6 +583,11 @@ from cayu.storage import migrations as schema
 from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
 )
+from cayu.storage._knowledge_closure import (
+    KnowledgeClosureInventory,
+    KnowledgeClosureQuery,
+    copy_knowledge_closure_query,
+)
 from cayu.storage._postgres_verified_work import (
     PostgresVerifiedWorkMixin,
     _PostgresMutationConnectionOwner,
@@ -806,6 +817,7 @@ from cayu.tasks.base import (
     TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
+    TaskSessionClosureClaim,
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
@@ -883,6 +895,7 @@ from cayu.tasks.base import (
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
+    copy_task_session_closure_claim,
     decode_task_topology_cursor,
     prepare_interrupted_task_continuation_claim_page,
     prepare_interrupted_task_handoff,
@@ -1019,8 +1032,8 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
     }
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 83
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 84
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 88
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 88
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
 
@@ -1352,6 +1365,88 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    88: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_task_session_closure_claims (
+            session_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL CHECK (plan_id ~ '^[0-9a-f]{64}$'),
+            claim_json JSONB NOT NULL CHECK (
+                octet_length(claim_json::text) BETWEEN 1 AND 16777216
+                AND jsonb_typeof(claim_json) = 'object'
+            )
+        )
+        """,
+        """
+        CREATE OR REPLACE FUNCTION cayu_task_closure_admission_guard()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+            previous_session TEXT;
+            candidate_session TEXT;
+        BEGIN
+            IF TG_OP = 'UPDATE' THEN
+                previous_session := OLD.session_id;
+            END IF;
+            FOR candidate_session IN
+                SELECT DISTINCT value FROM unnest(ARRAY[previous_session, NEW.session_id]) value
+                WHERE value IS NOT NULL ORDER BY value
+            LOOP
+                PERFORM pg_advisory_xact_lock(
+                    hashtextextended('cayu-task-session-closure:' || candidate_session, 0)
+                );
+                IF EXISTS (
+                    SELECT 1 FROM cayu_task_session_closure_claims
+                    WHERE session_id = candidate_session
+                ) THEN
+                    RAISE EXCEPTION 'Task session is owned by closure.' USING ERRCODE = '23514';
+                END IF;
+            END LOOP;
+            RETURN NEW;
+        END
+        $$
+        """,
+        """
+        DO $migration$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgrelid = 'cayu_tasks'::regclass
+                  AND tgname = 'cayu_task_closure_admission_guard'
+            ) THEN
+                CREATE TRIGGER cayu_task_closure_admission_guard
+                BEFORE INSERT OR UPDATE ON cayu_tasks
+                FOR EACH ROW EXECUTE FUNCTION cayu_task_closure_admission_guard();
+            END IF;
+        END
+        $migration$
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_session_closure_progress (
+            root_session_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL CHECK (plan_id ~ '^[0-9a-f]{64}$'),
+            progress_json JSONB NOT NULL CHECK (
+                octet_length(progress_json::text) BETWEEN 1 AND 384000
+                AND jsonb_typeof(progress_json) = 'object'
+            ),
+            PRIMARY KEY (root_session_id, plan_id)
+        )
+        """,
+    ),
+    87: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_session_closure_tombstones (
+            root_session_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL CHECK (plan_id ~ '^[0-9a-f]{64}$'),
+            child_session_id TEXT NOT NULL,
+            original_parent_session_id TEXT NOT NULL,
+            detached_at TIMESTAMPTZ NOT NULL,
+            tombstone_json JSONB NOT NULL CHECK (
+                octet_length(tombstone_json::text) BETWEEN 1 AND 32768
+                AND jsonb_typeof(tombstone_json) = 'object'
+            ),
+            PRIMARY KEY (root_session_id, plan_id, child_session_id)
+        )
+        """,
+    ),
     81: (
         """
         CREATE TABLE IF NOT EXISTS cayu_event_watcher_settlements (
@@ -4915,6 +5010,7 @@ class _ConcurrentIndexMigration:
     required_key_collations: tuple[str | None, ...] = ()
     unique: bool = False
     replace_existing: bool = False
+    replacement_predicates: tuple[str, ...] = ()
 
     def transactional_create_statement(self) -> str:
         """Return the equivalent index DDL for an empty, locked schema."""
@@ -5482,7 +5578,7 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
         ),
     ),
     # This pending-action index change is not registered in REVISIONS yet.
-    87: (
+    89: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -5509,6 +5605,15 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_lookup"
             ),
             replace_existing=True,
+            replacement_predicates=(
+                """
+                event_type = ANY (ARRAY[
+                    'tool.call.approval_requested', 'session.awaiting_user_input',
+                    'session.interrupted', 'tool.call.started', 'tool.call.completed',
+                    'tool.call.failed', 'tool.call.blocked', 'tool.call.approval_denied'
+                ]) AND pending_action_lookup_key IS NOT NULL
+                """,
+            ),
         ),
     ),
 }
@@ -6522,6 +6627,8 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_maintenance_governance_schema(cur)
                         if self._min_required_revision >= 78:
                             await self._validate_knowledge_semantic_watch_schema(cur)
+                        if self._min_required_revision >= 88:
+                            await self._validate_task_closure_guard(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -6834,6 +6941,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_semantic_watch_schema(cur)
         if self._min_required_revision >= 79:
             await self._validate_child_session_lifecycle_schema(cur)
+        if self._min_required_revision >= 88:
+            await self._validate_task_closure_guard(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -6995,6 +7104,37 @@ class _PostgresStoreBase:
             await self._validate_knowledge_semantic_watch_schema(cur)
         if revision.revision == 79:
             await self._validate_child_session_lifecycle_schema(cur)
+        if revision.revision == 88:
+            await self._validate_task_closure_guard(cur)
+
+    async def _validate_task_closure_guard(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT t.tgtype, t.tgenabled, t.tgqual, t.tgattr::text, t.tgnargs,
+                   p.prosrc, p.prosecdef, pn.nspname
+            FROM pg_trigger t
+            JOIN pg_class c ON c.oid = t.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_proc p ON p.oid = t.tgfoid
+            JOIN pg_namespace pn ON pn.oid = p.pronamespace
+            WHERE n.nspname = current_schema() AND c.relname = 'cayu_tasks'
+              AND t.tgname = 'cayu_task_closure_admission_guard'
+              AND NOT t.tgisinternal
+            """
+        )
+        row = await cur.fetchone()
+        expected_source = _MIGRATION_STEPS[88][1].split("$$")[1]
+        await cur.execute("SELECT current_schema()")
+        schema_row = await cur.fetchone()
+        if (
+            row is None
+            or row[:5] != (23, "O", None, "", 0)
+            or " ".join(row[5].split()) != " ".join(expected_source.split())
+            or row[6] is not False
+            or schema_row is None
+            or row[7] != schema_row[0]
+        ):
+            raise RuntimeError("Postgres task closure admission guard is missing or conflicting.")
 
     async def _validate_knowledge_activation_schema(self, cur: Any) -> None:
         table = "cayu_knowledge_activation_receipts"
@@ -12550,6 +12690,12 @@ class _PostgresStoreBase:
             # indexes can be built transactionally. Existing databases still use
             # the non-transactional CONCURRENTLY path in ``_migrate_schema``.
             for index in _CONCURRENT_INDEX_MIGRATIONS.get(rev.revision, ()):
+                if index.replace_existing:
+                    existing = await self._concurrent_index_state(
+                        cur, index, allow_replacement=True
+                    )
+                    if existing is not None and not existing[0]:
+                        await cur.execute(index.drop_statement.replace("CONCURRENTLY", ""))
                 await cur.execute(index.transactional_create_statement())
             await self._validate_revision_schema_objects(cur, rev)
             await self._record_revision(cur, rev)
@@ -12731,7 +12877,14 @@ class _PostgresStoreBase:
                 and bool(row[2])
                 and bool(row[3])
                 and key_definitions == expected_keys
-                and predicate == expected_predicate
+                and (
+                    predicate == expected_predicate
+                    or predicate
+                    in {
+                        _normalize_postgres_index_expression(value)
+                        for value in index.replacement_predicates
+                    }
+                )
                 and bool(row[7]) is index.unique
             )
             if replaceable_definition:
@@ -18885,6 +19038,170 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
         return None if record is None else copy_knowledge_maintenance_decision_receipt(record[2])
 
+    async def inspect_closure_sources(self, query: KnowledgeClosureQuery) -> dict[str, object]:
+        query = copy_knowledge_closure_query(query)
+        inventory = KnowledgeClosureInventory(query)
+        revisions: set[tuple[str, int]] = set()
+        count = 0
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            for start in range(0, max(len(query.sources), len(query.source_uris)), 100):
+                batch = query.sources[start : start + 100]
+                uri_batch = query.source_uris[start : start + 100]
+                source_types = [pair[0] for pair in batch]
+                source_ids = [pair[1] for pair in batch]
+                uri_types = [pair[0] for pair in uri_batch]
+                source_uris = [pair[1] for pair in uri_batch]
+                await cur.execute(
+                    """
+                    SELECT COUNT(*), MAX(octet_length(e.locator::text) + octet_length(e.metadata::text))
+                    FROM cayu_knowledge_evidence e
+                    WHERE EXISTS (
+                        SELECT 1 FROM unnest(%s::text[], %s::text[]) AS selected(source_type, source_id)
+                        WHERE e.source_type = selected.source_type AND e.source_id = selected.source_id
+                    ) OR EXISTS (
+                        SELECT 1 FROM unnest(%s::text[], %s::text[]) AS selected(source_type, source_uri)
+                        WHERE e.source_type = selected.source_type AND e.source_uri = selected.source_uri
+                    )
+                    """,
+                    (source_types, source_ids, uri_types, source_uris),
+                )
+                sizes = await cur.fetchone()
+                if (
+                    sizes is None
+                    or sizes[0] > query.max_records
+                    or (sizes[1] or 0) > query.max_bytes
+                ):
+                    raise ValueError("Knowledge closure inventory exceeds its bounds.")
+                await cur.execute(
+                    """
+                    SELECT e.id, e.entry_id, e.entry_revision, e.chunk_id, e.role,
+                           e.source_type, e.source_id, e.source_uri, e.source_revision,
+                           e.source_hash, e.locator, e.disposition, e.created_at, e.metadata
+                    FROM cayu_knowledge_evidence e
+                    WHERE EXISTS (
+                        SELECT 1 FROM unnest(%s::text[], %s::text[]) AS selected(source_type, source_id)
+                        WHERE e.source_type = selected.source_type AND e.source_id = selected.source_id
+                    ) OR EXISTS (
+                        SELECT 1 FROM unnest(%s::text[], %s::text[]) AS selected(source_type, source_uri)
+                        WHERE e.source_type = selected.source_type AND e.source_uri = selected.source_uri
+                    )
+                    ORDER BY e.id LIMIT %s
+                    """,
+                    (
+                        source_types,
+                        source_ids,
+                        uri_types,
+                        source_uris,
+                        query.max_records + 1,
+                    ),
+                )
+                while rows := await cur.fetchmany(100):
+                    for row in rows:
+                        revisions.add(inventory.add_evidence(_knowledge_evidence_from_row(row)))
+                await cur.execute(
+                    """
+                    SELECT e.entry_id, e.revision, e.source_type, e.source_id, e.source_uri, e.source_hash
+                    FROM cayu_knowledge_revisions e
+                    WHERE EXISTS (
+                        SELECT 1 FROM unnest(%s::text[], %s::text[]) AS selected(source_type, source_id)
+                        WHERE e.source_type = selected.source_type AND e.source_id = selected.source_id
+                    ) OR EXISTS (
+                        SELECT 1 FROM unnest(%s::text[], %s::text[]) AS selected(source_type, source_uri)
+                        WHERE e.source_type = selected.source_type AND e.source_uri = selected.source_uri
+                    )
+                    ORDER BY e.entry_id, e.revision LIMIT %s
+                    """,
+                    (source_types, source_ids, uri_types, source_uris, query.max_records + 1),
+                )
+                while rows := await cur.fetchmany(100):
+                    for row in rows:
+                        revisions.add(inventory.add_revision(*row))
+            ordered_revisions = sorted(revisions)
+            for start in range(0, len(ordered_revisions), 100):
+                batch = ordered_revisions[start : start + 100]
+                await cur.execute(
+                    """
+                    SELECT event.* FROM cayu_knowledge_index_readiness_events event
+                    JOIN unnest(%s::text[], %s::bigint[]) AS selected(entry_id, revision)
+                      ON event.entry_id = selected.entry_id
+                     AND event.entry_revision = selected.revision
+                    ORDER BY event.sequence LIMIT %s
+                    """,
+                    (
+                        [pair[0] for pair in batch],
+                        [pair[1] for pair in batch],
+                        query.max_records + 1,
+                    ),
+                )
+                while rows := await cur.fetchmany(100):
+                    for row in rows:
+                        inventory.add_readiness(_knowledge_index_readiness_from_row(row))
+            count = inventory.count
+            # A plain knowledge-store handle can share a database with a vector
+            # store. Inspect the actual durable table, not this handle's class.
+            await cur.execute("SELECT to_regclass('cayu_knowledge_embeddings')")
+            table = await cur.fetchone()
+            if table is not None and table[0] is not None:
+                ordered_revisions = sorted(revisions)
+                for start in range(0, len(ordered_revisions), 100):
+                    batch = ordered_revisions[start : start + 100]
+                    await cur.execute(
+                        """
+                        SELECT e.entry_id, e.entry_revision, e.chunk_id, e.projection_type,
+                               e.projection_content_hash, e.embedding_model, e.dimensions,
+                               e.preprocessing_version, e.generator, e.generator_version,
+                               e.index_representation_version, e.attempt_id, e.readiness_sequence,
+                               e.embedding_sha256
+                        FROM cayu_knowledge_embeddings e
+                        JOIN unnest(%s::text[], %s::bigint[]) AS selected(entry_id, revision)
+                          ON e.entry_id = selected.entry_id AND e.entry_revision = selected.revision
+                        ORDER BY e.identity_sha256, e.readiness_sequence LIMIT %s
+                        """,
+                        (
+                            [pair[0] for pair in batch],
+                            [pair[1] for pair in batch],
+                            query.max_records - count + 1,
+                        ),
+                    )
+                    while rows := await cur.fetchmany(100):
+                        for row in rows:
+                            count += 1
+                            if count > query.max_records:
+                                raise ValueError("Knowledge closure inventory exceeds its bounds.")
+                            identity = KnowledgeEmbeddingIdentity(
+                                **dict(
+                                    zip(
+                                        (
+                                            "entry_id",
+                                            "entry_revision",
+                                            "chunk_id",
+                                            "projection_type",
+                                            "projection_content_hash",
+                                            "embedding_model",
+                                            "dimensions",
+                                            "preprocessing_version",
+                                            "generator",
+                                            "generator_version",
+                                            "index_representation_version",
+                                        ),
+                                        row[:11],
+                                        strict=True,
+                                    )
+                                )
+                            )
+                            inventory.add(
+                                "knowledge_projections",
+                                {
+                                    "identity": identity.model_dump(mode="json"),
+                                    "attempt_id": row[11],
+                                    "readiness_sequence": row[12],
+                                    "vector_sha256": row[13],
+                                },
+                            )
+            return inventory.document()
+
     async def read_evidence(
         self,
         entry_id: str,
@@ -24802,6 +25119,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
     supports_session_closure_receipts: ClassVar[bool] = True
+    supports_session_closure_detachment: ClassVar[bool] = True
+    supports_session_closure_recursive_deletion: ClassVar[bool] = True
+    supports_session_closure_progress: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -25824,6 +26144,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     event,
                                 )
                             else:
+                                for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                                    _check_closure_lineage_owner(owner, (session_id,))
                                 await cur.execute(
                                     "SELECT MAX(bound_at) "
                                     "FROM cayu_targeted_tool_grant_uses WHERE grant_id = %s",
@@ -26477,6 +26799,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
+                    await self._require_available_closure_identity(cur, session_id)
                     parent_session = (
                         None
                         if request.parent_session_id is None
@@ -26484,6 +26808,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if request.parent_session_id is not None and parent_session is None:
                         raise ValueError(f"Parent session not found: {request.parent_session_id}")
+                    if parent_session is not None:
+                        for owner in await self._closure_lineage_owners(cur, (parent_session.id,)):
+                            _check_closure_lineage_owner(owner, (parent_session.id,))
                     now = await self._session_store_now(cur)
                     session = Session(
                         id=session_id,
@@ -26811,6 +27138,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
+                    for owner in await self._closure_lineage_owners(cur, (source_session_id,)):
+                        _check_closure_lineage_owner(owner, (source_session_id,))
+                    await self._require_available_closure_identity(cur, fork.id)
                     source_session = _validate_session_fork_source(
                         source_session=await self._load_for_update(cur, source_session_id),
                         source_session_id=source_session_id,
@@ -27153,6 +27484,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     await _postgres_lock_memory_evidence_id(
                         cur,
                         f"recall-receipt:{copied.receipt_id}",
@@ -27176,6 +27508,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             raise RecallEvidenceConflict("Recall receipt", copied.receipt_id)
                         await conn.commit()
                         return current
+                    for owner in await self._closure_lineage_owners(cur, (copied.session_id,)):
+                        _check_closure_lineage_owner(owner, (copied.session_id,))
                     await cur.execute(
                         "SELECT 1 FROM cayu_sessions WHERE id = %s FOR KEY SHARE",
                         (copied.session_id,),
@@ -27320,6 +27654,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     for lock_id in lock_ids:
                         await _postgres_lock_memory_evidence_id(cur, lock_id)
                     await cur.execute(
@@ -27367,6 +27702,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                         await conn.commit()
                         return current
+                    for owner in await self._closure_lineage_owners(cur, (copied.session_id,)):
+                        _check_closure_lineage_owner(owner, (copied.session_id,))
                     await cur.execute(
                         "SELECT 1 FROM cayu_sessions WHERE id = %s FOR KEY SHARE",
                         (copied.session_id,),
@@ -27618,6 +27955,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     await cur.execute(
                         """
                         SELECT exposure_id, session_id, interaction_id, model_step_id,
@@ -27649,6 +27987,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                         await conn.commit()
                         return current
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     updated = append_context_exposure_transition(current, copied_request)
                     updated_document = memory_evidence_document_bytes(
                         updated,
@@ -27772,6 +28112,373 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             row = await cur.fetchone()
         return None if row is None else dict(row[0])
 
+    async def load_session_closure_progress(self, session_id: str, plan_id: str):
+        session_id = require_clean_nonblank(session_id, "session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT progress_json FROM cayu_session_closure_progress "
+                "WHERE root_session_id = %s AND plan_id = %s",
+                (session_id, plan_id),
+            )
+            row = await cur.fetchone()
+        return None if row is None else dict(row[0])
+
+    async def save_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        root_id = progress.get("root_session_id")
+        plan_id = progress.get("plan_id")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            await self._lock_closure_lineage(conn)
+            cursor = await conn.execute(
+                "SELECT progress_json FROM cayu_session_closure_progress "
+                "WHERE root_session_id = %s AND plan_id = %s",
+                (root_id, plan_id),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                _validate_closure_progress_update(dict(row[0]), progress)
+            await conn.execute(
+                "INSERT INTO cayu_session_closure_progress "
+                "(root_session_id, plan_id, progress_json) VALUES (%s, %s, %s) "
+                "ON CONFLICT (root_session_id, plan_id) DO UPDATE "
+                "SET progress_json = EXCLUDED.progress_json",
+                (root_id, plan_id, Jsonb(progress)),
+            )
+
+    @staticmethod
+    async def _lock_closure_lineage(executor: Any) -> None:
+        # Short admission/publication transactions only: never held across
+        # dependent-store cleanup. The progress row retains durable ownership.
+        await executor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            ("cayu-session-closure-lineage",),
+        )
+
+    async def _closure_lineage_owners(
+        self, cur: Any, targets: Iterable[str]
+    ) -> tuple[dict[str, Any], ...]:
+        targets = list(targets)
+        await cur.execute(
+            "SELECT progress_json FROM cayu_session_closure_progress AS p "
+            "WHERE root_session_id = ANY(%s) OR EXISTS "
+            "(SELECT 1 FROM jsonb_array_elements(p.progress_json->'descendants') AS child "
+            "WHERE child->>'session_id' = ANY(%s))",
+            (targets, targets),
+        )
+        return tuple(dict(row[0]) for row in await cur.fetchall())
+
+    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        progress = deepcopy(progress)
+        targets = _closure_progress_targets(progress)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await self._lock_closure_lineage(cur)
+            for owner in await self._closure_lineage_owners(cur, targets):
+                if (owner["root_session_id"], owner["plan_id"]) == (
+                    progress["root_session_id"],
+                    progress["plan_id"],
+                ):
+                    _validate_closure_progress_update(owner, progress)
+                    return
+                _check_closure_lineage_owner(owner, targets)
+            await cur.execute(
+                "SELECT id, parent_session_id FROM cayu_sessions WHERE id = ANY(%s) FOR UPDATE",
+                (list(targets),),
+            )
+            parents = dict(await cur.fetchall())
+            if progress["root_session_id"] not in parents:
+                raise ValueError("Closure root disappeared before lineage admission.")
+            for item in progress["descendants"]:
+                if parents.get(item["session_id"]) != item["parent_session_id"]:
+                    raise ValueError("Child lineage changed before closure admission.")
+            if progress["phase"] in {"recursive", "reject"}:
+                expected = {
+                    (item["session_id"], item["parent_session_id"])
+                    for item in progress["descendants"]
+                }
+                await cur.execute(
+                    "SELECT id, parent_session_id FROM cayu_sessions "
+                    "WHERE parent_session_id = ANY(%s) LIMIT %s",
+                    (list(targets), len(expected) + 1),
+                )
+                if set(await cur.fetchall()) != expected:
+                    raise ValueError("Child lineage changed before closure admission.")
+            for target_id in targets:
+                target = await self._load_for_update(cur, target_id)
+                if target is None:
+                    raise ValueError("Closure target disappeared before admission.")
+                await self._require_session_erasure_quiescence(cur, target)
+                await self._load_session_closure_records(
+                    cur,
+                    target_id,
+                    max_records=progress["max_records"],
+                    max_bytes=progress["max_bytes"],
+                )
+            await cur.execute(
+                "INSERT INTO cayu_session_closure_progress "
+                "(root_session_id, plan_id, progress_json) VALUES (%s, %s, %s)",
+                (progress["root_session_id"], progress["plan_id"], Jsonb(progress)),
+            )
+
+    async def _require_available_closure_identity(self, cur: Any, session_id: str) -> None:
+        for owner in await self._closure_lineage_owners(cur, (session_id,)):
+            _check_closure_lineage_owner(owner, (session_id,))
+        await cur.execute(
+            "SELECT 1 FROM cayu_session_closure_receipts WHERE session_id = %s LIMIT 1",
+            (session_id,),
+        )
+        if await cur.fetchone() is not None:
+            raise ValueError("Session identity was retired by closure.")
+
+    async def load_session_closure_tombstones(
+        self, root_session_id: str, plan_id: str
+    ) -> tuple[dict[str, Any], ...]:
+        root_session_id = require_clean_nonblank(root_session_id, "root_session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT tombstone_json FROM cayu_session_closure_tombstones "
+                "WHERE root_session_id = %s AND plan_id = %s "
+                'ORDER BY child_session_id COLLATE "C"',
+                (root_session_id, plan_id),
+            )
+            rows = await cur.fetchall()
+        return tuple(dict(row[0]) for row in rows)
+
+    async def detach_session_children(
+        self,
+        parent_session_id: str,
+        child_session_ids: tuple[str, ...],
+        *,
+        closure_receipt: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        parent_session_id = require_clean_nonblank(parent_session_id, "parent_session_id")
+        root_id = closure_receipt.get("root_session_id")
+        plan_id = closure_receipt.get("plan_id")
+        if type(root_id) is not str or type(plan_id) is not str:
+            raise ValueError("Closure detachment receipt is missing identity.")
+        if len(set(child_session_ids)) != len(child_session_ids):
+            raise ValueError("Detached child session IDs must be unique.")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
+                    await cur.execute(
+                        "SELECT tombstone_json FROM cayu_session_closure_tombstones "
+                        "WHERE root_session_id = %s AND plan_id = %s "
+                        'ORDER BY child_session_id COLLATE "C"',
+                        (root_id, plan_id),
+                    )
+                    existing = await cur.fetchall()
+                    if existing:
+                        tombstones = tuple(dict(row[0]) for row in existing)
+                        _validate_session_closure_detach_replay(
+                            tombstones,
+                            root_id=root_id,
+                            plan_id=plan_id,
+                            parent_session_id=parent_session_id,
+                            child_session_ids=child_session_ids,
+                        )
+                        return tombstones
+                    for owner in await self._closure_lineage_owners(cur, child_session_ids):
+                        _check_closure_lineage_owner(owner, child_session_ids)
+                    if not child_session_ids:
+                        return ()
+                    await cur.execute(
+                        "SELECT id, parent_session_id FROM cayu_sessions "
+                        "WHERE id = ANY(%s) FOR UPDATE",
+                        (list(child_session_ids),),
+                    )
+                    rows = await cur.fetchall()
+                    if {row[0] for row in rows} != set(child_session_ids) or any(
+                        row[1] != parent_session_id for row in rows
+                    ):
+                        raise ValueError("Child lineage changed before detachment.")
+                    detached_at = await self._session_store_now(cur)
+                    tombstones = tuple(
+                        {
+                            "root_session_id": root_id,
+                            "plan_id": plan_id,
+                            "child_session_id": child_id,
+                            "original_parent_session_id": parent_session_id,
+                            "detached_at": detached_at.isoformat(),
+                        }
+                        for child_id in sorted(child_session_ids)
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET parent_session_id = NULL, updated_at = %s "
+                        "WHERE id = ANY(%s)",
+                        (detached_at, list(child_session_ids)),
+                    )
+                    await cur.executemany(
+                        "INSERT INTO cayu_session_closure_tombstones "
+                        "(root_session_id, plan_id, child_session_id, original_parent_session_id, "
+                        "detached_at, tombstone_json) VALUES (%s, %s, %s, %s, %s, %s)",
+                        [
+                            (
+                                item["root_session_id"],
+                                item["plan_id"],
+                                item["child_session_id"],
+                                item["original_parent_session_id"],
+                                detached_at,
+                                Jsonb(item),
+                            )
+                            for item in tombstones
+                        ],
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            return tombstones
+
+    async def _require_session_erasure_quiescence(self, cur, session: Session) -> None:
+        """Shared admission for closure and final deletion; no mutations."""
+        from cayu._validation import DURABLE_DOCUMENT_LIMITS
+        from cayu.runtime._session_closure_records import require_terminal_protected_effect
+
+        session_id = session.id
+        after_key = ""
+        while True:
+            # Read one bounded document at a time, allowing JSON text overhead.
+            # The shared validator applies the durable document limit.
+            await cur.execute(
+                "SELECT idempotency_key, CASE WHEN octet_length(record::text) <= %s "
+                "THEN record END FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key LIKE 'tool-effect:%%' "
+                "AND idempotency_key > %s ORDER BY idempotency_key LIMIT 1",
+                (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id, after_key),
+            )
+            effects = await cur.fetchall()
+            for key, raw in effects:
+                require_terminal_protected_effect(session_id, session.instance_id, key, raw)
+            if not effects:
+                break
+            after_key = effects[-1][0]
+        if session.status in DELETE_BLOCKED_SESSION_STATUSES:
+            raise ValueError("Session closure requires a non-running target.")
+        await cur.execute(
+            "SELECT 1 FROM cayu_persisted_event_side_effects "
+            "WHERE session_id = %s AND status = 'leased' LIMIT 1",
+            (session_id,),
+        )
+        if await cur.fetchone() is not None:
+            raise ValueError("Session closure requires settled event side-effect deliveries.")
+        checkpoint = await self._load_checkpoint(cur, session_id)
+        deletion_now = await self._session_store_now(cur)
+        active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+            checkpoint,
+            now=deletion_now,
+        )
+        if active_recovery_claim_id is not None:
+            raise ValueError(
+                "Cannot delete a session while incomplete-session recovery claim "
+                f"{active_recovery_claim_id} is active: {session_id}"
+            )
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        if run_operation is not None:
+            raise ValueError(
+                "Cannot delete a session while terminal publication "
+                f"{run_operation.operation_id} is incomplete: {session_id}"
+            )
+        if _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint):
+            raise ValueError(
+                "Cannot delete a session while queued dispatch terminal "
+                f"acknowledgement is incomplete: {session_id}"
+            )
+        await cur.execute(
+            "SELECT event FROM cayu_events "
+            "WHERE session_id = %s AND event_type = ANY(%s) "
+            "ORDER BY session_order DESC LIMIT %s",
+            (
+                session_id,
+                [str(event_type) for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES],
+                _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
+            ),
+        )
+        terminal_publication_block = _terminal_publication_delete_block_reason(
+            session=session,
+            checkpoint=checkpoint,
+            evidence_events=[Event(**_json_obj(row[0])) for row in await cur.fetchall()],
+        )
+        if terminal_publication_block is not None:
+            raise ValueError(
+                f"Cannot delete a session while {terminal_publication_block}: {session_id}"
+            )
+        active_operation_id = _active_unexpired_session_operation_id(
+            checkpoint,
+            now=deletion_now,
+        )
+        if active_operation_id is not None:
+            raise ValueError(
+                "Cannot delete a session while durable operation "
+                f"{active_operation_id} is active: {session_id}"
+            )
+        completion_result_publication_block = (
+            _completion_result_event_publication_delete_block_reason(
+                checkpoint,
+                now=deletion_now,
+            )
+        )
+        if completion_result_publication_block is not None:
+            raise ValueError(
+                f"Cannot delete a session while {completion_result_publication_block}: {session_id}"
+            )
+        await cur.execute(
+            "SELECT 1 FROM cayu_session_operations WHERE session_id = %s AND idempotency_key = %s",
+            (
+                session_id,
+                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+            ),
+        )
+        if await cur.fetchone() is not None:
+            raise ValueError(
+                f"Cannot delete a session while a model-completion stage is active: {session_id}"
+            )
+        await cur.execute(
+            """
+            SELECT identity.reservation_id
+            FROM cayu_budget_reservation_identities AS identity
+            LEFT JOIN cayu_events AS event
+              ON event.session_id = identity.publication_session_id
+             AND event.event_type IN (
+                 'budget.reconciled',
+                 'budget.reservation_released'
+             )
+             AND event.payload ->> 'reservation_id'
+                 = identity.reservation_id
+            LEFT JOIN cayu_persisted_event_side_effects AS delivery
+              ON delivery.session_id = event.session_id
+             AND delivery.event_id = event.event_id
+            WHERE identity.publication_session_id = %s
+            GROUP BY identity.reservation_id
+            HAVING COUNT(event.event_id) <> 1
+                OR COUNT(*) FILTER (
+                    WHERE delivery.status = 'delivered'
+                ) <> 1
+            LIMIT 1
+            """,
+            (session_id,),
+        )
+        if await cur.fetchone() is not None:
+            raise ValueError(
+                "Cannot delete a session while a budget settlement audit "
+                f"event is pending: {session_id}"
+            )
+
+    async def validate_session_closure_admission(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            session = await self._load_for_update(cur, session_id)
+            if session is None:
+                raise ValueError("Closure target is unavailable.")
+            await self._require_session_erasure_quiescence(cur, session)
+
     async def delete_session(
         self,
         session_id: str,
@@ -27783,10 +28490,33 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     session = await self._load_for_update(cur, session_id)
                     if session is None:
                         await conn.rollback()
                         return
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,), closure_receipt)
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_closure_progress AS p "
+                        "JOIN cayu_sessions AS child ON child.id = p.root_session_id "
+                        "WHERE child.parent_session_id = %s LIMIT 1",
+                        (session_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise ValueError(
+                            "Session lineage is owned by an unfinished recursive closure."
+                        )
+                    if (
+                        closure_receipt is not None
+                        and closure_receipt.get("operation") == "recursive"
+                    ):
+                        expected_parent = closure_receipt.get("original_parent_session_id")
+                        if (
+                            type(expected_parent) is not str
+                            or session.parent_session_id != expected_parent
+                        ):
+                            raise ValueError("Recursive closure child parent identity conflict.")
                     if session.status in DELETE_BLOCKED_SESSION_STATUSES:
                         raise ValueError(
                             f"Cannot delete a session while it is {session.status}; "
@@ -27800,120 +28530,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         (session_id, "durable"),
                     )
                     durable_child = await cur.fetchone()
+                    if closure_receipt is not None:
+                        await cur.execute(
+                            "SELECT 1 FROM cayu_sessions WHERE parent_session_id = %s LIMIT 1",
+                            (session_id,),
+                        )
+                        if await cur.fetchone() is not None:
+                            raise ValueError("Closure deletion requires no remaining child edges.")
                     if durable_child is not None:
                         raise ValueError(
                             _durable_subagent_parent_delete_block_reason(durable_child[0])
                         )
-                    checkpoint = await self._load_checkpoint(cur, session_id)
-                    deletion_now = await self._session_store_now(cur)
-                    active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                        checkpoint,
-                        now=deletion_now,
-                    )
-                    if active_recovery_claim_id is not None:
-                        raise ValueError(
-                            "Cannot delete a session while incomplete-session recovery claim "
-                            f"{active_recovery_claim_id} is active: {session_id}"
-                        )
-                    run_operation = _session_run_operation_from_checkpoint(checkpoint)
-                    if run_operation is not None:
-                        raise ValueError(
-                            "Cannot delete a session while terminal publication "
-                            f"{run_operation.operation_id} is incomplete: {session_id}"
-                        )
-                    if _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint):
-                        raise ValueError(
-                            "Cannot delete a session while queued dispatch terminal "
-                            f"acknowledgement is incomplete: {session_id}"
-                        )
-                    await cur.execute(
-                        "SELECT event FROM cayu_events "
-                        "WHERE session_id = %s AND event_type = ANY(%s) "
-                        "ORDER BY session_order DESC LIMIT %s",
-                        (
-                            session_id,
-                            [
-                                str(event_type)
-                                for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
-                            ],
-                            _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
-                        ),
-                    )
-                    terminal_publication_block = _terminal_publication_delete_block_reason(
-                        session=session,
-                        checkpoint=checkpoint,
-                        evidence_events=[
-                            Event(**_json_obj(row[0])) for row in await cur.fetchall()
-                        ],
-                    )
-                    if terminal_publication_block is not None:
-                        raise ValueError(
-                            "Cannot delete a session while "
-                            f"{terminal_publication_block}: {session_id}"
-                        )
-                    active_operation_id = _active_unexpired_session_operation_id(
-                        checkpoint,
-                        now=deletion_now,
-                    )
-                    if active_operation_id is not None:
-                        raise ValueError(
-                            "Cannot delete a session while durable operation "
-                            f"{active_operation_id} is active: {session_id}"
-                        )
-                    completion_result_publication_block = (
-                        _completion_result_event_publication_delete_block_reason(
-                            checkpoint,
-                            now=deletion_now,
-                        )
-                    )
-                    if completion_result_publication_block is not None:
-                        raise ValueError(
-                            "Cannot delete a session while "
-                            f"{completion_result_publication_block}: {session_id}"
-                        )
-                    await cur.execute(
-                        "SELECT 1 FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = %s",
-                        (
-                            session_id,
-                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                        ),
-                    )
-                    if await cur.fetchone() is not None:
-                        raise ValueError(
-                            "Cannot delete a session while a model-completion stage is active: "
-                            f"{session_id}"
-                        )
-                    await cur.execute(
-                        """
-                        SELECT identity.reservation_id
-                        FROM cayu_budget_reservation_identities AS identity
-                        LEFT JOIN cayu_events AS event
-                          ON event.session_id = identity.publication_session_id
-                         AND event.event_type IN (
-                             'budget.reconciled',
-                             'budget.reservation_released'
-                         )
-                         AND event.payload ->> 'reservation_id'
-                             = identity.reservation_id
-                        LEFT JOIN cayu_persisted_event_side_effects AS delivery
-                          ON delivery.session_id = event.session_id
-                         AND delivery.event_id = event.event_id
-                        WHERE identity.publication_session_id = %s
-                        GROUP BY identity.reservation_id
-                        HAVING COUNT(event.event_id) <> 1
-                            OR COUNT(*) FILTER (
-                                WHERE delivery.status = 'delivered'
-                            ) <> 1
-                        LIMIT 1
-                        """,
-                        (session_id,),
-                    )
-                    if await cur.fetchone() is not None:
-                        raise ValueError(
-                            "Cannot delete a session while a budget settlement audit "
-                            f"event is pending: {session_id}"
-                        )
+                    await self._require_session_erasure_quiescence(cur, session)
                     # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
                     # the self-FK is ON DELETE SET NULL so children keep loading.
                     await cur.execute(
@@ -27929,7 +28557,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "(session_id, plan_id, committed_at, receipt_json) "
                             "VALUES (%s, %s, clock_timestamp(), %s) "
                             "ON CONFLICT (session_id, plan_id) DO UPDATE SET receipt_json = EXCLUDED.receipt_json",
-                            (session_id, receipt_plan_id, closure_receipt),
+                            (session_id, receipt_plan_id, Jsonb(closure_receipt)),
                         )
                 await conn.commit()
             except Exception:
@@ -27945,6 +28573,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             async with conn.cursor() as cur:
                 if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
+                for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = await self._session_store_now(cur)
                 if expected_run_epoch is None:
                     await cur.execute(
@@ -28002,6 +28632,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch_value(session_id, row[0])
                     updated_at = await self._session_store_now(cur)
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     new_metadata = replace_session_user_metadata(_json_obj(row[1]), user_metadata)
                     await cur.execute(
                         "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",
@@ -28041,6 +28673,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             async with conn.cursor() as cur:
                 if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
+                for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = await self._session_store_now(cur)
                 params: list[object] = [
                     str(to_status),
@@ -28163,6 +28797,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, loaded)
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
@@ -28572,6 +29208,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     session = await self._load_for_update(cur, session_id)
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
@@ -28606,6 +29243,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await conn.commit()
                         return ExecutionProfileRejectionResult(event=existing, replayed=True)
 
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     activity_at = await self._session_store_now(cur)
                     await cur.execute(
                         "UPDATE cayu_sessions "
@@ -28701,6 +29340,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionQueuedMessagesPending(
                             f"Session has durable queued messages: {session_id}"
                         )
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     if mutation is not None:
                         checkpoint = _apply_queue_completion_checkpoint_mutation(
                             loaded, mutation, await self._load_checkpoint(cur, session_id)
@@ -28867,6 +29508,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Terminal session event exists without its interaction receipt."
                         )
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     checkpoint = await self._load_checkpoint(cur, session_id)
                     if terminalization_only:
                         from cayu.runtime._durable_model_terminalization import (
@@ -29459,6 +30102,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     ):
                         await conn.commit()
                         return None
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     transformed = checkpoint_transform(
                         loaded,
                         _copy_checkpoint_for_transform(
@@ -29508,6 +30153,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionStatusConflict(
                             f"Session status cannot be fenced: {loaded.status}"
                         )
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
                     _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                         current_checkpoint,
@@ -29782,6 +30429,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             publication_session_id,
                             expected_run_epoch,
                         )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_budget_reservation_identities WHERE reservation_id = %s",
+                        (reservation_id,),
+                    )
+                    if await cur.fetchone() is None:
+                        for owner in await self._closure_lineage_owners(
+                            cur, (publication_session_id,)
+                        ):
+                            _check_closure_lineage_owner(owner, (publication_session_id,))
                     await cur.execute(
                         """
                         INSERT INTO cayu_budget_reservation_identities (
@@ -30066,6 +30722,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if not copied_events:
+                        _assert_session_run_epoch(session_id, loaded)
+                        return
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     await self._append_events_with_cursor(
                         cur,
                         session_id,
@@ -30106,6 +30770,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     session = await self._load_for_update(cur, session_id)
                     if session is None:
                         raise KeyError("Tool effect audit session is unavailable.")
@@ -30129,6 +30794,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             event, Event(**_json_obj(existing[0]))
                         )
                     else:
+                        for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                            _check_closure_lineage_owner(owner, (session_id,))
                         await cur.execute(
                             "UPDATE cayu_sessions SET event_seq = event_seq + 1 "
                             "WHERE id = %s RETURNING event_seq",
@@ -30171,6 +30838,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     if await self._load_for_update(cur, session_id) is None:
                         raise KeyError(f"Session not found: {session_id}")
                     activity_at = await self._session_store_now(cur)
@@ -30229,6 +30897,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await conn.rollback()
                         return False
 
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     await self._register_event_public_authorities(
                         cur,
                         session_id,
@@ -30329,6 +30999,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    await self._lock_closure_lineage(cur)
                     # Missing rows need the same fence as existing rows. Locking
                     # the stable keys first also gives multi-toolset batches one
                     # deterministic lock order.
@@ -30366,6 +31037,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if await self._load_for_update(cur, session_id) is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     activity_at = await self._session_store_now(cur)
                     if expected_run_epoch is None:
                         await cur.execute(
@@ -30578,6 +31251,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 async with conn.cursor() as cur:
                     exact_filter = ""
                     params: list[Any] = []
+                    # The same transaction-level lock protects closure admission.
+                    # Exclude closed targets in selection, so one retained target
+                    # cannot starve unrelated event deliveries.
+                    await self._lock_closure_lineage(cur)
                     if session_id is not None and event_id is not None:
                         exact_filter = (
                             "AND candidate_delivery.session_id = %s "
@@ -30604,6 +31281,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     AND candidate_delivery.lease_expires_at <= timing.now)
                             )
                             {exact_filter}
+                            AND NOT EXISTS (
+                                SELECT 1 FROM cayu_session_closure_progress AS p
+                                WHERE p.root_session_id = candidate_delivery.session_id
+                                   OR EXISTS (
+                                       SELECT 1 FROM jsonb_array_elements(
+                                           p.progress_json->'descendants'
+                                       ) AS child
+                                       WHERE child->>'session_id' = candidate_delivery.session_id
+                                   )
+                            )
                             ORDER BY candidate_delivery.event_sequence ASC
                             FOR UPDATE OF candidate_delivery SKIP LOCKED
                             LIMIT 1
@@ -31201,6 +31888,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         return SessionMessageActionResult(
                             record=record, event=replay, replayed=True
                         )
+                    for owner in await self._closure_lineage_owners(cur, (session.id,)):
+                        _check_closure_lineage_owner(owner, (session.id,))
                     if (
                         record.revision != request.expected_revision
                         or raw["status"] != "queued"
@@ -31329,6 +32018,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             event=Event(**_json_obj(event_row[0])),
                             replayed=True,
                         )
+                    for owner in await self._closure_lineage_owners(cur, (request.session_id,)):
+                        _check_closure_lineage_owner(owner, (request.session_id,))
                     if loaded.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
                         raise SessionStatusConflict(
                             "Session messages may be enqueued only while a session is pending or running."
@@ -33441,6 +34132,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             replayed=True,
                         )
 
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
+
                     operation_mutation_records: dict[str, dict[str, Any]] = {}
                     if request.operation_record_mutations:
                         mutation_keys = [
@@ -34036,6 +34730,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, loaded)
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     if allowed_statuses is not None and loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             "Session status is not eligible for checkpoint publication: "
@@ -34309,6 +35005,153 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             return loaded.model_copy(
                 update={"updated_at": updated_at, "last_activity_at": activity_at}
             )
+
+    async def load_session_closure_records(
+        self, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            return await self._load_session_closure_records(
+                cur, session_id, max_records=max_records, max_bytes=max_bytes
+            )
+
+    async def _load_session_closure_records(
+        self, cur: Any, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        from cayu.runtime._session_closure_records import (
+            ClosureRecordsBuilder,
+            ClosureRecordsTooLarge,
+        )
+        from cayu.storage._session_closure_sql import closure_size_statement
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        builder = ClosureRecordsBuilder(max_records=max_records, max_bytes=max_bytes)
+        statement, source_count = closure_size_statement(postgres=True)
+        await cur.execute(statement, (session_id, max_records + 1) * source_count)
+        count, size = await cur.fetchone()
+        if count > max_records or size > max_bytes:
+            raise ClosureRecordsTooLarge()
+        session = await self._load(cur, session_id)
+        builder.add_class(
+            "session",
+            ()
+            if session is None
+            else (
+                {
+                    name: getattr(session, name)
+                    for name in type(session).model_fields
+                    if name not in {"labels", "metadata"}
+                },
+            ),
+        )
+        builder.add_class(
+            "labels",
+            ()
+            if session is None
+            else ({"key": key, "value": value} for key, value in session.labels.items()),
+        )
+        builder.add_class("metadata", () if session is None else (session.metadata,))
+
+        def project_grant(row):
+            codec = self.public_authority_alias_codec
+            if codec is None:
+                raise RuntimeError("Closure grant export requires an authority alias codec.")
+            return targeted_tool_grant_with_active_reference(
+                _targeted_tool_grant_from_postgres_row(row), codec
+            )
+
+        queries: tuple[tuple[str, str, Callable[[Any], Any]], ...] = (
+            (
+                "recall_receipts",
+                "SELECT receipt_id, session_id, interaction_id, model_step_id, created_at, "
+                "receipt_json, document_bytes FROM cayu_recall_receipts WHERE session_id = %s "
+                "ORDER BY created_at, receipt_id LIMIT %s",
+                _postgres_recall_receipt,
+            ),
+            (
+                "context_exposures",
+                "SELECT exposure_id, session_id, interaction_id, model_step_id, model_attempt_id, "
+                "provider_attempt_id, state, state_revision, created_at, updated_at, exposure_json, "
+                "document_bytes FROM cayu_context_exposures WHERE session_id = %s "
+                "ORDER BY created_at, exposure_id LIMIT %s",
+                _postgres_context_exposure,
+            ),
+            (
+                "recall_item_exposures",
+                "SELECT item.item_json FROM cayu_recall_item_exposures AS item "
+                "JOIN cayu_context_exposures AS exposure ON exposure.exposure_id = item.exposure_id "
+                "WHERE exposure.session_id = %s "
+                "ORDER BY exposure.created_at, exposure.exposure_id, item.ordinal LIMIT %s",
+                lambda row: _json_obj(row[0]),
+            ),
+            (
+                "events",
+                "SELECT sequence, event FROM cayu_events WHERE session_id = %s ORDER BY sequence LIMIT %s",
+                lambda row: EventRecord(sequence=row[0], event=Event(**_json_obj(row[1]))),
+            ),
+            (
+                "transcript",
+                "SELECT session_order, interaction_id, message FROM cayu_transcript_messages WHERE session_id = %s ORDER BY session_order LIMIT %s",
+                lambda row: {
+                    "transcript_index": row[0] - 1,
+                    "interaction_id": row[1],
+                    "message": _json_obj(row[2]),
+                },
+            ),
+            (
+                "checkpoint",
+                "SELECT state FROM cayu_checkpoints WHERE session_id = %s LIMIT %s",
+                lambda row: _json_obj(row[0]),
+            ),
+            (
+                "queued_messages",
+                f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} FROM cayu_session_message_queue WHERE session_id = %s ORDER BY ordering_key LIMIT %s",
+                lambda row: {
+                    "message": _queued_session_message_from_row(row),
+                    "terminal": None if row[18] is None else _json_obj(row[18]),
+                },
+            ),
+            (
+                "session_operations",
+                "SELECT idempotency_key, record FROM cayu_session_operations WHERE session_id = %s ORDER BY idempotency_key LIMIT %s",
+                lambda row: {"idempotency_key": row[0], "record": _json_obj(row[1])},
+            ),
+            (
+                "event_side_effect_deliveries",
+                "SELECT session_id, event_id, event_sequence, status, attempts, claim_id, lease_expires_at, next_attempt_at, last_error, updated_at FROM cayu_persisted_event_side_effects WHERE session_id = %s ORDER BY event_sequence LIMIT %s",
+                _persisted_event_side_effect_delivery_from_row,
+            ),
+            (
+                "queue_deliveries",
+                "SELECT to_jsonb(d) - 'created_at' FROM cayu_session_message_deliveries AS d WHERE session_id = %s ORDER BY created_at, delivery_id LIMIT %s",
+                lambda row: _json_obj(row[0]),
+            ),
+            (
+                "deferred_interaction_inputs",
+                "SELECT interaction_id, source_messages FROM cayu_deferred_interaction_inputs WHERE session_id = %s LIMIT %s",
+                lambda row: deferred_interaction_input_from_storage_payload(
+                    row[0], _json_obj(row[1])
+                ),
+            ),
+            (
+                "targeted_tool_grants",
+                "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, generation_id, tool_id, tool_name, catalogue_revision, descriptor_version, issued_at, expires_at, max_calls, used_calls, revoked_at, record FROM cayu_targeted_tool_grants WHERE session_id = %s ORDER BY issued_at, grant_id LIMIT %s",
+                project_grant,
+            ),
+            (
+                "targeted_tool_grant_uses",
+                "SELECT use_id, grant_id, session_id, interaction_id, model_step_id, outer_tool_call_id, arguments_sha256, invocation_id, bound_at, record FROM cayu_targeted_tool_grant_uses WHERE session_id = %s ORDER BY bound_at, use_id LIMIT %s",
+                _targeted_tool_use_from_postgres_row,
+            ),
+        )
+        for name, statement, convert in queries:
+            builder.add_class(name, ())
+            await cur.execute(statement, (session_id, max_records + 1))
+            while rows := await cur.fetchmany(100):
+                for row in rows:
+                    builder.add_record(name, convert(row))
+        return builder.finish()
 
     async def load_session_export_snapshot(
         self,
@@ -37258,6 +38101,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 if await cur.fetchone() is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if copied_messages:
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     await self._register_public_authorities(
                         cur,
                         session_id,
@@ -37323,6 +38168,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Deferred interaction input changed before finalization."
                         )
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     stored = deferred_interaction_input_from_storage_payload(
                         row[0],
                         _json_obj(row[1]),
@@ -37428,6 +38275,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Deferred interaction input belongs to another interaction."
                         )
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     deferred = deferred_interaction_input_from_storage_payload(
                         row[0],
                         _json_obj(row[1]),
@@ -37509,6 +38358,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, session)
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
                         session,
@@ -38022,6 +38873,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             async with conn.cursor() as cur:
                 if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
+                for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = await self._session_store_now(cur)
                 replacement = _replace_checkpoint_preserving_completion_result_event_publications(
                     await self._load_checkpoint(cur, session_id),
@@ -38049,6 +38902,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, session)
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     current = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
                         session,
@@ -38085,6 +38940,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch(session_id, session)
+                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     current = await self._load_checkpoint(cur, session_id)
                     now = await self._session_store_now(cur)
                     transformed = checkpoint_transform(
@@ -38370,6 +39227,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
+    supports_session_closure_claims: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
@@ -39249,6 +40107,73 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             rows = await cur.fetchall()
             return [pg_support.task_from_row(row) for row in rows]
 
+    async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
+                "WHERE session_id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            claim = TaskSessionClosureClaim.model_validate(row[1])
+            if claim.session_id != session_id or claim.plan_id != row[0]:
+                raise ValueError("Task closure claim conflicts with its retained authority.")
+            return claim
+
+    async def claim_session_closure(
+        self, claim: TaskSessionClosureClaim
+    ) -> TaskSessionClosureClaim:
+        claim = copy_task_session_closure_claim(claim)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            async with conn.cursor() as cur:
+                # Writers acquire this same lock in their INSERT/UPDATE trigger.
+                # Do not take task row locks here: a writer can already own one
+                # while waiting in that trigger. The claim excludes its commit.
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    ("cayu-task-session-closure:" + claim.session_id,),
+                )
+                await cur.execute(
+                    "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
+                    "WHERE session_id = %s",
+                    (claim.session_id,),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    existing = TaskSessionClosureClaim.model_validate(row[1])
+                    if existing != claim or row[0] != claim.plan_id:
+                        raise ValueError(
+                            "Task closure claim conflicts with its retained authority."
+                        )
+                    return existing
+                await cur.execute(
+                    "SELECT id, status, worker_id, lease_expires_at FROM cayu_tasks "
+                    "WHERE session_id = %s LIMIT %s",
+                    (claim.session_id, len(claim.task_ids) + 1),
+                )
+                rows = await cur.fetchall()
+                if {row[0] for row in rows} != set(claim.task_ids):
+                    raise ValueError("Task closure set changed before admission.")
+                if any(
+                    row[1] not in {"completed", "failed", "cancelled"}
+                    or row[2] is not None
+                    or row[3] is not None
+                    for row in rows
+                ):
+                    raise ValueError("Task closure requires quiescent terminal tasks.")
+                await cur.execute(
+                    "INSERT INTO cayu_task_session_closure_claims "
+                    "(session_id, plan_id, claim_json) VALUES (%s, %s, %s)",
+                    (claim.session_id, claim.plan_id, Jsonb(claim.model_dump(mode="json"))),
+                )
+            await conn.commit()
+        return claim
+
     async def delete_session_tasks(
         self,
         session_id: str,
@@ -39257,21 +40182,39 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         policy: Any,
     ) -> None:
         """Delete a bounded, quiescent session task graph transactionally."""
+        from cayu.storage._session_closure_sql import TASK_CLOSURE_DEPENDENCIES
 
         session_id = require_clean_nonblank(session_id, "session_id")
-        if not task_ids:
-            return
         await self._ensure_ready()
         async with self._connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT id, status, worker_id, lease_expires_at "
-                    "FROM cayu_tasks WHERE session_id = %s AND id = ANY(%s) "
+                    "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
+                    "WHERE session_id = %s",
+                    (session_id,),
+                )
+                claim_row = await cur.fetchone()
+                claim = None
+                if claim_row is not None:
+                    claim = TaskSessionClosureClaim.model_validate(claim_row[1])
+                    if (
+                        claim.session_id != session_id
+                        or claim.plan_id != claim_row[0]
+                        or set(task_ids) != set(claim.task_ids)
+                    ):
+                        raise ValueError("Task deletion conflicts with the retained closure set.")
+                if not task_ids:
+                    return
+                await cur.execute(
+                    "SELECT id, status, worker_id, lease_expires_at, session_id "
+                    "FROM cayu_tasks WHERE id = ANY(%s) "
                     "FOR UPDATE",
-                    (session_id, list(task_ids)),
+                    (list(task_ids),),
                 )
                 rows = await cur.fetchall()
-                if {row[0] for row in rows} != set(task_ids):
+                if (claim is None and {row[0] for row in rows} != set(task_ids)) or any(
+                    row[4] != session_id for row in rows
+                ):
                     raise ValueError("Task closure authority changed during deletion.")
                 if any(
                     row[1]
@@ -39302,7 +40245,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     """
                 )
                 for table, column in await cur.fetchall():
-                    if table == "cayu_tasks":
+                    if (table, column) not in TASK_CLOSURE_DEPENDENCIES:
                         continue
                     await cur.execute(
                         sql.SQL("DELETE FROM {} WHERE {} = ANY(%s)").format(

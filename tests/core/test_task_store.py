@@ -2897,7 +2897,10 @@ def test_sqlite_task_store_validate_rejects_pre_handoff_generation_schema(tmp_pa
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 84"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {schema_migrations.MIN_SUPPORTED_REVISION}",
+    ):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 

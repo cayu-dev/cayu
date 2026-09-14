@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from hashlib import sha256
 from threading import Barrier as ThreadBarrier
 from threading import Event as ThreadEvent
 from threading import Lock as ThreadLock
@@ -54,8 +55,12 @@ class _S3Client:
             in self.objects
         ):
             raise _ClientError("PreconditionFailed")
+        if "IfMatch" in kwargs:
+            previous = self.objects.get((kwargs["Bucket"], kwargs["Key"]))
+            if previous is None or kwargs["IfMatch"] != sha256(previous).hexdigest():
+                raise _ClientError("PreconditionFailed")
         self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
-        return {"ETag": '"etag"'}
+        return {"ETag": sha256(kwargs["Body"]).hexdigest()}
 
     def get_object(self, **kwargs: Any) -> dict[str, Any]:
         self.get_calls.append(kwargs)
@@ -70,7 +75,11 @@ class _S3Client:
         if byte_range is not None:
             start, end = byte_range.removeprefix("bytes=").split("-", 1)
             value = value[int(start) : int(end) + 1]
-        response = {"Body": io.BytesIO(value), "ContentLength": len(value)}
+        response = {
+            "Body": io.BytesIO(value),
+            "ContentLength": len(value),
+            "ETag": sha256(value).hexdigest(),
+        }
         if byte_range is not None:
             response["ContentRange"] = f"bytes {start}-{int(start) + len(value) - 1}/{total}"
         return response
@@ -315,7 +324,7 @@ def test_s3_artifact_store_delete_remains_idempotent_for_missing_objects() -> No
     assert client.objects == {}
 
 
-def test_s3_artifact_store_lists_all_metadata_then_applies_limit() -> None:
+def test_s3_artifact_store_counts_all_metadata_with_bounded_selection() -> None:
     client = _S3Client()
     store = S3ArtifactStore("bucket", client=client)
     first = asyncio.run(store.put_bytes(b"one", filename="one.txt", session_id="sess_1"))
@@ -690,7 +699,8 @@ def test_s3_cancelled_content_upload_retains_a_fenced_orphan_candidate() -> None
         assert len(combined.exceptions) == 2
         assert any(key.endswith("/content") for _, key in client.objects)
         assert client.delete_calls == []
-        assert (await store.list(session_id="sess_1")).artifacts == ()
+        with pytest.raises(ArtifactStoreUnavailableError, match="without ownership metadata"):
+            await store.list(session_id="sess_1")
 
     asyncio.run(scenario())
 

@@ -25,6 +25,7 @@ from tests.core.checkpoint_schema_conformance import (
     assert_versionless_pending_continuation_fails_closed_conformance,
 )
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
+from tests.core.session_closure_conformance import assert_detach_closure_conformance
 from tests.core.session_operation_fault_conformance import (
     assert_session_operation_fault_conformance,
 )
@@ -112,6 +113,10 @@ from cayu.support_bundles import (
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_task_session_closure_claims",
+    "cayu_session_closure_progress",
+    "cayu_session_closure_tombstones",
+    "cayu_session_closure_receipts",
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",
     "cayu_knowledge_index_readiness_events",
@@ -228,6 +233,19 @@ def _new_store(dsn: str):
     return PostgresSessionStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
 
 
+def test_postgres_detach_closure_conformance(postgres_dsn: str) -> None:
+    async def run():
+        store = _new_store(postgres_dsn)
+        competitor = _new_store(postgres_dsn)
+        try:
+            await assert_detach_closure_conformance(store, competitor)
+        finally:
+            await competitor.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_postgres_deferred_input_accepts_textual_jsonb_loader(postgres_dsn: str) -> None:
     async def scenario() -> None:
         from psycopg.types.json import set_json_loads
@@ -294,6 +312,32 @@ def test_postgres_deferred_input_accepts_textual_jsonb_loader(postgres_dsn: str)
         finally:
             await store.close()
             await pool.close()
+
+    asyncio.run(scenario())
+
+
+def test_postgres_session_closure_progress_survives_reopen(postgres_dsn: str) -> None:
+    async def scenario() -> None:
+        await _truncate(postgres_dsn)
+        progress = {
+            "schema_version": 1,
+            "root_session_id": "root",
+            "plan_id": "a" * 64,
+            "policy_digest": "b" * 64,
+            "max_records": 1000,
+            "max_bytes": 1000000,
+            "phase": "recursive",
+            "descendants": [{"session_id": "child", "parent_session_id": "root"}],
+            "completed": ["child"],
+        }
+        first = _new_store(postgres_dsn)
+        await first.save_session_closure_progress(progress)
+        await first.close()
+        reopened = _new_store(postgres_dsn)
+        try:
+            assert await reopened.load_session_closure_progress("root", "a" * 64) == progress
+        finally:
+            await reopened.close()
 
     asyncio.run(scenario())
 

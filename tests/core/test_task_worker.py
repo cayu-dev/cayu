@@ -575,45 +575,56 @@ def test_task_worker_stops_handler_when_heartbeat_stalls_past_lease() -> None:
                 store,
                 handler,
                 worker_id="stale-worker",
-                lease_seconds=1,
+                lease_seconds=5,
                 poll_interval_s=0.001,
                 reclaim=False,
                 max_tasks=1,
             )
         )
-        await asyncio.wait_for(stale_handler_started.wait(), timeout=10)
-        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=10)
-        await asyncio.sleep(1.05)
-        assert stale_worker.done() is False
-        assert stale_handler_stopped.is_set() is False
-        for _attempt in range(100):
-            draining = await store.load_task("stalled-periodic-heartbeat")
-            if draining is not None and draining.status_reason == "cancellation_requested":
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("Task worker did not durably fence its draining handler.")
-        assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
-        assert (
-            await store.claim_task(
-                "replacement-worker",
-                TaskQuery(type="job"),
-                lease_seconds=1,
-            )
-            is None
-        )
-        release_stale_handler.set()
-        await asyncio.wait_for(stale_handler_stopped.wait(), timeout=2)
-        with pytest.raises(TaskClaimLost, match="positively known lease deadline"):
-            await stale_worker
-        terminal = await store.load_task("stalled-periodic-heartbeat")
-        assert terminal is not None
-        assert terminal.status is TaskStatus.CANCELLED
-        assert terminal.worker_id is None
-        assert terminal.lease_expires_at is None
+        try:
+            await asyncio.wait_for(stale_handler_started.wait(), timeout=10)
+            await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=10)
 
-        store.release_periodic_heartbeat.set()
-        await asyncio.sleep(0)
+            async def wait_for_draining():
+                while True:
+                    draining = await store.load_task("stalled-periodic-heartbeat")
+                    if draining is not None and draining.status_reason == "cancellation_requested":
+                        return draining
+                    await asyncio.sleep(0.01)
+
+            # Observe the actual lease-loss fence instead of assuming a fixed
+            # sleep corresponds to the worker's renewal/deadline schedule.
+            draining = await asyncio.wait_for(wait_for_draining(), timeout=10)
+            assert draining.lease_expires_at is not None
+            remaining = (draining.lease_expires_at - datetime.now(UTC)).total_seconds()
+            if remaining > 0:
+                await asyncio.sleep(remaining + 0.05)
+            assert stale_worker.done() is False
+            assert stale_handler_stopped.is_set() is False
+            assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+            assert (
+                await store.claim_task(
+                    "replacement-worker",
+                    TaskQuery(type="job"),
+                    lease_seconds=1,
+                )
+                is None
+            )
+            release_stale_handler.set()
+            await asyncio.wait_for(stale_handler_stopped.wait(), timeout=10)
+            with pytest.raises(TaskClaimLost, match="positively known lease deadline"):
+                await asyncio.wait_for(asyncio.shield(stale_worker), timeout=10)
+            terminal = await store.load_task("stalled-periodic-heartbeat")
+            assert terminal is not None
+            assert terminal.status is TaskStatus.CANCELLED
+            assert terminal.worker_id is None
+            assert terminal.lease_expires_at is None
+        finally:
+            # A failed setup/assertion must not strand the executor thread and
+            # make asyncio.run wait for its 300-second executor shutdown limit.
+            release_stale_handler.set()
+            store.release_periodic_heartbeat.set()
+            await asyncio.wait_for(asyncio.gather(stale_worker, return_exceptions=True), timeout=10)
 
     asyncio.run(scenario())
 

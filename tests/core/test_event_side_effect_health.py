@@ -307,7 +307,8 @@ def test_sqlite_health_index_migration_preserves_rows(tmp_path):
         with sqlite3.connect(path) as conn:
             conn.execute("DROP INDEX idx_cayu_side_effect_health")
             conn.execute("DROP INDEX idx_cayu_side_effect_outstanding")
-            conn.execute("DELETE FROM cayu_schema_migrations WHERE revision = 86")
+            conn.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 86")
+            conn.execute("PRAGMA user_version = 85")
         store = SQLiteSessionStore(path, schema_mode=SchemaMode.MIGRATE)
         try:
             assert (await store.get_persisted_event_side_effect_health()).pending == 1
@@ -357,7 +358,7 @@ def test_postgres_health_index_migration_preserves_rows(conformance_postgres_dsn
             async with store._connection() as conn, conn.cursor() as cur:
                 await cur.execute("DROP INDEX idx_cayu_side_effect_health")
                 await cur.execute("DROP INDEX idx_cayu_side_effect_outstanding")
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 86")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 86")
                 await conn.commit()
         finally:
             await _close_store(store)

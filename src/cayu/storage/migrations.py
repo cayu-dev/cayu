@@ -445,6 +445,12 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=85, kind=RevisionKind.BREAKING, compatible_from=85),
     # Payload-free delivery health and stable operational pagination indexes.
     Revision(revision=86, kind=RevisionKind.ADDITIVE, compatible_from=85),
+    # Child-session detach now requires durable lineage tombstones and an
+    # atomic store-owned parent-edge update.
+    Revision(revision=87, kind=RevisionKind.BREAKING, compatible_from=87),
+    # Closure claims fence session and dependent-task admission. Every writer
+    # must participate before destructive closure is admitted.
+    Revision(revision=88, kind=RevisionKind.BREAKING, compatible_from=88),
 )
 
 #: The revision an empty database is initialized to.

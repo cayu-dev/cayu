@@ -96,9 +96,9 @@ def test_nested_input_routing_and_parent_closure_are_isolated(tmp_path, backend)
                     ]
                 assert await snapshot() == before
                 assert len(provider.requests) == 4
-            # Current deletion policy refuses a parent with descendants; it
-            # must not partially erase the wait or invalidate the child action.
-            with pytest.raises(ValueError, match="child-session policy"):
+            # The delegated call still owns an unsettled protected effect.
+            # Closure must reject before erasing the wait or child action.
+            with pytest.raises(ValueError, match="settled protected tool effects"):
                 await app.erase_session_closure("parent")
             assert await snapshot() == before
             assert len(provider.requests) == 4

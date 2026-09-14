@@ -5,17 +5,29 @@ import importlib
 import json
 import mimetypes
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_metadata,
     require_clean_nonblank,
     require_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.artifacts._closure import (
+    ARTIFACT_CLOSURE_MAX_POLICY_BYTES,
+    ArtifactClosureClaim,
+    ArtifactClosureItem,
+    copy_artifact_closure_claim,
+    decode_artifact_closure_claim,
+    encode_artifact_closure_claim,
+)
+from cayu.artifacts._listing import BoundedArtifactListing
+from cayu.artifacts._s3_closure import S3ArtifactClosureGate
 from cayu.artifacts._settlement import (
     _absent_artifact_write,
     _ArtifactWritePhaseReporter,
@@ -38,6 +50,7 @@ from cayu.artifacts.base import (
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementFailureCode,
     ArtifactWriteSettlementPhase,
+    ArtifactWriteSettlementStatus,
 )
 
 _ARTIFACT_ID_PATTERN = re.compile(r"\Aart_[0-9a-f]{32}\Z")
@@ -145,7 +158,275 @@ class S3ArtifactStore(ArtifactStore):
             ),
         )
 
-    async def _run_artifact_write(
+    async def _run_artifact_write(self, reporter, *, artifact, content, supplied_identity):
+        gate = None
+        reserved = False
+        token = uuid4().hex
+        request_digest = sha256(
+            canonical_durable_json_bytes(
+                {
+                    "artifact": artifact.model_dump(mode="json"),
+                    "content_sha256": sha256(content).hexdigest(),
+                },
+                "S3 artifact write intent",
+            )
+        ).hexdigest()
+        try:
+            client = await self._get_client(reporter=reporter)
+            if artifact.scope is ArtifactScope.SESSION:
+                gate = S3ArtifactClosureGate(
+                    client,
+                    bucket=self.bucket,
+                    prefix=self.prefix,
+                    store_id=self.id,
+                    session_id=artifact.session_id,
+                    encryption=self._encryption_options(),
+                )
+                await _run_s3_sync_call(reporter, gate.reserve, token, artifact.id, request_digest)
+                reserved = True
+            await _run_s3_sync_call(reporter, self._bind_artifact_owner, client, artifact)
+        except BaseException as error:
+            if reserved and gate is not None:
+                # The owner check precedes every content/metadata upload. Its
+                # failure cannot leave a business mutation running, so this
+                # exact reservation can be retired once the guard settles.
+                try:
+                    await _run_s3_sync_call(
+                        reporter, gate.release, token, artifact.id, request_digest
+                    )
+                except BaseException as cleanup_error:
+                    error = _combined_s3_write_failure(
+                        "S3 artifact admission and reservation cleanup failed.",
+                        primary=error,
+                        reconciliation=cleanup_error,
+                    )
+                else:
+                    return _absent_artifact_write(
+                        error,
+                        phase=ArtifactWriteSettlementPhase.PRE_DISPATCH,
+                        failure_codes=(ArtifactWriteSettlementFailureCode.MUTATION_FAILED,),
+                    )
+            elif gate is None:
+                return _absent_artifact_write(
+                    error,
+                    phase=ArtifactWriteSettlementPhase.PRE_DISPATCH,
+                    failure_codes=(ArtifactWriteSettlementFailureCode.MUTATION_FAILED,),
+                )
+            # A reserve acknowledgement may have been lost. No artifact upload
+            # starts without positive admission; retained gate state stays fenced.
+            return _unsettled_artifact_write(
+                error,
+                phase=ArtifactWriteSettlementPhase.PRE_DISPATCH,
+                failure_codes=(ArtifactWriteSettlementFailureCode.MUTATION_FAILED,),
+            )
+        try:
+            outcome = await self._run_reserved_artifact_write(
+                reporter, artifact=artifact, content=content, supplied_identity=supplied_identity
+            )
+        except BaseException as error:
+            return _unsettled_artifact_write(
+                error,
+                phase=reporter.phase,
+                failure_codes=(ArtifactWriteSettlementFailureCode.MUTATION_FAILED,),
+            )
+        if gate is not None and outcome.status in {
+            ArtifactWriteSettlementStatus.COMMITTED,
+            ArtifactWriteSettlementStatus.ABSENT,
+        }:
+            try:
+                await _run_s3_sync_call(reporter, gate.release, token, artifact.id, request_digest)
+            except BaseException as error:
+                if outcome.error is not None and outcome.error is not error:
+                    error = _combined_s3_write_failure(
+                        "S3 artifact write and reservation settlement failed.",
+                        primary=outcome.error,
+                        reconciliation=error,
+                    )
+                return _unsettled_artifact_write(
+                    error,
+                    phase=ArtifactWriteSettlementPhase.RECONCILIATION,
+                    failure_codes=(ArtifactWriteSettlementFailureCode.RECONCILIATION_FAILED,),
+                )
+        return outcome
+
+    def _bind_artifact_owner(self, client, artifact):
+        key = (
+            (self.prefix + "/" if self.prefix else "")
+            + "_closure/artifact-owners/"
+            + artifact.id
+            + ".json"
+        )
+        encoded = canonical_durable_json_bytes(
+            {
+                "artifact_id": artifact.id,
+                "scope": artifact.scope.value,
+                "session_id": artifact.session_id,
+                "environment_name": artifact.environment_name
+                if artifact.scope is ArtifactScope.ENVIRONMENT
+                else None,
+            },
+            "S3 artifact ownership",
+        )
+        try:
+            client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=encoded,
+                ContentType="application/json",
+                IfNoneMatch="*",
+                **self._encryption_options(),
+            )
+        except Exception:
+            response = client.get_object(Bucket=self.bucket, Key=key)
+            observed = _response_body_bytes(response, len(encoded) + 1)
+            if observed != encoded:
+                raise ValueError(
+                    "Artifact identity already exists with different content or metadata."
+                ) from None
+
+    def _closure_gate(self, client, session_id):
+        return S3ArtifactClosureGate(
+            client,
+            bucket=self.bucket,
+            prefix=self.prefix,
+            store_id=self.id,
+            session_id=session_id,
+            encryption=self._encryption_options(),
+        )
+
+    @property
+    def supports_session_closure_claims(self) -> bool:
+        return True
+
+    async def load_session_closure_claim(self, session_id: str) -> ArtifactClosureClaim | None:
+        ArtifactClosureClaim(self.id, session_id, "0" * 64, ())
+        client = await self._get_client()
+        state, _ = await _run_s3_sync_call(None, self._closure_gate(client, session_id).read)
+        if state["claim"] is None:
+            return None
+        return decode_artifact_closure_claim(
+            canonical_durable_json_bytes(
+                state["claim"], "S3 artifact closure claim", max_bytes=16 * 1024 * 1024
+            )
+        )
+
+    async def _require_closure_owner(self, client, artifact_id, session_id):
+        key = (
+            (self.prefix + "/" if self.prefix else "")
+            + "_closure/artifact-owners/"
+            + artifact_id
+            + ".json"
+        )
+        expected = canonical_durable_json_bytes(
+            {
+                "artifact_id": artifact_id,
+                "scope": "session",
+                "session_id": session_id,
+                "environment_name": None,
+            },
+            "S3 artifact owner",
+        )
+        response = await _run_s3_sync_call(None, client.get_object, Bucket=self.bucket, Key=key)
+        value = await _run_s3_sync_call(None, _response_body_bytes, response, len(expected) + 1)
+        if value != expected:
+            raise ValueError("S3 artifact closure ownership conflicts.")
+
+    async def claim_session_closure(
+        self, session_id: str, plan_id: str, *, max_records: int, max_bytes: int
+    ) -> ArtifactClosureClaim:
+        ArtifactClosureClaim(self.id, session_id, plan_id, ())
+        if type(max_records) is not int or not 0 < max_records <= 100_000:
+            raise ValueError("Invalid artifact closure record bound.")
+        if type(max_bytes) is not int or not 0 < max_bytes <= ARTIFACT_CLOSURE_MAX_POLICY_BYTES:
+            raise ValueError("Invalid artifact closure byte bound.")
+        client = await self._get_client()
+        gate = self._closure_gate(client, session_id)
+        await _run_s3_sync_call(None, gate.retire_settled)
+        state, _ = await _run_s3_sync_call(None, gate.read)
+        if state["claim"] is not None:
+            claim = decode_artifact_closure_claim(
+                canonical_durable_json_bytes(
+                    state["claim"], "S3 artifact closure claim", max_bytes=16 * 1024 * 1024
+                )
+            )
+            if claim.plan_id != plan_id:
+                raise ValueError("S3 artifact closure plan conflicts.")
+        else:
+            if state["active"]:
+                raise ValueError("S3 artifact publication has not quiesced.")
+            listing = await self.list(
+                scope=ArtifactScope.SESSION, session_id=session_id, limit=max_records
+            )
+            if listing.truncated:
+                raise ValueError("S3 artifact closure inventory is truncated.")
+            items = []
+            for artifact in listing.artifacts:
+                if artifact.scope is not ArtifactScope.SESSION or artifact.session_id != session_id:
+                    raise ValueError("S3 artifact closure inventory ownership conflicts.")
+                await self._require_closure_owner(client, artifact.id, session_id)
+                items.append(
+                    ArtifactClosureItem(
+                        artifact.id,
+                        artifact.size_bytes,
+                        sha256(
+                            canonical_durable_json_bytes(
+                                artifact.model_dump(mode="json"), "artifact closure metadata"
+                            )
+                        ).hexdigest(),
+                    )
+                )
+            claim = ArtifactClosureClaim(
+                self.id,
+                session_id,
+                plan_id,
+                tuple(sorted(items, key=lambda item: item.artifact_id)),
+            )
+        if (
+            len(claim.artifacts) > max_records
+            or len(encode_artifact_closure_claim(claim)) > max_bytes
+        ):
+            raise ValueError("S3 artifact closure claim exceeds its requested bounds.")
+        await _run_s3_sync_call(None, gate.seal, claim, expected_revision=state["revision"])
+        return claim
+
+    async def delete_session_closure_artifact(
+        self, claim: ArtifactClosureClaim, artifact_id: str
+    ) -> None:
+        claim = copy_artifact_closure_claim(claim)
+        if claim.store_id != self.id:
+            raise ValueError("S3 artifact closure store conflicts.")
+        expected = next((item for item in claim.artifacts if item.artifact_id == artifact_id), None)
+        if expected is None:
+            raise ValueError("Artifact is not owned by the closure claim.")
+        if await self.load_session_closure_claim(claim.session_id) != claim:
+            raise ValueError("S3 artifact closure claim conflicts.")
+        client = await self._get_client()
+        await self._require_closure_owner(client, artifact_id, claim.session_id)
+        try:
+            metadata = await self._read_metadata(client, artifact_id)
+        except FileNotFoundError:
+            pass
+        else:
+            actual = sha256(
+                canonical_durable_json_bytes(
+                    metadata.model_dump(mode="json"), "artifact closure metadata"
+                )
+            ).hexdigest()
+            if actual != expected.metadata_sha256:
+                raise ValueError("S3 artifact closure item was replaced.")
+        # The permanent owner binding and sealed session exclude future writers,
+        # including attempts to reuse this ID from another scope or session.
+        await _run_s3_sync_call(
+            None,
+            self._delete_keys,
+            client,
+            (
+                self._artifact_key(artifact_id, "content"),
+                self._artifact_key(artifact_id, "metadata.json"),
+            ),
+        )
+
+    async def _run_reserved_artifact_write(
         self,
         reporter: _ArtifactWritePhaseReporter,
         *,
@@ -422,12 +703,12 @@ class S3ArtifactStore(ArtifactStore):
         validated_limit = _validate_limit(limit, "limit")
         client = await self._get_client()
         try:
-            metadata_ids = await asyncio.to_thread(self._list_metadata_ids, client)
-            artifacts: list[ArtifactMetadata] = []
-            for artifact_id in metadata_ids:
+            inventory = BoundedArtifactListing(validated_limit)
+            async for artifact_id in self._iter_metadata_ids(client):
                 try:
                     artifact = await self._read_metadata(client, artifact_id)
-                except (FileNotFoundError, ValueError):
+                except FileNotFoundError:
+                    await self._require_no_surviving_content(client, artifact_id)
                     continue
                 if validated_scope is not None and artifact.scope != validated_scope:
                     continue
@@ -437,21 +718,14 @@ class S3ArtifactStore(ArtifactStore):
                     continue
                 if environment_name is not None and artifact.environment_name != environment_name:
                     continue
-                artifacts.append(artifact)
+                inventory.add(artifact)
         except ArtifactStoreUnavailableError:
             raise
         except Exception as exc:
             raise ArtifactStoreUnavailableError(
                 "S3 artifact store could not list artifacts."
             ) from exc
-        artifacts.sort(key=lambda artifact: artifact.created_at, reverse=True)
-        total_count = len(artifacts)
-        selected = artifacts if validated_limit is None else artifacts[:validated_limit]
-        return ArtifactListResult(
-            artifacts=tuple(selected),
-            total_count=total_count,
-            truncated=len(selected) < total_count,
-        )
+        return inventory.result()
 
     async def delete(self, artifact_id: str) -> None:
         artifact_id = _validate_artifact_id(artifact_id)
@@ -544,37 +818,81 @@ class S3ArtifactStore(ArtifactStore):
             truncated=False,
         )
 
-    def _list_metadata_ids(self, client: Any) -> Sequence[str]:
+    async def _require_no_surviving_content(self, client: Any, artifact_id: str) -> None:
+        try:
+            await _run_s3_sync_call(
+                None,
+                client.head_object,
+                Bucket=self.bucket,
+                Key=self._artifact_key(artifact_id, "content"),
+            )
+        except Exception as error:
+            if _aws_error_code(error) in _NOT_FOUND_CODES:
+                return
+            raise
+        raise ArtifactStoreUnavailableError(
+            "S3 artifact inventory contains content without ownership metadata."
+        )
+
+    async def _iter_metadata_ids(self, client: Any) -> AsyncIterator[str]:
         prefix = f"{self.prefix}/" if self.prefix else ""
         continuation: str | None = None
-        artifact_ids: list[str] = []
         while True:
-            options: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+            options: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
             if continuation is not None:
                 options["ContinuationToken"] = continuation
-            response = client.list_objects_v2(**options)
+            response = await asyncio.to_thread(client.list_objects_v2, **options)
             if not isinstance(response, Mapping):
                 raise ArtifactStoreUnavailableError(
                     "S3 artifact store received an invalid list response."
                 )
-            for entry in response.get("Contents", []):
+            entries = response.get("Contents", [])
+            if (
+                type(entries) is not list
+                or len(entries) > 1000
+                or type(response.get("IsTruncated")) is not bool
+            ):
+                raise ArtifactStoreUnavailableError(
+                    "S3 artifact store received an invalid list page."
+                )
+            for entry in entries:
                 if not isinstance(entry, Mapping):
                     continue
                 key = entry.get("Key")
-                if type(key) is not str or not key.endswith("/metadata.json"):
+                if type(key) is not str or not key.startswith(prefix):
                     continue
                 relative = key[len(prefix) :]
                 artifact_id, separator, filename = relative.partition("/")
                 if (
                     separator
-                    and filename == "metadata.json"
+                    and filename in {"metadata.json", "content"}
                     and _ARTIFACT_ID_PATTERN.fullmatch(artifact_id)
                 ):
-                    artifact_ids.append(artifact_id)
-            if not response.get("IsTruncated"):
-                return artifact_ids
+                    if filename == "metadata.json":
+                        yield artifact_id
+                    else:
+                        # Inspect content keys too, without collecting an unbounded
+                        # set of IDs or counting the two objects twice. A partial
+                        # DeleteObjects failure can leave content without metadata.
+                        try:
+                            await _run_s3_sync_call(
+                                None,
+                                client.head_object,
+                                Bucket=self.bucket,
+                                Key=self._artifact_key(artifact_id, "metadata.json"),
+                            )
+                        except Exception as error:
+                            if _aws_error_code(error) not in _NOT_FOUND_CODES:
+                                raise
+                            await self._require_no_surviving_content(client, artifact_id)
+            if not response["IsTruncated"]:
+                return
             continuation_value = response.get("NextContinuationToken")
-            if type(continuation_value) is not str or not continuation_value:
+            if (
+                type(continuation_value) is not str
+                or not continuation_value
+                or continuation_value == continuation
+            ):
                 raise ArtifactStoreUnavailableError(
                     "S3 artifact store list response omitted continuation token."
                 )

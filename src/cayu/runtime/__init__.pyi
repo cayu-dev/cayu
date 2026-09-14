@@ -826,9 +826,14 @@ from cayu.runtime.session_closure import SessionClosureChildPolicy as SessionClo
 from cayu.runtime.session_closure import SessionClosureCoordinator as SessionClosureCoordinator
 from cayu.runtime.session_closure import SessionClosureDisposition as SessionClosureDisposition
 from cayu.runtime.session_closure import SessionClosureExport as SessionClosureExport
+from cayu.runtime.session_closure import (
+    SessionClosureExportIncomplete as SessionClosureExportIncomplete,
+)
+from cayu.runtime.session_closure import SessionClosureLineageStore as SessionClosureLineageStore
 from cayu.runtime.session_closure import SessionClosureManifest as SessionClosureManifest
 from cayu.runtime.session_closure import SessionClosureOperation as SessionClosureOperation
 from cayu.runtime.session_closure import SessionClosurePolicy as SessionClosurePolicy
+from cayu.runtime.session_closure import SessionClosureProgress as SessionClosureProgress
 from cayu.runtime.session_closure import SessionClosureRecord as SessionClosureRecord
 from cayu.runtime.session_closure import SessionClosureReport as SessionClosureReport
 from cayu.runtime.session_closure import SessionClosureStore as SessionClosureStore
@@ -1361,6 +1366,7 @@ from cayu.tasks.base import TaskRetrySeriesDisposition as TaskRetrySeriesDisposi
 from cayu.tasks.base import TaskRetrySeriesSnapshot as TaskRetrySeriesSnapshot
 from cayu.tasks.base import TaskRetrySettlementRequest as TaskRetrySettlementRequest
 from cayu.tasks.base import TaskRetrySettlementResult as TaskRetrySettlementResult
+from cayu.tasks.base import TaskSessionClosureClaim as TaskSessionClosureClaim
 from cayu.tasks.base import TaskStatus as TaskStatus
 from cayu.tasks.base import TaskStatusCounts as TaskStatusCounts
 from cayu.tasks.base import TaskStore as TaskStore

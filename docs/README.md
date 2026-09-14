@@ -51,6 +51,7 @@ authoritative only where a maintained guide points to the implementation or the
 
 - [Citation offset diagnostics](citation-offset-diagnostics.md)
 - [Diagnostic support bundles](diagnostic-support-bundles.md)
+- [Persisted event side-effect health](event-side-effect-health.md)
 - [Git command policy](git-command-policy.md)
 - [Nightly verification](nightly-verification.md)
 - [Private provider-error diagnostics](provider-error-diagnostics.md)

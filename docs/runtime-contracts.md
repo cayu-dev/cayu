@@ -15766,14 +15766,204 @@ Cayu's session-store deletion and closure-complete deletion are distinct
 operations. `CayuApp.inspect_session_closure()` returns a versioned, bounded
 manifest for the selected session; `export_session_closure()` emits bounded
 session records only when the configured store snapshot and every required
-dependent capability are complete. `erase_session_closure()` inventories and
-settles eligible dependents before deleting the session-store row. It fails
-closed for unsupported, unavailable, truncated, active, or retained state and
-never reports those records as erased. Session-scoped artifacts are matched by
+dependent capability are complete.
+An incomplete export raises `SessionClosureExportIncomplete`, carrying the
+manifest but no exported record data. Calling `export_session_closure()` with
+`allow_partial=True` explicitly permits a bounded diagnostic export whose
+manifest remains incomplete; it does not authorize incomplete erasure. Budget
+retention remains visible in the manifest even when export is refused.
+Export collection shares one byte budget across all retained store payloads,
+including their container keys. An adapter response that exceeds the remaining
+budget is reported as truncated rather than retained until final serialization.
+A partial diagnostic export retains earlier fitting payloads and identifies the
+omitted store in the manifest; the complete serialized package, including its
+manifest, must still fit `max_bytes`.
+Built-in session stores provide `load_session_closure_records()` as a bounded
+native snapshot. It includes the session, labels, metadata, events, transcript,
+checkpoint, queued input and delivery records, durable operation records,
+persisted-event deliveries, deferred interaction input, targeted tool grants
+and uses, recall receipts, context exposures, and per-item recall exposures.
+These session-owned memory records share the native snapshot's aggregate bounds;
+they are not counted again as a separate default dependent-store inventory.
+Counts and encoded record bytes come from the included records rather
+than presence estimates. Export uses a fresh native snapshot and updates those
+manifest counts from the records actually exported. No partial native snapshot
+is returned when its record or byte bound is exceeded.
+Public export remeasures native record bytes after secret redaction, so its
+counts and byte evidence describe the returned records rather than the private
+snapshot. Native envelope and record-class names are fixed schema controls.
+Dependent store identities must be unique and cannot use `session-store` or
+its `session-store/` namespace.
+
+Configured knowledge stores supply a reference-only inventory through
+`inspect_closure_sources()`. Built-in closure selects `session` and `tool`
+sources by the exact session ID or `cayu://sessions/<session-id>` URI,
+`session_event` sources by IDs in the session's bounded event snapshot, and
+`artifact` sources by IDs in its registered session-scoped artifact inventories.
+Source types remain part of the match; IDs or URIs are not matched by substring.
+The inventory includes directly attributed knowledge revisions, revision-bound
+evidence, stored embedding projections, and index-readiness history of matching
+revisions, including pending or failed attempts without a stored projection. Duplicate
+ID/URI matches count once. Export contains retained reference digests rather
+than knowledge text, metadata, or embedding vectors. Shared knowledge is not
+deleted. A store lacking this enumeration capability is reported as unsupported,
+not as an empty or complete inventory. Application-specific source conventions
+require an application closure adapter rather than inferred ownership.
+
+`validate_session_closure_admission()` checks native recovery, terminal
+publication, unreleased invocation fences, durable-operation, model-stage, and
+budget-audit guards before dependent cleanup. Terminal status alone does not
+prove that terminal hooks or trailing cleanup have finished. The same guards
+run again in final native deletion. This
+read-only preflight is not by itself a reservation against concurrent writes.
+`erase_session_closure()` inventories and settles eligible dependents before
+deleting the session-store row. It fails
+closed for unsupported, unavailable, truncated, or active state. Explicitly
+retained records follow their retention policy and are never reported as erased.
+Session-scoped artifacts are matched by
 both scope and exact session ID. Budget records currently support retention
 only; no destructive or pseudonymizing budget disposition is available.
-Descendant
-sessions currently support only the explicit ``reject`` policy; the default and
-only supported behavior rejects them without mutation. The HTTP
-session DELETE route uses this closure boundary and returns conflict when a
-complete closure cannot be proven.
+For a limited artifact listing, Local and S3 retain at most `limit` matching
+metadata records while scanning; they do not collect all matching metadata and
+then truncate it. Local directory names and S3 object pages are consumed
+incrementally. Computing `total_count` still scans the inventory; this is a
+retained-result bound, not a bound on the number of directory entries or remote
+pages visited.
+Unreadable artifact metadata prevents a complete inventory rather than being
+silently omitted. A public closure therefore reports the artifact store as
+unavailable and starts no deletion when metadata cannot establish ownership.
+Artifact inspection, export, and erasure revalidate the returned inventory's
+exact session scope, session ID, unique artifact identities, counts, sizes,
+and truncation evidence. Erasure captures detached identities before its first
+delete call; later mutation of an adapter-owned metadata object cannot redirect
+the remaining deletes. Unused metadata fields are not serialized into closure
+authority or exported records.
+Artifact erasure additionally requires `supports_session_closure_claims` and the
+`load_session_closure_claim`, `claim_session_closure`, and
+`delete_session_closure_artifact` operations. Listing alone is not deletion
+authority. A claim binds the store ID, exact session ID, closure plan ID, and
+sorted complete set of artifact IDs, content sizes, and immutable metadata
+digests. `ArtifactClosureClaim`, `ArtifactClosureItem`, and
+`copy_artifact_closure_claim` are public contracts for application store adapters.
+The claim serializes with session publication, survives restart and partial
+deletion, and permanently rejects later publication to that session. Exact
+replay returns the original set, including already-deleted items; changed plans
+or replacement metadata conflict. Uncertain earlier writes prevent claim
+acquisition. Stores without this capability can provide inventory/export but
+cannot participate in complete artifact erasure.
+Inspection represents an existing claim as `artifact_cleanup_claim`: its counts
+describe the original cleanup set, not current artifact existence. Exact-plan
+erasure can resume from that authority without requiring intact live metadata;
+the store revalidates the complete claim before deletion. Ordinary artifact
+listing and live-metadata export remain fail-closed for unowned or incomplete
+content and do not substitute claim records for live metadata.
+Local claims use the store's process-shared publication lock and a durable
+private claim record. Claimed deletion checks metadata and pins, then durably
+renames the directory into exact-claim cleanup staging before removing files.
+Retry after partial removal or lost rename acknowledgement finishes that staging
+under the artifact lock, including after reopening; missing metadata at the
+original path alone is not proof of completed deletion. Symlinked staging is
+rejected, and removal is directory-synchronized before success.
+S3 uses conditional writes for session reservations and
+claim publication, and retains immutable artifact-owner records to prevent ID
+reuse under another owner. These records are retained ownership evidence, not
+artifact contents. Once its business calls have settled, an S3 publisher records
+that positive settlement before retiring the reservation. Closure can retire
+such durable settlements after a lost acknowledgement or handle reconstruction.
+Active reservations have no time-based expiry: visible content/metadata objects,
+worker disappearance, and caller cancellation do not prove quiescence. Without
+durable settlement evidence, closure remains unavailable rather than deleting
+under a possibly live writer.
+The internal claim document remains limited to 16 MiB even
+when the caller permits a larger closure package. Invocation-scoped artifact
+handles do not expose this administrative claim capability; closure uses the
+application's registered store authority.
+Descendant sessions support explicit ``reject``, ``detach``, and bounded
+``recursive`` policies. ``reject`` fails before mutation. ``detach`` clears
+only the selected parent edge through an atomic SessionStore operation and
+retains a durable lineage tombstone containing the original relationship and
+closure plan. ``recursive`` requires a complete descendant census within the
+caller-supplied descendant and byte bounds, rejects overflow before mutation,
+and deletes terminal descendants in post-order with replayable per-node
+receipts. Active descendants, unsupported lineage/tombstone capabilities,
+ambiguous topology, and incomplete enumeration fail closed. Closure exports
+include descendant dispositions and retained tombstones. The HTTP session
+DELETE route uses this closure boundary and returns conflict when a complete
+closure cannot be proven.
+
+Root admission precedes descendant deletion or detachment. Recursive retries
+accept missing descendants only with matching completion receipts and reject
+new or reparented descendants outside the saved plan. Detach replay binds the
+original parent and exact child set; surviving sessions are reported as retained,
+with detached edges recorded separately. Final closure deletion rejects remaining
+child edges atomically, and recursive child deletion checks the original parent.
+Recursive progress also owns the admitted lineage throughout dependent cleanup:
+its initial publication validates the complete parent-edge set atomically with
+admission, including an empty recursive plan. Every selected descendant's native
+inventory must satisfy the same record and byte limits as a direct closure,
+in the same atomic admission that publishes ownership, before destructive work
+begins. Bound rejection leaves no claim; a caller can retry with sufficient
+limits. The admitted limits are immutable parts of saved progress.
+Detachment and competing deletion cannot change claimed sessions, including by
+deleting their parent. This ownership survives cancellation and process restart;
+the same saved plan resumes cleanup rather than releasing ownership on timeout.
+Progress updates cannot replace the original descendant set or forget completion.
+PostgreSQL serializes lineage admission transactions before reading detach replay
+evidence, so concurrent conflicting child sets cannot both publish under one plan.
+Every closure also admits its own target before dependent cleanup, including
+leaf, reject-only, and detach closures. A competing public closure of a claimed
+descendant is rejected before invoking any dependent-store deletion.
+Native status transitions, including invocation admission with a checkpoint,
+reject a claimed closure target in the same transaction before transforming its
+checkpoint or advancing its run epoch. New child sessions likewise cannot attach
+to a claimed parent. These checks use durable progress, so reconstructing a store
+or cancelling the closure caller does not reopen those admission paths.
+Retained closure claims and deletion receipts retire their session identities:
+ordinary creation and fork destinations cannot reuse those IDs. Receipt replay
+also rejects a live replacement rather than reporting it as already absent.
+Direct checkpoint replacement, checkpoint transforms (including store-time
+transforms), checkpoint/event publication, durable session-operation publication,
+and transcript/checkpoint transforms also reject claimed targets inside their
+store transaction, before invoking transform callbacks. Reading the checkpoint
+or existing operation records remains available for inspection and reconciliation.
+Receipt-backed runtime publication also refuses a new publication under a closure
+claim. An exact already-committed publication remains replayable after verifying
+both its request identity and retained material; replay changes no checkpoint,
+transcript, event, or receipt. Conflicting replay never becomes new admission.
+Queued-input admission follows the same rule: a matching existing acceptance
+receipt remains replayable, but a new queue record cannot enter a claimed target,
+including a pending session. Direct nonempty event and transcript appends are
+also refused; empty append calls remain no-ops.
+New queued-message withdrawal/quarantine actions and targeted-grant revocations
+are refused while closure owns the target. Exact committed action receipts and
+revocation evidence remain replayable without adding another event. Labels,
+metadata, and new budget-reservation publication identities cannot change the
+claimed native inventory either.
+
+Leased persisted-event side-effect deliveries prevent closure admission, even
+after lease expiry: expiry alone does not establish handler quiescence. Once
+closure owns a root or descendant, both exact and unfiltered delivery claims
+skip that target. Existing delivery settlement remains available, and unrelated
+sessions remain eligible for delivery.
+
+Task-store closure claims bind the session ID, closure plan ID, and complete
+sorted task-ID set. The built-in Memory, SQLite, and PostgreSQL stores admit a
+claim only when that exact set is terminal and has no worker or lease. Closure
+claims all selected task sets before deleting any selected descendant. Claims
+survive task deletion and caller cancellation; neither new task creation nor
+attachment can reopen the retired session's task namespace. Exact claim and
+deletion retries retain the original set, including after persistent-store
+reopening. Custom task stores must explicitly support this claim contract or
+closure reports unsupported rather than starting dependent deletion.
+
+Schema revision 88 requires coordinated writer deployment: stop all older
+session/task writers before migration and restart them with the current build.
+SQLite and PostgreSQL enforce task admission against retained claims at the
+database write boundary, including attachment updates.
+
+The optional receipt/exposure adapter follows session-scoped evidence cursors rather than
+treating the first page as a complete inventory. Receipt and exposure references
+share the caller's record and byte bounds. Invalid pagination, duplicate record
+identities, and foreign-session evidence prevent a complete closure claim.
+Inspection and export use the same enumeration path; export repeats enumeration
+and refuses newly observed truncation rather than trusting an earlier inspection.

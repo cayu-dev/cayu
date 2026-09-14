@@ -1,6 +1,9 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ArtifactClosureClaim": ("cayu.artifacts._closure", "ArtifactClosureClaim"),
+    "ArtifactClosureItem": ("cayu.artifacts._closure", "ArtifactClosureItem"),
+    "copy_artifact_closure_claim": ("cayu.artifacts._closure", "copy_artifact_closure_claim"),
     "ArtifactListResult": ("cayu.artifacts.base", "ArtifactListResult"),
     "ArtifactMetadata": ("cayu.artifacts.base", "ArtifactMetadata"),
     "ArtifactReadResult": ("cayu.artifacts.base", "ArtifactReadResult"),
@@ -107,6 +110,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "ArtifactClosureClaim",
+    "ArtifactClosureItem",
+    "copy_artifact_closure_claim",
     "ArtifactListResult",
     "ArtifactMetadata",
     "ArtifactReadResult",

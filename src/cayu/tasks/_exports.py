@@ -1,6 +1,7 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskSessionClosureClaim": ("cayu.tasks.base", "TaskSessionClosureClaim"),
     "AdmittedCompletionProposalRequest": (
         "cayu.tasks.admission",
         "AdmittedCompletionProposalRequest",
@@ -206,6 +207,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "TaskSessionClosureClaim",
     "AdmittedCompletionProposalRequest",
     "CompletionConstraintOutcome",
     "CompletionContinuationPolicy",

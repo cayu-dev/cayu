@@ -96,6 +96,7 @@ from cayu.tasks.base import TaskRetrySeriesDisposition as TaskRetrySeriesDisposi
 from cayu.tasks.base import TaskRetrySeriesSnapshot as TaskRetrySeriesSnapshot
 from cayu.tasks.base import TaskRetrySettlementRequest as TaskRetrySettlementRequest
 from cayu.tasks.base import TaskRetrySettlementResult as TaskRetrySettlementResult
+from cayu.tasks.base import TaskSessionClosureClaim as TaskSessionClosureClaim
 from cayu.tasks.base import TaskStatus as TaskStatus
 from cayu.tasks.base import TaskStatusCounts as TaskStatusCounts
 from cayu.tasks.base import TaskStore as TaskStore

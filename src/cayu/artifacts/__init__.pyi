@@ -1,5 +1,8 @@
 """Static declarations for the lazy public API."""
 
+from cayu.artifacts._closure import ArtifactClosureClaim as ArtifactClosureClaim
+from cayu.artifacts._closure import ArtifactClosureItem as ArtifactClosureItem
+from cayu.artifacts._closure import copy_artifact_closure_claim as copy_artifact_closure_claim
 from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES as DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
 )

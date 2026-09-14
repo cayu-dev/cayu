@@ -1013,9 +1013,27 @@ def test_compact_session_late_completion_commit_is_not_republished(
                 observed.append(event)
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(store.blocked.wait(), timeout=1)
-        with pytest.raises(ContextBuildError, match="bounded store wait"):
-            await asyncio.wait_for(task, timeout=1)
+        blocked = asyncio.create_task(store.blocked.wait())
+        try:
+            # This is a harness deadline, not the 10ms store deadline under test.
+            # Surface an early operation failure instead of masking it as a
+            # barrier timeout, and allow loaded CI workers time to reach it.
+            done, _ = await asyncio.wait(
+                {blocked, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done and not store.blocked.is_set():
+                await task
+            assert store.blocked.is_set(), "completion publication did not reach its barrier"
+            with pytest.raises(ContextBuildError, match="bounded store wait"):
+                await asyncio.wait_for(task, timeout=10)
+        finally:
+            # Even a failed assertion must release the cancellation-resistant
+            # physical write so teardown cannot strand its owner.
+            store.release.set()
+            blocked.cancel()
+            if not task.done():
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, blocked, return_exceptions=True), 10)
         assert stale_completion_reconciled
         assert store.committed.is_set()
         assert completion_fan_out_calls == 2
@@ -5270,7 +5288,9 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_LEASE",
-            timedelta(milliseconds=500),
+            # Leave time for admission and provider startup on loaded workers;
+            # the test expires the admitted claim, not the startup machinery.
+            timedelta(seconds=5),
         )
         monkeypatch.setattr(
             session_engine_module,
@@ -5323,25 +5343,26 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(provider.started.wait(), timeout=10)
-        await asyncio.wait_for(store.renewal_committed.wait(), timeout=5)
-        now["value"] = accepted_at + timedelta(seconds=1)
-        monkeypatch.setattr(
-            session_engine_module,
-            "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
-            60.0,
-        )
         try:
+            await asyncio.wait_for(provider.started.wait(), timeout=10)
+            await asyncio.wait_for(store.renewal_committed.wait(), timeout=10)
+            now["value"] = accepted_at + timedelta(seconds=10)
+            monkeypatch.setattr(
+                session_engine_module,
+                "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
+                60.0,
+            )
             # Provider cancellation is the lease-deadline invariant. Returning
             # also includes bounded heartbeat/store cleanup, so do not make
             # that cleanup race a second, shorter caller-imposed deadline.
-            await asyncio.wait_for(provider.cancelled.wait(), timeout=2)
+            await asyncio.wait_for(provider.cancelled.wait(), timeout=10)
             with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
-                await asyncio.wait_for(task, timeout=5)
+                await asyncio.wait_for(task, timeout=10)
         finally:
             store.release_acknowledgement.set()
             if not task.done():
-                await asyncio.gather(task, return_exceptions=True)
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
 
         assert provider.calls == 1
         assert provider.cancelled.is_set()
@@ -5904,7 +5925,9 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_LEASE",
-            timedelta(milliseconds=100),
+            # A 100ms lease can expire during admission before the injected
+            # stalled renewal is reached. Keep real expiry but permit startup.
+            timedelta(seconds=5),
         )
         monkeypatch.setattr(
             session_engine_module,
@@ -5953,10 +5976,15 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(compactor.started.wait(), timeout=10)
-        await asyncio.wait_for(store.heartbeat_started.wait(), timeout=10)
-        with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
-            await asyncio.wait_for(task, timeout=5)
+        try:
+            await asyncio.wait_for(compactor.started.wait(), timeout=10)
+            await asyncio.wait_for(store.heartbeat_started.wait(), timeout=10)
+            with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
+                await asyncio.wait_for(task, timeout=10)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
 
         assert store.heartbeat_cancelled.is_set()
         assert compactor.cancelled.is_set()

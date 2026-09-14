@@ -1734,7 +1734,7 @@ def test_orphan_staging_directory_is_ignored_and_does_not_block_retry(tmp_path):
 
 
 @pytest.mark.parametrize("content_state", ("missing", "truncated"))
-def test_listing_excludes_incomplete_legacy_artifact_pairs(tmp_path, content_state):
+def test_listing_rejects_corrupt_or_incomplete_content(tmp_path, content_state):
     root = tmp_path / content_state
     root.mkdir()
     store = LocalArtifactStore(root)
@@ -1746,10 +1746,12 @@ def test_listing_excludes_incomplete_legacy_artifact_pairs(tmp_path, content_sta
         content_path.write_bytes(b"short")
 
     reopened = LocalArtifactStore(root)
-    listed = asyncio.run(reopened.list())
-
-    assert listed.artifacts == ()
-    assert listed.total_count == 0
+    if content_state == "truncated":
+        with pytest.raises(ValueError, match="size does not match metadata"):
+            asyncio.run(reopened.list())
+        return
+    with pytest.raises(ValueError, match="incomplete artifact"):
+        asyncio.run(reopened.list())
 
 
 def test_deterministic_retry_repairs_matching_metadata_only_legacy_pair(tmp_path):
@@ -1760,12 +1762,14 @@ def test_deterministic_retry_repairs_matching_metadata_only_legacy_pair(tmp_path
     (root / artifact.id / "content").unlink()
 
     reopened = LocalArtifactStore(root)
-    assert asyncio.run(reopened.list()).artifacts == ()
+    with pytest.raises(ValueError, match="incomplete artifact"):
+        asyncio.run(reopened.list())
 
     repaired = _put(reopened, artifact_id=_ARTIFACT_ID)
 
     assert repaired.id == _ARTIFACT_ID
     assert asyncio.run(reopened.read_bytes(_ARTIFACT_ID)).content == b"durable-content"
+    assert asyncio.run(reopened.list()).artifacts == (repaired,)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Local durable publication is POSIX-only.")

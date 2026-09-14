@@ -35,6 +35,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_metadata,
+    inspect_bounded_durable_json,
     revalidate_model_input,
 )
 from cayu._validation import (
@@ -3280,6 +3281,52 @@ class TaskTopologyStoreResult(BaseModel):
         return self
 
 
+class TaskSessionClosureClaim(BaseModel):
+    """Exact non-expiring authority for retiring one session's task set."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: str = Field(strict=True, min_length=1, max_length=256)
+    plan_id: str = Field(strict=True, pattern=r"^[0-9a-f]{64}$")
+    task_ids: tuple[str, ...]
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session(cls, value):
+        return require_clean_nonblank(value, "session_id")
+
+    @field_validator("task_ids", mode="before")
+    @classmethod
+    def validate_task_ids(cls, value):
+        if type(value) not in (tuple, list) or len(value) > 100_000:
+            raise ValueError("Invalid closure task set.")
+        if any(type(item) is not str or not 0 < len(item) <= 256 for item in value):
+            raise ValueError("Invalid closure task identity.")
+        copied = tuple(require_clean_nonblank(item, "task_id") for item in value)
+        if len(set(copied)) != len(copied):
+            raise ValueError("Closure task identities must be unique.")
+        return tuple(sorted(copied))
+
+    @model_validator(mode="after")
+    def validate_claim_bound(self):
+        inspect_bounded_durable_json(
+            {"session_id": self.session_id, "plan_id": self.plan_id, "task_ids": self.task_ids},
+            "task closure claim",
+            max_bytes=8 * 1024 * 1024,
+            max_nodes=100_010,
+            allow_tuples=True,
+        )
+        return self
+
+
+def copy_task_session_closure_claim(claim: TaskSessionClosureClaim) -> TaskSessionClosureClaim:
+    if type(claim) is not TaskSessionClosureClaim:
+        raise TypeError("A typed task closure claim is required.")
+    return TaskSessionClosureClaim(
+        session_id=claim.session_id, plan_id=claim.plan_id, task_ids=claim.task_ids
+    )
+
+
 class TaskStore(ABC):
     """Persistent store for durable work items.
 
@@ -3302,6 +3349,7 @@ class TaskStore(ABC):
     supports_verified_task_worker: ClassVar[bool] = False
     supports_local_execution_attempts: ClassVar[bool] = False
     supports_session_closure_deletion: ClassVar[bool] = False
+    supports_session_closure_claims: ClassVar[bool] = False
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
@@ -3854,6 +3902,20 @@ class TaskStore(ABC):
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         """List tasks for dashboards, queues, and orchestration."""
 
+    async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
+        """Read the retained task-set authority without reopening admission."""
+        raise NotImplementedError("Task store does not support session closure claims.")
+
+    async def claim_session_closure(
+        self, claim: TaskSessionClosureClaim
+    ) -> TaskSessionClosureClaim:
+        """Reserve an exact, complete quiescent task set before independent deletion.
+
+        Retain the claim after deletion so future creation/attachment cannot
+        revive the retired session's task namespace. Exact retries are read-only.
+        """
+        raise NotImplementedError("This TaskStore does not support session closure claims.")
+
     async def delete_session_tasks(
         self,
         session_id: str,
@@ -4314,6 +4376,7 @@ class InMemoryTaskStore(TaskStore):
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
+    supports_session_closure_claims: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
@@ -4328,6 +4391,7 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
         self._tasks: dict[str, Task] = {}
+        self._session_closure_claims: dict[str, TaskSessionClosureClaim] = {}
         self._task_id_by_interrupted_handoff_id: dict[str, str] = {}
         self._interrupted_continuation_claims: dict[str, tuple[str, str]] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
@@ -5956,6 +6020,42 @@ class InMemoryTaskStore(TaskStore):
             page = tasks[query.offset : query.offset + query.limit]
             return [task.model_copy(deep=True) for task in page]
 
+    async def claim_session_closure(
+        self, claim: TaskSessionClosureClaim
+    ) -> TaskSessionClosureClaim:
+        claim = copy_task_session_closure_claim(claim)
+        async with self._lock:
+            existing = self._session_closure_claims.get(claim.session_id)
+            if existing is not None:
+                existing = copy_task_session_closure_claim(existing)
+                if existing != claim:
+                    raise ValueError("Task closure claim conflicts with its retained authority.")
+                return existing
+            indexed = self._task_keys_by_session.get(claim.session_id, ())
+            if len(indexed) != len(claim.task_ids) or {item[1] for item in indexed} != set(
+                claim.task_ids
+            ):
+                raise ValueError("Task closure set changed before admission.")
+            for task_id in claim.task_ids:
+                task = self._tasks.get(task_id)
+                if task is None or task.session_id != claim.session_id:
+                    raise ValueError("Task closure source is unavailable.")
+                if (
+                    task.status
+                    not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                    or task.worker_id is not None
+                    or task.lease_expires_at is not None
+                ):
+                    raise ValueError("Task closure requires quiescent terminal tasks.")
+            self._session_closure_claims[claim.session_id] = claim
+            return copy_task_session_closure_claim(claim)
+
+    async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            claim = self._session_closure_claims.get(session_id)
+            return None if claim is None else copy_task_session_closure_claim(claim)
+
     async def delete_session_tasks(
         self,
         session_id: str,
@@ -5966,8 +6066,15 @@ class InMemoryTaskStore(TaskStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         task_id_set = set(task_ids)
         async with self._lock:
+            claim = self._session_closure_claims.get(session_id)
+            if claim is not None and task_id_set != set(claim.task_ids):
+                raise ValueError("Task deletion conflicts with the retained closure set.")
             tasks = [self._tasks.get(task_id) for task_id in task_ids]
-            if any(task is None or task.session_id != session_id for task in tasks):
+            if any(
+                (task is None and claim is None)
+                or (task is not None and task.session_id != session_id)
+                for task in tasks
+            ):
                 raise ValueError("Task closure authority changed during deletion.")
             tasks = [task for task in tasks if task is not None]
             if any(
@@ -5977,6 +6084,146 @@ class InMemoryTaskStore(TaskStore):
                 for task in tasks
             ):
                 raise ValueError("Task closure requires quiescent terminal tasks.")
+            # Resolve ownership before mutation. Equal strings in other identity
+            # namespaces (sessions, contracts, workers) do not confer task ownership.
+            attempt_ids = {
+                key for key, value in self._work_attempts.items() if value.task_id in task_id_set
+            }
+            admission_ids = {
+                key
+                for key, value in self._work_attempt_admissions.items()
+                if value.task_id in task_id_set
+            }
+            attempt_ids.update(
+                self._work_attempt_admissions[key].attempt_id for key in admission_ids
+            )
+            proposal_ids = {
+                key
+                for key, value in self._completion_proposals.items()
+                if value.attempt_id in attempt_ids
+            }
+            decision_ids = {
+                key
+                for key, value in self._completion_decisions.items()
+                if value.proposal_id in proposal_ids
+            }
+            local_attempt_ids = {
+                key
+                for key, value in self._local_execution_attempts.items()
+                if value.authority.task_id in task_id_set
+            }
+            owned_entries: tuple[tuple[dict[Any, Any], set[Any]], ...] = (
+                (self._work_attempts, attempt_ids),
+                (self._work_attempt_admissions, admission_ids),
+                (self._completion_proposals, proposal_ids),
+                (self._completion_decisions, decision_ids),
+                (self._local_execution_attempts, local_attempt_ids),
+                (self._attempt_ids_by_task, task_id_set),
+                (self._latest_admission_id_by_task, task_id_set),
+                (self._admission_id_by_attempt, attempt_ids),
+                (self._proposal_id_by_attempt, attempt_ids),
+                (self._completion_verifier_profiles, proposal_ids),
+                (self._completion_verification_claims, proposal_ids),
+                (self._decision_id_by_proposal, proposal_ids),
+                (self._decision_application_key_by_decision, decision_ids),
+                (self._work_attempt_lifecycle_receipts, admission_ids),
+                (
+                    self._admission_id_by_session_interaction,
+                    {
+                        key
+                        for key, value in self._admission_id_by_session_interaction.items()
+                        if value in admission_ids
+                    },
+                ),
+                (
+                    self._unreleased_admission_id_by_session,
+                    {
+                        key
+                        for key, value in self._unreleased_admission_id_by_session.items()
+                        if value in admission_ids
+                    },
+                ),
+                (
+                    self._lifecycle_admission_by_settlement_id,
+                    {
+                        key
+                        for key, value in self._lifecycle_admission_by_settlement_id.items()
+                        if value in admission_ids
+                    },
+                ),
+                (
+                    self._local_execution_attempt_by_lineage,
+                    {
+                        key
+                        for key, value in self._local_execution_attempt_by_lineage.items()
+                        if value in local_attempt_ids
+                    },
+                ),
+                (
+                    self._work_attempt_preparation_holds,
+                    {
+                        key
+                        for key, value in self._work_attempt_preparation_holds.items()
+                        if value.task.id in task_id_set
+                    },
+                ),
+                (
+                    self._work_attempt_execution_claims,
+                    {
+                        key
+                        for key, value in self._work_attempt_execution_claims.items()
+                        if value.admission_id in admission_ids
+                    },
+                ),
+                (
+                    self._verification_claims_by_id,
+                    {
+                        key
+                        for key, value in self._verification_claims_by_id.items()
+                        if value.proposal_id in proposal_ids
+                    },
+                ),
+            )
+            for mapping in (
+                self._terminalization_receipts,
+                self._interrupted_handoff_receipts,
+                self._retry_settlements,
+                self._retry_reconciliation_rejections,
+                self._cancellation_reconciliation_rejections,
+                self._decision_application_receipts,
+            ):
+                # These exact-replay indexes are keyed by (task_id, operation_id).
+                for key in tuple(mapping):
+                    if key[0] in task_id_set:
+                        mapping.pop(key, None)
+            for mapping, removed_ids in owned_entries:
+                for key in removed_ids:
+                    cast("dict[Any, Any]", mapping).pop(key, None)
+            for topology_index, scope_ids in (
+                (self._task_keys_by_session, {task.session_id for task in tasks}),
+                (self._task_keys_by_parent, {task.parent_task_id for task in tasks}),
+            ):
+                for scope_id in scope_ids:
+                    if scope_id is None:
+                        continue
+                    entries = [
+                        entry
+                        for entry in topology_index.get(scope_id, ())
+                        if entry[1] not in task_id_set
+                    ]
+                    if entries:
+                        topology_index[scope_id] = entries
+                    else:
+                        topology_index.pop(scope_id, None)
+            for scope_id in {task.session_id for task in tasks}:
+                if scope_id is None:
+                    continue
+                contracted = self._contracted_task_ids_by_session.get(scope_id)
+                if contracted is not None:
+                    for task_id in task_id_set:
+                        contracted.pop(task_id, None)
+                    if not contracted:
+                        self._contracted_task_ids_by_session.pop(scope_id, None)
             for task_id in task_id_set:
                 self._tasks.pop(task_id, None)
             self._task_id_by_interrupted_handoff_id = {
@@ -5987,37 +6234,8 @@ class InMemoryTaskStore(TaskStore):
             self._interrupted_continuation_claims = {
                 key: value
                 for key, value in self._interrupted_continuation_claims.items()
-                if not task_id_set.intersection(value)
+                if value[0] not in task_id_set
             }
-            for name, mapping in vars(self).items():
-                if not isinstance(mapping, dict) or name in {
-                    "_tasks",
-                    "_task_id_by_interrupted_handoff_id",
-                    "_interrupted_continuation_claims",
-                }:
-                    continue
-                for key, value in list(mapping.items()):
-                    value_task_id = getattr(value, "task_id", None)
-                    nested_task = getattr(value, "task", None)
-                    if value_task_id is None and nested_task is not None:
-                        value_task_id = getattr(nested_task, "id", None)
-                    key_contains_task = isinstance(key, tuple) and bool(
-                        task_id_set.intersection(key)
-                    )
-                    if value_task_id in task_id_set or key in task_id_set or key_contains_task:
-                        mapping.pop(key, None)
-            self._contracted_task_ids_by_session.pop(session_id, None)
-            self._task_keys_by_session.pop(session_id, None)
-            for parent_id in list(self._task_keys_by_parent):
-                entries = [
-                    entry
-                    for entry in self._task_keys_by_parent[parent_id]
-                    if entry[1] not in task_id_set
-                ]
-                if entries:
-                    self._task_keys_by_parent[parent_id] = entries
-                else:
-                    self._task_keys_by_parent.pop(parent_id, None)
 
     async def query_task_topology(
         self,
@@ -7959,6 +8177,10 @@ class InMemoryTaskStore(TaskStore):
         return candidates
 
     def _store_task(self, task: Task) -> None:
+        prior = self._tasks.get(task.id)
+        for session_id in (task.session_id, None if prior is None else prior.session_id):
+            if session_id is not None and session_id in self._session_closure_claims:
+                raise ValueError("Task session is owned by closure.")
         # ``model_copy(update=...)`` intentionally skips Pydantic validation.
         # Revalidate every contracted lifecycle snapshot at the final in-memory
         # publication boundary so no transition can outgrow the bounded task

@@ -13790,19 +13790,36 @@ def test_server_startup_bounds_non_returning_side_effect_recovery(
     assert "startup recovery exceeded" in caplog.text
 
 
-def test_create_server_does_not_swallow_recovery_timeout_error() -> None:
+def test_create_server_retries_recovery_timeout_error(monkeypatch, caplog) -> None:
     app = CayuApp()
+    attempts = 0
+    monkeypatch.setattr("cayu.server._PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS", 0.01)
 
     async def fail_recovery(*, limit):
-        raise TimeoutError("session store timed out")
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("private session store timeout")
+        return []
 
     app.recover_persisted_event_side_effects = fail_recovery
+    server = create_server(app, config=_LOCAL_SERVER_CONFIG)
 
-    with (
-        pytest.raises(TimeoutError, match="session store timed out"),
-        TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)),
-    ):
-        pass
+    async def wait_for_retry():
+        status = server.state.cayu_event_side_effect_recovery
+        async with asyncio.timeout(5):
+            while status.sweep_successes == 0:
+                await asyncio.sleep(0.01)
+        assert status.sweep_failures == 1
+        assert status.consecutive_failures == 0
+        assert status.last_error_at is not None
+        assert "private session store timeout" not in status.model_dump_json()
+
+    with TestClient(server) as client:
+        assert client.portal is not None
+        client.portal.call(wait_for_retry)
+    assert "startup sweep timed out" in caplog.text
+    assert "private session store timeout" not in caplog.text
 
 
 def test_create_server_retries_crash_claim_after_lease_expiry(monkeypatch) -> None:

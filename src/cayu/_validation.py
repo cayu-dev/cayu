@@ -1375,7 +1375,13 @@ def copy_durable_json_object(value: Any, field_name: str) -> dict[str, Any]:
     return copied
 
 
-def canonical_durable_json_bytes(value: Any, field_name: str) -> bytes:
+def canonical_durable_json_bytes(
+    value: Any,
+    field_name: str,
+    *,
+    max_bytes: int | None = None,
+    max_nodes: int | None = None,
+) -> bytes:
     """Return one backend-stable canonical encoding of a durable JSON value.
 
     PostgreSQL JSONB preserves a JSON number's value but may normalize its
@@ -1384,7 +1390,16 @@ def canonical_durable_json_bytes(value: Any, field_name: str) -> bytes:
     value semantics instead of hashing Python's input spelling.
     """
 
-    copied = copy_durable_json_value(value, field_name)
+    copied = (
+        copy_durable_json_value(value, field_name)
+        if max_bytes is None and max_nodes is None
+        else copy_bounded_durable_json_value(
+            value,
+            field_name,
+            max_bytes=(max_bytes if max_bytes is not None else DURABLE_DOCUMENT_LIMITS.max_bytes),
+            max_nodes=(max_nodes if max_nodes is not None else DURABLE_DOCUMENT_LIMITS.max_nodes),
+        )
+    )
     return _canonical_durable_json_text(copied).encode("utf-8")
 
 

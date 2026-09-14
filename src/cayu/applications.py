@@ -251,6 +251,11 @@ from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
 )
+from cayu.runtime._session_closure_projection import (
+    project_closure_export,
+    project_closure_manifest,
+    project_closure_report,
+)
 from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
@@ -380,14 +385,14 @@ from cayu.runtime.retry_policy import (
 )
 from cayu.runtime.session_closure import (
     ArtifactSessionClosureStore,
-    RetainedSessionClosureStore,
+    BudgetSessionClosureStore,
+    KnowledgeSessionClosureStore,
     SessionClosureCoordinator,
     SessionClosureExport,
+    SessionClosureExportIncomplete,
     SessionClosurePolicy,
     SessionClosureReport,
     SessionClosureStore,
-    SessionEvidenceClosureStore,
-    SharedSessionClosureStore,
     TaskSessionClosureStore,
 )
 from cayu.runtime.session_message_lifecycle import (
@@ -1054,13 +1059,10 @@ class CayuApp:
         owned_store_ids = list(closure_stores)
         if self.task_store is not None:
             owned_store_ids.append(TaskSessionClosureStore(self.task_store))
-        if self.knowledge_store is not None:
-            owned_store_ids.append(
-                SharedSessionClosureStore("knowledge-store", "knowledge_references")
-            )
-        owned_store_ids.append(RetainedSessionClosureStore("budget-store", "budget_ledger"))
+        owned_store_ids.append(BudgetSessionClosureStore())
         self._session_closure_external_stores = tuple(owned_store_ids)
-        self._rebuild_session_closure()
+        self._secret_redactor = resolved_secret_redactor
+        self._session_closure = self._build_session_closure()
         self.knowledge_access_scope = (
             None
             if knowledge_access_scope is None
@@ -1085,7 +1087,6 @@ class CayuApp:
         self.event_watcher_store = (
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
-        self._secret_redactor = resolved_secret_redactor
         self._browser_control_runtime = (
             None
             if browser_control is None
@@ -1377,28 +1378,45 @@ class CayuApp:
 
         return self._secret_redactor.redact_uppercase_text(value)
 
-    def _rebuild_session_closure(self) -> None:
+    def _build_session_closure(
+        self,
+        *,
+        artifact_store_registration: _ArtifactStoreRegistration | None = None,
+    ) -> SessionClosureCoordinator:
+        """Validate prospective closure inventory without publishing registration state."""
+        registrations = dict(getattr(self, "_artifact_store_registrations_by_id", {}))
+        if artifact_store_registration is not None:
+            registrations[artifact_store_registration.store_id] = artifact_store_registration
         stores = list(self._session_closure_external_stores)
-        known_ids = {store.store_id for store in stores}
-        if (
-            hasattr(self.session_store, "list_recall_receipts")
-            and hasattr(self.session_store, "list_context_exposures")
-            and "session-store-evidence" not in known_ids
-        ):
-            stores.append(SessionEvidenceClosureStore(self.session_store))
-            known_ids.add("session-store-evidence")
-        for store_id in getattr(self, "_artifact_store_registrations_by_id", {}):
-            if store_id not in known_ids:
-                stores.append(
-                    ArtifactSessionClosureStore(
-                        self._artifact_store_registrations_by_id[store_id].store
-                    )
-                )
-                known_ids.add(store_id)
-        self._session_closure = SessionClosureCoordinator(
+        # Registrations already deduplicate raw artifact IDs. Closure adapters
+        # use a separate, qualified namespace; never omit a registered store by
+        # comparing its raw ID with an unrelated adapter's identity. The
+        # coordinator rejects genuine duplicate adapter identities below.
+        for registration in registrations.values():
+            stores.append(ArtifactSessionClosureStore(registration.store))
+        if self.knowledge_store is not None:
+            # Inventory shared references before session artifacts are erased.
+            first_artifact = next(
+                (
+                    index
+                    for index, store in enumerate(stores)
+                    if type(store) is ArtifactSessionClosureStore
+                ),
+                len(stores),
+            )
+            stores.insert(
+                first_artifact,
+                KnowledgeSessionClosureStore(
+                    self.knowledge_store,
+                    self.session_store,
+                    tuple(store for store in stores if type(store) is ArtifactSessionClosureStore),
+                ),
+            )
+        return SessionClosureCoordinator(
             self.session_store,
             dependent_stores=tuple(stores),
             clock=self._clock,
+            secret_redactor=self._secret_redactor,
         )
 
     async def inspect_session_closure(
@@ -1409,7 +1427,12 @@ class CayuApp:
     ):
         """Inspect all explicitly configured Cayu-owned closure stores."""
 
-        return await self._session_closure.inspect(session_id, policy=policy)
+        manifest = await self._session_closure.inspect(session_id, policy=policy)
+        return project_closure_manifest(
+            manifest,
+            redactor=self._secret_redactor,
+            project_session_id=self.project_session_id_for_exposure,
+        )
 
     async def erase_session_closure(
         self,
@@ -1420,10 +1443,15 @@ class CayuApp:
     ) -> SessionClosureReport:
         """Perform a bounded, dependent-first session closure."""
 
-        return await self._session_closure.erase(
+        report = await self._session_closure.erase(
             session_id,
             policy=policy,
             expected_plan_id=expected_plan_id,
+        )
+        return project_closure_report(
+            report,
+            redactor=self._secret_redactor,
+            project_session_id=self.project_session_id_for_exposure,
         )
 
     async def validate_session_closure(
@@ -1433,17 +1461,39 @@ class CayuApp:
         policy: SessionClosurePolicy | None = None,
     ):
         """Validate closure admission before any external cleanup begins."""
-        return await self._session_closure.validate(session_id, policy=policy)
+        manifest = await self._session_closure.validate(session_id, policy=policy)
+        return project_closure_manifest(
+            manifest,
+            redactor=self._secret_redactor,
+            project_session_id=self.project_session_id_for_exposure,
+        )
 
     async def export_session_closure(
         self,
         session_id: str,
         *,
         policy: SessionClosurePolicy | None = None,
+        allow_partial: bool = False,
     ) -> SessionClosureExport:
-        """Export a bounded, redaction-safe closure manifest."""
+        """Export bounded closure records, requiring opt-in for incomplete diagnostics."""
 
-        return await self._session_closure.export(session_id, policy=policy)
+        try:
+            export = await self._session_closure.export(
+                session_id, policy=policy, allow_partial=allow_partial
+            )
+        except SessionClosureExportIncomplete as exc:
+            raise SessionClosureExportIncomplete(
+                project_closure_manifest(
+                    exc.manifest,
+                    redactor=self._secret_redactor,
+                    project_session_id=self.project_session_id_for_exposure,
+                )
+            ) from None
+        return project_closure_export(
+            export,
+            redactor=self._secret_redactor,
+            project_session_id=self.project_session_id_for_exposure,
+        )
 
     def stream_redacted_bytes(
         self,
@@ -2863,7 +2913,7 @@ class CayuApp:
         artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
 
         registration_source, registration_symbol = _registration_site()
-        self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
+        registered_environment = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
             environment=stored_environment,
             runner_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
@@ -2876,11 +2926,17 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
+        closure = self._session_closure
+        if artifact_store_registration is not None:
+            closure = self._build_session_closure(
+                artifact_store_registration=artifact_store_registration
+            )
+        self._environments[stored_spec.name] = registered_environment
         if artifact_store_registration is not None:
             self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
                 artifact_store_registration
             )
-            self._rebuild_session_closure()
+            self._session_closure = closure
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return environment
 
@@ -2913,7 +2969,7 @@ class CayuApp:
         artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
 
         registration_source, registration_symbol = _registration_site()
-        self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
+        registered_environment = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
             environment=stored_environment,
             factory=factory,
@@ -2927,11 +2983,17 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
+        closure = self._session_closure
+        if artifact_store_registration is not None:
+            closure = self._build_session_closure(
+                artifact_store_registration=artifact_store_registration
+            )
+        self._environments[stored_spec.name] = registered_environment
         if artifact_store_registration is not None:
             self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
                 artifact_store_registration
             )
-            self._rebuild_session_closure()
+            self._session_closure = closure
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return factory
 

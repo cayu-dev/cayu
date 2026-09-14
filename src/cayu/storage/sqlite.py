@@ -35,6 +35,10 @@ from cayu.runtime.session_message_lifecycle import (
 from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageInspection,
+    _check_closure_lineage_owner,
+    _closure_progress_targets,
+    _validate_closure_progress_update,
+    _validate_session_closure_detach_replay,
 )
 
 if TYPE_CHECKING:
@@ -553,6 +557,7 @@ from cayu.tasks.base import (
     TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
+    TaskSessionClosureClaim,
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
@@ -634,6 +639,7 @@ from cayu.tasks.base import (
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
+    copy_task_session_closure_claim,
     decode_task_topology_cursor,
     prepare_interrupted_task_continuation_claim_page,
     prepare_interrupted_task_handoff,
@@ -718,8 +724,8 @@ from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 83
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 84
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 88
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 88
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -1955,6 +1961,9 @@ class SQLiteSessionStore(SessionStore):
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
     supports_session_closure_receipts: ClassVar[bool] = True
+    supports_session_closure_detachment: ClassVar[bool] = True
+    supports_session_closure_recursive_deletion: ClassVar[bool] = True
+    supports_session_closure_progress: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -3329,6 +3338,10 @@ class SQLiteSessionStore(SessionStore):
                         persisted_event,
                     )
                     return record, persisted_event
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 latest_use_row = connection.execute(
                     "SELECT MAX(bound_at) AS latest_bound_at "
                     "FROM cayu_targeted_tool_grant_uses WHERE grant_id = ?",
@@ -3610,12 +3623,16 @@ class SQLiteSessionStore(SessionStore):
                     )
                     if request.parent_session_id is not None and parent_session is None:
                         raise ValueError(f"Parent session not found: {request.parent_session_id}")
+                    if parent_session is not None:
+                        for owner in self._closure_lineage_owners_unlocked((parent_session.id,)):
+                            _check_closure_lineage_owner(owner, (parent_session.id,))
                     session = sqlite_support.session_from_request(
                         request,
                         identity=identity,
                         parent_session=parent_session,
                         created_at=created_at,
                     )
+                    self._require_available_closure_identity_unlocked(session.id)
                     admission = _copy_optional_interaction_admission(
                         session.id,
                         interaction_started_event,
@@ -3971,6 +3988,9 @@ class SQLiteSessionStore(SessionStore):
             self._require_current_public_authority_configuration(self._connection)
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                for owner in self._closure_lineage_owners_unlocked((source_session_id,)):
+                    _check_closure_lineage_owner(owner, (source_session_id,))
+                self._require_available_closure_identity_unlocked(fork.id)
                 source_session = _validate_session_fork_source(
                     source_session=self._load_unlocked(source_session_id),
                     source_session_id=source_session_id,
@@ -4320,6 +4340,10 @@ class SQLiteSessionStore(SessionStore):
                         raise RecallEvidenceConflict("Recall receipt", copied.receipt_id)
                     connection.commit()
                     return current
+                for owner in self._closure_lineage_owners_unlocked(
+                    (copied.session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (copied.session_id,))
                 if not connection.execute(
                     "SELECT 1 FROM cayu_sessions WHERE id = ?",
                     (copied.session_id,),
@@ -4488,6 +4512,10 @@ class SQLiteSessionStore(SessionStore):
                         raise RecallEvidenceConflict("Context exposure", copied.exposure_id)
                     connection.commit()
                     return current
+                for owner in self._closure_lineage_owners_unlocked(
+                    (copied.session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (copied.session_id,))
                 if not connection.execute(
                     "SELECT 1 FROM cayu_sessions WHERE id = ?",
                     (copied.session_id,),
@@ -4754,6 +4782,10 @@ class SQLiteSessionStore(SessionStore):
                         )
                     connection.commit()
                     return current
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 updated = append_context_exposure_transition(current, copied_request)
                 updated_document = memory_evidence_document_bytes(
                     updated,
@@ -4894,6 +4926,371 @@ class SQLiteSessionStore(SessionStore):
             ).fetchone()
         return None if row is None else json.loads(row[0])
 
+    async def load_session_closure_progress(self, session_id: str, plan_id: str):
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT progress_json FROM cayu_session_closure_progress "
+                "WHERE root_session_id = ? AND plan_id = ?",
+                (session_id, plan_id),
+            ).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    async def save_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        root_id = progress.get("root_session_id")
+        plan_id = progress.get("plan_id")
+        payload = json.dumps(progress, ensure_ascii=False, separators=(",", ":"))
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT progress_json FROM cayu_session_closure_progress "
+                    "WHERE root_session_id = ? AND plan_id = ?",
+                    (root_id, plan_id),
+                ).fetchone()
+                if row is not None:
+                    _validate_closure_progress_update(json.loads(row[0]), progress)
+                self._connection.execute(
+                    "INSERT INTO cayu_session_closure_progress "
+                    "(root_session_id, plan_id, progress_json) VALUES (?, ?, ?) "
+                    "ON CONFLICT(root_session_id, plan_id) DO UPDATE SET progress_json=excluded.progress_json",
+                    (root_id, plan_id, payload),
+                )
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def _closure_lineage_owners_unlocked(
+        self, targets: Iterable[str], *, connection: sqlite3.Connection | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        encoded = json.dumps(tuple(targets))
+        executor = self._connection if connection is None else connection
+        rows = executor.execute(
+            "SELECT progress_json FROM cayu_session_closure_progress AS p "
+            "WHERE root_session_id IN (SELECT value FROM json_each(?)) OR EXISTS "
+            "(SELECT 1 FROM json_each(p.progress_json, '$.descendants') AS child "
+            "WHERE json_extract(child.value, '$.session_id') IN (SELECT value FROM json_each(?)))",
+            (encoded, encoded),
+        ).fetchall()
+        return tuple(json.loads(row[0]) for row in rows)
+
+    async def claim_session_closure_progress(self, progress: dict[str, Any]) -> None:
+        payload = json.dumps(progress, ensure_ascii=False, separators=(",", ":"))
+        progress = json.loads(payload)
+        targets = _closure_progress_targets(progress)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for owner in self._closure_lineage_owners_unlocked(targets):
+                    if (owner["root_session_id"], owner["plan_id"]) == (
+                        progress["root_session_id"],
+                        progress["plan_id"],
+                    ):
+                        _validate_closure_progress_update(owner, progress)
+                        self._connection.rollback()
+                        return
+                    _check_closure_lineage_owner(owner, targets)
+                if self._load_unlocked(progress["root_session_id"]) is None:
+                    raise ValueError("Closure root disappeared before lineage admission.")
+                for item in progress["descendants"]:
+                    child = self._load_unlocked(item["session_id"])
+                    if child is None or child.parent_session_id != item["parent_session_id"]:
+                        raise ValueError("Child lineage changed before closure admission.")
+                if progress["phase"] in {"recursive", "reject"}:
+                    expected = {
+                        (item["session_id"], item["parent_session_id"])
+                        for item in progress["descendants"]
+                    }
+                    rows = self._connection.execute(
+                        "SELECT id, parent_session_id FROM cayu_sessions "
+                        "WHERE parent_session_id IN (SELECT value FROM json_each(?)) LIMIT ?",
+                        (json.dumps(list(targets)), len(expected) + 1),
+                    )
+                    if {(row["id"], row["parent_session_id"]) for row in rows} != expected:
+                        raise ValueError("Child lineage changed before closure admission.")
+                for target_id in targets:
+                    target = self._load_unlocked(target_id)
+                    if target is None:
+                        raise ValueError("Closure target disappeared before admission.")
+                    self._require_session_erasure_quiescence_unlocked(target)
+                    self._load_session_closure_records_unlocked(
+                        self._connection,
+                        target_id,
+                        max_records=progress["max_records"],
+                        max_bytes=progress["max_bytes"],
+                    )
+                self._connection.execute(
+                    "INSERT INTO cayu_session_closure_progress "
+                    "(root_session_id, plan_id, progress_json) VALUES (?, ?, ?)",
+                    (progress["root_session_id"], progress["plan_id"], payload),
+                )
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def _require_available_closure_identity_unlocked(self, session_id: str) -> None:
+        for owner in self._closure_lineage_owners_unlocked((session_id,)):
+            _check_closure_lineage_owner(owner, (session_id,))
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM cayu_session_closure_receipts WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("Session identity was retired by closure.")
+
+    async def load_session_closure_tombstones(
+        self, root_session_id: str, plan_id: str
+    ) -> tuple[dict[str, Any], ...]:
+        root_session_id = require_clean_nonblank(root_session_id, "root_session_id")
+        plan_id = require_clean_nonblank(plan_id, "plan_id")
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT tombstone_json FROM cayu_session_closure_tombstones "
+                "WHERE root_session_id = ? AND plan_id = ? ORDER BY child_session_id",
+                (root_session_id, plan_id),
+            ).fetchall()
+        return tuple(json.loads(row["tombstone_json"]) for row in rows)
+
+    async def detach_session_children(
+        self,
+        parent_session_id: str,
+        child_session_ids: tuple[str, ...],
+        *,
+        closure_receipt: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        parent_session_id = require_clean_nonblank(parent_session_id, "parent_session_id")
+        child_session_ids = tuple(child_session_ids)
+        root_id = closure_receipt.get("root_session_id")
+        plan_id = closure_receipt.get("plan_id")
+        if type(root_id) is not str or type(plan_id) is not str:
+            raise ValueError("Closure detachment receipt is missing identity.")
+        if len(set(child_session_ids)) != len(child_session_ids):
+            raise ValueError("Detached child session IDs must be unique.")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._connection.execute(
+                    "SELECT tombstone_json FROM cayu_session_closure_tombstones "
+                    "WHERE root_session_id = ? AND plan_id = ? ORDER BY child_session_id",
+                    (root_id, plan_id),
+                ).fetchall()
+                if existing:
+                    tombstones = tuple(json.loads(row["tombstone_json"]) for row in existing)
+                    _validate_session_closure_detach_replay(
+                        tombstones,
+                        root_id=root_id,
+                        plan_id=plan_id,
+                        parent_session_id=parent_session_id,
+                        child_session_ids=child_session_ids,
+                    )
+                    self._connection.rollback()
+                    return tombstones
+                for owner in self._closure_lineage_owners_unlocked(child_session_ids):
+                    _check_closure_lineage_owner(owner, child_session_ids)
+                if not child_session_ids:
+                    self._connection.rollback()
+                    return ()
+                placeholders = ", ".join("?" for _ in child_session_ids)
+                rows = self._connection.execute(
+                    f"SELECT id, parent_session_id FROM cayu_sessions WHERE id IN ({placeholders})",
+                    child_session_ids,
+                ).fetchall()
+                if {row["id"] for row in rows} != set(child_session_ids) or any(
+                    row["parent_session_id"] != parent_session_id for row in rows
+                ):
+                    raise ValueError("Child lineage changed before detachment.")
+                detached_at = datetime.now(UTC).isoformat()
+                tombstones = tuple(
+                    {
+                        "root_session_id": root_id,
+                        "plan_id": plan_id,
+                        "child_session_id": child_id,
+                        "original_parent_session_id": parent_session_id,
+                        "detached_at": detached_at,
+                    }
+                    for child_id in sorted(child_session_ids)
+                )
+                self._connection.execute(
+                    f"UPDATE cayu_sessions SET parent_session_id = NULL, updated_at = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (detached_at, *child_session_ids),
+                )
+                self._connection.executemany(
+                    "INSERT INTO cayu_session_closure_tombstones "
+                    "(root_session_id, plan_id, child_session_id, original_parent_session_id, "
+                    "detached_at, tombstone_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            item["root_session_id"],
+                            item["plan_id"],
+                            item["child_session_id"],
+                            item["original_parent_session_id"],
+                            item["detached_at"],
+                            json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+                        )
+                        for item in tombstones
+                    ],
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            return tombstones
+
+    def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
+        """Shared admission for closure and final deletion; no mutations."""
+        from cayu._validation import DURABLE_DOCUMENT_LIMITS
+        from cayu.runtime._session_closure_records import require_terminal_protected_effect
+
+        session_id = session.id
+        # Allow JSON escaping/whitespace overhead; the shared validator applies
+        # the durable document limit before model reconstruction.
+        rows = self._connection.execute(
+            "SELECT idempotency_key, CASE WHEN length(CAST(record_json AS BLOB)) <= ? "
+            "THEN record_json END FROM cayu_session_operations "
+            "WHERE session_id = ? AND idempotency_key GLOB 'tool-effect:*'",
+            (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id),
+        )
+        try:
+            for key, raw in rows:
+                try:
+                    value = None if raw is None else json.loads(raw)
+                except (ValueError, RecursionError):
+                    raise ValueError(
+                        "Session closure requires settled protected tool effects."
+                    ) from None
+                require_terminal_protected_effect(session_id, session.instance_id, key, value)
+        finally:
+            rows.close()
+        if session.status in DELETE_BLOCKED_SESSION_STATUSES:
+            raise ValueError("Session closure requires a non-running target.")
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM cayu_persisted_event_side_effects "
+                "WHERE session_id = ? AND status = 'leased' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("Session closure requires settled event side-effect deliveries.")
+        checkpoint = self._load_checkpoint_unlocked(session_id)
+        deletion_now = self._ownership_clock()
+        active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+            checkpoint,
+            now=deletion_now,
+        )
+        if active_recovery_claim_id is not None:
+            raise ValueError(
+                "Cannot delete a session while incomplete-session recovery claim "
+                f"{active_recovery_claim_id} is active: {session_id}"
+            )
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        if run_operation is not None:
+            raise ValueError(
+                "Cannot delete a session while terminal publication "
+                f"{run_operation.operation_id} is incomplete: {session_id}"
+            )
+        if _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint):
+            raise ValueError(
+                "Cannot delete a session while queued dispatch terminal "
+                f"acknowledgement is incomplete: {session_id}"
+            )
+        terminal_evidence_rows = self._connection.execute(
+            f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+            "WHERE session_id = ? "
+            f"AND event_type IN ({', '.join('?' for _ in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES)}) "
+            "ORDER BY sequence DESC LIMIT ?",
+            (
+                session_id,
+                *(str(event_type) for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES),
+                _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
+            ),
+        ).fetchall()
+        terminal_publication_block = _terminal_publication_delete_block_reason(
+            session=session,
+            checkpoint=checkpoint,
+            evidence_events=[_event_from_row(row) for row in terminal_evidence_rows],
+        )
+        if terminal_publication_block is not None:
+            raise ValueError(
+                f"Cannot delete a session while {terminal_publication_block}: {session_id}"
+            )
+        active_operation_id = _active_unexpired_session_operation_id(
+            checkpoint,
+            now=deletion_now,
+        )
+        if active_operation_id is not None:
+            raise ValueError(
+                "Cannot delete a session while durable operation "
+                f"{active_operation_id} is active: {session_id}"
+            )
+        completion_result_publication_block = (
+            _completion_result_event_publication_delete_block_reason(
+                checkpoint,
+                now=deletion_now,
+            )
+        )
+        if completion_result_publication_block is not None:
+            raise ValueError(
+                f"Cannot delete a session while {completion_result_publication_block}: {session_id}"
+            )
+        active_stage = self._connection.execute(
+            "SELECT 1 FROM cayu_session_operations WHERE session_id = ? AND idempotency_key = ?",
+            (
+                session_id,
+                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+            ),
+        ).fetchone()
+        if active_stage is not None:
+            raise ValueError(
+                f"Cannot delete a session while a model-completion stage is active: {session_id}"
+            )
+        pending_budget_settlement = self._connection.execute(
+            """
+            SELECT identity.reservation_id
+            FROM cayu_budget_reservation_identities AS identity
+            LEFT JOIN cayu_events AS event
+              ON event.session_id = identity.publication_session_id
+             AND event.event_type IN (
+                 'budget.reconciled',
+                 'budget.reservation_released'
+             )
+             AND json_extract(event.payload_json, '$.reservation_id')
+                 = identity.reservation_id
+            LEFT JOIN cayu_persisted_event_side_effects AS delivery
+              ON delivery.session_id = event.session_id
+             AND delivery.event_id = event.event_id
+            WHERE identity.publication_session_id = ?
+            GROUP BY identity.reservation_id
+            HAVING COUNT(event.event_id) <> 1
+                OR COUNT(
+                    CASE WHEN delivery.status = 'delivered' THEN 1 END
+                ) <> 1
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if pending_budget_settlement is not None:
+            raise ValueError(
+                "Cannot delete a session while a budget settlement audit "
+                f"event is pending: {session_id}"
+            )
+
+    async def validate_session_closure_admission(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise ValueError("Closure target is unavailable.")
+                self._require_session_erasure_quiescence_unlocked(session)
+            finally:
+                self._connection.rollback()
+
     async def delete_session(
         self,
         session_id: str,
@@ -4908,6 +5305,25 @@ class SQLiteSessionStore(SessionStore):
                 if session is None:
                     self._connection.rollback()
                     return
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,), closure_receipt)
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM cayu_session_closure_progress AS p "
+                        "JOIN cayu_sessions AS child ON child.id = p.root_session_id "
+                        "WHERE child.parent_session_id = ? LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise ValueError("Session lineage is owned by an unfinished recursive closure.")
+                if closure_receipt is not None and closure_receipt.get("operation") == "recursive":
+                    expected_parent = closure_receipt.get("original_parent_session_id")
+                    if (
+                        type(expected_parent) is not str
+                        or session.parent_session_id != expected_parent
+                    ):
+                        raise ValueError("Recursive closure child parent identity conflict.")
                 if session.status in DELETE_BLOCKED_SESSION_STATUSES:
                     raise ValueError(
                         f"Cannot delete a session while it is {session.status}; "
@@ -4920,118 +5336,20 @@ class SQLiteSessionStore(SessionStore):
                     "ORDER BY id LIMIT 1",
                     (session_id, "durable"),
                 ).fetchone()
+                if (
+                    closure_receipt is not None
+                    and self._connection.execute(
+                        "SELECT 1 FROM cayu_sessions WHERE parent_session_id = ? LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise ValueError("Closure deletion requires no remaining child edges.")
                 if durable_child is not None:
                     raise ValueError(
                         _durable_subagent_parent_delete_block_reason(durable_child["id"])
                     )
-                checkpoint = self._load_checkpoint_unlocked(session_id)
-                deletion_now = self._ownership_clock()
-                active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                    checkpoint,
-                    now=deletion_now,
-                )
-                if active_recovery_claim_id is not None:
-                    raise ValueError(
-                        "Cannot delete a session while incomplete-session recovery claim "
-                        f"{active_recovery_claim_id} is active: {session_id}"
-                    )
-                run_operation = _session_run_operation_from_checkpoint(checkpoint)
-                if run_operation is not None:
-                    raise ValueError(
-                        "Cannot delete a session while terminal publication "
-                        f"{run_operation.operation_id} is incomplete: {session_id}"
-                    )
-                if _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint):
-                    raise ValueError(
-                        "Cannot delete a session while queued dispatch terminal "
-                        f"acknowledgement is incomplete: {session_id}"
-                    )
-                terminal_evidence_rows = self._connection.execute(
-                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
-                    "WHERE session_id = ? "
-                    f"AND event_type IN ({', '.join('?' for _ in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES)}) "
-                    "ORDER BY sequence DESC LIMIT ?",
-                    (
-                        session_id,
-                        *(
-                            str(event_type)
-                            for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
-                        ),
-                        _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
-                    ),
-                ).fetchall()
-                terminal_publication_block = _terminal_publication_delete_block_reason(
-                    session=session,
-                    checkpoint=checkpoint,
-                    evidence_events=[_event_from_row(row) for row in terminal_evidence_rows],
-                )
-                if terminal_publication_block is not None:
-                    raise ValueError(
-                        f"Cannot delete a session while {terminal_publication_block}: {session_id}"
-                    )
-                active_operation_id = _active_unexpired_session_operation_id(
-                    checkpoint,
-                    now=deletion_now,
-                )
-                if active_operation_id is not None:
-                    raise ValueError(
-                        "Cannot delete a session while durable operation "
-                        f"{active_operation_id} is active: {session_id}"
-                    )
-                completion_result_publication_block = (
-                    _completion_result_event_publication_delete_block_reason(
-                        checkpoint,
-                        now=deletion_now,
-                    )
-                )
-                if completion_result_publication_block is not None:
-                    raise ValueError(
-                        "Cannot delete a session while "
-                        f"{completion_result_publication_block}: {session_id}"
-                    )
-                active_stage = self._connection.execute(
-                    "SELECT 1 FROM cayu_session_operations "
-                    "WHERE session_id = ? AND idempotency_key = ?",
-                    (
-                        session_id,
-                        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                    ),
-                ).fetchone()
-                if active_stage is not None:
-                    raise ValueError(
-                        "Cannot delete a session while a model-completion stage is active: "
-                        f"{session_id}"
-                    )
-                pending_budget_settlement = self._connection.execute(
-                    """
-                    SELECT identity.reservation_id
-                    FROM cayu_budget_reservation_identities AS identity
-                    LEFT JOIN cayu_events AS event
-                      ON event.session_id = identity.publication_session_id
-                     AND event.event_type IN (
-                         'budget.reconciled',
-                         'budget.reservation_released'
-                     )
-                     AND json_extract(event.payload_json, '$.reservation_id')
-                         = identity.reservation_id
-                    LEFT JOIN cayu_persisted_event_side_effects AS delivery
-                      ON delivery.session_id = event.session_id
-                     AND delivery.event_id = event.event_id
-                    WHERE identity.publication_session_id = ?
-                    GROUP BY identity.reservation_id
-                    HAVING COUNT(event.event_id) <> 1
-                        OR COUNT(
-                            CASE WHEN delivery.status = 'delivered' THEN 1 END
-                        ) <> 1
-                    LIMIT 1
-                    """,
-                    (session_id,),
-                ).fetchone()
-                if pending_budget_settlement is not None:
-                    raise ValueError(
-                        "Cannot delete a session while a budget settlement audit "
-                        f"event is pending: {session_id}"
-                    )
+                self._require_session_erasure_quiescence_unlocked(session)
                 # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
                 # the self-FK is ON DELETE SET NULL so children keep loading.
                 self._connection.execute(
@@ -5065,6 +5383,9 @@ class SQLiteSessionStore(SessionStore):
         expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._lock:
             with self._connection:
+                self._connection.execute("BEGIN IMMEDIATE")
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
                 params: list[object] = [
                     sqlite_support.format_datetime(updated_at),
@@ -5121,6 +5442,8 @@ class SQLiteSessionStore(SessionStore):
                 if row is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch_value(session_id, row["run_epoch"])
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 new_metadata = replace_session_user_metadata(
                     json.loads(row["metadata_json"]),
                     user_metadata,
@@ -5165,6 +5488,8 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = self._ownership_clock()
                 expected_run_epoch = _current_session_run_epoch(session_id)
                 placeholders = ", ".join("?" for _ in allowed_statuses)
@@ -5293,6 +5618,8 @@ class SQLiteSessionStore(SessionStore):
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, loaded)
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
@@ -5759,6 +6086,8 @@ class SQLiteSessionStore(SessionStore):
                     self._connection.commit()
                     return ExecutionProfileRejectionResult(event=existing, replayed=True)
 
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                     copied_event
                 )
@@ -5900,6 +6229,8 @@ class SQLiteSessionStore(SessionStore):
                 ):
                     self._connection.commit()
                     return None
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 transformed = checkpoint_transform(
                     loaded,
                     _copy_checkpoint_for_transform(current, session_id=session_id),
@@ -5964,6 +6295,8 @@ class SQLiteSessionStore(SessionStore):
                     raise KeyError(f"Session not found: {session_id}")
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(f"Session status cannot be fenced: {loaded.status}")
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                     current_checkpoint,
@@ -6077,6 +6410,8 @@ class SQLiteSessionStore(SessionStore):
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 pending = self._connection.execute(
                     "SELECT 1 FROM cayu_session_message_queue "
                     "WHERE session_id = ? AND status = 'queued' LIMIT 1",
@@ -6261,6 +6596,10 @@ class SQLiteSessionStore(SessionStore):
                     raise RuntimeError(
                         "Terminal session event exists without its interaction receipt."
                     )
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 current_checkpoint = _load_checkpoint_state(connection, session_id)
                 if terminalization_only:
                     from cayu.runtime._durable_model_terminalization import (
@@ -7014,6 +7353,15 @@ class SQLiteSessionStore(SessionStore):
                             expected_run_epoch,
                         )
                     raise KeyError(f"Session not found: {publication_session_id}")
+                existing = connection.execute(
+                    "SELECT 1 FROM cayu_budget_reservation_identities WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                if existing is None:
+                    for owner in self._closure_lineage_owners_unlocked(
+                        (publication_session_id,), connection=connection
+                    ):
+                        _check_closure_lineage_owner(owner, (publication_session_id,))
                 _claim_budget_reservation_identity(
                     connection,
                     reservation_id=reservation_id,
@@ -7037,6 +7385,8 @@ class SQLiteSessionStore(SessionStore):
                 if not _session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 activity_at = self._ownership_clock()
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 _append_events_in_transaction(
                     connection,
                     session_id,
@@ -7095,6 +7445,10 @@ class SQLiteSessionStore(SessionStore):
                 if existing is not None:
                     event = reconcile_tool_effect_conflict_event(event, _event_from_row(existing))
                 else:
+                    for owner in self._closure_lineage_owners_unlocked(
+                        (session_id,), connection=connection
+                    ):
+                        _check_closure_lineage_owner(owner, (session_id,))
                     # Evidence authority was established above; do not touch the
                     # current run's liveness or weaken the ordinary append fence.
                     _insert_event_rows_in_transaction(
@@ -7149,6 +7503,10 @@ class SQLiteSessionStore(SessionStore):
                     connection.rollback()
                     return False
 
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 _touch_session_activity(connection, session_id, self._ownership_clock())
                 lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                     copied_event
@@ -7290,6 +7648,10 @@ class SQLiteSessionStore(SessionStore):
                     baseline_updates=updates,
                     events=copied_events,
                 )
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 _touch_session_activity(connection, session_id, self._ownership_clock())
                 event_rows = []
                 for event in copied_events:
@@ -7400,7 +7762,12 @@ class SQLiteSessionStore(SessionStore):
                     "(status = 'pending' "
                     "OR (status = 'failed' AND "
                     "(next_attempt_at IS NULL OR next_attempt_at <= ?)) "
-                    "OR (status = 'leased' AND lease_expires_at <= ?))"
+                    "OR (status = 'leased' AND lease_expires_at <= ?))",
+                    "NOT EXISTS (SELECT 1 FROM cayu_session_closure_progress AS p "
+                    "WHERE p.root_session_id = cayu_persisted_event_side_effects.session_id "
+                    "OR EXISTS (SELECT 1 FROM json_each(p.progress_json, '$.descendants') AS child "
+                    "WHERE json_extract(child.value, '$.session_id') = "
+                    "cayu_persisted_event_side_effects.session_id))",
                 ]
                 params: list[object] = [formatted_now, formatted_now]
                 if session_id is not None and event_id is not None:
@@ -7904,6 +8271,10 @@ class SQLiteSessionStore(SessionStore):
                 if replay is not None:
                     connection.commit()
                     return SessionMessageActionResult(record=record, event=replay, replayed=True)
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session.id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session.id,))
                 if (
                     record.revision != request.expected_revision
                     or raw["status"] != "queued"
@@ -8015,6 +8386,8 @@ class SQLiteSessionStore(SessionStore):
                         event=_event_from_row(event_row),
                         replayed=True,
                     )
+                for owner in self._closure_lineage_owners_unlocked((request.session_id,)):
+                    _check_closure_lineage_owner(owner, (request.session_id,))
                 if loaded.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
                     raise SessionStatusConflict(
                         "Session messages may be enqueued only while a session is pending or running."
@@ -10123,6 +10496,9 @@ class SQLiteSessionStore(SessionStore):
                         replayed=True,
                     )
 
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
+
                 operation_mutation_records: dict[str, dict[str, Any]] = {}
                 if request.operation_record_mutations:
                     mutation_keys = tuple(
@@ -10686,6 +11062,8 @@ class SQLiteSessionStore(SessionStore):
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, loaded)
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 if allowed_statuses is not None and loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(
                         "Session status is not eligible for checkpoint publication: "
@@ -10929,6 +11307,224 @@ class SQLiteSessionStore(SessionStore):
             )
 
         return await self._run_write(statement)
+
+    async def load_session_closure_records(
+        self, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        def query(connection: sqlite3.Connection) -> dict[str, Any]:
+            with connection:
+                connection.execute("BEGIN")
+                return self._load_session_closure_records_unlocked(
+                    connection, session_id, max_records=max_records, max_bytes=max_bytes
+                )
+
+        return await self._run_read(query)
+
+    def _load_session_closure_records_unlocked(
+        self, connection: sqlite3.Connection, session_id: str, *, max_records: int, max_bytes: int
+    ) -> dict[str, Any]:
+        from cayu.runtime._session_closure_records import (
+            ClosureRecordsBuilder,
+            ClosureRecordsTooLarge,
+        )
+        from cayu.storage._session_closure_sql import closure_size_statement
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        builder = ClosureRecordsBuilder(max_records=max_records, max_bytes=max_bytes)
+
+        statement, source_count = closure_size_statement(postgres=False)
+        count, size = connection.execute(
+            statement, (session_id, max_records + 1) * source_count
+        ).fetchone()
+        if count > max_records or size > max_bytes:
+            raise ClosureRecordsTooLarge()
+        session = _load_session(connection, session_id)
+        builder.add_class(
+            "session",
+            ()
+            if session is None
+            else (
+                {
+                    name: getattr(session, name)
+                    for name in type(session).model_fields
+                    if name not in {"labels", "metadata"}
+                },
+            ),
+        )
+        builder.add_class(
+            "labels",
+            ()
+            if session is None
+            else ({"key": key, "value": value} for key, value in session.labels.items()),
+        )
+        builder.add_class("metadata", () if session is None else (session.metadata,))
+        builder.add_class(
+            "recall_receipts",
+            (
+                _sqlite_recall_receipt(row)
+                for row in connection.execute(
+                    "SELECT * FROM cayu_recall_receipts WHERE session_id = ? "
+                    "ORDER BY created_at, receipt_id LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "context_exposures",
+            (
+                _sqlite_context_exposure(row)
+                for row in connection.execute(
+                    "SELECT * FROM cayu_context_exposures WHERE session_id = ? "
+                    "ORDER BY created_at, exposure_id LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "recall_item_exposures",
+            (
+                json.loads(row[0])
+                for row in connection.execute(
+                    "SELECT item.item_json FROM cayu_recall_item_exposures AS item "
+                    "JOIN cayu_context_exposures AS exposure "
+                    "ON exposure.exposure_id = item.exposure_id "
+                    "WHERE exposure.session_id = ? "
+                    "ORDER BY exposure.created_at, exposure.exposure_id, item.ordinal LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "events",
+            (
+                EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                for row in connection.execute(
+                    "SELECT * FROM cayu_events WHERE session_id = ? ORDER BY sequence LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "transcript",
+            (
+                {
+                    "transcript_index": row["session_order"] - 1,
+                    "interaction_id": row["interaction_id"],
+                    "message": json.loads(row["message_json"]),
+                }
+                for row in connection.execute(
+                    "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY session_order LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        checkpoint = _load_checkpoint_state(connection, session_id)
+        builder.add_class("checkpoint", () if checkpoint is None else (checkpoint,))
+        builder.add_class(
+            "queued_messages",
+            (
+                {
+                    "message": _queued_session_message_from_row(row),
+                    "terminal": None
+                    if row["terminal_json"] is None
+                    else json.loads(row["terminal_json"]),
+                }
+                for row in connection.execute(
+                    "SELECT * FROM cayu_session_message_queue WHERE session_id = ? ORDER BY ordering_key LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "session_operations",
+            (
+                {
+                    "idempotency_key": row["idempotency_key"],
+                    "record": json.loads(row["record_json"]),
+                }
+                for row in connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations WHERE session_id = ? ORDER BY idempotency_key LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "event_side_effect_deliveries",
+            (
+                _persisted_event_side_effect_delivery_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM cayu_persisted_event_side_effects WHERE session_id = ? ORDER BY event_sequence LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+
+        def delivery_record(row):
+            record = {
+                key.removesuffix("_json"): json.loads(row[key])
+                if key.endswith("_json") and row[key] is not None
+                else row[key]
+                for key in dict(row)
+                if key != "created_at"
+            }
+            for key in ("include_on_idle", "has_more", "reject_only"):
+                if type(record[key]) is not int or record[key] not in (0, 1):
+                    raise ValueError("Invalid stored queue delivery boolean.")
+                record[key] = bool(record[key])
+            return record
+
+        builder.add_class(
+            "queue_deliveries",
+            (
+                delivery_record(row)
+                for row in connection.execute(
+                    "SELECT * FROM cayu_session_message_deliveries WHERE session_id = ? ORDER BY created_at, delivery_id LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "deferred_interaction_inputs",
+            (
+                deferred_interaction_input_from_storage_payload(
+                    row["interaction_id"], json.loads(row["source_messages_json"])
+                )
+                for row in connection.execute(
+                    "SELECT interaction_id, source_messages_json FROM cayu_deferred_interaction_inputs WHERE session_id = ? LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+
+        def project_grant(row):
+            codec = self.public_authority_alias_codec
+            if codec is None:
+                raise RuntimeError("Closure grant export requires an authority alias codec.")
+            return targeted_tool_grant_with_active_reference(
+                _targeted_tool_grant_from_row(row), codec
+            )
+
+        builder.add_class(
+            "targeted_tool_grants",
+            (
+                project_grant(row)
+                for row in connection.execute(
+                    "SELECT * FROM cayu_targeted_tool_grants WHERE session_id = ? ORDER BY issued_at, grant_id LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        builder.add_class(
+            "targeted_tool_grant_uses",
+            (
+                _targeted_tool_use_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM cayu_targeted_tool_grant_uses WHERE session_id = ? ORDER BY bound_at, use_id LIMIT ?",
+                    (session_id, max_records + 1),
+                )
+            ),
+        )
+        return builder.finish()
 
     async def load_session_export_snapshot(
         self,
@@ -14226,6 +14822,8 @@ class SQLiteSessionStore(SessionStore):
                 if not _session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 activity_at = self._ownership_clock()
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 _touch_session_activity(connection, session_id, activity_at)
                 connection.executemany(
                     """
@@ -14288,6 +14886,10 @@ class SQLiteSessionStore(SessionStore):
                 ).fetchone()
                 if row is None or row["interaction_id"] != interaction_id:
                     raise RuntimeError("Deferred interaction input changed before finalization.")
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 stored = deferred_interaction_input_from_storage_payload(
                     row["interaction_id"],
                     json.loads(row["source_messages_json"]),
@@ -14412,6 +15014,10 @@ class SQLiteSessionStore(SessionStore):
                     return False
                 if row["interaction_id"] != interaction_id:
                     raise RuntimeError("Deferred interaction input belongs to another interaction.")
+                for owner in self._closure_lineage_owners_unlocked(
+                    (session_id,), connection=connection
+                ):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 deferred = deferred_interaction_input_from_storage_payload(
                     row["interaction_id"],
                     json.loads(row["source_messages_json"]),
@@ -14496,6 +15102,8 @@ class SQLiteSessionStore(SessionStore):
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, session)
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
@@ -15028,6 +15636,8 @@ class SQLiteSessionStore(SessionStore):
                 updated_at = self._ownership_clock()
                 if not _session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 replacement = _replace_checkpoint_preserving_completion_result_event_publications(
                     self._load_checkpoint_unlocked(session_id),
                     checkpoint,
@@ -15078,6 +15688,8 @@ class SQLiteSessionStore(SessionStore):
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, session)
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 current = self._load_checkpoint_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
@@ -15141,6 +15753,8 @@ class SQLiteSessionStore(SessionStore):
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, session)
+                for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                    _check_closure_lineage_owner(owner, (session_id,))
                 current = self._load_checkpoint_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
@@ -15295,6 +15909,7 @@ class SQLiteTaskStore(TaskStore):
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
+    supports_session_closure_claims: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
 
     def __init__(
@@ -18259,6 +18874,60 @@ class SQLiteTaskStore(TaskStore):
             ).fetchall()
             return [sqlite_support.task_from_row(row) for row in rows]
 
+    async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            claim = TaskSessionClosureClaim.model_validate_json(row["claim_json"])
+            if claim.session_id != session_id or claim.plan_id != row["plan_id"]:
+                raise ValueError("Task closure claim conflicts with its retained authority.")
+            return claim
+
+    async def claim_session_closure(
+        self, claim: TaskSessionClosureClaim
+    ) -> TaskSessionClosureClaim:
+        claim = copy_task_session_closure_claim(claim)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                row = self._connection.execute(
+                    "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
+                    "WHERE session_id = ?",
+                    (claim.session_id,),
+                ).fetchone()
+                if row is not None:
+                    existing = TaskSessionClosureClaim.model_validate_json(row["claim_json"])
+                    if existing != claim or row["plan_id"] != claim.plan_id:
+                        raise ValueError(
+                            "Task closure claim conflicts with its retained authority."
+                        )
+                    return existing
+                rows = self._connection.execute(
+                    "SELECT id, status, worker_id, lease_expires_at FROM cayu_tasks "
+                    "WHERE session_id = ? LIMIT ?",
+                    (claim.session_id, len(claim.task_ids) + 1),
+                ).fetchall()
+                if {row["id"] for row in rows} != set(claim.task_ids):
+                    raise ValueError("Task closure set changed before admission.")
+                if any(
+                    row["status"] not in {"completed", "failed", "cancelled"}
+                    or row["worker_id"] is not None
+                    or row["lease_expires_at"] is not None
+                    for row in rows
+                ):
+                    raise ValueError("Task closure requires quiescent terminal tasks.")
+                self._connection.execute(
+                    "INSERT INTO cayu_task_session_closure_claims "
+                    "(session_id, plan_id, claim_json) VALUES (?, ?, ?)",
+                    (claim.session_id, claim.plan_id, claim.model_dump_json()),
+                )
+                return claim
+
     async def delete_session_tasks(
         self,
         session_id: str,
@@ -18272,33 +18941,45 @@ class SQLiteTaskStore(TaskStore):
         this method owns the SQL dependency cleanup so receipts and attempt
         records cannot outlive their task rows.
         """
+        from cayu.storage._session_closure_sql import TASK_CLOSURE_DEPENDENCIES
 
         session_id = require_clean_nonblank(session_id, "session_id")
-        if not task_ids:
-            return
         async with self._lock:
-            placeholders = ", ".join("?" for _ in task_ids)
-            rows = self._connection.execute(
-                f"SELECT id, session_id, status, worker_id, lease_expires_at "
-                f"FROM cayu_tasks WHERE session_id = ? AND id IN ({placeholders})",
-                (session_id, *task_ids),
-            ).fetchall()
-            if {row["id"] for row in rows} != set(task_ids):
-                raise ValueError("Task closure authority changed during deletion.")
-            if any(
-                row["status"]
-                not in {
-                    TaskStatus.COMPLETED.value,
-                    TaskStatus.FAILED.value,
-                    TaskStatus.CANCELLED.value,
-                }
-                or row["worker_id"] is not None
-                or row["lease_expires_at"] is not None
-                for row in rows
-            ):
-                raise ValueError("Task closure requires quiescent terminal tasks.")
-            try:
-                with self._verified_transaction_unlocked():
+            with self._verified_transaction_unlocked():
+                claim_row = self._connection.execute(
+                    "SELECT plan_id, claim_json FROM cayu_task_session_closure_claims "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                claim = None
+                if claim_row is not None:
+                    claim = TaskSessionClosureClaim.model_validate_json(claim_row["claim_json"])
+                    if (
+                        claim.session_id != session_id
+                        or claim.plan_id != claim_row["plan_id"]
+                        or set(task_ids) != set(claim.task_ids)
+                    ):
+                        raise ValueError("Task deletion conflicts with the retained closure set.")
+                if not task_ids:
+                    return
+                placeholders = ", ".join("?" for _ in task_ids)
+                rows = self._connection.execute(
+                    f"SELECT id, session_id, status, worker_id, lease_expires_at "
+                    f"FROM cayu_tasks WHERE id IN ({placeholders})",
+                    task_ids,
+                ).fetchall()
+                if (claim is None and {row["id"] for row in rows} != set(task_ids)) or any(
+                    row["session_id"] != session_id for row in rows
+                ):
+                    raise ValueError("Task closure authority changed during deletion.")
+                if any(
+                    row["status"] not in {"completed", "failed", "cancelled"}
+                    or row["worker_id"] is not None
+                    or row["lease_expires_at"] is not None
+                    for row in rows
+                ):
+                    raise ValueError("Task closure requires quiescent terminal tasks.")
+                if rows:
                     table_rows = self._connection.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table' "
                         "AND name NOT LIKE 'sqlite_%'"
@@ -18314,6 +18995,8 @@ class SQLiteTaskStore(TaskStore):
                             if foreign_key["table"] != "cayu_tasks":
                                 continue
                             column = foreign_key["from"]
+                            if (table, column) not in TASK_CLOSURE_DEPENDENCIES:
+                                continue
                             self._connection.execute(
                                 f'DELETE FROM "{table.replace(chr(34), chr(34) * 2)}" '
                                 f'WHERE "{column.replace(chr(34), chr(34) * 2)}" IN ({placeholders})',
@@ -18323,9 +19006,6 @@ class SQLiteTaskStore(TaskStore):
                         f"DELETE FROM cayu_tasks WHERE session_id = ? AND id IN ({placeholders})",
                         (session_id, *task_ids),
                     )
-            except Exception:
-                self._connection.rollback()
-                raise
 
     async def query_task_topology(
         self,

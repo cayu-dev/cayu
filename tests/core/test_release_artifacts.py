@@ -113,6 +113,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/evals-ai-quality.md",
         "cayu/guides/evals-first.md",
         "cayu/guides/evals-production.md",
+        "cayu/guides/human-attention.md",
         "cayu/guides/providers.md",
         "cayu/guides/references.md",
         "cayu/guides/structured-output.md",
