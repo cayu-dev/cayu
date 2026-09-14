@@ -39,7 +39,13 @@ from cayu.deadlines import (
     deadline_from_metadata,
     effective_deadline,
 )
+from cayu.runtime import event_side_effect_health as side_effect_health
 from cayu.runtime._argument_continuity import ArgumentContinuity
+from cayu.runtime.event_side_effect_health import (
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
+)
 
 if TYPE_CHECKING:
     from cayu.runtime._invocation_lifecycle import (
@@ -10924,6 +10930,17 @@ class SessionStore(ABC):
         ``claimable_only`` excludes terminal deliveries and live leases.
         """
 
+    async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
+        """Read exact aggregate delivery health without loading source events."""
+        raise NotImplementedError("This store does not support event side-effect health.")
+
+    async def query_persisted_event_side_effect_deliveries(
+        self,
+        query: PersistedEventSideEffectQuery,
+    ) -> PersistedEventSideEffectPage:
+        """Read a bounded operational page; inspection never reserves a claim."""
+        raise NotImplementedError("This store does not support event side-effect inspection.")
+
     async def defer_persisted_event_side_effect(
         self,
         claim: PersistedEventSideEffectClaim,
@@ -16964,6 +16981,95 @@ class InMemorySessionStore(SessionStore):
                 updated
             )
             return updated.model_copy(deep=True)
+
+    async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
+        async with self._lock:
+            now = self._ownership_clock().astimezone(UTC)
+            rows = list(self._persisted_event_side_effect_deliveries.values())
+            counts = dict.fromkeys(side_effect_health.CONDITIONS, 0)
+            timestamps: dict[str, datetime | None] = dict.fromkeys(
+                [
+                    "oldest_claimable_at",
+                    "oldest_pending_at",
+                    "oldest_failed_at",
+                    "oldest_dead_letter_at",
+                    "earliest_live_lease_expires_at",
+                ]
+            )
+            max_attempts = 0
+
+            def oldest(key: str, value: datetime) -> None:
+                previous = timestamps[key]
+                timestamps[key] = value if previous is None else min(previous, value)
+
+            for row in rows:
+                if row.status == "leased":
+                    counts[
+                        "leased_expired"
+                        if side_effect_health.claimable(row, now)
+                        else "leased_live"
+                    ] += 1
+                    if row.lease_expires_at is not None and row.lease_expires_at > now:
+                        oldest("earliest_live_lease_expires_at", row.lease_expires_at)
+                elif row.status == "failed":
+                    counts["failed_retryable"] += 1
+                    counts["failed_deferred"] += int(
+                        row.next_attempt_at is not None and row.next_attempt_at > now
+                    )
+                    counts["repeatedly_failing"] += int(row.attempts > 1)
+                    oldest("oldest_failed_at", row.updated_at)
+                else:
+                    counts[str(row.status)] += 1
+                if row.status == "pending":
+                    oldest("oldest_pending_at", row.updated_at)
+                if row.status == "dead_lettered":
+                    oldest("oldest_dead_letter_at", row.updated_at)
+                if row.status != "delivered":
+                    counts["outstanding_total"] += 1
+                    max_attempts = max(max_attempts, row.attempts)
+                if row.status in {"pending", "failed", "leased"}:
+                    live = (
+                        row.status == "leased"
+                        and row.lease_expires_at is not None
+                        and row.lease_expires_at > now
+                    )
+                    threshold = side_effect_health.PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS - (
+                        0 if live else 1
+                    )
+                    counts["final_attempt_boundary"] += int(row.attempts >= threshold)
+                if side_effect_health.claimable(row, now):
+                    counts["claimable_total"] += 1
+                    eligible = row.updated_at
+                    if row.status == "leased" and row.lease_expires_at is not None:
+                        eligible = row.lease_expires_at
+                    elif row.status == "failed" and row.next_attempt_at is not None:
+                        eligible = max(eligible, row.next_attempt_at)
+                    oldest("oldest_claimable_at", eligible)
+            return side_effect_health.finish_health(
+                {**counts, **timestamps, "max_outstanding_attempts": max_attempts},
+                now,
+            )
+
+    async def query_persisted_event_side_effect_deliveries(
+        self,
+        query: PersistedEventSideEffectQuery,
+    ) -> PersistedEventSideEffectPage:
+        query = PersistedEventSideEffectQuery.model_validate(query)
+        key = side_effect_health.cursor_key(query)
+        async with self._lock:
+            now = self._ownership_clock().astimezone(UTC)
+            rows = sorted(
+                (
+                    row
+                    for row in self._persisted_event_side_effect_deliveries.values()
+                    if (key is None or (row.session_id, row.event_id) > key)
+                    and (query.statuses is None or row.status in query.statuses)
+                    and (not query.outstanding_only or row.status != "delivered")
+                    and (not query.claimable_only or side_effect_health.claimable(row, now))
+                ),
+                key=lambda row: (row.session_id, row.event_id),
+            )[: query.limit + 1]
+            return side_effect_health.page(rows, query, now)
 
     async def list_persisted_event_side_effect_deliveries(
         self,

@@ -16,8 +16,14 @@ from uuid import uuid4
 
 from cayu.budgets.pricing import PriceBook
 from cayu.runtime import _session_message_queue as message_queue
+from cayu.runtime import event_side_effect_health as side_effect_health
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.runtime.event_side_effect_health import (
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
+)
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConditions,
@@ -7640,6 +7646,37 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         return await self._run_write(statement)
+
+    async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
+        def query(connection: sqlite3.Connection) -> PersistedEventSideEffectHealth:
+            now = self._ownership_clock().astimezone(UTC)
+            row = connection.execute(
+                side_effect_health.health_sql("?"), (sqlite_support.format_datetime(now),)
+            ).fetchone()
+            return side_effect_health.finish_health(dict(row), now)
+
+        return await self._run_read(query)
+
+    async def query_persisted_event_side_effect_deliveries(
+        self,
+        query: PersistedEventSideEffectQuery,
+    ) -> PersistedEventSideEffectPage:
+        query = PersistedEventSideEffectQuery.model_validate(query)
+        side_effect_health.cursor_key(query)
+
+        def read(connection: sqlite3.Connection) -> PersistedEventSideEffectPage:
+            now = self._ownership_clock().astimezone(UTC)
+            sql, params = side_effect_health.page_sql(
+                query, sqlite_support.format_datetime(now), "?"
+            )
+            rows = connection.execute(sql, params).fetchall()
+            return side_effect_health.page(
+                [_persisted_event_side_effect_delivery_from_row(row) for row in rows],
+                query,
+                now,
+            )
+
+        return await self._run_read(read)
 
     async def list_persisted_event_side_effect_deliveries(
         self,

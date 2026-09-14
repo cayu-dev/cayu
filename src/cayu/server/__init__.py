@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from inspect import Parameter, signature
 from math import isfinite
 from pathlib import Path
@@ -41,7 +43,9 @@ from cayu.project_control_plane import (
     ResolvedProjectControlPlaneContext,
     resolve_project_control_plane_context,
 )
+from cayu.runtime.event_side_effect_health import safe_error
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.server._event_side_effect_health import EventSideEffectRecoveryLoop
 from cayu.sessions.recovery import (
     RecoveryExecutionRequest,
     RecoveryPlan,
@@ -280,10 +284,16 @@ def create_server(
             # and allocation cleanup owners from making shutdown progress.
             await _drain_server_owned_work(app, lifecycle=lifecycle)
 
+    side_effect_health = EventSideEffectRecoveryLoop(
+        interval_seconds=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS,
+        batch_limit=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE,
+    )
+
     async def recover_startup_state() -> RecoveryPlanRequest | None:
         await _recover_persisted_event_side_effects_during_startup(
             app,
             timeout_s=lifecycle.event_side_effect_startup_timeout_seconds,
+            status=side_effect_health,
         )
         continuation_request: RecoveryPlanRequest | None = None
         if recovery_statuses is not None:
@@ -320,7 +330,9 @@ def create_server(
                     app,
                     continuation_request,
                 )
-                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
+                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
+                    app, side_effect_health
+                )
                 yield
             finally:
                 app.seal_knowledge_publications()
@@ -342,7 +354,9 @@ def create_server(
                     app,
                     continuation_request,
                 )
-                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
+                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
+                    app, side_effect_health
+                )
                 yield state
             finally:
                 app.seal_knowledge_publications()
@@ -369,6 +383,7 @@ def create_server(
         resolved_fastapi_options["openapi_url"] = None
 
     server = FastAPI(title=resolved_config.title, **resolved_fastapi_options)
+    server.state.cayu_event_side_effect_recovery = side_effect_health
     server.state.cayu_server_config = resolved_config
     server.state.cayu_server_config_summary = resolved_config.safe_summary()
     server.state.cayu_project_control_plane_summary = (
@@ -902,20 +917,58 @@ async def _drain_server_owned_work(
         )
 
 
-async def _recover_persisted_event_side_effects_until_idle(app: CayuApp) -> None:
+async def _recover_persisted_event_side_effects_until_idle(
+    app: CayuApp,
+    status: EventSideEffectRecoveryLoop | None = None,
+) -> None:
     while True:
-        recovered = await app.recover_persisted_event_side_effects(
-            limit=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE
-        )
+        started = time.monotonic()
+        if status is not None:
+            status.state = "running"
+            status.started_at = status.started_at or datetime.now(UTC)
+            status.last_sweep_started_at = datetime.now(UTC)
+            status.sweep_attempts += 1
+        try:
+            recovered = await app.recover_persisted_event_side_effects(
+                limit=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE
+            )
+            remaining = (
+                None
+                if recovered
+                else await app.session_store.list_persisted_event_side_effect_deliveries(
+                    claimable_only=True,
+                    limit=1,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if status is not None:
+                status.last_sweep_completed_at = datetime.now(UTC)
+                status.last_duration_seconds = time.monotonic() - started
+                status.consecutive_failures += 1
+                status.sweep_failures += 1
+                status.last_error = safe_error("failure")
+                status.last_error_at = status.last_sweep_completed_at
+            raise
+        else:
+            if status is not None:
+                status.last_sweep_completed_at = datetime.now(UTC)
+                status.last_success_at = status.last_sweep_completed_at
+                status.last_duration_seconds = time.monotonic() - started
+                status.last_delivered_count = len(recovered)
+                status.last_success_saturated = (
+                    len(recovered) == _PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE
+                )
+                status.saturated_batches += int(status.last_success_saturated)
+                status.consecutive_failures = 0
+                status.sweep_successes += 1
+                status.delivered_rows += len(recovered)
         # Failed deliveries receive a durable retry deadline and are omitted
         # from the result. Check the store once more before declaring the
         # backlog idle so a full page of poison events cannot strand later work.
         if recovered:
             continue
-        remaining = await app.session_store.list_persisted_event_side_effect_deliveries(
-            claimable_only=True,
-            limit=1,
-        )
         if not remaining:
             return
 
@@ -924,30 +977,49 @@ async def _recover_persisted_event_side_effects_during_startup(
     app: CayuApp,
     *,
     timeout_s: float,
+    status: EventSideEffectRecoveryLoop | None = None,
 ) -> None:
     timeout = asyncio.timeout(timeout_s)
     try:
         async with timeout:
-            await _recover_persisted_event_side_effects_until_idle(app)
+            await _recover_persisted_event_side_effects_until_idle(app, status)
     except TimeoutError:
         if not timeout.expired():
-            raise
+            logger.warning(
+                "Persisted event side-effect startup sweep timed out; background recovery will retry."
+            )
+            return
         logger.warning(
             "Persisted event side-effect startup recovery exceeded %.3fs; "
             "unfinished durable handoffs will remain eligible for background recovery.",
             timeout_s,
         )
 
+    except Exception:
+        logger.warning(
+            "Persisted event side-effect startup sweep failed; background recovery will retry."
+        )
 
-async def _recover_persisted_event_side_effects_forever(app: CayuApp) -> None:
-    while True:
-        await asyncio.sleep(_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS)
-        try:
-            await _recover_persisted_event_side_effects_until_idle(app)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Failed to recover persisted event side effects.")
+
+async def _recover_persisted_event_side_effects_forever(
+    app: CayuApp,
+    status: EventSideEffectRecoveryLoop | None = None,
+) -> None:
+    try:
+        while True:
+            await asyncio.sleep(_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS)
+            try:
+                await _recover_persisted_event_side_effects_until_idle(app, status)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if status is None or status.consecutive_failures == 1:
+                    logger.warning(
+                        "Persisted event side-effect recovery failed; inspect protected health."
+                    )
+    finally:
+        if status is not None:
+            status.state = "stopped"
 
 
 async def _continue_incomplete_session_startup_recovery(
@@ -1020,9 +1092,12 @@ async def _stop_incomplete_session_startup_recovery(
         await task
 
 
-def _start_persisted_event_side_effect_recovery(app: CayuApp) -> asyncio.Task[None]:
+def _start_persisted_event_side_effect_recovery(
+    app: CayuApp,
+    status: EventSideEffectRecoveryLoop | None = None,
+) -> asyncio.Task[None]:
     return asyncio.create_task(
-        _recover_persisted_event_side_effects_forever(app),
+        _recover_persisted_event_side_effects_forever(app, status),
         name="cayu-persisted-event-side-effect-recovery",
     )
 
@@ -1047,6 +1122,11 @@ def _compose_interruption_drain_lifespan(
     side_effect_startup_timeout_s: float,
     project_context: ResolvedProjectControlPlaneContext | None,
 ) -> None:
+    side_effect_health = EventSideEffectRecoveryLoop(
+        interval_seconds=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS,
+        batch_limit=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE,
+    )
+    server.state.cayu_event_side_effect_recovery = side_effect_health
     existing_lifespan = server.router.lifespan_context
 
     @asynccontextmanager
@@ -1057,11 +1137,14 @@ def _compose_interruption_drain_lifespan(
                 await _recover_persisted_event_side_effects_during_startup(
                     app,
                     timeout_s=side_effect_startup_timeout_s,
+                    status=side_effect_health,
                 )
                 await app.resume_pending_interruption_cascades(
                     interrupting_inactive_for_seconds=recovery_inactive_after_seconds
                 )
-                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
+                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
+                    app, side_effect_health
+                )
                 yield state
             finally:
                 app.seal_knowledge_publications()

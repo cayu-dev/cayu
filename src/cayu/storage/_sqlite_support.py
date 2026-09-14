@@ -4141,6 +4141,10 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_lifecycle_task
             ON cayu_work_attempt_lifecycle_receipts(task_id, retired_contract_binding);
     """,
+    86: """CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_health
+ ON cayu_persisted_event_side_effects(status, next_attempt_at, lease_expires_at, updated_at, attempts);
+CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
+ ON cayu_persisted_event_side_effects(session_id, event_id) WHERE status <> 'delivered';""",
     85: """
         CREATE TABLE IF NOT EXISTS cayu_session_closure_receipts (
             session_id TEXT COLLATE BINARY NOT NULL,

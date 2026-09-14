@@ -321,6 +321,11 @@ from cayu.runtime.completion_verifiers import (
     DeterministicCompletionVerifier,
 )
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
+from cayu.runtime.event_side_effect_health import (
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
+)
 from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
@@ -5275,6 +5280,17 @@ class CayuApp:
             refresh=refresh,
             settle=settle,
         )
+
+    async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
+        """Read the store-wide durable fan-out snapshot; never emit or retry events."""
+        return await self._runtime_session_store.get_persisted_event_side_effect_health()
+
+    async def query_persisted_event_side_effect_deliveries(
+        self,
+        query: PersistedEventSideEffectQuery,
+    ) -> PersistedEventSideEffectPage:
+        """Inspect bounded, sanitized delivery records without acquiring ownership."""
+        return await self._runtime_session_store.query_persisted_event_side_effect_deliveries(query)
 
     async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
         """Retry committed event fan-out that was not acknowledged before a crash.

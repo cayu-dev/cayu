@@ -8560,6 +8560,96 @@ export type Event = {
 export type EventOrder = 'sequence_asc' | 'sequence_desc';
 
 /**
+ * EventSideEffectHealthResponse
+ */
+export type EventSideEffectHealthResponse = {
+    durable: PersistedEventSideEffectHealth;
+    recovery_loop?: EventSideEffectRecoveryLoop | null;
+};
+
+/**
+ * EventSideEffectRecoveryLoop
+ */
+export type EventSideEffectRecoveryLoop = {
+    /**
+     * Batch Limit
+     */
+    batch_limit: number;
+    /**
+     * Consecutive Failures
+     */
+    consecutive_failures?: number;
+    /**
+     * Delivered Rows
+     */
+    delivered_rows?: number;
+    /**
+     * Interval Seconds
+     */
+    interval_seconds: number;
+    /**
+     * Last Delivered Count
+     */
+    last_delivered_count?: number | null;
+    /**
+     * Last Duration Seconds
+     */
+    last_duration_seconds?: number | null;
+    /**
+     * Last Error
+     */
+    last_error?: string | null;
+    /**
+     * Last Error At
+     */
+    last_error_at?: string | null;
+    /**
+     * Last Success At
+     */
+    last_success_at?: string | null;
+    /**
+     * Last Success Saturated
+     */
+    last_success_saturated?: boolean;
+    /**
+     * Last Sweep Completed At
+     */
+    last_sweep_completed_at?: string | null;
+    /**
+     * Last Sweep Started At
+     */
+    last_sweep_started_at?: string | null;
+    /**
+     * Saturated Batches
+     */
+    saturated_batches?: number;
+    /**
+     * Scope
+     */
+    scope?: 'process_local_reset_on_restart';
+    /**
+     * Started At
+     */
+    started_at?: string | null;
+    /**
+     * State
+     */
+    state?: 'configured' | 'running' | 'stopped';
+    /**
+     * Sweep Attempts
+     */
+    sweep_attempts?: number;
+    /**
+     * Sweep Failures
+     */
+    sweep_failures?: number;
+    /**
+     * Sweep Successes
+     */
+    sweep_successes?: number;
+};
+
+/**
  * EventType
  */
 export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
@@ -12151,6 +12241,168 @@ export type PendingKnowledgeListResponse = {
      * Truncated
      */
     truncated: boolean;
+};
+
+/**
+ * PersistedEventSideEffectHealth
+ */
+export type PersistedEventSideEffectHealth = {
+    /**
+     * Claimable Total
+     */
+    claimable_total?: number;
+    /**
+     * Dead Lettered
+     */
+    dead_lettered?: number;
+    /**
+     * Delivered
+     */
+    delivered?: number;
+    /**
+     * Earliest Live Lease Expires At
+     */
+    earliest_live_lease_expires_at?: string | null;
+    /**
+     * Failed Deferred
+     */
+    failed_deferred?: number;
+    /**
+     * Failed Retryable
+     */
+    failed_retryable?: number;
+    /**
+     * Final Attempt Boundary
+     */
+    final_attempt_boundary?: number;
+    /**
+     * Leased Expired
+     */
+    leased_expired?: number;
+    /**
+     * Leased Live
+     */
+    leased_live?: number;
+    /**
+     * Max Automatic Attempts
+     */
+    max_automatic_attempts?: number;
+    /**
+     * Max Outstanding Attempts
+     */
+    max_outstanding_attempts?: number;
+    /**
+     * Observed At
+     */
+    observed_at: string;
+    /**
+     * Oldest Claimable Age Seconds
+     */
+    oldest_claimable_age_seconds?: number | null;
+    /**
+     * Oldest Claimable At
+     */
+    oldest_claimable_at?: string | null;
+    /**
+     * Oldest Dead Letter Age Seconds
+     */
+    oldest_dead_letter_age_seconds?: number | null;
+    /**
+     * Oldest Dead Letter At
+     */
+    oldest_dead_letter_at?: string | null;
+    /**
+     * Oldest Failed Age Seconds
+     */
+    oldest_failed_age_seconds?: number | null;
+    /**
+     * Oldest Failed At
+     */
+    oldest_failed_at?: string | null;
+    /**
+     * Oldest Pending Age Seconds
+     */
+    oldest_pending_age_seconds?: number | null;
+    /**
+     * Oldest Pending At
+     */
+    oldest_pending_at?: string | null;
+    /**
+     * Outstanding Total
+     */
+    outstanding_total?: number;
+    /**
+     * Pending
+     */
+    pending?: number;
+    /**
+     * Repeatedly Failing
+     */
+    repeatedly_failing?: number;
+};
+
+/**
+ * PersistedEventSideEffectInspection
+ */
+export type PersistedEventSideEffectInspection = {
+    /**
+     * Attempts
+     */
+    attempts: number;
+    /**
+     * Claimable
+     */
+    claimable: boolean;
+    /**
+     * Event Id
+     */
+    event_id: string;
+    /**
+     * Event Sequence
+     */
+    event_sequence: number;
+    /**
+     * Last Error
+     */
+    last_error: string | null;
+    /**
+     * Lease Expires At
+     */
+    lease_expires_at: string | null;
+    /**
+     * Next Attempt At
+     */
+    next_attempt_at: string | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'pending' | 'leased' | 'failed' | 'delivered' | 'dead_lettered';
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * PersistedEventSideEffectPage
+ */
+export type PersistedEventSideEffectPage = {
+    /**
+     * Deliveries
+     */
+    deliveries: Array<PersistedEventSideEffectInspection>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+    /**
+     * Observed At
+     */
+    observed_at: string;
 };
 
 /**
@@ -20711,6 +20963,83 @@ export type ListEvalTargetsApiEvalsTargetsGetResponses = {
 };
 
 export type ListEvalTargetsApiEvalsTargetsGetResponse = ListEvalTargetsApiEvalsTargetsGetResponses[keyof ListEvalTargetsApiEvalsTargetsGetResponses];
+
+export type EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Status
+         */
+        status?: 'pending' | 'leased' | 'failed' | 'delivered' | 'dead_lettered' | null;
+        /**
+         * Claimable Only
+         */
+        claimable_only?: boolean;
+        /**
+         * Outstanding Only
+         */
+        outstanding_only?: boolean;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+    };
+    url: '/api/event-side-effects/deliveries';
+};
+
+export type EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetErrors = {
+    /**
+     * Invalid cursor
+     */
+    400: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * Delivery store unavailable
+     */
+    503: unknown;
+};
+
+export type EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetError = EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetErrors[keyof EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetErrors];
+
+export type EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: PersistedEventSideEffectPage;
+};
+
+export type EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetResponse = EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetResponses[keyof EventSideEffectDeliveriesApiEventSideEffectsDeliveriesGetResponses];
+
+export type EventSideEffectHealthApiEventSideEffectsHealthGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/event-side-effects/health';
+};
+
+export type EventSideEffectHealthApiEventSideEffectsHealthGetErrors = {
+    /**
+     * Delivery store unavailable
+     */
+    503: unknown;
+};
+
+export type EventSideEffectHealthApiEventSideEffectsHealthGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EventSideEffectHealthResponse;
+};
+
+export type EventSideEffectHealthApiEventSideEffectsHealthGetResponse = EventSideEffectHealthApiEventSideEffectsHealthGetResponses[keyof EventSideEffectHealthApiEventSideEffectsHealthGetResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;

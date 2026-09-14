@@ -6567,6 +6567,9 @@ to redact known secret values. Applications can disable the default sink with
 `CayuApp(enable_logging=False)`, pass additional sinks through
 `CayuApp(event_sinks=[...])`.
 
+For store-wide counts, lease/retry ages, protected inspection, and operational
+alerts, see [Operating durable event side effects](event-side-effect-health.md).
+
 Every built-in `SessionStore` creates a persisted side-effect handoff in the
 same atomic write as each runtime event. `RuntimeEventWriter` claims that
 handoff before forwarding `model.completed` to the configured `BudgetStore` and

@@ -17403,6 +17403,190 @@
         "title": "EventOrder",
         "type": "string"
       },
+      "EventSideEffectHealthResponse": {
+        "properties": {
+          "durable": {
+            "$ref": "#/components/schemas/PersistedEventSideEffectHealth"
+          },
+          "recovery_loop": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EventSideEffectRecoveryLoop"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "durable"
+        ],
+        "title": "EventSideEffectHealthResponse",
+        "type": "object"
+      },
+      "EventSideEffectRecoveryLoop": {
+        "properties": {
+          "batch_limit": {
+            "title": "Batch Limit",
+            "type": "integer"
+          },
+          "consecutive_failures": {
+            "default": 0,
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "delivered_rows": {
+            "default": 0,
+            "title": "Delivered Rows",
+            "type": "integer"
+          },
+          "interval_seconds": {
+            "title": "Interval Seconds",
+            "type": "number"
+          },
+          "last_delivered_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Delivered Count"
+          },
+          "last_duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Duration Seconds"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "last_error_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error At"
+          },
+          "last_success_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Success At"
+          },
+          "last_success_saturated": {
+            "default": false,
+            "title": "Last Success Saturated",
+            "type": "boolean"
+          },
+          "last_sweep_completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Sweep Completed At"
+          },
+          "last_sweep_started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Sweep Started At"
+          },
+          "saturated_batches": {
+            "default": 0,
+            "title": "Saturated Batches",
+            "type": "integer"
+          },
+          "scope": {
+            "const": "process_local_reset_on_restart",
+            "default": "process_local_reset_on_restart",
+            "title": "Scope",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "state": {
+            "default": "configured",
+            "enum": [
+              "configured",
+              "running",
+              "stopped"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "sweep_attempts": {
+            "default": 0,
+            "title": "Sweep Attempts",
+            "type": "integer"
+          },
+          "sweep_failures": {
+            "default": 0,
+            "title": "Sweep Failures",
+            "type": "integer"
+          },
+          "sweep_successes": {
+            "default": 0,
+            "title": "Sweep Successes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "interval_seconds",
+          "batch_limit"
+        ],
+        "title": "EventSideEffectRecoveryLoop",
+        "type": "object"
+      },
       "EventType": {
         "enum": [
           "workspace.checkpoint.updated",
@@ -24392,6 +24576,312 @@
           "total_entries_known"
         ],
         "title": "PendingKnowledgeListResponse",
+        "type": "object"
+      },
+      "PersistedEventSideEffectHealth": {
+        "additionalProperties": false,
+        "properties": {
+          "claimable_total": {
+            "default": 0,
+            "title": "Claimable Total",
+            "type": "integer"
+          },
+          "dead_lettered": {
+            "default": 0,
+            "title": "Dead Lettered",
+            "type": "integer"
+          },
+          "delivered": {
+            "default": 0,
+            "title": "Delivered",
+            "type": "integer"
+          },
+          "earliest_live_lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Earliest Live Lease Expires At"
+          },
+          "failed_deferred": {
+            "default": 0,
+            "title": "Failed Deferred",
+            "type": "integer"
+          },
+          "failed_retryable": {
+            "default": 0,
+            "title": "Failed Retryable",
+            "type": "integer"
+          },
+          "final_attempt_boundary": {
+            "default": 0,
+            "title": "Final Attempt Boundary",
+            "type": "integer"
+          },
+          "leased_expired": {
+            "default": 0,
+            "title": "Leased Expired",
+            "type": "integer"
+          },
+          "leased_live": {
+            "default": 0,
+            "title": "Leased Live",
+            "type": "integer"
+          },
+          "max_automatic_attempts": {
+            "default": 3,
+            "title": "Max Automatic Attempts",
+            "type": "integer"
+          },
+          "max_outstanding_attempts": {
+            "default": 0,
+            "title": "Max Outstanding Attempts",
+            "type": "integer"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "oldest_claimable_age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Claimable Age Seconds"
+          },
+          "oldest_claimable_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Claimable At"
+          },
+          "oldest_dead_letter_age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Dead Letter Age Seconds"
+          },
+          "oldest_dead_letter_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Dead Letter At"
+          },
+          "oldest_failed_age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Failed Age Seconds"
+          },
+          "oldest_failed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Failed At"
+          },
+          "oldest_pending_age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Pending Age Seconds"
+          },
+          "oldest_pending_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Pending At"
+          },
+          "outstanding_total": {
+            "default": 0,
+            "title": "Outstanding Total",
+            "type": "integer"
+          },
+          "pending": {
+            "default": 0,
+            "title": "Pending",
+            "type": "integer"
+          },
+          "repeatedly_failing": {
+            "default": 0,
+            "title": "Repeatedly Failing",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "observed_at"
+        ],
+        "title": "PersistedEventSideEffectHealth",
+        "type": "object"
+      },
+      "PersistedEventSideEffectInspection": {
+        "properties": {
+          "attempts": {
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "claimable": {
+            "title": "Claimable",
+            "type": "boolean"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_sequence": {
+            "title": "Event Sequence",
+            "type": "integer"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "leased",
+              "failed",
+              "delivered",
+              "dead_lettered"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "event_id",
+          "event_sequence",
+          "status",
+          "claimable",
+          "attempts",
+          "lease_expires_at",
+          "next_attempt_at",
+          "updated_at",
+          "last_error"
+        ],
+        "title": "PersistedEventSideEffectInspection",
+        "type": "object"
+      },
+      "PersistedEventSideEffectPage": {
+        "properties": {
+          "deliveries": {
+            "items": {
+              "$ref": "#/components/schemas/PersistedEventSideEffectInspection"
+            },
+            "title": "Deliveries",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observed_at",
+          "deliveries"
+        ],
+        "title": "PersistedEventSideEffectPage",
         "type": "object"
       },
       "PriceBook": {
@@ -39397,6 +39887,135 @@
           }
         },
         "summary": "List Eval Targets"
+      }
+    },
+    "/api/event-side-effects/deliveries": {
+      "get": {
+        "operationId": "event_side_effect_deliveries_api_event_side_effects_deliveries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "pending",
+                    "leased",
+                    "failed",
+                    "delivered",
+                    "dead_lettered"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "claimable_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Claimable Only",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "outstanding_only",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Outstanding Only",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 16384,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersistedEventSideEffectPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid cursor"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "Delivery store unavailable"
+          }
+        },
+        "summary": "Event Side Effect Deliveries"
+      }
+    },
+    "/api/event-side-effects/health": {
+      "get": {
+        "operationId": "event_side_effect_health_api_event_side_effects_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventSideEffectHealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "description": "Delivery store unavailable"
+          }
+        },
+        "summary": "Event Side Effect Health"
       }
     },
     "/api/health": {

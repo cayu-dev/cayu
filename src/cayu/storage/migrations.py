@@ -443,6 +443,8 @@ REVISIONS: tuple[Revision, ...] = (
     # Session closure now requires every writer to preserve an exact erase
     # receipt; pre-85 workers can delete the session without that boundary.
     Revision(revision=85, kind=RevisionKind.BREAKING, compatible_from=85),
+    # Payload-free delivery health and stable operational pagination indexes.
+    Revision(revision=86, kind=RevisionKind.ADDITIVE, compatible_from=85),
 )
 
 #: The revision an empty database is initialized to.

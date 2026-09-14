@@ -27,6 +27,9 @@ from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
     project_persisted_runtime_event,
 )
+from cayu.runtime.event_side_effect_health import (
+    PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS as _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS,
+)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions.base import (
     EventQuery,
@@ -43,7 +46,6 @@ from cayu.sessions.base import (
 )
 from cayu.vaults.redaction import SecretRedactor
 
-_PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS = 3
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
 _MAX_AGGREGATED_FAILURES = 16
 _MAX_EXCEPTION_NOTES = 16

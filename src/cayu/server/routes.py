@@ -267,6 +267,16 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
+from cayu.runtime.event_side_effect_health import (
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
+)
+from cayu.runtime.event_side_effect_health import (
+    Status as EventSideEffectStatus,
+)
+from cayu.runtime.event_side_effect_health import (
+    cursor_key as event_side_effect_cursor_key,
+)
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import (
@@ -289,6 +299,7 @@ from cayu.runtime.session_message_lifecycle import (
 from cayu.runtime.stop_policy import RunLimits
 from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
+from cayu.server._event_side_effect_health import EventSideEffectHealthResponse
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
 from cayu.server.contracts import (
@@ -10244,6 +10255,72 @@ def create_router(
                 "Cache-Control": "private, no-store",
             },
         )
+
+    @router.get(
+        "/event-side-effects/health",
+        response_model=EventSideEffectHealthResponse,
+        dependencies=protected,
+        responses={503: {"description": "Delivery store unavailable"}},
+    )
+    async def event_side_effect_health(request: Request):
+        try:
+            durable = await cayu_app.get_persisted_event_side_effect_health()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "event_side_effect_store_unavailable",
+                    "message": "Event side-effect health is unavailable.",
+                },
+            ) from exc
+        return EventSideEffectHealthResponse(
+            durable=durable,
+            recovery_loop=getattr(request.app.state, "cayu_event_side_effect_recovery", None),
+        )
+
+    @router.get(
+        "/event-side-effects/deliveries",
+        response_model=PersistedEventSideEffectPage,
+        dependencies=protected,
+        responses={
+            400: {"description": "Invalid cursor"},
+            503: {"description": "Delivery store unavailable"},
+        },
+    )
+    async def event_side_effect_deliveries(
+        status: EventSideEffectStatus | None = None,
+        claimable_only: bool = False,
+        outstanding_only: bool = True,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        cursor: Annotated[str | None, Query(max_length=16384)] = None,
+    ):
+        try:
+            query = PersistedEventSideEffectQuery(
+                statuses=None if status is None else {status},
+                claimable_only=claimable_only,
+                outstanding_only=outstanding_only,
+                limit=limit,
+                cursor=cursor,
+            )
+            event_side_effect_cursor_key(query)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_event_side_effect_query",
+                    "message": "Invalid inspection cursor or filters.",
+                },
+            ) from exc
+        try:
+            return await cayu_app.query_persisted_event_side_effect_deliveries(query)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "event_side_effect_store_unavailable",
+                    "message": "Event side-effect inspection is unavailable.",
+                },
+            ) from exc
 
     @router.get(
         "/pending-actions",

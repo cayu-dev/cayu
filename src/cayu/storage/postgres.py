@@ -19,8 +19,14 @@ from weakref import ReferenceType, ref
 
 from cayu.budgets.pricing import PriceBook
 from cayu.runtime import _session_message_queue as message_queue
+from cayu.runtime import event_side_effect_health as side_effect_health
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.runtime.event_side_effect_health import (
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
+)
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,
     SessionMessageConditions,
@@ -4471,7 +4477,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
-    86: (),
+    86: (
+        "CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_health\n ON cayu_persisted_event_side_effects(status, next_attempt_at, lease_expires_at, updated_at, attempts)",
+        'CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding\n ON cayu_persisted_event_side_effects(session_id COLLATE "C", event_id COLLATE "C") WHERE status <> \'delivered\'',
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -5472,7 +5481,8 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             ),
         ),
     ),
-    86: (
+    # This pending-action index change is not registered in REVISIONS yet.
+    87: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -30838,6 +30848,39 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.rollback()
                 raise
         return _persisted_event_side_effect_delivery_from_row(row)
+
+    async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT clock_timestamp()")
+            now = (await cur.fetchone())[0]
+            await cur.execute(
+                cast("LiteralString", side_effect_health.health_sql("%s::timestamptz")), (now,)
+            )
+            row = await cur.fetchone()
+        return side_effect_health.finish_health(
+            dict(zip(side_effect_health.AGGREGATES, row, strict=True)), now
+        )
+
+    async def query_persisted_event_side_effect_deliveries(
+        self,
+        query: PersistedEventSideEffectQuery,
+    ) -> PersistedEventSideEffectPage:
+        query = PersistedEventSideEffectQuery.model_validate(query)
+        side_effect_health.cursor_key(query)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT clock_timestamp()")
+            now = (await cur.fetchone())[0]
+            sql, params = side_effect_health.page_sql(query, now, "%s")
+            sql = sql.replace("SELECT %s AS observed_at", "SELECT %s::timestamptz AS observed_at")
+            await cur.execute(cast("LiteralString", sql), params)
+            rows = await cur.fetchall()
+        return side_effect_health.page(
+            [_persisted_event_side_effect_delivery_from_row(row) for row in rows],
+            query,
+            now,
+        )
 
     async def list_persisted_event_side_effect_deliveries(
         self,

@@ -1,6 +1,22 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "PersistedEventSideEffectHealth": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectHealth",
+    ),
+    "PersistedEventSideEffectInspection": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectInspection",
+    ),
+    "PersistedEventSideEffectPage": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectPage",
+    ),
+    "PersistedEventSideEffectQuery": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectQuery",
+    ),
     "ALL_REGISTERED_TOOLS_PROFILE_ID": ("cayu.tools.exposure", "ALL_REGISTERED_TOOLS_PROFILE_ID"),
     "ANY_TAINT_LABEL": ("cayu.tools.policy", "ANY_TAINT_LABEL"),
     "APP_MANIFEST_SCHEMA_VERSION": ("cayu.runtime.manifest", "APP_MANIFEST_SCHEMA_VERSION"),
@@ -1890,6 +1906,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "PersistedEventSideEffectHealth",
+    "PersistedEventSideEffectInspection",
+    "PersistedEventSideEffectPage",
+    "PersistedEventSideEffectQuery",
     "ALL_REGISTERED_TOOLS_PROFILE_ID",
     "ANY_TAINT_LABEL",
     "APP_MANIFEST_SCHEMA_VERSION",

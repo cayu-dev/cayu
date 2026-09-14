@@ -1,6 +1,22 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "PersistedEventSideEffectHealth": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectHealth",
+    ),
+    "PersistedEventSideEffectInspection": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectInspection",
+    ),
+    "PersistedEventSideEffectPage": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectPage",
+    ),
+    "PersistedEventSideEffectQuery": (
+        "cayu.runtime.event_side_effect_health",
+        "PersistedEventSideEffectQuery",
+    ),
     "AESGCMBrowserProfileKeyAuthority": (
         "cayu.browser_profiles",
         "AESGCMBrowserProfileKeyAuthority",
@@ -5671,6 +5687,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "PersistedEventSideEffectHealth",
+    "PersistedEventSideEffectInspection",
+    "PersistedEventSideEffectPage",
+    "PersistedEventSideEffectQuery",
     "AESGCMBrowserProfileKeyAuthority",
     "AGENT_BUNDLE_CONTAINER_EXTENSION",
     "AGENT_BUNDLE_CONTAINER_MAX_BYTES",
