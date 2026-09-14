@@ -15113,6 +15113,21 @@ class RecoveryCoordinator:
             (tool_call.id, tool_call.name) for tool_call in pending_tool_calls
         ]:
             raise RuntimeError("Interrupted tool calls conflict with the durable pending round.")
+        (
+            source_checkpoint,
+            pending_round,
+            workspace_events,
+        ) = await self._settle_tool_round_workspace_observations(
+            session=request.session,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+            checkpoint=source_checkpoint,
+            pending_round=pending_round,
+            staged_only=True,
+        )
+        for event in workspace_events:
+            yield event
         if await ToolEffectStateOwner(self._session_store).preserve_unresolved(
             request.session,
             tool_round_id=tool_round_identity.tool_round_id,
@@ -16104,6 +16119,49 @@ class RecoveryCoordinator:
             )
         return reattached
 
+    async def _settle_tool_round_workspace_observations(
+        self,
+        *,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
+        checkpoint: dict[str, Any] | None,
+        pending_round: tool_round_recovery.PendingToolRound,
+        staged_only: bool = False,
+    ) -> tuple[dict[str, Any] | None, tool_round_recovery.PendingToolRound, tuple[Event, ...]]:
+        """Settle the exact workspace-bound stage before changing publication timing.
+
+        Live interruption and later recovery obey the same ordering and authority
+        checks. No tool or model work is dispatched by observation recovery.
+        """
+        if not workspace_observations_from_checkpoint(checkpoint):
+            return checkpoint, pending_round, ()
+        snapshot = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if snapshot is None or execution_profile is None or snapshot.profile != execution_profile:
+            raise RuntimeError("Workspace recovery lost the admitted execution profile.")
+        snapshot = snapshot.model_copy(update={"profile": execution_profile})
+        events = await self._recover_workspace_observations(
+            session=session,
+            registered_environment=registered_environment,
+            execution_profile_snapshot=snapshot,
+            invocation_context=invocation_context,
+            staged_only=staged_only,
+        )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        recovered_pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if recovered_pending is None or (
+            tool_round_recovery.pending_tool_round_identity(recovered_pending)
+            != tool_round_recovery.pending_tool_round_identity(pending_round)
+        ):
+            raise RuntimeError("Workspace recovery lost its pending tool round.")
+        return checkpoint, recovered_pending, events
+
     async def recover_pending_tool_round(
         self,
         *,
@@ -16158,38 +16216,20 @@ class RecoveryCoordinator:
         )
         if pending_round is None:
             return
-        if workspace_observations_from_checkpoint(checkpoint):
-            snapshot = active_invocation_execution_profile_from_checkpoint(checkpoint)
-            if (
-                snapshot is None
-                or execution_profile is None
-                or snapshot.profile != execution_profile
-            ):
-                raise RuntimeError("Workspace recovery lost the admitted execution profile.")
-            # Use the already admitted profile object after exact durable comparison.
-            # Workspace settlement owns its observation and stage; native receipt
-            # reconstruction must not retire their pending round first.
-            snapshot = snapshot.model_copy(update={"profile": execution_profile})
-            for event in await self._recover_workspace_observations(
-                session=session,
-                registered_environment=registered_environment,
-                execution_profile_snapshot=snapshot,
-                invocation_context=invocation_context,
-            ):
-                yield event
-            checkpoint = await self._session_store.load_checkpoint(session.id)
-            recovered_pending = tool_round_recovery.pending_tool_round_from_checkpoint(
-                checkpoint,
-                redactor=self._secret_redactor,
-                consume_on_rejection=True,
-                runtime_session=session,
-            )
-            if recovered_pending is None or (
-                tool_round_recovery.pending_tool_round_identity(recovered_pending)
-                != tool_round_recovery.pending_tool_round_identity(pending_round)
-            ):
-                raise RuntimeError("Workspace recovery lost its pending tool round.")
-            pending_round = recovered_pending
+        (
+            checkpoint,
+            pending_round,
+            workspace_events,
+        ) = await self._settle_tool_round_workspace_observations(
+            session=session,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            checkpoint=checkpoint,
+            pending_round=pending_round,
+        )
+        for event in workspace_events:
+            yield event
         for event in await settle_prepared_tool_effects(
             store=self._session_store,
             writer=self._event_writer,
@@ -21091,6 +21131,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None,
         invocation_context: InvocationContext | None = None,
+        staged_only: bool = False,
     ) -> tuple[Event, ...]:
         """Close crash-interrupted observation state without redispatching effects."""
 
@@ -21127,6 +21168,17 @@ class RecoveryCoordinator:
         )
         for window_id in sorted(observations):
             durable_lifecycle = observations[window_id]
+            if staged_only and (
+                pending_round is None
+                or not any(
+                    stage.tool_call_id == durable_lifecycle.tool_call_id
+                    for stage in pending_round.staged_terminals
+                )
+            ):
+                # Live interruption only settles observations that own a staged
+                # result awaiting publication. An unfinished call, including a
+                # supervisory exit during capture, retains its recovery owner.
+                continue
             reconstructed_stage = self._reconstruct_workspace_observation_staged_outcome(
                 session=session,
                 checkpoint=checkpoint,

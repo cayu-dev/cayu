@@ -1,6 +1,7 @@
 """Native final-response transport controls; all responses are synthetic."""
 
 import asyncio
+import gzip
 import json
 from copy import deepcopy
 
@@ -148,6 +149,39 @@ async def test_final_response_preserves_reasoning_search_usage_and_exactly_one_t
     replay = requests[1]["input"]
     assert [i["id"] for i in replay if i.get("type") == "reasoning"] == ["rs_a", "rs_b"]
     assert len([i for i in replay if i.get("type") == "function_call_output"]) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("compressed", [False, True], ids=["identity", "gzip"])
+async def test_final_response_owned_body_preserves_http_decoding(tmp_path, compressed):
+    body = json.dumps(response(message("Résumé ✓")), ensure_ascii=False).encode()
+    wire = gzip.compress(body) if compressed else body
+    closed = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield wire[:7]
+            yield wire[7:]
+
+        async def aclose(self):
+            closed.append(True)
+
+    events, durable, requests, executed = await run_responses(
+        tmp_path,
+        [
+            httpx.Response(
+                200,
+                headers={"content-encoding": "gzip"} if compressed else {},
+                stream=Body(),
+            )
+        ],
+    )
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len([e for e in durable if e.type == EventType.MODEL_COMPLETED]) == 1
+    text = "".join(e.payload["delta"] for e in durable if e.type == EventType.MODEL_TEXT_DELTA)
+    assert text == "Résumé ✓"
+    assert closed == [True]
+    assert len(requests) == 1 and executed == []
 
 
 @pytest.mark.anyio

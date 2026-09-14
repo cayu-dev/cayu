@@ -14,6 +14,7 @@ from tests.core.test_workspace_mutation_receipts import (
 )
 
 import cayu.runtime._tool_round_executor as executor
+from cayu import ExecutionDeadline, StepError, StepRunOptions, WorkflowBase, WorkflowSpec, step
 from cayu.core import AgentSpec, EventType, Message
 from cayu.runtime import (
     CayuApp,
@@ -25,9 +26,29 @@ from cayu.runtime import (
 from cayu.storage.sqlite import SQLiteSessionStore
 
 
+class SettlementWorkflow(WorkflowBase):
+    spec = WorkflowSpec(name="settlement-control")
+
+    async def run(self, session_id):
+        yield await self.context(session_id).start()
+
+
+@pytest.mark.parametrize("cancel_phase", ["workspace_terminal", "runner_terminal"])
+@pytest.mark.parametrize("native_child", [False, True])
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend):
+def test_cancel_before_workspace_terminal(
+    tmp_path,
+    monkeypatch,
+    cancel,
+    backend,
+    native_child,
+    cancel_phase,
+    runner_factory=LocalRunner,
+    provider_factory=_ScriptedProvider,
+    child_deadline=False,
+    binding_factory=DeterministicWorkspaceBinding,
+):
     async def run():
         store = (
             InMemorySessionStore()
@@ -42,8 +63,8 @@ def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend
                 Environment(
                     _portable_environment_spec("local"),
                     workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
-                    runner=LocalRunner(tmp_path),
-                    binding=DeterministicWorkspaceBinding(),
+                    runner=runner_factory(tmp_path),
+                    binding=binding_factory(),
                 ),
                 default=True,
             )
@@ -52,15 +73,23 @@ def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend
             )
             return app
 
-        provider = _ScriptedProvider()
+        provider = provider_factory()
         app = registered_app(provider)
         reached = asyncio.Event()
+        release_runner_publication = asyncio.Event()
         original = executor.publish_workspace_observation_transition
         paused = False
+        session_id = "settlement-probe"
 
         async def intercept(**kwargs):
-            nonlocal paused
-            if cancel and kwargs.get("phase") == "terminal" and not paused:
+            nonlocal paused, session_id
+            session_id = kwargs["session"].id
+            if (
+                cancel
+                and cancel_phase == "workspace_terminal"
+                and kwargs.get("phase") == "terminal"
+                and not paused
+            ):
                 paused = True
                 reached.set()
                 await asyncio.Event().wait()
@@ -68,7 +97,38 @@ def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend
 
         monkeypatch.setattr(executor, "publish_workspace_observation_transition", intercept)
 
+        original_emit = executor.RuntimeEventWriter.emit
+
+        async def emit(writer, event, *args, **kwargs):
+            nonlocal session_id, paused
+            saved = await original_emit(writer, event, *args, **kwargs)
+            if (
+                cancel
+                and cancel_phase == "runner_terminal"
+                and event.type == EventType.RUNNER_EXEC_COMPLETED
+                and not paused
+            ):
+                session_id = event.session_id
+                paused = True
+                reached.set()
+                await release_runner_publication.wait()
+            return saved
+
+        monkeypatch.setattr(executor.RuntimeEventWriter, "emit", emit)
+
         async def consume():
+            if native_child:
+                ctx = SettlementWorkflow(app).context("settlement-parent")
+                await ctx.start()
+                return await step(
+                    ctx,
+                    agent="assistant",
+                    step_id="write",
+                    prompt="create a file",
+                    run_options=StepRunOptions(
+                        execution_deadline=ExecutionDeadline.after(5 if child_deadline else None)
+                    ),
+                )
             return [
                 e
                 async for e in app.run(
@@ -84,12 +144,29 @@ def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend
         try:
             if cancel:
                 await asyncio.wait_for(reached.wait(), 15)
-                task.cancel("cancel before workspace terminal")
-                with pytest.raises(asyncio.CancelledError):
-                    await task
+                if child_deadline:
+                    with pytest.raises(StepError) as caught:
+                        await asyncio.wait_for(task, 15)
+                    assert caught.value.evidence.classification == "deadline"
+                    assert not caught.value.evidence.secondary_failures
+                else:
+                    task.cancel("cancel before terminal staging")
+                if cancel_phase == "runner_terminal" and not child_deadline:
+                    await asyncio.sleep(0.01)
+                    task.cancel("repeated cancellation during runner publication")
+                    await asyncio.sleep(0.01)
+                    release_runner_publication.set()
+                if not child_deadline:
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    if cancel_phase == "runner_terminal":
+                        assert task.cancelling() == 2
             else:
                 await task
-            checkpoint = await store.load_checkpoint("settlement-probe")
+            checkpoint = await store.load_checkpoint(session_id)
+            if child_deadline:
+                assert not checkpoint.get("workspace_observations")
+                assert not checkpoint.get("pending_tool_round")
             assert checkpoint.get("pending_tool_round") or not checkpoint.get(
                 "workspace_observations"
             )
@@ -100,21 +177,21 @@ def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend
             if backend == "sqlite":
                 await store.close()
                 store = SQLiteSessionStore(tmp_path / "probe.sqlite")
-            recovery_provider = _ScriptedProvider()
+            recovery_provider = provider_factory()
             recovery_app = registered_app(recovery_provider)
             for _ in range(2):
                 await recovery_app.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(
-                        session_id="settlement-probe",
+                        session_id=session_id,
                     )
                 )
-            checkpoint = await store.load_checkpoint("settlement-probe")
+            checkpoint = await store.load_checkpoint(session_id)
             assert not checkpoint.get("workspace_observations")
             assert not checkpoint.get("pending_tool_round")
             assert provider.requests == requests
             assert recovery_provider.requests == 0
             assert (tmp_path / "shell.txt").read_text() == "settled sentinel"
-            events = await store.query_events(EventQuery(session_id="settlement-probe"))
+            events = await store.query_events(EventQuery(session_id=session_id))
             assert sum(e.event.type == EventType.TOOL_CALL_COMPLETED for e in events) == 1
             assert (
                 len(
@@ -130,3 +207,17 @@ def test_cancel_before_workspace_terminal(tmp_path, monkeypatch, cancel, backend
                 await store.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("configured_binding", [False, True])
+def test_native_deadline_settles_workspace_publication(tmp_path, monkeypatch, configured_binding):
+    test_cancel_before_workspace_terminal(
+        tmp_path,
+        monkeypatch,
+        cancel=True,
+        backend="sqlite",
+        native_child=True,
+        cancel_phase="workspace_terminal",
+        child_deadline=True,
+        binding_factory=DeterministicWorkspaceBinding if configured_binding else lambda: None,
+    )

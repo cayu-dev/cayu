@@ -60,6 +60,8 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
         )
         if streaming:
             payload += frame({"type": "response.output_text.delta", "delta": "hello"})
+        else:
+            payload = b'{"id":"resp_synthetic","output":['
 
         def mark_received():
             nonlocal received
@@ -132,7 +134,10 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
         ) as client:
             transport._client._client = client
             provider = OpenAIProvider(
-                api_key="synthetic", base_url="https://synthetic.invalid", transport=transport
+                api_key="synthetic",
+                base_url="https://synthetic.invalid",
+                transport=transport,
+                streaming=streaming,
             )
             app = CayuApp(enable_logging=False, session_store=store)
             app.register_provider(provider, default=True)

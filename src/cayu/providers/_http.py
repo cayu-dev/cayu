@@ -191,9 +191,26 @@ async def _aiter_unclosed_response_bytes(
         raise
 
 
+class _HttpResponseCloseTrace:
+    """Observe HTTP-core closure when cancellation precedes response headers."""
+
+    def __init__(self) -> None:
+        self.succeeded: bool | None = None
+
+    async def __call__(self, name: str, info: Mapping[str, Any]) -> None:
+        del info
+        if name in {"http11.response_closed.started", "http2.response_closed.started"}:
+            self.succeeded = None
+        elif name in {"http11.response_closed.complete", "http2.response_closed.complete"}:
+            self.succeeded = True
+        elif name in {"http11.response_closed.failed", "http2.response_closed.failed"}:
+            self.succeeded = False
+
+
 async def _aiter_owned_stream_response(
     response_context: AbstractAsyncContextManager[httpx.Response],
     deadline_controller: ProviderStreamDeadlineController,
+    close_trace: _HttpResponseCloseTrace | None = None,
 ) -> AsyncIterator[tuple[httpx.Response, AsyncGenerator[bytes, None]]]:
     """Own bytes and response closure together, after the interrupted read joins."""
 
@@ -213,8 +230,13 @@ async def _aiter_owned_stream_response(
         raise
     finally:
         observer = deadline_controller._cleanup_observer
-        if opened and observer is not None and not fatal_failure:
-            await observer.closed(succeeded=succeeded)
+        if observer is not None and not fatal_failure:
+            if opened:
+                await observer.closed(succeeded=succeeded)
+            elif close_trace is not None and close_trace.succeeded is not None:
+                # A joined request is not itself proof of cleanup. Require the
+                # HTTP layer's completed close operation before publishing.
+                await observer.closed(succeeded=close_trace.succeeded)
 
 
 _TRUSTED_HTTPX_REQUEST_ERROR_TYPES: dict[type[httpx.RequestError], str] = {
@@ -505,7 +527,12 @@ async def request_json(
         }
         if payload is not None:
             request_kwargs["json"] = dict(payload)
-        if method == "POST":
+        controller = current_provider_deadline_controller()
+        if controller is not None:
+            response = await _read_owned_json_response(
+                client, method, url, request_kwargs, controller
+            )
+        elif method == "POST":
             response = await client.post(url, **request_kwargs)
         elif method == "GET":
             response = await client.get(url, **request_kwargs)
@@ -543,6 +570,44 @@ async def request_json(
     if not isinstance(decoded, Mapping):
         raise protocol_error(f"{response_label} response must be a JSON object.")
     return decoded
+
+
+async def _read_owned_json_response(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    request_kwargs: dict[str, Any],
+    controller: ProviderStreamDeadlineController,
+) -> httpx.Response:
+    """Retain final-JSON HTTP closure under the admitted provider operation.
+
+    ``AsyncClient.request`` consumes and implicitly closes its response before
+    returning it. That hides close outcome from the durable deadline observer.
+    Reuse the streaming response owner while buffering the complete JSON body;
+    the outer provider controller still owns the original wait and any retained
+    cancellation. A local close receipt never certifies the remote operation.
+    """
+    close_trace = _HttpResponseCloseTrace()
+    request_kwargs = {**request_kwargs, "extensions": {"trace": close_trace}}
+    responses = _aiter_owned_stream_response(
+        client.stream(method, url, **request_kwargs), controller, close_trace
+    )
+    async with aclosing_provider_stream(responses):
+        response, chunks = await anext(responses)
+        if response.is_stream_consumed:
+            # Custom HTTPX transports may supply an already buffered response.
+            # Its content is already decoded; do not decode it a second time.
+            return response
+        content = b"".join([chunk async for chunk in chunks])
+        # HTTPX decodes Content-Encoding on the buffered copy, preserving final
+        # JSON/error-body semantics without implicitly closing the live stream.
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=content,
+            request=response.request,
+            extensions=response.extensions,
+        )
 
 
 async def stream_sse_json_events(
@@ -606,8 +671,10 @@ async def stream_sse_json_events(
         }
         if method != "GET":
             request_kwargs["json"] = dict(payload)
+        close_trace = _HttpResponseCloseTrace()
+        request_kwargs["extensions"] = {"trace": close_trace}
         response_context = client.stream(method, url, **request_kwargs)
-        responses = _aiter_owned_stream_response(response_context, deadline_controller)
+        responses = _aiter_owned_stream_response(response_context, deadline_controller, close_trace)
         interrupted_read: asyncio.Future[Any] | None = None
 
         def retain_interrupted_read(operation: asyncio.Future[Any]) -> None:

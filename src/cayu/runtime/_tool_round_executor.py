@@ -5837,11 +5837,36 @@ class ToolRoundExecutor:
                         "workspace_mutation_capture_status": "pending",
                     }
             publication_snapshot = invocation_secret_scope.seal_for_publication()
-            await _await_post_tool_operation(
-                persist_sealed_invocation_evidence(publication_snapshot),
-                cancellation=post_tool_cancellation,
-                restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+            # The tool has returned an exact result. Sealed invocation/runner
+            # evidence precedes terminal staging, so cancellation here must not
+            # discard that result and turn a completed effect into ambiguity.
+            publication_outcome = await await_shielded_task_outcome(
+                asyncio.create_task(persist_sealed_invocation_evidence(publication_snapshot))
             )
+            post_tool_cancellation_requests_consumed += (
+                publication_outcome.cancellation_requests_consumed
+            )
+            if publication_outcome.cancellation is not None:
+                observed_cancellation = await consume_post_tool_cancellation(
+                    publication_outcome.cancellation
+                )
+                post_tool_cancellation = post_tool_cancellation or observed_cancellation
+                if post_tool_cancellation is not None:
+                    invocation_secrets.initialize_cancellation_evidence(post_tool_cancellation)
+                    invocation_secrets.set_cancellation_redactor(
+                        post_tool_cancellation, invocation_secret_scope.redactor
+                    )
+                    invocation_secrets.set_cancellation_tool_call_id(
+                        post_tool_cancellation, tool_call.id
+                    )
+            if publication_outcome.error is not None:
+                if post_tool_cancellation is not None:
+                    _raise_preserved_post_tool_cancellation(
+                        post_tool_cancellation,
+                        publication_outcome.error,
+                        restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    )
+                raise publication_outcome.error
 
             hook_argument_projection = (
                 tool_argument_publication.unavailable_argument_projection()

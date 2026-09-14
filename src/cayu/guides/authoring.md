@@ -305,6 +305,25 @@ Use an environment only when tools need these execution capabilities. Bind and
 finalize workspaces explicitly. When recovery or reconnect matters, verify the
 same identity and naming contract used by the original run.
 
+Treat workspace IDs as opaque identities owned by the selected workspace.
+Never reconstruct an ID from an environment name, filesystem path, hash, or
+another environment builder's naming convention. For an explicitly registered
+static environment, obtain it from
+`app.get_environment(name).environment.workspace.id` after checking that the
+workspace exists. Inside tools, use `ToolContext.workspace_id` and the active
+`ToolContext.workspace`; factory-created or bound workspaces may not exist until
+the session has materialized them. An environment name selects execution
+capabilities; it is not the workspace's identity.
+
+Bind application-owned file inventories and receipts to that actual workspace
+identity and validate it before accepting their authority. Runtime cannot infer
+the semantics of arbitrary application metadata: a string named `workspace_id`
+inside that metadata does not establish a Runtime-validated binding. Fail with
+an explicit identity-mismatch diagnostic instead of silently treating every
+declared file as unavailable. Prove the contract through a native run with an
+independently assigned workspace ID, including a different environment builder
+or evaluation wrapper when the application supports one.
+
 Environment selection is opt-in. Pass `default=True` to
 `register_environment(...)` or `register_environment_factory(...)` only when
 unnamed `RunRequest`s should use that environment. Otherwise leave it

@@ -483,3 +483,66 @@ def test_quote_heavy_transport_on_linux(mode):
         "environment-canary",
         extra,
     ]
+
+
+@pytest.mark.parametrize(
+    ("cancel_phase", "child_deadline", "configured_binding"),
+    [
+        ("workspace_terminal", False, True),
+        ("runner_terminal", False, True),
+        ("workspace_terminal", True, True),
+        ("workspace_terminal", True, False),
+    ],
+)
+def test_real_docker_native_child_completed_result_survives_cancellation(
+    tmp_path, monkeypatch, cancel_phase, child_deadline, configured_binding
+):
+    from tests.core.test_workspace_mutation_receipts import (
+        DeterministicWorkspaceBinding,
+        _ScriptedProvider,
+    )
+    from tests.core.test_workspace_settlement_cancellation import (
+        test_cancel_before_workspace_terminal,
+    )
+
+    from cayu import ModelStreamEvent
+
+    class ContainerProvider(_ScriptedProvider):
+        async def stream(self, request):
+            self.requests += 1
+            if self.requests == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call-shell",
+                    name="exec_command",
+                    arguments={"argv": ["sh", "-c", "printf created > shell.txt"]},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            else:
+                yield ModelStreamEvent.text_delta("done")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    docker_path = _docker_path_or_skip()
+    runner = asyncio.run(
+        DockerRunner.create(
+            f"cayu-publication-{uuid4().hex[:12]}",
+            image=os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20"),
+            docker_path=docker_path,
+            mount_path=str(tmp_path),
+            close_action="remove",
+        )
+    )
+    try:
+        test_cancel_before_workspace_terminal(
+            tmp_path,
+            monkeypatch,
+            cancel=True,
+            backend="sqlite",
+            native_child=True,
+            cancel_phase=cancel_phase,
+            runner_factory=lambda root: runner,
+            provider_factory=ContainerProvider,
+            child_deadline=child_deadline,
+            binding_factory=DeterministicWorkspaceBinding if configured_binding else lambda: None,
+        )
+    finally:
+        asyncio.run(runner.close())

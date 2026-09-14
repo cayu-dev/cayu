@@ -20,7 +20,11 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._clock import normalize_utc_datetime
-from cayu._task_wait import await_shielded_task_outcome, capture_awaitable_outcome
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    capture_awaitable_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -1234,6 +1238,10 @@ async def _run_step(
                     or settlement_failure is not None,
                 }
             ),
+        )
+        restore_task_cancellation_requests(
+            settlement.cancellation_requests_consumed,
+            cancellation=authoritative_cancellation,
         )
         if authoritative_cancellation is cancellation:
             raise

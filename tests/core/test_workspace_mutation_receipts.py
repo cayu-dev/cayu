@@ -6050,6 +6050,7 @@ def test_artifact_store_process_control_is_not_lost_to_concurrent_cancellation(
     assert consumer.cancelled() is False
 
 
+@pytest.mark.parametrize("prior_completed_call", [False, True])
 @pytest.mark.parametrize("run_fence_release_failure", [False, True])
 @pytest.mark.parametrize("entrance", ["run", "resume"])
 def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
@@ -6057,6 +6058,7 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
     monkeypatch,
     entrance: str,
     run_fence_release_failure: bool,
+    prior_completed_call: bool,
 ) -> None:
     workspace_root = tmp_path / "workspace"
     artifact_root = tmp_path / "artifacts"
@@ -6074,8 +6076,18 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
         provider_type = (
             _SingleToolProvider if entrance == "run" else _CompletionThenSingleToolProvider
         )
+
+        class MixedProvider(provider_type):
+            async def stream(self, request):
+                async for event in super().stream(request):
+                    if prior_completed_call and event.type == "tool_call":
+                        yield ModelStreamEvent.tool_call(
+                            id="call-completed", name="following_tool", arguments={}
+                        )
+                    yield event
+
         app.register_provider(
-            provider_type(
+            MixedProvider(
                 tool_name=tool.spec.name,
                 arguments={},
             ),
@@ -6092,7 +6104,7 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
         )
         app.register_agent(
             AgentSpec(name="assistant", model="cancel-model"),
-            tools=[tool],
+            tools=[_FollowingTool(), tool] if prior_completed_call else [tool],
         )
         session_id = f"session-interrupted-artifact-generator-exit-{entrance}"
         if entrance == "resume":
@@ -6140,7 +6152,9 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
         assert checkpoint is not None and checkpoint.get("workspace_observations")
         pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
         assert pending is not None
-        assert not pending.staged_terminals
+        assert [stage.tool_call_id for stage in pending.staged_terminals] == (
+            ["call-completed"] if prior_completed_call else []
+        )
         durable = await store.query_events(EventQuery(session_id=session_id))
         unknown = [
             record.event

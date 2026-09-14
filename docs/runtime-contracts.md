@@ -9279,6 +9279,17 @@ closure only, not all provider work. A settled task is not proof of successful
 closure, and local closure is never proof of remote settlement. Recovery actions,
 unknown remote outcome, and retry suppression do not change. Opaque transports
 without this response owner do not gain a successful-cleanup claim.
+This includes final-JSON Responses requests: buffering a non-streaming body
+retains the same explicit response-close owner, including at absolute expiry.
+When cancellation occurs before response headers arrive, the bundled HTTP path
+uses the HTTP layer's completed response-close trace to establish local cleanup.
+It publishes only after the interrupted request unwinds; a pending close remains
+unknown and a failed close records failure. Cancellation without this close
+observation, including an opaque transport merely returning, remains unknown.
+`http_cleanup_observation_policy_version=1` participates in execution identity.
+Normal JSON decoding, content encoding, and HTTP error classification remain
+unchanged; local cleanup evidence does not authorize retrying an unknown remote
+operation.
 
 Provider stream configuration also declares `max_concurrent_streams`, defaulting
 to 100 so the normal N9 evaluation capacity does not encounter a lower hidden
@@ -12062,6 +12073,18 @@ process death never release them.
 ## Workspace
 
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.
+
+Interrupted tool-round closure settles each workspace observation that owns a
+staged tool result against its exact admitted execution profile and pending round
+before publishing that result. Observations without a staged result, including
+supervisory exits during artifact capture, remain owned by later recovery even
+when another call in the same round has a staged result. It uses the same
+checkpoint-only settlement path as later recovery;
+neither path redispatches the tool or calls a model. This ordering also applies
+when a native child deadline expires during workspace terminal publication.
+Missing or conflicting authority remains a recovery failure, and a completed
+command alone does not authorize publication before workspace settlement.
+
 `LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root. Path-addressed reads, creates, replacements, and deletions require POSIX descriptor-relative filesystem primitives. Each operation pins the operator-configured root, opens every component below it with `O_NOFOLLOW` relative to the preceding directory descriptor, and performs the final open, link, rename, or unlink relative to the pinned parent. Concurrent replacement of a checked component therefore cannot redirect a workspace API operation outside the opened root. Writes preserve the existing atomic create/replace behavior and conventional umask-derived creation mode. Platforms without the required primitives fail closed rather than falling back to pathname validation. Applications that require these operations during normal execution can call `LocalWorkspace.require_path_operations_supported()` during construction so an incompatible host is rejected before dispatch. The configured root ancestry remains trusted, and the cooperative per-path lock serializes Cayu clients but is not a process-isolation boundary. `LocalRunner` code still runs as the host user and may access host paths directly; use a sandbox runner when code itself is untrusted.
 `EFSAccessPointBinding` and `S3FilesAccessPointBinding` mount an exact AWS access
 point at the runner's workspace path using an explicit mount-target IPv4

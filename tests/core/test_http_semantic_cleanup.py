@@ -1,4 +1,4 @@
-"""Credential-free semantic-idle shutdown and durable local HTTP receipts."""
+"""Credential-free stream/final-response shutdown and durable HTTP receipts."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from cayu import (
     WorkflowSpec,
     step,
 )
+from cayu.providers import _credential_boundary as credential_boundary
 from cayu.providers import deadlines as ds
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
@@ -36,6 +37,7 @@ def frame(x):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("streaming", [True, False], ids=["stream", "final-json"])
 @pytest.mark.parametrize(
     "mode,traffic",
     [
@@ -44,14 +46,29 @@ def frame(x):
         for traffic in ("silence", "heartbeat", "whitespace")
     ]
     + [
+        ("socket_preheaders", "silence"),
+        ("socket_preheaders_delayed", "silence"),
+        ("socket_preheaders_failure", "silence"),
+        ("mock_preheaders", "silence"),
         ("noncooperative", "silence"),
         ("receipt_failure", "silence"),
         ("delayed_receipt", "silence"),
         ("socket_delayed_receipt", "whitespace"),
     ],
 )
-async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
+async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, streaming):
     baseline_tasks = set(asyncio.all_tasks())
+
+    def cleanup_owners():
+        # A close that reaches publication before deadline-read teardown is
+        # retained there; a later SSE close belongs to the stream-close owner.
+        return ds._PROVIDER_DEADLINE_AWAIT_OWNERS or any(
+            registry.get(asyncio.get_running_loop())
+            for registry in (
+                credential_boundary._PROVIDER_STREAM_CLEANUP_REGISTRIES,
+                credential_boundary._PROVIDER_STREAM_DEADLINE_CLEANUP_REGISTRIES,
+            )
+        )
 
     payload = frame(
         {
@@ -64,6 +81,9 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
         if traffic == "heartbeat"
         else frame({"type": "response.output_text.delta", "delta": " "})
     )
+    if not streaming:
+        payload = b'{"id":"resp_synthetic","status":"in_progress","output":['
+        extra = b" "
     handlers = set()
     closed = asyncio.Event()
     release = asyncio.Event()
@@ -80,11 +100,12 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
                 if line.lower().startswith(b"content-length:")
             )
             await reader.readexactly(n)
-            writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
-                + payload
-            )
-            await writer.drain()
+            if not mode.startswith("socket_preheaders"):
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    + payload
+                )
+                await writer.drain()
             stream_started.set()
             while True:
                 try:
@@ -105,6 +126,20 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
 
     server = await asyncio.start_server(serve, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
+
+    if mode in {"socket_preheaders_delayed", "socket_preheaders_failure"}:
+        from httpcore._backends.anyio import AnyIOStream
+
+        close_network_stream = AnyIOStream.aclose
+
+        async def controlled_close(stream):
+            if mode == "socket_preheaders_delayed":
+                await release.wait()
+            await close_network_stream(stream)
+            if mode == "socket_preheaders_failure":
+                raise RuntimeError("synthetic pre-header close failure")
+
+        monkeypatch.setattr(AnyIOStream, "aclose", controlled_close)
 
     class Local(httpx.AsyncBaseTransport):
         def __init__(self):
@@ -140,9 +175,15 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
                 raise RuntimeError("synthetic close failure")
             closed.set()
 
-    def handle(request):
+    async def handle(request):
         nonlocal requests
         requests += 1
+        if mode == "mock_preheaders":
+            stream_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
         return httpx.Response(200, stream=Mock())
 
     transport = HttpxOpenAITransport()
@@ -166,7 +207,14 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
         async with httpx.AsyncClient(
             transport=(
                 Local()
-                if mode in {"socket", "socket_delayed_receipt"}
+                if mode
+                in {
+                    "socket",
+                    "socket_preheaders",
+                    "socket_preheaders_delayed",
+                    "socket_preheaders_failure",
+                    "socket_delayed_receipt",
+                }
                 else httpx.MockTransport(handle)
             )
         ) as client:
@@ -175,11 +223,12 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
                 api_key="synthetic",
                 base_url="https://synthetic.invalid",
                 transport=transport,
+                streaming=streaming,
                 stream_deadlines=ProviderStreamDeadlines(
-                    semantic_progress_timeout_s=0.2,
+                    semantic_progress_timeout_s=0.2 if streaming else 5,
                     transport_idle_timeout_s=5,
                     protocol_idle_timeout_s=5,
-                    absolute_stream_timeout_s=10,
+                    absolute_stream_timeout_s=10 if streaming else 0.2,
                 ),
             )
             app = CayuApp(enable_logging=False, session_store=store)
@@ -224,7 +273,9 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
 
             events, initial_plan = await snapshot()
             error = next(e for e in events if e.type == "model.error")
-            assert error.payload["provider_deadline_kind"] == "semantic_idle"
+            assert error.payload["provider_deadline_kind"] == (
+                "semantic_idle" if streaming else "absolute"
+            )
             assert error.payload["provider_deadline_timeout_s"] == 0.2
             assert error.payload["provider_effect_outcome"] == "unknown"
             assert error.payload["retry_disposition"] == "suppressed"
@@ -233,33 +284,35 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
             # bounded 100/50 ms joins on a loaded worker. The original error
             # can therefore report unconfirmed cleanup even when it later
             # succeeds. Require the immutable, exact durable receipt below.
-            if mode not in {"socket", "mock"}:
+            if mode == "mock_preheaders":
+                assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
+            elif mode not in {"socket", "socket_preheaders", "mock"}:
                 assert error.payload["stream_cleanup_failed"] is True
             elif not error.payload.get("stream_cleanup_failed", False):
                 assert initial_plan.active_model_stage.local_http_cleanup == "succeeded"
-            if mode in {"delayed", "noncooperative"}:
+            if mode in {"delayed", "noncooperative", "socket_preheaders_delayed"}:
                 assert not closed.is_set()
-                assert ds._PROVIDER_DEADLINE_AWAIT_OWNERS
+                assert cleanup_owners()
                 assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
             if mode in {"delayed_receipt", "socket_delayed_receipt"}:
                 # For a socket, peer EOF observation is independent of the
                 # local close/receipt task; join it explicitly before checking.
                 await asyncio.wait_for(closed.wait(), 2)
                 assert closed.is_set()
-                assert ds._PROVIDER_DEADLINE_AWAIT_OWNERS
+                assert cleanup_owners()
                 assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
             release.set()
             async with asyncio.timeout(2):
-                while ds._PROVIDER_DEADLINE_AWAIT_OWNERS:
+                while cleanup_owners():
                     await asyncio.sleep(0.001)
             events, settled_plan = await snapshot()
             receipts = [e for e in events if e.type == "model.http_cleanup"]
-            assert len(receipts) == (0 if mode == "receipt_failure" else 1)
+            assert len(receipts) == (0 if mode in {"receipt_failure", "mock_preheaders"} else 1)
             expected = (
                 "unknown"
-                if mode == "receipt_failure"
+                if mode in {"receipt_failure", "mock_preheaders"}
                 else "failed"
-                if mode == "failure"
+                if mode in {"failure", "socket_preheaders_failure"}
                 else "succeeded"
             )
             assert settled_plan.active_model_stage.local_http_cleanup == expected
@@ -306,7 +359,13 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
                     assert unrelated_plan.allowed_actions == settled_plan.allowed_actions
             assert next(e for e in events if e.id == error.id) == error
             assert requests == 1
-            if mode in {"socket", "socket_delayed_receipt"}:
+            if mode in {
+                "socket",
+                "socket_preheaders",
+                "socket_preheaders_delayed",
+                "socket_preheaders_failure",
+                "socket_delayed_receipt",
+            }:
                 await asyncio.wait_for(closed.wait(), 2)
             assert closed.is_set() == (mode != "failure")
             assert not handlers
@@ -330,7 +389,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic):
             *(owned for owned in (running, opening) if owned is not None), return_exceptions=True
         )
         async with asyncio.timeout(2):
-            while ds._PROVIDER_DEADLINE_AWAIT_OWNERS:
+            while cleanup_owners():
                 await asyncio.sleep(0.001)
         if provider is not None:
             await provider.aclose()
@@ -355,7 +414,7 @@ async def test_semantic_http_cleanup_watchdog_excludes_session_setup(tmp_path, m
         return await prepare(self, request, **kwargs)
 
     monkeypatch.setattr(SessionEngine, "_prepare_initial_run", slow_prepare)
-    await test_semantic_idle_http_cleanup(tmp_path, monkeypatch, "delayed", "whitespace")
+    await test_semantic_idle_http_cleanup(tmp_path, monkeypatch, "delayed", "whitespace", True)
 
 
 @pytest.mark.anyio

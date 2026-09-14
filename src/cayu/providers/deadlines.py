@@ -798,6 +798,7 @@ def _provider_deadline_material(deadlines: object) -> dict[str, float | int]:
     return {
         "text_progress_policy_version": 2,
         "semantic_cleanup_policy_version": 1,
+        "http_cleanup_observation_policy_version": 1,
         "transport_idle_timeout_s": deadlines.transport_idle_timeout_s,
         "protocol_idle_timeout_s": deadlines.protocol_idle_timeout_s,
         "semantic_progress_timeout_s": deadlines.semantic_progress_timeout_s,
