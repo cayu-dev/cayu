@@ -118,6 +118,17 @@ from cayu.sessions.invocation import (
     copy_task_invocation,
     inherited_task_invocation,
 )
+from cayu.tasks._scheduling import (
+    admitted_schedule,
+    require_schedule,
+    require_schedule_mutation,
+    rescheduled_task,
+    schedule_creation_digest,
+    schedule_mutation_digest,
+    schedule_receipt,
+    schedule_revision_after,
+    schedule_transition_events,
+)
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -190,6 +201,20 @@ from cayu.tasks.contracts import (
     validate_work_completion_idempotency_key,
     validate_work_completion_linked_id,
     work_attempt_request_sha256,
+)
+from cayu.tasks.scheduling import (
+    TaskRescheduleRequest,
+    TaskScheduleCancelRequest,
+    TaskScheduleConflict,
+    TaskScheduleEligibility,
+    TaskScheduleEvent,
+    TaskScheduleEventType,
+    TaskSchedulePolicy,
+    TaskScheduleReceipt,
+    TaskScheduleState,
+    TaskScheduleWakeup,
+    task_schedule_eligibility,
+    validate_task_schedule_window,
 )
 
 _DURABLE_WORKER_POLLER_REGISTRY_LOCK = Lock()
@@ -1504,6 +1529,7 @@ class Task(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     invocation: TaskInvocation = Field(frozen=True)
+    schedule: TaskScheduleState | None = None
     retry_series: TaskRetrySeriesSnapshot | None = None
     work_contract: WorkContractRef | None = Field(default=None, frozen=True)
 
@@ -1576,6 +1602,20 @@ class Task(BaseModel):
         if value is None:
             return None
         return normalize_utc_datetime(value, "available_at")
+
+    @field_validator("schedule", mode="before")
+    @classmethod
+    def copy_schedule(cls, value: object) -> object:
+        return revalidate_model_input(value, TaskScheduleState)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> Task:
+        if self.schedule is not None:
+            if self.available_at is None:
+                raise ValueError("Managed task schedules require available_at.")
+            if self.schedule.admitted_at is None:
+                validate_task_schedule_window(self.available_at, self.schedule.policy)
+        return self
 
     @field_validator("work_contract", mode="before")
     @classmethod
@@ -1689,6 +1729,7 @@ class TaskCreate(BaseModel):
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
     available_at: datetime | None = None
+    schedule_policy: TaskSchedulePolicy | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     retry_policy: TaskRetryPolicy | None = None
@@ -1697,6 +1738,21 @@ class TaskCreate(BaseModel):
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
     _runtime_session_binding: SessionInvocationBinding | None = PrivateAttr(default=None)
+
+    @field_validator("schedule_policy", mode="before")
+    @classmethod
+    def copy_schedule_policy(cls, value: object) -> object:
+        return revalidate_model_input(value, TaskSchedulePolicy)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> TaskCreate:
+        if self.schedule_policy is not None:
+            if self.task_id is None or self.available_at is None:
+                raise ValueError("Managed task schedules require task_id and available_at.")
+            if self.session_id is not None:
+                raise ValueError("Managed schedules start as unattached queue tasks.")
+            validate_task_schedule_window(self.available_at, self.schedule_policy)
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -3337,6 +3393,7 @@ class TaskStore(ABC):
     """
 
     supports_delayed_availability: ClassVar[bool] = False
+    supports_task_scheduling: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
     supports_idempotent_terminalization: ClassVar[bool] = False
     supports_attached_task_recovery_terminalization: ClassVar[bool] = False
@@ -3823,6 +3880,26 @@ class TaskStore(ABC):
         Implementations must mint the final task ID, load any requested parent,
         and call ``task_invocation_for_create`` inside the same create boundary.
         """
+
+    async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
+        """Atomically replace an exact unadmitted schedule, or replay its receipt."""
+        raise NotImplementedError("This TaskStore does not support task scheduling.")
+
+    async def cancel_scheduled_task(
+        self, request: TaskScheduleCancelRequest
+    ) -> TaskScheduleReceipt:
+        """Cancel an exact schedule without releasing live execution ownership."""
+        raise NotImplementedError("This TaskStore does not support task scheduling.")
+
+    async def list_task_schedule_events(
+        self, task_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskScheduleEvent]:
+        """Read bounded task-owned scheduling evidence in durable sequence order."""
+        raise NotImplementedError("This TaskStore does not support task scheduling.")
+
+    async def next_task_schedule_wakeup(self, query: TaskQuery | None = None) -> TaskScheduleWakeup:
+        """Observe the next matching deadline; the result grants no claim authority."""
+        raise NotImplementedError("This TaskStore does not support task scheduling.")
 
     @abstractmethod
     async def create_running_task(
@@ -4364,6 +4441,7 @@ class InMemoryTaskStore(TaskStore):
     """In-process task store for tests, local development, and examples."""
 
     supports_delayed_availability: ClassVar[bool] = True
+    supports_task_scheduling: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
@@ -4391,6 +4469,8 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
         self._tasks: dict[str, Task] = {}
+        self._schedule_receipts: dict[tuple[str, str], TaskScheduleReceipt] = {}
+        self._schedule_events: dict[str, list[TaskScheduleEvent]] = {}
         self._session_closure_claims: dict[str, TaskSessionClosureClaim] = {}
         self._task_id_by_interrupted_handoff_id: dict[str, str] = {}
         self._interrupted_continuation_claims: dict[str, tuple[str, str]] = {}
@@ -5891,6 +5971,16 @@ class InMemoryTaskStore(TaskStore):
         request = copy_task_create(request)
         async with self._lock:
             task_id = request.task_id or str(uuid4())
+            if request.schedule_policy is not None and task_id in self._tasks:
+                existing = self._require_task(task_id)
+                if (
+                    existing.schedule is None
+                    or existing.schedule.creation_sha256 != schedule_creation_digest(request)
+                ):
+                    raise TaskScheduleConflict(
+                        "Task schedule creation conflicts with retained intent."
+                    )
+                return existing.model_copy(deep=True)
             parent = self._task_parent_for_create(request, task_id=task_id)
             if request.work_contract is not None:
                 self._require_work_contract(request.work_contract)
@@ -5912,6 +6002,154 @@ class InMemoryTaskStore(TaskStore):
             created = task.model_copy(deep=True)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
+
+    async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
+        if type(request) is not TaskRescheduleRequest:
+            raise TypeError("A typed task reschedule request is required.")
+        request = revalidate_model_input(request, TaskRescheduleRequest)
+        digest = schedule_mutation_digest(request)
+        async with self._lock:
+            key = (request.task_id, request.operation_id)
+            retained = self._schedule_receipts.get(key)
+            if retained is not None:
+                if retained.request_sha256 != digest:
+                    raise TaskScheduleConflict("Schedule operation identity has different content.")
+                return retained.model_copy(deep=True)
+            current = self._require_task(request.task_id)
+            if self._task_has_unsettled_local_execution_attempt(current.id):
+                raise TaskScheduleConflict("Task has unsettled execution authority.")
+            now = self._clock()
+            updated = rescheduled_task(current, request, now=now)
+            receipt = schedule_receipt(
+                updated, request, now=now, kind=TaskScheduleEventType.RESCHEDULED
+            )
+            self._store_task(updated, schedule_operation_id=request.operation_id)
+            self._schedule_receipts[key] = receipt
+        # A changed future deadline can shorten an existing worker wait. The
+        # edge is advisory and contains no task data; claims recheck the store.
+        self._publish_task_admission_broadcast()
+        return receipt.model_copy(deep=True)
+
+    async def cancel_scheduled_task(
+        self, request: TaskScheduleCancelRequest
+    ) -> TaskScheduleReceipt:
+        if type(request) is not TaskScheduleCancelRequest:
+            raise TypeError("A typed task schedule cancellation is required.")
+        request = revalidate_model_input(request, TaskScheduleCancelRequest)
+        digest = schedule_mutation_digest(request)
+        async with self._lock:
+            key = (request.task_id, request.operation_id)
+            retained = self._schedule_receipts.get(key)
+            if retained is not None:
+                if retained.request_sha256 != digest:
+                    raise TaskScheduleConflict("Schedule operation identity has different content.")
+                return retained.model_copy(deep=True)
+            current = self._require_task(request.task_id)
+            state = require_schedule_mutation(current, request.expected_revision)
+            now = self._ownership_clock()
+            updated, retry_settlement = self._prepare_finished_task(
+                current.id,
+                TaskStatus.CANCELLED,
+                result=None,
+                error=None,
+                now=now,
+                worker_id=None,
+                expected_lease_expires_at=None,
+                accepted_decision_id=None,
+            )
+            updated = updated.model_copy(
+                update={
+                    "schedule": state.model_copy(
+                        update={"revision": schedule_revision_after(state)}
+                    )
+                }
+            )
+            kind = (
+                TaskScheduleEventType.CANCELLED
+                if updated.status is TaskStatus.CANCELLED
+                else TaskScheduleEventType.CANCELLATION_REQUESTED
+            )
+            receipt = schedule_receipt(updated, request, now=now, kind=kind)
+            if retry_settlement is not None:
+                retry_settlement = retry_settlement.model_copy(update={"task": updated}, deep=True)
+            self._store_task(updated, schedule_operation_id=request.operation_id)
+            if retry_settlement is not None:
+                self._retry_settlements[(updated.id, retry_settlement.idempotency_key)] = (
+                    retry_settlement
+                )
+            self._schedule_receipts[key] = receipt
+            return receipt.model_copy(deep=True)
+
+    async def list_task_schedule_events(
+        self, task_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskScheduleEvent]:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        if type(after_sequence) is not int or not 0 <= after_sequence <= 9007199254740991:
+            raise ValueError("after_sequence must be a bounded nonnegative integer.")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Schedule event limit must be between 1 and 1000.")
+        async with self._lock:
+            events = self._schedule_events.get(task_id, ())
+            return [
+                event.model_copy(deep=True)
+                for event in events[after_sequence : after_sequence + limit]
+            ]
+
+    async def next_task_schedule_wakeup(self, query: TaskQuery | None = None) -> TaskScheduleWakeup:
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        async with self._lock:
+            now = self._clock()
+            if query.status is not None and query.status is not TaskStatus.PENDING:
+                return TaskScheduleWakeup(as_of=now)
+            due: datetime | None = None
+            expiry: datetime | None = None
+            maintenance = False
+            for task in self._tasks.values():
+                if (
+                    task.session_id is not None
+                    or task.status
+                    not in {
+                        TaskStatus.PENDING,
+                        TaskStatus.PAUSED,
+                        TaskStatus.BLOCKED,
+                        TaskStatus.NEEDS_ATTENTION,
+                    }
+                    or not _task_matches_claim_filter(task, query)
+                    or self._task_has_unsettled_local_execution_attempt(task.id)
+                ):
+                    continue
+                if (
+                    task.status is TaskStatus.PENDING
+                    and task.available_at is not None
+                    and task.available_at > now
+                    and (task.schedule is None or task.schedule.admitted_at is None)
+                    and not _task_retry_attempt_elapsed(task, series_now=now)
+                ):
+                    due = task.available_at if due is None else min(due, task.available_at)
+                if task.schedule is not None and task.schedule.admitted_at is None:
+                    if task.schedule.policy.expires_at is not None:
+                        candidate_expiry = task.schedule.policy.expires_at
+                        if candidate_expiry > now:
+                            expiry = (
+                                candidate_expiry
+                                if expiry is None
+                                else min(expiry, candidate_expiry)
+                            )
+                    assert task.available_at is not None
+                    eligibility = task_schedule_eligibility(
+                        available_at=task.available_at, policy=task.schedule.policy, as_of=now
+                    )
+                    maintenance |= eligibility in {
+                        TaskScheduleEligibility.EXPIRED,
+                        TaskScheduleEligibility.SKIPPED,
+                    }
+            return TaskScheduleWakeup(
+                as_of=now,
+                next_available_at=due,
+                next_expiry_at=expiry,
+                maintenance_required=maintenance,
+            )
 
     async def create_running_task(
         self,
@@ -6113,6 +6351,11 @@ class InMemoryTaskStore(TaskStore):
                 if value.authority.task_id in task_id_set
             }
             owned_entries: tuple[tuple[dict[Any, Any], set[Any]], ...] = (
+                (self._schedule_events, task_id_set),
+                (
+                    self._schedule_receipts,
+                    {key for key in self._schedule_receipts if key[0] in task_id_set},
+                ),
                 (self._work_attempts, attempt_ids),
                 (self._work_attempt_admissions, admission_ids),
                 (self._completion_proposals, proposal_ids),
@@ -7189,6 +7432,10 @@ class InMemoryTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         copied_error = None if error is None else copy_durable_json_object(error, "error")
         async with self._lock:
+            if self._require_task(task_id).schedule is not None:
+                raise TaskScheduleConflict(
+                    "Managed schedules require revision-fenced cancellation."
+                )
             return self._finish_task(
                 task_id,
                 TaskStatus.CANCELLED,
@@ -7347,6 +7594,9 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             availability_now = self._clock()
             now = self._ownership_clock()
+            # Pending retry authority expires before schedule expiry/misfire,
+            # matching the persistent stores' admission order. Once terminal,
+            # the task cannot be settled again by scheduling maintenance.
             for task in tuple(self._tasks.values()):
                 if _task_retry_attempt_elapsed(
                     task, series_now=availability_now
@@ -7358,6 +7608,40 @@ class InMemoryTaskStore(TaskStore):
                     )
                     self._store_task(receipt.task)
                     self._retry_settlements[(receipt.task_id, receipt.idempotency_key)] = receipt
+            for waiting in tuple(self._tasks.values()):
+                if (
+                    waiting.schedule is None
+                    or waiting.schedule.admitted_at is not None
+                    or waiting.status
+                    not in {
+                        TaskStatus.PENDING,
+                        TaskStatus.PAUSED,
+                        TaskStatus.BLOCKED,
+                        TaskStatus.NEEDS_ATTENTION,
+                    }
+                    or waiting.session_id is not None
+                    or not _task_matches_claim_filter(waiting, query)
+                    or self._task_has_unsettled_local_execution_attempt(waiting.id)
+                ):
+                    continue
+                assert waiting.available_at is not None
+                eligibility = task_schedule_eligibility(
+                    available_at=waiting.available_at,
+                    policy=waiting.schedule.policy,
+                    as_of=availability_now,
+                )
+                if eligibility in {
+                    TaskScheduleEligibility.EXPIRED,
+                    TaskScheduleEligibility.SKIPPED,
+                }:
+                    expired, retry_settlement = _scheduled_task_nonexecution(
+                        waiting, eligibility=eligibility, now=now
+                    )
+                    self._store_task(expired)
+                    if retry_settlement is not None:
+                        self._retry_settlements[(expired.id, retry_settlement.idempotency_key)] = (
+                            retry_settlement
+                        )
             candidates = [
                 task
                 for task in self._tasks.values()
@@ -7379,6 +7663,7 @@ class InMemoryTaskStore(TaskStore):
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.CLAIMED,
+                    "schedule": admitted_schedule(task, now=availability_now),
                     "worker_id": worker_id,
                     "lease_expires_at": now + timedelta(seconds=lease_seconds),
                     "updated_at": now,
@@ -7979,7 +8264,7 @@ class InMemoryTaskStore(TaskStore):
         accepted_decision_id: str | None = None,
         now: datetime | None = None,
     ) -> Task:
-        updated = self._prepare_finished_task(
+        updated, retry_settlement = self._prepare_finished_task(
             task_id,
             status,
             result=result,
@@ -7991,6 +8276,10 @@ class InMemoryTaskStore(TaskStore):
             now=self._ownership_clock() if now is None else now,
         )
         self._store_task(updated)
+        if retry_settlement is not None:
+            self._retry_settlements[(updated.id, retry_settlement.idempotency_key)] = (
+                retry_settlement
+            )
         return updated.model_copy(deep=True)
 
     def _prepare_finished_task(
@@ -8005,7 +8294,8 @@ class InMemoryTaskStore(TaskStore):
         handoff_id: str | None = None,
         accepted_decision_id: str | None,
         now: datetime,
-    ) -> Task:
+    ) -> tuple[Task, TaskRetrySettlementResult | None]:
+        """Prepare state and optional retry evidence without publishing either."""
         task = self._require_task(task_id)
         if worker_id is not None:
             if expected_lease_expires_at is None:
@@ -8044,18 +8334,13 @@ class InMemoryTaskStore(TaskStore):
                     error=error,
                     updated_at=now,
                 )
-                self._store_task(cancellation_requested)
-                return cancellation_requested.model_copy(deep=True)
+                return cancellation_requested, None
             cancellation = _cancelled_task_retry_settlement(
                 task,
                 error=error,
                 committed_at=now,
             )
-            self._store_task(cancellation.task)
-            self._retry_settlements[(cancellation.task_id, cancellation.idempotency_key)] = (
-                cancellation
-            )
-            return cancellation.task.model_copy(deep=True)
+            return cancellation.task, cancellation
         if (
             task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
             and status is TaskStatus.CANCELLED
@@ -8068,8 +8353,7 @@ class InMemoryTaskStore(TaskStore):
                 error=error,
                 updated_at=now,
             )
-            self._store_task(cancellation_requested)
-            return cancellation_requested.model_copy(deep=True)
+            return cancellation_requested, None
         if _task_cancellation_requested(task) and not (
             status is TaskStatus.CANCELLED and worker_id is not None
         ):
@@ -8092,7 +8376,7 @@ class InMemoryTaskStore(TaskStore):
                 "retry_series": None,
             }
         )
-        return updated
+        return updated, None
 
     def _matching_completion_gap_count(self, decision: CompletionDecision) -> int:
         matching_gap_count = 0
@@ -8176,7 +8460,7 @@ class InMemoryTaskStore(TaskStore):
             candidates.append(task)
         return candidates
 
-    def _store_task(self, task: Task) -> None:
+    def _store_task(self, task: Task, *, schedule_operation_id: str | None = None) -> None:
         prior = self._tasks.get(task.id)
         for session_id in (task.session_id, None if prior is None else prior.session_id):
             if session_id is not None and session_id in self._session_closure_claims:
@@ -8187,6 +8471,12 @@ class InMemoryTaskStore(TaskStore):
         # representation that decision receipts rely on.
         if task.work_contract is not None:
             task = copy_task(task)
+        events = schedule_transition_events(
+            prior,
+            task,
+            first_sequence=len(self._schedule_events.get(task.id, ())) + 1,
+            operation_id=schedule_operation_id,
+        )
         prior = self._tasks.get(task.id)
         prior_handoff_id = None if prior is None else prior.interrupted_handoff_id
         next_handoff_id = task.interrupted_handoff_id
@@ -8213,6 +8503,8 @@ class InMemoryTaskStore(TaskStore):
             # Lifecycle/status updates are the hot path. They do not change
             # either topology index, so avoid an O(n) list removal/reinsert.
             self._tasks[task.id] = task
+            if events:
+                self._schedule_events.setdefault(task.id, []).extend(events)
             return
         if prior is not None:
             self._remove_task_index_entry(self._task_keys_by_session, prior.session_id, prior)
@@ -8222,6 +8514,8 @@ class InMemoryTaskStore(TaskStore):
         self._add_task_index_entry(self._task_keys_by_session, task.session_id, task)
         self._add_task_index_entry(self._task_keys_by_parent, task.parent_task_id, task)
         self._add_contracted_session_index_entry(task)
+        if events:
+            self._schedule_events.setdefault(task.id, []).extend(events)
 
     def _add_contracted_session_index_entry(self, task: Task) -> None:
         if task.session_id is None or task.work_contract is None:
@@ -8696,6 +8990,7 @@ def copy_task(task: Task) -> Task:
         parent_task_id=task.parent_task_id,
         assigned_agent_name=task.assigned_agent_name,
         available_at=task.available_at,
+        schedule=task.schedule,
         worker_id=task.worker_id,
         lease_expires_at=task.lease_expires_at,
         interrupted_handoff_id=task.interrupted_handoff_id,
@@ -9381,6 +9676,46 @@ def _task_retry_attempt_authority_sha256(
         "task_retry_attempt_authority",
     )
     return sha256(material).hexdigest()
+
+
+def _rescheduled_initial_task_retry_series(
+    task: Task, *, available_at: datetime
+) -> TaskRetrySeriesSnapshot | None:
+    """Rebind only an unstarted first attempt, without renewing its retry envelope."""
+    series = task.retry_series
+    if series is None:
+        return None
+    if (
+        series.attempt != 1
+        or series.predecessor_task_id is not None
+        or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
+        or task.started_at is not None
+    ):
+        raise TaskScheduleConflict(
+            "Retry successor eligibility is owned by its predecessor receipt."
+        )
+    digest = _task_retry_attempt_authority_sha256(
+        task_id=task.id,
+        task_type=task.type,
+        title=task.title,
+        description=task.description,
+        parent_task_id=task.parent_task_id,
+        assigned_agent_name=task.assigned_agent_name,
+        available_at=available_at,
+        created_at=task.created_at,
+        task_input=task.input,
+        metadata=task.metadata,
+        invocation=task.invocation,
+        series_id=series.series_id,
+        causal_budget_id=series.causal_budget_id,
+        attempt=series.attempt,
+        policy=series.policy,
+        started_at=series.started_at,
+        cumulative_tokens=series.cumulative_tokens,
+        cumulative_estimated_cost=series.cumulative_estimated_cost,
+        predecessor_task_id=series.predecessor_task_id,
+    )
+    return series.model_copy(update={"authority_sha256": digest}, deep=True)
 
 
 def _task_retry_runtime_idempotency_key(task: Task, operation: str) -> str:
@@ -10557,6 +10892,42 @@ def _expired_task_retry_settlement(
     )
 
 
+def _scheduled_task_nonexecution(
+    task: Task,
+    *,
+    eligibility: TaskScheduleEligibility,
+    now: datetime,
+) -> tuple[Task, TaskRetrySettlementResult | None]:
+    """Prepare an unadmitted schedule's terminal task and retry evidence."""
+    state = require_schedule(task)
+    if state.admitted_at is not None or task.worker_id is not None or task.session_id is not None:
+        raise TaskScheduleConflict("Admitted schedules require their execution settlement owner.")
+    if eligibility not in {TaskScheduleEligibility.EXPIRED, TaskScheduleEligibility.SKIPPED}:
+        raise TaskScheduleConflict("Schedule remains eligible for execution.")
+    reason = (
+        "schedule_expired" if eligibility is TaskScheduleEligibility.EXPIRED else "schedule_skipped"
+    )
+    settlement = (
+        _cancelled_task_retry_settlement(task, error={"code": reason}, committed_at=now)
+        if task.retry_series is not None
+        else None
+    )
+    terminal = task if settlement is None else settlement.task
+    terminal = terminal.model_copy(
+        update={
+            "status": TaskStatus.CANCELLED,
+            "status_reason": reason,
+            "error": {"code": reason},
+            "completed_at": now,
+            "updated_at": now,
+            "schedule": state.model_copy(update={"revision": schedule_revision_after(state)}),
+        }
+    )
+    if settlement is not None:
+        settlement = settlement.model_copy(update={"task": terminal}, deep=True)
+    return terminal, settlement
+
+
 def _cancelled_task_retry_settlement(
     task: Task,
     *,
@@ -11468,6 +11839,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         parent_task_id=request.parent_task_id,
         assigned_agent_name=request.assigned_agent_name,
         available_at=request.available_at,
+        schedule_policy=request.schedule_policy,
         input=copy_durable_json_object(request.input, "input"),
         metadata=copy_durable_metadata(request.metadata),
         retry_policy=(
@@ -11811,6 +12183,8 @@ def _task_from_create(
         if retry_started_at is None
         else normalize_utc_datetime(retry_started_at, "retry_started_at")
     )
+    if request.schedule_policy is not None:
+        now = retry_started_at
     invocation = task_invocation_for_create(
         request,
         task_id=task_id,
@@ -11877,6 +12251,15 @@ def _task_from_create(
         retry_series=retry_series,
         work_contract=copy_work_contract_ref(request.work_contract),
     )
+    if request.schedule_policy is not None:
+        task = task.model_copy(
+            update={
+                "schedule": TaskScheduleState(
+                    policy=request.schedule_policy,
+                    creation_sha256=schedule_creation_digest(request),
+                )
+            }
+        )
     if task.work_contract is not None:
         require_contract_bound_task_creation_snapshot(task)
     return task
@@ -11931,6 +12314,12 @@ def preflight_contract_bound_task_creation(
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
+    if (
+        task.schedule is not None
+        and task.schedule.admitted_at is None
+        and next_status is TaskStatus.RUNNING
+    ):
+        raise TaskScheduleConflict("Managed schedules must be claimed before execution starts.")
     _ensure_task_status_can_transition(task.id, task.status, next_status)
 
 

@@ -5952,6 +5952,11 @@ filtering, billing authority, or permission to use a task payload. Tokens,
 credentials, webhook bodies, prompts, and arbitrary task metadata are not
 provenance fields.
 
+Opt-in managed one-shot scheduling adds revision-fenced edits,
+expiry/misfire decisions, and durable task-owned history; see
+[durable task scheduling](task-scheduling.md). The following base availability
+contract also applies when no managed schedule policy is supplied.
+
 `TaskCreate.available_at` and `Task.available_at` accept only timezone-aware
 datetimes and normalize them to UTC. Omitting the field means immediate
 availability. A pending task whose timestamp is in the future remains durable

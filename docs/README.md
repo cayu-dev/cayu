@@ -40,6 +40,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Session inspection](session-inspection.md)
 - [Session-message lifecycle](session-message-lifecycle.md)
 - [Session-store targets](session-store-targets.md)
+- [Durable one-shot task scheduling](task-scheduling.md)
 - [Triggering runs](triggering-runs.md)
 - [Virtual egress](virtual-egress.md)
 - [Web fetch](web-fetch.md)

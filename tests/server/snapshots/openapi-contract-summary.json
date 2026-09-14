@@ -2774,6 +2774,16 @@
             }
           ]
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApiTaskScheduleState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_id": {
           "anyOf": [
             {
@@ -2872,6 +2882,7 @@
         "updated_at",
         "completed_at",
         "retry_series",
+        "schedule",
         "invocation",
         "input",
         "result",
@@ -3010,6 +3021,16 @@
             }
           ]
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApiTaskScheduleState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_id": {
           "anyOf": [
             {
@@ -3096,7 +3117,8 @@
         "created_at",
         "updated_at",
         "completed_at",
-        "retry_series"
+        "retry_series",
+        "schedule"
       ],
       "title": "ApiTaskListItem",
       "type": "object"
@@ -3306,6 +3328,184 @@
         "next_eligible_at"
       ],
       "title": "ApiTaskRetrySeries",
+      "type": "object"
+    },
+    "ApiTaskScheduleEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "available_at": {
+          "title": "Available At",
+          "type": "string"
+        },
+        "invocation_id": {
+          "title": "Invocation Id",
+          "type": "string"
+        },
+        "occurred_at": {
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Operation Id"
+        },
+        "policy": {
+          "$ref": "#/components/schemas/ApiTaskSchedulePolicy"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "sequence": {
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/components/schemas/TaskScheduleEventType"
+        }
+      },
+      "required": [
+        "task_id",
+        "sequence",
+        "type",
+        "revision",
+        "occurred_at",
+        "available_at",
+        "policy",
+        "invocation_id",
+        "operation_id"
+      ],
+      "title": "ApiTaskScheduleEvent",
+      "type": "object"
+    },
+    "ApiTaskSchedulePolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "misfire_grace_seconds": {
+          "title": "Misfire Grace Seconds",
+          "type": "integer"
+        },
+        "misfire_policy": {
+          "enum": [
+            "fire_once",
+            "skip"
+          ],
+          "title": "Misfire Policy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expires_at",
+        "misfire_policy",
+        "misfire_grace_seconds"
+      ],
+      "title": "ApiTaskSchedulePolicy",
+      "type": "object"
+    },
+    "ApiTaskScheduleReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "available_at": {
+          "title": "Available At",
+          "type": "string"
+        },
+        "committed_at": {
+          "title": "Committed At",
+          "type": "string"
+        },
+        "expected_revision": {
+          "title": "Expected Revision",
+          "type": "integer"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "schedule": {
+          "$ref": "#/components/schemas/ApiTaskScheduleState"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "task.rescheduled",
+            "task.schedule_cancelled",
+            "task.schedule_cancellation_requested"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "operation_id",
+        "expected_revision",
+        "schedule",
+        "available_at",
+        "committed_at",
+        "type"
+      ],
+      "title": "ApiTaskScheduleReceipt",
+      "type": "object"
+    },
+    "ApiTaskScheduleState": {
+      "additionalProperties": false,
+      "properties": {
+        "admitted_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Admitted At"
+        },
+        "policy": {
+          "$ref": "#/components/schemas/ApiTaskSchedulePolicy"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "revision",
+        "policy",
+        "admitted_at"
+      ],
+      "title": "ApiTaskScheduleState",
       "type": "object"
     },
     "ApiTaskTopologyChildBranch": {
@@ -10290,6 +10490,14 @@
       "title": "TaskHoldBody",
       "type": "object"
     },
+    "TaskMisfirePolicy": {
+      "enum": [
+        "fire_once",
+        "skip"
+      ],
+      "title": "TaskMisfirePolicy",
+      "type": "string"
+    },
     "TaskOperationalSnapshot": {
       "additionalProperties": false,
       "description": "Exact current task counts captured by one store-local read snapshot.",
@@ -10341,6 +10549,120 @@
       ],
       "title": "TaskOrder",
       "type": "string"
+    },
+    "TaskRescheduleRequest": {
+      "additionalProperties": false,
+      "description": "Replace a not-yet-admitted schedule at one expected revision.",
+      "properties": {
+        "available_at": {
+          "format": "date-time",
+          "title": "Available At",
+          "type": "string"
+        },
+        "expected_revision": {
+          "maximum": 9007199254740991.0,
+          "minimum": 1.0,
+          "title": "Expected Revision",
+          "type": "integer"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/components/schemas/TaskSchedulePolicy"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "operation_id",
+        "expected_revision",
+        "available_at"
+      ],
+      "title": "TaskRescheduleRequest",
+      "type": "object"
+    },
+    "TaskScheduleCancelRequest": {
+      "additionalProperties": false,
+      "description": "Cancel one exact schedule revision without bypassing a live worker.",
+      "properties": {
+        "expected_revision": {
+          "maximum": 9007199254740991.0,
+          "minimum": 1.0,
+          "title": "Expected Revision",
+          "type": "integer"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "operation_id",
+        "expected_revision"
+      ],
+      "title": "TaskScheduleCancelRequest",
+      "type": "object"
+    },
+    "TaskScheduleEventType": {
+      "enum": [
+        "task.scheduled",
+        "task.rescheduled",
+        "task.schedule_eligible",
+        "task.schedule_misfired",
+        "task.schedule_expired",
+        "task.schedule_skipped",
+        "task.schedule_claimed",
+        "task.schedule_cancellation_requested",
+        "task.schedule_cancelled",
+        "task.schedule_started",
+        "task.schedule_held",
+        "task.schedule_resumed",
+        "task.schedule_completed",
+        "task.schedule_failed"
+      ],
+      "title": "TaskScheduleEventType",
+      "type": "string"
+    },
+    "TaskSchedulePolicy": {
+      "additionalProperties": false,
+      "description": "An optional latest admission time and deterministic late-arrival policy.\n\n``expires_at`` is exclusive. A task observed exactly at expiry cannot be\nadmitted. Lateness strictly greater than the grace interval is a misfire;\nequality stays eligible. Expiry takes precedence over the misfire policy.",
+      "properties": {
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "misfire_grace_seconds": {
+          "default": 60,
+          "maximum": 31622400.0,
+          "minimum": 0.0,
+          "title": "Misfire Grace Seconds",
+          "type": "integer"
+        },
+        "misfire_policy": {
+          "$ref": "#/components/schemas/TaskMisfirePolicy",
+          "default": "fire_once"
+        }
+      },
+      "title": "TaskSchedulePolicy",
+      "type": "object"
     },
     "TaskStatus": {
       "enum": [
@@ -16941,6 +17263,66 @@
         }
       }
     },
+    "/api/tasks/schedule/cancel": {
+      "post": {
+        "operation_id": "cancel_scheduled_task_api_tasks_schedule_cancel_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/TaskScheduleCancelRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskScheduleReceipt"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/schedule/reschedule": {
+      "post": {
+        "operation_id": "reschedule_task_api_tasks_schedule_reschedule_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/TaskRescheduleRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskScheduleReceipt"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/tasks/{task_id}": {
       "get": {
         "operation_id": "get_task_api_tasks__task_id__get",
@@ -16964,6 +17346,70 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/schedule/events": {
+      "get": {
+        "operation_id": "list_task_schedule_events_api_tasks__task_id__schedule_events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "title": "After Sequence",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "items": {
+                  "$ref": "#/components/schemas/ApiTaskScheduleEvent"
+                },
+                "title": "Response List Task Schedule Events Api Tasks  Task Id  Schedule Events Get",
+                "type": "array"
               }
             }
           },

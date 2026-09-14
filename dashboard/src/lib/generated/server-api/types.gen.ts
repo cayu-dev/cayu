@@ -1609,6 +1609,7 @@ export type ApiTaskDetail = {
         [key: string]: unknown;
     } | null;
     retry_series: ApiTaskRetrySeries | null;
+    schedule: ApiTaskScheduleState | null;
     /**
      * Session Id
      */
@@ -1706,6 +1707,7 @@ export type ApiTaskListItem = {
      */
     parent_task_id: string | null;
     retry_series: ApiTaskRetrySeries | null;
+    schedule: ApiTaskScheduleState | null;
     /**
      * Session Id
      */
@@ -1841,6 +1843,110 @@ export type ApiTaskRetrySeries = {
      * Tokens Remaining
      */
     tokens_remaining: string | null;
+};
+
+/**
+ * ApiTaskScheduleEvent
+ */
+export type ApiTaskScheduleEvent = {
+    /**
+     * Available At
+     */
+    available_at: string;
+    /**
+     * Invocation Id
+     */
+    invocation_id: string;
+    /**
+     * Occurred At
+     */
+    occurred_at: string;
+    /**
+     * Operation Id
+     */
+    operation_id: string | null;
+    policy: ApiTaskSchedulePolicy;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Task Id
+     */
+    task_id: string;
+    type: TaskScheduleEventType;
+};
+
+/**
+ * ApiTaskSchedulePolicy
+ */
+export type ApiTaskSchedulePolicy = {
+    /**
+     * Expires At
+     */
+    expires_at: string | null;
+    /**
+     * Misfire Grace Seconds
+     */
+    misfire_grace_seconds: number;
+    /**
+     * Misfire Policy
+     */
+    misfire_policy: 'fire_once' | 'skip';
+};
+
+/**
+ * ApiTaskScheduleReceipt
+ */
+export type ApiTaskScheduleReceipt = {
+    /**
+     * Available At
+     */
+    available_at: string;
+    /**
+     * Committed At
+     */
+    committed_at: string;
+    /**
+     * Expected Revision
+     */
+    expected_revision: number;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    schedule: ApiTaskScheduleState;
+    /**
+     * Task Id
+     */
+    task_id: string;
+    /**
+     * Type
+     */
+    type: 'task.rescheduled' | 'task.schedule_cancelled' | 'task.schedule_cancellation_requested';
+};
+
+/**
+ * ApiTaskScheduleState
+ */
+export type ApiTaskScheduleState = {
+    /**
+     * Admitted At
+     */
+    admitted_at: string | null;
+    policy: ApiTaskSchedulePolicy;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Schema Version
+     */
+    schema_version: 1;
 };
 
 /**
@@ -16287,6 +16393,11 @@ export type TaskHoldBody = {
 };
 
 /**
+ * TaskMisfirePolicy
+ */
+export type TaskMisfirePolicy = 'fire_once' | 'skip';
+
+/**
  * TaskOperationalSnapshot
  *
  * Exact current task counts captured by one store-local read snapshot.
@@ -16316,6 +16427,77 @@ export type TaskOperationalSnapshot = {
  * TaskOrder
  */
 export type TaskOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
+
+/**
+ * TaskRescheduleRequest
+ *
+ * Replace a not-yet-admitted schedule at one expected revision.
+ */
+export type TaskRescheduleRequest = {
+    /**
+     * Available At
+     */
+    available_at: string;
+    /**
+     * Expected Revision
+     */
+    expected_revision: number;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    policy?: TaskSchedulePolicy;
+    /**
+     * Task Id
+     */
+    task_id: string;
+};
+
+/**
+ * TaskScheduleCancelRequest
+ *
+ * Cancel one exact schedule revision without bypassing a live worker.
+ */
+export type TaskScheduleCancelRequest = {
+    /**
+     * Expected Revision
+     */
+    expected_revision: number;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Task Id
+     */
+    task_id: string;
+};
+
+/**
+ * TaskScheduleEventType
+ */
+export type TaskScheduleEventType = 'task.scheduled' | 'task.rescheduled' | 'task.schedule_eligible' | 'task.schedule_misfired' | 'task.schedule_expired' | 'task.schedule_skipped' | 'task.schedule_claimed' | 'task.schedule_cancellation_requested' | 'task.schedule_cancelled' | 'task.schedule_started' | 'task.schedule_held' | 'task.schedule_resumed' | 'task.schedule_completed' | 'task.schedule_failed';
+
+/**
+ * TaskSchedulePolicy
+ *
+ * An optional latest admission time and deterministic late-arrival policy.
+ *
+ * ``expires_at`` is exclusive. A task observed exactly at expiry cannot be
+ * admitted. Lateness strictly greater than the grace interval is a misfire;
+ * equality stays eligible. Expiry takes precedence over the misfire policy.
+ */
+export type TaskSchedulePolicy = {
+    /**
+     * Expires At
+     */
+    expires_at?: string | null;
+    /**
+     * Misfire Grace Seconds
+     */
+    misfire_grace_seconds?: number;
+    misfire_policy?: TaskMisfirePolicy;
+};
 
 /**
  * TaskStatus
@@ -22837,6 +23019,56 @@ export type ListTasksApiTasksGetResponses = {
 
 export type ListTasksApiTasksGetResponse = ListTasksApiTasksGetResponses[keyof ListTasksApiTasksGetResponses];
 
+export type CancelScheduledTaskApiTasksScheduleCancelPostData = {
+    body: TaskScheduleCancelRequest;
+    path?: never;
+    query?: never;
+    url: '/api/tasks/schedule/cancel';
+};
+
+export type CancelScheduledTaskApiTasksScheduleCancelPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CancelScheduledTaskApiTasksScheduleCancelPostError = CancelScheduledTaskApiTasksScheduleCancelPostErrors[keyof CancelScheduledTaskApiTasksScheduleCancelPostErrors];
+
+export type CancelScheduledTaskApiTasksScheduleCancelPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskScheduleReceipt;
+};
+
+export type CancelScheduledTaskApiTasksScheduleCancelPostResponse = CancelScheduledTaskApiTasksScheduleCancelPostResponses[keyof CancelScheduledTaskApiTasksScheduleCancelPostResponses];
+
+export type RescheduleTaskApiTasksScheduleReschedulePostData = {
+    body: TaskRescheduleRequest;
+    path?: never;
+    query?: never;
+    url: '/api/tasks/schedule/reschedule';
+};
+
+export type RescheduleTaskApiTasksScheduleReschedulePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RescheduleTaskApiTasksScheduleReschedulePostError = RescheduleTaskApiTasksScheduleReschedulePostErrors[keyof RescheduleTaskApiTasksScheduleReschedulePostErrors];
+
+export type RescheduleTaskApiTasksScheduleReschedulePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskScheduleReceipt;
+};
+
+export type RescheduleTaskApiTasksScheduleReschedulePostResponse = RescheduleTaskApiTasksScheduleReschedulePostResponses[keyof RescheduleTaskApiTasksScheduleReschedulePostResponses];
+
 export type GetTaskApiTasksTaskIdGetData = {
     body?: never;
     path: {
@@ -22995,6 +23227,47 @@ export type ResumeTaskApiTasksTaskIdResumePostResponses = {
 };
 
 export type ResumeTaskApiTasksTaskIdResumePostResponse = ResumeTaskApiTasksTaskIdResumePostResponses[keyof ResumeTaskApiTasksTaskIdResumePostResponses];
+
+export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: {
+        /**
+         * After Sequence
+         */
+        after_sequence?: number;
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/tasks/{task_id}/schedule/events';
+};
+
+export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetError = ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetErrors[keyof ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetErrors];
+
+export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponses = {
+    /**
+     * Response List Task Schedule Events Api Tasks  Task Id  Schedule Events Get
+     *
+     * Successful Response
+     */
+    200: Array<ApiTaskScheduleEvent>;
+};
+
+export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponse = ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponses[keyof ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponses];
 
 export type RecoverToolApprovalApiToolApprovalsRecoverPostData = {
     body: ToolApprovalRecoveryBody;

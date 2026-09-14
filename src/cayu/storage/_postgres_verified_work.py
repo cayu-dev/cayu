@@ -331,6 +331,10 @@ class PostgresVerifiedWorkMixin:
 
         async def _ensure_ready(self) -> None: ...
 
+        async def _record_schedule_transition(
+            self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None
+        ) -> None: ...
+
         def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]: ...
 
     async def _await_owned_store_mutation(
@@ -1043,7 +1047,7 @@ class PostgresVerifiedWorkMixin:
                 worker_id = %s, lease_expires_at = %s,
                 status_reason = %s, status_payload = %s, result = %s, error = %s,
                 updated_at = %s, started_at = %s, completed_at = %s, retry_series = %s,
-                work_contract = %s
+                work_contract = %s, available_at = %s, schedule = %s
             WHERE id = %s
             """,
             (
@@ -1065,6 +1069,10 @@ class PostgresVerifiedWorkMixin:
                 None
                 if task.work_contract is None
                 else json.dumps(task.work_contract.model_dump(mode="json", warnings=False)),
+                pg_support.to_utc_optional(task.available_at),
+                None
+                if task.schedule is None
+                else json.dumps(task.schedule.model_dump(mode="json")),
                 task.id,
             ),
         )
@@ -1226,6 +1234,7 @@ class PostgresVerifiedWorkMixin:
                 }
             )
             await self._update_task_snapshot(cur, updated)
+            await self._record_schedule_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
         return await self._run_verified_work_mutation(operation)
@@ -1555,6 +1564,7 @@ class PostgresVerifiedWorkMixin:
                 }
             )
             await self._update_task_snapshot(cur, updated_task)
+            await self._record_schedule_transition(cur, task, updated_task)
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_admissions "
                 "(admission_id, attempt_id, task_id, session_id, interaction_id, state, "
@@ -1885,6 +1895,7 @@ class PostgresVerifiedWorkMixin:
             )
             encoded = receipt.model_dump_json(warnings=False)
             await self._update_task_snapshot(cur, updated)
+            await self._record_schedule_transition(cur, task, updated)
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_preparation_holds "
                 "(hold_id, task_id, request_sha256, receipt_json) VALUES (%s, %s, %s, %s)",
@@ -2004,6 +2015,7 @@ class PostgresVerifiedWorkMixin:
             encoded = receipt.model_dump_json(warnings=False)
             await self._update_task_snapshot(cur, updated)
             await self._update_work_attempt_admission_row(cur, settled_admission)
+            await self._record_schedule_transition(cur, task, updated)
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_lifecycle_receipts "
                 "(admission_id, settlement_id, task_id, request_sha256, retired_contract_binding, settled_at, receipt_json) "
@@ -3371,6 +3383,7 @@ class PostgresVerifiedWorkMixin:
             )
             if updated != task:
                 await self._update_task_snapshot(cur, updated)
+                await self._record_schedule_transition(cur, task, updated)
             await cur.execute(
                 "INSERT INTO cayu_completion_decision_application_receipts "
                 "(task_id, idempotency_key, decision_id, request_sha256, applied_at, "

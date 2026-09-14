@@ -91,6 +91,7 @@ from cayu._validation import (
     copy_label_map,
     require_durable_nonblank,
     require_nonblank,
+    revalidate_model_input,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -595,6 +596,7 @@ from cayu.storage._postgres_verified_work import (
     _require_quiescent_postgres_mutation_connection,
     _require_quiescent_postgres_mutation_pool,
 )
+from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
@@ -794,6 +796,16 @@ from cayu.storage.memory import (
     prepare_knowledge_publication,
     prepare_knowledge_relations,
 )
+from cayu.tasks._scheduling import (
+    admitted_schedule,
+    require_schedule_mutation,
+    rescheduled_task,
+    schedule_creation_digest,
+    schedule_mutation_digest,
+    schedule_receipt,
+    schedule_revision_after,
+    schedule_transition_events,
+)
 from cayu.tasks.admission import WorkAttemptExecutionClaimLost
 from cayu.tasks.base import (
     _TASK_CANCELLATION_REQUESTED_REASON,
@@ -870,6 +882,7 @@ from cayu.tasks.base import (
     _require_direct_attached_task_resume,
     _require_interrupted_task_handoff_authority,
     _running_task_from_create,
+    _scheduled_task_nonexecution,
     _settled_task_retry_attempt,
     _task_cancellation_reconciliation_conflict,
     _task_cancellation_reconciliation_rejection_record,
@@ -910,6 +923,17 @@ from cayu.tasks.base import (
     task_query_from_aggregate_filter,
 )
 from cayu.tasks.contracts import WorkCompletionConflict
+from cayu.tasks.scheduling import (
+    TaskRescheduleRequest,
+    TaskScheduleCancelRequest,
+    TaskScheduleConflict,
+    TaskScheduleEligibility,
+    TaskScheduleEvent,
+    TaskScheduleEventType,
+    TaskScheduleReceipt,
+    TaskScheduleWakeup,
+    task_schedule_eligibility,
+)
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.grants import (
     TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
@@ -1261,7 +1285,7 @@ _TASK_RETURNING_COLUMNS = (
     "task.available_at, task.worker_id, task.lease_expires_at, task.interrupted_handoff_id, "
     "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
     "task.created_at, task.updated_at, task.started_at, task.completed_at, task.invocation, "
-    "task.retry_series, task.work_contract"
+    "task.retry_series, task.work_contract, task.schedule"
 )
 _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
@@ -1366,6 +1390,7 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    90: POSTGRES_SCHEDULING_DDL,
     88: (
         """
         CREATE TABLE IF NOT EXISTS cayu_task_session_closure_claims (
@@ -5580,7 +5605,7 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
         ),
     ),
     # This pending-action index change is not registered in REVISIONS yet.
-    90: (
+    91: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -39251,6 +39276,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     """Postgres-backed task store for durable multi-tenant work items."""
 
     supports_delayed_availability: ClassVar[bool] = True
+    supports_task_scheduling: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
@@ -39852,6 +39878,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
+        if request.schedule_policy is not None and not self.supports_task_scheduling:
+            raise NotImplementedError("This store does not support managed task scheduling.")
         await self._ensure_ready()
         task = await self._insert_task(request, running=False)
         return task.model_copy(deep=True)
@@ -39886,6 +39914,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         async def operation(conn: Any, cur: Any) -> tuple[Task, bool]:
             nonlocal notification_sender_connection, notification_sender_pid
             await self._lock_verified_work_task(cur, task_id)
+            if request.schedule_policy is not None:
+                existing = await self._load_task(cur, task_id)
+                if existing is not None:
+                    if (
+                        existing.schedule is None
+                        or existing.schedule.creation_sha256 != schedule_creation_digest(request)
+                    ):
+                        raise TaskScheduleConflict("Task creation identity has different content.")
+                    return existing, False
             retry_started_at = await self._verified_evidence_now(cur)
             parent: TaskInvocationSnapshot | None = None
             if request.parent_task_id is not None:
@@ -39956,11 +39993,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 """,
                 pg_support.task_insert_values(task),
             )
+            await self._record_schedule_transition(cur, None, task)
             publish_admission_wakeup = not running and (
                 task.available_at is None or task.available_at <= retry_started_at
             )
@@ -39990,6 +40028,243 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 now=task.available_at or task.created_at,
             )
         return task
+
+    async def _record_schedule_transition(
+        self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None
+    ) -> None:
+        """Append evidence while the caller owns the task's native transaction lock."""
+        if current.schedule is None:
+            return
+        await cur.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM cayu_task_schedule_events WHERE task_id = %s",
+            (current.id,),
+        )
+        row = await cur.fetchone()
+        events = schedule_transition_events(
+            prior, current, first_sequence=row[0] + 1, operation_id=operation_id
+        )
+        for event in events:
+            await cur.execute(
+                "INSERT INTO cayu_task_schedule_events (task_id, sequence, event_json) "
+                "VALUES (%s, %s, %s)",
+                (event.task_id, event.sequence, json.dumps(event.model_dump(mode="json"))),
+            )
+
+    async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
+        if type(request) is not TaskRescheduleRequest:
+            raise TypeError("A typed task reschedule request is required.")
+        request = revalidate_model_input(request, TaskRescheduleRequest)
+        digest = schedule_mutation_digest(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> TaskScheduleReceipt:
+            del conn
+            await self._lock_verified_work_task(cur, request.task_id)
+            await cur.execute(
+                "SELECT receipt_json FROM cayu_task_schedule_receipts "
+                "WHERE task_id = %s AND operation_id = %s",
+                (request.task_id, request.operation_id),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                retained = TaskScheduleReceipt.model_validate(
+                    json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                )
+                if retained.request_sha256 != digest:
+                    raise TaskScheduleConflict("Schedule operation identity has different content.")
+                return retained
+            current = await self._load_task_locked(cur, request.task_id)
+            await cur.execute(
+                "SELECT 1 FROM cayu_local_execution_attempts "
+                "WHERE task_id = %s AND retry_admissible = FALSE LIMIT 1",
+                (current.id,),
+            )
+            if await cur.fetchone() is not None:
+                raise TaskScheduleConflict("Task has unsettled execution authority.")
+            now = await self._database_now(cur)
+            updated = rescheduled_task(current, request, now=now)
+            receipt = schedule_receipt(
+                updated, request, now=now, kind=TaskScheduleEventType.RESCHEDULED
+            )
+            await self._update_task_snapshot(cur, updated)
+            await self._record_schedule_transition(
+                cur, current, updated, operation_id=request.operation_id
+            )
+            await cur.execute(
+                "INSERT INTO cayu_task_schedule_receipts (task_id, operation_id, receipt_json) "
+                "VALUES (%s, %s, %s)",
+                (
+                    request.task_id,
+                    request.operation_id,
+                    json.dumps(receipt.model_dump(mode="json")),
+                ),
+            )
+            await cur.execute("SELECT pg_notify(%s, %s)", (_TASK_ADMISSION_NOTIFY_CHANNEL, ""))
+            return receipt
+
+        receipt = await self._run_verified_work_mutation(operation)
+        self._publish_task_admission_broadcast()
+        return receipt
+
+    async def cancel_scheduled_task(
+        self, request: TaskScheduleCancelRequest
+    ) -> TaskScheduleReceipt:
+        if type(request) is not TaskScheduleCancelRequest:
+            raise TypeError("A typed task schedule cancellation is required.")
+        request = revalidate_model_input(request, TaskScheduleCancelRequest)
+        digest = schedule_mutation_digest(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> TaskScheduleReceipt:
+            del conn
+            await self._lock_verified_work_task(cur, request.task_id)
+            await cur.execute(
+                "SELECT receipt_json FROM cayu_task_schedule_receipts "
+                "WHERE task_id = %s AND operation_id = %s",
+                (request.task_id, request.operation_id),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                retained = TaskScheduleReceipt.model_validate(
+                    json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                )
+                if retained.request_sha256 != digest:
+                    raise TaskScheduleConflict("Schedule operation identity has different content.")
+                return retained
+            prior = await self._load_task_locked(cur, request.task_id)
+            state = require_schedule_mutation(prior, request.expected_revision)
+            updated = await self._finish_task_in_transaction(
+                cur, prior.id, TaskStatus.CANCELLED, result=None, error=None
+            )
+            updated = updated.model_copy(
+                update={
+                    "schedule": state.model_copy(
+                        update={"revision": schedule_revision_after(state)}
+                    )
+                }
+            )
+            await self._update_task_snapshot(cur, updated)
+            if updated.retry_series is not None and updated.status is TaskStatus.CANCELLED:
+                assert updated.status_payload is not None
+                settlement_key = updated.status_payload["settlement_idempotency_key"]
+                await cur.execute(
+                    "SELECT receipt_json FROM cayu_task_retry_settlements "
+                    "WHERE task_id = %s AND idempotency_key = %s",
+                    (updated.id, settlement_key),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise TaskScheduleConflict("Retry cancellation has no settlement evidence.")
+                settled = TaskRetrySettlementResult.model_validate(
+                    json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                )
+                if settled.task.model_copy(update={"schedule": updated.schedule}) != updated:
+                    raise TaskScheduleConflict("Retry settlement has contradictory authority.")
+                settled = settled.model_copy(update={"task": updated})
+                await cur.execute(
+                    "UPDATE cayu_task_retry_settlements SET receipt_json = %s "
+                    "WHERE task_id = %s AND idempotency_key = %s",
+                    (json.dumps(settled.model_dump(mode="json")), updated.id, settlement_key),
+                )
+            receipt = schedule_receipt(
+                updated,
+                request,
+                now=updated.updated_at,
+                kind=TaskScheduleEventType.CANCELLED
+                if updated.status is TaskStatus.CANCELLED
+                else TaskScheduleEventType.CANCELLATION_REQUESTED,
+            )
+            await self._record_schedule_transition(
+                cur, prior, updated, operation_id=request.operation_id
+            )
+            await cur.execute(
+                "INSERT INTO cayu_task_schedule_receipts (task_id, operation_id, receipt_json) "
+                "VALUES (%s, %s, %s)",
+                (
+                    request.task_id,
+                    request.operation_id,
+                    json.dumps(receipt.model_dump(mode="json")),
+                ),
+            )
+            return receipt
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def list_task_schedule_events(
+        self, task_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskScheduleEvent]:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        if type(after_sequence) is not int or not 0 <= after_sequence <= 9007199254740991:
+            raise ValueError("after_sequence must be a bounded nonnegative integer.")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Schedule event limit must be between 1 and 1000.")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT event_json FROM cayu_task_schedule_events "
+                "WHERE task_id = %s AND sequence > %s ORDER BY sequence LIMIT %s",
+                (task_id, after_sequence, limit),
+            )
+            return [
+                TaskScheduleEvent.model_validate(
+                    json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                )
+                for row in await cur.fetchall()
+            ]
+
+    async def next_task_schedule_wakeup(self, query: TaskQuery | None = None) -> TaskScheduleWakeup:
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            now = self._clock() if self._clock_is_injected else await self._database_now(cur)
+            if query.status is not None and query.status is not TaskStatus.PENDING:
+                return TaskScheduleWakeup(as_of=now)
+            clauses, params = self._task_filter_clauses(query)
+            scope = " AND ".join(
+                [
+                    "session_id IS NULL",
+                    "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                    "WHERE NOT attempt.retry_admissible AND (attempt.task_id = cayu_tasks.id OR "
+                    "(cayu_tasks.retry_series IS NOT NULL AND attempt.retry_series_id = "
+                    "cayu_tasks.retry_series->>'series_id')))",
+                    *clauses,
+                ]
+            )
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"SELECT MIN(available_at) FROM cayu_tasks WHERE {scope} "
+                    "AND status = 'pending' AND available_at > %s "
+                    "AND (schedule IS NULL OR schedule->>'admitted_at' IS NULL) "
+                    "AND (retry_series IS NULL OR retry_series->>'elapsed_deadline' IS NULL "
+                    "OR (retry_series->>'elapsed_deadline')::timestamptz > %s)",
+                ),
+                [*params, now, now],
+            )
+            due = (await cur.fetchone())[0]
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    "SELECT MIN(CASE WHEN (schedule->'policy'->>'expires_at')::timestamptz > %s "
+                    "THEN (schedule->'policy'->>'expires_at')::timestamptz END), "
+                    "COALESCE(BOOL_OR((schedule->'policy'->>'expires_at')::timestamptz <= %s "
+                    "OR (schedule->'policy'->>'misfire_policy' = 'skip' AND "
+                    "EXTRACT(EPOCH FROM (%s::timestamptz - available_at)) > "
+                    "(schedule->'policy'->>'misfire_grace_seconds')::bigint)), FALSE) "
+                    f"FROM cayu_tasks WHERE {scope} "
+                    "AND status IN ('pending', 'paused', 'blocked', 'needs_attention') "
+                    "AND schedule IS NOT NULL AND schedule->>'admitted_at' IS NULL",
+                ),
+                [now, now, now, *params],
+            )
+            expiry, maintenance = await cur.fetchone()
+            return TaskScheduleWakeup(
+                as_of=now,
+                next_available_at=due,
+                next_expiry_at=expiry,
+                maintenance_required=maintenance,
+            )
 
     async def load_task(self, task_id: str) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -40653,6 +40928,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 }
             )
             await self._update_task_snapshot(cur, updated)
+            await self._record_schedule_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
         return await self._run_verified_work_mutation(operation)
@@ -40731,6 +41007,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 }
             )
             await self._update_task_snapshot(cur, updated)
+            await self._record_schedule_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
         return await self._run_verified_work_mutation(operation)
@@ -40905,6 +41182,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         )
                     assert terminal_row is not None
                     terminal_task = pg_support.task_from_row(terminal_row)
+                    await self._record_schedule_transition(cur, task, terminal_task)
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "
                         "(task_id, idempotency_key, request_sha256, worker_id, "
@@ -41039,6 +41317,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             "Attached-task recovery lost its exact durable authority."
                         )
                     terminal_task = pg_support.task_from_row(terminal_row)
+                    await self._record_schedule_transition(cur, task, terminal_task)
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "
                         "(task_id, idempotency_key, request_sha256, worker_id, "
@@ -41746,6 +42025,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         )
                     durable_task = pg_support.task_from_row(durable_row)
                     receipt = result.terminalization_receipt.model_copy(
+                        # The corresponding journal entry is committed below
+                        # with this exact returned task snapshot.
                         update={"task": durable_task},
                         deep=True,
                     )
@@ -41756,6 +42037,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         reconciliation=result.reconciliation,
                         committed_at=now,
                     )
+                    await self._record_schedule_transition(cur, task, durable_task)
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "
                         "(task_id, idempotency_key, request_sha256, worker_id, "
@@ -41866,6 +42148,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         )
                     assert settled_row is not None
                     durable_task = pg_support.task_from_row(settled_row)
+                    await self._record_schedule_transition(cur, task, durable_task)
                     if successor is not None:
                         await cur.execute(
                             f"""
@@ -41874,11 +42157,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s
+                                %s, %s, %s
                             )
                             """,
                             pg_support.task_insert_values(successor),
                         )
+                        await self._record_schedule_transition(cur, None, successor)
                         if successor.available_at is None or successor.available_at <= series_now:
                             notification_sender_connection = conn
                             notification_sender_pid = (
@@ -42090,6 +42374,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         events=_task_retry_events(durable_task, occurred_at=now),
                         committed_at=now,
                     )
+                    await self._record_schedule_transition(cur, task, durable_task)
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "
                         "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -42195,6 +42480,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             worker_id,
                             now=lease_now,
                         )
+                    await self._record_schedule_transition(cur, task, settled)
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "
                         "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -42324,6 +42610,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 return current.model_copy(deep=True)
             started = current.model_copy(update={"started_at": now, "updated_at": now})
             await self._update_task_snapshot(cur, started)
+            await self._record_schedule_transition(cur, current, started)
             return started.model_copy(deep=True)
 
         return await self._run_verified_work_mutation(operation)
@@ -42375,7 +42662,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await self._load_task_locked(cur, task_id)
+                prior = await self._load_task_locked(cur, task_id)
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
                     (task_id,),
@@ -42413,6 +42700,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     _ensure_can_resume_task(task)
                     raise ValueError(f"Task {task.id} cannot resume from {task.status}")
                 updated = pg_support.task_from_row(row)
+                await self._record_schedule_transition(cur, prior, updated)
             await conn.commit()
             return updated.model_copy(deep=True)
 
@@ -42446,6 +42734,69 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             ),
             connection_owner=connection_owner,
         )
+
+    async def _settle_schedule_nonexecution(
+        self, cur: Any, task: Task, *, eligibility: TaskScheduleEligibility, now: datetime
+    ) -> None:
+        settled, cancellation = _scheduled_task_nonexecution(task, eligibility=eligibility, now=now)
+        await self._update_task_snapshot(cur, settled)
+        await self._record_schedule_transition(cur, task, settled)
+        if cancellation is not None:
+            await cur.execute(
+                "INSERT INTO cayu_task_retry_settlements "
+                "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    cancellation.task_id,
+                    cancellation.idempotency_key,
+                    cancellation.request_sha256,
+                    _dumps(cancellation.model_dump(mode="json")),
+                    cancellation.committed_at,
+                ),
+            )
+
+    async def _expire_held_schedules(self, cur: Any, query: TaskQuery, *, now: datetime) -> None:
+        clauses, params = self._task_filter_clauses(query)
+        scope = " AND ".join(
+            [
+                "status IN ('paused', 'blocked', 'needs_attention')",
+                "session_id IS NULL",
+                "worker_id IS NULL",
+                "schedule IS NOT NULL AND schedule->>'admitted_at' IS NULL",
+                "((schedule->'policy'->>'expires_at')::timestamptz <= %s OR "
+                "(schedule->'policy'->>'misfire_policy' = 'skip' AND "
+                "EXTRACT(EPOCH FROM (%s::timestamptz - available_at)) > "
+                "(schedule->'policy'->>'misfire_grace_seconds')::bigint))",
+                "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                "WHERE NOT attempt.retry_admissible AND (attempt.task_id = cayu_tasks.id OR "
+                "(cayu_tasks.retry_series IS NOT NULL AND attempt.retry_series_id = "
+                "cayu_tasks.retry_series->>'series_id')))",
+                *clauses,
+            ]
+        )
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks WHERE {scope} "
+                "ORDER BY created_at ASC, id ASC FOR UPDATE SKIP LOCKED LIMIT 100",
+            ),
+            [now, now, *params],
+        )
+        tasks = [pg_support.task_from_row(row) for row in await cur.fetchall()]
+        by_scope = {self._local_execution_retry_fence_scope(task): task for task in tasks}
+        for scope_id in sorted(by_scope):
+            await self._lock_local_execution_retry_fence(cur, by_scope[scope_id])
+        for task in tasks:
+            if await self._local_execution_attempt_fences_task(cur, task):
+                continue
+            assert task.schedule is not None and task.available_at is not None
+            eligibility = task_schedule_eligibility(
+                available_at=task.available_at, policy=task.schedule.policy, as_of=now
+            )
+            if eligibility in {TaskScheduleEligibility.EXPIRED, TaskScheduleEligibility.SKIPPED}:
+                await self._settle_schedule_nonexecution(
+                    cur, task, eligibility=eligibility, now=now
+                )
 
     async def _claim_task_unowned(
         self,
@@ -42518,6 +42869,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     raise RuntimeError("Postgres did not return a transaction timestamp.")
                 now = transaction_timestamp_row[0]
                 authoritative_series_now = series_now if self._clock_is_injected else now
+                await self._expire_held_schedules(cur, query, now=authoritative_series_now)
                 await cur.execute(
                     f"""
                         SELECT {pg_support.TASK_COLUMNS}
@@ -42581,6 +42933,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         raise TaskTerminalizationConflict(
                             "Elapsed task retry attempt changed during claim admission."
                         )
+                    await self._record_schedule_transition(cur, expired_task, expiration.task)
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "
                         "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -42598,7 +42951,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         "LiteralString",
                         f"""
                         WITH candidate AS (
-                            SELECT id
+                            SELECT id, status AS prior_status, worker_id AS prior_worker_id,
+                                   lease_expires_at AS prior_lease, updated_at AS prior_updated_at
                             FROM cayu_tasks
                             WHERE {where_sql}
                             ORDER BY {order_sql}, id ASC
@@ -42612,7 +42966,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             updated_at = {updated_at_sql}
                         FROM candidate
                         WHERE task.id = candidate.id
-                        RETURNING {_TASK_RETURNING_COLUMNS}
+                        RETURNING {_TASK_RETURNING_COLUMNS}, candidate.prior_status,
+                                  candidate.prior_worker_id, candidate.prior_lease,
+                                  candidate.prior_updated_at
                         """,
                     ),
                     [
@@ -42627,6 +42983,18 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 )
                 row = await cur.fetchone()
                 claimed = None if row is None else pg_support.task_from_row(row)
+                prior = (
+                    None
+                    if claimed is None
+                    else claimed.model_copy(
+                        update={
+                            "status": TaskStatus(row[-4]),
+                            "worker_id": row[-3],
+                            "lease_expires_at": row[-2],
+                            "updated_at": row[-1],
+                        }
+                    )
+                )
                 fenced = False
                 if claimed is not None:
                     await self._lock_local_execution_retry_fence(cur, claimed)
@@ -42648,7 +43016,28 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         )
                     else:
                         retry_elapsed = False
-                    if retry_elapsed:
+                    schedule_eligibility = None
+                    if (
+                        not fenced
+                        and claimed.schedule is not None
+                        and claimed.schedule.admitted_at is None
+                    ):
+                        assert claimed.available_at is not None
+                        schedule_eligibility = task_schedule_eligibility(
+                            available_at=claimed.available_at,
+                            policy=claimed.schedule.policy,
+                            as_of=post_fence_series_now,
+                        )
+                    if not retry_elapsed and schedule_eligibility in {
+                        TaskScheduleEligibility.EXPIRED,
+                        TaskScheduleEligibility.SKIPPED,
+                    }:
+                        assert prior is not None
+                        await self._settle_schedule_nonexecution(
+                            cur, prior, eligibility=schedule_eligibility, now=post_fence_series_now
+                        )
+                        claimed = None
+                    elif retry_elapsed:
                         expiration = _elapsed_claimed_task_retry_settlement(
                             claimed,
                             committed_at=post_fence_now,
@@ -42682,6 +43071,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             raise TaskTerminalizationConflict(
                                 "Elapsed task retry attempt changed during claim admission."
                             )
+                        await self._record_schedule_transition(cur, prior, settled)
                         await cur.execute(
                             "INSERT INTO cayu_task_retry_settlements "
                             "(task_id, idempotency_key, request_sha256, receipt_json, "
@@ -42729,6 +43119,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                                 "Task claim changed while its retry fence was acquired."
                             )
                         claimed = pg_support.task_from_row(refreshed_row)
+                        if claimed.schedule is not None:
+                            claimed = claimed.model_copy(
+                                update={
+                                    "schedule": admitted_schedule(
+                                        claimed, now=post_fence_series_now
+                                    )
+                                }
+                            )
+                            await self._update_task_snapshot(cur, claimed)
+                        await self._record_schedule_transition(cur, prior, claimed)
             if fenced:
                 await conn.rollback()
                 return None
@@ -42867,6 +43267,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     )
                 assert row is not None
                 updated = pg_support.task_from_row(row)
+                await self._record_schedule_transition(cur, task, updated)
             await conn.commit()
             return updated.model_copy(deep=True)
 
@@ -43052,6 +43453,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             )
                             reclaimed.append(updated)
                         await self._update_task_snapshot(cur, updated)
+                        await self._record_schedule_transition(cur, task, updated)
             if fenced:
                 # Roll back every row selected by this batch.  A later reclaim
                 # starts from a fresh snapshot and can still settle unrelated
@@ -43077,7 +43479,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await self._load_task_locked(cur, task_id)
+                prior = await self._load_task_locked(cur, task_id)
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
                     (task_id,),
@@ -43131,6 +43533,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     _ensure_can_hold_task(task, status)
                     raise ValueError(f"Task {task.id} cannot transition to {status}")
                 updated = pg_support.task_from_row(row)
+                await self._record_schedule_transition(cur, prior, updated)
             await conn.commit()
             return updated.model_copy(deep=True)
 
@@ -43147,6 +43550,42 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         request_claimed_cancellation: bool = False,
     ) -> Task:
         await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> Task:
+            del conn
+            await self._lock_verified_work_task(cur, task_id)
+            prior = await self._load_task_locked(cur, task_id)
+            if prior.schedule is not None and status is TaskStatus.CANCELLED and worker_id is None:
+                raise TaskScheduleConflict("Managed cancellation requires its schedule revision.")
+            updated = await self._finish_task_in_transaction(
+                cur,
+                task_id,
+                status,
+                result=result,
+                error=error,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                expected_lease_expires_at=expected_lease_expires_at,
+                request_claimed_cancellation=request_claimed_cancellation,
+            )
+            await self._record_schedule_transition(cur, prior, updated)
+            return updated
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def _finish_task_in_transaction(
+        self,
+        cur: Any,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
+        request_claimed_cancellation: bool = False,
+    ) -> Task:
         if expected_lease_expires_at is not None:
             expected_lease_expires_at = normalize_utc_datetime(
                 expected_lease_expires_at,
@@ -43163,213 +43602,200 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 "\n                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s"
                 "\n                      AND interrupted_handoff_id IS NOT DISTINCT FROM %s"
             )
-        async with self._pool.connection() as conn:
-            async with conn.cursor() as cur:
-                task = await self._load_task_locked(cur, task_id)
-                now = await self._database_now(cur)
-                if (
-                    worker_id is not None
-                    and expected_lease_expires_at is not None
-                    and (
-                        task.worker_id != worker_id
-                        or task.lease_expires_at != expected_lease_expires_at
-                    )
-                ):
-                    raise TaskClaimLost(
-                        "Task terminalization no longer owns the expected worker lease."
-                    )
-                await cur.execute(
-                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
-                    (task_id,),
+        task = await self._load_task_locked(cur, task_id)
+        now = await self._database_now(cur)
+        if (
+            worker_id is not None
+            and expected_lease_expires_at is not None
+            and (task.worker_id != worker_id or task.lease_expires_at != expected_lease_expires_at)
+        ):
+            raise TaskClaimLost("Task terminalization no longer owns the expected worker lease.")
+        await cur.execute(
+            "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+            (task_id,),
+        )
+        if await cur.fetchone() is not None:
+            raise WorkAttemptExecutionClaimLost(
+                "Admitted work attempts cannot use ordinary terminalization."
+            )
+        verified_work_support.require_contracted_completion_authority(task, status)
+        if request_claimed_cancellation and (
+            _task_cancellation_requested(task)
+            or task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+        ):
+            return task.model_copy(deep=True)
+        if worker_id is not None:
+            if not (request_claimed_cancellation and task.started_at is not None):
+                _ensure_owned_active_task_lease(task, worker_id, now=now)
+            effective_handoff_id = (
+                task.interrupted_handoff_id if request_claimed_cancellation else handoff_id
+            )
+            _ensure_task_handoff_authority(task, effective_handoff_id)
+            owner_params = [worker_id, now, effective_handoff_id]
+        cancellation = None
+        if task.retry_series is not None:
+            if status is not TaskStatus.CANCELLED:
+                raise ValueError(
+                    "Retry-series tasks require settle_task_retry_attempt for "
+                    "completion or failure."
                 )
-                if await cur.fetchone() is not None:
-                    raise WorkAttemptExecutionClaimLost(
-                        "Admitted work attempts cannot use ordinary terminalization."
-                    )
-                verified_work_support.require_contracted_completion_authority(task, status)
-                if request_claimed_cancellation and (
-                    _task_cancellation_requested(task)
-                    or task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
-                ):
-                    await conn.commit()
-                    return task.model_copy(deep=True)
-                if worker_id is not None:
-                    if not (request_claimed_cancellation and task.started_at is not None):
-                        _ensure_owned_active_task_lease(task, worker_id, now=now)
-                    effective_handoff_id = (
-                        task.interrupted_handoff_id if request_claimed_cancellation else handoff_id
-                    )
-                    _ensure_task_handoff_authority(task, effective_handoff_id)
-                    owner_params = [worker_id, now, effective_handoff_id]
-                cancellation = None
-                if task.retry_series is not None:
-                    if status is not TaskStatus.CANCELLED:
-                        raise ValueError(
-                            "Retry-series tasks require settle_task_retry_attempt for "
-                            "completion or failure."
-                        )
-                    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
-                        cancellation_requested = _task_retry_cancellation_requested_task(
-                            task,
-                            error=error,
-                            updated_at=now,
-                        )
-                        await cur.execute(
-                            f"""
-                            UPDATE cayu_tasks
-                            SET status_reason = %s, status_payload = %s, updated_at = %s
-                            WHERE id = %s AND status IN (%s, %s)
-                            RETURNING {pg_support.TASK_COLUMNS}
-                            """,
-                            (
-                                cancellation_requested.status_reason,
-                                _dumps(cancellation_requested.status_payload),
-                                cancellation_requested.updated_at,
-                                task_id,
-                                str(TaskStatus.CLAIMED),
-                                str(TaskStatus.RUNNING),
-                            ),
-                        )
-                        row = await cur.fetchone()
-                        if row is None:
-                            raise TaskTerminalizationConflict(
-                                "Task retry cancellation lost active ownership."
-                            )
-                        updated = pg_support.task_from_row(row)
-                        await conn.commit()
-                        return updated.model_copy(deep=True)
-                    cancellation = _cancelled_task_retry_settlement(
-                        task,
-                        error=error,
-                        committed_at=now,
-                    )
-                    terminal_task = cancellation.task
-                elif (
-                    task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
-                    and status is TaskStatus.CANCELLED
-                    and task.worker_id is not None
-                    and task.lease_expires_at is not None
-                    and not _task_cancellation_requested(task)
-                ):
-                    cancellation_requested = _task_cancellation_requested_task(
-                        task,
-                        error=error,
-                        updated_at=now,
-                    )
-                    await cur.execute(
-                        f"""
-                        UPDATE cayu_tasks
-                        SET status_reason = %s, status_payload = %s, updated_at = %s
-                        WHERE id = %s AND status IN (%s, %s)
-                        RETURNING {pg_support.TASK_COLUMNS}
-                        """,
-                        (
-                            cancellation_requested.status_reason,
-                            _dumps(cancellation_requested.status_payload),
-                            cancellation_requested.updated_at,
-                            task_id,
-                            str(TaskStatus.CLAIMED),
-                            str(TaskStatus.RUNNING),
-                        ),
-                    )
-                    row = await cur.fetchone()
-                    if row is None:
-                        raise TaskTerminalizationConflict(
-                            "Task cancellation lost active ownership."
-                        )
-                    updated = pg_support.task_from_row(row)
-                    await conn.commit()
-                    return updated.model_copy(deep=True)
-                else:
-                    if _task_cancellation_requested(task):
-                        raise TaskTerminalizationConflict(
-                            "Task cancellation is still draining under its current owner."
-                        )
-                    terminal_task = task.model_copy(
-                        update={
-                            "status": status,
-                            "status_reason": None,
-                            "status_payload": None,
-                            "result": result,
-                            "error": error,
-                            "started_at": task.started_at or now,
-                            "completed_at": now,
-                            "updated_at": now,
-                            "interrupted_handoff_id": None,
-                        }
-                    )
+            if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                cancellation_requested = _task_retry_cancellation_requested_task(
+                    task,
+                    error=error,
+                    updated_at=now,
+                )
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
-                    SET status = %s,
-                        status_reason = %s,
-                        status_payload = %s,
-                        result = %s,
-                        error = %s,
-                        worker_id = NULL,
-                        lease_expires_at = NULL,
-                        interrupted_handoff_id = NULL,
-                        started_at = COALESCE(started_at, %s),
-                        completed_at = %s,
-                        updated_at = %s,
-                        retry_series = %s
-                    WHERE id = %s
-                      AND status NOT IN (%s, %s, %s){owner_clause}
+                    SET status_reason = %s, status_payload = %s, updated_at = %s
+                    WHERE id = %s AND status IN (%s, %s)
+                    RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
-                        str(status),
-                        terminal_task.status_reason,
-                        (
-                            None
-                            if terminal_task.status_payload is None
-                            else _dumps(terminal_task.status_payload)
-                        ),
-                        None if terminal_task.result is None else _dumps(terminal_task.result),
-                        None if terminal_task.error is None else _dumps(terminal_task.error),
-                        terminal_task.started_at,
-                        terminal_task.completed_at,
-                        terminal_task.updated_at,
-                        (
-                            None
-                            if terminal_task.retry_series is None
-                            else _dumps(terminal_task.retry_series.model_dump(mode="json"))
-                        ),
+                        cancellation_requested.status_reason,
+                        _dumps(cancellation_requested.status_payload),
+                        cancellation_requested.updated_at,
                         task_id,
-                        str(TaskStatus.COMPLETED),
-                        str(TaskStatus.FAILED),
-                        str(TaskStatus.CANCELLED),
-                        *owner_params,
+                        str(TaskStatus.CLAIMED),
+                        str(TaskStatus.RUNNING),
                     ),
                 )
-                if cur.rowcount != 1:
-                    if worker_id is not None:
-                        await self._raise_task_active_lease_error(
-                            cur,
-                            task_id,
-                            worker_id,
-                            now=now,
-                        )
-                        current = await self._require_task(cur, task_id)
-                        _ensure_task_handoff_authority(current, effective_handoff_id)
-                    task = await self._require_task(cur, task_id)
-                    _ensure_can_transition(task, status)
-                    raise ValueError(f"Task {task.id} cannot transition from {task.status}")
-                if cancellation is not None:
-                    await cur.execute(
-                        "INSERT INTO cayu_task_retry_settlements "
-                        "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
-                        "VALUES (%s, %s, %s, %s, %s)",
-                        (
-                            cancellation.task_id,
-                            cancellation.idempotency_key,
-                            cancellation.request_sha256,
-                            _dumps(cancellation.model_dump(mode="json")),
-                            cancellation.committed_at,
-                        ),
+                row = await cur.fetchone()
+                if row is None:
+                    raise TaskTerminalizationConflict(
+                        "Task retry cancellation lost active ownership."
                     )
-                updated = await self._require_task(cur, task_id)
-            await conn.commit()
+                updated = pg_support.task_from_row(row)
+                return updated.model_copy(deep=True)
+            cancellation = _cancelled_task_retry_settlement(
+                task,
+                error=error,
+                committed_at=now,
+            )
+            terminal_task = cancellation.task
+        elif (
+            task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+            and status is TaskStatus.CANCELLED
+            and task.worker_id is not None
+            and task.lease_expires_at is not None
+            and not _task_cancellation_requested(task)
+        ):
+            cancellation_requested = _task_cancellation_requested_task(
+                task,
+                error=error,
+                updated_at=now,
+            )
+            await cur.execute(
+                f"""
+                UPDATE cayu_tasks
+                SET status_reason = %s, status_payload = %s, updated_at = %s
+                WHERE id = %s AND status IN (%s, %s)
+                RETURNING {pg_support.TASK_COLUMNS}
+                """,
+                (
+                    cancellation_requested.status_reason,
+                    _dumps(cancellation_requested.status_payload),
+                    cancellation_requested.updated_at,
+                    task_id,
+                    str(TaskStatus.CLAIMED),
+                    str(TaskStatus.RUNNING),
+                ),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise TaskTerminalizationConflict("Task cancellation lost active ownership.")
+            updated = pg_support.task_from_row(row)
             return updated.model_copy(deep=True)
+        else:
+            if _task_cancellation_requested(task):
+                raise TaskTerminalizationConflict(
+                    "Task cancellation is still draining under its current owner."
+                )
+            terminal_task = task.model_copy(
+                update={
+                    "status": status,
+                    "status_reason": None,
+                    "status_payload": None,
+                    "result": result,
+                    "error": error,
+                    "started_at": task.started_at or now,
+                    "completed_at": now,
+                    "updated_at": now,
+                    "interrupted_handoff_id": None,
+                }
+            )
+        await cur.execute(
+            f"""
+            UPDATE cayu_tasks
+            SET status = %s,
+                status_reason = %s,
+                status_payload = %s,
+                result = %s,
+                error = %s,
+                worker_id = NULL,
+                lease_expires_at = NULL,
+                interrupted_handoff_id = NULL,
+                started_at = COALESCE(started_at, %s),
+                completed_at = %s,
+                updated_at = %s,
+                retry_series = %s
+            WHERE id = %s
+              AND status NOT IN (%s, %s, %s){owner_clause}
+            """,
+            (
+                str(status),
+                terminal_task.status_reason,
+                (
+                    None
+                    if terminal_task.status_payload is None
+                    else _dumps(terminal_task.status_payload)
+                ),
+                None if terminal_task.result is None else _dumps(terminal_task.result),
+                None if terminal_task.error is None else _dumps(terminal_task.error),
+                terminal_task.started_at,
+                terminal_task.completed_at,
+                terminal_task.updated_at,
+                (
+                    None
+                    if terminal_task.retry_series is None
+                    else _dumps(terminal_task.retry_series.model_dump(mode="json"))
+                ),
+                task_id,
+                str(TaskStatus.COMPLETED),
+                str(TaskStatus.FAILED),
+                str(TaskStatus.CANCELLED),
+                *owner_params,
+            ),
+        )
+        if cur.rowcount != 1:
+            if worker_id is not None:
+                await self._raise_task_active_lease_error(
+                    cur,
+                    task_id,
+                    worker_id,
+                    now=now,
+                )
+                current = await self._require_task(cur, task_id)
+                _ensure_task_handoff_authority(current, effective_handoff_id)
+            task = await self._require_task(cur, task_id)
+            _ensure_can_transition(task, status)
+            raise ValueError(f"Task {task.id} cannot transition from {task.status}")
+        if cancellation is not None:
+            await cur.execute(
+                "INSERT INTO cayu_task_retry_settlements "
+                "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    cancellation.task_id,
+                    cancellation.idempotency_key,
+                    cancellation.request_sha256,
+                    _dumps(cancellation.model_dump(mode="json")),
+                    cancellation.committed_at,
+                ),
+            )
+        updated = await self._require_task(cur, task_id)
+        return updated.model_copy(deep=True)
 
     async def _load_task(self, cur: Any, task_id: str) -> Task | None:
         await cur.execute(

@@ -453,6 +453,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=88, kind=RevisionKind.BREAKING, compatible_from=88),
     # Auxiliary usage is required by every accounting reader and writer.
     Revision(revision=89, kind=RevisionKind.BREAKING, compatible_from=89),
+    # Every task writer must preserve schedule revisions and admission policy.
+    Revision(revision=90, kind=RevisionKind.BREAKING, compatible_from=90),
 )
 
 #: The revision an empty database is initialized to.

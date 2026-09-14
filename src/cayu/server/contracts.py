@@ -217,6 +217,7 @@ from cayu.tasks.base import (
     TaskOperationalSnapshot,
     TaskTopologyTruncatedField,
 )
+from cayu.tasks.scheduling import TaskScheduleEventType
 
 SERVER_API_PREFIX = "/api"
 SSE_CONTENT_TYPE = "text/event-stream"
@@ -2592,6 +2593,43 @@ class ApiTaskRetrySeries(ApiBaseModel):
     next_eligible_at: str | None
 
 
+class ApiTaskSchedulePolicy(ApiBaseModel):
+    expires_at: str | None
+    misfire_policy: Literal["fire_once", "skip"]
+    misfire_grace_seconds: StrictInt
+
+
+class ApiTaskScheduleState(ApiBaseModel):
+    schema_version: Literal[1]
+    revision: StrictInt
+    policy: ApiTaskSchedulePolicy
+    admitted_at: str | None
+
+
+class ApiTaskScheduleReceipt(ApiBaseModel):
+    task_id: str
+    operation_id: str
+    expected_revision: StrictInt
+    schedule: ApiTaskScheduleState
+    available_at: str
+    committed_at: str
+    type: Literal[
+        "task.rescheduled", "task.schedule_cancelled", "task.schedule_cancellation_requested"
+    ]
+
+
+class ApiTaskScheduleEvent(ApiBaseModel):
+    task_id: str
+    sequence: StrictInt
+    type: TaskScheduleEventType
+    revision: StrictInt
+    occurred_at: str
+    available_at: str
+    policy: ApiTaskSchedulePolicy
+    invocation_id: str
+    operation_id: str | None
+
+
 class ApiTaskListItem(ApiBaseModel):
     id: str
     type: str
@@ -2610,6 +2648,7 @@ class ApiTaskListItem(ApiBaseModel):
     updated_at: str
     completed_at: str | None
     retry_series: ApiTaskRetrySeries | None
+    schedule: ApiTaskScheduleState | None
 
 
 class ApiTaskInvocation(ApiBaseModel):

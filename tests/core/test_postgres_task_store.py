@@ -6026,7 +6026,7 @@ def test_postgres_lost_notification_converges_at_bounded_poll(postgres_dsn):
 
 
 @pytest.mark.qualification
-def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgres_dsn):
+def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgres_dsn, monkeypatch):
     async def run() -> None:
         await _truncate(postgres_dsn)
         producer = _new_store(postgres_dsn)
@@ -6035,6 +6035,15 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
         stop = asyncio.Event()
         handled = asyncio.Event()
         metrics = DurableWorkerMetrics(configured_handler_capacity=100)
+        schedule_reads = 0
+        original_schedule_wakeup = consumer.next_task_schedule_wakeup
+
+        async def observe_schedule(query=None):
+            nonlocal schedule_reads
+            schedule_reads += 1
+            return await original_schedule_wakeup(query)
+
+        monkeypatch.setattr(consumer, "next_task_schedule_wakeup", observe_schedule)
 
         async def handler(app: CayuApp, task: Task, worker_id: str) -> None:
             assert app.task_store is consumer
@@ -6090,6 +6099,7 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
             idle_cpu_s = process_time() - cpu_started
             idle_snapshot = metrics.snapshot()
             assert 2 <= idle_snapshot.claim_attempts <= 10
+            assert 0 < schedule_reads <= idle_snapshot.claim_attempts
             assert idle_cpu_s <= 0.10
 
             await producer.create_task(

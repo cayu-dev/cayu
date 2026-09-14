@@ -57,6 +57,7 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_label_map,
     require_nonblank,
+    revalidate_model_input,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -505,6 +506,16 @@ from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.tasks._scheduling import (
+    admitted_schedule,
+    require_schedule_mutation,
+    rescheduled_task,
+    schedule_creation_digest,
+    schedule_mutation_digest,
+    schedule_receipt,
+    schedule_revision_after,
+    schedule_transition_events,
+)
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -612,6 +623,7 @@ from cayu.tasks.base import (
     _require_direct_attached_task_resume,
     _require_interrupted_task_handoff_authority,
     _running_task_from_create,
+    _scheduled_task_nonexecution,
     _settled_task_retry_attempt,
     _task_cancellation_reconciliation_conflict,
     _task_cancellation_reconciliation_rejection_record,
@@ -687,6 +699,17 @@ from cayu.tasks.contracts import (
     validate_completion_decision_contract,
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
+)
+from cayu.tasks.scheduling import (
+    TaskRescheduleRequest,
+    TaskScheduleCancelRequest,
+    TaskScheduleConflict,
+    TaskScheduleEligibility,
+    TaskScheduleEvent,
+    TaskScheduleEventType,
+    TaskScheduleReceipt,
+    TaskScheduleWakeup,
+    task_schedule_eligibility,
 )
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.grants import (
@@ -15927,6 +15950,7 @@ class SQLiteTaskStore(TaskStore):
     """SQLite-backed task store for durable local work items."""
 
     supports_delayed_availability: ClassVar[bool] = True
+    supports_task_scheduling: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_attached_task_recovery_terminalization: ClassVar[bool] = True
@@ -16701,7 +16725,7 @@ class SQLiteTaskStore(TaskStore):
                 worker_id = ?, lease_expires_at = ?,
                 status_reason = ?, status_payload_json = ?, result_json = ?, error_json = ?,
                 updated_at = ?, started_at = ?, completed_at = ?, retry_series_json = ?,
-                work_contract_json = ?
+                work_contract_json = ?, available_at = ?, schedule_json = ?
             WHERE id = ?
             """,
             (
@@ -16727,6 +16751,10 @@ class SQLiteTaskStore(TaskStore):
                 else sqlite_support.json_dumps(
                     task.work_contract.model_dump(mode="json", warnings=False)
                 ),
+                sqlite_support.format_optional_datetime(task.available_at),
+                None
+                if task.schedule is None
+                else sqlite_support.json_dumps(task.schedule.model_dump(mode="json")),
                 task.id,
             ),
         )
@@ -16852,6 +16880,7 @@ class SQLiteTaskStore(TaskStore):
                     }
                 )
                 self._update_task_snapshot_unlocked(updated)
+                self._record_schedule_transition_unlocked(task, updated)
                 return updated.model_copy(deep=True)
 
     def _work_attempt_continuation_context_unlocked(
@@ -17139,6 +17168,7 @@ class SQLiteTaskStore(TaskStore):
                     }
                 )
                 self._update_task_snapshot_unlocked(updated_task)
+                self._record_schedule_transition_unlocked(task, updated_task)
                 self._connection.execute(
                     "INSERT INTO cayu_work_attempt_admissions "
                     "(admission_id, attempt_id, task_id, session_id, interaction_id, state, "
@@ -17424,6 +17454,7 @@ class SQLiteTaskStore(TaskStore):
                 )
                 encoded = receipt.model_dump_json(warnings=False)
                 self._update_task_snapshot_unlocked(updated)
+                self._record_schedule_transition_unlocked(task, updated)
                 self._connection.execute(
                     "INSERT INTO cayu_work_attempt_preparation_holds "
                     "(hold_id, task_id, request_sha256, receipt_json) VALUES (?, ?, ?, ?)",
@@ -17535,6 +17566,7 @@ class SQLiteTaskStore(TaskStore):
                 )
                 encoded = receipt.model_dump_json(warnings=False)
                 self._update_task_snapshot_unlocked(updated)
+                self._record_schedule_transition_unlocked(task, updated)
                 self._update_work_attempt_admission_unlocked(settled_admission)
                 self._connection.execute(
                     "INSERT INTO cayu_work_attempt_lifecycle_receipts "
@@ -18638,6 +18670,7 @@ class SQLiteTaskStore(TaskStore):
                 )
                 if updated != task:
                     self._update_task_snapshot_unlocked(updated)
+                    self._record_schedule_transition_unlocked(task, updated)
                 self._connection.execute(
                     "INSERT INTO cayu_completion_decision_application_receipts "
                     "(task_id, idempotency_key, decision_id, request_sha256, applied_at, "
@@ -18669,9 +18702,23 @@ class SQLiteTaskStore(TaskStore):
 
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
+        if request.schedule_policy is not None and not self.supports_task_scheduling:
+            raise NotImplementedError("This store does not support managed task scheduling.")
         async with self._lock:
             with self._verified_transaction_unlocked():
                 task_id = request.task_id or str(uuid4())
+                if request.schedule_policy is not None:
+                    existing = self._load_task_unlocked(task_id)
+                    if existing is not None:
+                        if (
+                            existing.schedule is None
+                            or existing.schedule.creation_sha256
+                            != schedule_creation_digest(request)
+                        ):
+                            raise TaskScheduleConflict(
+                                "Task schedule creation conflicts with retained intent."
+                            )
+                        return existing.model_copy(deep=True)
                 parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
                 if request.work_contract is not None:
                     contract = self._load_work_contract_unlocked(request.work_contract)
@@ -18693,9 +18740,233 @@ class SQLiteTaskStore(TaskStore):
                     supports_verified_work_contracts=True,
                 )
                 self._insert_task_unlocked(task)
+                self._record_schedule_transition_unlocked(None, task)
                 created = task.model_copy(deep=True)
         self._publish_task_admission_wakeup(task, now=admission_now)
         return created
+
+    def _record_schedule_transition_unlocked(
+        self, prior: Task | None, current: Task, *, operation_id: str | None = None
+    ) -> None:
+        if current.schedule is None:
+            return
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM cayu_task_schedule_events WHERE task_id = ?",
+            (current.id,),
+        ).fetchone()
+        events = schedule_transition_events(
+            prior, current, first_sequence=row[0] + 1, operation_id=operation_id
+        )
+        self._connection.executemany(
+            "INSERT INTO cayu_task_schedule_events (task_id, sequence, event_json) VALUES (?, ?, ?)",
+            [
+                (
+                    event.task_id,
+                    event.sequence,
+                    sqlite_support.json_dumps(event.model_dump(mode="json")),
+                )
+                for event in events
+            ],
+        )
+
+    async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
+        if type(request) is not TaskRescheduleRequest:
+            raise TypeError("A typed task reschedule request is required.")
+        request = revalidate_model_input(request, TaskRescheduleRequest)
+        digest = schedule_mutation_digest(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                row = self._connection.execute(
+                    "SELECT receipt_json FROM cayu_task_schedule_receipts "
+                    "WHERE task_id = ? AND operation_id = ?",
+                    (request.task_id, request.operation_id),
+                ).fetchone()
+                if row is not None:
+                    retained = TaskScheduleReceipt.model_validate_json(row[0])
+                    if retained.request_sha256 != digest:
+                        raise TaskScheduleConflict(
+                            "Schedule operation identity has different content."
+                        )
+                    return retained
+                current = self._require_task_unlocked(request.task_id)
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM cayu_local_execution_attempts "
+                        "WHERE task_id = ? AND retry_admissible = 0 LIMIT 1",
+                        (current.id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise TaskScheduleConflict("Task has unsettled execution authority.")
+                now = self._clock()
+                updated = rescheduled_task(current, request, now=now)
+                receipt = schedule_receipt(
+                    updated, request, now=now, kind=TaskScheduleEventType.RESCHEDULED
+                )
+                self._update_task_snapshot_unlocked(updated)
+                self._record_schedule_transition_unlocked(
+                    current, updated, operation_id=request.operation_id
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_task_schedule_receipts "
+                    "(task_id, operation_id, receipt_json) VALUES (?, ?, ?)",
+                    (
+                        request.task_id,
+                        request.operation_id,
+                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                    ),
+                )
+        self._publish_task_admission_broadcast()
+        return receipt
+
+    async def list_task_schedule_events(
+        self, task_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskScheduleEvent]:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        if type(after_sequence) is not int or not 0 <= after_sequence <= 9007199254740991:
+            raise ValueError("after_sequence must be a bounded nonnegative integer.")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Schedule event limit must be between 1 and 1000.")
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT event_json FROM cayu_task_schedule_events "
+                "WHERE task_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
+                (task_id, after_sequence, limit),
+            ).fetchall()
+            return [TaskScheduleEvent.model_validate_json(row[0]) for row in rows]
+
+    async def cancel_scheduled_task(
+        self, request: TaskScheduleCancelRequest
+    ) -> TaskScheduleReceipt:
+        if type(request) is not TaskScheduleCancelRequest:
+            raise TypeError("A typed task schedule cancellation is required.")
+        request = revalidate_model_input(request, TaskScheduleCancelRequest)
+        digest = schedule_mutation_digest(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                row = self._connection.execute(
+                    "SELECT receipt_json FROM cayu_task_schedule_receipts "
+                    "WHERE task_id = ? AND operation_id = ?",
+                    (request.task_id, request.operation_id),
+                ).fetchone()
+                if row is not None:
+                    retained = TaskScheduleReceipt.model_validate_json(row[0])
+                    if retained.request_sha256 != digest:
+                        raise TaskScheduleConflict(
+                            "Schedule operation identity has different content."
+                        )
+                    return retained
+                prior = self._require_task_unlocked(request.task_id)
+                state = require_schedule_mutation(prior, request.expected_revision)
+                updated = self._finish_task_in_transaction_unlocked(
+                    prior.id, TaskStatus.CANCELLED, result=None, error=None
+                )
+                updated = updated.model_copy(
+                    update={
+                        "schedule": state.model_copy(
+                            update={"revision": schedule_revision_after(state)}
+                        )
+                    }
+                )
+                self._update_task_snapshot_unlocked(updated)
+                # Native retry cancellation may have persisted a receipt in this
+                # same transaction. Its task must name the accepted schedule revision.
+                if updated.retry_series is not None and updated.status is TaskStatus.CANCELLED:
+                    assert updated.status_payload is not None
+                    settlement_key = updated.status_payload["settlement_idempotency_key"]
+                    row = self._connection.execute(
+                        "SELECT receipt_json FROM cayu_task_retry_settlements "
+                        "WHERE task_id = ? AND idempotency_key = ?",
+                        (updated.id, settlement_key),
+                    ).fetchone()
+                    if row is None:
+                        raise TaskScheduleConflict("Retry cancellation has no settlement evidence.")
+                    settled = TaskRetrySettlementResult.model_validate_json(row[0])
+                    if settled.task.model_copy(update={"schedule": updated.schedule}) != updated:
+                        raise TaskScheduleConflict("Retry settlement has contradictory authority.")
+                    settled = settled.model_copy(update={"task": updated})
+                    self._connection.execute(
+                        "UPDATE cayu_task_retry_settlements SET receipt_json = ? "
+                        "WHERE task_id = ? AND idempotency_key = ?",
+                        (
+                            sqlite_support.json_dumps(settled.model_dump(mode="json")),
+                            updated.id,
+                            settlement_key,
+                        ),
+                    )
+                receipt = schedule_receipt(
+                    updated,
+                    request,
+                    now=updated.updated_at,
+                    kind=TaskScheduleEventType.CANCELLED
+                    if updated.status is TaskStatus.CANCELLED
+                    else TaskScheduleEventType.CANCELLATION_REQUESTED,
+                )
+                self._record_schedule_transition_unlocked(
+                    prior, updated, operation_id=request.operation_id
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_task_schedule_receipts (task_id, operation_id, receipt_json) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        updated.id,
+                        request.operation_id,
+                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                    ),
+                )
+                return receipt
+
+    async def next_task_schedule_wakeup(self, query: TaskQuery | None = None) -> TaskScheduleWakeup:
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                now = self._clock()
+                if query.status is not None and query.status is not TaskStatus.PENDING:
+                    return TaskScheduleWakeup(as_of=now)
+                clauses, params = self._task_filter_clauses(
+                    query.model_copy(update={"status": None})
+                )
+                scope = " AND ".join(
+                    [
+                        "session_id IS NULL",
+                        "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                        "WHERE attempt.retry_admissible = 0 AND (attempt.task_id = cayu_tasks.id OR "
+                        "(cayu_tasks.retry_series_json IS NOT NULL AND attempt.retry_series_id = "
+                        "json_extract(cayu_tasks.retry_series_json, '$.series_id'))))",
+                        *clauses,
+                    ]
+                )
+                stamp = sqlite_support.format_datetime(now)
+                due = self._connection.execute(
+                    f"SELECT MIN(available_at) FROM cayu_tasks WHERE {scope} "
+                    "AND status = 'pending' AND available_at > ? "
+                    "AND (schedule_json IS NULL OR json_extract(schedule_json, '$.admitted_at') IS NULL) "
+                    "AND (retry_series_json IS NULL OR json_extract(retry_series_json, '$.elapsed_deadline') IS NULL "
+                    "OR julianday(json_extract(retry_series_json, '$.elapsed_deadline')) > julianday(?))",
+                    [*params, stamp, stamp],
+                ).fetchone()[0]
+                # JSON uses Z whereas column timestamps use +00:00. Normalize
+                # the UTC suffix, including before MIN, without rounding away
+                # microseconds through SQLite's date/time functions.
+                expiry, maintenance = self._connection.execute(
+                    "SELECT MIN(CASE WHEN replace(json_extract(schedule_json, '$.policy.expires_at'), 'Z', '+00:00') > ? "
+                    "THEN replace(json_extract(schedule_json, '$.policy.expires_at'), 'Z', '+00:00') END), "
+                    "COALESCE(MAX(CASE WHEN replace(json_extract(schedule_json, '$.policy.expires_at'), 'Z', '+00:00') <= ? "
+                    "OR (json_extract(schedule_json, '$.policy.misfire_policy') = 'skip' AND "
+                    "(julianday(?) - julianday(available_at)) * 86400 > "
+                    "json_extract(schedule_json, '$.policy.misfire_grace_seconds')) THEN 1 ELSE 0 END), 0) "
+                    f"FROM cayu_tasks WHERE {scope} "
+                    "AND status IN ('pending', 'paused', 'blocked', 'needs_attention') "
+                    "AND schedule_json IS NOT NULL AND json_extract(schedule_json, '$.admitted_at') IS NULL",
+                    [stamp, stamp, stamp, *params],
+                ).fetchone()
+                return TaskScheduleWakeup(
+                    as_of=now,
+                    next_available_at=sqlite_support.parse_optional_datetime(due),
+                    next_expiry_at=sqlite_support.parse_optional_datetime(expiry),
+                    maintenance_required=bool(maintenance),
+                )
 
     async def create_running_task(
         self,
@@ -18761,9 +19032,10 @@ class SQLiteTaskStore(TaskStore):
                     completed_at,
                     invocation_json,
                     retry_series_json,
-                    work_contract_json
+                    work_contract_json,
+                    schedule_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_support.task_to_row_values(task),
             )
@@ -19363,6 +19635,7 @@ class SQLiteTaskStore(TaskStore):
                     }
                 )
                 self._update_task_snapshot_unlocked(updated)
+                self._record_schedule_transition_unlocked(task, updated)
                 return updated.model_copy(deep=True)
 
     async def attach_task(
@@ -19434,6 +19707,7 @@ class SQLiteTaskStore(TaskStore):
                     }
                 )
                 self._update_task_snapshot_unlocked(updated)
+                self._record_schedule_transition_unlocked(task, updated)
                 return updated.model_copy(deep=True)
 
     async def complete_task(
@@ -19609,6 +19883,7 @@ class SQLiteTaskStore(TaskStore):
                         now=now,
                     )
                 terminal_task = self._require_task_unlocked(request.task_id)
+                self._record_schedule_transition_unlocked(task, terminal_task)
                 self._connection.execute(
                     "INSERT INTO cayu_task_terminalization_receipts "
                     "(task_id, idempotency_key, request_sha256, worker_id, "
@@ -19720,6 +19995,7 @@ class SQLiteTaskStore(TaskStore):
                     error=request.error,
                     worker_id=None,
                 )
+                self._record_schedule_transition_unlocked(task, terminal_task)
                 self._connection.execute(
                     "INSERT INTO cayu_task_terminalization_receipts "
                     "(task_id, idempotency_key, request_sha256, worker_id, "
@@ -20281,6 +20557,7 @@ class SQLiteTaskStore(TaskStore):
                         "Task cancellation reconciliation lost its fenced transition.",
                     )
                 durable_task = self._require_task_unlocked(request.task_id)
+                self._record_schedule_transition_unlocked(task, durable_task)
                 receipt = result.terminalization_receipt.model_copy(
                     update={"task": durable_task},
                     deep=True,
@@ -20408,8 +20685,8 @@ class SQLiteTaskStore(TaskStore):
                             status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
-                            work_contract_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            work_contract_json, schedule_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_support.task_to_row_values(successor),
                     )
@@ -20422,6 +20699,9 @@ class SQLiteTaskStore(TaskStore):
                     events=_task_retry_events(settled, occurred_at=now),
                     committed_at=now,
                 )
+                self._record_schedule_transition_unlocked(task, settled)
+                if successor is not None:
+                    self._record_schedule_transition_unlocked(None, successor)
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -20584,6 +20864,7 @@ class SQLiteTaskStore(TaskStore):
                         request,
                         "Task retry cancellation reconciliation lost its fenced transition.",
                     )
+                self._record_schedule_transition_unlocked(task, settled)
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -20669,6 +20950,7 @@ class SQLiteTaskStore(TaskStore):
                 )
                 if cursor.rowcount != 1:
                     self._raise_task_active_lease_error(task_id, worker_id, now=lease_now)
+                self._record_schedule_transition_unlocked(task, settled)
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -20725,12 +21007,14 @@ class SQLiteTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         copied_error = None if error is None else copy_durable_json_object(error, "error")
         async with self._lock:
-            return self._finish_task_unlocked(
-                task_id,
-                TaskStatus.CANCELLED,
-                result=None,
-                error=copied_error,
-            )
+            with self._verified_transaction_unlocked():
+                if self._require_task_unlocked(task_id).schedule is not None:
+                    raise TaskScheduleConflict(
+                        "Managed schedule cancellation requires its revision."
+                    )
+                return self._finish_task_in_transaction_unlocked(
+                    task_id, TaskStatus.CANCELLED, result=None, error=copied_error
+                )
 
     async def request_claimed_task_cancellation(
         self,
@@ -20761,8 +21045,9 @@ class SQLiteTaskStore(TaskStore):
                         error=copied_error,
                     )
                     self._update_task_snapshot_unlocked(requested)
+                    self._record_schedule_transition_unlocked(current, requested)
                     return requested.model_copy(deep=True)
-                return self._finish_task_in_transaction_unlocked(
+                updated = self._finish_task_in_transaction_unlocked(
                     task_id,
                     TaskStatus.CANCELLED,
                     result=None,
@@ -20771,6 +21056,8 @@ class SQLiteTaskStore(TaskStore):
                     handoff_id=current.interrupted_handoff_id,
                     expected_lease_expires_at=expected_lease,
                 )
+                self._record_schedule_transition_unlocked(current, updated)
+                return updated
 
     async def mark_claimed_task_execution_started(
         self,
@@ -20803,6 +21090,7 @@ class SQLiteTaskStore(TaskStore):
                     return current.model_copy(deep=True)
                 started = current.model_copy(update={"started_at": now, "updated_at": now})
                 self._update_task_snapshot_unlocked(started)
+                self._record_schedule_transition_unlocked(current, started)
                 return started.model_copy(deep=True)
 
     async def pause_task(
@@ -20851,6 +21139,7 @@ class SQLiteTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             with self._verified_transaction_unlocked():
+                prior = self._require_task_unlocked(task_id)
                 now = self._ownership_clock()
                 if (
                     self._connection.execute(
@@ -20888,6 +21177,10 @@ class SQLiteTaskStore(TaskStore):
                         task_id,
                     ),
                 )
+                if cursor.rowcount == 1:
+                    updated = self._require_task_unlocked(task_id)
+                    self._record_schedule_transition_unlocked(prior, updated)
+                    return updated.model_copy(deep=True)
             if cursor.rowcount != 1:
                 if (
                     self._connection.execute(
@@ -20954,6 +21247,7 @@ class SQLiteTaskStore(TaskStore):
                 availability_now = self._clock()
                 now = self._ownership_clock()
                 lease_expires_at = now + timedelta(seconds=lease_seconds)
+                self._expire_held_schedules_unlocked(query, as_of=availability_now, now=now)
                 expired_rows = self._connection.execute(
                     """
                     SELECT id
@@ -21031,13 +21325,14 @@ class SQLiteTaskStore(TaskStore):
                             sqlite_support.format_datetime(expiration.committed_at),
                         ),
                     )
-                row = self._connection.execute(
+                    self._record_schedule_transition_unlocked(expired_task, expiration.task)
+                rows = self._connection.execute(
                     f"""
                     SELECT id
                     FROM cayu_tasks
                     WHERE {where_sql}
                     ORDER BY {order_sql}, id ASC
-                    LIMIT 1
+                    LIMIT 100
                     """,
                     [
                         str(TaskStatus.PENDING),
@@ -21049,11 +21344,32 @@ class SQLiteTaskStore(TaskStore):
                         ),
                         *params,
                     ],
-                ).fetchone()
-                if row is None:
+                ).fetchall()
+                prior: Task | None = None
+                for row in rows:
+                    candidate = self._require_task_unlocked(row["id"])
+                    if candidate.schedule is not None and candidate.schedule.admitted_at is None:
+                        assert candidate.available_at is not None
+                        eligibility = task_schedule_eligibility(
+                            available_at=candidate.available_at,
+                            policy=candidate.schedule.policy,
+                            as_of=availability_now,
+                        )
+                        if eligibility in {
+                            TaskScheduleEligibility.EXPIRED,
+                            TaskScheduleEligibility.SKIPPED,
+                        }:
+                            self._settle_schedule_nonexecution_unlocked(
+                                candidate, eligibility, now=now
+                            )
+                            continue
+                    prior = candidate
+                    break
+                if prior is None:
                     self._connection.commit()
                     return None
-                task_id = row["id"]
+                task_id = prior.id
+                schedule = admitted_schedule(prior, now=availability_now)
                 cursor = self._connection.execute(
                     """
                     UPDATE cayu_tasks
@@ -21076,11 +21392,64 @@ class SQLiteTaskStore(TaskStore):
                     self._connection.rollback()
                     return None
                 updated = self._require_task_unlocked(task_id)
+                if schedule is not None:
+                    updated = updated.model_copy(update={"schedule": schedule})
+                    self._update_task_snapshot_unlocked(updated)
+                    self._record_schedule_transition_unlocked(prior, updated)
                 self._connection.commit()
                 return updated.model_copy(deep=True)
-            except Exception:
+            except BaseException:
                 self._connection.rollback()
                 raise
+
+    def _settle_schedule_nonexecution_unlocked(
+        self, task: Task, eligibility: TaskScheduleEligibility, *, now: datetime
+    ) -> None:
+        terminal, settlement = _scheduled_task_nonexecution(task, eligibility=eligibility, now=now)
+        self._update_task_snapshot_unlocked(terminal)
+        self._record_schedule_transition_unlocked(task, terminal)
+        if settlement is not None:
+            self._connection.execute(
+                "INSERT INTO cayu_task_retry_settlements "
+                "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    settlement.task_id,
+                    settlement.idempotency_key,
+                    settlement.request_sha256,
+                    sqlite_support.json_dumps(settlement.model_dump(mode="json")),
+                    sqlite_support.format_datetime(settlement.committed_at),
+                ),
+            )
+
+    def _expire_held_schedules_unlocked(
+        self, query: TaskQuery, *, as_of: datetime, now: datetime
+    ) -> None:
+        clauses, params = self._task_filter_clauses(query.model_copy(update={"status": None}))
+        scope = " AND ".join(["session_id IS NULL", *clauses])
+        stamp = sqlite_support.format_datetime(as_of)
+        rows = self._connection.execute(
+            f"SELECT id FROM cayu_tasks WHERE {scope} "
+            "AND status IN ('paused', 'blocked', 'needs_attention') "
+            "AND schedule_json IS NOT NULL AND json_extract(schedule_json, '$.admitted_at') IS NULL "
+            "AND (replace(json_extract(schedule_json, '$.policy.expires_at'), 'Z', '+00:00') <= ? OR "
+            "(json_extract(schedule_json, '$.policy.misfire_policy') = 'skip' AND "
+            "(julianday(?) - julianday(available_at)) * 86400 >= "
+            "json_extract(schedule_json, '$.policy.misfire_grace_seconds'))) "
+            "AND NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+            "WHERE attempt.retry_admissible = 0 AND (attempt.task_id = cayu_tasks.id OR "
+            "(cayu_tasks.retry_series_json IS NOT NULL AND attempt.retry_series_id = "
+            "json_extract(cayu_tasks.retry_series_json, '$.series_id')))) "
+            "ORDER BY available_at, id LIMIT 100",
+            [*params, stamp, stamp],
+        ).fetchall()
+        for row in rows:
+            task = self._require_task_unlocked(row["id"])
+            assert task.schedule is not None and task.available_at is not None
+            eligibility = task_schedule_eligibility(
+                available_at=task.available_at, policy=task.schedule.policy, as_of=as_of
+            )
+            if eligibility in {TaskScheduleEligibility.EXPIRED, TaskScheduleEligibility.SKIPPED}:
+                self._settle_schedule_nonexecution_unlocked(task, eligibility, now=now)
 
     async def heartbeat(
         self,
@@ -21213,6 +21582,7 @@ class SQLiteTaskStore(TaskStore):
                     )
                     self._raise_task_release_error(task_id, worker_id, now=now)
                 updated = self._require_task_unlocked(task_id)
+                self._record_schedule_transition_unlocked(task, updated)
                 return updated.model_copy(deep=True)
 
     async def release_attached_task_worker(
@@ -21346,6 +21716,7 @@ class SQLiteTaskStore(TaskStore):
                             updated_at=now,
                         )
                         self._update_task_snapshot_unlocked(requested)
+                        self._record_schedule_transition_unlocked(task, requested)
                         continue
                     updated = task.model_copy(
                         update={
@@ -21356,6 +21727,7 @@ class SQLiteTaskStore(TaskStore):
                         }
                     )
                     self._update_task_snapshot_unlocked(updated)
+                    self._record_schedule_transition_unlocked(task, updated)
                     reclaimed.append(updated)
                 self._connection.commit()
                 return [task.model_copy(deep=True) for task in reclaimed]
@@ -21450,7 +21822,8 @@ class SQLiteTaskStore(TaskStore):
         expected_lease_expires_at: datetime | None = None,
     ) -> Task:
         with self._verified_transaction_unlocked():
-            return self._finish_task_in_transaction_unlocked(
+            prior = self._require_task_unlocked(task_id)
+            updated = self._finish_task_in_transaction_unlocked(
                 task_id,
                 status,
                 result=result,
@@ -21459,6 +21832,8 @@ class SQLiteTaskStore(TaskStore):
                 handoff_id=handoff_id,
                 expected_lease_expires_at=expected_lease_expires_at,
             )
+            self._record_schedule_transition_unlocked(prior, updated)
+            return updated
 
     def _finish_task_in_transaction_unlocked(
         self,
@@ -21728,6 +22103,7 @@ class SQLiteTaskStore(TaskStore):
         payload = _copy_optional_status_payload(payload)
         async with self._lock:
             with self._verified_transaction_unlocked():
+                prior = self._require_task_unlocked(task_id)
                 now = self._ownership_clock()
                 if (
                     self._connection.execute(
@@ -21795,6 +22171,7 @@ class SQLiteTaskStore(TaskStore):
                     _ensure_can_hold_task(task, status)
                     raise ValueError(f"Task {task.id} cannot transition to {status}")
                 updated = self._require_task_unlocked(task_id)
+                self._record_schedule_transition_unlocked(prior, updated)
                 return updated.model_copy(deep=True)
 
     def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]:

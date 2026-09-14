@@ -30,6 +30,7 @@ from cayu.tasks.contracts import (
     WorkCompletionConflict,
     WorkContractConflict,
 )
+from cayu.tasks.scheduling import TaskScheduleConflict
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
@@ -488,6 +489,7 @@ def _detached_task_store_failure(
         TaskCompletionDecisionRequired,
         WorkContractConflict,
         WorkCompletionConflict,
+        TaskScheduleConflict,
         ValueError,
         TypeError,
         NotImplementedError,
@@ -648,6 +650,7 @@ def _generic_task_store_failure(
         TaskCompletionDecisionRequired,
         WorkContractConflict,
         WorkCompletionConflict,
+        TaskScheduleConflict,
         ValueError,
         TypeError,
         NotImplementedError,

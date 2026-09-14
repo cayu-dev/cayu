@@ -6457,6 +6457,15 @@ def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
     claim_calls = 0
     metrics = DurableWorkerMetrics(configured_handler_capacity=100)
     original_claim = h.tasks.claim_task
+    schedule_reads = 0
+    original_schedule_wakeup = h.tasks.next_task_schedule_wakeup
+
+    async def observe_schedule(query=None):
+        nonlocal schedule_reads
+        schedule_reads += 1
+        return await original_schedule_wakeup(query)
+
+    monkeypatch.setattr(h.tasks, "next_task_schedule_wakeup", observe_schedule)
 
     async def count_claims(worker_id, query=None, *, lease_seconds=300):
         nonlocal claim_calls
@@ -6498,6 +6507,7 @@ def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
             await asyncio.wait_for(empty_claim.wait(), timeout=1)
             await asyncio.sleep(0.15)
             assert 2 <= claim_calls <= 10
+            assert 0 < schedule_reads <= claim_calls * len(h.dispatcher._claim_task_types())
         finally:
             stop.set()
             await asyncio.gather(*workers)

@@ -52,6 +52,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_json_text,
     require_unicode_scalar_text,
+    revalidate_model_input,
 )
 from cayu.approvals.review import (
     HumanReviewContext,
@@ -338,6 +339,8 @@ from cayu.server.contracts import (
     ApiSessionDetail,
     ApiTaskDetail,
     ApiTaskListItem,
+    ApiTaskScheduleEvent,
+    ApiTaskScheduleReceipt,
     ArtifactReadResponse,
     ArtifactsResponse,
     CapturedEvaluationConversion,
@@ -516,6 +519,13 @@ from cayu.tasks.base import (
     TaskTopologyTraversalLimitExceeded,
     decode_task_topology_cursor,
     task_create_with_runtime_invocation,
+)
+from cayu.tasks.scheduling import (
+    TaskRescheduleRequest,
+    TaskScheduleCancelRequest,
+    TaskScheduleConflict,
+    TaskScheduleReceipt,
+    TaskScheduleState,
 )
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
@@ -970,6 +980,17 @@ class _BoundedSessionTopologyRoute(_BoundedPrivateJsonBodyRoute):
     max_request_bytes = MAX_SESSION_TOPOLOGY_REQUEST_BYTES
     invalid_request_detail = "Invalid session topology request."
     oversized_request_detail = "Session topology request exceeds the server byte limit."
+
+
+def _task_schedule_route_class(auth: AuthDependency | None) -> type[APIRoute]:
+    class PrivateTaskScheduleRoute(_BoundedPrivateJsonBodyRoute):
+        max_request_bytes = 8192
+        invalid_request_detail = "Invalid task schedule request."
+        oversized_request_detail = "Task schedule request exceeds the server byte limit."
+        reject_duplicate_json_keys = True
+        preparse_auth = None if auth is None else staticmethod(auth)
+
+    return PrivateTaskScheduleRoute
 
 
 def _private_tool_discovery_view_route_class(cayu_app: Any) -> type[APIRoute]:
@@ -3719,6 +3740,36 @@ def _serialize_transcript_message(
     }
 
 
+def _serialize_task_schedule(schedule: TaskScheduleState) -> dict[str, Any]:
+    # Only validated finite controls and timestamps are public. Content hashes
+    # remain private: they identify accepted intent, not display information.
+    schedule = revalidate_model_input(schedule, TaskScheduleState)
+    return {
+        "schema_version": schedule.schema_version,
+        "revision": schedule.revision,
+        "admitted_at": schedule.admitted_at.isoformat() if schedule.admitted_at else None,
+        "policy": {
+            "expires_at": (
+                schedule.policy.expires_at.isoformat() if schedule.policy.expires_at else None
+            ),
+            "misfire_policy": schedule.policy.misfire_policy.value,
+            "misfire_grace_seconds": schedule.policy.misfire_grace_seconds,
+        },
+    }
+
+
+def _serialize_task_schedule_receipt(cayu_app: Any, receipt: TaskScheduleReceipt) -> dict[str, Any]:
+    return {
+        "task_id": cayu_app.redact_json(receipt.task_id),
+        "operation_id": cayu_app.redact_json(receipt.operation_id),
+        "expected_revision": receipt.expected_revision,
+        "schedule": _serialize_task_schedule(receipt.schedule),
+        "available_at": receipt.available_at.isoformat(),
+        "committed_at": receipt.committed_at.isoformat(),
+        "type": receipt.type.value,
+    }
+
+
 def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
     projected = _redact_control_plane_values(
         cayu_app,
@@ -3768,6 +3819,7 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
         "retry_series": (
             None if task.retry_series is None else _serialize_task_retry_series(cayu_app, task)
         ),
+        "schedule": None if task.schedule is None else _serialize_task_schedule(task.schedule),
     }
 
 
@@ -11506,6 +11558,104 @@ def create_router(
         if task_store is None:
             raise HTTPException(status_code=404, detail="Task store is not configured.")
         return task_store
+
+    async def _apply_schedule_mutation(body: TaskRescheduleRequest | TaskScheduleCancelRequest):
+        await _require_task_store()
+        try:
+            if isinstance(body, TaskRescheduleRequest):
+                receipt = await cayu_app.reschedule_task(body)
+            else:
+                receipt = await cayu_app.cancel_scheduled_task(body)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Scheduled task was not found.") from None
+        except TaskScheduleConflict:
+            raise HTTPException(
+                status_code=409, detail="Task schedule authority conflicts."
+            ) from None
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail="Task schedule request is invalid."
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="Task schedule mutation is unavailable."
+            ) from None
+        return _serialize_task_schedule_receipt(cayu_app, receipt)
+
+    async def reschedule_task(body: TaskRescheduleRequest):
+        return await _apply_schedule_mutation(body)
+
+    async def cancel_scheduled_task(body: TaskScheduleCancelRequest):
+        return await _apply_schedule_mutation(body)
+
+    async def list_task_schedule_events(
+        task_id: NonBlankString,
+        after_sequence: int = Query(default=0, ge=0, le=9007199254740991),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        await _require_task_store()
+        try:
+            events = await cayu_app.list_task_schedule_events(
+                task_id, after_sequence=after_sequence, limit=limit
+            )
+        except TaskScheduleConflict:
+            raise HTTPException(
+                status_code=503, detail="Schedule history is unavailable."
+            ) from None
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail="Schedule history is unavailable."
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="Schedule history is unavailable."
+            ) from None
+        return [
+            {
+                "task_id": cayu_app.redact_json(event.task_id),
+                "sequence": event.sequence,
+                "type": event.type.value,
+                "revision": event.revision,
+                "occurred_at": event.occurred_at.isoformat(),
+                "available_at": event.available_at.isoformat(),
+                "policy": {
+                    "expires_at": (
+                        event.policy.expires_at.isoformat() if event.policy.expires_at else None
+                    ),
+                    "misfire_policy": event.policy.misfire_policy.value,
+                    "misfire_grace_seconds": event.policy.misfire_grace_seconds,
+                },
+                "invocation_id": cayu_app.redact_json(event.invocation_id),
+                "operation_id": cayu_app.redact_json(event.operation_id),
+            }
+            for event in events
+        ]
+
+    router.add_api_route(
+        "/tasks/{task_id}/schedule/events",
+        list_task_schedule_events,
+        methods=["GET"],
+        dependencies=protected,
+        response_model=list[ApiTaskScheduleEvent],
+        route_class_override=_task_schedule_route_class(auth),
+    )
+
+    router.add_api_route(
+        "/tasks/schedule/reschedule",
+        reschedule_task,
+        methods=["POST"],
+        dependencies=protected,
+        response_model=ApiTaskScheduleReceipt,
+        route_class_override=_task_schedule_route_class(auth),
+    )
+    router.add_api_route(
+        "/tasks/schedule/cancel",
+        cancel_scheduled_task,
+        methods=["POST"],
+        dependencies=protected,
+        response_model=ApiTaskScheduleReceipt,
+        route_class_override=_task_schedule_route_class(auth),
+    )
 
     @router.get(
         "/tasks/{task_id}",

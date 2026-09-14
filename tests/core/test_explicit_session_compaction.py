@@ -663,7 +663,9 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
             return [event async for event in app.compact_session(request)]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(store.blocked.wait(), timeout=1)
+        # Startup includes profile/budget preparation; it is not the bounded
+        # cancellation behavior measured after this publication barrier.
+        await asyncio.wait_for(store.blocked.wait(), timeout=5)
         task.cancel("cancel stalled explicit compaction publication")
         assert task.cancelling() == 1
         await asyncio.wait_for(store.child_cancellation_observed.wait(), timeout=1)

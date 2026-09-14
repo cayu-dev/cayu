@@ -143,6 +143,10 @@ class _BillingIdentityCompletedProvider(_CompletedProvider):
 
 class _CrashBeforeFirstReconciliation(InMemoryBudgetLedger):
     def __init__(self, *, clock=None) -> None:
+        # Reach the intended post-publication crash even on slow workers.
+        # Tests about expiration supply and advance their own clock explicitly.
+        if clock is None:
+            clock = _MutableClock(datetime.now(UTC))
         super().__init__(clock=clock, reservation_ttl_seconds=1)
         self.crash_enabled = True
 

@@ -14,6 +14,8 @@ TASK_CLOSURE_DEPENDENCIES = frozenset(
         ("cayu_local_execution_attempts", "task_id"),
         ("cayu_work_attempt_preparation_holds", "task_id"),
         ("cayu_work_attempt_lifecycle_receipts", "task_id"),
+        ("cayu_task_schedule_receipts", "task_id"),
+        ("cayu_task_schedule_events", "task_id"),
     }
 )
 

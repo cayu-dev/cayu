@@ -99,6 +99,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
+from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     InterruptedTaskContinuationClaimPage,
     Task,
@@ -597,6 +598,11 @@ async def run_task_worker(
                     activity=True,
                 )
             wake_deadlines: list[float] = []
+            # Only the cohort's admitted poller inspects durable deadlines. An
+            # idle handler denied a poll turn must not create another DB poll.
+            schedule_deadline = (
+                await next_schedule_wake_at(task_store, (query,)) if poller.last_attempted else None
+            )
             if recovered_interrupted_task_handler is not None and continuation_after is None:
                 wake_deadlines.append(next_interrupted_continuation_scan_at)
             if (
@@ -611,6 +617,7 @@ async def run_task_worker(
                 handled=handled_this_step,
                 idle=True,
                 next_wake_at=min(wake_deadlines) if wake_deadlines else None,
+                next_claim_at=schedule_deadline,
                 activity=meaningful_activity,
             )
         record_task_admission_to_claim_latency(

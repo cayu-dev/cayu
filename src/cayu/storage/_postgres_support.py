@@ -32,6 +32,7 @@ from cayu.tasks.base import (
     TaskTopologyNode,
 )
 from cayu.tasks.contracts import WorkContractRef
+from cayu.tasks.scheduling import TaskScheduleState
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,
@@ -819,6 +820,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
             if task.work_contract is None
             else _dumps(task.work_contract.model_dump(mode="json", warnings=False))
         ),
+        None if task.schedule is None else _dumps(task.schedule.model_dump(mode="json")),
     )
 
 
@@ -826,7 +828,7 @@ TASK_COLUMNS = (
     "id, type, title, description, status, session_id, session_instance_id, parent_task_id, "
     "assigned_agent_name, available_at, worker_id, lease_expires_at, interrupted_handoff_id, "
     "status_reason, status_payload, input, result, error, metadata, created_at, updated_at, "
-    "started_at, completed_at, invocation, retry_series, work_contract"
+    "started_at, completed_at, invocation, retry_series, work_contract, schedule"
 )
 
 
@@ -862,6 +864,7 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         work_contract=(
             None if row[25] is None else WorkContractRef.model_validate(_loads(row[25]))
         ),
+        schedule=None if row[26] is None else TaskScheduleState.model_validate(_loads(row[26])),
     )
 
 

@@ -735,6 +735,10 @@ class DurableWorkerPoller:
             random_source=self._random_source,
         )
 
+    def note_scheduled_claim(self) -> None:
+        """Audit due work without treating a local timer as a received wake hint."""
+        self._forced = True
+
     def next_wake_at(self) -> float:
         now = self._clock()
         return self._group._deadline(self._token, now=now, forced=self._forced)
@@ -761,6 +765,7 @@ class DurableWorkerStep:
     continue_immediately: bool = False
     stop: bool = False
     next_wake_at: float | None = None
+    next_claim_at: float | None = None
     activity: bool = False
 
     def __post_init__(self) -> None:
@@ -775,6 +780,11 @@ class DurableWorkerStep:
                 raise ValueError("next_wake_at must be finite and non-negative.")
             if not self.idle:
                 raise ValueError("next_wake_at requires an idle worker step.")
+        if self.next_claim_at is not None:
+            if not isfinite(self.next_claim_at) or self.next_claim_at < 0:
+                raise ValueError("next_claim_at must be finite and non-negative.")
+            if not self.idle:
+                raise ValueError("next_claim_at requires an idle worker step.")
 
 
 @dataclass
@@ -983,11 +993,28 @@ async def run_durable_worker_loop(
             if adapter_wait_s < idle_wait_s:
                 idle_wait_s = adapter_wait_s
                 fallback_poll_due = False
+        if outcome.next_claim_at is not None:
+            claim_wait_s = max(outcome.next_claim_at - now, 0.0)
+            if claim_wait_s < idle_wait_s:
+                idle_wait_s = claim_wait_s
+                fallback_poll_due = False
         if idle_wait_s == 0:
+            if (
+                poller is not None
+                and outcome.next_claim_at is not None
+                and outcome.next_claim_at <= now
+            ):
+                poller.note_scheduled_claim()
             continue
         wait_result = _normalize_worker_wait_result(await wait(idle_wait_s, stop))
         if wait_result is DurableWorkerWaitResult.STOP:
             break
+        if (
+            poller is not None
+            and outcome.next_claim_at is not None
+            and outcome.next_claim_at <= worker_clock()
+        ):
+            poller.note_scheduled_claim()
         if (
             metrics is not None
             and fallback_poll_due

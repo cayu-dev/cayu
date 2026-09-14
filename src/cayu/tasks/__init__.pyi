@@ -175,6 +175,17 @@ from cayu.tasks.dispatch import InlineDispatcher as InlineDispatcher
 from cayu.tasks.dispatch import TaskStoreDispatcher as TaskStoreDispatcher
 from cayu.tasks.dispatch import copy_dispatch_handle as copy_dispatch_handle
 from cayu.tasks.dispatch import copy_dispatch_request as copy_dispatch_request
+from cayu.tasks.scheduling import TaskMisfirePolicy as TaskMisfirePolicy
+from cayu.tasks.scheduling import TaskRescheduleRequest as TaskRescheduleRequest
+from cayu.tasks.scheduling import TaskScheduleCancelRequest as TaskScheduleCancelRequest
+from cayu.tasks.scheduling import TaskScheduleConflict as TaskScheduleConflict
+from cayu.tasks.scheduling import TaskScheduleEligibility as TaskScheduleEligibility
+from cayu.tasks.scheduling import TaskScheduleEvent as TaskScheduleEvent
+from cayu.tasks.scheduling import TaskScheduleEventType as TaskScheduleEventType
+from cayu.tasks.scheduling import TaskSchedulePolicy as TaskSchedulePolicy
+from cayu.tasks.scheduling import TaskScheduleReceipt as TaskScheduleReceipt
+from cayu.tasks.scheduling import TaskScheduleState as TaskScheduleState
+from cayu.tasks.scheduling import TaskScheduleWakeup as TaskScheduleWakeup
 from cayu.tasks.worker import TaskHandlerOutcome as TaskHandlerOutcome
 from cayu.tasks.worker import complete_managed_task as complete_managed_task
 from cayu.tasks.worker import fail_managed_task as fail_managed_task

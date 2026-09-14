@@ -49,6 +49,7 @@ from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
 )
+from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
@@ -67,6 +68,7 @@ from cayu.tasks.base import (
     prepare_interrupted_task_handoff,
 )
 from cayu.tasks.contracts import WorkContractRef
+from cayu.tasks.scheduling import TaskScheduleState
 
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -967,6 +969,7 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    90: SQLITE_SCHEDULING_DDL,
     81: """
         CREATE TABLE IF NOT EXISTS cayu_event_watcher_settlements (
             watcher_name TEXT NOT NULL,
@@ -4487,6 +4490,15 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    90: (
+        (
+            "cayu_tasks",
+            "schedule_json",
+            "TEXT CHECK (schedule_json IS NULL OR "
+            "(json_valid(schedule_json) AND json_type(schedule_json) = 'object' "
+            "AND length(CAST(schedule_json AS BLOB)) BETWEEN 1 AND 32768))",
+        ),
+    ),
     4: (
         ("cayu_tasks", "worker_id", "TEXT"),
         ("cayu_tasks", "lease_expires_at", "TEXT"),
@@ -11167,6 +11179,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
             if task.work_contract is None
             else json_dumps(task.work_contract.model_dump(mode="json", warnings=False))
         ),
+        None if task.schedule is None else json_dumps(task.schedule.model_dump(mode="json")),
     )
 
 
@@ -11208,6 +11221,11 @@ def task_from_row(row: sqlite3.Row) -> Task:
             None
             if row["work_contract_json"] is None
             else WorkContractRef.model_validate(json.loads(row["work_contract_json"]))
+        ),
+        schedule=(
+            None
+            if row["schedule_json"] is None
+            else TaskScheduleState.model_validate(json.loads(row["schedule_json"]))
         ),
     )
 

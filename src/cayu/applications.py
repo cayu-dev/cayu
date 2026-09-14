@@ -237,6 +237,11 @@ from cayu.runtime._model_step_executor import (
     ModelStepLimitEvaluationRequest,
     model_completion_recovery_context_from_stage,
 )
+from cayu.runtime._public_task_scheduling import (
+    create_scheduled_task,
+    inspect_task_schedule_events,
+    publish_task_schedule,
+)
 from cayu.runtime._recovery_coordinator import (
     ProviderOperationFailureRequest,
     RecoveryAbandonedTurnRequest,
@@ -499,6 +504,7 @@ from cayu.storage.memory import (
     KnowledgeStore,
     copy_knowledge_access_scope,
 )
+from cayu.tasks._scheduling import schedule_creation_digest
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
     WORK_ATTEMPT_RENEWABLE_STATES,
@@ -570,6 +576,12 @@ from cayu.tasks.dispatch import (
     copy_dispatch_handle,
     copy_dispatch_request,
     redact_dispatch_request,
+)
+from cayu.tasks.scheduling import (
+    TaskRescheduleRequest,
+    TaskScheduleCancelRequest,
+    TaskScheduleEvent,
+    TaskScheduleReceipt,
 )
 from cayu.tools.base import (
     DurableToolRecovery,
@@ -6538,12 +6550,21 @@ class CayuApp:
             raise NotImplementedError(
                 f"{type(self.task_store).__name__} does not support delayed task availability."
             )
+        if request.schedule_policy is not None and not self.task_store.supports_task_scheduling:
+            del request
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support managed task scheduling."
+            )
         if request.retry_policy is not None and not self.task_store.supports_task_retry_series:
             del request
             raise NotImplementedError(
                 f"{type(self.task_store).__name__} does not support task retry series."
             )
         if request.work_contract is None:
+            if request.schedule_policy is not None:
+                return await create_scheduled_task(
+                    self.task_store, request, redactor=self._secret_redactor
+                )
             return await self.task_store.create_task(request)
         parent_invocation_snapshot: TaskInvocationSnapshot | None = None
         if request.parent_task_id is not None:
@@ -6636,7 +6657,13 @@ class CayuApp:
         task = copied_task
         del copied_task
         try:
-            require_contract_bound_task_creation_snapshot(task)
+            # The request was preflighted against creation headroom before
+            # dispatch. A managed replay may now contain legitimate lifecycle
+            # growth; copy_task already enforces the full task bound.
+            if request.schedule_policy is None or (
+                task.schedule is not None and task.schedule.revision == 1
+            ):
+                require_contract_bound_task_creation_snapshot(task)
         except (TypeError, ValueError):
             del parent_invocation_snapshot, request, task
             raise WorkContractConflict(
@@ -6677,6 +6704,38 @@ class CayuApp:
             ) from None
         del copied_invocation_snapshot, parent_invocation_snapshot
         return task
+
+    async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
+        """Replace an unadmitted one-shot schedule at its exact durable revision."""
+        if type(request) is not TaskRescheduleRequest:
+            raise TypeError("Task rescheduling requires a TaskRescheduleRequest.")
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to reschedule tasks.")
+        return await publish_task_schedule(self.task_store, request, redactor=self._secret_redactor)
+
+    async def list_task_schedule_events(
+        self, task_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskScheduleEvent]:
+        """Inspect a bounded, sequence-ordered page of durable scheduling decisions."""
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to inspect schedules.")
+        return await inspect_task_schedule_events(
+            self.task_store,
+            task_id,
+            after_sequence=after_sequence,
+            limit=limit,
+            redactor=self._secret_redactor,
+        )
+
+    async def cancel_scheduled_task(
+        self, request: TaskScheduleCancelRequest
+    ) -> TaskScheduleReceipt:
+        """Request exact schedule cancellation while preserving live execution ownership."""
+        if type(request) is not TaskScheduleCancelRequest:
+            raise TypeError("Schedule cancellation requires a TaskScheduleCancelRequest.")
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to cancel scheduled tasks.")
+        return await publish_task_schedule(self.task_store, request, redactor=self._secret_redactor)
 
     async def pause_task(
         self,
@@ -9199,8 +9258,9 @@ async def _create_public_contracted_task(
 ) -> tuple[Task | None, BaseException | None]:
     """Capture contract-binding conflicts without exporting the task payload traceback."""
 
+    dispatched = copy_task_create(request) if request.schedule_policy is not None else request
     outcome = await capture_task_store_operation(
-        lambda: task_store.create_task(request),
+        lambda: task_store.create_task(dispatched),
         operation_name="Contracted task creation",
         redactor=redactor,
         mutation_store=task_store,
@@ -9500,15 +9560,23 @@ def _contracted_task_creation_result_matches_request(
         task.type != request.type
         or task.title != request.title
         or task.description != request.description
-        or task.session_id != request.session_id
+        or (request.schedule_policy is None and task.session_id != request.session_id)
         or task.parent_task_id != request.parent_task_id
         or task.assigned_agent_name != request.assigned_agent_name
-        or task.available_at != request.available_at
+        or (request.schedule_policy is None and task.available_at != request.available_at)
         or task.input != request.input
         or task.metadata != request.metadata
         or task.work_contract != request.work_contract
     ):
         return False
+    if request.schedule_policy is not None:
+        # Native replay returns the current occurrence, which may have moved,
+        # attached, or settled. Authenticate immutable creation intent without
+        # treating an old due time or pending status as current authority.
+        return (
+            task.schedule is not None
+            and task.schedule.creation_sha256 == schedule_creation_digest(request)
+        )
     return (
         task.status is TaskStatus.PENDING
         and task.worker_id is None

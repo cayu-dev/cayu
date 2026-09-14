@@ -98,6 +98,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     copy_session_invocation_binding,
 )
+from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     Task,
     TaskCancellationReconciliationEvent,
@@ -2698,6 +2699,11 @@ class TaskStoreDispatcher(Dispatcher):
                     activity=True,
                 )
             wake_deadlines: list[float] = []
+            schedule_deadline = (
+                await next_schedule_wake_at(self._tasks, claim_queries)
+                if poller.last_attempted
+                else None
+            )
             if reconcile_terminal_receipts and reconciliation_cadence.next_run_at is not None:
                 wake_deadlines.append(reconciliation_cadence.next_run_at)
             if reclaim_expired_leases and reclaim_cadence.next_run_at is not None:
@@ -2706,6 +2712,7 @@ class TaskStoreDispatcher(Dispatcher):
                 handled=0 if handle is None else 1,
                 idle=True,
                 next_wake_at=min(wake_deadlines) if wake_deadlines else None,
+                next_claim_at=schedule_deadline,
                 activity=meaningful_activity,
             )
 
