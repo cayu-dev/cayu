@@ -8459,6 +8459,7 @@ def create_router(
         )
         async def get_eval_result(run_id: str) -> Response:
             run, result = await _load_eval_result(run_id)
+            trial_evidence_links = await eval_store.load_trial_evidence_links(run_id)
             baseline = None
             if captured_eval_store is not None and captured_eval_store.captured_results:
                 baseline = await captured_eval_store.load_baseline(
@@ -8475,6 +8476,7 @@ def create_router(
                 result=result,
                 presentation=presentation,
                 baseline=baseline,
+                trial_evidence_links=trial_evidence_links,
             )
             return await _model_json_response(response, EvalResultResponse)
 

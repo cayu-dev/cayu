@@ -134,6 +134,10 @@ def add_eval_parser(subparsers: Any) -> None:
         help="Limit each direct-suite case to SECONDS; corpus timeouts are declared in JSON.",
     )
 
+    from cayu.cli._benchmark_campaigns import add_benchmark_arguments
+
+    add_benchmark_arguments(run, inner)
+
     for command in ("status", "failures"):
         inspection = inner.add_parser(
             command,
@@ -263,9 +267,27 @@ def run_eval_command(args: argparse.Namespace) -> int:
     try:
         if args.eval_command == "run":
             return asyncio.run(_run(args))
+        if args.eval_command == "package":
+            from cayu.cli._benchmark_campaigns import package_command
+
+            return package_command(args)
+        if args.eval_command in {"resume", "retry", "cancel", "rescore"}:
+            from cayu.cli._benchmark_campaigns import maintain_benchmark
+
+            return asyncio.run(maintain_benchmark(args))
         if args.eval_command in {"status", "failures"}:
+            if (Path(args.directory) / "campaign.json").is_file() or Path(args.directory).is_file():
+                from cayu.cli._benchmark_campaigns import inspect_benchmark
+
+                return asyncio.run(inspect_benchmark(args))
             return asyncio.run(_inspect_process(args))
         if args.eval_command == "export":
+            if (Path(args.directory) / "campaign.json").is_file():
+                from cayu.evals.benchmark_inspection import export_benchmark_campaign
+
+                snapshot = asyncio.run(export_benchmark_campaign(args.directory, args.output))
+                print(f"Exported {snapshot.campaign.id} to {args.output}")
+                return 0
             from cayu.evals.process_inspection import export_process_eval_run
 
             snapshot = export_process_eval_run(args.directory, args.output)
@@ -424,6 +446,11 @@ def _inspection_text(value: str) -> str:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    from cayu.cli._benchmark_campaigns import require_package_for_benchmark_options, run_benchmark
+
+    if getattr(args, "package", None) is not None:
+        return await run_benchmark(args)
+    require_package_for_benchmark_options(args)
     admission = LaunchAdmission(getattr(args, "stagger_seconds", 0))
     with admission_scope(admission):
         return await _run_with_admission(args, admission)
@@ -559,6 +586,23 @@ async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
 
 
 def _report(args: argparse.Namespace) -> int:
+    if (Path(args.input) / "campaign.json").is_file():
+        from cayu.cli._benchmark_campaigns import _protect_outputs, benchmark_protected_stores
+        from cayu.evals.benchmark_inspection import (
+            inspect_benchmark_campaign,
+            render_benchmark_campaign_html,
+        )
+
+        snapshot = asyncio.run(inspect_benchmark_campaign(args.input))
+        protected = benchmark_protected_stores(snapshot)
+        _protect_outputs(args, Path(args.input), protected)
+        output = (
+            snapshot.model_dump_json(indent=2)
+            if args.output_format == "json"
+            else render_benchmark_campaign_html(snapshot)
+        )
+        _write_or_print(output, args.output)
+        return 0
     result = _load_saved_eval_result(args.input)
     if type(result) is CapturedEvaluationResultV1:
         output = (
@@ -609,6 +653,38 @@ def _memory_report(args: argparse.Namespace) -> int:
 
 
 def _compare(args: argparse.Namespace) -> int:
+    if (Path(args.baseline) / "campaign.json").is_file() or (
+        Path(args.current) / "campaign.json"
+    ).is_file():
+        import html
+
+        from cayu.cli._benchmark_campaigns import _protect_outputs, benchmark_protected_stores
+        from cayu.evals.benchmark_comparison import compare_benchmark_campaigns
+        from cayu.evals.benchmark_inspection import inspect_benchmark_campaign
+
+        for directory in (args.baseline, args.current):
+            snapshot = asyncio.run(inspect_benchmark_campaign(directory, include_successors=False))
+            _protect_outputs(args, Path(directory), benchmark_protected_stores(snapshot))
+        comparison = asyncio.run(
+            compare_benchmark_campaigns(
+                args.baseline, args.current, score_tolerance=args.score_tolerance
+            )
+        )
+        output = json.dumps(comparison, indent=2)
+        if args.output_format == "html":
+            output = (
+                "<!doctype html><meta charset=utf-8><title>Benchmark comparison</title><pre>"
+                + html.escape(output)
+                + "</pre>"
+            )
+        _write_or_print(output, args.output)
+        return (
+            2
+            if comparison["compatibility"] != "comparable"
+            else 1
+            if comparison["regressions"]
+            else 0
+        )
     baseline = _load_saved_eval_result(args.baseline)
     current = _load_saved_eval_result(args.current)
     published_types = {CorpusExecutionResult, CapturedEvaluationResultV1}
@@ -815,9 +891,16 @@ def _corpus_inspection_table(inspection: Any) -> str:
 def _coerce_plan(value: Any) -> EvalPlan:
     if type(value) is EvalPlan:
         if value.corpus_target is not None:
-            return EvalPlan(corpus_target=value.corpus_target)
+            return EvalPlan(
+                corpus_target=value.corpus_target,
+                execution_profile_policy=value.execution_profile_policy,
+            )
         if value.workflow_target is not None:
-            return EvalPlan(workflow_target=value.workflow_target, suite=value.suite)
+            return EvalPlan(
+                workflow_target=value.workflow_target,
+                suite=value.suite,
+                execution_profile_policy=value.execution_profile_policy,
+            )
         return _validate_plan(value.app, value.suite)
     if type(value) is WorkflowEvalTarget:
         return EvalPlan(workflow_target=value)
@@ -828,15 +911,16 @@ def _coerce_plan(value: Any) -> EvalPlan:
     suite = getattr(value, "suite", None)
     corpus_target = getattr(value, "corpus_target", None)
     workflow_target = getattr(value, "workflow_target", None)
+    execution_profile_policy = getattr(value, "execution_profile_policy", None)
     configured = sum((app is not None, corpus_target is not None, workflow_target is not None))
     if configured > 1:
         raise ValueError("Eval target cannot configure multiple execution target modes.")
     if workflow_target is not None:
-        return _validate_workflow_plan(workflow_target, suite)
+        return _validate_workflow_plan(workflow_target, suite, execution_profile_policy)
     if app is not None or suite is not None:
         return _validate_plan(app, suite)
     if corpus_target is not None:
-        return _validate_corpus_plan(corpus_target)
+        return _validate_corpus_plan(corpus_target, execution_profile_policy)
     if isinstance(value, dict):
         has_direct = "app" in value
         has_corpus = "corpus_target" in value
@@ -847,11 +931,14 @@ def _coerce_plan(value: Any) -> EvalPlan:
             return _validate_workflow_plan(
                 value["workflow_target"],
                 value.get("suite"),
+                value.get("execution_profile_policy"),
             )
         if has_direct:
             return _validate_plan(value.get("app"), value.get("suite"))
         if has_corpus:
-            return _validate_corpus_plan(value["corpus_target"])
+            return _validate_corpus_plan(
+                value["corpus_target"], value.get("execution_profile_policy")
+            )
     raise TypeError(
         "Eval target must return EvalPlan, (CayuApp, EvalSuite), app/suite attributes, "
         "a corpus_target attribute, or a workflow_target attribute."
@@ -866,18 +953,22 @@ def _validate_plan(app: Any, suite: Any) -> EvalPlan:
     return EvalPlan(app=app, suite=suite)
 
 
-def _validate_corpus_plan(target: Any) -> EvalPlan:
+def _validate_corpus_plan(target: Any, execution_profile_policy: Any = None) -> EvalPlan:
     if type(target) is not CorpusTarget:
         raise TypeError("Eval plan corpus_target must be an exact CorpusTarget.")
-    return EvalPlan(corpus_target=target)
+    return EvalPlan(corpus_target=target, execution_profile_policy=execution_profile_policy)
 
 
-def _validate_workflow_plan(target: Any, suite: Any = None) -> EvalPlan:
+def _validate_workflow_plan(
+    target: Any, suite: Any = None, execution_profile_policy: Any = None
+) -> EvalPlan:
     if type(target) is not WorkflowEvalTarget:
         raise TypeError("Eval plan workflow_target must be an exact WorkflowEvalTarget.")
     if suite is not None and type(suite) is not EvalSuite:
         suite = EvalSuite.model_validate(suite)
-    return EvalPlan(workflow_target=target, suite=suite)
+    return EvalPlan(
+        workflow_target=target, suite=suite, execution_profile_policy=execution_profile_policy
+    )
 
 
 def _write_or_print(content: str, path: str | None) -> None:

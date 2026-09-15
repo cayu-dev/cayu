@@ -47,6 +47,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Incremental workflow evidence](incremental-workflow-evidence.md)
 - [Workflow capture and recovery](workflow-eval-recovery.md)
 - [Benchmark packages](benchmark-packages.md)
+- [Benchmark campaigns](benchmark-campaigns.md)
 - Recipes: [business approvals](recipes/business-approvals.md), [GitHub CLI virtual egress](recipes/github-cli-virtual-egress.md), [PR reviewer](recipes/pr-reviewer.md), and [server auth and tenancy](recipes/server-auth-tenancy.md)
 
 ## Operations and verification

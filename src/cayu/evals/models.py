@@ -357,6 +357,9 @@ class EvalTrialResult(BaseModel):
     execution_status: Literal["completed", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    execution_failure_category: (
+        Literal["provider_failure", "environment_failure", "execution_failure"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     failure_evidence: FailureEvidence | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -381,6 +384,9 @@ class EvalTrialResult(BaseModel):
     evidence_complete: StrictBool = False
     events_count: StrictInt = Field(default=0, ge=0)
     usage_summary: dict[str, Any] | None = None
+    usage_evidence_state: Literal["complete", "partial", "unavailable"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     memory_attribution: EvalMemoryAttributionEvidenceV1 = Field(
         default_factory=lambda: EvalMemoryAttributionEvidenceV1.unavailable(
             EvalMemoryEvidenceLimitation.MISSING

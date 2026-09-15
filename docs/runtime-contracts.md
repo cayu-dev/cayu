@@ -15779,6 +15779,31 @@ remain readable with no diagnostic. New eval stores require revision 80 and norm
 storage migration before using an existing database. No diagnostic contains raw
 exception text, tracebacks, corpus values, prompts, provider responses or credentials.
 
+### Benchmark campaign recovery and private trial evidence
+
+Campaigns bind existing authored-suite selections and execution profiles to native
+run requests. An optional `EvalRunRecoveryPolicyV1` limits execution attempts by
+native claim epoch. Checkpoint-only recovery preserves completed trials and marks
+uncheckpointed slots unavailable after ownership loss; it never assumes pending
+effects are safe to replay. Explicitly admitted additional attempts retain the
+original per-trial budgets and finite attempt ceiling. Selective successors bind
+the original trial revision and a reserved ordinal in `invocation.retry_of`.
+
+`invocation.retain_trial_checkpoints` opts into retaining bounded, redacted private
+checkpoints through terminal settlement. Default runs keep their existing cleanup
+behavior. The built-in stores expose observational `load_trial_evidence_links`;
+these links confer no claim or replay authority. The protected result API verifies
+links against published trial revisions, while portable result artifacts omit
+private session identifiers. Retention ends when the operator removes the private
+EvalStore. This changes no database schema or checkpoint size bound.
+
+Optional trial `execution_failure_category` and `usage_evidence_state` distinguish
+typed execution failure and incomplete accounting independently of assertion
+outcomes. Missing usage remains unavailable. Campaign comparison binds package,
+cohort, scorer, execution profile, budget, and retry identities; static rescoring
+uses retained facts and never dispatches candidate or judge work. See
+[benchmark campaigns](benchmark-campaigns.md) for supported modes and acceptance.
+
 ### Workflow evaluation capture and recovery
 
 Workflow eval targets own finite aggregate child capture bounds independently of

@@ -97,6 +97,7 @@ from cayu.evals.store import (
     EvalRunRecord,
     EvalRunStatus,
     EvalScenarioCatalogEntry,
+    EvalTrialEvidenceLinkV1,
 )
 from cayu.evals.suite_authoring import (
     EvalSuiteAuthoringAssertionSpecV1,
@@ -1152,6 +1153,9 @@ class EvalResultResponse(ApiBaseModel):
     result: CorpusExecutionResult
     presentation: EvalResultPresentationV2
     baseline: EvalBaselineRecord | None = None
+    trial_evidence_links: tuple[EvalTrialEvidenceLinkV1, ...] = Field(
+        default=(), max_length=100_000
+    )
 
     @model_validator(mode="after")
     def validate_run_result(self) -> EvalResultResponse:
@@ -1159,6 +1163,17 @@ class EvalResultResponse(ApiBaseModel):
             raise ValueError("Eval result response requires a completed run.")
         spec = self.run.spec
         published = self.result.run
+        slots = {
+            (case.case_id, trial.trial_number): trial.source_trial_revision
+            for case in published.cases
+            for trial in case.trials
+        }
+        seen = set()
+        for link in self.trial_evidence_links:
+            key = (link.case_id, link.trial_number)
+            if key in seen or slots.get(key) != link.source_trial_revision:
+                raise ValueError("Private trial evidence link does not match its published result.")
+            seen.add(key)
         if (
             spec.corpus_revision != published.corpus_revision
             or spec.target_key != published.target_key

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from datetime import UTC, datetime
@@ -1278,6 +1279,43 @@ async def assert_eval_store_conformance(
                 cursor=target_page.next_cursor,
             )
         )
+
+    # Opt-in private checkpoint retention survives terminal failure/cancellation;
+    # ordinary portable results and read APIs never acquire replay authority.
+    for transition in ("failed", "cancelled"):
+        retained_request = main_request.model_copy(
+            update={
+                "run_id": f"retained-evidence-{transition}",
+                "idempotency_key": "sha256:"
+                + hashlib.sha256(f"retained-evidence-{transition}".encode()).hexdigest(),
+                "invocation": EvalRunInvocation(retain_trial_checkpoints=True),
+            }
+        )
+        await store.admit_run(retained_request, redact_json=_NO_SECRETS.redact_json)
+        retained_lease = await store.claim_run(target_key=corpus.target_key)
+        assert retained_lease is not None
+        checkpoint = _terminal_trial_checkpoint(corpus)
+        checkpoint = checkpoint.model_copy(
+            update={
+                "result": checkpoint.result.model_copy(
+                    update={"session_id": "retained-private-session"}
+                )
+            }
+        )
+        await store.save_trial_checkpoint(
+            retained_lease.claim, checkpoint, redact_json=_NO_SECRETS.redact_json
+        )
+        if transition == "failed":
+            await store.fail_run(retained_lease.claim, EvalRunFailureCode.EXECUTION_FAILED)
+        else:
+            await store.request_cancel(retained_lease.run.id)
+            await store.finish_cancel(retained_lease.claim)
+        links = await store.load_trial_evidence_links(retained_lease.run.id)
+        assert len(links) == 1
+        assert links[0].session_id == "retained-private-session"
+        assert links[0].case_id == corpus.cases[0].id
+        with pytest.raises(EvalRunClaimLost):
+            await store.load_trial_checkpoints(retained_lease.claim)
 
 
 async def assert_judge_calibration_store_conformance(

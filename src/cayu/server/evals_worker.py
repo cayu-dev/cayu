@@ -194,7 +194,12 @@ class EvalRunCoordinator:
     state and never publishes after its fenced claim is lost.
     """
 
-    def __init__(self, config: EvalsConfig | ResolvedEvalsRuntime) -> None:
+    def __init__(
+        self,
+        config: EvalsConfig | ResolvedEvalsRuntime,
+        *,
+        launch_revision: str | None = None,
+    ) -> None:
         if type(config) is EvalsConfig:
             resolved = resolved_evals_runtime(
                 explicit=config,
@@ -206,6 +211,13 @@ class EvalRunCoordinator:
         elif type(config) is not ResolvedEvalsRuntime:
             raise TypeError("config must be an exact EvalsConfig or ResolvedEvalsRuntime.")
         self._config = config
+        if launch_revision is not None:
+            from cayu.evals.corpus import _sha256_revision
+
+            launch_revision = _sha256_revision(launch_revision, "launch_revision")
+            if len(config.registry.target_keys) != 1:
+                raise ValueError("A launch-scoped worker requires exactly one registered target.")
+        self._launch_revision = launch_revision
         self._stop_requested = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -269,6 +281,12 @@ class EvalRunCoordinator:
 
     async def _claim_run(self) -> EvalRunLease | None:
         target_keys = self._config.registry.target_keys
+        if self._launch_revision is not None:
+            return await self._config.store.claim_run(
+                target_key=target_keys[0],
+                launch_revision=self._launch_revision,
+                lease_seconds=self._config.lease_seconds,
+            )
         if len(target_keys) == 1:
             return await self._config.store.claim_run(
                 target_key=target_keys[0],
@@ -663,7 +681,11 @@ class EvalRunCoordinator:
                 logger=logger,
             )
 
-        if prepared.scenario is None:
+        recovery = lease.run.spec.invocation.recovery_policy
+        block_reexecution = recovery is not None and (
+            lease.claim.epoch > recovery.max_execution_attempts
+        )
+        if prepared.scenario is None or block_reexecution:
             checkpoints = await self._config.store.load_trial_checkpoints(lease.claim)
             completed_trials = {
                 (checkpoint.case_id, checkpoint.trial_number): (
@@ -672,6 +694,10 @@ class EvalRunCoordinator:
                 )
                 for checkpoint in checkpoints
             }
+            if block_reexecution:
+                from cayu.evals._recovery import block_uncheckpointed_trials
+
+                completed_trials = block_uncheckpointed_trials(prepared.compiled, completed_trials)
 
             execution_coro = _run_compiled_corpus_suite(
                 target,

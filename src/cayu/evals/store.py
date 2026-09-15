@@ -1746,6 +1746,86 @@ class EvalScenarioApprovalSubmission(_EvalStoreModel):
         return EvalScenarioApprovalDecisionRecord.validate_actor_id(value, info)
 
 
+class EvalRunRetryLineageV1(_EvalStoreModel):
+    campaign_revision: StrictStr
+    run_id: StrictStr
+    case_id: StrictStr
+    trial_number: StrictInt = Field(ge=1, le=100)
+    source_trial_revision: StrictStr
+    attempt: StrictInt = Field(ge=1, le=3)
+    failure_category: Literal[
+        "timeout",
+        "provider_failure",
+        "environment_failure",
+        "execution_failure",
+        "recovery_blocked",
+        "answer_mismatch",
+        "scoring_failure",
+        "capture_failure",
+        "cancelled",
+        "evidence_unavailable",
+    ]
+    replay_decision: Literal["application_reset", "caller_authorized"]
+
+    @field_validator("campaign_revision")
+    @classmethod
+    def validate_campaign_revision(cls, value: str) -> str:
+        return _sha256_revision(value, "campaign_revision")
+
+    @field_validator("source_trial_revision")
+    @classmethod
+    def validate_trial_revision(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("source_trial_revision must be lowercase SHA-256 hex.")
+        return value
+
+    @field_validator("run_id", "case_id")
+    @classmethod
+    def validate_link_ids(cls, value: str, info) -> str:
+        return _store_identifier(value, info.field_name)
+
+
+class EvalTrialEvidenceLinkV1(_EvalStoreModel):
+    """Private operational link; deliberately absent from portable result JSON."""
+
+    case_id: StrictStr
+    trial_number: StrictInt = Field(ge=1, le=100)
+    session_id: StrictStr = Field(min_length=1, max_length=2048)
+    source_trial_revision: StrictStr = Field(min_length=64, max_length=64)
+
+
+def trial_evidence_links(
+    checkpoints: tuple[EvalRunTrialCheckpoint, ...],
+) -> tuple[EvalTrialEvidenceLinkV1, ...]:
+    return tuple(
+        EvalTrialEvidenceLinkV1(
+            case_id=item.case_id,
+            trial_number=item.trial_number,
+            session_id=item.result.session_id,
+            source_trial_revision=eval_trial_result_revision(item.result),
+        )
+        for item in checkpoints
+        if item.result.session_id is not None
+    )
+
+
+class EvalRunRecoveryPolicyV1(_EvalStoreModel):
+    """Finite permission to redispatch work whose completion was not checkpointed.
+
+    Each permitted claim can consume another full run allowance. This does not
+    imply idempotent external effects or renew the original trial's budget.
+    """
+
+    mode: Literal["checkpoint_only", "caller_authorized"] = "checkpoint_only"
+    max_execution_attempts: StrictInt = Field(default=1, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_permission(self) -> EvalRunRecoveryPolicyV1:
+        if self.mode == "checkpoint_only" and self.max_execution_attempts != 1:
+            raise ValueError("Additional execution attempts require explicit caller authorization.")
+        return self
+
+
 class EvalRunInvocation(_EvalStoreModel):
     """Durable, authority-free execution contractions and trusted caller provenance.
 
@@ -1756,6 +1836,15 @@ class EvalRunInvocation(_EvalStoreModel):
     """
 
     schema_version: Literal[1] = 1
+    retain_trial_checkpoints: StrictBool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+    recovery_policy: EvalRunRecoveryPolicyV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    retry_of: EvalRunRetryLineageV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     source: SessionExecutionSource = SessionExecutionSource.SDK_RUN
     origin: InvocationOrigin | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=MAX_STEPS)
@@ -3275,9 +3364,10 @@ class EvalStore(ABC):
         self,
         *,
         target_key: str | None = None,
+        launch_revision: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
-        """Claim the oldest eligible queued or expired run for an optional target."""
+        """Claim eligible work, optionally restricted to one exact authored launch."""
 
     async def claim_run_for_targets(
         self,
@@ -3357,6 +3447,10 @@ class EvalStore(ABC):
 
         del claim
         raise NotImplementedError("Durable eval trial checkpoints are not supported.")
+
+    async def load_trial_evidence_links(self, run_id: str) -> tuple[EvalTrialEvidenceLinkV1, ...]:
+        """Read private retained links without execution authority; unsupported stores return none."""
+        return ()
 
     async def save_trial_checkpoint(
         self,
@@ -4046,10 +4140,13 @@ class InMemoryEvalStore(EvalStore):
         self,
         *,
         target_key: str | None = None,
+        launch_revision: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
         if target_key is not None:
             target_key = _portable_id(target_key, "target_key")
+        if launch_revision is not None:
+            launch_revision = _sha256_revision(launch_revision, "launch_revision")
         lease_seconds = _lease_seconds(lease_seconds)
         async with self._lock:
             now = self._now()
@@ -4057,6 +4154,10 @@ class InMemoryEvalStore(EvalStore):
                 state
                 for state in self._runs.values()
                 if (target_key is None or state.request.target_key == target_key)
+                and (
+                    launch_revision is None
+                    or state.request.invocation.authored_suite_launch_revision == launch_revision
+                )
                 and state.epoch < _EVAL_STORE_MAX_BIGINT
                 and (
                     state.status is EvalRunStatus.QUEUED
@@ -4211,8 +4312,9 @@ class InMemoryEvalStore(EvalStore):
                 state.finished_at = now
                 state.claim_id = None
                 state.lease_expires_at = None
-                state.trial_checkpoints.clear()
-                state.trial_checkpoint_bytes = 0
+                if not state.request.invocation.retain_trial_checkpoints:
+                    state.trial_checkpoints.clear()
+                    state.trial_checkpoint_bytes = 0
             else:
                 state.status = EvalRunStatus.CANCELLING
             return self._record(state)
@@ -4239,6 +4341,16 @@ class InMemoryEvalStore(EvalStore):
             state.scenario_progress = progress.model_copy(deep=True)
             state.updated_at = self._now()
             return self._record(state)
+
+    async def load_trial_evidence_links(self, run_id: str) -> tuple[EvalTrialEvidenceLinkV1, ...]:
+        run_id = _store_identifier(run_id, "run_id")
+        async with self._lock:
+            state = self._require_run(run_id)
+            if not state.request.invocation.retain_trial_checkpoints:
+                return ()
+            return trial_evidence_links(
+                tuple(state.trial_checkpoints[key] for key in sorted(state.trial_checkpoints))
+            )
 
     async def load_trial_checkpoints(
         self,
@@ -4390,8 +4502,9 @@ class InMemoryEvalStore(EvalStore):
             )
             state.status = EvalRunStatus.COMPLETED
             state.result = validated_result
-            state.trial_checkpoints.clear()
-            state.trial_checkpoint_bytes = 0
+            if not state.request.invocation.retain_trial_checkpoints:
+                state.trial_checkpoints.clear()
+                state.trial_checkpoint_bytes = 0
             state.updated_at = now
             state.finished_at = now
             state.lease_expires_at = None
@@ -4426,8 +4539,9 @@ class InMemoryEvalStore(EvalStore):
             state.status = EvalRunStatus.FAILED
             state.failure_code = code
             state.failure_diagnostic = diagnostic
-            state.trial_checkpoints.clear()
-            state.trial_checkpoint_bytes = 0
+            if not state.request.invocation.retain_trial_checkpoints:
+                state.trial_checkpoints.clear()
+                state.trial_checkpoint_bytes = 0
             state.updated_at = now
             state.finished_at = now
             state.lease_expires_at = None
@@ -4712,8 +4826,9 @@ class InMemoryEvalStore(EvalStore):
         state.updated_at = now
         state.finished_at = now
         state.lease_expires_at = None
-        state.trial_checkpoints.clear()
-        state.trial_checkpoint_bytes = 0
+        if not state.request.invocation.retain_trial_checkpoints:
+            state.trial_checkpoints.clear()
+            state.trial_checkpoint_bytes = 0
 
     @staticmethod
     def _record(state: _MemoryRunState) -> EvalRunRecord:

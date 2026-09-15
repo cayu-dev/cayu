@@ -28,6 +28,10 @@ scenarios retain their TaskGroup exception behavior even at concurrency one.
 
 ## Start with the workflow you need
 
+For packaged suites with exact cohorts, native durable launch, bounded recovery,
+selective retry, inspection/export, comparison, and saved-output rescoring, use
+the [benchmark campaign command path](benchmark-campaigns.md).
+
 The installed package includes three focused, version-matched guides:
 
 - `cayu guide evals-first` creates a Control Plane suite, runs it, approves a

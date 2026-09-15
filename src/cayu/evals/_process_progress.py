@@ -29,12 +29,16 @@ class ProcessEvalProgress:
         index: int,
         fingerprint: str,
         case_ids: tuple[str, ...],
+        max_trials: int = 1,
+        retain_trial_revisions: bool = False,
     ) -> None:
         self.path = directory / f"progress-{index}.json"
         self.launch_id = launch_id
         self.index = index
         self.fingerprint = fingerprint
         self.case_ids = frozenset(case_ids)
+        self.max_trials = max_trials
+        self.retain_trial_revisions = retain_trial_revisions
         self.trials: dict[tuple[str, int], dict[str, Any]] = {}
         self.failed = False
 
@@ -75,7 +79,11 @@ def observe_eval_trial(case_id: str, trial_number: int) -> Iterator[None]:
     if progress is None:
         yield
         return
-    if _TRIAL.get() is not None or case_id not in progress.case_ids or trial_number != 1:
+    if (
+        _TRIAL.get() is not None
+        or case_id not in progress.case_ids
+        or not 1 <= trial_number <= progress.max_trials
+    ):
         # Nested application evaluations must not replace an outer trial's locator.
         nested_token = _ACTIVE.set(None)
         try:
@@ -123,6 +131,13 @@ def observe_eval_trial_result(result: EvalTrialResult) -> None:
     progress, key = _ACTIVE.get(), _TRIAL.get()
     if progress is None or key is None:
         return
+    # Scenario drivers can replace the initially planned session ID. Only the
+    # completed result anchors the actual root in the observed target store.
+    reference = progress.trials[key].get("session")
+    if result.session_id is None:
+        progress.trials[key].pop("session", None)
+    elif type(reference) is dict:
+        reference["session_id"] = result.session_id
     progress.trials[key].update(
         state="finished",
         completed_at=result.completed_at.isoformat(),
@@ -130,4 +145,8 @@ def observe_eval_trial_result(result: EvalTrialResult) -> None:
         score=result.score,
         error=None if result.error is None else result.error[:4096],
     )
+    if progress.retain_trial_revisions:
+        from cayu.evals.revisions import eval_trial_result_revision
+
+        progress.trials[key]["source_trial_revision"] = eval_trial_result_revision(result)
     progress.write()

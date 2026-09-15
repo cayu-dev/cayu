@@ -156,6 +156,7 @@ _ASSERTION_MESSAGE = {
     "error": "Assertion evaluation failed.",
 }
 _TRIAL_MESSAGE = {
+    EvalTrialDiagnosticCode.RECOVERY_REEXECUTION_BLOCKED: "Recovery requires a new, explicitly authorized execution attempt.",
     EvalTrialDiagnosticCode.PASSED: "Trial passed.",
     EvalTrialDiagnosticCode.ASSERTION_FAILED: "One or more assertions failed.",
     EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE: (
@@ -222,6 +223,7 @@ _TRIAL_CODES_BY_STATUS = {
     "passed": {EvalTrialDiagnosticCode.PASSED},
     "failed": {EvalTrialDiagnosticCode.ASSERTION_FAILED},
     "unavailable": {
+        EvalTrialDiagnosticCode.RECOVERY_REEXECUTION_BLOCKED,
         EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED,
         EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
         EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE,
@@ -1276,12 +1278,18 @@ def _validate_memory_assertions_for_evidence(
 
 
 class PublishedEvalTrialResult(_PortableModel):
+    usage_evidence_state: Literal["complete", "partial", "unavailable"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     operation_outcomes: OperationOutcomeSummary | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     execution_status: Literal["completed", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    execution_failure_category: (
+        Literal["provider_failure", "environment_failure", "execution_failure"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     failure_evidence: FailureEvidence | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -2855,6 +2863,13 @@ def _published_case(
             PublishedEvalTrialResult(
                 operation_outcomes=trial.operation_outcomes,
                 execution_status=trial.execution_status,
+                execution_failure_category=trial.execution_failure_category,
+                usage_evidence_state=trial.usage_evidence_state
+                or (
+                    "partial"
+                    if trial.failure_capture is not None and trial.usage_summary is not None
+                    else None
+                ),
                 capture_bounds=trial.capture_bounds,
                 capture_diagnostic=trial.capture_diagnostic,
                 failure_evidence=trial.failure_evidence,

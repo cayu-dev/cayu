@@ -96,6 +96,7 @@ from cayu.evals.store import (
     EvalSuiteCatalogEntry,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
+    EvalTrialEvidenceLinkV1,
     _bounded_authored_suite_page,
     _bounded_case_page,
     _bounded_corpus_page,
@@ -136,6 +137,7 @@ from cayu.evals.store import (
     eval_run_invocation_from_json,
     eval_run_trial_checkpoint_from_json,
     result_summary,
+    trial_evidence_links,
     validate_authored_suite_scenario,
     validate_result_for_run,
 )
@@ -328,6 +330,21 @@ def _load_trial_checkpoints(
 
 
 def _delete_trial_checkpoints(connection: sqlite3.Connection, run_id: str) -> None:
+    row = connection.execute(
+        "SELECT invocation_json FROM cayu_eval_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if (
+        row is not None
+        and eval_run_invocation_from_json(row["invocation_json"]).retain_trial_checkpoints
+    ):
+        connection.execute(
+            """UPDATE cayu_eval_runs SET
+            trial_checkpoint_count = (SELECT COUNT(*) FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?),
+            trial_checkpoint_bytes = (SELECT COALESCE(SUM(document_bytes), 0) FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?)
+            WHERE run_id = ?""",
+            (run_id, run_id, run_id),
+        )
+        return
     connection.execute(
         "DELETE FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?",
         (run_id,),
@@ -1554,10 +1571,13 @@ class SQLiteEvalStore(EvalStore):
         self,
         *,
         target_key: str | None = None,
+        launch_revision: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
         if target_key is not None:
             target_key = _portable_id(target_key, "target_key")
+        if launch_revision is not None:
+            launch_revision = _sha256_revision(launch_revision, "launch_revision")
         lease_seconds = _lease_seconds(lease_seconds)
 
         def operation(connection: sqlite3.Connection) -> EvalRunLease | None:
@@ -1567,6 +1587,9 @@ class SQLiteEvalStore(EvalStore):
                 claim_id = str(uuid4())
                 target_clause = "" if target_key is None else "AND candidate.target_key = ?"
                 target_params: tuple[str, ...] = () if target_key is None else (target_key,)
+                if launch_revision is not None:
+                    target_clause += " AND candidate.authored_suite_launch_revision = ?"
+                    target_params += (launch_revision,)
                 row = connection.execute(
                     f"""
                     SELECT {_RUN_COLUMNS}
@@ -2055,6 +2078,26 @@ class SQLiteEvalStore(EvalStore):
                 checkpoints = _load_trial_checkpoints(connection, row)
                 connection.commit()
                 return checkpoints
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def load_trial_evidence_links(self, run_id: str) -> tuple[EvalTrialEvidenceLinkV1, ...]:
+        run_id = _store_identifier(run_id, "run_id")
+
+        def operation(connection: sqlite3.Connection) -> tuple[EvalTrialEvidenceLinkV1, ...]:
+            try:
+                connection.execute("BEGIN")
+                row = self._require_run_row(connection, run_id)
+                links = (
+                    trial_evidence_links(_load_trial_checkpoints(connection, row))
+                    if _request_from_row(row).invocation.retain_trial_checkpoints
+                    else ()
+                )
+                connection.commit()
+                return links
             except BaseException:
                 connection.rollback()
                 raise

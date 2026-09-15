@@ -90,6 +90,7 @@ from cayu.evals.store import (
     EvalSuiteCatalogEntry,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
+    EvalTrialEvidenceLinkV1,
     _bounded_authored_suite_page,
     _bounded_case_page,
     _bounded_corpus_page,
@@ -130,6 +131,7 @@ from cayu.evals.store import (
     eval_run_invocation_from_json,
     eval_run_trial_checkpoint_from_json,
     result_summary,
+    trial_evidence_links,
     validate_authored_suite_scenario,
     validate_result_for_run,
 )
@@ -285,6 +287,17 @@ async def _load_trial_checkpoints(
 
 
 async def _delete_trial_checkpoints(cur: Any, run_id: str) -> None:
+    await cur.execute("SELECT invocation_json FROM cayu_eval_runs WHERE run_id = %s", (run_id,))
+    row = await cur.fetchone()
+    if row is not None and eval_run_invocation_from_json(row[0]).retain_trial_checkpoints:
+        await cur.execute(
+            """UPDATE cayu_eval_runs SET
+            trial_checkpoint_count = (SELECT COUNT(*) FROM cayu_eval_run_trial_checkpoints WHERE run_id = %s),
+            trial_checkpoint_bytes = (SELECT COALESCE(SUM(document_bytes), 0) FROM cayu_eval_run_trial_checkpoints WHERE run_id = %s)
+            WHERE run_id = %s""",
+            (run_id, run_id, run_id),
+        )
+        return
     await cur.execute(
         "DELETE FROM cayu_eval_run_trial_checkpoints WHERE run_id = %s",
         (run_id,),
@@ -1206,10 +1219,13 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         self,
         *,
         target_key: str | None = None,
+        launch_revision: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
         if target_key is not None:
             target_key = _portable_id(target_key, "target_key")
+        if launch_revision is not None:
+            launch_revision = _sha256_revision(launch_revision, "launch_revision")
         lease_seconds = _lease_seconds(lease_seconds)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -1218,6 +1234,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     now = await _database_now(cur)
                     target_clause = "" if target_key is None else "AND candidate.target_key = %s"
                     target_params: tuple[str, ...] = () if target_key is None else (target_key,)
+                    if launch_revision is not None:
+                        target_clause += " AND candidate.authored_suite_launch_revision = %s"
+                        target_params += (launch_revision,)
                     await cur.execute(
                         f"""
                         SELECT {_RUN_COLUMNS}
@@ -1678,6 +1697,17 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             now = await _database_now(cur)
             self._require_live_claim(row, claim, now)
             return await _load_trial_checkpoints(cur, row)
+
+    async def load_trial_evidence_links(self, run_id: str) -> tuple[EvalTrialEvidenceLinkV1, ...]:
+        run_id = _store_identifier(run_id, "run_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            row = await self._require_run_row(cur, run_id, for_update=True)
+            return (
+                trial_evidence_links(await _load_trial_checkpoints(cur, row))
+                if _request_from_row(row).invocation.retain_trial_checkpoints
+                else ()
+            )
 
     async def save_trial_checkpoint(
         self,

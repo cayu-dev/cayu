@@ -25,6 +25,15 @@ from cayu.evals.assertions import TranscriptContains as TranscriptContains
 from cayu.evals.assertions import UsageRecorded as UsageRecorded
 from cayu.evals.assertions import WorkspaceFileContains as WorkspaceFileContains
 from cayu.evals.assertions import WorkspaceFileExists as WorkspaceFileExists
+from cayu.evals.benchmark_package import BenchmarkFileV1 as BenchmarkFileV1
+from cayu.evals.benchmark_package import BenchmarkPackageV1 as BenchmarkPackageV1
+from cayu.evals.benchmark_package import BenchmarkRequirementsV1 as BenchmarkRequirementsV1
+from cayu.evals.benchmark_package import LoadedBenchmarkPackage as LoadedBenchmarkPackage
+from cayu.evals.benchmark_package import benchmark_package_from_json as benchmark_package_from_json
+from cayu.evals.benchmark_package import benchmark_package_scenarios as benchmark_package_scenarios
+from cayu.evals.benchmark_package import benchmark_package_to_json as benchmark_package_to_json
+from cayu.evals.benchmark_package import benchmark_suite_selection as benchmark_suite_selection
+from cayu.evals.benchmark_package import load_benchmark_package as load_benchmark_package
 from cayu.evals.browser_acceptance import (
     BROWSER_ACCEPTANCE_HTML_MAX_BYTES as BROWSER_ACCEPTANCE_HTML_MAX_BYTES,
 )

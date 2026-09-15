@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
     from cayu.evals.evidence import AssertionEvidenceView
     from cayu.evals.execution import CorpusExecutionResult, CorpusTarget, WorkflowEvalTarget
+    from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 
 
 class _FreshInterruptedEvidenceUnavailable(RuntimeError):
@@ -742,9 +743,17 @@ class EvalPlan:
     suite: EvalSuite | None = None
     corpus_target: CorpusTarget | None = None
     workflow_target: WorkflowEvalTarget | None = None
+    execution_profile_policy: EvalExecutionProfilePolicyV1 | None = None
 
     def __post_init__(self) -> None:
         from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
+        from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
+
+        if self.execution_profile_policy is not None:
+            if type(self.execution_profile_policy) is not EvalExecutionProfilePolicyV1:
+                raise TypeError("execution_profile_policy must be an exact Evals profile policy.")
+            if self.app is not None:
+                raise ValueError("Durable execution profiles require a corpus or workflow target.")
 
         direct_configured = self.app is not None
         corpus_configured = self.corpus_target is not None
@@ -1207,29 +1216,27 @@ async def _run_suite_cases(
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
 ]:
     async def execute_trial(case: EvalCase, trial_number: int):
-        with observe_eval_trial(case.id, trial_number):
-            result = await _run_case_once_with_public_projection(
-                app,
-                case,
-                trial_number=trial_number,
-                suite_id=suite.id,
-                retain_trajectory=retain_trajectory,
-                retain_final_output=retain_final_output,
-                timeout_seconds=case_timeout_seconds,
-                public_output_preview_bytes=public_output_preview_bytes,
-                memory_attribution_bounds=memory_attribution_bounds,
-                memory_attribution_source_limit=memory_attribution_source_limit,
-                memory_attribution_max_bytes=memory_attribution_max_bytes,
-                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-                run_stream=run_stream,
-                trial_request_transform=trial_request_transform,
-                run_id=run_id,
-                workflow_target=workflow_target,
-                workflow_instance_tracker=workflow_instance_tracker,
-                workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
-            )
-            observe_eval_trial_result(result[0])
-            return result
+        result = await _run_case_once_with_public_projection(
+            app,
+            case,
+            trial_number=trial_number,
+            suite_id=suite.id,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            timeout_seconds=case_timeout_seconds,
+            public_output_preview_bytes=public_output_preview_bytes,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            run_stream=run_stream,
+            trial_request_transform=trial_request_transform,
+            run_id=run_id,
+            workflow_target=workflow_target,
+            workflow_instance_tracker=workflow_instance_tracker,
+            workflow_execution_profile_fingerprint=(workflow_execution_profile_fingerprint),
+        )
+        return result
 
     scripted_providers = _require_scripted_provider_concurrency(
         app,
@@ -1457,6 +1464,7 @@ async def _schedule_suite_trials(
                 # Nested evaluations are not additional cases of this CLI launch.
                 with (
                     admission_scope(None),
+                    observe_eval_trial(case.id, trial_number),
                     _scripted_eval_trial(
                         concurrent=max_concurrency > 1,
                         providers=(scripted_providers_by_case or {}).get(case.id, ()),
@@ -1464,6 +1472,7 @@ async def _schedule_suite_trials(
                     ),
                 ):
                     execution = await execute_trial(case, trial_number)
+                    observe_eval_trial_result(execution[0])
                 result, public_data = execution
                 if trial_completed is not None:
                     if public_data is None:
@@ -3159,6 +3168,41 @@ async def _run_case_once_with_public_projection(
             )
         )
 
+    execution_status = (
+        None
+        if session is None
+        else (
+            "failed"
+            if session.status == SessionStatus.FAILED
+            else "completed"
+            if session.status == SessionStatus.COMPLETED
+            else None
+        )
+    )
+    failure_category = None
+    if execution_status == "failed":
+        event_types = {event.type for event in events}
+        if event_types & {
+            EventType.ENVIRONMENT_BINDING_FAILED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+            EventType.ENVIRONMENT_FACTORY_FAILED,
+        }:
+            failure_category = "environment_failure"
+        elif EventType.MODEL_ERROR in event_types:
+            failure_category = "provider_failure"
+        else:
+            failure_category = "execution_failure"
+    from cayu.budgets.usage import count_model_steps_with_usage
+
+    observed_model_calls = sum(event.type == EventType.MODEL_STARTED for event in events)
+    observed_usage_calls = count_model_steps_with_usage(events)
+    usage_state = (
+        "unavailable"
+        if usage_summary is None or (observed_model_calls > 0 and observed_usage_calls == 0)
+        else "complete"
+        if evidence_complete and observed_usage_calls >= observed_model_calls
+        else "partial"
+    )
     # A yielded runtime event proves the session was created before a deadline interrupted
     # evidence capture. Do not perform any store I/O after the deadline; without an event, the
     # request UUID remains only a plan and must not be published as a concrete trial ID.
@@ -3184,6 +3228,8 @@ async def _run_case_once_with_public_projection(
     )
     return (
         EvalTrialResult(
+            execution_failure_category=failure_category,
+            usage_evidence_state=usage_state,
             trial_number=trial_number,
             status=status,
             session_id=session_id,

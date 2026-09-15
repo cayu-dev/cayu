@@ -362,6 +362,9 @@ class EvalAssertionPresentationV1(_PortableModel):
 
 
 class EvalTrialPresentationV1(_PortableModel):
+    execution_failure_category: (
+        Literal["provider_failure", "environment_failure", "execution_failure"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     execution_status: Literal["completed", "failed"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -405,7 +408,9 @@ class EvalTrialPresentationV1(_PortableModel):
             ):
                 raise ValueError("Captured presentation cannot carry fresh runtime identity.")
         elif self.diagnostic_code is None or self.dimensions.runtime != (
-            self.execution_status or _fresh_runtime(self.diagnostic_code)
+            "failed"
+            if self.execution_failure_category is not None
+            else self.execution_status or _fresh_runtime(self.diagnostic_code)
         ):
             raise ValueError("Fresh presentation runtime contradicts its diagnostic.")
         expected_dimensions = _presented_dimensions(
@@ -844,6 +849,7 @@ _RUNTIME_FAILED_CODES = {
     EvalTrialDiagnosticCode.CASE_TIMEOUT,
 }
 _RUNTIME_UNAVAILABLE_CODES = {
+    EvalTrialDiagnosticCode.RECOVERY_REEXECUTION_BLOCKED,
     EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNAVAILABLE,
     EvalTrialDiagnosticCode.EXTERNAL_TARGET_CANCELLED,
     EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNKNOWN,
@@ -1058,7 +1064,11 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
         trial.model_dump(mode="python", round_trip=True, warnings="none")
     )
     assertions = tuple(_present_assertion(assertion) for assertion in validated.assertions)
-    runtime = validated.execution_status or _fresh_runtime(validated.code)
+    runtime = (
+        "failed"
+        if validated.execution_failure_category is not None
+        else validated.execution_status or _fresh_runtime(validated.code)
+    )
     evidence: EvalEvidenceState = (
         "complete"
         if validated.evidence_complete
@@ -1067,6 +1077,7 @@ def _present_fresh_trial(trial: PublishedEvalTrialResult) -> EvalTrialPresentati
         else "incomplete"
     )
     return EvalTrialPresentationV1(
+        execution_failure_category=validated.execution_failure_category,
         execution_status=validated.execution_status,
         trial_number=validated.trial_number,
         status=validated.status,

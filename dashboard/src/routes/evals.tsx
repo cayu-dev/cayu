@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { useNavigate, useSearch } from "@tanstack/react-router"
+import { Link, useNavigate, useSearch } from "@tanstack/react-router"
 import {
   Ban,
   CheckCircle2,
@@ -2072,6 +2072,29 @@ function RunLifecycleCard({
         <RunFact label="Created" value={formatDateTime(run.created_at)} />
         <RunFact label="Started" value={formatDateTime(run.started_at)} />
         <RunFact label="Finished" value={formatDateTime(run.finished_at)} />
+        {run.spec.invocation?.recovery_policy && (
+          <>
+            <RunFact label="Ownership claims" value={String(run.attempt_count)} />
+            <RunFact
+              label="Execution attempt ceiling"
+              value={String(run.spec.invocation.recovery_policy.max_execution_attempts)}
+            />
+          </>
+        )}
+        {run.spec.invocation?.retry_of && (
+          <>
+            <RunFact label="Retry of run" value={run.spec.invocation.retry_of.run_id} />
+            <RunFact
+              label="Original trial"
+              value={`${run.spec.invocation.retry_of.case_id} · ${run.spec.invocation.retry_of.trial_number}`}
+            />
+            <RunFact label="Retry attempt" value={String(run.spec.invocation.retry_of.attempt)} />
+            <RunFact
+              label="Replay decision"
+              value={run.spec.invocation.retry_of.replay_decision.replaceAll("_", " ")}
+            />
+          </>
+        )}
         {scenarioInvocation && (
           <>
             <RunFact
@@ -2209,6 +2232,12 @@ function ResultInspector({
   const presentedCase = result.presentation.cases[caseIndex]
   const presentedTrial = presentedCase?.trials[trialIndex]
   const selectedTrialCost = selectedTrial ? evalTrialCostSummary(selectedTrial.assertions) : null
+  const evidenceLink = result.trial_evidence_links?.find(
+    (link) =>
+      link.case_id === selectedCase?.case_id &&
+      link.trial_number === selectedTrial?.trial_number &&
+      link.source_trial_revision === selectedTrial?.source_trial_revision,
+  )
 
   return (
     <DataCard
@@ -2355,11 +2384,31 @@ function ResultInspector({
               value={selectedTrial.evidence_complete ? "complete" : "incomplete"}
             />
             <RunFact label="Diagnostic" value={selectedTrial.code.replaceAll("_", " ")} />
+            {selectedTrial.execution_failure_category && (
+              <RunFact
+                label="Execution failure"
+                value={selectedTrial.execution_failure_category.replaceAll("_", " ")}
+              />
+            )}
+            <div>
+              <div className="text-xs text-muted-foreground">Execution evidence</div>
+              {evidenceLink ? (
+                <Link
+                  className="text-primary underline"
+                  to="/sessions/$sessionId"
+                  params={{ sessionId: evidenceLink.session_id }}
+                >
+                  Open trial session
+                </Link>
+              ) : (
+                <span>Exact session link unavailable</span>
+              )}
+            </div>
             <RunFact
               label="Usage"
               value={
-                selectedTrial.usage
-                  ? `${formatCount(selectedTrial.usage.total_tokens)} tokens · ${formatCount(selectedTrial.usage.model_steps)} model steps · ${formatCount(selectedTrial.usage.tool_calls)} tools`
+                selectedTrial.usage && selectedTrial.usage_evidence_state !== "unavailable"
+                  ? `${formatCount(selectedTrial.usage.total_tokens)} tokens · ${formatCount(selectedTrial.usage.model_steps)} model steps · ${formatCount(selectedTrial.usage.tool_calls)} tools${selectedTrial.usage_evidence_state === "partial" ? " · partial observed usage" : ""}`
                   : "unavailable"
               }
             />

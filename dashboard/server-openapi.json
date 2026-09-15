@@ -13763,6 +13763,15 @@
           },
           "run": {
             "$ref": "#/components/schemas/EvalRunRecord"
+          },
+          "trial_evidence_links": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalTrialEvidenceLinkV1"
+            },
+            "maxItems": 100000,
+            "title": "Trial Evidence Links",
+            "type": "array"
           }
         },
         "required": [
@@ -14058,6 +14067,31 @@
               }
             ]
           },
+          "recovery_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunRecoveryPolicyV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retain_trial_checkpoints": {
+            "default": false,
+            "title": "Retain Trial Checkpoints",
+            "type": "boolean"
+          },
+          "retry_of": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunRetryLineageV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "scenario": {
             "anyOf": [
               {
@@ -14260,6 +14294,30 @@
         "title": "EvalRunRecord",
         "type": "object"
       },
+      "EvalRunRecoveryPolicyV1": {
+        "additionalProperties": false,
+        "description": "Finite permission to redispatch work whose completion was not checkpointed.\n\nEach permitted claim can consume another full run allowance. This does not\nimply idempotent external effects or renew the original trial's budget.",
+        "properties": {
+          "max_execution_attempts": {
+            "default": 1,
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Max Execution Attempts",
+            "type": "integer"
+          },
+          "mode": {
+            "default": "checkpoint_only",
+            "enum": [
+              "checkpoint_only",
+              "caller_authorized"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "title": "EvalRunRecoveryPolicyV1",
+        "type": "object"
+      },
       "EvalRunResultSummary": {
         "additionalProperties": false,
         "properties": {
@@ -14303,6 +14361,75 @@
           "duration_ms"
         ],
         "title": "EvalRunResultSummary",
+        "type": "object"
+      },
+      "EvalRunRetryLineageV1": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "campaign_revision": {
+            "title": "Campaign Revision",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "failure_category": {
+            "enum": [
+              "timeout",
+              "provider_failure",
+              "environment_failure",
+              "execution_failure",
+              "recovery_blocked",
+              "answer_mismatch",
+              "scoring_failure",
+              "capture_failure",
+              "cancelled",
+              "evidence_unavailable"
+            ],
+            "title": "Failure Category",
+            "type": "string"
+          },
+          "replay_decision": {
+            "enum": [
+              "application_reset",
+              "caller_authorized"
+            ],
+            "title": "Replay Decision",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "source_trial_revision": {
+            "title": "Source Trial Revision",
+            "type": "string"
+          },
+          "trial_number": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "campaign_revision",
+          "run_id",
+          "case_id",
+          "trial_number",
+          "source_trial_revision",
+          "attempt",
+          "failure_category",
+          "replay_decision"
+        ],
+        "title": "EvalRunRetryLineageV1",
         "type": "object"
       },
       "EvalRunSpec": {
@@ -16849,6 +16976,7 @@
         "description": "Stable, non-secret reason for one fresh trial's terminal outcome.",
         "enum": [
           "passed",
+          "recovery_reexecution_blocked",
           "assertion_failed",
           "assertion_evidence_unavailable",
           "terminal_evidence_unavailable",
@@ -16878,6 +17006,42 @@
         ],
         "title": "EvalTrialDiagnosticCode",
         "type": "string"
+      },
+      "EvalTrialEvidenceLinkV1": {
+        "additionalProperties": false,
+        "description": "Private operational link; deliberately absent from portable result JSON.",
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "source_trial_revision": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Source Trial Revision",
+            "type": "string"
+          },
+          "trial_number": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "case_id",
+          "trial_number",
+          "session_id",
+          "source_trial_revision"
+        ],
+        "title": "EvalTrialEvidenceLinkV1",
+        "type": "object"
       },
       "EvalTrialOutputPreviewV1": {
         "additionalProperties": false,
@@ -16964,6 +17128,22 @@
           },
           "dimensions": {
             "$ref": "#/components/schemas/EvalResultOutcomeDimensionsV1"
+          },
+          "execution_failure_category": {
+            "anyOf": [
+              {
+                "enum": [
+                  "provider_failure",
+                  "environment_failure",
+                  "execution_failure"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Failure Category"
           },
           "execution_status": {
             "anyOf": [
@@ -26799,6 +26979,22 @@
             "title": "Evidence Complete",
             "type": "boolean"
           },
+          "execution_failure_category": {
+            "anyOf": [
+              {
+                "enum": [
+                  "provider_failure",
+                  "environment_failure",
+                  "execution_failure"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Failure Category"
+          },
           "execution_status": {
             "anyOf": [
               {
@@ -26898,6 +27094,22 @@
                 "type": "null"
               }
             ]
+          },
+          "usage_evidence_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "complete",
+                  "partial",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Evidence State"
           }
         },
         "required": [

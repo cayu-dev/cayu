@@ -8086,7 +8086,7 @@
         },
         "max_steps": {
           "default": 64,
-          "maximum": 256.0,
+          "maximum": 9007199254740991.0,
           "minimum": 1.0,
           "title": "Max Steps",
           "type": "integer"
@@ -8294,7 +8294,7 @@
         },
         "max_steps": {
           "default": 64,
-          "maximum": 256.0,
+          "maximum": 9007199254740991.0,
           "minimum": 1.0,
           "title": "Max Steps",
           "type": "integer"
@@ -10963,7 +10963,7 @@
         "max_steps": {
           "anyOf": [
             {
-              "maximum": 256.0,
+              "maximum": 9007199254740991.0,
               "minimum": 1.0,
               "type": "integer"
             },
@@ -11141,7 +11141,7 @@
         "max_steps": {
           "anyOf": [
             {
-              "maximum": 256.0,
+              "maximum": 9007199254740991.0,
               "minimum": 1.0,
               "type": "integer"
             },
@@ -11606,7 +11606,7 @@
         "max_steps": {
           "anyOf": [
             {
-              "maximum": 256.0,
+              "maximum": 9007199254740991.0,
               "minimum": 1.0,
               "type": "integer"
             },
@@ -12847,7 +12847,7 @@
         "max_steps": {
           "anyOf": [
             {
-              "maximum": 256.0,
+              "maximum": 9007199254740991.0,
               "minimum": 1.0,
               "type": "integer"
             },
@@ -13038,7 +13038,7 @@
         "max_steps": {
           "anyOf": [
             {
-              "maximum": 256.0,
+              "maximum": 9007199254740991.0,
               "minimum": 1.0,
               "type": "integer"
             },

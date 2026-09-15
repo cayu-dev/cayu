@@ -203,6 +203,15 @@ steps:
       unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
       unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
       .release-server-venv/bin/python examples/dashboard_behavior_live.py
+  - name: Verify installed benchmark campaign lifecycle
+    groups: server
+    run: |
+      unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+      unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      for campaign_wheel in dist/first/*.whl; do
+        CAYU_BENCHMARK_WHEEL="$(realpath "$campaign_wheel")" \
+          uv run --extra dev pytest -q tests/qualification/test_benchmark_campaign_wheel.py
+      done
   - name: Install built source distribution
     groups: core, dashboard
     run: |

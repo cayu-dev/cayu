@@ -1,5 +1,8 @@
 # Benchmark packages
 
+For installed launch, recovery, inspection, comparison, and static rescoring,
+see [native benchmark campaigns](benchmark-campaigns.md).
+
 A benchmark package distributes an existing authored Evals suite, its scenario
 documents, and named input files. It is a reusable Runtime interface: a benchmark
 author supplies data and scoring definitions; the operator supplies the trusted

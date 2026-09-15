@@ -6730,6 +6730,10 @@ export type EvalResultResponse = {
     presentation: EvalResultPresentationV2;
     result: CorpusExecutionResult;
     run: EvalRunRecord;
+    /**
+     * Trial Evidence Links
+     */
+    trial_evidence_links?: Array<EvalTrialEvidenceLinkV1>;
 };
 
 /**
@@ -6866,6 +6870,12 @@ export type EvalRunInvocation = {
      */
     max_steps?: number | null;
     origin?: InvocationOrigin | null;
+    recovery_policy?: EvalRunRecoveryPolicyV1 | null;
+    /**
+     * Retain Trial Checkpoints
+     */
+    retain_trial_checkpoints?: boolean;
+    retry_of?: EvalRunRetryLineageV1 | null;
     scenario?: EvalScenarioRunInvocation | null;
     /**
      * Schema Version
@@ -6944,6 +6954,25 @@ export type EvalRunRecord = {
 };
 
 /**
+ * EvalRunRecoveryPolicyV1
+ *
+ * Finite permission to redispatch work whose completion was not checkpointed.
+ *
+ * Each permitted claim can consume another full run allowance. This does not
+ * imply idempotent external effects or renew the original trial's budget.
+ */
+export type EvalRunRecoveryPolicyV1 = {
+    /**
+     * Max Execution Attempts
+     */
+    max_execution_attempts?: number;
+    /**
+     * Mode
+     */
+    mode?: 'checkpoint_only' | 'caller_authorized';
+};
+
+/**
  * EvalRunResultSummary
  */
 export type EvalRunResultSummary = {
@@ -6963,6 +6992,44 @@ export type EvalRunResultSummary = {
      * Status
      */
     status: 'passed' | 'failed' | 'unavailable' | 'error';
+};
+
+/**
+ * EvalRunRetryLineageV1
+ */
+export type EvalRunRetryLineageV1 = {
+    /**
+     * Attempt
+     */
+    attempt: number;
+    /**
+     * Campaign Revision
+     */
+    campaign_revision: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Failure Category
+     */
+    failure_category: 'timeout' | 'provider_failure' | 'environment_failure' | 'execution_failure' | 'recovery_blocked' | 'answer_mismatch' | 'scoring_failure' | 'capture_failure' | 'cancelled' | 'evidence_unavailable';
+    /**
+     * Replay Decision
+     */
+    replay_decision: 'application_reset' | 'caller_authorized';
+    /**
+     * Run Id
+     */
+    run_id: string;
+    /**
+     * Source Trial Revision
+     */
+    source_trial_revision: string;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
 };
 
 /**
@@ -8331,7 +8398,31 @@ export type EvalToolJsonObservationMismatchV1 = {
  *
  * Stable, non-secret reason for one fresh trial's terminal outcome.
  */
-export type EvalTrialDiagnosticCode = 'passed' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'external_target_unavailable' | 'external_target_cancelled' | 'external_target_unknown' | 'external_target_incomplete' | 'external_target_identity_mismatch' | 'external_target_failed' | 'workflow_target_failed' | 'workflow_execution_failed' | 'workflow_completion_missing' | 'workflow_completion_conflict' | 'workflow_attempt_superseded' | 'workflow_projector_failed' | 'workflow_output_invalid' | 'workflow_capture_failed' | 'workflow_quiescence_failed' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
+export type EvalTrialDiagnosticCode = 'passed' | 'recovery_reexecution_blocked' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'external_target_unavailable' | 'external_target_cancelled' | 'external_target_unknown' | 'external_target_incomplete' | 'external_target_identity_mismatch' | 'external_target_failed' | 'workflow_target_failed' | 'workflow_execution_failed' | 'workflow_completion_missing' | 'workflow_completion_conflict' | 'workflow_attempt_superseded' | 'workflow_projector_failed' | 'workflow_output_invalid' | 'workflow_capture_failed' | 'workflow_quiescence_failed' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
+
+/**
+ * EvalTrialEvidenceLinkV1
+ *
+ * Private operational link; deliberately absent from portable result JSON.
+ */
+export type EvalTrialEvidenceLinkV1 = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Source Trial Revision
+     */
+    source_trial_revision: string;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
+};
 
 /**
  * EvalTrialOutputPreviewV1
@@ -8379,6 +8470,10 @@ export type EvalTrialPresentationV1 = {
     assertions: Array<EvalAssertionPresentationV1>;
     diagnostic_code?: EvalTrialDiagnosticCode | null;
     dimensions: EvalResultOutcomeDimensionsV1;
+    /**
+     * Execution Failure Category
+     */
+    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | null;
     /**
      * Execution Status
      */
@@ -13373,6 +13468,10 @@ export type PublishedEvalTrialResult = {
      */
     evidence_complete: boolean;
     /**
+     * Execution Failure Category
+     */
+    execution_failure_category?: 'provider_failure' | 'environment_failure' | 'execution_failure' | null;
+    /**
      * Execution Status
      */
     execution_status?: 'completed' | 'failed' | null;
@@ -13402,6 +13501,10 @@ export type PublishedEvalTrialResult = {
      */
     trial_number: number;
     usage?: PublishedUsageSummaryV1 | null;
+    /**
+     * Usage Evidence State
+     */
+    usage_evidence_state?: 'complete' | 'partial' | 'unavailable' | null;
 };
 
 /**

@@ -29,6 +29,7 @@ class EvalTrialDiagnosticCode(StrEnum):
     """Stable, non-secret reason for one fresh trial's terminal outcome."""
 
     PASSED = "passed"
+    RECOVERY_REEXECUTION_BLOCKED = "recovery_reexecution_blocked"
     ASSERTION_FAILED = "assertion_failed"
     ASSERTION_EVIDENCE_UNAVAILABLE = "assertion_evidence_unavailable"
     TERMINAL_EVIDENCE_UNAVAILABLE = "terminal_evidence_unavailable"
