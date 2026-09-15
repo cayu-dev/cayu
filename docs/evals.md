@@ -541,6 +541,10 @@ connections, or callbacks from the browser.
 
 ## Portable corpus documents
 
+For versioned distribution of authored suites, scenarios, and input files, see
+[benchmark packages](benchmark-packages.md). Packages resolve to the same Evals
+contracts described here.
+
 `EvalCorpusDocument` is Cayu's bounded, JSON-portable definition format for
 reusable eval suites and cases. A document describes exactly one trusted
 `target_key`. A runnable case contains only user-role text input; a captured-only

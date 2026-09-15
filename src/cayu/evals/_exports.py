@@ -1,6 +1,15 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "benchmark_package_scenarios": ("cayu.evals.benchmark_package", "benchmark_package_scenarios"),
+    "BenchmarkFileV1": ("cayu.evals.benchmark_package", "BenchmarkFileV1"),
+    "BenchmarkPackageV1": ("cayu.evals.benchmark_package", "BenchmarkPackageV1"),
+    "BenchmarkRequirementsV1": ("cayu.evals.benchmark_package", "BenchmarkRequirementsV1"),
+    "LoadedBenchmarkPackage": ("cayu.evals.benchmark_package", "LoadedBenchmarkPackage"),
+    "benchmark_package_from_json": ("cayu.evals.benchmark_package", "benchmark_package_from_json"),
+    "benchmark_package_to_json": ("cayu.evals.benchmark_package", "benchmark_package_to_json"),
+    "benchmark_suite_selection": ("cayu.evals.benchmark_package", "benchmark_suite_selection"),
+    "load_benchmark_package": ("cayu.evals.benchmark_package", "load_benchmark_package"),
     "ASSERTION_EVIDENCE_MAX_BYTES": ("cayu.evals.evidence", "ASSERTION_EVIDENCE_MAX_BYTES"),
     "ASSERTION_EVIDENCE_SCHEMA_VERSION": (
         "cayu.evals.evidence",
@@ -1784,6 +1793,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "benchmark_package_scenarios",
+    "BenchmarkFileV1",
+    "BenchmarkPackageV1",
+    "BenchmarkRequirementsV1",
+    "LoadedBenchmarkPackage",
+    "benchmark_package_from_json",
+    "benchmark_package_to_json",
+    "benchmark_suite_selection",
+    "load_benchmark_package",
     "ASSERTION_EVIDENCE_MAX_BYTES",
     "ASSERTION_EVIDENCE_SCHEMA_VERSION",
     "ArtifactAssertionSpec",
