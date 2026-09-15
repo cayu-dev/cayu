@@ -12,14 +12,20 @@ round publication; unsafe or conflicting evidence remains fail-closed.
 ## Application Runtime Configuration
 
 `CayuConfig` is the immutable application tuning API. `CayuApp()` uses a
-64-step model budget; the supported maximum is 256. Configure alternatives
-directly in Python:
+64-step model budget. Explicit `max_steps` accepts strict positive integers up to
+`2**53 - 1` (9,007,199,254,740,991), the largest safe integer for exact JSON
+interchange with JavaScript API clients. This is a representation bound, not a
+work allowance. Configuration, workflow roles, CLI/server admission, and durable
+recovery share this bound. Unlimited model steps are not supported: `None` on
+continuation options means omitted/inherit, not unlimited. Cancellation, execution
+deadlines, and explicit token/tool limits still apply independently. Configure
+alternatives directly in Python:
 
 ```python
 from cayu import CayuApp, CayuConfig, EvalConfig, RunDefaults
 
 app = CayuApp(config=CayuConfig(
-    run=RunDefaults(max_steps=128),
+    run=RunDefaults(max_steps=10000),
     evals=EvalConfig(max_concurrency=100),
 ))
 ```

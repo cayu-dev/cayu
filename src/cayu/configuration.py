@@ -27,7 +27,8 @@ from cayu.sessions.cleanup import (
 )
 
 DEFAULT_MAX_STEPS = 64
-MAX_STEPS = 256
+# Keep step allowances exact across durable JSON and JavaScript API clients.
+MAX_STEPS = 2**53 - 1
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS = 256
 

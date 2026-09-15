@@ -644,7 +644,10 @@ export function ScenarioAuthoring({
               <NumberSetting
                 label="Max steps"
                 value={settings.maxSteps}
-                maximum={selectedTarget?.max_steps ?? 256}
+                maximum={Math.min(
+                  selectedTarget?.max_steps ?? MAX_SAFE_SCENARIO_RUNTIME_LIMIT,
+                  MAX_SAFE_SCENARIO_RUNTIME_LIMIT,
+                )}
                 optional
                 edit={(maxSteps) => setSettings((current) => ({ ...current, maxSteps }))}
               />

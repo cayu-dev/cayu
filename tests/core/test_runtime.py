@@ -65194,8 +65194,10 @@ def _run_config_approval_app() -> tuple[InMemorySessionStore, SideEffectTool, Ca
 
 
 @pytest.mark.parametrize("restate_configuration", [False, True])
+@pytest.mark.parametrize("max_steps", [7, 10000])
 def test_cayu_app_resolving_tool_approval_restores_original_run_limits(
     restate_configuration: bool,
+    max_steps: int,
 ):
     store, tool, app = _run_config_approval_app()
     session_id = "sess_approval_restores_run_config"
@@ -65207,7 +65209,7 @@ def test_cayu_app_resolving_tool_approval_restores_original_run_limits(
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "use the tool")],
-                max_steps=7,
+                max_steps=max_steps,
                 limits=RunLimits(max_tool_calls=1, scope="session"),
                 retry_policy=RetryPolicy(max_attempts=3),
             ),
@@ -65216,7 +65218,7 @@ def test_cayu_app_resolving_tool_approval_restores_original_run_limits(
     checkpoint = asyncio.run(store.load_checkpoint(session_id))
     assert checkpoint is not None
     pending = checkpoint["pending_tool_approval"]
-    assert pending["max_steps"] == 7
+    assert pending["max_steps"] == max_steps
     assert pending["limits"]["max_tool_calls"] == 1
     assert pending["limits"]["scope"] == "session"
     assert pending["retry_policy"]["max_attempts"] == 3
@@ -65234,7 +65236,7 @@ def test_cayu_app_resolving_tool_approval_restores_original_run_limits(
                 tool_round_id=pending["tool_round_id"],
                 tool_call_id=pending["tool_call_id"],
                 decision=ToolApprovalDecision.APPROVE,
-                max_steps=7 if restate_configuration else None,
+                max_steps=max_steps if restate_configuration else None,
                 limits=(
                     RunLimits(max_tool_calls=1, scope="session") if restate_configuration else None
                 ),
@@ -65251,7 +65253,8 @@ def test_cayu_app_resolving_tool_approval_restores_original_run_limits(
     assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_cayu_app_tool_approval_rejects_explicit_limits_drift_before_dispatch():
+@pytest.mark.parametrize("change", [{"limits": RunLimits()}, {"max_steps": 10001}])
+def test_cayu_app_tool_approval_rejects_explicit_limits_drift_before_dispatch(change):
     store, tool, app = _run_config_approval_app()
     session_id = "sess_approval_override_run_config"
 
@@ -65262,6 +65265,7 @@ def test_cayu_app_tool_approval_rejects_explicit_limits_drift_before_dispatch():
                 agent_name="assistant",
                 session_id=session_id,
                 messages=[Message.text("user", "use the tool")],
+                max_steps=10000,
                 limits=RunLimits(max_tool_calls=1, scope="session"),
             ),
         )
@@ -65282,7 +65286,7 @@ def test_cayu_app_tool_approval_rejects_explicit_limits_drift_before_dispatch():
                     tool_round_id=pending["tool_round_id"],
                     tool_call_id=pending["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
-                    limits=RunLimits(),
+                    **change,
                 ),
             )
         )

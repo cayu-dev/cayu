@@ -12,7 +12,7 @@ from cayu._exception_groups import exception_cause, set_exception_cause
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.billing import BillingIdentity
-from cayu.configuration import CayuConfig, RunDefaults
+from cayu.configuration import MAX_STEPS, CayuConfig, RunDefaults
 from cayu.context.base import RecentTurnsContextPolicy
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
@@ -1271,8 +1271,8 @@ def test_offline_recovery_context_is_bounded_before_stage_storage() -> None:
     )
     with pytest.raises(ValidationError, match="interaction_id.*cannot be blank"):
         ModelCompletionRecoveryContext(interaction_id=" ")
-    with pytest.raises(ValidationError, match="less than or equal to 256"):
-        ModelCompletionRecoveryContext(max_steps=257)
+    with pytest.raises(ValidationError, match=f"less than or equal to {MAX_STEPS}"):
+        ModelCompletionRecoveryContext(max_steps=MAX_STEPS + 1)
     with pytest.raises(ValidationError, match="request_metadata cannot contain more than"):
         ModelCompletionRecoveryContext(
             request_metadata={

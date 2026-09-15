@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from cayu.configuration import MAX_STEPS
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.work_attempt_semantics import (
     WORK_ATTEMPT_RUN_SEMANTICS_MAX_BYTES,
@@ -40,7 +41,7 @@ def test_work_attempt_semantics_detaches_source_and_copies() -> None:
     assert copied.request_metadata == {"job": {"version": 1}}
 
 
-@pytest.mark.parametrize("value", [True, False, 0, 257, "7"])
+@pytest.mark.parametrize("value", [True, False, 0, MAX_STEPS + 1, "7"])
 def test_work_attempt_semantics_requires_bounded_strict_steps(value) -> None:
     with pytest.raises(ValidationError):
         WorkAttemptRunSemantics(max_steps=value)

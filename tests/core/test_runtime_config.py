@@ -32,7 +32,7 @@ def test_zero_configuration_uses_canonical_runtime_defaults() -> None:
     config = CayuConfig()
 
     assert config.run.max_steps == DEFAULT_MAX_STEPS == 64
-    assert MAX_STEPS == 256
+    assert MAX_STEPS == 2**53 - 1
     assert config.run.limits.model_dump(mode="python") == RunLimits().model_dump(mode="python")
     assert config.run.thinking is None
     assert config.tool_execution.max_parallel_tool_calls == DEFAULT_MAX_PARALLEL_TOOL_CALLS == 4
@@ -43,7 +43,7 @@ def test_zero_configuration_uses_canonical_runtime_defaults() -> None:
     )
 
 
-@pytest.mark.parametrize("value", [0, 257, True, 1.5, "64"])
+@pytest.mark.parametrize("value", [0, MAX_STEPS + 1, True, 1.5, "64"])
 def test_run_defaults_reject_invalid_max_steps(value: object) -> None:
     with pytest.raises(ValidationError):
         RunDefaults(max_steps=value)  # type: ignore[arg-type]

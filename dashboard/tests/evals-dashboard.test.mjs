@@ -50,6 +50,32 @@ class MemoryStorage {
   }
 }
 
+test("scenario step allowances honor the target and safe integer bounds", () => {
+  const target = {
+    max_trials: 100,
+    max_concurrency: 100,
+    max_timeout_seconds: 3_600,
+    max_steps: 10_000,
+  }
+  const contract = (maxSteps, selectedTarget = target) =>
+    scenarioLaunchSettingsContract({ ...DEFAULT_SCENARIO_SETTINGS, maxSteps }, selectedTarget)
+
+  for (const steps of [257, 10_000]) {
+    assert.equal(contract(String(steps)).max_steps, steps)
+  }
+  assert.equal(contract("").max_steps, null)
+  assert.equal(contract("10001"), null)
+  assert.equal(contract("257", { ...target, max_steps: 256 }), null)
+  const largestTarget = { ...target, max_steps: Number.MAX_SAFE_INTEGER }
+  assert.equal(
+    contract(String(Number.MAX_SAFE_INTEGER), largestTarget).max_steps,
+    Number.MAX_SAFE_INTEGER,
+  )
+  for (const value of ["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992"]) {
+    assert.equal(contract(value, largestTarget), null)
+  }
+})
+
 test("scenario launch settings honor the selected target above 32", () => {
   const target = {
     max_trials: 100,

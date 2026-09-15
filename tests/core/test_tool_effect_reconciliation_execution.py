@@ -6,6 +6,7 @@ import pytest
 from tests.core.test_tool_effect_reconciliation_registration import _register, _spec
 from tests.core.test_tool_effect_state import _intent, _receipt
 
+from cayu.configuration import MAX_STEPS
 from cayu.runtime._tool_effect_reconciliation import (
     ToolEffectReconciliationOwner,
     ToolEffectReconciliationTimeout,
@@ -250,7 +251,7 @@ def test_callback_error_is_not_misclassified_as_owner_deadline_or_cancellation(c
         {"expected_run_epoch": True},
         {"expected_revision": True},
         {"max_steps": True},
-        {"max_steps": 257},
+        {"max_steps": MAX_STEPS + 1},
         {"max_steps": 0},
         {"task_handoff_id": "handoff"},
         {"tool_name": "other"},

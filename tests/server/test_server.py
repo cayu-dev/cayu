@@ -21,6 +21,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 import cayu.sessions.base as sessions_module
+from cayu.configuration import MAX_STEPS
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
@@ -2998,7 +2999,8 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
     ]
 
 
-def test_server_resume_overrides_max_steps() -> None:
+@pytest.mark.parametrize("max_steps", [42, 257, 10000, MAX_STEPS])
+def test_server_resume_overrides_max_steps(max_steps) -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -3007,7 +3009,7 @@ def test_server_resume_overrides_max_steps() -> None:
     started = _session_started_event(
         client,
         "/api/run",
-        {"prompt": "hello", "max_steps": 42},
+        {"prompt": "hello", "max_steps": max_steps},
         {},
     )
     session_id = started["session_id"]
@@ -3024,16 +3026,16 @@ def test_server_resume_overrides_max_steps() -> None:
     with client.stream(
         "POST",
         "/api/resume",
-        json={"session_id": session_id, "prompt": "again", "max_steps": 42},
+        json={"session_id": session_id, "prompt": "again", "max_steps": max_steps},
     ) as response:
         assert response.status_code == 200
         list(response.iter_lines())
 
-    assert captured == [42]
+    assert captured == [max_steps]
 
 
 @pytest.mark.parametrize("path", ["/api/run", "/api/resume"])
-@pytest.mark.parametrize("bad_value", [0, 257, -1])
+@pytest.mark.parametrize("bad_value", [0, MAX_STEPS + 1, -1])
 def test_server_rejects_out_of_range_max_steps(path: str, bad_value: int) -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)

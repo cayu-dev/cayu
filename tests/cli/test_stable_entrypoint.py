@@ -16,6 +16,7 @@ from cayu import ModelStreamEvent, ScriptedModelProvider, run_project_entrypoint
 from cayu.cli import _build_parser
 from cayu.cli import main as cayu_main
 from cayu.cli.project import project_context
+from cayu.configuration import MAX_STEPS
 
 
 def test_every_cli_command_help_has_a_purpose_and_next_step() -> None:
@@ -96,13 +97,16 @@ def _generated_command(project: Path, provider: ScriptedModelProvider):
         yield command_module
 
 
-def test_generated_command_runs_the_only_registered_agent(tmp_path: Path, capsys) -> None:
+@pytest.mark.parametrize("max_steps", [64, 257, 10000])
+def test_generated_command_runs_the_only_registered_agent(
+    tmp_path: Path, capsys, max_steps
+) -> None:
     project = _scaffold(tmp_path)
     capsys.readouterr()
     provider = _completed_provider("Review result.")
 
     with _generated_command(project, provider) as command:
-        result = command.main(["--message", "Review this change."])
+        result = command.main(["--message", "Review this change.", "--max-steps", str(max_steps)])
 
     assert result == 0
     captured = capsys.readouterr()
@@ -171,12 +175,12 @@ def test_generated_command_rejects_steps_above_the_runtime_limit(
         "--message",
         "Review this change.",
         "--max-steps",
-        "257",
+        str(MAX_STEPS + 1),
     )
 
     assert completed.returncode == 2
     assert completed.stdout == ""
-    assert completed.stderr == "setup error: --max-steps must be at most 256\n"
+    assert completed.stderr == f"setup error: --max-steps must be at most {MAX_STEPS}\n"
 
 
 @pytest.mark.parametrize(
@@ -327,8 +331,8 @@ def test_entrypoint_rejects_blank_messages_and_invalid_step_limits(capsys) -> No
     assert (
         run_project_entrypoint(
             must_not_build,
-            ["--message", "Run.", "--max-steps", "257"],
+            ["--message", "Run.", "--max-steps", str(MAX_STEPS + 1)],
         )
         == 2
     )
-    assert "--max-steps must be at most 256" in capsys.readouterr().err
+    assert f"--max-steps must be at most {MAX_STEPS}" in capsys.readouterr().err

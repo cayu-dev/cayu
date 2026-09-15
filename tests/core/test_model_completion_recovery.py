@@ -220,6 +220,7 @@ def _test_execution_profile(
     provider_name: str,
     tool_name: str | None = None,
     limits: RunLimits | None = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
 ) -> ExecutionProfileIdentity:
     tool = _test_tool(tool_name)
     profile_app = CayuApp(enable_logging=False)
@@ -243,7 +244,7 @@ def _test_execution_profile(
         process_identity=profile_app._execution_profile_process_identity,
         registered_provider=profile_app._providers[provider_name],
         finalization=execution_profile_admission.model_finalization_material(
-            max_steps=DEFAULT_MAX_STEPS,
+            max_steps=max_steps,
             limits=RunLimits() if limits is None else limits,
             retry_policy=profile_app._effective_retry_policy(None),
         ),
@@ -441,6 +442,7 @@ async def _stage_completed_model_boundary(
     tool_call_count: int = 1,
     usage: dict[str, int] | None = None,
     limits: RunLimits | None = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
     pending_source_run_epoch: int | None = 1,
     retain_empty_prefix: bool = False,
     non_turn_classification: str | None = None,
@@ -452,6 +454,7 @@ async def _stage_completed_model_boundary(
         provider_name=provider_name,
         tool_name=tool_name if with_tool_call else None,
         limits=limits,
+        max_steps=max_steps,
     )
     admitted = await create_admitted_session(
         store,
@@ -459,6 +462,7 @@ async def _stage_completed_model_boundary(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            max_steps=max_steps,
             limits=RunLimits() if limits is None else limits,
             tool_capability_ceiling=ToolCapabilityCeiling(
                 tool_names=((tool_name,) if with_tool_call else ())
@@ -495,7 +499,7 @@ async def _stage_completed_model_boundary(
         "source_transcript_cursor": source_cursor,
         "request_fingerprint": "0" * 64,
         "recovery_context": ModelCompletionRecoveryContext(
-            max_steps=DEFAULT_MAX_STEPS,
+            max_steps=max_steps,
             execution_profile_fingerprint=execution_profile.fingerprint,
             tool_exposure=(_test_tool_exposure_authority(tool_name) if with_tool_call else None),
         ).model_dump(mode="json"),
@@ -565,7 +569,7 @@ async def _stage_completed_model_boundary(
             policy_outcomes=None,
             structured_output=None,
             tool_round_identity=tool_round_identity,
-            max_steps=DEFAULT_MAX_STEPS,
+            max_steps=max_steps,
             limits=RunLimits() if limits is None else limits,
             budget_limits=(),
             retry_policy=RetryPolicy(),
@@ -1104,7 +1108,10 @@ def test_model_reconciliation_retains_exact_detached_completed_stage(
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("with_tool_call", [False, True])
 @pytest.mark.parametrize("end_turn", [None, False], ids=["default", "follow_up"])
-def test_reconstruct_reconciled_model_result(backend, with_tool_call, end_turn, tmp_path) -> None:
+@pytest.mark.parametrize("max_steps", [64, 257, 10000])
+def test_reconstruct_reconciled_model_result(
+    backend, with_tool_call, end_turn, max_steps, tmp_path
+) -> None:
     async def run():
         store = (
             InMemorySessionStore()
@@ -1119,6 +1126,7 @@ def test_reconstruct_reconciled_model_result(backend, with_tool_call, end_turn, 
                 provider_name=provider.name,
                 with_tool_call=with_tool_call,
                 end_turn=end_turn,
+                max_steps=max_steps,
             )
             boundary = await _register_runtime(
                 store, provider
@@ -1131,6 +1139,9 @@ def test_reconstruct_reconciled_model_result(backend, with_tool_call, end_turn, 
                 interaction_id=staged.publication.interaction_id,
                 source_run_epoch=staged.session.run_epoch,
             )
+            assert boundary.completed_stage.intent["recovery_context"]["max_steps"] == max_steps
+            if with_tool_call:
+                assert boundary.pending_tool_round.max_steps == max_steps
             assert result is not None
             assert result.step == 1
             assert result.model_step_id == staged.stage.logical_step_id
