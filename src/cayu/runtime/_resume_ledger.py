@@ -347,6 +347,9 @@ def tool_call_outcome_from_terminal_event(
                     else copy_json_value(argument_projection.arguments, "arguments")
                 )
             ),
+            arguments_state=(
+                argument_projection.state if argument_projection is not None else "unavailable"
+            ),
             targeted_tool_grant_id=pending_tool_call.targeted_tool_grant_id,
             model_tool_name=pending_tool_call.model_tool_name,
             targeted_tool_invocation=pending_tool_call.targeted_tool_invocation,

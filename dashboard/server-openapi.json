@@ -33935,6 +33935,15 @@
             "title": "Arguments",
             "type": "object"
           },
+          "arguments_state": {
+            "default": "finalized",
+            "enum": [
+              "finalized",
+              "unavailable"
+            ],
+            "title": "Arguments State",
+            "type": "string"
+          },
           "model_attempt_id": {
             "anyOf": [
               {

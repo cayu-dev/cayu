@@ -7129,7 +7129,7 @@ def _message_part_digest(
     if type(part) is ToolCallPart:
         return (
             f"[tool_call id={part.tool_call_id} name={part.tool_name} "
-            f"arguments={copy_json_value(part.arguments, 'arguments')}]"
+            f"arguments_state={part.arguments_state} arguments={part.continuation_arguments()}]"
         )
     if type(part) is ToolResultPart:
         return (

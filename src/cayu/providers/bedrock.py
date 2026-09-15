@@ -1216,7 +1216,7 @@ def _bedrock_message_content(
                     "toolUse": {
                         "toolUseId": part.tool_call_id,
                         "name": part.tool_name,
-                        "input": copy_json_value(part.arguments, "tool arguments"),
+                        "input": copy_json_value(part.continuation_arguments(), "tool arguments"),
                     }
                 }
             )

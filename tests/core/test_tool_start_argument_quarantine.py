@@ -2431,6 +2431,12 @@ async def _run_restart_recovery_scenario() -> None:
     )
     assert recovered_terminal.payload["result"]["content"] == "done"
     assert recovered_terminal.payload["arguments_state"] == "unavailable"
+    assert all(
+        part.arguments_state == "unavailable"
+        for message in provider.requests[1].messages
+        for part in message.content
+        if isinstance(part, ToolCallPart)
+    )
     assert "arguments" not in recovered_terminal.payload
     assert not any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in durable_events)
     assert secret not in repr(durable_events)

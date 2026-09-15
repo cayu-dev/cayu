@@ -3633,7 +3633,7 @@ class ToolRoundExecutor:
                 "model_tool_name",
             )
             outcome = runtime_records.ToolCallOutcome(
-                call=replace(tool_call, arguments={}),
+                call=replace(tool_call, arguments={}, arguments_state="unavailable"),
                 result=result,
             )
             publication_snapshot = invocation_secrets.InvocationPublicationSnapshot(
@@ -3709,7 +3709,7 @@ class ToolRoundExecutor:
                 tool_call,
             )
             outcome = runtime_records.ToolCallOutcome(
-                call=replace(tool_call, arguments={}),
+                call=replace(tool_call, arguments={}, arguments_state="unavailable"),
                 result=result,
             )
             publication_snapshot = invocation_secrets.InvocationPublicationSnapshot(
@@ -3788,7 +3788,7 @@ class ToolRoundExecutor:
                     if field in payload
                 ),
             )
-            projected_call = replace(tool_call, arguments={})
+            projected_call = replace(tool_call, arguments={}, arguments_state="unavailable")
             outcome = runtime_records.ToolCallOutcome(
                 call=projected_call,
                 result=result,
@@ -6042,6 +6042,7 @@ class ToolRoundExecutor:
                         call=replace(
                             effective_tool_call,
                             arguments=argument_projection.transcript_arguments(),
+                            arguments_state=argument_projection.state,
                         ),
                         result=result,
                     )
@@ -7145,6 +7146,7 @@ class ToolRoundExecutor:
         projected_tool_call = replace(
             tool_call,
             arguments=resolved_argument_projection.transcript_arguments(),
+            arguments_state=resolved_argument_projection.state,
         )
         event = _restore_targeted_tool_invocation_event_authority(
             event,
@@ -8268,7 +8270,7 @@ class ToolRoundRun:
                 if call is None or type(result_payload) is not dict:
                     raise RuntimeError("Staged outcome conflicts with its tool-round call.")
                 staged_private_outcomes[staged.tool_call_id] = runtime_records.ToolCallOutcome(
-                    call=replace(call, arguments={}),
+                    call=replace(call, arguments={}, arguments_state="unavailable"),
                     result=tool_results.tool_result_from_payload(result_payload),
                 )
             tool_outcomes[:] = [
@@ -9293,7 +9295,7 @@ class ToolRoundRun:
         return (
             event,
             runtime_records.ToolCallOutcome(
-                call=replace(tool_call, arguments={}),
+                call=replace(tool_call, arguments={}, arguments_state="unavailable"),
                 result=result,
             ),
         )

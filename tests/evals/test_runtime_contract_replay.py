@@ -35,7 +35,7 @@ from cayu.evals.runtime_replay import (
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import trajectory_from_session
 from cayu.events import EventType
-from cayu.messages import Message, MessageRole
+from cayu.messages import Message, MessageRole, ToolCallPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -479,7 +479,10 @@ def test_runtime_contract_replay_matches_parallel_mixed_tool_results() -> None:
     assert "Osh unavailable" not in serialized
 
 
-def test_runtime_contract_replay_rejects_nonexact_tool_argument_evidence() -> None:
+@pytest.mark.parametrize("unavailable_transcript", [False, True])
+def test_runtime_contract_replay_rejects_nonexact_tool_argument_evidence(
+    unavailable_transcript,
+) -> None:
     async def scenario():
         app, _tool, trajectory = await _captured_multi_tool_round(parallel_safe=False)
         terminal_index = next(
@@ -493,7 +496,21 @@ def test_runtime_contract_replay_rejects_nonexact_tool_argument_evidence() -> No
             update={"payload": {**terminal.payload, "arguments_exact": False}},
             deep=True,
         )
-        trajectory.events = tuple(changed_events)
+        if unavailable_transcript:
+            trajectory.transcript = tuple(
+                Message(
+                    role=message.role,
+                    content=tuple(
+                        part.model_copy(update={"arguments_state": "unavailable"})
+                        if isinstance(part, ToolCallPart)
+                        else part
+                        for part in message.content
+                    ),
+                )
+                for message in trajectory.transcript
+            )
+        else:
+            trajectory.events = tuple(changed_events)
         trajectory._promotion_capture_sha256 = _trajectory_promotion_capture_sha256(trajectory)
         return await replay_session(app, RuntimeReplayRequest(trajectory=trajectory))
 

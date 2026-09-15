@@ -19,6 +19,7 @@ _MESSAGE_PART_STRUCTURE_KEYS = {
     "tool_call": frozenset(
         {
             "arguments",
+            "arguments_state",
             "model_attempt_id",
             "model_step_id",
             "tool_call_id",
@@ -154,6 +155,7 @@ _MESSAGE_RUNTIME_EXECUTION_AUTHORITY_FIELDS = frozenset(
 )
 _MESSAGE_PRESERVED_STRING_FIELDS = _MESSAGE_AUTHORITY_STRING_FIELDS | {
     "type",
+    "arguments_state",
 }
 
 
@@ -567,7 +569,11 @@ def _require_secret_free_tool_result_structure(
     )
     is_command_policy_denial = (
         part.get("is_error") is True
-        and set(structured) == _COMMAND_POLICY_DENIAL_RESULT_STRUCTURE_KEYS
+        and set(structured)
+        in (
+            _COMMAND_POLICY_DENIAL_RESULT_STRUCTURE_KEYS,
+            _COMMAND_POLICY_DENIAL_RESULT_STRUCTURE_KEYS | {"recovery_instruction"},
+        )
         and (structured.get("error"), structured.get("decision"))
         in _COMMAND_POLICY_DENIAL_IDENTITIES
         and (structured.get("reason") is None or type(structured.get("reason")) is str)

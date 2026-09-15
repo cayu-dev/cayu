@@ -288,6 +288,7 @@ def tool_call_part(tool_call: ToolCallRequest) -> ToolCallPart:
         tool_call_id=tool_call.id,
         tool_name=tool_call.name,
         arguments=deepcopy(tool_call.arguments),
+        arguments_state=tool_call.arguments_state,
     )
 
 
@@ -348,6 +349,7 @@ def assistant_message_with_tool_round(
                 tool_call_id=part.tool_call_id,
                 tool_name=part.tool_name,
                 arguments=deepcopy(part.arguments),
+                arguments_state=part.arguments_state,
                 tool_round_id=identity.tool_round_id,
                 model_step_id=identity.model_step_id,
                 model_attempt_id=identity.model_attempt_id,
@@ -391,6 +393,7 @@ def assistant_message_without_tool_round(
                 tool_call_id=part.tool_call_id,
                 tool_name=part.tool_name,
                 arguments=deepcopy(part.arguments),
+                arguments_state=part.arguments_state,
             )
         )
     if not tool_call_seen:
@@ -469,7 +472,12 @@ def assistant_message_with_tool_call_arguments(
                 )
             projected_openai_state_ids.add(call_id)
             state["arguments"] = json.dumps(
-                projected_call.transcript_arguments,
+                ToolCallPart(
+                    tool_call_id=call_id,
+                    tool_name=tool_name,
+                    arguments=projected_call.transcript_arguments,
+                    arguments_state=projected_call.arguments_state,
+                ).continuation_arguments(),
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -489,6 +497,7 @@ def assistant_message_with_tool_call_arguments(
                 tool_call_id=part.tool_call_id,
                 tool_name=part.tool_name,
                 arguments=deepcopy(projected_call.transcript_arguments),
+                arguments_state=projected_call.arguments_state,
                 tool_round_id=part.tool_round_id,
                 model_step_id=part.model_step_id,
                 model_attempt_id=part.model_attempt_id,
@@ -531,6 +540,7 @@ def project_assistant_message_for_tool_round_publication(
                     tool_call_id=part.tool_call_id,
                     tool_name=part.tool_name,
                     arguments={},
+                    arguments_state="unavailable",
                     tool_round_id=part.tool_round_id,
                     model_step_id=part.model_step_id,
                     model_attempt_id=part.model_attempt_id,

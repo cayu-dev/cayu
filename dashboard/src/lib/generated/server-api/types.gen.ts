@@ -17109,6 +17109,10 @@ export type ToolCallPart = {
         [key: string]: unknown;
     };
     /**
+     * Arguments State
+     */
+    arguments_state?: 'finalized' | 'unavailable';
+    /**
      * Model Attempt Id
      */
     model_attempt_id?: string | null;

@@ -152,6 +152,26 @@ Withdrawal/quarantine use the inspected revision and a separate action
 idempotency key. Retry the same action request after an acknowledgement loss;
 do not substitute a new revision while reusing its key.
 
+## Tool argument availability
+
+`ToolCallPart.arguments_state` distinguishes `finalized` argument projections from
+`unavailable` input. An unavailable call may retain an empty `arguments` placeholder
+(or a safe targeted-tool envelope); it does **not** mean the model submitted an
+empty object. Command-policy refusals suppress arguments because argv, shell text,
+stdin, and environment values can contain credentials unknown to the vault.
+
+Inspect `arguments_state` before interpreting arguments. The state survives stored
+transcripts and JSONL exports. Provider continuations render unavailable input as an
+explicit `__cayu_arguments_unavailable__` history marker with a no-replay instruction.
+Command refusal results include a safe `recovery_instruction` alongside the redacted
+policy reason. Use that guidance to choose a permitted command or request the
+required capability from the application operator.
+
+`finalized` means publication-safe, not necessarily exact: redaction can change the
+object. Replay still requires exact terminal argument evidence; unavailable history
+is never replay authority. Older messages without this field retain the default
+`finalized` representation and do not gain any new replay authority.
+
 ## Store extension guarantee
 
 The base `SessionStore.session_message_lifecycle_version` defaults to `None`.

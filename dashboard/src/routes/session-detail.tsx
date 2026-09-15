@@ -752,6 +752,18 @@ function TranscriptPart({ part }: { part: Record<string, unknown> }) {
   }
 
   if (type === "tool_call") {
+    if (part.arguments_state === "unavailable") {
+      return (
+        <div className="min-w-0">
+          <span className="block rounded bg-background/80 px-2 py-1 font-mono text-xs">
+            call {toolName} — arguments unavailable
+          </span>
+          <p className="mt-2 text-xs text-muted-foreground">
+            The submitted arguments were suppressed. See the tool result for recovery guidance.
+          </p>
+        </div>
+      )
+    }
     return (
       <div className="min-w-0">
         <span className="block overflow-x-auto rounded bg-background/80 px-2 py-1 font-mono text-xs">

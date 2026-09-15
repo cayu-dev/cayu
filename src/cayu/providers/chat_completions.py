@@ -1788,7 +1788,7 @@ def _assistant_message(
                 "type": "function",
                 "function": {
                     "name": part.tool_name,
-                    "arguments": _json_arguments(part.arguments),
+                    "arguments": _json_arguments(part.continuation_arguments()),
                 },
             }
             extra_content = tool_call_extra_content.get(part.tool_call_id)

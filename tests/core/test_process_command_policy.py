@@ -481,6 +481,11 @@ def test_process_command_policy_runs_allowed_and_blocks_denied_command_in_cayu_a
         "error": "command_denied",
         "decision": "deny",
         "reason": "Executable is not allowed by the process policy.",
+        "recovery_instruction": (
+            "Choose a command permitted by the configured command policy, or ask the "
+            "application operator to authorize the required capability. Do not retry "
+            "suppressed arguments from transcript history."
+        ),
     }
     assert not denied_marker.exists()
 

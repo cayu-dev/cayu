@@ -220,6 +220,7 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+    arguments_state: Literal["finalized", "unavailable"] = "finalized"
     targeted_tool_grant_id: str | None = None
     model_tool_name: str | None = None
     targeted_tool_invocation: ResolvedTargetedToolInvocation | None = None
@@ -294,6 +295,7 @@ def copy_tool_call_request(
     value: ToolCallRequest,
     *,
     arguments: dict[str, Any] | None = None,
+    arguments_state: Literal["finalized", "unavailable"] | None = None,
 ) -> ToolCallRequest:
     """Return a detached copy without losing targeted-tool dual identity."""
 
@@ -306,6 +308,7 @@ def copy_tool_call_request(
             value.arguments if arguments is None else arguments,
             "tool_call.arguments",
         ),
+        arguments_state=value.arguments_state if arguments_state is None else arguments_state,
         targeted_tool_grant_id=value.targeted_tool_grant_id,
         model_tool_name=value.model_tool_name,
         targeted_tool_invocation=(

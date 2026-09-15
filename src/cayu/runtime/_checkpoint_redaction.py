@@ -98,6 +98,7 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
 )
 _DURABLE_ENUM_STRING_FIELDS = frozenset(
     {
+        "arguments_state",
         "assistant_message_state",
         "channel",
         "channels",
@@ -482,6 +483,7 @@ _QUARANTINED_ASSISTANT_MESSAGE_PART_KEYS = frozenset(
         "tool_call_id",
         "tool_name",
         "arguments",
+        "arguments_state",
         "tool_round_id",
         "model_step_id",
         "model_attempt_id",

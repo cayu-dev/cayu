@@ -404,6 +404,11 @@ def _policy_refusal_result(
         content=content,
         structured={
             "error": error,
+            "recovery_instruction": (
+                "Choose a command permitted by the configured command policy, or ask the "
+                "application operator to authorize the required capability. Do not retry "
+                "suppressed arguments from transcript history."
+            ),
             "decision": str(verdict.decision),
             "reason": verdict.reason,
         },

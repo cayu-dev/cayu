@@ -14931,6 +14931,7 @@ class RecoveryCoordinator:
                         id=record.intent.tool_call_id,
                         name=record.intent.tool_name,
                         arguments={},
+                        arguments_state="unavailable",
                     )
                 ],
             ),
@@ -15983,6 +15984,7 @@ class RecoveryCoordinator:
                     call=runtime_records.copy_tool_call_request(
                         expected_outcome.call,
                         arguments=recorded_projection.transcript_arguments(),
+                        arguments_state=recorded_projection.state,
                     ),
                     result=expected_outcome.result,
                 )
@@ -16799,6 +16801,7 @@ class RecoveryCoordinator:
                         call=runtime_records.copy_tool_call_request(
                             tool_call,
                             arguments={},
+                            arguments_state="unavailable",
                         ),
                         result=unexposed_tool_result(),
                     )
@@ -17350,6 +17353,7 @@ class RecoveryCoordinator:
                 call=runtime_records.copy_tool_call_request(
                     expected_outcome.call,
                     arguments={},
+                    arguments_state="unavailable",
                 ),
                 result=expected_outcome.result,
             )

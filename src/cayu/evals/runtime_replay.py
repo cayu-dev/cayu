@@ -1131,7 +1131,7 @@ def _extract_evidence(
             )
         except (TypeError, ValueError) as exc:
             raise _ReplayUnavailable(RuntimeReplayReason.SOURCE_TOOL_EVIDENCE_UNAVAILABLE) from exc
-        if terminal_arguments_exact is not True:
+        if call.arguments_state != "finalized" or terminal_arguments_exact is not True:
             raise _ReplayUnavailable(RuntimeReplayReason.SOURCE_TOOL_ARGUMENT_EVIDENCE_UNAVAILABLE)
         if (
             type(source_effect) is not str

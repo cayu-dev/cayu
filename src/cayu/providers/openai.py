@@ -6855,7 +6855,7 @@ def _function_call_input_item(part: ToolCallPart) -> dict[str, Any]:
             "type": "function_call",
             "call_id": part.tool_call_id,
             "name": part.tool_name,
-            "arguments": _json_arguments(part.arguments),
+            "arguments": _json_arguments(part.continuation_arguments()),
             "status": "completed",
         }
     )

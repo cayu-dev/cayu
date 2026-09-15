@@ -56,9 +56,25 @@ class ToolCallPart(BaseModel):
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # Finalized is a publication-safe projection, not proof of replay authority.
+    arguments_state: Literal["finalized", "unavailable"] = "finalized"
+
     tool_round_id: str | None = None
     model_step_id: str | None = None
     model_attempt_id: str | None = None
+
+    def continuation_arguments(self) -> dict[str, Any]:
+        """Return explicit non-executable evidence for suppressed historical input."""
+        if self.arguments_state == "unavailable":
+            return {
+                "__cayu_arguments_unavailable__": (
+                    "Original arguments are unavailable; this is not a submitted argument object. "
+                    "Do not replay this placeholder. Read the tool result before choosing a new call. "
+                    "For a policy denial, choose a permitted capability or ask the application "
+                    "operator to authorize the required capability."
+                )
+            }
+        return copy_durable_json_value(self.arguments, "arguments")
 
     @field_validator("arguments", mode="before")
     @classmethod

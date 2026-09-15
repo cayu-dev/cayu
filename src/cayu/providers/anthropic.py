@@ -1704,7 +1704,7 @@ def _assistant_block(
             "type": "tool_use",
             "id": part.tool_call_id,
             "name": part.tool_name,
-            "input": copy_json_value(part.arguments, "arguments"),
+            "input": copy_json_value(part.continuation_arguments(), "arguments"),
         }
     raise AnthropicProtocolError("Assistant messages can only contain text and tool_call blocks.")
 
