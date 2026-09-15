@@ -83,6 +83,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -269,6 +270,9 @@ class DispatchRequest(BaseModel):
     dispatch_id: str = Field(default_factory=lambda: str(uuid4()))
     task_id: str | None = None
     target: ModelTarget | None = None
+    failover: ModelFailoverPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # None preserves the durable maximum; an explicit subset narrows it permanently.
     tool_capability_ceiling: ToolCapabilityCeiling | None = None
     # Fresh grants apply only to the newly admitted ordinary interaction.
@@ -285,6 +289,11 @@ class DispatchRequest(BaseModel):
         default_factory=tuple,
         exclude=True,
     )
+
+    @field_validator("failover", mode="before")
+    @classmethod
+    def copy_failover(cls, value: object) -> ModelFailoverPolicy | None:
+        return copy_optional_model_failover_policy(value)
 
     @field_validator("messages")
     @classmethod
@@ -3014,6 +3023,7 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         messages=[detach_message(message) for message in request.messages],
         dispatch_id=request.dispatch_id,
         task_id=request.task_id,
+        failover=copy_optional_model_failover_policy(request.failover),
         target=(
             None
             if request.target is None
@@ -3140,6 +3150,7 @@ def _queued_dispatch_schema_version(
         request.tool_capability_ceiling is not None
         or request.tool_grants
         or request.profile_adoption is not None
+        or request.failover is not None
     ):
         return _QUEUED_DISPATCH_INVOCATION_CONTROL_SCHEMA_VERSION
     return _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION
@@ -3154,6 +3165,8 @@ def _queued_dispatch_request_payload(
 
     payload = copy_dispatch_request(request).model_dump(mode="json")
     if schema_version == _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION:
+        if request.failover is not None:
+            raise ValueError("Failover cannot use a queue writer without invocation controls.")
         for field_name in _QUEUED_DISPATCH_INVOCATION_CONTROL_FIELDS:
             payload.pop(field_name)
         return payload
@@ -3574,6 +3587,7 @@ def redact_dispatch_request(
             session_id=request.session_id,
             messages=request.messages,
             target=request.target,
+            failover=request.failover,
             tool_capability_ceiling=request.tool_capability_ceiling,
             tool_grants=request.tool_grants,
             profile_adoption=request.profile_adoption,
@@ -3647,6 +3661,7 @@ def redact_dispatch_request(
             )
         ),
         tool_capability_ceiling=prepared_invocation.tool_capability_ceiling,
+        failover=prepared_invocation.failover,
         tool_grants=prepared_invocation.tool_grants,
         profile_adoption=prepared_invocation.profile_adoption,
         metadata=metadata,

@@ -15838,6 +15838,80 @@ resource accounting, supported assertions and source-mutation limitations. Live
 post-execution timeouts retain safe phase/capture progress under the outer deadline.
 
 
+### Explicit ordinary-model failover
+
+`RunRequest.failover` is an opt-in `ModelFailoverPolicy` containing an ordered
+tuple of `ModelTarget` alternatives. Every alternative names both its registered
+`provider_name` and `model`. One to seven alternatives are allowed; targets must
+be unique, including the resolved primary. `max_total_attempts` is an integer
+from 1 through 80, defaults to 20, and bounds all actual attempts for one logical
+ordinary model step. A value of one permits one attempt on the selected target
+and no fallback transition within that step. Without this policy, ordinary
+single-target execution retains its existing behavior.
+
+The selected provider's `RetryPolicy` runs before moving to the next candidate,
+subject to the shared attempt ceiling. Only a runtime-observed typed
+`ModelProviderError` with `retryable=True` and status 429, 500, 502, 503, 504, or
+529 can select a fallback. No accepted non-error provider frame may have occurred
+anywhere in that logical step, including earlier local retries. Partial text,
+thinking, tool calls, usage, hosted activity, completion, or owned background work
+therefore suppress fallback. Transport ambiguity, unknown errors, context
+overflow, deadlines, cancellation, and unsettled cleanup do not authorize a new
+target. No client tool executes from an incomplete or discarded attempt.
+
+All candidates are frozen into the invocation's execution profile, including
+their ordered targets, execution modes, and ordinary component identities.
+Admission validates required target, native structured-output, hosted-tool,
+portable-message/tool/file, and thinking capabilities. The fully constructed
+selected request is checked again before reservation and dispatch. An
+incompatible candidate fails closed; Runtime does not silently skip it or remove
+requested semantics. A switch projects prior provider-native continuation state
+out of the request while retaining portable conversation history. New native
+state produced by the selected provider remains available to its later steps.
+
+The configured session target, invocation profile, and environment/work authority
+do not change during fallback. A separate internal execution selection carries
+the actual provider/model. Each attempt uses that target's billing identity,
+pricing, reservation and usage evidence through the existing budget owner.
+Unknown cost is not evidence of zero cost; a failed dispatched reservation keeps
+the existing conservative accounting treatment. Fallback neither grants a new
+budget nor converts currencies. The invocation deadline is unchanged; each
+actual provider request retains its normal provider-stream deadlines. Tool-owned
+auxiliary inference remains separately governed on the root target and is not
+implicitly granted an ordinary failover chain.
+
+The `model_failover` checkpoint is the single mutable selection record. Native
+memory, SQLite and PostgreSQL stage preparation atomically compare its complete
+expected value with the exact model stage, profile, session incarnation, epoch,
+interaction, transcript cursor, attempt identities and predecessor settlement.
+Dispatch consumes that prepared authority once. A preparation replay is not
+permission to dispatch again. An ambiguous dispatched attempt stays under the
+existing model-stage recovery contract; reconstructing a matching plan is not
+permission to repeat it.
+
+Resume, approval continuation and queued work preserve the recorded selection.
+New logical steps reset their attempt counts without resetting the selected
+target. Explicit profile adoption remains required for a changed plan or
+registration. At an authorized new-invocation boundary, adoption preserves the
+selection for unchanged ordered targets and starts at the new primary for a
+changed chain. An inherited fork gets its own selected-only origin, not its
+parent's stage or dispatch authority; its first step starts fresh counters.
+Exact fork/adoption replay must not publish or dispatch again.
+
+`model.error` retains the original provider diagnostic identity and adds
+runtime-owned `provider_name` and `requested_model` attribution. The diagnostic
+provider string may differ from the registered execution name. Native stage
+preparation publishes `model.failover.selected` for initial selection and
+fallback transitions, with the selected/configured targets, counters, stage,
+and transition reason. Eligible exhaustion publishes `model.failover.exhausted`
+with reason `attempt_limit` or `candidate_chain`, then preserves the original
+typed failure. Suppressed fallback is not exhaustion, even at the attempt cap.
+These events are bounded diagnostics, never dispatch or settlement authority;
+private model-step/attempt identities retain their ordinary public redaction.
+An exhaustion-publication failure retains the original failure alongside the
+diagnostic failure, and lost acknowledgements use exact event readback rather
+than another provider request.
+
 ### Model retry decision evidence
 
 The OpenAI Responses adapter recognizes `server_is_overloaded` by error code,

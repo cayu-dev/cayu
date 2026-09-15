@@ -19,7 +19,13 @@ from cayu.runtime.work_attempt_source import (
     WORK_ATTEMPT_SOURCE_MAX_ITEMS,
     WorkAttemptSourceRequest,
 )
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import (
+    InMemorySessionStore,
+    ModelFailoverPolicy,
+    ModelTarget,
+    ResumeRequest,
+    RunRequest,
+)
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
@@ -83,6 +89,35 @@ def test_source_snapshot_preserves_explicit_defaults_and_detaches_data() -> None
     snapshots[0].request["messages"].clear()
     assert restored.request["messages"]
     assert restored.fields_set == snapshots[0].fields_set
+
+
+@pytest.mark.parametrize("kind", ["initial", "continuation"])
+@pytest.mark.parametrize("policy_state", ["implicit", "none", "configured"])
+def test_runtime_source_snapshot_preserves_optional_failover(kind, policy_state):
+    engine = CayuApp(enable_logging=False)._session_engine
+    model = RunRequest if kind == "initial" else ResumeRequest
+    fields = {"agent_name": "worker"} if kind == "initial" else {"session_id": "source"}
+    policy = ModelFailoverPolicy(
+        fallbacks=(ModelTarget(provider_name="backup", model="large"),), max_total_attempts=3
+    )
+    if policy_state != "implicit":
+        fields["failover"] = policy if policy_state == "configured" else None
+    request = model(messages=[Message.text("user", "work")], **fields)
+    digest = engine.work_attempt_source_request_sha256(request, kind=kind)
+    snapshot = engine.work_attempt_source_snapshot(request, kind=kind, source_request_sha256=digest)
+    assert snapshot is not None
+    assert ("failover" in snapshot.fields_set) is (policy_state != "implicit")
+    assert snapshot.request["failover"] == (
+        policy.model_dump(mode="json") if policy_state == "configured" else None
+    )
+    stored = WorkAttemptSourceRequest.model_validate_json(snapshot.model_dump_json())
+    reconstructed = model.model_validate(stored.request)
+    object.__setattr__(reconstructed, "__pydantic_fields_set__", set(stored.fields_set))
+    assert engine._work_attempt_source_document(reconstructed) == stored.request
+    assert engine.work_attempt_source_request_sha256(reconstructed, kind=kind) == digest
+    if policy_state == "implicit":
+        explicit = request.model_copy(update={"failover": None})
+        assert engine.work_attempt_source_request_sha256(explicit, kind=kind) != digest
 
 
 @pytest.mark.parametrize(
@@ -151,6 +186,7 @@ def test_public_admission_retains_exact_source_before_session_creation(
                 messages=[Message.text("user", "Retain input, redact source-secret-canary.")],
                 metadata={"job": {"revision": 7}},
                 max_steps=7,
+                failover=None,
             )
             execution = WorkAttemptExecutionRequest(
                 admission_id="source-admission",
@@ -181,6 +217,8 @@ def test_public_admission_retains_exact_source_before_session_creation(
             assert "source-secret-canary" not in prepared.model_dump_json()
             assert snapshot.request["messages"] != source.model_dump(mode="json")["messages"]
             assert snapshot.request["execution_deadline"]["expires_at"] is None
+            assert snapshot.request["failover"] is None
+            assert "failover" in snapshot.fields_set
             assert snapshot.request["metadata"] == {"job": {"revision": 7}}
             assert "max_steps" in snapshot.fields_set
             retained_json = prepared.model_dump_json()

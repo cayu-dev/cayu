@@ -18095,6 +18095,8 @@
           "model.http_cleanup",
           "model.retry",
           "model.attempt_discarded",
+          "model.failover.selected",
+          "model.failover.exhausted",
           "provider.operation.starting",
           "provider.operation.started",
           "provider.operation.progress",
@@ -18360,6 +18362,16 @@
             "title": "Fingerprint",
             "type": "string"
           },
+          "model_failover": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelFailoverProfileBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "runtime_build_provenance": {
             "$ref": "#/components/schemas/RuntimeBuildProvenance"
           },
@@ -18370,7 +18382,8 @@
               2,
               4,
               5,
-              6
+              6,
+              7
             ],
             "title": "Schema Version",
             "type": "integer"
@@ -23322,6 +23335,177 @@
         ],
         "title": "MessageRole",
         "type": "string"
+      },
+      "ModelFailoverCandidate": {
+        "additionalProperties": false,
+        "properties": {
+          "execution_mode": {
+            "enum": [
+              "synchronous",
+              "background"
+            ],
+            "title": "Execution Mode",
+            "type": "string"
+          },
+          "execution_profile_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Execution Profile Fingerprint",
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "title": "Model",
+            "type": "string"
+          },
+          "provider_name": {
+            "maxLength": 256,
+            "title": "Provider Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_name",
+          "model",
+          "execution_profile_fingerprint",
+          "execution_mode"
+        ],
+        "title": "ModelFailoverCandidate",
+        "type": "object"
+      },
+      "ModelFailoverCandidateProfile": {
+        "additionalProperties": false,
+        "description": "Nonrecursive, digest-only reconstruction of one unbound candidate.",
+        "properties": {
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionProfileComponentIdentity"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "egress_authority": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EgressAuthorityIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "runtime_build_provenance": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenance"
+          },
+          "schema_version": {
+            "const": 6,
+            "default": 6,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "components",
+          "runtime_build_provenance"
+        ],
+        "title": "ModelFailoverCandidateProfile",
+        "type": "object"
+      },
+      "ModelFailoverPlan": {
+        "additionalProperties": false,
+        "description": "Resolved candidate identities, bound into the configured root profile.",
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/ModelFailoverCandidate"
+            },
+            "maxItems": 8,
+            "minItems": 2,
+            "title": "Candidates",
+            "type": "array"
+          },
+          "max_total_attempts": {
+            "maximum": 80.0,
+            "minimum": 1.0,
+            "title": "Max Total Attempts",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "candidates",
+          "max_total_attempts"
+        ],
+        "title": "ModelFailoverPlan",
+        "type": "object"
+      },
+      "ModelFailoverPolicy": {
+        "additionalProperties": false,
+        "description": "Bounded, explicit alternatives after an eligible ordinary model failure.\n\nThe primary target is resolved by the run entrance. ``max_total_attempts``\nincludes that primary's attempts and all same-provider retries, not just\ntransitions between targets. This value never authorizes dispatch itself.",
+        "properties": {
+          "fallbacks": {
+            "items": {
+              "$ref": "#/components/schemas/ModelTarget"
+            },
+            "maxItems": 7,
+            "minItems": 1,
+            "title": "Fallbacks",
+            "type": "array"
+          },
+          "max_total_attempts": {
+            "default": 20,
+            "maximum": 80.0,
+            "minimum": 1.0,
+            "title": "Max Total Attempts",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fallbacks"
+        ],
+        "title": "ModelFailoverPolicy",
+        "type": "object"
+      },
+      "ModelFailoverProfileBinding": {
+        "additionalProperties": false,
+        "description": "Reconstructable immutable candidate plan, not mutable selection authority.",
+        "properties": {
+          "candidate_profiles": {
+            "items": {
+              "$ref": "#/components/schemas/ModelFailoverCandidateProfile"
+            },
+            "maxItems": 8,
+            "minItems": 2,
+            "title": "Candidate Profiles",
+            "type": "array"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/ModelFailoverPlan"
+          },
+          "primary_request_policy": {
+            "$ref": "#/components/schemas/ExecutionProfileComponentIdentity"
+          },
+          "strength": {
+            "$ref": "#/components/schemas/ExecutionProfileIdentityStrength"
+          }
+        },
+        "required": [
+          "plan",
+          "candidate_profiles",
+          "primary_request_policy",
+          "strength"
+        ],
+        "title": "ModelFailoverProfileBinding",
+        "type": "object"
       },
       "ModelJudgeAssertionSpec": {
         "additionalProperties": false,
@@ -28819,6 +29003,16 @@
             "title": "Budget Limits",
             "type": "array"
           },
+          "failover": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelFailoverPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "limits": {
             "$ref": "#/components/schemas/RunLimits"
           },
@@ -29059,6 +29253,16 @@
               }
             ],
             "title": "Causal Budget Id"
+          },
+          "failover": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelFailoverPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "labels": {
             "additionalProperties": {

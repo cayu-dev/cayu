@@ -29,6 +29,7 @@ from cayu import (
     ScenarioLaunchSettingsV2,
     ScenarioTextPartV2,
     ScenarioUserMessageV2,
+    ThinkingConfig,
     compile_corpus_suite,
     corpus_for_eval_scenario,
     preflight_eval_scenario,
@@ -418,6 +419,11 @@ def test_external_process_provider_uses_reconnectable_runtime_operations() -> No
     assert provider.provider_operation_mode == "background"
     assert provider.execution_profile_identity.behavior_version == EXTERNAL_PROCESS_PROTOCOL_VERSION
     assert provider.execution_profile_identity.implementation_version == target.revision
+    provider.preflight_thinking(model=EXTERNAL_PROCESS_PROTOCOL_VERSION, thinking=None)
+    with pytest.raises(ValueError, match="does not declare thinking-control support"):
+        provider.preflight_thinking(
+            model=EXTERNAL_PROCESS_PROTOCOL_VERSION, thinking=ThinkingConfig()
+        )
 
     provider.preflight_portable_messages(
         model=EXTERNAL_PROCESS_PROTOCOL_VERSION,

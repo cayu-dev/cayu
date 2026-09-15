@@ -19,6 +19,7 @@ from cayu.artifacts import (
     file_attachment_from_payload,
     resolved_file_attachments_from_options,
 )
+from cayu.context.thinking import ThinkingConfig
 from cayu.messages import (
     CitationPart,
     FilePart,
@@ -64,7 +65,7 @@ from cayu.providers._stream_lifecycle import (
     StreamTransitionKind,
     StreamViolation,
 )
-from cayu.providers._thinking import validate_thinking_effort
+from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProvider,
@@ -429,6 +430,9 @@ class ChatCompletionsProvider(ModelProvider):
     @property
     def stream_deadlines(self) -> ProviderStreamDeadlines:
         return self._stream_deadlines
+
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        preflight_thinking_effort(thinking, protocol="chat_completions", model=model)
 
     def preflight_portable_messages(
         self,

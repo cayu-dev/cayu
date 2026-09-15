@@ -18,6 +18,7 @@ from cayu import (
     EventType,
     Message,
     ScriptedModelProvider,
+    ThinkingConfig,
     ToolEffect,
 )
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
@@ -436,6 +437,12 @@ def test_tool_result_projection_recording_provider_forwards_request_analysis_hoo
         request
     )
     assert provider.stream_deadlines == delegate.stream_deadlines
+    provider.preflight_portable_messages(model=request.model, messages=request.messages, tools=[])
+    provider.preflight_thinking(model=request.model, thinking=ThinkingConfig(effort="high"))
+    with pytest.raises(ValueError, match="Local thinking incompatibility"):
+        provider.preflight_thinking(
+            model="claude-opus-4-6", thinking=ThinkingConfig(effort="xhigh")
+        )
     assert (
         type(provider).runtime_stream
         is tool_result_projection_live.RecordingProvider.runtime_stream

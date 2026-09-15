@@ -109,6 +109,14 @@ class RecordingProvider(ModelProvider):
     def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
         self.delegate.preflight_native_structured_output_schema(json_schema)
 
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        self.delegate.preflight_thinking(model=model, thinking=thinking)
+
+    def preflight_portable_messages(
+        self, *, model: str, messages: list[Message], tools: list[dict[str, Any]]
+    ) -> None:
+        self.delegate.preflight_portable_messages(model=model, messages=messages, tools=tools)
+
     async def count_input_tokens(self, request: ModelRequest):
         return await self.delegate.count_input_tokens(request)
 

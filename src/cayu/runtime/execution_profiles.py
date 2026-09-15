@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -26,6 +26,7 @@ from cayu._validation import (
     copy_session_metadata,
     require_durable_clean_nonblank,
     require_durable_nonblank,
+    revalidate_model_input,
 )
 from cayu.approvals.tools import (
     ResolutionActor,
@@ -45,6 +46,7 @@ from cayu.runtime.build_provenance import (
     legacy_runtime_build_provenance,
     runtime_build_provenance_identity,
 )
+from cayu.sessions._model_failover import ModelFailoverCandidate, ModelFailoverPlan
 from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 from cayu.tools.catalogue import (
     TOOL_CATALOGUE_MAX_TOOLS,
@@ -139,6 +141,7 @@ _SCHEMA_COMPONENT_CLASSES = {
     4: _SCHEMA_V4_COMPONENT_CLASSES,
     5: _SCHEMA_V5_COMPONENT_CLASSES,
     6: _SCHEMA_V6_COMPONENT_CLASSES,
+    7: _SCHEMA_V6_COMPONENT_CLASSES,
 }
 
 
@@ -648,18 +651,141 @@ class ExecutionProfileComponentIdentity(BaseModel):
         return self
 
 
+class ModelFailoverCandidateProfile(BaseModel):
+    """Nonrecursive, digest-only reconstruction of one unbound candidate."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[6] = 6
+    fingerprint: str
+    components: tuple[ExecutionProfileComponentIdentity, ...]
+    egress_authority: EgressAuthorityIdentity | None = None
+    runtime_build_provenance: RuntimeBuildProvenance
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> ModelFailoverCandidateProfile:
+        self.as_profile()
+        return self
+
+    def as_profile(self) -> ExecutionProfileIdentity:
+        # One canonical validator owns component/fingerprint/egress consistency.
+        # This shape deliberately has no model_failover field, so nested plans
+        # cannot recursively inflate a durable candidate binding.
+        return ExecutionProfileIdentity(
+            schema_version=6,
+            fingerprint=self.fingerprint,
+            components=self.components,
+            egress_authority=self.egress_authority,
+            runtime_build_provenance=self.runtime_build_provenance,
+        )
+
+
+class ModelFailoverProfileBinding(BaseModel):
+    """Reconstructable immutable candidate plan, not mutable selection authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    plan: ModelFailoverPlan
+    candidate_profiles: tuple[ModelFailoverCandidateProfile, ...] = Field(
+        min_length=2, max_length=8
+    )
+    primary_request_policy: ExecutionProfileComponentIdentity
+    strength: ExecutionProfileIdentityStrength
+
+    @field_validator("plan", mode="before")
+    @classmethod
+    def copy_plan(cls, value: object) -> ModelFailoverPlan:
+        return ModelFailoverPlan.model_validate(value)
+
+    @field_validator("candidate_profiles", mode="before")
+    @classmethod
+    def copy_candidate_profiles(cls, value: object) -> tuple[ModelFailoverCandidateProfile, ...]:
+        if type(value) not in (list, tuple):
+            raise ValueError("Failover requires two to eight candidate profile identities.")
+        items = cast("list[object] | tuple[object, ...]", value)
+        if not 2 <= len(items) <= 8:
+            raise ValueError("Failover requires two to eight candidate profile identities.")
+        return tuple(
+            ModelFailoverCandidateProfile.model_validate(
+                revalidate_model_input(item, ModelFailoverCandidateProfile)
+            )
+            for item in items
+        )
+
+    @field_validator("primary_request_policy", mode="before")
+    @classmethod
+    def copy_primary_policy(cls, value: object) -> ExecutionProfileComponentIdentity:
+        return ExecutionProfileComponentIdentity.model_validate(
+            revalidate_model_input(value, ExecutionProfileComponentIdentity)
+        )
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> ModelFailoverProfileBinding:
+        if len(self.candidate_profiles) != len(self.plan.candidates):
+            raise ValueError("Failover requires one profile identity per candidate.")
+        for target, stored in zip(self.plan.candidates, self.candidate_profiles, strict=True):
+            profile = stored.as_profile()
+            if profile.fingerprint != target.execution_profile_fingerprint or profile.component(
+                ExecutionProfileComponentClass.PROVIDER_TARGET
+            ) != execution_profile_provider_target_component(target.provider_name, target.model):
+                raise ValueError("Failover candidate profile conflicts with its plan.")
+        if (
+            self.primary_request_policy.component_class
+            is not ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+            or self.primary_request_policy.availability
+            is not ExecutionProfileIdentityAvailability.AVAILABLE
+            or self.strength is ExecutionProfileIdentityStrength.UNAVAILABLE
+        ):
+            raise ValueError("Failover binding requires available provider request authority.")
+        return self
+
+    def component(self) -> ExecutionProfileComponentIdentity:
+        binding = ModelFailoverProfileBinding.model_validate(
+            revalidate_model_input(self, ModelFailoverProfileBinding)
+        )
+        return ExecutionProfileComponentIdentity(
+            component_class=ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+            strength=binding.strength,
+            availability=ExecutionProfileIdentityAvailability.AVAILABLE,
+            fingerprint=sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "kind": "cayu:model-failover-request-policy:v1",
+                        "primary_request_policy": binding.primary_request_policy.model_dump(
+                            mode="json"
+                        ),
+                        "plan": binding.plan.payload(),
+                    },
+                    "model failover request policy",
+                )
+            ).hexdigest(),
+        )
+
+
 class ExecutionProfileIdentity(BaseModel):
     """Versioned, redacted identity frozen before a session can execute."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 4, 5, 6] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 4, 5, 6, 7] = EXECUTION_PROFILE_SCHEMA_VERSION
     fingerprint: str
     components: tuple[ExecutionProfileComponentIdentity, ...]
+    model_failover: ModelFailoverProfileBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     egress_authority: EgressAuthorityIdentity | None = None
     runtime_build_provenance: RuntimeBuildProvenance = Field(
         default_factory=legacy_runtime_build_provenance
     )
+
+    @field_validator("model_failover", mode="before")
+    @classmethod
+    def copy_model_failover(cls, value: object) -> ModelFailoverProfileBinding | None:
+        if value is None:
+            return None
+        return ModelFailoverProfileBinding.model_validate(
+            revalidate_model_input(value, ModelFailoverProfileBinding)
+        )
 
     @field_validator("runtime_build_provenance", mode="before")
     @classmethod
@@ -686,6 +812,8 @@ class ExecutionProfileIdentity(BaseModel):
 
     @model_validator(mode="after")
     def validate_components(self) -> ExecutionProfileIdentity:
+        if (self.schema_version == 7) != (self.model_failover is not None):
+            raise ValueError("Routed execution profiles require schema 7 and a failover binding.")
         classes = tuple(component.component_class for component in self.components)
         required_classes = tuple(sorted(_SCHEMA_COMPONENT_CLASSES[self.schema_version], key=str))
         if classes != required_classes:
@@ -724,6 +852,38 @@ class ExecutionProfileIdentity(BaseModel):
         )
         if self.fingerprint != expected:
             raise ValueError("Execution-profile fingerprint does not match its components.")
+        if self.model_failover is not None:
+            binding = self.model_failover
+            if (
+                self.component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+                != binding.component()
+            ):
+                raise ValueError(
+                    "Execution-profile failover material conflicts with its component."
+                )
+            primary_components = tuple(
+                binding.primary_request_policy
+                if item.component_class is ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+                else item
+                for item in self.components
+            )
+            primary = ExecutionProfileIdentity(
+                fingerprint=_profile_fingerprint(
+                    primary_components,
+                    schema_version=6,
+                    runtime_build_provenance=self.runtime_build_provenance,
+                ),
+                components=primary_components,
+                egress_authority=self.egress_authority,
+                runtime_build_provenance=self.runtime_build_provenance,
+            )
+            if primary != binding.candidate_profiles[0].as_profile():
+                raise ValueError("Execution-profile failover material conflicts with its primary.")
+            target = binding.plan.candidates[0]
+            if primary.fingerprint != target.execution_profile_fingerprint or primary.component(
+                ExecutionProfileComponentClass.PROVIDER_TARGET
+            ) != execution_profile_provider_target_component(target.provider_name, target.model):
+                raise ValueError("Execution-profile failover material conflicts with its primary.")
         return self
 
     def component(
@@ -1352,6 +1512,48 @@ def changed_execution_profile_components(
     )
 
 
+def inherited_execution_profile_component_changes(
+    expected: ExecutionProfileIdentity,
+    candidate: ExecutionProfileIdentity,
+) -> tuple[ExecutionProfileComponentClass, ...]:
+    """Compare inherited authority beneath an unchanged candidate plan.
+
+    A bound request-policy digest also changes when a permitted component is
+    replaced on a candidate. Inspect every candidate instead of treating that
+    aggregate change as either unconditional drift or unconditional permission.
+    This does not change the general profile-adoption comparison.
+    """
+
+    expected = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(expected, ExecutionProfileIdentity)
+    )
+    candidate = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(candidate, ExecutionProfileIdentity)
+    )
+    before, after = expected.model_failover, candidate.model_failover
+    if before is None or after is None:
+        return changed_execution_profile_components(expected, candidate)
+    changes: set[ExecutionProfileComponentClass] = set()
+    if (
+        before.plan.max_total_attempts != after.plan.max_total_attempts
+        or before.strength != after.strength
+        or tuple(
+            (item.provider_name, item.model, item.execution_mode) for item in before.plan.candidates
+        )
+        != tuple(
+            (item.provider_name, item.model, item.execution_mode) for item in after.plan.candidates
+        )
+    ):
+        changes.add(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+    # A different candidate count is already a plan change, but all common
+    # entries must still expose their actual component differences.
+    for source, target in zip(before.candidate_profiles, after.candidate_profiles, strict=False):
+        changes.update(
+            changed_execution_profile_components(source.as_profile(), target.as_profile())
+        )
+    return tuple(sorted(changes, key=str))
+
+
 def execution_profile_egress_authority_change(
     expected: ExecutionProfileIdentity,
     candidate: ExecutionProfileIdentity,
@@ -1384,6 +1586,34 @@ def unavailable_execution_profile_components(
     )
 
 
+def execution_profile_with_model_failover(
+    profile: ExecutionProfileIdentity,
+    binding: ModelFailoverProfileBinding,
+) -> ExecutionProfileIdentity:
+    """Bind once, after ordinary candidate profile resolution has completed."""
+
+    profile = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(profile, ExecutionProfileIdentity)
+    )
+    if profile.schema_version != 6 or profile.model_failover is not None:
+        raise ValueError("Failover requires an unbound current execution profile.")
+    component = binding.component()
+    components = tuple(
+        component if item.component_class is component.component_class else item
+        for item in profile.components
+    )
+    return ExecutionProfileIdentity(
+        schema_version=7,
+        fingerprint=_profile_fingerprint(
+            components, schema_version=7, runtime_build_provenance=profile.runtime_build_provenance
+        ),
+        components=components,
+        model_failover=binding,
+        egress_authority=profile.egress_authority,
+        runtime_build_provenance=profile.runtime_build_provenance,
+    )
+
+
 def execution_profile_with_component(
     profile: ExecutionProfileIdentity,
     component: ExecutionProfileComponentIdentity,
@@ -1412,8 +1642,58 @@ def execution_profile_with_component(
             runtime_build_provenance=profile.runtime_build_provenance,
         ),
         components=components,
+        model_failover=profile.model_failover,
         egress_authority=egress_authority,
         runtime_build_provenance=profile.runtime_build_provenance,
+    )
+
+
+def execution_profile_with_tool_capability_ceiling(
+    profile: ExecutionProfileIdentity,
+    tool_names: Iterable[str],
+) -> ExecutionProfileIdentity:
+    """Project a ceiling through all frozen candidates, without resolving providers.
+
+    The caller owns permission to narrow the ceiling. This pure identity
+    projection grants neither tool access nor permission to adopt a profile.
+    """
+
+    profile = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(profile, ExecutionProfileIdentity)
+    )
+    component = direct_tool_capability_ceiling_component(tool_names)
+    binding = profile.model_failover
+    if binding is None:
+        return execution_profile_with_component(profile, component)
+    profiles = tuple(
+        execution_profile_with_component(item.as_profile(), component)
+        for item in binding.candidate_profiles
+    )
+    plan = ModelFailoverPlan(
+        max_total_attempts=binding.plan.max_total_attempts,
+        candidates=tuple(
+            ModelFailoverCandidate(
+                provider_name=target.provider_name,
+                model=target.model,
+                execution_mode=target.execution_mode,
+                execution_profile_fingerprint=updated.fingerprint,
+            )
+            for target, updated in zip(binding.plan.candidates, profiles, strict=True)
+        ),
+    )
+    return execution_profile_with_model_failover(
+        profiles[0],
+        ModelFailoverProfileBinding(
+            plan=plan,
+            candidate_profiles=tuple(
+                ModelFailoverCandidateProfile.model_validate(item.model_dump(mode="json"))
+                for item in profiles
+            ),
+            primary_request_policy=binding.primary_request_policy,
+            # The replaced component is always structural. Every other
+            # candidate component, including the weakest one, is unchanged.
+            strength=binding.strength,
+        ),
     )
 
 
@@ -1443,6 +1723,7 @@ def execution_profile_with_egress_authority(
             runtime_build_provenance=profile.runtime_build_provenance,
         ),
         components=components,
+        model_failover=profile.model_failover,
         egress_authority=authority,
         runtime_build_provenance=profile.runtime_build_provenance,
     )

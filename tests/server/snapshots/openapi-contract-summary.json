@@ -5996,6 +5996,8 @@
         "model.http_cleanup",
         "model.retry",
         "model.attempt_discarded",
+        "model.failover.selected",
+        "model.failover.exhausted",
         "provider.operation.starting",
         "provider.operation.started",
         "provider.operation.progress",
@@ -6773,6 +6775,33 @@
       ],
       "title": "MessageRole",
       "type": "string"
+    },
+    "ModelFailoverPolicy": {
+      "additionalProperties": false,
+      "description": "Bounded, explicit alternatives after an eligible ordinary model failure.\n\nThe primary target is resolved by the run entrance. ``max_total_attempts``\nincludes that primary's attempts and all same-provider retries, not just\ntransitions between targets. This value never authorizes dispatch itself.",
+      "properties": {
+        "fallbacks": {
+          "items": {
+            "$ref": "#/components/schemas/ModelTarget"
+          },
+          "maxItems": 7,
+          "minItems": 1,
+          "title": "Fallbacks",
+          "type": "array"
+        },
+        "max_total_attempts": {
+          "default": 20,
+          "maximum": 80.0,
+          "minimum": 1.0,
+          "title": "Max Total Attempts",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fallbacks"
+      ],
+      "title": "ModelFailoverPolicy",
+      "type": "object"
     },
     "ModelPrice": {
       "additionalProperties": false,
@@ -8081,6 +8110,16 @@
           "title": "Budget Limits",
           "type": "array"
         },
+        "failover": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ModelFailoverPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "limits": {
           "$ref": "#/components/schemas/RunLimits"
         },
@@ -8281,6 +8320,16 @@
             }
           ],
           "title": "Causal Budget Id"
+        },
+        "failover": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ModelFailoverPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "labels": {
           "additionalProperties": {

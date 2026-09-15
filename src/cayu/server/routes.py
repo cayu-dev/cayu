@@ -450,6 +450,7 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     LabelSelectorOperator,
     LabelSelectorRequirement,
+    ModelFailoverPolicy,
     ModelTarget,
     PendingActionKind,
     PendingActionQuery,
@@ -1882,6 +1883,7 @@ class RunBody(_BoundedControlPlanePromptBody):
     )
     agent: NonBlankString = "assistant"
     target: ModelTarget | None = None
+    failover: ModelFailoverPolicy | None = None
     causal_budget_id: NonBlankString | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
@@ -1925,6 +1927,7 @@ class ResumeBody(_BoundedControlPlanePromptBody):
     task_handoff_id: NonBlankString | None = None
     prompt: NonBlankString
     profile_adoption: ExecutionProfileAdoptionBody | None = None
+    failover: ModelFailoverPolicy | None = None
     max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
@@ -9096,6 +9099,7 @@ def create_router(
             agent_name=body.agent,
             session_id=session_id,
             target=body.target,
+            failover=body.failover,
             causal_budget_id=body.causal_budget_id,
             task_id=task_id,
             labels=body.labels,
@@ -9210,6 +9214,7 @@ def create_router(
             task_handoff_id=body.task_handoff_id,
             messages=[Message.text("user", body.prompt)],
             profile_adoption=profile_adoption,
+            failover=body.failover,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,

@@ -22,6 +22,7 @@ from cayu.artifacts.attachments import (
     file_attachment_from_payload,
     resolved_file_attachments_from_options,
 )
+from cayu.context.thinking import ThinkingConfig
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -95,7 +96,7 @@ from cayu.providers._stream_lifecycle import (
     StreamTransitionKind,
     StreamViolation,
 )
-from cayu.providers._thinking import validate_thinking_effort
+from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
     MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -1051,6 +1052,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     @property
     def provider_operations(self) -> ProviderOperationAdapter | None:
         return self._background_operations
+
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        preflight_thinking_effort(thinking, protocol="openai", model=model)
 
     def preflight_portable_messages(
         self,

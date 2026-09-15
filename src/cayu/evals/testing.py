@@ -8,7 +8,9 @@ from typing import Any
 
 from cayu._validation import copy_json_value
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.context.thinking import ThinkingConfig
 from cayu.messages import Message
+from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
@@ -205,6 +207,11 @@ class ScriptedModelProvider(ModelProvider):
             max_output_tokens=max_output_tokens,
             output_option_path=(self.name, "max_output_tokens"),
         )
+
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        # Scripted responses model the supplied controls without a remote backend.
+        del model
+        copy_preflight_thinking(thinking)
 
     def preflight_portable_messages(
         self,

@@ -177,7 +177,12 @@ async def _admitted_model_provider_events(
                 _local_http_cleanup_observer.reset(cleanup_token)
             yield event
     finally:
-        await _close_async_iterator(iterator)
+        # The outer aclosing_provider_stream owns classification, redaction and
+        # retained cleanup. Do not suppress an inner close failure here: doing
+        # so would present failed cleanup as settled and allow another dispatch.
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
 
 
 async def _owned_model_provider_events(

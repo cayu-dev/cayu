@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         ReleaseInvocationCommand,
         SettleInvocationCommand,
     )
+    from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -292,6 +293,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_provider_target_component,
     execution_profile_runtime_component,
     execution_profile_session_metadata,
+    inherited_execution_profile_component_changes,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -320,6 +322,22 @@ from cayu.runtime.session_message_lifecycle import (
     session_message_rejection,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._model_failover import (
+    MODEL_FAILOVER_CHECKPOINT_KEY,
+    ModelFailoverProgress,
+    ModelFailoverSelection,
+    copy_model_failover_state,
+    copy_optional_model_failover_policy,
+)
+from cayu.sessions._model_failover import (
+    ModelFailoverPolicy as ModelFailoverPolicy,
+)
+from cayu.sessions._model_failover import (
+    ModelTarget as ModelTarget,
+)
+from cayu.sessions._model_failover import (
+    copy_model_failover_policy as copy_model_failover_policy,
+)
 from cayu.sessions.checkpoints import (
     BROWSER_CONTROLS_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -1674,20 +1692,6 @@ def _empty_run_request_authority() -> frozenset[tuple[str, str]]:
     return frozenset()
 
 
-class ModelTarget(BaseModel):
-    """An application-selected provider and model pair for one session epoch."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    provider_name: str
-    model: str
-
-    @field_validator("provider_name", "model")
-    @classmethod
-    def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-
 def _copy_optional_tool_capability_ceiling(
     value: object,
 ) -> ToolCapabilityCeiling | None:
@@ -1725,6 +1729,9 @@ class RunRequest(BaseModel):
     # Exact per-run execution target. When omitted, the agent model and provider
     # routing/defaults select the initial target.
     target: ModelTarget | None = None
+    failover: ModelFailoverPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # Durable application-tool maximum. None selects the current registered catalog.
     tool_capability_ceiling: ToolCapabilityCeiling | None = None
     # Interaction-scoped addressability requests resolved from the registered catalogue.
@@ -1755,6 +1762,11 @@ class RunRequest(BaseModel):
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
     _runtime_task_invocation: TaskInvocationSnapshot | None = PrivateAttr(default=None)
     _runtime_prepared_session_authority: object | None = PrivateAttr(default=None)
+
+    @field_validator("failover", mode="before")
+    @classmethod
+    def copy_failover(cls, value: object) -> ModelFailoverPolicy | None:
+        return copy_optional_model_failover_policy(value)
 
     @field_validator("messages")
     @classmethod
@@ -1988,6 +2000,9 @@ class ResumeRequest(BaseModel):
     task_handoff_id: str | None = None
     messages: list[Message]
     target: ModelTarget | None = None
+    failover: ModelFailoverPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # None preserves the durable maximum; an explicit subset narrows it permanently.
     tool_capability_ceiling: ToolCapabilityCeiling | None = None
     # Fresh grants apply only to the newly admitted ordinary interaction.
@@ -2006,6 +2021,11 @@ class ResumeRequest(BaseModel):
     )
     _runtime_transport_metadata_authority: object | None = PrivateAttr(default=None)
     _input_redactions_applied: bool = PrivateAttr(default=False)
+
+    @field_validator("failover", mode="before")
+    @classmethod
+    def copy_failover(cls, value: object) -> ModelFailoverPolicy | None:
+        return copy_optional_model_failover_policy(value)
 
     @field_validator("messages")
     @classmethod
@@ -3547,6 +3567,9 @@ class SessionForkProfileRelationship(BaseModel):
     system_prompt_policy: ForkSystemPromptPolicy
     selection: ForkExecutionProfileSelection
     selected_profile: ExecutionProfileIdentity
+    model_failover_candidate_index: StrictInt | None = Field(
+        default=None, ge=0, le=7, exclude_if=lambda value: value is None
+    )
     source_environment_allocation_owners: tuple[SessionForkEnvironmentAllocationOwner, ...]
     initial_invocation_request_sha256: str | None = None
     initial_dispatch_id: str | None = None
@@ -3622,6 +3645,18 @@ class SessionForkProfileRelationship(BaseModel):
 
     @model_validator(mode="after")
     def validate_relationship(self) -> SessionForkProfileRelationship:
+        selected_binding = self.selected_profile.model_failover
+        if (selected_binding is None) != (self.model_failover_candidate_index is None):
+            raise ValueError("Fork routing origin conflicts with its selected profile.")
+        if selected_binding is not None and (
+            self.model_failover_candidate_index is None
+            or self.model_failover_candidate_index >= len(selected_binding.plan.candidates)
+            or (
+                self.selection is ForkExecutionProfileSelection.CURRENT_CHILD
+                and self.model_failover_candidate_index != 0
+            )
+        ):
+            raise ValueError("Fork routing origin is outside its configured selection.")
         if len(self.request_sha256) != 64 or any(
             character not in "0123456789abcdef" for character in self.request_sha256
         ):
@@ -3669,7 +3704,7 @@ class SessionForkProfileRelationship(BaseModel):
         if active != (self.source_active_run_epoch is not None):
             raise ValueError("Active parent profile authority requires a run epoch.")
         if self.selection is ForkExecutionProfileSelection.INHERIT_PARENT:
-            selected_changes = changed_execution_profile_components(
+            selected_changes = inherited_execution_profile_component_changes(
                 self.source_profile,
                 self.selected_profile,
             )
@@ -3691,7 +3726,7 @@ class SessionForkProfileRelationship(BaseModel):
                 }
                 if any(
                     component not in allowed_initial_changes
-                    for component in changed_execution_profile_components(
+                    for component in inherited_execution_profile_component_changes(
                         self.source_profile,
                         self.initial_invocation_profile,
                     )
@@ -4904,6 +4939,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
                 SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
                 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
                 BROWSER_CONTROLS_CHECKPOINT_KEY,
+                MODEL_FAILOVER_CHECKPOINT_KEY,
             )
         )
     ):
@@ -4924,6 +4960,16 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     updated.pop(BROWSER_CONTROLS_CHECKPOINT_KEY, None)
     if browser_controls is not None:
         updated[BROWSER_CONTROLS_CHECKPOINT_KEY] = browser_controls
+        updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
+    # Model selection belongs to native stage, fork and admission transactions.
+    # Generic replacement (including lifecycle callbacks) cannot manufacture,
+    # reset or erase a selected route. Forks have no current route to preserve.
+    updated.pop(MODEL_FAILOVER_CHECKPOINT_KEY, None)
+    if authoritative_current is not None and MODEL_FAILOVER_CHECKPOINT_KEY in authoritative_current:
+        route = copy_model_failover_state(authoritative_current[MODEL_FAILOVER_CHECKPOINT_KEY])
+        if route.session_id != session_id:
+            raise ValueError("Model failover checkpoint belongs to another session.")
+        updated[MODEL_FAILOVER_CHECKPOINT_KEY] = route.payload()
         updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
     if preserve_completion_result_publications:
         updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
@@ -5000,6 +5046,8 @@ def _copy_checkpoint_for_transform(
         copied.pop(SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
     if not browser_control_checkpoint_visible(session_id=session_id):
         copied.pop(BROWSER_CONTROLS_CHECKPOINT_KEY, None)
+    if not lifecycle_authority_allowed:
+        copied.pop(MODEL_FAILOVER_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -5534,6 +5582,8 @@ class RuntimePublicationCheckpointOperation(BaseModel):
             raise ValueError(
                 "Runtime publications cannot mutate completion-result event publication authority."
             )
+        if value == MODEL_FAILOVER_CHECKPOINT_KEY:
+            raise ValueError("Only model-stage preparation may mutate model failover authority.")
         return value
 
     @field_validator("expected_value_digest")
@@ -6234,6 +6284,16 @@ class ModelCompletionStageResult(BaseModel):
     stage: ModelCompletionStage
     replayed: StrictBool
     dispatch_authorized: StrictBool
+    prepared_events: tuple[Event, ...] = Field(
+        default_factory=tuple, exclude_if=lambda events: not events
+    )
+
+    @field_validator("prepared_events", mode="before")
+    @classmethod
+    def copy_prepared_events(cls, value):
+        if type(value) not in (list, tuple) or len(value) > 1:
+            raise ValueError("Stage preparation may publish at most one selection event.")
+        return tuple(copy_event(event) for event in value)
 
     @model_validator(mode="after")
     def validate_dispatch_authorization(self) -> ModelCompletionStageResult:
@@ -6243,6 +6303,8 @@ class ModelCompletionStageResult(BaseModel):
                 "dispatch_authorized must be true exactly for a newly inserted "
                 "in-flight preparation."
             )
+        if self.prepared_events and not expected:
+            raise ValueError("Only a newly prepared stage returns newly published events.")
         return self
 
 
@@ -6476,6 +6538,7 @@ class _PreparedModelCompletionStage:
     expected_statuses: frozenset[SessionStatus]
     expected_run_epoch: int
     expected_transcript_cursor: int
+    failover_admission: ModelFailoverStageAdmission | None = None
 
 
 @dataclass(frozen=True)
@@ -9912,6 +9975,7 @@ class SessionStore(ABC):
     supports_session_closure_recursive_deletion: ClassVar[bool] = False
     supports_session_closure_progress: ClassVar[bool] = False
     model_completion_recovery_fence_version: ClassVar[int] = 0
+    model_failover_stage_version: ClassVar[int] = 0
     supports_completion_result_event_publication_reservations: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
     supports_recall_evidence: ClassVar[bool] = False
@@ -11543,6 +11607,28 @@ class SessionStore(ABC):
             storage_key=storage_key,
         )
 
+    async def load_model_completion_stage_abandonment(
+        self,
+        session_id: str,
+        stage_id: str,
+    ) -> ModelCompletionStageAbandonment | None:
+        """Read positive no-dispatch evidence after the preparation was removed.
+
+        This is a query, not permission to dispatch. Re-preparation compares the
+        complete expected predecessor and this receipt in its own transaction.
+        The shared operation-record lookup keeps all supported backends under
+        their existing read owner; no second route cache is needed after restart.
+        """
+
+        session_id, stage_id, _, _ = _model_completion_stage_storage_identity(session_id, stage_id)
+        storage_key = _model_completion_stage_abandonment_storage_key(stage_id)
+        record = await self._load_model_completion_stage_settlement_record(session_id, storage_key)
+        if record is None:
+            return None
+        return _reconstruct_model_completion_stage_abandonment(
+            record, session_id=session_id, stage_id=stage_id, storage_key=storage_key
+        )
+
     async def load_active_model_completion_stage(
         self,
         session_id: str,
@@ -11648,6 +11734,63 @@ class SessionStore(ABC):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+        )
+        return await self._prepare_model_completion_stage_atomic(prepared)
+
+    def _supports_model_failover_stage_protocol(self) -> bool:
+        """Overriding a mutation owner requires renewed atomic-route attestation."""
+
+        mro = type(self).__mro__
+        capability_owner = next(
+            index
+            for index, owner in enumerate(mro)
+            if "model_failover_stage_version" in owner.__dict__
+        )
+        return (
+            type(self.model_failover_stage_version) is int
+            and self.model_failover_stage_version == 1
+            and all(
+                capability_owner
+                <= next((index for index, owner in enumerate(mro) if hook in owner.__dict__), -1)
+                for hook in (
+                    "_prepare_model_completion_stage_atomic",
+                    "_mark_model_completion_stage_dispatched_atomic",
+                    "_promote_model_completion_stage_atomic",
+                    "create_profiled_fork",
+                    "_create_fork",
+                    "admit_session_invocation",
+                    "admit_execution_profile_resume",
+                    "transition_status_and_checkpoint",
+                )
+            )
+        )
+
+    def _require_model_failover_stage_protocol(self) -> None:
+        """Reject routed admission unless every native mutation owner attests it."""
+
+        if not self._supports_model_failover_stage_protocol():
+            raise NotImplementedError("Store does not attest atomic model failover stages.")
+
+    async def _prepare_model_completion_stage_with_failover(
+        self,
+        session_id: str,
+        *,
+        request: ModelCompletionStageRequest,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_transcript_cursor: int,
+        admission: ModelFailoverStageAdmission,
+    ) -> ModelCompletionStageResult:
+        """Private live-authority entrance; raw public intents cannot select a route."""
+
+        self._require_model_failover_stage_protocol()
+        prepared = _prepare_model_completion_stage(
+            session_id,
+            request,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+            failover_admission=admission,
         )
         return await self._prepare_model_completion_stage_atomic(prepared)
 
@@ -13297,6 +13440,7 @@ class InMemorySessionStore(SessionStore):
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
+    model_failover_stage_version: ClassVar[int] = 1
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
@@ -15267,7 +15411,10 @@ class InMemorySessionStore(SessionStore):
                         "checkpoint",
                     )
             if profile_relationship is not None:
-                _validate_profiled_fork_checkpoint_result(
+                copied_checkpoint = _prepare_profiled_fork_checkpoint_result(
+                    supports_model_failover=self._supports_model_failover_stage_protocol(),
+                    fork=fork,
+                    transcript_cursor=len(copied_transcript),
                     relationship=profile_relationship,
                     source_checkpoint_present=source_checkpoint_present,
                     copied_checkpoint=copied_checkpoint,
@@ -16098,6 +16245,16 @@ class InMemorySessionStore(SessionStore):
             if transition_metadata is not None:
                 session_updates["metadata"] = transition_metadata
             updated = session.model_copy(update=session_updates)
+            transformed_checkpoint = _model_failover_checkpoint_after_profile_admission(
+                source_session=session,
+                admitted_session=updated,
+                source_checkpoint=current_checkpoint,
+                admitted_checkpoint=transformed_checkpoint,
+                candidate_profile=prepared_execution_profile,
+                records=self._session_operation_records.get(session_id, {}),
+                transcript_cursor=len(self._transcripts.get(session_id, [])),
+                supports_model_failover=self._supports_model_failover_stage_protocol(),
+            )
             if result_checkpoint_transform is not None:
                 result_checkpoint = result_checkpoint_transform(
                     updated.model_copy(deep=True),
@@ -19207,6 +19364,7 @@ class InMemorySessionStore(SessionStore):
             dispatch_key = _model_completion_stage_dispatch_storage_key(stage.stage_id)
             _validate_model_completion_stage_for_dispatch(
                 session=session,
+                checkpoint=self._checkpoints.get(session_id),
                 current_transcript_cursor=len(self._transcripts.get(session_id, [])),
                 stage=stage,
                 active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
@@ -19339,6 +19497,25 @@ class InMemorySessionStore(SessionStore):
                     winner_exists=records.get(prepared.winner_storage_key) is not None,
                     receipt_exists=(records.get(prepared.publication_storage_key) is not None),
                 )
+                _model_failover_preparation_checkpoint(
+                    prepared,
+                    session=session,
+                    checkpoint=self._checkpoints.get(session_id),
+                    current_transcript_cursor=len(self._transcripts.get(session_id, [])),
+                    active=active,
+                    records=records,
+                    replayed=True,
+                )
+                expected_selection = _model_failover_selection_event(
+                    prepared, session=session, prepared_at=stage.prepared_at
+                )
+                if expected_selection is not None:
+                    event_record = self._event_records_by_id.get(
+                        (session_id, expected_selection.id)
+                    )
+                    _validate_model_failover_selection_replay(
+                        expected_selection, None if event_record is None else event_record.event
+                    )
                 return ModelCompletionStageResult(
                     stage=stage,
                     replayed=True,
@@ -19386,11 +19563,28 @@ class InMemorySessionStore(SessionStore):
 
             if active is None:
                 self._reject_new_work_after_steering_unlocked(session)
+            route_checkpoint = _model_failover_preparation_checkpoint(
+                prepared,
+                session=session,
+                checkpoint=self._checkpoints.get(session_id),
+                current_transcript_cursor=current_cursor,
+                active=active,
+                records=records,
+                replayed=False,
+            )
             prepared_at = _next_runtime_publication_timestamp(session)
             preparation_record = _model_completion_stage_preparation_record(
                 prepared,
                 source_session=session,
                 prepared_at=prepared_at,
+            )
+            selection_event = _model_failover_selection_event(
+                prepared, session=session, prepared_at=prepared_at
+            )
+            prepared_selection = (
+                None
+                if selection_event is None
+                else self._prepare_event_append_unlocked(session, (selection_event,))
             )
             stage = _reconstruct_model_completion_stage(
                 preparation_record,
@@ -19442,11 +19636,20 @@ class InMemorySessionStore(SessionStore):
                 records[retry_settlement_storage_key] = retry_settlement_record
             records[prepared.preparation_storage_key] = preparation_record
             records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY] = active_record
+            if route_checkpoint is not None:
+                # Only the route root changed; pending-action/queue projections
+                # remain identical and need no separate mutation owner.
+                self._checkpoints[session_id] = route_checkpoint
+            if prepared_selection is not None:
+                updated_session = self._apply_event_append_unlocked(
+                    updated_session, prepared_selection, activity_at=prepared_at
+                )
             self._sessions[session_id] = updated_session
             return ModelCompletionStageResult(
                 stage=stage,
                 replayed=False,
                 dispatch_authorized=True,
+                prepared_events=() if selection_event is None else (selection_event,),
             )
 
     async def _complete_model_completion_stage_atomic(
@@ -22433,6 +22636,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         task_id=request.task_id,
         task_worker_id=request.task_worker_id,
         task_lease_expires_at=request.task_lease_expires_at,
+        failover=copy_optional_model_failover_policy(request.failover),
         target=(
             None
             if request.target is None
@@ -23795,6 +23999,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         session_id=request.session_id,
         task_worker_id=request.task_worker_id,
         task_handoff_id=request.task_handoff_id,
+        failover=copy_optional_model_failover_policy(request.failover),
         messages=[detach_message(message) for message in messages],
         target=(
             None
@@ -24819,6 +25024,26 @@ def _validate_profiled_fork_authority(
         source_session,
         source_checkpoint,
     )
+    if relationship.selected_profile.model_failover is not None:
+        from cayu.runtime._model_execution_selection import model_failover_progress_for_session
+
+        source_selection = model_failover_progress_for_session(
+            session=source_session,
+            execution_profile=source_profile,
+            checkpoint=(
+                None
+                if source_checkpoint is None
+                else copy_durable_json_object(source_checkpoint, "checkpoint")
+            ),
+        )
+        expected_index = (
+            source_selection.candidate_index
+            if relationship.selection is ForkExecutionProfileSelection.INHERIT_PARENT
+            and source_selection is not None
+            else 0
+        )
+        if relationship.model_failover_candidate_index != expected_index:
+            raise ValueError("Fork routing origin conflicts with its exact source selection.")
     if source_profile.component(
         ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
     ) != direct_tool_capability_ceiling_component(source_ceiling.tool_names):
@@ -24866,20 +25091,52 @@ def _profiled_fork_authority_validation_error(error: Exception) -> ValueError:
     return ValueError("Fork source no longer has the expected durable execution-profile identity.")
 
 
-def _validate_profiled_fork_checkpoint_result(
+def _prepare_profiled_fork_checkpoint_result(
     *,
+    supports_model_failover: bool,
+    fork: Session,
+    transcript_cursor: int,
     relationship: SessionForkProfileRelationship,
     source_checkpoint_present: bool,
     copied_checkpoint: Mapping[str, Any] | None,
-) -> None:
-    """Bind the transformed checkpoint outcome to the durable fork decision."""
+) -> dict[str, Any] | None:
+    """Validate copied state and initialize the child's own routing origin."""
 
     if not relationship.copy_checkpoint:
         if copied_checkpoint is not None:
             raise ValueError("Fork copied checkpoint state contrary to its profile relationship.")
-        return
-    if source_checkpoint_present and copied_checkpoint is None:
+    elif source_checkpoint_present and copied_checkpoint is None:
         raise ValueError("Fork discarded checkpoint state contrary to its profile relationship.")
+    checkpoint = (
+        None
+        if copied_checkpoint is None
+        else copy_durable_json_object(copied_checkpoint, "checkpoint")
+    )
+    binding = relationship.selected_profile.model_failover
+    if binding is None:
+        return checkpoint
+    if supports_model_failover is not True:
+        raise NotImplementedError("Store does not attest atomic model failover forks.")
+    if checkpoint is not None and MODEL_FAILOVER_CHECKPOINT_KEY in checkpoint:
+        raise ValueError("Fork checkpoint cannot copy source routing authority.")
+    index = relationship.model_failover_candidate_index
+    if index is None or fork.run_epoch != 0:
+        raise ValueError("Fork routing origin lost its creation authority.")
+    origin = ModelFailoverSelection(
+        session_id=fork.id,
+        session_instance_id=fork.instance_id,
+        execution_profile_fingerprint=relationship.selected_profile.fingerprint,
+        plan=binding.plan,
+        candidate_index=index,
+        origin_id=relationship.request_sha256,
+        source_run_epoch=0,
+        source_transcript_cursor=transcript_cursor,
+        projection_cursor=0,
+    )
+    updated = {} if checkpoint is None else checkpoint
+    updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
+    updated[MODEL_FAILOVER_CHECKPOINT_KEY] = origin.payload()
+    return updated
 
 
 def validate_profiled_fork_evidence(
@@ -24968,6 +25225,12 @@ def validate_profiled_fork_evidence(
     ):
         raise ValueError("Fork targeted-grant reset evidence is inconsistent.")
     payload = fork_event.payload
+    selected_index = relationship.model_failover_candidate_index
+    if payload.get("model_failover_candidate_index") != selected_index or (
+        selected_index is not None
+        and type(payload.get("model_failover_candidate_index")) is not int
+    ):
+        raise ValueError("Fork event conflicts with its initial model selection.")
     exact_source_snapshot_event_fields = {
         "source_instance_fingerprint",
         "source_run_epoch",
@@ -25903,6 +26166,8 @@ def _apply_runtime_publication_checkpoint_mutation(
         return None
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
     for operation in mutation.operations:
+        if operation.key == MODEL_FAILOVER_CHECKPOINT_KEY:
+            raise ValueError("Only model-stage preparation may mutate model failover authority.")
         present = operation.key in updated
         if operation.expected_value_digest is None:
             matches = not present
@@ -26935,6 +27200,7 @@ def _prepare_model_completion_stage(
     expected_statuses: set[SessionStatus],
     expected_run_epoch: int,
     expected_transcript_cursor: int,
+    failover_admission: ModelFailoverStageAdmission | None = None,
 ) -> _PreparedModelCompletionStage:
     session_id = require_clean_nonblank(session_id, "session_id")
     if type(request) is not ModelCompletionStageRequest:
@@ -26950,6 +27216,54 @@ def _prepare_model_completion_stage(
         )
     except AttributeError as exc:
         raise ValueError("Model completion stage request is malformed.") from exc
+    if MODEL_FAILOVER_CHECKPOINT_KEY in copied_request.intent:
+        raise ValueError("Public model-stage intents cannot supply model failover authority.")
+    if failover_admission is not None:
+        from dataclasses import replace
+
+        from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
+
+        if type(failover_admission) is not ModelFailoverStageAdmission:
+            raise TypeError("Model failover requires authenticated stage admission.")
+        failover_admission = replace(failover_admission)
+        progress = failover_admission.successor
+        candidate = progress.plan.candidates[progress.candidate_index]
+        recovery_context = copied_request.intent.get("recovery_context")
+        if (
+            copied_request.purpose != "assistant-turn"
+            or progress.session_id != session_id
+            or progress.stage_id != copied_request.stage_id
+            or progress.logical_step_id != copied_request.logical_step_id
+            or progress.dispatch_ordinal != copied_request.dispatch_ordinal
+            or progress.source_run_epoch != expected_run_epoch
+            or progress.source_transcript_cursor != expected_transcript_cursor
+            or copied_request.intent.get("request_fingerprint") != progress.request_fingerprint
+            or copied_request.intent.get("provider_name") != candidate.provider_name
+            or copied_request.intent.get("requested_model") != candidate.model
+            or copied_request.intent.get("model_step_id") != progress.logical_step_id
+            or copied_request.intent.get("interaction_id") != progress.interaction_id
+            or type(recovery_context) is not dict
+            or recovery_context.get("execution_profile_fingerprint")
+            != progress.execution_profile_fingerprint
+        ):
+            raise ValueError("Model failover conflicts with its exact prepared request.")
+        ModelAttemptIdentity.model_validate(
+            {
+                "model_step_id": copied_request.intent.get("model_step_id"),
+                "model_attempt_id": copied_request.intent.get("model_attempt_id"),
+            }
+        )
+        copied_request = ModelCompletionStageRequest(
+            stage_id=copied_request.stage_id,
+            logical_step_id=copied_request.logical_step_id,
+            dispatch_ordinal=copied_request.dispatch_ordinal,
+            purpose=copied_request.purpose,
+            reservation_ids=copied_request.reservation_ids,
+            intent={
+                **copied_request.intent,
+                MODEL_FAILOVER_CHECKPOINT_KEY: failover_admission.intent_payload(),
+            },
+        )
     allowed_statuses = frozenset(_validate_status_set(expected_statuses, "expected_statuses"))
     expected_run_epoch = _validate_required_runtime_fence(
         expected_run_epoch,
@@ -26992,7 +27306,523 @@ def _prepare_model_completion_stage(
         expected_statuses=allowed_statuses,
         expected_run_epoch=expected_run_epoch,
         expected_transcript_cursor=expected_transcript_cursor,
+        failover_admission=failover_admission,
     )
+
+
+def _model_failover_selection_event(
+    prepared: _PreparedModelCompletionStage,
+    *,
+    session: Session,
+    prepared_at: datetime,
+) -> Event | None:
+    admission = prepared.failover_admission
+    if admission is None or admission.transition not in {"initial", "fallback"}:
+        return None
+    from cayu.runtime.execution_profiles import event_with_execution_profile_authority
+
+    progress = admission.successor
+    target = progress.plan.candidates[progress.candidate_index]
+    previous = admission.expected
+    previous_target = (
+        None if previous is None else previous.plan.candidates[previous.candidate_index]
+    )
+    eligibility = admission.intent_payload().get("eligibility", {})
+    event = Event(
+        id="evt_failover_" + prepared.request_digest,
+        type=EventType.MODEL_FAILOVER_SELECTED,
+        timestamp=prepared_at,
+        session_id=session.id,
+        interaction_id=progress.interaction_id,
+        agent_name=session.agent_name,
+        environment_name=session.environment_name,
+        payload={
+            "schema_version": 1,
+            "route_id": progress.route_id,
+            "route_generation": progress.generation,
+            "stage_id": progress.stage_id,
+            "model_step_id": progress.logical_step_id,
+            "model_attempt_id": prepared.request.intent["model_attempt_id"],
+            "provider": target.provider_name,
+            "model": target.model,
+            "configured_provider": progress.plan.candidates[0].provider_name,
+            "configured_model": progress.plan.candidates[0].model,
+            "candidate_index": progress.candidate_index,
+            "candidate_count": len(progress.plan.candidates),
+            "attempts_used": progress.attempts_used,
+            "max_total_attempts": progress.plan.max_total_attempts,
+            "previous_provider": None if previous_target is None else previous_target.provider_name,
+            "previous_model": None if previous_target is None else previous_target.model,
+            "previous_stage_id": (
+                previous.stage_id if isinstance(previous, ModelFailoverProgress) else None
+            ),
+            "reason": admission.transition,
+            "status_code": eligibility.get("status_code"),
+        },
+    )
+    event = event_with_runtime_generated_id(event)
+    event = event_with_runtime_payload_authority(event, "model_step_id", "model_attempt_id")
+    return event_with_runtime_envelope_authority(
+        event_with_execution_profile_authority(event, admission.invocation_context.profile),
+        "session_id",
+        "interaction_id",
+    )
+
+
+def _validate_model_failover_selection_replay(expected: Event, observed: Event | None) -> None:
+    if observed is None or _runtime_publication_event_digest(
+        observed
+    ) != _runtime_publication_event_digest(expected):
+        raise SessionModelCompletionStageConflict(
+            "Model failover preparation lost its exact durable selection event."
+        )
+
+
+def _model_failover_predecessor_storage_keys(
+    prepared: _PreparedModelCompletionStage,
+) -> tuple[str, ...]:
+    admission = prepared.failover_admission
+    if admission is None or not isinstance(admission.expected, ModelFailoverProgress):
+        return ()
+    return _model_failover_progress_storage_keys(admission.expected)
+
+
+def _model_failover_progress_storage_keys(expected: ModelFailoverProgress) -> tuple[str, ...]:
+    from cayu.runtime.provider_operations import provider_operation_resolution_storage_key
+
+    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        expected.session_id, expected.stage_id
+    )
+    return (
+        preparation_key,
+        terminal_key,
+        _model_completion_stage_winner_storage_key(expected.logical_step_id),
+        _runtime_publication_storage_key(expected.logical_step_id),
+        _model_completion_stage_abandonment_storage_key(expected.stage_id),
+        _model_completion_stage_dispatch_storage_key(expected.stage_id),
+        _model_completion_stage_settlement_storage_key(expected.stage_id),
+        provider_operation_resolution_storage_key(expected.stage_id),
+    )
+
+
+def _require_settled_model_failover_predecessor(
+    expected: ModelFailoverProgress,
+    *,
+    session: Session,
+    records: Mapping[str, dict[str, Any]],
+    active_present: bool,
+    target_run_epoch: int,
+    new_interaction: bool,
+    source_preparation_digest: str | None = None,
+) -> None:
+    """Prove terminal ownership from the native transaction's exact read set."""
+
+    if active_present:
+        raise SessionModelCompletionStageConflict("The previous model stage still owns execution.")
+    (
+        preparation_key,
+        terminal_key,
+        winner_key,
+        receipt_key,
+        abandonment_key,
+        dispatch_key,
+        settlement_key,
+        resolution_key,
+    ) = _model_failover_progress_storage_keys(expected)
+    if new_interaction and records.get(abandonment_key) is not None:
+        if any(
+            records.get(key) is not None
+            for key in (
+                preparation_key,
+                terminal_key,
+                winner_key,
+                receipt_key,
+                dispatch_key,
+                settlement_key,
+                resolution_key,
+            )
+        ):
+            raise SessionModelCompletionStageConflict(
+                "Abandoned model stage has competing evidence."
+            )
+        abandonment = _reconstruct_model_completion_stage_abandonment(
+            records[abandonment_key],
+            session_id=session.id,
+            stage_id=expected.stage_id,
+            storage_key=abandonment_key,
+        )
+        if (
+            (
+                source_preparation_digest is not None
+                and abandonment.preparation_digest != source_preparation_digest
+            )
+            or abandonment.logical_step_id != expected.logical_step_id
+            or abandonment.dispatch_ordinal != expected.dispatch_ordinal
+            or abandonment.source_run_epoch != expected.source_run_epoch
+            or abandonment.source_transcript_cursor != expected.source_transcript_cursor
+            or abandonment.purpose != "assistant-turn"
+            or abandonment.source_run_epoch >= target_run_epoch
+        ):
+            raise SessionModelCompletionStageConflict("Model abandonment authority changed.")
+        return
+    source = _reconstruct_model_completion_stage(
+        records.get(preparation_key),
+        records.get(terminal_key),
+        session_id=session.id,
+        stage_id=expected.stage_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+    )
+    capsule = None if source is None else source.intent.get(MODEL_FAILOVER_CHECKPOINT_KEY)
+    if (
+        source is None
+        or (
+            source_preparation_digest is not None
+            and source.preparation_digest != source_preparation_digest
+        )
+        or type(capsule) is not dict
+        or ModelFailoverProgress.model_validate(capsule.get("successor")) != expected
+    ):
+        raise SessionModelCompletionStageConflict("Model failover lost its exact source stage.")
+    receipt_record = records.get(receipt_key)
+    settlement_record = records.get(settlement_key)
+    if new_interaction and source.state == "in_flight" and settlement_record is not None:
+        settlement = _reconstruct_model_completion_stage_settlement(
+            settlement_record,
+            session_id=session.id,
+            stage_id=expected.stage_id,
+            storage_key=settlement_key,
+        )
+        if (
+            receipt_record is not None
+            or records.get(winner_key) is not None
+            or settlement.disposition is ModelCompletionStageDisposition.SUPERSEDED
+            or settlement.settlement_run_epoch >= target_run_epoch
+        ):
+            raise SessionModelCompletionStageConflict(
+                "Model predecessor is not terminally settled."
+            )
+        expected_settlement = model_completion_stage_settlement_request(
+            source,
+            interaction_id=expected.interaction_id,
+            disposition=settlement.disposition,
+            reason_code=settlement.reason_code,
+            execution_profile_fingerprint=expected.execution_profile_fingerprint,
+            settlement_run_epoch=settlement.settlement_run_epoch,
+            settled_reservation_ids=source.reservation_ids,
+        )
+        observed = ModelCompletionStageSettlementRequest.model_validate(
+            settlement.model_dump(
+                mode="python", include=set(ModelCompletionStageSettlementRequest.model_fields)
+            )
+        )
+        if observed != expected_settlement:
+            raise SessionModelCompletionStageConflict("Model settlement conflicts with its stage.")
+        return
+    if source.state != "completed" or receipt_record is None:
+        raise SessionModelCompletionStageConflict("Model predecessor is not durably published.")
+    receipt = _reconstruct_runtime_publication_receipt(
+        receipt_record,
+        storage_key=receipt_key,
+        session_id=session.id,
+        publication_id=expected.logical_step_id,
+    )
+    _validate_model_completion_stage_winner(
+        records.get(winner_key), stage=source, receipt=receipt, winner_storage_key=winner_key
+    )
+
+
+def _model_failover_admission_storage_keys(
+    checkpoint: dict[str, Any] | None,
+    candidate_profile: ExecutionProfileIdentity | None,
+) -> tuple[str, ...]:
+    if candidate_profile is None:
+        return ()
+    raw = None if checkpoint is None else checkpoint.get(MODEL_FAILOVER_CHECKPOINT_KEY)
+    if raw is None and candidate_profile.model_failover is None:
+        return ()
+    previous = None if raw is None else copy_model_failover_state(raw)
+    return (
+        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+        *(
+            _model_failover_progress_storage_keys(previous)
+            if isinstance(previous, ModelFailoverProgress)
+            else ()
+        ),
+    )
+
+
+def _model_failover_checkpoint_after_profile_admission(
+    *,
+    source_session: Session,
+    admitted_session: Session,
+    source_checkpoint: dict[str, Any] | None,
+    admitted_checkpoint: dict[str, Any] | None,
+    candidate_profile: ExecutionProfileIdentity | None,
+    records: Mapping[str, dict[str, Any]],
+    transcript_cursor: int,
+    supports_model_failover: bool,
+) -> dict[str, Any] | None:
+    """Rebind selection inside validated native admission, before its receipt.
+
+    This is not a callback privilege or a dispatch authorization. All operation
+    records and both checkpoint snapshots belong to the same native transaction.
+    """
+    if candidate_profile is None:
+        return admitted_checkpoint
+    active = active_invocation_execution_profile_from_checkpoint(source_checkpoint)
+    source_profile = (
+        execution_profile_from_session_metadata(source_session.metadata)
+        if active is None
+        else active.profile
+    )
+    if source_profile.fingerprint == candidate_profile.fingerprint:
+        return admitted_checkpoint
+    raw = (
+        None if source_checkpoint is None else source_checkpoint.get(MODEL_FAILOVER_CHECKPOINT_KEY)
+    )
+    if raw is None and candidate_profile.model_failover is None:
+        return admitted_checkpoint
+    if not supports_model_failover or not _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get():
+        raise SessionRunFenced("Model routing changes require atomic invocation admission.")
+    admitted_active = active_invocation_execution_profile_from_checkpoint(admitted_checkpoint)
+    if (
+        admitted_session.id != source_session.id
+        or admitted_session.instance_id != source_session.instance_id
+        or admitted_session.run_epoch != source_session.run_epoch + 1
+        or admitted_session.status is not SessionStatus.RUNNING
+        or admitted_active is None
+        or admitted_active.profile != candidate_profile
+        or admitted_active.session_id != source_session.id
+        or admitted_active.run_epoch != admitted_session.run_epoch
+        or (
+            active is not None
+            and (
+                not active_invocation_execution_profile_is_released(
+                    active, session_id=source_session.id, run_epoch=source_session.run_epoch
+                )
+                or active.interaction_id == admitted_active.interaction_id
+            )
+        )
+    ):
+        raise SessionRunFenced("Model routing changes require a released invocation boundary.")
+    from cayu.runtime._model_execution_selection import model_failover_progress_for_session
+
+    previous = model_failover_progress_for_session(
+        session=source_session,
+        execution_profile=source_profile,
+        checkpoint=source_checkpoint,
+    )
+    active_present = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY) is not None
+    if isinstance(previous, ModelFailoverProgress):
+        _require_settled_model_failover_predecessor(
+            previous,
+            session=source_session,
+            records=records,
+            active_present=active_present,
+            target_run_epoch=admitted_session.run_epoch,
+            new_interaction=True,
+        )
+    elif active_present:
+        raise SessionModelCompletionStageConflict("Profile adoption cannot clear an active stage.")
+    if previous is not None and previous.source_transcript_cursor > transcript_cursor:
+        raise SessionRunFenced("Model selection exceeds the stored transcript.")
+    assert admitted_checkpoint is not None
+    updated = copy_durable_json_value(admitted_checkpoint, "checkpoint")
+    binding = candidate_profile.model_failover
+    if binding is None:
+        updated.pop(MODEL_FAILOVER_CHECKPOINT_KEY, None)
+        return updated
+    same_targets = previous is not None and tuple(
+        (item.provider_name, item.model) for item in previous.plan.candidates
+    ) == tuple((item.provider_name, item.model) for item in binding.plan.candidates)
+    index = previous.candidate_index if same_targets and previous is not None else 0
+    projection_cursor = 0 if previous is None else previous.projection_cursor
+    if previous is not None and (
+        previous.plan.candidates[previous.candidate_index].provider_name,
+        previous.plan.candidates[previous.candidate_index].model,
+    ) != (binding.plan.candidates[index].provider_name, binding.plan.candidates[index].model):
+        projection_cursor = transcript_cursor
+    selection = ModelFailoverSelection(
+        session_id=admitted_session.id,
+        session_instance_id=admitted_session.instance_id,
+        execution_profile_fingerprint=candidate_profile.fingerprint,
+        plan=binding.plan,
+        candidate_index=index,
+        origin_id=_canonical_runtime_publication_digest(
+            {
+                "source": None if previous is None else previous.model_dump(mode="json"),
+                "source_profile": source_profile.fingerprint,
+                "target_profile": candidate_profile.fingerprint,
+                "session_instance_id": admitted_session.instance_id,
+                "interaction_id": admitted_active.interaction_id,
+                "run_epoch": admitted_session.run_epoch,
+                "transcript_cursor": transcript_cursor,
+            }
+        ),
+        source_run_epoch=admitted_session.run_epoch,
+        source_transcript_cursor=transcript_cursor,
+        projection_cursor=projection_cursor,
+    )
+    updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
+    updated[MODEL_FAILOVER_CHECKPOINT_KEY] = selection.model_dump(mode="json")
+    return updated
+
+
+def _model_failover_preparation_checkpoint(
+    prepared: _PreparedModelCompletionStage,
+    *,
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    current_transcript_cursor: int,
+    active: ActiveModelCompletionStage | None,
+    records: Mapping[str, dict[str, Any]],
+    replayed: bool,
+) -> dict[str, Any] | None:
+    """Validate a route against the same snapshot as stage preparation.
+
+    None means no route mutation, not permission to delete the checkpoint.
+    The returned checkpoint must commit with preparation and supersession.
+    """
+
+    admission = prepared.failover_admission
+    if admission is None:
+        if (
+            prepared.request.purpose == "assistant-turn"
+            and checkpoint is not None
+            and MODEL_FAILOVER_CHECKPOINT_KEY in checkpoint
+        ):
+            decoded = decode_runtime_checkpoint(checkpoint, session_id=session.id)
+            if decoded is not None and MODEL_FAILOVER_CHECKPOINT_KEY in decoded:
+                raise SessionModelCompletionStageConflict(
+                    "An ordinary model preparation cannot bypass its failover route."
+                )
+        return None
+    from cayu.runtime._model_failover_stage import model_failover_checkpoint_after_preparation
+
+    if prepared.request.intent.get(MODEL_FAILOVER_CHECKPOINT_KEY) != admission.intent_payload():
+        raise SessionModelCompletionStageConflict(
+            "Model failover admission changed after preparation."
+        )
+    updated = model_failover_checkpoint_after_preparation(
+        admission,
+        session=session,
+        checkpoint=checkpoint,
+        transcript_cursor=current_transcript_cursor,
+        replayed=replayed,
+    )
+    if replayed:
+        return None
+    expected = admission.expected
+    if expected is None or isinstance(expected, ModelFailoverSelection):
+        if active is not None:
+            raise SessionModelCompletionStageConflict(
+                "A new failover route cannot supersede an existing active stage."
+            )
+        return updated
+    (
+        preparation_key,
+        terminal_key,
+        winner_key,
+        receipt_key,
+        abandonment_key,
+        dispatch_key,
+        settlement_key,
+        resolution_key,
+    ) = _model_failover_predecessor_storage_keys(prepared)
+    new_interaction = (
+        admission.transition == "next_step"
+        and admission.successor.interaction_id != expected.interaction_id
+        and admission.successor.source_run_epoch > expected.source_run_epoch
+    )
+    if admission.transition == "next_step":
+        _require_settled_model_failover_predecessor(
+            expected,
+            session=session,
+            records=records,
+            active_present=active is not None,
+            target_run_epoch=admission.successor.source_run_epoch,
+            new_interaction=new_interaction,
+            source_preparation_digest=admission.source_preparation_digest,
+        )
+        return updated
+    if admission.transition == "reprepare":
+        if active is not None or any(
+            records.get(key) is not None
+            for key in (
+                preparation_key,
+                terminal_key,
+                winner_key,
+                receipt_key,
+                dispatch_key,
+                settlement_key,
+                resolution_key,
+            )
+        ):
+            raise SessionModelCompletionStageConflict(
+                "Model failover re-preparation requires an abandoned, undispatched predecessor."
+            )
+        abandonment_record = records.get(abandonment_key)
+        if abandonment_record is None:
+            raise SessionModelCompletionStageConflict(
+                "Model failover lost its abandonment receipt."
+            )
+        abandonment = _reconstruct_model_completion_stage_abandonment(
+            abandonment_record,
+            session_id=session.id,
+            stage_id=expected.stage_id,
+            storage_key=abandonment_key,
+        )
+        if (
+            abandonment.preparation_digest != admission.source_preparation_digest
+            or abandonment.logical_step_id != expected.logical_step_id
+            or abandonment.dispatch_ordinal != expected.dispatch_ordinal
+            or abandonment.source_run_epoch != expected.source_run_epoch
+            or abandonment.source_transcript_cursor != expected.source_transcript_cursor
+            or abandonment.purpose != "assistant-turn"
+        ):
+            raise SessionModelCompletionStageConflict(
+                "Model failover abandonment authority changed."
+            )
+        return updated
+    source = _reconstruct_model_completion_stage(
+        records.get(preparation_key),
+        records.get(terminal_key),
+        session_id=session.id,
+        stage_id=expected.stage_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+    )
+    capsule = None if source is None else source.intent.get(MODEL_FAILOVER_CHECKPOINT_KEY)
+    if (
+        source is None
+        or source.preparation_digest != admission.source_preparation_digest
+        or type(capsule) is not dict
+        or ModelFailoverProgress.model_validate(capsule.get("successor")) != expected
+    ):
+        raise SessionModelCompletionStageConflict("Model failover lost its exact source stage.")
+    if (
+        admission.transition == "retry"
+        and active is None
+        and source.state == "in_flight"
+        and records.get(resolution_key) is not None
+    ):
+        from cayu.runtime.provider_operations import validate_provider_operation_retry_preparation
+
+        validate_provider_operation_retry_preparation(
+            session_id=session.id,
+            checkpoint=checkpoint,
+            source=source,
+            resolution_record=records[resolution_key],
+            target_dispatch_ordinal=admission.successor.dispatch_ordinal,
+            execution_profile_fingerprint=admission.successor.execution_profile_fingerprint,
+            target_run_epoch=admission.successor.source_run_epoch,
+        )
+    elif active is None or active.stage != source or source.state != "in_flight":
+        raise SessionModelCompletionStageConflict(
+            "A failover retry requires its exact active predecessor."
+        )
+    return updated
 
 
 def _prepare_model_completion_stage_abandonment(
@@ -28120,6 +28950,7 @@ def _validate_model_completion_stage_dispatch(
 def _validate_model_completion_stage_for_dispatch(
     *,
     session: Session,
+    checkpoint: dict[str, Any] | None,
     current_transcript_cursor: int,
     stage: ModelCompletionStage,
     active_record: dict[str, Any] | None,
@@ -28151,6 +28982,9 @@ def _validate_model_completion_stage_for_dispatch(
         raise SessionModelCompletionStageConflict(
             "Only the exact active model-completion stage can cross the dispatch fence."
         )
+    from cayu.runtime._model_failover_stage import validate_model_failover_dispatch
+
+    validate_model_failover_dispatch(session=session, checkpoint=checkpoint, stage=stage)
     settlement_storage_key = _model_completion_stage_settlement_storage_key(stage.stage_id)
     _reject_settled_model_completion_stage(
         settlement_record,

@@ -150,6 +150,8 @@ class EventType(StrEnum):
     MODEL_HTTP_CLEANUP = "model.http_cleanup"
     MODEL_RETRY = "model.retry"
     MODEL_ATTEMPT_DISCARDED = "model.attempt_discarded"
+    MODEL_FAILOVER_SELECTED = "model.failover.selected"
+    MODEL_FAILOVER_EXHAUSTED = "model.failover.exhausted"
     PROVIDER_OPERATION_STARTING = "provider.operation.starting"
     PROVIDER_OPERATION_STARTED = "provider.operation.started"
     PROVIDER_OPERATION_PROGRESS = "provider.operation.progress"

@@ -72,6 +72,7 @@ from cayu.runtime._child_session_identity import (
 from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     ModelTarget,
@@ -149,6 +150,9 @@ class StepRunOptions(BaseModel):
         default_factory=ExecutionDeadline, exclude_if=lambda boundary: boundary.expires_at is None
     )
     target: ModelTarget | None = None
+    failover: ModelFailoverPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -160,6 +164,11 @@ class StepRunOptions(BaseModel):
     task_id: str | None = None
     task_worker_id: str | None = None
     task_lease_expires_at: datetime | None = None
+
+    @field_validator("failover", mode="before")
+    @classmethod
+    def copy_failover(cls, value: object) -> ModelFailoverPolicy | None:
+        return copy_optional_model_failover_policy(value)
 
     @field_validator("environment_name", "task_id", "task_worker_id")
     @classmethod
@@ -875,6 +884,7 @@ async def _run_step(
         messages=run_messages,
         structured_output=spec,
         target=opts.target,
+        failover=opts.failover,
         environment_name=opts.environment_name,
         labels=opts.labels,
         metadata=opts.metadata,

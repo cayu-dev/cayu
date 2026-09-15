@@ -209,6 +209,7 @@ from cayu.runtime._event_writer import (
     _reconcile_exact_persisted_event,
     prepare_runtime_event,
 )
+from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
 from cayu.runtime._foreground_child_wait import (
     ForegroundChildActionRequired,
     ForegroundChildTerminal,
@@ -257,6 +258,8 @@ from cayu.runtime._model_errors import (
     _FallbackBillingCancellationStateCheckFailed,
     detach_billing_identity_cancellation_group,
 )
+from cayu.runtime._model_execution_selection import ModelExecutionSelection
+from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
 from cayu.runtime._model_step_executor import (
     ModelCompletionRecoveryContext,
     model_completion_recovery_context_from_stage,
@@ -1894,6 +1897,7 @@ RecoverProviderOperation = Callable[
         runtime_records.RegisteredProvider,
         runtime_records.RegisteredEnvironment | None,
         InvocationContext | None,
+        ModelExecutionSelection | None,
     ],
     Awaitable[ProviderOperationRecoveryResult],
 ]
@@ -1906,6 +1910,7 @@ RecoverProviderOperationStart = Callable[
         runtime_records.RegisteredProvider,
         runtime_records.RegisteredEnvironment | None,
         InvocationContext | None,
+        ModelExecutionSelection | None,
     ],
     Awaitable[ProviderOperationRecoveryResult],
 ]
@@ -1918,6 +1923,7 @@ CancelProviderOperation = Callable[
         runtime_records.RegisteredProvider,
         runtime_records.RegisteredEnvironment | None,
         InvocationContext | None,
+        ModelExecutionSelection | None,
     ],
     Awaitable[ProviderOperationSnapshot | None],
 ]
@@ -2538,7 +2544,20 @@ class RecoveryCoordinator:
             except KeyError:
                 return None
         elif registered_provider.name != operation.provider:
-            return None
+            session = await self._session_store.load(stage.session_id)
+            target = (
+                None
+                if session is None
+                else model_failover_target_for_stored_stage(session=session, stage=stage)
+            )
+            if (
+                target is None
+                or session is None
+                or registered_provider.name != session.provider_name
+                or target.provider_name != operation.provider
+            ):
+                return None
+            registered_provider = self._resolve_registered_provider(target.provider_name)
         provider = registered_provider.provider
         if (
             provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
@@ -2549,6 +2568,104 @@ class RecoveryCoordinator:
         ):
             return None
         return operation, registered_provider
+
+    async def _provider_operation_execution_scope(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        recovered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None,
+    ) -> tuple[InvocationContext, ModelExecutionSelection | None]:
+        """Validate root continuation and retain its separately selected collaborators."""
+        if registered_provider.name != session.provider_name:
+            raise RuntimeError("Provider-operation recovery substituted its root provider.")
+        if invocation_context is not None and (
+            registered_agent is not invocation_context.registered_agent
+            or registered_provider is not invocation_context.registered_provider
+            or registered_environment is not invocation_context.registered_environment
+        ):
+            raise RuntimeError(
+                "Provider-operation recovery substituted frozen invocation authority."
+            )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        binding = None if active is None else active.profile.model_failover
+        providers = (
+            ()
+            if binding is None
+            else tuple(
+                registered_provider
+                if target.provider_name == registered_provider.name
+                else self._resolve_registered_provider(target.provider_name)
+                for target in binding.plan.candidates
+            )
+        )
+        budget_policy = (
+            copy_budget_policy(self._resolve_budget_policy())
+            if invocation_context is None
+            else invocation_context.budget_policy
+        )
+        snapshot = await self._validate_execution_profile_continuation(
+            session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+            None,
+            budget_policy=budget_policy,
+        )
+        # The validator checked every candidate. Do not replace those collaborators
+        # by a second registry lookup after its asynchronous continuation boundary.
+        if any(
+            provider.name != registered_provider.name
+            and self._resolve_registered_provider(provider.name) is not provider
+            for provider in providers
+        ):
+            raise RuntimeError(
+                "Provider-operation recovery registrations changed during validation."
+            )
+        if invocation_context is None:
+            invocation_context = self._reconstruct_invocation_context(
+                session=session,
+                execution_profile_snapshot=snapshot,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                budget_policy=budget_policy,
+            )
+        elif invocation_context.active_profile != snapshot:
+            raise RuntimeError("Provider-operation recovery substituted its execution profile.")
+        target = model_failover_target_for_stored_stage(session=session, stage=stage)
+        if target is None:
+            if recovered_provider is not registered_provider:
+                raise RuntimeError("Provider-operation recovery substituted its provider.")
+            return invocation_context, None
+        if binding is None or active is None or snapshot.profile != active.profile:
+            raise RuntimeError("Provider-operation recovery lost its admitted candidate plan.")
+        index = next(
+            i
+            for i, candidate in enumerate(binding.plan.candidates)
+            if (candidate.provider_name, candidate.model) == (target.provider_name, target.model)
+        )
+        selection = ModelExecutionSelection(
+            invocation_context=invocation_context,
+            resolution=ModelFailoverProfileResolution(
+                plan=binding.plan,
+                candidate_profiles=tuple(item.as_profile() for item in binding.candidate_profiles),
+                registered_providers=providers,
+            ),
+            candidate_index=index,
+        )
+        selection.require_recovery_scope(
+            session=session,
+            stage=stage,
+            invocation_context=invocation_context,
+            registered_provider=recovered_provider,
+        )
+        return invocation_context, selection
 
     async def has_recoverable_provider_operation(self, stage: ModelCompletionStage) -> bool:
         """Read-only eligibility for this owner's exact background recovery path.
@@ -2652,7 +2769,7 @@ class RecoveryCoordinator:
         if registered_agent is None or registered_provider is None:
             try:
                 registered_agent = self._resolve_registered_agent(session.agent_name)
-                registered_provider = recovered_provider
+                registered_provider = self._resolve_registered_provider(session.provider_name)
                 registered_environment = self._resolve_registered_environment(
                     session.environment_name
                 )
@@ -2661,48 +2778,18 @@ class RecoveryCoordinator:
                     "Provider-operation cancellation requires the original agent, provider, "
                     "and environment registrations."
                 ) from registration_error
-        elif registered_provider is not recovered_provider:
-            if registered_provider.name != recovered_provider.name:
-                raise ModelCompletionManualRecoveryRequired(
-                    "Provider-operation cancellation resolved a different provider identity."
-                )
-            recovered_provider = registered_provider
-        checkpoint = await self._session_store.load_checkpoint(session.id)
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or registered_agent is not invocation_context.registered_agent
-            or recovered_provider is not invocation_context.registered_provider
-            or registered_environment is not invocation_context.registered_environment
-        ):
-            raise RuntimeError(
-                "Provider-operation interruption substituted frozen invocation authority."
-            )
-        budget_policy_snapshot = (
-            copy_budget_policy(self._resolve_budget_policy())
-            if invocation_context is None
-            else invocation_context.budget_policy
+        (
+            invocation_context,
+            model_execution_selection,
+        ) = await self._provider_operation_execution_scope(
+            session=session,
+            stage=stage,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            recovered_provider=recovered_provider,
+            registered_environment=registered_environment,
+            invocation_context=invocation_context,
         )
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            session,
-            checkpoint,
-            registered_agent,
-            recovered_provider,
-            None,
-            budget_policy=budget_policy_snapshot,
-        )
-        if invocation_context is None:
-            invocation_context = self._reconstruct_invocation_context(
-                session=session,
-                execution_profile_snapshot=execution_profile_snapshot,
-                registered_agent=registered_agent,
-                registered_provider=recovered_provider,
-                registered_environment=registered_environment,
-                budget_policy=budget_policy_snapshot,
-            )
-        elif invocation_context.active_profile != execution_profile_snapshot:
-            raise RuntimeError("Provider-operation interruption substituted its execution profile.")
-        else:
-            execution_profile_snapshot = invocation_context.active_profile
         cancellation = await self._cancel_provider_operation(
             session,
             stage,
@@ -2711,6 +2798,7 @@ class RecoveryCoordinator:
             recovered_provider,
             registered_environment,
             invocation_context,
+            model_execution_selection,
         )
         if cancellation is not None and cancellation.status is ProviderOperationStatus.COMPLETED:
             recovered = await self._recover_provider_operation(
@@ -2721,6 +2809,7 @@ class RecoveryCoordinator:
                 recovered_provider,
                 registered_environment,
                 invocation_context,
+                model_execution_selection,
             )
             if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
                 raise ModelCompletionManualRecoveryRequired(
@@ -2775,7 +2864,8 @@ class RecoveryCoordinator:
                 else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
             )
             if (
-                type(pending_interrupt) is not dict
+                checkpoint is None
+                or type(pending_interrupt) is not dict
                 or interruption_request_id_from_payload(pending_interrupt)
                 != interruption_request_id
                 or _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None
@@ -2818,7 +2908,11 @@ class RecoveryCoordinator:
                     "Provider-operation interruption no longer owns the active invocation epoch."
                 )
             return checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
+                _checkpoint_with_rebased_session_run_operation(
+                    checkpoint,
+                    previous_run_epoch=current_session.run_epoch,
+                    run_epoch=current_session.run_epoch + 1,
+                ),
                 session_id=current_session.id,
                 interaction_id=current_profile.interaction_id,
                 run_epoch=current_session.run_epoch + 1,
@@ -3201,7 +3295,9 @@ class RecoveryCoordinator:
                 if registered_agent is None or registered_provider is None:
                     try:
                         registered_agent = self._resolve_registered_agent(session.agent_name)
-                        registered_provider = recovered_provider
+                        registered_provider = self._resolve_registered_provider(
+                            session.provider_name
+                        )
                         registered_environment = self._resolve_registered_environment(
                             session.environment_name
                         )
@@ -3210,41 +3306,18 @@ class RecoveryCoordinator:
                             "Provider-operation recovery requires the original agent, provider, "
                             "and environment registrations."
                         ) from registration_error
-                elif registered_provider is not recovered_provider:
-                    if registered_provider.name != recovered_provider.name:
-                        raise ModelCompletionManualRecoveryRequired(
-                            "Provider-operation recovery resolved a different provider identity."
-                        )
-                    recovered_provider = registered_provider
-                checkpoint = await self._session_store.load_checkpoint(session.id)
-                budget_policy_snapshot = (
-                    copy_budget_policy(self._resolve_budget_policy())
-                    if invocation_context is None
-                    else invocation_context.budget_policy
+                (
+                    invocation_context,
+                    model_execution_selection,
+                ) = await self._provider_operation_execution_scope(
+                    session=session,
+                    stage=stage,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    recovered_provider=recovered_provider,
+                    registered_environment=registered_environment,
+                    invocation_context=invocation_context,
                 )
-                execution_profile_snapshot = await self._validate_execution_profile_continuation(
-                    session,
-                    checkpoint,
-                    registered_agent,
-                    recovered_provider,
-                    None,
-                    budget_policy=budget_policy_snapshot,
-                )
-                if invocation_context is None:
-                    invocation_context = self._reconstruct_invocation_context(
-                        session=session,
-                        execution_profile_snapshot=execution_profile_snapshot,
-                        registered_agent=registered_agent,
-                        registered_provider=recovered_provider,
-                        registered_environment=registered_environment,
-                        budget_policy=budget_policy_snapshot,
-                    )
-                elif invocation_context.active_profile != execution_profile_snapshot:
-                    raise RuntimeError(
-                        "Provider-operation recovery substituted its execution profile."
-                    )
-                else:
-                    execution_profile_snapshot = invocation_context.active_profile
                 if isinstance(operation, RecoverableProviderOperationStart):
                     recovered = await self._recover_provider_operation_start(
                         session,
@@ -3254,6 +3327,7 @@ class RecoveryCoordinator:
                         recovered_provider,
                         registered_environment,
                         invocation_context,
+                        model_execution_selection,
                     )
                 else:
                     recovered = await self._recover_provider_operation(
@@ -3264,6 +3338,7 @@ class RecoveryCoordinator:
                         recovered_provider,
                         registered_environment,
                         invocation_context,
+                        model_execution_selection,
                     )
                 recovery_events = tuple(
                     {event.id: event for event in (*recovery_events, *recovered.events)}.values()

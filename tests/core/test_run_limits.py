@@ -1412,6 +1412,58 @@ def test_controller_does_not_return_reservation_after_proven_identity_conflict(
     assert setup.events == ()
 
 
+@pytest.mark.parametrize("selected_model", [None, "backup-model"])
+def test_model_reservation_prices_effective_target_without_changing_root(selected_model):
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger()
+    controller = _controller(store, ledger=ledger)
+    pricing = PriceBook(
+        prices=(
+            *_pricing().prices,
+            ModelPrice.fixed(
+                provider_name="backup",
+                model="backup-model",
+                input_per_million=Decimal("2"),
+                output_per_million=Decimal("20"),
+            ),
+        )
+    )
+    limit = _reserved_limit("10").model_copy(update={"pricing": pricing})
+
+    async def scenario():
+        session = await _running_session(store, "selected-model-reservation")
+        original = session.model_dump(mode="json")
+        identity = _model_attempt_identity()
+        provider_name = "fake" if selected_model is None else "backup"
+        setup = await controller.reserve_for_model_step(
+            session=session,
+            agent_name="assistant",
+            provider_name=provider_name,
+            model=selected_model,
+            environment_name=None,
+            model_attempt_identity=identity,
+            budget_policy=BudgetPolicy(limits=(limit,)),
+        )
+        assert setup.error is None and setup.failure is None
+        assert len(setup.reservations) == 1
+        reservation = setup.reservations[0]
+        record = await ledger.load_reservation(reservation.record.reservation_id)
+        assert record is not None
+        assert record == reservation.record
+        assert record.model == (session.model if selected_model is None else selected_model)
+        assert record.provider_name == provider_name
+        assert record.reserved_amount == Decimal("1" if selected_model is None else "2")
+        assert record.model_attempt_id == identity.model_attempt_id
+        assert session.model_dump(mode="json") == original
+        events = await store.load_events(session.id)
+        reserved = [event for event in events if event.type is EventType.BUDGET_RESERVED]
+        assert len(reserved) == 1
+        assert reserved[0].payload["model"] == record.model
+        assert reserved[0].payload["provider_name"] == record.provider_name
+
+    asyncio.run(scenario())
+
+
 def test_controller_releases_model_reservation_when_event_attestation_fails(monkeypatch):
     store = InMemorySessionStore()
     ledger = InMemoryBudgetLedger()

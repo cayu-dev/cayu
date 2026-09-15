@@ -30,6 +30,7 @@ from cayu import (
     RunRequest,
     SessionIdentity,
     SessionStatus,
+    ThinkingConfig,
     ToolEffect,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, ProviderStreamDeadlines
@@ -53,6 +54,14 @@ def test_prompt_cache_recording_provider_forwards_stream_deadlines() -> None:
 
     assert provider.stream_deadlines == delegate.stream_deadlines
     assert type(provider).runtime_stream is RecordingProvider.runtime_stream
+    provider.preflight_portable_messages(
+        model="claude-test", messages=[Message.text("system", "prompt")], tools=[]
+    )
+    provider.preflight_thinking(model="claude-test", thinking=ThinkingConfig(effort="high"))
+    with pytest.raises(ValueError, match="Local thinking incompatibility"):
+        provider.preflight_thinking(
+            model="claude-opus-4-6", thinking=ThinkingConfig(effort="xhigh")
+        )
 
 
 @pytest.mark.anyio

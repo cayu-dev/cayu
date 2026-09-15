@@ -8885,7 +8885,7 @@ export type EventSideEffectRecoveryLoop = {
 /**
  * EventType
  */
-export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.auxiliary.attempt_started' | 'model.auxiliary.attempt_settled' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
+export type EventType = 'workspace.checkpoint.updated' | 'server.mutation.accepted' | 'recovery.plan.item.executed' | 'session.started' | 'session.resumed' | 'session.completed' | 'session.failed' | 'session.interrupted' | 'session.delegated_action.updated' | 'session.interruption_cascade_retry_requested' | 'session.interruption_cascade_completed' | 'session.interruption_cascade_failed' | 'session.awaiting_user_input' | 'session.checkpointed' | 'session.forked' | 'session.limit_reached' | 'session.message.queued' | 'session.message.delivered' | 'session.message.withdrawn' | 'session.message.quarantined' | 'session.message.stale' | 'session.message.expired' | 'session.model.switched' | 'session.execution_profile.decided' | 'session.execution_profile.rejected' | 'session.run_fenced' | 'turn.completed' | 'interaction.started' | 'interaction.resumed' | 'interaction.paused' | 'interaction.completed' | 'interaction.failed' | 'interaction.interrupted' | 'budget.checked' | 'budget.limit_reached' | 'budget.reserved' | 'budget.reconciled' | 'budget.reservation_failed' | 'budget.reservation_released' | 'credential.proxy.checked' | 'credential.mode.selected' | 'egress.grant.minted' | 'egress.grant.revoked' | 'egress.request.authorized' | 'egress.request.denied' | 'egress.authority.requested' | 'egress.authority.authorized' | 'egress.authority.installing' | 'egress.authority.activated' | 'egress.authority.refused' | 'egress.authority.ambiguous' | 'mcp.manifest.checked' | 'mcp.manifest.blocked' | 'task.created' | 'task.started' | 'task.completed' | 'task.failed' | 'task.cancelled' | 'task.interrupted_handoff' | 'task.completion_result.resolved' | 'model.started' | 'model.text.delta' | 'model.thinking.delta' | 'model.hosted_tool_call' | 'model.citation' | 'model.completed' | 'model.auxiliary.attempt_started' | 'model.auxiliary.attempt_settled' | 'model.error' | 'model.http_cleanup' | 'model.retry' | 'model.attempt_discarded' | 'model.failover.selected' | 'model.failover.exhausted' | 'provider.operation.starting' | 'provider.operation.started' | 'provider.operation.progress' | 'provider.operation.cancel_requested' | 'provider.operation.cancel_resolved' | 'provider.operation.reconnect_scheduled' | 'provider.operation.reconnect_started' | 'provider.operation.recovery_required' | 'provider.operation.resolved' | 'provider.operation.reconciled' | 'request.footprint.recorded' | 'tool.exposure.recorded' | 'tool.grant.issued' | 'tool.grant.reused' | 'tool.grant.reconstructed' | 'tool.grant.expired' | 'tool.grant.revoked' | 'tool.grant.fork_reset' | 'tool.reference.consumed' | 'tool.reference.rejoined' | 'tool.reference.rejected' | 'structured_output.validated' | 'structured_output.validating' | 'structured_output.failed' | 'structured_output.retry' | 'context.compaction.started' | 'context.compaction.completed' | 'context.compaction.failed' | 'context.counted' | 'context.count.failed' | 'context.count.reconciled' | 'context.pressure.estimated' | 'context.pressure.reconciled' | 'context.overflow.detected' | 'context.overflow.recovering' | 'context.overflow.failed' | 'memory.recall.started' | 'memory.recall.completed' | 'memory.recall.failed' | 'memory.recall.admitted' | 'environment.binding.started' | 'environment.binding.completed' | 'environment.binding.failed' | 'environment.binding.finalize_started' | 'environment.binding.finalize_completed' | 'environment.binding.finalize_failed' | 'environment.factory.started' | 'environment.factory.completed' | 'environment.factory.failed' | 'environment.lifecycle.progress' | 'environment.lifecycle.transition' | 'workspace.revision.observed' | 'workspace.mutation.recorded' | 'workspace.observation.finalized' | 'hook.started' | 'hook.completed' | 'hook.failed' | 'tool.call.started' | 'tool.call.completed' | 'tool.call.failed' | 'tool.effect.reconciliation.observed' | 'tool.effect.outcome_unknown' | 'tool.effect.cleanup.observed' | 'tool.effect.reconciliation.started' | 'tool.effect.reconciliation.conflict' | 'tool.effect.receipt.validated' | 'tool.call.blocked' | 'tool.call.approval_requested' | 'tool.call.approved' | 'tool.call.approval_denied' | 'tool.call.approval_expired' | 'workflow.started' | 'workflow.step.started' | 'workflow.step.completed' | 'workflow.completed' | 'memory.search' | 'runner.exec.started' | 'runner.exec.completed' | 'runtime.sink.failed' | 'runtime.interaction_transition.acknowledgement_failed';
 
 /**
  * ExecutionDeadline
@@ -8978,11 +8978,12 @@ export type ExecutionProfileIdentity = {
      * Fingerprint
      */
     fingerprint: string;
+    model_failover?: ModelFailoverProfileBinding | null;
     runtime_build_provenance?: RuntimeBuildProvenance;
     /**
      * Schema Version
      */
-    schema_version?: 1 | 2 | 4 | 5 | 6;
+    schema_version?: 1 | 2 | 4 | 5 | 6 | 7;
 };
 
 /**
@@ -11626,6 +11627,105 @@ export type Message = {
  * MessageRole
  */
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
+
+/**
+ * ModelFailoverCandidate
+ */
+export type ModelFailoverCandidate = {
+    /**
+     * Execution Mode
+     */
+    execution_mode: 'synchronous' | 'background';
+    /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint: string;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+};
+
+/**
+ * ModelFailoverCandidateProfile
+ *
+ * Nonrecursive, digest-only reconstruction of one unbound candidate.
+ */
+export type ModelFailoverCandidateProfile = {
+    /**
+     * Components
+     */
+    components: Array<ExecutionProfileComponentIdentity>;
+    egress_authority?: EgressAuthorityIdentity | null;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    runtime_build_provenance: RuntimeBuildProvenance;
+    /**
+     * Schema Version
+     */
+    schema_version?: 6;
+};
+
+/**
+ * ModelFailoverPlan
+ *
+ * Resolved candidate identities, bound into the configured root profile.
+ */
+export type ModelFailoverPlan = {
+    /**
+     * Candidates
+     */
+    candidates: Array<ModelFailoverCandidate>;
+    /**
+     * Max Total Attempts
+     */
+    max_total_attempts: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * ModelFailoverPolicy
+ *
+ * Bounded, explicit alternatives after an eligible ordinary model failure.
+ *
+ * The primary target is resolved by the run entrance. ``max_total_attempts``
+ * includes that primary's attempts and all same-provider retries, not just
+ * transitions between targets. This value never authorizes dispatch itself.
+ */
+export type ModelFailoverPolicy = {
+    /**
+     * Fallbacks
+     */
+    fallbacks: Array<ModelTarget>;
+    /**
+     * Max Total Attempts
+     */
+    max_total_attempts?: number;
+};
+
+/**
+ * ModelFailoverProfileBinding
+ *
+ * Reconstructable immutable candidate plan, not mutable selection authority.
+ */
+export type ModelFailoverProfileBinding = {
+    /**
+     * Candidate Profiles
+     */
+    candidate_profiles: Array<ModelFailoverCandidateProfile>;
+    plan: ModelFailoverPlan;
+    primary_request_policy: ExecutionProfileComponentIdentity;
+    strength: ExecutionProfileIdentityStrength;
+};
 
 /**
  * ModelJudgeAssertionSpec
@@ -14358,6 +14458,7 @@ export type ResumeBody = {
      * Budget Limits
      */
     budget_limits?: Array<BudgetLimit>;
+    failover?: ModelFailoverPolicy | null;
     limits?: RunLimits;
     /**
      * Max Steps
@@ -14478,6 +14579,7 @@ export type RunBody = {
      * Causal Budget Id
      */
     causal_budget_id?: string | null;
+    failover?: ModelFailoverPolicy | null;
     /**
      * Labels
      */

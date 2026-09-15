@@ -125,6 +125,22 @@ def targeted_tool_projection_marker_message(
         generation_id=generation_id,
         batch_fingerprint=prepared_targeted_tool_grant_batch_fingerprint(prepared),
     )
+    return _projection_marker_message(marker_id)
+
+
+def persisted_targeted_tool_projection_marker_message(
+    records: Iterable[TargetedToolGrantRecord],
+) -> Message:
+    """Render a marker from a durable batch; this does not authenticate that batch.
+
+    Runtime callers must independently resolve the exact invocation's grant
+    records before using this projection. A marker grants no tool-use authority.
+    """
+
+    return _projection_marker_message(persisted_targeted_tool_projection_marker_id(records))
+
+
+def _projection_marker_message(marker_id: str) -> Message:
     return Message(
         role=MessageRole.ASSISTANT,
         content=(

@@ -21,6 +21,7 @@ from cayu._validation import (
 )
 from cayu.artifacts.attachments import file_attachment_from_payload
 from cayu.budgets.billing import BillingIdentity
+from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import current_execution_deadline
 from cayu.messages import (
     CitationPart,
@@ -35,6 +36,7 @@ from cayu.messages import (
     ToolResultPart,
     detach_message,
 )
+from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
@@ -1488,6 +1490,20 @@ class ModelProvider(ABC):
         """
 
         del model
+
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        """Reject thinking controls whose semantics this adapter has not established.
+
+        Routed runs call this side-effect-free hook for every configured target
+        and again for the actual selected request before dispatch. Adapters must
+        preserve native effort values and their documented best-effort controls;
+        passing preflight does not guarantee an unknown backend model accepts them.
+        Transparent wrappers delegate the hook. The default accepts only None.
+        """
+
+        require_clean_nonblank(model, "model")
+        if copy_preflight_thinking(thinking) is not None:
+            raise ValueError("Target provider does not declare thinking-control support.")
 
     def preflight_portable_messages(
         self,

@@ -30,6 +30,7 @@ import httpx
 from cayu._validation import require_clean_nonblank
 from cayu._version import package_version
 from cayu.budgets.billing import BillingIdentity
+from cayu.context.thinking import ThinkingConfig
 from cayu.messages import Message
 from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
 from cayu.providers._config import positive_finite_seconds
@@ -50,7 +51,7 @@ from cayu.providers._http import (
     validate_base_url,
 )
 from cayu.providers._openai_protocol import protocol_exception_fields
-from cayu.providers._thinking import validate_thinking_effort
+from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountResult,
     ModelContextOverflowError,
@@ -657,6 +658,9 @@ class OpenAISubscriptionProvider(ModelProvider):
     @property
     def stream_deadlines(self) -> ProviderStreamDeadlines:
         return self._stream_deadlines
+
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        preflight_thinking_effort(thinking, protocol="openai", model=model)
 
     def preflight_portable_messages(
         self,

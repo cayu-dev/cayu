@@ -716,12 +716,26 @@ class _RuntimeCheckpointSessionStore:
                 session_id=source_session_id,
             )
 
+        versioned_transform = _optional_versioned_checkpoint_transform(
+            source_session_id, checkpoint_transform
+        )
+
+        def validate_fork_source(
+            session: Session, checkpoint: dict[str, Any] | None
+        ) -> dict[str, Any] | None:
+            if versioned_transform is None:
+                return None
+            # This internal owner compares the exact source checkpoint, which
+            # includes model selection and effective invocation authority.
+            # Generic callbacks retain their restricted view. Read permission
+            # cannot replace private roots, and the store's fork transform
+            # removes all source-owned routing authority from the child.
+            with _invocation_lifecycle_authority_read_scope():
+                return versioned_transform(session, checkpoint)
+
         return await self._store.create_profiled_fork(
             source_session_id=source_session_id,
-            checkpoint_transform=_optional_versioned_checkpoint_transform(
-                source_session_id,
-                checkpoint_transform,
-            ),
+            checkpoint_transform=None if versioned_transform is None else validate_fork_source,
             checkpoint_authority_decoder=decode_profile_authority,
             **kwargs,
         )

@@ -28075,6 +28075,8 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
     assert events[2].payload == {
         "error": "stream idle timeout",
         "error_type": "TimeoutError",
+        "provider_name": "fake",
+        "requested_model": "fake-model",
         "step": 1,
         "attempt": 1,
         "max_attempts": 2,
@@ -28093,6 +28095,8 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
     assert events[6].payload == {
         "error": "stream idle timeout",
         "error_type": "TimeoutError",
+        "provider_name": "fake",
+        "requested_model": "fake-model",
         "step": 1,
         "attempt": 2,
         "max_attempts": 2,
@@ -45497,6 +45501,8 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
     assert model_error.payload == {
         "error": "context too large",
         "error_type": "ModelContextOverflowError",
+        "provider_name": "overflow",
+        "requested_model": "fake-model",
         "stage": "provider_dispatch",
         "context_overflow": True,
         "provider": "overflow",

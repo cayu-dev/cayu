@@ -21,6 +21,18 @@ existing defaults and legacy budget behavior. Typed effort overwrites raw effort
 unrelated raw siblings such as `reasoning.summary` and `output_config.format`
 remain intact. No adapter downgrades or drops an explicit typed effort.
 
+For an opt-in failover chain, `ModelProvider.preflight_thinking(model=...,
+thinking=...)` validates each candidate before initial session creation and the
+actual selected request before attempt reservation and staging. The hook must be
+side-effect-free: no authentication, network request, or provider probing. It
+receives a detached, validated `ThinkingConfig` (or `None`) and must reject
+unsupported controls without echoing request input. The base implementation
+accepts only `None`; custom providers must explicitly declare configured-control
+support. Transparent wrappers must delegate the hook. Bundled adapters reuse the
+local compatibility rules below; success does not prove unknown backend support
+or turn best-effort controls into portable guarantees. Ordinary nonrouted runs
+retain their existing validation paths.
+
 Provider-contract audit: **2026-09-05**. “Declared” below means documented wire
 support, not tested backend availability or evidence of internal reasoning work.
 
@@ -94,4 +106,3 @@ Audit sources: OpenAI [Chat Completions schema](https://developers.openai.com/ap
 Anthropic [effort](https://platform.claude.com/docs/en/build-with-claude/effort) and
 [thinking modes](https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models);
 Google [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai).
-

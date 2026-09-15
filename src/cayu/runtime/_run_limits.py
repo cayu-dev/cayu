@@ -2431,7 +2431,9 @@ class RunLimitController:
         execution_profile_fingerprint: str | None = None,
         existing_reservation_ids: Collection[str] = (),
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
+        model: str | None = None,
     ) -> BudgetReservationSetup:
+        effective_model = require_clean_nonblank(session.model if model is None else model, "model")
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         limits = self.provider_reservation_limits(
             session=session,
@@ -2469,7 +2471,7 @@ class RunLimitController:
                 expected_requested_amount = _budget_reservation_amount(
                     limit=expected_limit,
                     provider_name=provider_name,
-                    model=session.model,
+                    model=effective_model,
                     effective_at=reservation_effective_at,
                     billing_identity=expected_billing_identity,
                 )
@@ -2481,7 +2483,7 @@ class RunLimitController:
                     agent_name=agent_name,
                     environment_name=environment_name,
                     provider_name=provider_name,
-                    model=session.model,
+                    model=effective_model,
                     settlement_event_payload=settlement_event_payload,
                     billing_identity=expected_billing_identity,
                     reserved_amount=expected_requested_amount,
@@ -2497,7 +2499,7 @@ class RunLimitController:
                             session_id=session.id,
                             agent_name=agent_name,
                             provider_name=provider_name,
-                            model=session.model,
+                            model=effective_model,
                             model_attempt_identity=ledger_model_attempt_identity,
                             environment_name=environment_name,
                             settlement_event_payload=copy_durable_json_object(
@@ -2514,7 +2516,7 @@ class RunLimitController:
                             session_id=session.id,
                             agent_name=agent_name,
                             provider_name=provider_name,
-                            model=session.model,
+                            model=effective_model,
                             model_attempt_identity=ledger_model_attempt_identity,
                             environment_name=environment_name,
                             settlement_event_payload=copy_durable_json_object(
@@ -2539,7 +2541,7 @@ class RunLimitController:
                     session_id=session.id,
                     agent_name=agent_name,
                     provider_name=provider_name,
-                    model=session.model,
+                    model=effective_model,
                     environment_name=environment_name,
                     settlement_event_payload=settlement_event_payload,
                     settlement_fallback=authority.settlement_fallback,

@@ -91,9 +91,11 @@ async def test_deferred_cancelled_session_finalization(tmp_path, monkeypatch, ba
     try:
         await asyncio.wait_for(reached.wait(), 10)
         task.cancel("original caller")
+        assert task.cancelling() == 1
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
         assert close_entered.is_set()
+        assert task.cancelled() and task.cancelling() == 1
         assert app.recovery_cleanup_status().retained_tasks > 0
     finally:
         release.set()

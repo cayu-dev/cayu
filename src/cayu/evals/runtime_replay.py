@@ -41,6 +41,7 @@ from cayu.context.footprints import (
     RequestFootprint,
     RequestVariant,
 )
+from cayu.context.thinking import ThinkingConfig
 from cayu.evals.models import (
     Trajectory,
     _trajectory_public_sha256,
@@ -559,6 +560,9 @@ class _RecordedProvider(ModelProvider):
     def preflight_model_target(self, *, model: str) -> None:
         self._source.preflight_model_target(model=model)
 
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        self._source.preflight_thinking(model=model, thinking=thinking)
+
     def preflight_portable_messages(
         self,
         *,
@@ -978,6 +982,8 @@ def _extract_evidence(
         EventType.SESSION_MESSAGE_DELIVERED,
         EventType.MODEL_RETRY,
         EventType.MODEL_ATTEMPT_DISCARDED,
+        EventType.MODEL_FAILOVER_SELECTED,
+        EventType.MODEL_FAILOVER_EXHAUSTED,
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,

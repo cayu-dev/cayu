@@ -13,10 +13,11 @@ import threading
 import time
 import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal, NoReturn, TypeVar, cast
 from uuid import UUID, uuid4
@@ -393,6 +394,10 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
 )
+from cayu.runtime._model_execution_selection import (
+    ModelExecutionSelection,
+    model_failover_progress_for_session,
+)
 from cayu.runtime._model_step_executor import (
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
@@ -412,6 +417,8 @@ from cayu.runtime._model_step_executor import (
     _tool_capability_ceiling_exposure,
     is_ambiguous_provider_operation_start_error,
     model_completion_recovery_context_from_stage,
+    preflight_model_thinking,
+    preflight_portable_model_material,
     reconstruct_assistant_step_result,
 )
 from cayu.runtime._recovery_coordinator import (
@@ -546,6 +553,8 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
     execution_profile_with_component,
+    execution_profile_with_tool_capability_ceiling,
+    inherited_execution_profile_component_changes,
     unavailable_execution_profile_components,
 )
 from cayu.runtime.execution_units import (
@@ -636,6 +645,7 @@ from cayu.sessions.base import (
     ModelCompletionStageDisposition,
     ModelCompletionStageSettlement,
     ModelCompletionStageSettlementRequest,
+    ModelFailoverPolicy,
     ModelTarget,
     PersistedEventSideEffectStatus,
     ProfiledSessionForkResult,
@@ -3268,6 +3278,7 @@ class _PreparedInitialRun:
     rendered_system_prompt: str | None
     prompt_contributions: tuple[Any, ...]
     execution_profile: ExecutionProfileIdentity
+    model_failover: execution_profile_admission.ModelFailoverProfileResolution | None
     tool_capability_ceiling: ToolCapabilityCeiling
     targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
     budget_policy: BudgetPolicy | None
@@ -5361,6 +5372,11 @@ class SessionEngine:
     @staticmethod
     def _work_attempt_source_document(request: RunRequest | ResumeRequest) -> dict[str, Any]:
         document = request.model_dump(mode="json", warnings=False)
+        # Portable source snapshots retain explicit defaults, unlike ordinary
+        # wire projections. An explicitly absent policy must remain represented
+        # when failover is present in the request's explicit fields_set.
+        if request.failover is None:
+            document["failover"] = None
         if type(request) is RunRequest:
             # An unbounded deadline must not become an inherited replacement
             # deadline merely because the ordinary serializer omits it.
@@ -5574,6 +5590,8 @@ class SessionEngine:
             raise TypeError("Queued dispatch source profile has an invalid type.")
         if type(request) is not DispatchRequest:
             raise TypeError("Queued dispatch profile resolution requires a DispatchRequest.")
+        if request.failover is not None or source_profile.model_failover is not None:
+            self.session_store._require_model_failover_stage_protocol()
         initial_profile: ExecutionProfileIdentity | None = None
         if session.run_epoch == 0:
             initial_profile = _require_exact_fork_initial_invocation_profile(
@@ -5582,6 +5600,7 @@ class SessionEngine:
                     session_id=request.session_id,
                     messages=request.messages,
                     target=request.target,
+                    failover=request.failover,
                     tool_capability_ceiling=request.tool_capability_ceiling,
                     tool_grants=request.tool_grants,
                     profile_adoption=request.profile_adoption,
@@ -5602,49 +5621,79 @@ class SessionEngine:
         )
         registered_agent = self._get_registered_agent(session.agent_name)
         registered_provider = self._get_registered_provider(target.provider_name)
-        candidate = _execution_profile_identity(
-            registered_agent=registered_agent,
-            provider_name=registered_provider.name,
-            registered_provider=registered_provider,
-            model=target.model,
-            durable_system_prompt=None,
-            redactor=self._secret_redactor,
-            registered_environment=self._get_registered_environment_for_session(
-                session.environment_name
-            ),
-            process_identity=self._execution_profile_process_identity,
-            runtime_hooks=self._runtime_hooks,
-            loop_policies=self._loop_policies,
-            loop_policy_execution_profile_identities=(
-                self._loop_policy_execution_profile_identities
-            ),
-            request_loop_policies=request.loop_policies,
-            request_loop_policy_instance_identities=(
-                self._request_loop_policy_instance_identities(request.loop_policies)
-            ),
-            budget_policy=self._get_budget_policy(),
-            request_budget_limits=request.budget_limits,
-            causal_budget_id=session.causal_budget_id,
-            structured_output=request.structured_output,
-            thinking=request.thinking,
-            max_steps=request.max_steps,
-            limits=request.limits,
-            retry_policy=self._effective_retry_policy(request.retry_policy),
-            tool_capability_ceiling=resolve_tool_capability_ceiling(
-                request.tool_capability_ceiling,
-                registered_agent.tool_capabilities,
-                maximum=_session_tool_capability_ceiling(session),
-            ),
-        )
-        candidate = execution_profile_with_component(
-            candidate,
-            source_profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
-        )
-        if source_profile.schema_version >= 2:
+
+        def ordinary_queued_profile(
+            candidate_provider: runtime_records.RegisteredProvider, candidate_model: str
+        ) -> ExecutionProfileIdentity:
+            candidate = _execution_profile_identity(
+                registered_agent=registered_agent,
+                provider_name=candidate_provider.name,
+                registered_provider=candidate_provider,
+                model=candidate_model,
+                durable_system_prompt=None,
+                redactor=self._secret_redactor,
+                registered_environment=self._get_registered_environment_for_session(
+                    session.environment_name
+                ),
+                process_identity=self._execution_profile_process_identity,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                loop_policy_execution_profile_identities=(
+                    self._loop_policy_execution_profile_identities
+                ),
+                request_loop_policies=request.loop_policies,
+                request_loop_policy_instance_identities=(
+                    self._request_loop_policy_instance_identities(request.loop_policies)
+                ),
+                budget_policy=self._get_budget_policy(),
+                request_budget_limits=request.budget_limits,
+                causal_budget_id=session.causal_budget_id,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                tool_capability_ceiling=resolve_tool_capability_ceiling(
+                    request.tool_capability_ceiling,
+                    registered_agent.tool_capabilities,
+                    maximum=_session_tool_capability_ceiling(session),
+                ),
+            )
             candidate = execution_profile_with_component(
                 candidate,
-                source_profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
+                source_profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
             )
+            if source_profile.schema_version >= 2:
+                candidate = execution_profile_with_component(
+                    candidate,
+                    source_profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
+                )
+            return candidate
+
+        policy = request.failover
+        inherited = source_profile.model_failover
+        target_changed = (
+            target.provider_name != session.provider_name or target.model != session.model
+        )
+        if policy is None and inherited is not None and not target_changed:
+            policy = ModelFailoverPolicy(
+                fallbacks=tuple(
+                    ModelTarget(provider_name=item.provider_name, model=item.model)
+                    for item in inherited.plan.candidates[1:]
+                ),
+                max_total_attempts=inherited.plan.max_total_attempts,
+            )
+        if policy is None:
+            candidate = ordinary_queued_profile(registered_provider, target.model)
+        else:
+            candidate = execution_profile_admission.resolve_model_failover_execution_profile(
+                policy=policy,
+                primary=target,
+                registered_primary=registered_provider,
+                resolve_provider=self._get_registered_provider,
+                resolve_candidate_profile=ordinary_queued_profile,
+                redactor=self._secret_redactor,
+            ).profile
         if initial_profile is not None:
             if candidate != initial_profile:
                 raise ExecutionProfileMismatchError(
@@ -5680,6 +5729,51 @@ class SessionEngine:
         additional_profile_fingerprints: tuple[str, ...] = (),
         record_rejection: bool = True,
     ) -> ActiveInvocationExecutionProfile:
+        """Validate without exporting process-local candidate collaborators."""
+
+        resolved = await self._resolve_execution_profile_continuation(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_loop_policies=request_loop_policies,
+            budget_policy=budget_policy,
+            request_budget_limits=request_budget_limits,
+            structured_output=structured_output,
+            thinking=thinking,
+            max_steps=max_steps,
+            limits=limits,
+            retry_policy=retry_policy,
+            invocation_semantics_available=invocation_semantics_available,
+            frozen_candidate_profile=frozen_candidate_profile,
+            require_open_interaction=require_open_interaction,
+            additional_profile_fingerprints=additional_profile_fingerprints,
+            record_rejection=record_rejection,
+        )
+        return resolved.snapshot
+
+    async def _resolve_execution_profile_continuation(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        request_failover: ModelFailoverPolicy | None = None,
+        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
+        budget_policy: BudgetPolicy | None = None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+        structured_output: StructuredOutputSpec | None = None,
+        thinking: ThinkingConfig | None = None,
+        max_steps: int | None = None,
+        limits: RunLimits | None = None,
+        retry_policy: RetryPolicy | None = None,
+        invocation_semantics_available: bool = False,
+        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
+        require_open_interaction: bool = True,
+        additional_profile_fingerprints: tuple[str, ...] = (),
+        record_rejection: bool = True,
+    ) -> execution_profile_admission.ExecutionProfileContinuationPlan:
         """Resolve a recovery continuation against its durable invocation profile."""
 
         if invocation_semantics_available and max_steps is None:
@@ -5733,6 +5827,7 @@ class SessionEngine:
             checkpoint=checkpoint,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
+            request_failover=request_failover,
             runtime_version=_runtime_version(),
             runtime_build_provenance=current_runtime_build_provenance(),
             redactor=self._secret_redactor,
@@ -5787,8 +5882,19 @@ class SessionEngine:
             tool_capability_ceiling=_session_tool_capability_ceiling(
                 session,
             ).tool_names,
+            resolve_provider=self._get_registered_provider,
+            resolve_candidate_provider_options=lambda provider, model: (
+                _execution_profile_provider_options(
+                    registered_agent.spec.provider_options,
+                    provider=provider.provider,
+                    model=model,
+                    process_identity=self._execution_profile_process_identity,
+                )
+            ),
         )
         snapshot = plan.snapshot
+        if snapshot.profile.model_failover is not None or plan.model_failover is not None:
+            self.session_store._require_model_failover_stage_protocol()
         candidate = plan.candidate_profile
         changed = plan.changed_component_classes
         if not changed:
@@ -5818,8 +5924,13 @@ class SessionEngine:
                         active_model_completion=active_model_completion,
                     )
             if frozen_candidate_profile is not None:
-                return snapshot.model_copy(update={"profile": frozen_candidate_profile})
-            return snapshot
+                snapshot = snapshot.model_copy(update={"profile": frozen_candidate_profile})
+            return execution_profile_admission.ExecutionProfileContinuationPlan(
+                snapshot=snapshot,
+                candidate_profile=candidate,
+                changed_component_classes=(),
+                model_failover=plan.model_failover,
+            )
 
         if not record_rejection:
             raise ExecutionProfileMismatchError(
@@ -7187,7 +7298,14 @@ class SessionEngine:
         assert isinstance(provider_name, str)
         assert isinstance(pricing_provider_name, str)
         assert isinstance(model_attempt_id, str)
-        if stage.purpose == "assistant-turn" and provider_name != session.provider_name:
+        from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
+
+        selected_target = model_failover_target_for_stored_stage(session=session, stage=stage)
+        if (
+            stage.purpose == "assistant-turn"
+            and selected_target is None
+            and provider_name != session.provider_name
+        ):
             raise SessionModelCompletionStageConflict(
                 "Assistant model recovery provider conflicts with the session provider."
             )
@@ -7196,7 +7314,7 @@ class SessionEngine:
             model_attempt_id=model_attempt_id,
         )
         budget_dispatch_id = stage.stage_id
-        budget_model = session.model
+        budget_model = session.model if selected_target is None else selected_target.model
         if stage.purpose == "context-compaction":
             requested_model = stage.intent.get("requested_model")
             if type(requested_model) is not str:
@@ -9099,6 +9217,13 @@ class SessionEngine:
         )
         settlement_command: SettleInvocationCommand | None = None
         if active_invocation_profile is not None:
+            if (
+                execution_profile is not None
+                and active_invocation_profile.profile != execution_profile
+            ):
+                raise SessionRunFenced(
+                    "Interaction settlement lost its active invocation authority."
+                )
             released_invocation_authority = (
                 invocation_context is None
                 and allow_released_invocation_authority
@@ -9124,10 +9249,6 @@ class SessionEngine:
             elif (
                 active_invocation_profile.session_id != session.id
                 or active_invocation_profile.run_epoch != session.run_epoch
-                or (
-                    execution_profile is not None
-                    and active_invocation_profile.profile != execution_profile
-                )
             ):
                 raise SessionRunFenced(
                     "Interaction settlement lost its active invocation authority."
@@ -9447,6 +9568,7 @@ class SessionEngine:
         expected_recovery_claim_id: str | None = None,
         terminal_event: Event | None = None,
         terminal_decision: InvocationTerminalDecision | None = None,
+        allow_released_invocation_authority: bool = False,
     ) -> tuple[Session, Event | None, bool]:
         """Publish from a caller not enclosed by ``_run_session`` cleanup."""
 
@@ -9468,6 +9590,7 @@ class SessionEngine:
                 observed_at=observed_at,
                 event_id=event_id,
                 execution_profile=execution_profile,
+                allow_released_invocation_authority=allow_released_invocation_authority,
                 model_completion_failure=model_completion_failure,
                 expected_recovery_claim_id=expected_recovery_claim_id,
                 terminal_event=terminal_event,
@@ -9698,13 +9821,28 @@ class SessionEngine:
                 transitioned_session,
                 observed_at=resolution_event.timestamp,
             )
+            # Failure does not dispatch new work. Preserve the actual released
+            # epoch instead of treating a reconstructed context as a live owner.
+            stored_profile = active_invocation_execution_profile_from_checkpoint(
+                await self.session_store.load_checkpoint(session.id)
+            )
+            released_authority = (
+                stored_profile is not None
+                and stored_profile.profile == execution_profile
+                and stored_profile.interaction_id == resolution_event.interaction_id
+                and active_invocation_execution_profile_is_released(
+                    stored_profile,
+                    session_id=session.id,
+                    run_epoch=transitioned_session.run_epoch,
+                )
+            )
             (
                 transitioned_session,
                 interaction_failed_event,
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=transitioned_session,
-                invocation_context=invocation_context,
+                invocation_context=None if released_authority else invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
@@ -9713,6 +9851,7 @@ class SessionEngine:
                 observed_at=observed_at,
                 event_id=interaction_failed_id,
                 execution_profile=execution_profile,
+                allow_released_invocation_authority=released_authority,
             )
             if interaction_failed_event is not None:
                 yield interaction_failed_event
@@ -10020,6 +10159,8 @@ class SessionEngine:
             request,
             redactor=self._secret_redactor,
         )
+        if request.failover is not None:
+            self.session_store._require_model_failover_stage_protocol()
         parent = (
             await self.session_store.load(request.parent_session_id)
             if request.parent_session_id is not None
@@ -10173,11 +10314,9 @@ class SessionEngine:
             agent_system_prompt=registered_agent.spec.system_prompt,
             workspace_instructions=workspace_instructions,
         )
-        execution_profile = _execution_profile_identity(
+        resolve_profile = partial(
+            _execution_profile_identity,
             registered_agent=registered_agent,
-            provider_name=registered_provider.name,
-            registered_provider=registered_provider,
-            model=model,
             durable_system_prompt=rendered_system_prompt,
             redactor=self._secret_redactor,
             registered_environment=registered_environment,
@@ -10201,6 +10340,33 @@ class SessionEngine:
             retry_policy=self._effective_retry_policy(request.retry_policy),
             tool_capability_ceiling=effective_tool_capability_ceiling,
         )
+        model_failover = None
+        if request.failover is None:
+            execution_profile = resolve_profile(
+                provider_name=registered_provider.name,
+                registered_provider=registered_provider,
+                model=model,
+            )
+        else:
+
+            def resolve_candidate_profile(
+                candidate: runtime_records.RegisteredProvider, candidate_model: str
+            ) -> ExecutionProfileIdentity:
+                return resolve_profile(
+                    provider_name=candidate.name,
+                    registered_provider=candidate,
+                    model=candidate_model,
+                )
+
+            model_failover = execution_profile_admission.resolve_model_failover_execution_profile(
+                policy=request.failover,
+                primary=ModelTarget(provider_name=registered_provider.name, model=model),
+                registered_primary=registered_provider,
+                resolve_provider=self._get_registered_provider,
+                resolve_candidate_profile=resolve_candidate_profile,
+                redactor=self._secret_redactor,
+            )
+            execution_profile = model_failover.profile
         unavailable_profile_components = unavailable_execution_profile_components(execution_profile)
         if unavailable_profile_components:
             names = ", ".join(component.value for component in unavailable_profile_components)
@@ -10225,9 +10391,23 @@ class SessionEngine:
         # Native schema validation is provider-owned code, but it is not an
         # execution attempt. Freeze the invocation profile first while retaining
         # the established no-session-on-invalid-schema entry-point contract.
-        _require_native_structured_output_support(
-            request.structured_output, registered_provider=registered_provider
+        candidate_configurations = (
+            ((registered_provider, model),)
+            if model_failover is None
+            else tuple(
+                zip(
+                    model_failover.registered_providers,
+                    (target.model for target in model_failover.plan.candidates),
+                    strict=True,
+                )
+            )
         )
+        for candidate_provider, candidate_model in candidate_configurations:
+            if candidate_provider is not registered_provider or candidate_model != model:
+                candidate_provider.provider.preflight_model_target(model=candidate_model)
+            _require_native_structured_output_support(
+                request.structured_output, registered_provider=candidate_provider
+            )
         prepared_session_id = request.session_id
         if prepared_session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
@@ -10238,14 +10418,56 @@ class SessionEngine:
             ):
                 del existing_session
                 raise ValueError(f"Session already exists: {prepared_session_id}")
-        registered_provider.provider.preflight_hosted_tools(
-            model=model,
-            hosted_tools=registered_agent.hosted_tools,
-            options=copy_json_value(
-                registered_agent.spec.provider_options,
-                "agent provider_options",
-            ),
-        )
+        for candidate_provider, candidate_model in candidate_configurations:
+            candidate_provider.provider.preflight_hosted_tools(
+                model=candidate_model,
+                hosted_tools=registered_agent.hosted_tools,
+                options=copy_json_value(
+                    registered_agent.spec.provider_options,
+                    "agent provider_options",
+                ),
+            )
+            if model_failover is not None:
+                preflight_model_thinking(
+                    provider=candidate_provider.provider,
+                    model=candidate_model,
+                    thinking=(
+                        request.thinking
+                        if request.thinking is not None
+                        else registered_agent.spec.thinking
+                        if registered_agent.spec.thinking is not None
+                        else registered_agent.spec.provider_options.get("thinking")
+                    ),
+                    redactor=self._secret_redactor,
+                )
+                preflight_portable_model_material(
+                    provider=candidate_provider.provider,
+                    model=candidate_model,
+                    messages=_model_request_messages(
+                        messages=[
+                            *(
+                                ()
+                                if rendered_system_prompt is None
+                                else (Message.text("system", rendered_system_prompt),)
+                            ),
+                            *request.messages,
+                        ],
+                        structured_output=request.structured_output,
+                    ),
+                    tools=_model_request_tools(
+                        tool_exposure=_tool_capability_ceiling_exposure(
+                            registered_agent, effective_tool_capability_ceiling.tool_names
+                        ),
+                        structured_output=request.structured_output,
+                        targeted_tool_projection=resolve_targeted_tool_projection(
+                            registered_agent.targeted_tool_mode,
+                            provider=candidate_provider.provider,
+                            model=candidate_model,
+                        ),
+                        tool_discovery_mode=registered_agent.tool_discovery_mode,
+                    ),
+                    redactor=self._secret_redactor,
+                )
         session_identity = _session_identity(
             provider_name=registered_provider.name,
             model=model,
@@ -10275,6 +10497,7 @@ class SessionEngine:
             rendered_system_prompt=rendered_system_prompt,
             prompt_contributions=tuple(prompt_contributions),
             execution_profile=execution_profile,
+            model_failover=model_failover,
             tool_capability_ceiling=effective_tool_capability_ceiling,
             targeted_tool_grants=targeted_tool_grants,
             budget_policy=budget_policy,
@@ -11741,6 +11964,7 @@ class SessionEngine:
                 ),
                 tool_capability_ceiling=prepared.tool_capability_ceiling,
                 retry_policy=self._effective_retry_policy(prepared_request.retry_policy),
+                failover=prepared_request.failover,
                 structured_output=prepared_request.structured_output,
                 thinking=(
                     prepared_request.thinking
@@ -11972,6 +12196,7 @@ class SessionEngine:
         if (
             request.profile_adoption is not None
             or request.target is not None
+            or request.failover is not None
             or request.tool_capability_ceiling is not None
             or request.metadata
             or "max_steps" in request.model_fields_set
@@ -12548,6 +12773,7 @@ class SessionEngine:
         prompt_contributions = list(prepared.prompt_contributions)
         execution_profile = prepared.execution_profile
         tool_capability_ceiling = prepared.tool_capability_ceiling
+        model_failover = prepared.model_failover
         tool_discovery_initializer = _tool_discovery_operation_initializer(
             registered_agent,
             tool_capability_ceiling,
@@ -12556,9 +12782,10 @@ class SessionEngine:
         budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
         # ``prepared`` also retains the registered provider, whose repr may contain
-        # live credentials. Keep the deliberately scoped provider local below as the
-        # sole remaining reference so the existing cancellation cleanup can drop it
-        # before a traceback escapes this frame.
+        # live credentials. Keep the deliberately scoped provider local below so
+        # cancellation cleanup can drop it before a traceback escapes this frame.
+        # The failover resolution retains frozen collaborators through its own
+        # deliberately credential-free repr, not the prepared container's repr.
         del prepared
         session_id = request.session_id
         if session_id is None:
@@ -13278,6 +13505,7 @@ class SessionEngine:
             session_stream = self._run_session(
                 session=session,
                 invocation_context=invocation_context,
+                model_failover=model_failover,
                 messages=messages,
                 messages_to_append=[],
                 max_steps=request.max_steps,
@@ -19455,6 +19683,8 @@ class SessionEngine:
         required_foreground_continuation: ForegroundParentContinuation | None = None,
         foreground_before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if request.failover is not None:
+            self.session_store._require_model_failover_stage_protocol()
         # Resume profile admission and the resumed dispatch must observe one
         # application-budget snapshot even if the app configuration is changed
         # while the interaction-start event is being consumed.
@@ -19605,6 +19835,21 @@ class SessionEngine:
         loaded_projection_cursor = session_model_projection_cursor(loaded_session)
 
         stored_execution_profile = execution_profile_from_session_metadata(loaded_session.metadata)
+        if stored_execution_profile.model_failover is not None:
+            self.session_store._require_model_failover_stage_protocol()
+        expected_failover_progress = model_failover_progress_for_session(
+            session=loaded_session,
+            execution_profile=stored_execution_profile,
+            checkpoint=(
+                await self.session_store.load_checkpoint(loaded_session.id)
+                if stored_execution_profile.model_failover is not None
+                else None
+            ),
+        )
+        if expected_failover_progress is not None:
+            loaded_projection_cursor = max(
+                loaded_projection_cursor, expected_failover_progress.projection_cursor
+            )
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         stored_tool_capability_ceiling = _session_tool_capability_ceiling(
             loaded_session,
@@ -19665,17 +19910,18 @@ class SessionEngine:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        if request.profile_adoption is not None:
-            replay_expected_profile = stored_execution_profile
-            replay_candidate_profile = _execution_profile_identity(
+
+        def current_resume_profile(
+            max_steps: int,
+            candidate_provider: runtime_records.RegisteredProvider,
+            candidate_model: str,
+            runtime_identity: SessionRuntimeIdentity | None = None,
+        ) -> ExecutionProfileIdentity:
+            candidate = _execution_profile_identity(
                 registered_agent=registered_agent,
-                provider_name=registered_provider.name,
-                registered_provider=registered_provider,
-                model=(
-                    requested_target.model
-                    if target_changed and requested_target is not None
-                    else loaded_session.model
-                ),
+                provider_name=candidate_provider.name,
+                registered_provider=candidate_provider,
+                model=candidate_model,
                 durable_system_prompt=None,
                 redactor=self._secret_redactor,
                 registered_environment=registered_environment,
@@ -19694,17 +19940,54 @@ class SessionEngine:
                 causal_budget_id=loaded_session.causal_budget_id,
                 structured_output=request.structured_output,
                 thinking=request.thinking,
-                max_steps=request.max_steps,
+                max_steps=max_steps,
                 limits=request.limits,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 tool_capability_ceiling=effective_tool_capability_ceiling,
+                runtime_identity=runtime_identity,
             )
-            replay_candidate_profile = execution_profile_with_component(
-                replay_candidate_profile,
-                replay_expected_profile.component(
+            return execution_profile_with_component(
+                candidate,
+                stored_execution_profile.component(
                     ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
                 ),
             )
+
+        if request.profile_adoption is not None:
+            replay_model = (
+                requested_target.model
+                if target_changed and requested_target is not None
+                else loaded_session.model
+            )
+            replay_policy = request.failover
+            inherited = stored_execution_profile.model_failover
+            if replay_policy is None and inherited is not None and not target_changed:
+                replay_policy = ModelFailoverPolicy(
+                    fallbacks=tuple(
+                        ModelTarget(provider_name=item.provider_name, model=item.model)
+                        for item in inherited.plan.candidates[1:]
+                    ),
+                    max_total_attempts=inherited.plan.max_total_attempts,
+                )
+            if replay_policy is None:
+                replay_candidate_profile = current_resume_profile(
+                    request.max_steps, registered_provider, replay_model
+                )
+            else:
+                replay_candidate_profile = (
+                    execution_profile_admission.resolve_model_failover_execution_profile(
+                        policy=replay_policy,
+                        primary=ModelTarget(
+                            provider_name=registered_provider.name, model=replay_model
+                        ),
+                        registered_primary=registered_provider,
+                        resolve_provider=self._get_registered_provider,
+                        resolve_candidate_profile=lambda provider, model: current_resume_profile(
+                            request.max_steps, provider, model
+                        ),
+                        redactor=self._secret_redactor,
+                    ).profile
+                )
             replayed_profile_decision = await self._replay_execution_profile_decision(
                 session=loaded_session,
                 candidate_profile=replay_candidate_profile,
@@ -19834,6 +20117,27 @@ class SessionEngine:
             current_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
             if (
+                request.failover is not None
+                and tool_round_recovery.pending_tool_round_from_checkpoint(
+                    current_checkpoint,
+                    redactor=self._secret_redactor,
+                    runtime_session=current_session,
+                )
+                is not None
+            ):
+                execution_profile_admission.require_matching_recovery_failover_policy(
+                    profile=stored_execution_profile, requested_policy=request.failover
+                )
+            if (
+                model_failover_progress_for_session(
+                    session=current_session,
+                    execution_profile=stored_execution_profile,
+                    checkpoint=current_checkpoint,
+                )
+                != expected_failover_progress
+            ):
+                raise SessionRunFenced("Model failover selection changed during resume admission.")
+            if (
                 required_session_instance_fingerprint is not None
                 and _queued_dispatch_session_instance_fingerprint(current_session)
                 != required_session_instance_fingerprint
@@ -19946,6 +20250,31 @@ class SessionEngine:
         # Report deterministic checkpoint conflicts before claiming the session,
         # then repeat the same validation inside the atomic transition below so a
         # concurrent checkpoint update cannot bypass the guard.
+        if request.failover is not None:
+            recovery_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+            recovery_stage = await self._recovery_coordinator.load_model_completion_boundary(
+                loaded_session
+            )
+            if (
+                recovery_stage is not None
+                or tool_round_recovery.pending_tool_round_from_checkpoint(
+                    recovery_checkpoint,
+                    redactor=self._secret_redactor,
+                    runtime_session=loaded_session,
+                )
+                is not None
+            ):
+                recovery_profile = active_invocation_execution_profile_from_checkpoint(
+                    recovery_checkpoint
+                )
+                execution_profile_admission.require_matching_recovery_failover_policy(
+                    profile=(
+                        stored_execution_profile
+                        if recovery_profile is None
+                        else recovery_profile.profile
+                    ),
+                    requested_policy=request.failover,
+                )
         await require_no_incomplete_recovery_claim()
         await settle_expired_session_operation()
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
@@ -19978,29 +20307,31 @@ class SessionEngine:
         # must reject resume without mutating the session. Check that boundary
         # before terminal-evidence reconciliation, which may perform a fenced
         # repair and advance the durable run epoch.
+        model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None
         active_model_completion_boundary = (
             await self._recovery_coordinator.load_model_completion_boundary(loaded_session)
         )
         if active_model_completion_boundary is None:
             pending_model_completion = False
         else:
-            continuing_execution_profile_snapshot = (
-                await self.validate_execution_profile_continuation(
-                    session=loaded_session,
-                    checkpoint=checkpoint,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    request_loop_policies=request.loop_policies,
-                    budget_policy=budget_policy,
-                    request_budget_limits=request.budget_limits,
-                    structured_output=request.structured_output,
-                    thinking=request.thinking,
-                    max_steps=request.max_steps,
-                    limits=request.limits,
-                    retry_policy=self._effective_retry_policy(request.retry_policy),
-                    invocation_semantics_available=True,
-                )
+            continuing_profile_resolution = await self._resolve_execution_profile_continuation(
+                session=loaded_session,
+                checkpoint=checkpoint,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                request_failover=request.failover,
+                request_loop_policies=request.loop_policies,
+                budget_policy=budget_policy,
+                request_budget_limits=request.budget_limits,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                invocation_semantics_available=True,
             )
+            continuing_execution_profile_snapshot = continuing_profile_resolution.snapshot
+            model_failover = continuing_profile_resolution.model_failover
             pending_model_completion = (
                 await self._recovery_coordinator.preflight_model_completion_boundary(
                     loaded_session,
@@ -20088,49 +20419,48 @@ class SessionEngine:
             def ordinary_resume_profile(
                 max_steps: int,
                 candidate_provider: runtime_records.RegisteredProvider,
+                model: str | None = None,
             ) -> ExecutionProfileIdentity:
-                candidate = _execution_profile_identity(
-                    registered_agent=registered_agent,
-                    provider_name=candidate_provider.name,
-                    registered_provider=candidate_provider,
-                    model=candidate_model,
-                    durable_system_prompt=None,
-                    redactor=self._secret_redactor,
-                    registered_environment=registered_environment,
-                    process_identity=self._execution_profile_process_identity,
-                    runtime_hooks=self._runtime_hooks,
-                    loop_policies=self._loop_policies,
-                    loop_policy_execution_profile_identities=(
-                        self._loop_policy_execution_profile_identities
-                    ),
-                    request_loop_policies=request.loop_policies,
-                    request_loop_policy_instance_identities=(
-                        self._request_loop_policy_instance_identities(request.loop_policies)
-                    ),
-                    budget_policy=budget_policy,
-                    request_budget_limits=request.budget_limits,
-                    causal_budget_id=loaded_session.causal_budget_id,
-                    structured_output=request.structured_output,
-                    thinking=request.thinking,
-                    max_steps=max_steps,
-                    limits=request.limits,
-                    retry_policy=self._effective_retry_policy(request.retry_policy),
-                    tool_capability_ceiling=effective_tool_capability_ceiling,
-                    runtime_identity=candidate_runtime_identity,
-                )
                 # A resumed session executes the already-durable system
                 # projection. The current AgentSpec prompt is not re-injected.
-                return execution_profile_with_component(
-                    candidate,
-                    expected_execution_profile.component(
-                        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
-                    ),
+                return current_resume_profile(
+                    max_steps,
+                    candidate_provider,
+                    candidate_model if model is None else model,
+                    candidate_runtime_identity,
                 )
 
-            candidate_execution_profile = ordinary_resume_profile(
-                request.max_steps,
-                registered_provider,
-            )
+            stored_failover = stored_execution_profile.model_failover
+            if request.failover is not None or (stored_failover is not None and not target_changed):
+                policy = request.failover
+                if policy is None:
+                    assert stored_failover is not None
+                    policy = ModelFailoverPolicy(
+                        fallbacks=tuple(
+                            ModelTarget(provider_name=entry.provider_name, model=entry.model)
+                            for entry in stored_failover.plan.candidates[1:]
+                        ),
+                        max_total_attempts=stored_failover.plan.max_total_attempts,
+                    )
+                model_failover = (
+                    execution_profile_admission.resolve_model_failover_execution_profile(
+                        policy=policy,
+                        primary=ModelTarget(
+                            provider_name=registered_provider.name, model=candidate_model
+                        ),
+                        registered_primary=registered_provider,
+                        resolve_provider=self._get_registered_provider,
+                        resolve_candidate_profile=lambda provider, model: ordinary_resume_profile(
+                            request.max_steps, provider, model
+                        ),
+                        redactor=self._secret_redactor,
+                    )
+                )
+                candidate_execution_profile = model_failover.profile
+            else:
+                candidate_execution_profile = ordinary_resume_profile(
+                    request.max_steps, registered_provider
+                )
             built_in_model_target_transition = False
             if target_changed:
                 try:
@@ -20294,28 +20624,30 @@ class SessionEngine:
                     changed_component_classes=changed_profile_components,
                 )
         if continuing_recovery_boundary:
-            continuing_execution_profile_snapshot = (
-                await self.validate_execution_profile_continuation(
-                    session=loaded_session,
-                    checkpoint=checkpoint,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    request_loop_policies=request.loop_policies,
-                    budget_policy=budget_policy,
-                    request_budget_limits=request.budget_limits,
-                    structured_output=request.structured_output,
-                    thinking=request.thinking,
-                    max_steps=request.max_steps,
-                    limits=request.limits,
-                    retry_policy=self._effective_retry_policy(request.retry_policy),
-                    invocation_semantics_available=True,
-                    frozen_candidate_profile=(
-                        None
-                        if continuing_execution_profile_snapshot is None
-                        else continuing_execution_profile_snapshot.profile
-                    ),
-                )
+            continuing_profile_resolution = await self._resolve_execution_profile_continuation(
+                session=loaded_session,
+                checkpoint=checkpoint,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                request_failover=request.failover,
+                request_loop_policies=request.loop_policies,
+                budget_policy=budget_policy,
+                request_budget_limits=request.budget_limits,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                invocation_semantics_available=True,
+                frozen_candidate_profile=(
+                    None
+                    if continuing_execution_profile_snapshot is None
+                    else continuing_execution_profile_snapshot.profile
+                ),
             )
+            continuing_execution_profile_snapshot = continuing_profile_resolution.snapshot
+            if continuing_profile_resolution.model_failover is not None:
+                model_failover = continuing_profile_resolution.model_failover
             if (
                 required_execution_profile is not None
                 and continuing_execution_profile_snapshot.profile != required_execution_profile
@@ -20915,7 +21247,20 @@ class SessionEngine:
                 )
                 _deactivate_session_interaction(session.id)
                 return
-            projection_cursor = session_model_projection_cursor(session)
+            projection_cursor = max(
+                session_model_projection_cursor(session), loaded_projection_cursor
+            )
+            admitted_selection = model_failover_progress_for_session(
+                session=session,
+                execution_profile=invocation_profile,
+                checkpoint=(
+                    await self.session_store.load_checkpoint(session.id)
+                    if model_failover is not None
+                    else None
+                ),
+            )
+            if admitted_selection is not None:
+                projection_cursor = max(projection_cursor, admitted_selection.projection_cursor)
             if projection_cursor:
                 transcript_snapshot = await self.session_store.load_transcript_snapshot(session.id)
                 try:
@@ -21097,6 +21442,7 @@ class SessionEngine:
         session_stream = self._run_session(
             session=session,
             invocation_context=invocation_context,
+            model_failover=model_failover,
             messages=messages,
             messages_to_append=(
                 interaction_source_messages if continuing_recovery_boundary else request.messages
@@ -21203,6 +21549,11 @@ class SessionEngine:
         store_resolved_source_session_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = copy_fork_session_request(request)
+        if (
+            request.initial_invocation is not None
+            and request.initial_invocation.failover is not None
+        ):
+            self.session_store._require_model_failover_stage_protocol()
         if (
             len(request_sha256) != 64
             or any(character not in "0123456789abcdef" for character in request_sha256)
@@ -21435,6 +21786,11 @@ class SessionEngine:
                 source_session,
                 source_checkpoint_for_profile,
             )
+            source_model_selection = model_failover_progress_for_session(
+                session=source_session,
+                execution_profile=source_execution_profile,
+                checkpoint=source_checkpoint_for_profile,
+            )
             source_environment_allocation_owners_by_environment = (
                 environment_allocation_owners_from_checkpoint(
                     source_checkpoint_for_profile,
@@ -21555,12 +21911,14 @@ class SessionEngine:
             runtime_build_provenance=current_runtime_build_provenance(),
         )
 
-        def current_child_execution_profile() -> ExecutionProfileIdentity:
+        def ordinary_child_execution_profile(
+            child_provider: runtime_records.RegisteredProvider, child_model: str
+        ) -> ExecutionProfileIdentity:
             candidate = _execution_profile_identity(
                 registered_agent=registered_agent,
-                provider_name=registered_provider.name,
-                registered_provider=registered_provider,
-                model=model,
+                provider_name=child_provider.name,
+                registered_provider=child_provider,
+                model=child_model,
                 durable_system_prompt=prompt_workflow.rendered_child_prompt,
                 redactor=self._secret_redactor,
                 registered_environment=registered_environment,
@@ -21618,6 +21976,33 @@ class SessionEngine:
                     ),
                 )
             return candidate
+
+        def current_child_execution_profile() -> ExecutionProfileIdentity:
+            policy = None if initial_invocation is None else initial_invocation.failover
+            inherited = source_execution_profile.model_failover
+            if (
+                policy is None
+                and inherited is not None
+                and request.execution_profile_selection
+                is ForkExecutionProfileSelection.INHERIT_PARENT
+            ):
+                policy = ModelFailoverPolicy(
+                    fallbacks=tuple(
+                        ModelTarget(provider_name=item.provider_name, model=item.model)
+                        for item in inherited.plan.candidates[1:]
+                    ),
+                    max_total_attempts=inherited.plan.max_total_attempts,
+                )
+            if policy is None:
+                return ordinary_child_execution_profile(registered_provider, model)
+            return execution_profile_admission.resolve_model_failover_execution_profile(
+                policy=policy,
+                primary=ModelTarget(provider_name=registered_provider.name, model=model),
+                registered_primary=registered_provider,
+                resolve_provider=self._get_registered_provider,
+                resolve_candidate_profile=ordinary_child_execution_profile,
+                redactor=self._secret_redactor,
+            ).profile
 
         initial_invocation_profile: ExecutionProfileIdentity | None = None
         selected_execution_profile = source_execution_profile
@@ -21693,19 +22078,16 @@ class SessionEngine:
                 None if initial_invocation is None else candidate_execution_profile
             )
         else:
-            inherited_ceiling_profile = current_child_execution_profile()
-            selected_execution_profile = execution_profile_with_component(
+            selected_execution_profile = execution_profile_with_tool_capability_ceiling(
                 source_execution_profile,
-                inherited_ceiling_profile.component(
-                    ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
-                ),
+                initial_tool_capability_ceiling.tool_names,
             )
         if (
             request.execution_profile_selection is ForkExecutionProfileSelection.INHERIT_PARENT
             and initial_invocation is not None
         ):
             candidate_execution_profile = current_child_execution_profile()
-            changed_profile_components = changed_execution_profile_components(
+            changed_profile_components = inherited_execution_profile_component_changes(
                 source_execution_profile,
                 candidate_execution_profile,
             )
@@ -21746,7 +22128,17 @@ class SessionEngine:
                 "Prompt-anatomy succession to an agent with a different provider is not supported."
             )
 
+        if (
+            selected_execution_profile.model_failover is not None
+            and not self.session_store._supports_model_failover_stage_protocol()
+        ):
+            raise NotImplementedError("Store does not attest atomic model failover forks.")
+
         source_projection_cursor = session_model_projection_cursor(source_session)
+        if source_model_selection is not None:
+            source_projection_cursor = max(
+                source_projection_cursor, source_model_selection.projection_cursor
+            )
         model_changed = model != source_session.model
         provider_changed = registered_provider.name != source_session.provider_name
         target_changed = model_changed or provider_changed
@@ -22151,6 +22543,14 @@ class SessionEngine:
             and source_session.environment_name is not None
             and source_session.environment_name == fork_session.environment_name
         )
+        fork_model_candidate_index = (
+            None
+            if selected_execution_profile.model_failover is None
+            else source_model_selection.candidate_index
+            if request.execution_profile_selection is ForkExecutionProfileSelection.INHERIT_PARENT
+            and source_model_selection is not None
+            else 0
+        )
         fork_event_payload: dict[str, Any] = {
             "source_session_id": source_session.id,
             "source_status": source_session.status.value,
@@ -22182,6 +22582,8 @@ class SessionEngine:
                 ),
             ).model_dump(mode="json"),
         }
+        if fork_model_candidate_index is not None:
+            fork_event_payload["model_failover_candidate_index"] = fork_model_candidate_index
         if expected_source_snapshot is not None:
             fork_event_payload.update(
                 {
@@ -22326,6 +22728,7 @@ class SessionEngine:
             system_prompt_policy=request.system_prompt_policy,
             selection=request.execution_profile_selection,
             selected_profile=selected_execution_profile,
+            model_failover_candidate_index=fork_model_candidate_index,
             source_environment_allocation_owners=source_environment_allocation_owners,
             initial_invocation_request_sha256=(
                 None
@@ -23033,6 +23436,28 @@ class SessionEngine:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
         registered_agent = invocation_context.registered_agent
         registered_provider = invocation_context.registered_provider
+        model_failover = None
+        if invocation_context.profile.model_failover is not None:
+            continuation = await self._resolve_execution_profile_continuation(
+                session=session,
+                checkpoint=await self.session_store.load_checkpoint(session.id),
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                request_loop_policies=invocation_context.request_loop_policies,
+                budget_policy=invocation_context.budget_policy,
+                request_budget_limits=budget_limits,
+                structured_output=structured_output,
+                thinking=thinking,
+                max_steps=max_steps,
+                limits=limits,
+                retry_policy=retry_policy,
+                invocation_semantics_available=True,
+            )
+            if continuation.snapshot.profile != invocation_context.profile:
+                raise RuntimeError(
+                    "Recovered model configuration changed its invocation authority."
+                )
+            model_failover = continuation.model_failover
         interaction_id = _current_session_interaction_id(session.id)
         targeted_tool_projection = resolve_targeted_tool_projection(
             registered_agent.targeted_tool_mode,
@@ -23059,6 +23484,7 @@ class SessionEngine:
         stream = self._run_session(
             session=session,
             invocation_context=invocation_context,
+            model_failover=model_failover,
             messages=messages,
             messages_to_append=messages_to_append,
             messages_deferred=messages_deferred,
@@ -23155,6 +23581,7 @@ class SessionEngine:
         parked_egress_factory_result: EnvironmentFactoryResult | None = None,
         new_terminal_invocation: bool = False,
         foreground_wait: ForegroundChildWait | None = None,
+        model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -23180,6 +23607,20 @@ class SessionEngine:
         registered_provider = invocation_context.registered_provider
         registered_environment = invocation_context.registered_environment
         execution_profile = invocation_context.profile
+        if model_failover is not None:
+            if (
+                type(model_failover)
+                is not execution_profile_admission.ModelFailoverProfileResolution
+            ):
+                raise TypeError("Invocation failover configuration must be resolved.")
+            model_failover = replace(model_failover)
+            if (
+                model_failover.profile != execution_profile
+                or model_failover.registered_providers[0] is not registered_provider
+            ):
+                raise ValueError("Invocation failover configuration changed admitted authority.")
+        elif execution_profile.model_failover is not None:
+            raise RuntimeError("Routed invocation requires its resolved candidate configuration.")
         budget_policy = invocation_context.budget_policy
         request_loop_policies = invocation_context.request_loop_policies
         # Deep defense for internal recovery callers. Public entry points
@@ -23309,6 +23750,19 @@ class SessionEngine:
 
         provider = registered_provider.provider
         model_projection_cursor = session_model_projection_cursor(session)
+        selected_progress = model_failover_progress_for_session(
+            session=session,
+            execution_profile=execution_profile,
+            checkpoint=(
+                await self.session_store.load_checkpoint(session.id)
+                if model_failover is not None
+                else None
+            ),
+        )
+        if selected_progress is not None:
+            model_projection_cursor = max(
+                model_projection_cursor, selected_progress.projection_cursor
+            )
         model_projection_source_prefix_count = 0
         model_projection_prefix_count = 0
         if model_projection_cursor:
@@ -24357,16 +24811,14 @@ class SessionEngine:
                 request_loop_policies
             )
 
-            def validate_live_model_semantics() -> None:
-                """Fail before mutable registered model semantics can drift."""
-
-                if execution_profile is None:
-                    return
+            def live_candidate_profile(
+                candidate_provider: runtime_records.RegisteredProvider, candidate_model: str
+            ) -> ExecutionProfileIdentity:
                 candidate = _execution_profile_identity(
                     registered_agent=registered_agent,
-                    provider_name=registered_provider.name,
-                    registered_provider=registered_provider,
-                    model=session.model,
+                    provider_name=candidate_provider.name,
+                    registered_provider=candidate_provider,
+                    model=candidate_model,
                     durable_system_prompt=None,
                     redactor=self._secret_redactor,
                     registered_environment=registered_environment,
@@ -24392,12 +24844,43 @@ class SessionEngine:
                         session,
                     ),
                 )
-                candidate = execution_profile_with_component(
+                return execution_profile_with_component(
                     candidate,
                     execution_profile.component(
                         ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
                     ),
                 )
+
+            def validate_live_model_semantics() -> None:
+                """Fail before mutable registered model semantics can drift."""
+
+                if model_failover is None:
+                    candidate = live_candidate_profile(registered_provider, session.model)
+                else:
+                    # Resolve from the invocation's frozen collaborators, not
+                    # registrations installed after the invocation was admitted.
+                    providers = {item.name: item for item in model_failover.registered_providers}
+                    binding = execution_profile.model_failover
+                    if binding is None:
+                        raise RuntimeError("Routed invocation lost its profile binding.")
+                    candidate = (
+                        execution_profile_admission.resolve_model_failover_execution_profile(
+                            policy=ModelFailoverPolicy(
+                                fallbacks=tuple(
+                                    ModelTarget(provider_name=item.provider_name, model=item.model)
+                                    for item in model_failover.plan.candidates[1:]
+                                ),
+                                max_total_attempts=model_failover.plan.max_total_attempts,
+                            ),
+                            primary=ModelTarget(
+                                provider_name=registered_provider.name, model=session.model
+                            ),
+                            registered_primary=registered_provider,
+                            resolve_provider=providers.__getitem__,
+                            resolve_candidate_profile=live_candidate_profile,
+                            redactor=self._secret_redactor,
+                        ).profile
+                    )
                 changed = tuple(
                     component_class
                     for component_class in live_model_semantic_components
@@ -24440,6 +24923,17 @@ class SessionEngine:
                 interaction_id=_current_session_interaction_id(session.id),
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
+                model_execution_selection=(
+                    None
+                    if model_failover is None
+                    else ModelExecutionSelection(
+                        invocation_context=invocation_context,
+                        resolution=model_failover,
+                        candidate_index=0
+                        if selected_progress is None
+                        else selected_progress.candidate_index,
+                    )
+                ),
             )
 
             def install_queued_invocation_context(
@@ -24625,6 +25119,26 @@ class SessionEngine:
                     raise RuntimeError("Model step finished without a terminal flow outcome.")
                 if model_step_flow_outcome.stop_session:
                     return
+                if model_step_flow_outcome.portable_history_cursor is not None:
+                    if (
+                        model_failover is None
+                        or model_step_flow_outcome.portable_history_cursor
+                        != source_transcript_cursor
+                    ):
+                        raise RuntimeError("Model failover returned a different history boundary.")
+                    # The executor returns an explicit projection boundary;
+                    # it never mutates this loop's borrowed history. Preserve
+                    # neutral turns and runtime controls, and keep the newly
+                    # accepted provider's parts outside the invalidated prefix.
+                    model_projection_cursor = source_transcript_cursor
+                    snapshot = await self.session_store.load_transcript_snapshot(session.id)
+                    durable_projection = _project_model_target_snapshot(
+                        snapshot, model_projection_cursor
+                    )
+                    model_projection_source_prefix_count = durable_projection.source_prefix_count
+                    portable = model_target.project_portable_transcript(messages)
+                    messages[:] = portable.messages
+                    model_projection_prefix_count = portable.projected_prefix_count
                 await self._session_control.raise_if_interrupted(session.id)
                 assistant_step_result = model_step_flow_outcome.assistant_step_result
                 if assistant_step_result is None:

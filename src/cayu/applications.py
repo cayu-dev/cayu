@@ -227,6 +227,7 @@ from cayu.runtime._isolated_tool_process import (
     isolated_tool_execution_contract,
     validate_process_isolated_tool_registration,
 )
+from cayu.runtime._model_execution_selection import ModelExecutionSelection
 from cayu.runtime._model_step_executor import (
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
@@ -3486,6 +3487,7 @@ class CayuApp:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         invocation_context: InvocationContext | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ProviderOperationRecoveryResult:
         recovery_context = model_completion_recovery_context_from_stage(stage)
         publication_context = recovery_context or ModelCompletionRecoveryContext()
@@ -3506,6 +3508,7 @@ class CayuApp:
             recovery_context=recovery_context,
             model_completion_publisher=publish,
             invocation_context=invocation_context,
+            model_execution_selection=model_execution_selection,
         )
 
     async def _recover_provider_operation_start(
@@ -3517,6 +3520,7 @@ class CayuApp:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         invocation_context: InvocationContext | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ProviderOperationRecoveryResult:
         recovery_context = model_completion_recovery_context_from_stage(stage)
         publication_context = recovery_context or ModelCompletionRecoveryContext()
@@ -3536,6 +3540,7 @@ class CayuApp:
             environment_name=_environment_name(registered_environment),
             model_completion_publisher=publish,
             invocation_context=invocation_context,
+            model_execution_selection=model_execution_selection,
         )
 
     async def _cancel_provider_operation(
@@ -3547,6 +3552,7 @@ class CayuApp:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         invocation_context: InvocationContext | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ProviderOperationSnapshot | None:
         return await self._model_step_executor.cancel_provider_operation_for_interruption(
             session=session,
@@ -3556,6 +3562,7 @@ class CayuApp:
             registered_provider=registered_provider,
             environment_name=_environment_name(registered_environment),
             invocation_context=invocation_context,
+            model_execution_selection=model_execution_selection,
         )
 
     def _get_registered_provider(
@@ -5721,6 +5728,8 @@ class CayuApp:
                 )
             source_profile = execution_profile_from_session_metadata(session.metadata)
         durable_request = self.redact_dispatch_request(request)
+        if durable_request.failover is not None or source_profile.model_failover is not None:
+            self.session_store._require_model_failover_stage_protocol()
         target_changed = durable_request.target is not None and (
             durable_request.target.provider_name != session.provider_name
             or durable_request.target.model != session.model
@@ -6214,6 +6223,7 @@ class CayuApp:
             session_id=request.session_id,
             messages=request.messages,
             target=request.target,
+            failover=request.failover,
             tool_capability_ceiling=request.tool_capability_ceiling,
             tool_grants=request.tool_grants,
             profile_adoption=request.profile_adoption,

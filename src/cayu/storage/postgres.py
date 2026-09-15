@@ -433,6 +433,11 @@ from cayu.sessions.base import (
     _model_completion_stage_winner_record,
     _model_completion_stage_winner_storage_key,
     _model_completion_terminal_advances_last_activity,
+    _model_failover_admission_storage_keys,
+    _model_failover_checkpoint_after_profile_admission,
+    _model_failover_predecessor_storage_keys,
+    _model_failover_preparation_checkpoint,
+    _model_failover_selection_event,
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
     _prepare_execution_profile_rejection,
@@ -440,6 +445,7 @@ from cayu.sessions.base import (
     _prepare_interaction_transition,
     _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
+    _prepare_profiled_fork_checkpoint_result,
     _prepare_queue_completion_checkpoint_mutation,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
@@ -507,8 +513,8 @@ from cayu.sessions.base import (
     _validate_model_completion_stage_release,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
+    _validate_model_failover_selection_replay,
     _validate_profiled_fork_authority,
-    _validate_profiled_fork_checkpoint_result,
     _validate_runner_observed_event_identity_snapshot,
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_event_references,
@@ -25130,6 +25136,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
+    model_failover_stage_version: ClassVar[int] = 1
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
@@ -27305,7 +27312,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 "checkpoint",
                             )
                     if profile_relationship is not None:
-                        _validate_profiled_fork_checkpoint_result(
+                        copied_checkpoint = _prepare_profiled_fork_checkpoint_result(
+                            supports_model_failover=self._supports_model_failover_stage_protocol(),
+                            fork=fork,
+                            transcript_cursor=len(copied_messages),
                             relationship=profile_relationship,
                             source_checkpoint_present=source_checkpoint_present,
                             copied_checkpoint=copied_checkpoint,
@@ -29056,6 +29066,29 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             metadata=transition_metadata,
                         )
                     transitioned = loaded.model_copy(update=transition_updates)
+                    failover_keys = _model_failover_admission_storage_keys(
+                        current_checkpoint, prepared_execution_profile
+                    )
+                    if failover_keys:
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (session_id, list(failover_keys)),
+                        )
+                        route_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        transformed_checkpoint = _model_failover_checkpoint_after_profile_admission(
+                            source_session=loaded,
+                            admitted_session=transitioned,
+                            source_checkpoint=current_checkpoint,
+                            admitted_checkpoint=transformed_checkpoint,
+                            candidate_profile=prepared_execution_profile,
+                            records=route_records,
+                            transcript_cursor=await _transcript_cursor(cur, session_id),
+                            supports_model_failover=self._supports_model_failover_stage_protocol(),
+                        )
                     if result_checkpoint_transform is not None:
                         result_checkpoint = result_checkpoint_transform(
                             transitioned,
@@ -33287,6 +33320,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     }
                     _validate_model_completion_stage_for_dispatch(
                         session=loaded,
+                        checkpoint=await self._load_checkpoint(cur, session_id),
                         current_transcript_cursor=await _transcript_cursor(cur, session_id),
                         stage=stage,
                         active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
@@ -33436,6 +33470,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 prepared.preparation_storage_key,
                                 prepared.terminal_storage_key,
                                 prepared.abandonment_storage_key,
+                                *_model_failover_predecessor_storage_keys(prepared),
                             ],
                         ),
                     )
@@ -33517,6 +33552,28 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             winner_exists=winner_exists,
                             receipt_exists=receipt_exists,
                         )
+                        _model_failover_preparation_checkpoint(
+                            prepared,
+                            session=loaded,
+                            checkpoint=await self._load_checkpoint(cur, session_id),
+                            current_transcript_cursor=await _transcript_cursor(cur, session_id),
+                            active=active,
+                            records=records,
+                            replayed=True,
+                        )
+                        expected_selection = _model_failover_selection_event(
+                            prepared, session=loaded, prepared_at=stage.prepared_at
+                        )
+                        if expected_selection is not None:
+                            await cur.execute(
+                                "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                                (session_id, expected_selection.id),
+                            )
+                            event_row = await cur.fetchone()
+                            _validate_model_failover_selection_replay(
+                                expected_selection,
+                                None if event_row is None else Event(**_json_obj(event_row[0])),
+                            )
                         await conn.rollback()
                         return ModelCompletionStageResult(
                             stage=stage,
@@ -33557,11 +33614,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
                     if active is None:
                         await self._reject_new_work_after_steering(cur, loaded)
+                    route_checkpoint = _model_failover_preparation_checkpoint(
+                        prepared,
+                        session=loaded,
+                        checkpoint=await self._load_checkpoint(cur, session_id),
+                        current_transcript_cursor=current_cursor,
+                        active=active,
+                        records=records,
+                        replayed=False,
+                    )
                     prepared_at = _next_runtime_publication_timestamp(loaded)
+                    if route_checkpoint is not None:
+                        await self._upsert_checkpoint(
+                            cur, session_id, route_checkpoint, prepared_at
+                        )
                     record = _model_completion_stage_preparation_record(
                         prepared,
                         source_session=loaded,
                         prepared_at=prepared_at,
+                    )
+                    selection_event = _model_failover_selection_event(
+                        prepared, session=loaded, prepared_at=prepared_at
                     )
                     stage = _reconstruct_model_completion_stage(
                         record,
@@ -33645,11 +33718,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         "WHERE id = %s",
                         (prepared_at, prepared_at, session_id),
                     )
+                    if selection_event is not None:
+                        await self._append_events_with_cursor(
+                            cur,
+                            session_id,
+                            (selection_event,),
+                            expected_run_epoch=prepared.expected_run_epoch,
+                        )
                 await conn.commit()
                 return ModelCompletionStageResult(
                     stage=stage,
                     replayed=False,
                     dispatch_authorized=True,
+                    prepared_events=() if selection_event is None else (selection_event,),
                 )
             except BaseException:
                 await conn.rollback()

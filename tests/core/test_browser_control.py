@@ -395,11 +395,18 @@ def test_checkpoint_version_reserves_control_authority() -> None:
         BROWSER_CONTROLS_CHECKPOINT_KEY: controls.model_dump(mode="json"),
     }
     assert decode_runtime_checkpoint(checkpoint, session_id="session") == checkpoint
-    for writer_version in range(1, CURRENT_CHECKPOINT_SCHEMA_VERSION):
+    # Browser authority was introduced in v9; later independent checkpoint
+    # additions must not make a v9 writer lose its existing capability.
+    for writer_version in range(1, 9):
         with pytest.raises(ValueError, match="Browser control"):
             runtime_checkpoint_writer_view(
                 checkpoint, writer_version=writer_version, session_id="session"
             )
+    for writer_version in range(9, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1):
+        projected = runtime_checkpoint_writer_view(
+            checkpoint, writer_version=writer_version, session_id="session"
+        )
+        assert projected[BROWSER_CONTROLS_CHECKPOINT_KEY] == controls.model_dump(mode="json")
     old = {**checkpoint, CHECKPOINT_SCHEMA_VERSION_KEY: 8, "application": "preserved"}
     migrated = decode_runtime_checkpoint(old, session_id="session")
     assert migrated == {

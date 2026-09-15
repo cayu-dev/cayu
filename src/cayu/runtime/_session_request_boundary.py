@@ -26,6 +26,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     public_authority_alias_is_reserved,
 )
+from cayu.sessions._model_failover import ModelFailoverPolicy
 from cayu.sessions.base import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
@@ -127,6 +128,7 @@ def prepare_run_request(
     """Return a request safe to use as the source of a durable session."""
 
     request = strip_runtime_session_create_claim_before_redaction(copy_run_request(request))
+    require_secret_free_model_failover_policy(request.failover, redactor=redactor)
     if (
         request.session_id is not None
         and public_authority_alias_is_reserved(request.session_id)
@@ -235,6 +237,7 @@ def prepare_resume_request(
     store_resolved_session_id: str | None = None,
 ) -> ResumeRequest:
     request = copy_resume_request(request)
+    require_secret_free_model_failover_policy(request.failover, redactor=redactor)
     require_secret_free_structured_output_spec(
         request.structured_output,
         redactor=redactor,
@@ -308,6 +311,24 @@ def prepare_resume_request(
         for original, redacted in zip(request.messages, redacted_messages, strict=True)
     )
     return prepared
+
+
+def require_secret_free_model_failover_policy(
+    policy: ModelFailoverPolicy | None,
+    *,
+    redactor: SecretRedactor,
+) -> None:
+    """Target identities are control data: reject secrets instead of retargeting them."""
+
+    if policy is None:
+        return
+    for target in policy.fallbacks:
+        for name, value in (("provider_name", target.provider_name), ("model", target.model)):
+            require_secret_free_session_authority(
+                value,
+                field_name=f"failover.fallbacks.{name}",
+                redactor=redactor,
+            )
 
 
 def _require_secret_free_targeted_tool_grants(

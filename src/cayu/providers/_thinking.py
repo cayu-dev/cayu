@@ -89,6 +89,32 @@ _GOOGLE_CHAT_MODELS = {
 }
 
 
+def copy_preflight_thinking(value: object) -> ThinkingConfig | None:
+    """Copy neutral controls without serializing an unchecked model instance."""
+
+    if value is None:
+        return None
+    if type(value) is ThinkingConfig:
+        value = {name: getattr(value, name) for name in ThinkingConfig.model_fields}
+    elif type(value) is not dict:
+        raise TypeError("Thinking preflight requires a ThinkingConfig or neutral object.")
+    try:
+        return ThinkingConfig.model_validate(value)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid thinking configuration for provider preflight.") from None
+
+
+def preflight_thinking_effort(
+    thinking: ThinkingConfig | None,
+    *,
+    protocol: Literal["openai", "anthropic", "chat_completions", "bedrock"],
+    model: str,
+) -> None:
+    copied = copy_preflight_thinking(thinking)
+    if copied is not None:
+        validate_thinking_effort({"thinking": copied.model_dump()}, protocol=protocol, model=model)
+
+
 def validate_thinking_effort(
     options: Mapping[str, Any],
     *,

@@ -654,6 +654,8 @@ def test_cayu_app_terminalizes_nonportable_model_stream_values_without_retry_or_
     assert EventType.MODEL_ATTEMPT_DISCARDED not in [event.type for event in events]
     assert events[2].payload == {
         "error": "Model provider emitted a non-portable stream value.",
+        "provider_name": "fake",
+        "requested_model": "fake-model",
         "error_type": "ModelProviderError",
         "stage": "model_stream_validation",
         "durable_value_error_code": "nul_character",
@@ -744,6 +746,8 @@ def test_cayu_app_terminalizes_nonportable_raised_provider_error_without_retry_o
     assert len(provider.requests) == 1
     assert events[2].payload == {
         "error": "Model provider emitted a non-portable error value.",
+        "provider_name": "fake",
+        "requested_model": "fake-model",
         "error_type": "ModelProviderError",
         "stage": "model_stream_validation",
         "durable_value_error_code": "nul_character",

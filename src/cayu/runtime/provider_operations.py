@@ -2256,6 +2256,52 @@ async def clear_pending_provider_operation_disposition(
     await session_store.transform_checkpoint(pending.session_id, clear_marker)
 
 
+def validate_provider_operation_retry_preparation(
+    *,
+    session_id: str,
+    checkpoint: dict[str, Any] | None,
+    source: ModelCompletionStage,
+    resolution_record: object,
+    target_dispatch_ordinal: int,
+    execution_profile_fingerprint: str,
+    target_run_epoch: int,
+) -> None:
+    """Authenticate a store-read disposition inside stage preparation's transaction."""
+
+    pending = pending_provider_operation_disposition_from_checkpoint(checkpoint)
+    record = _parse_provider_operation_resolution_record(
+        resolution_record, session_id=session_id, stage_id=source.stage_id
+    )
+    if (
+        pending is None
+        or not pending.execution_claimed
+        or pending.action is not ProviderOperationResolutionAction.FALLBACK_RETRY
+        or record.action is not ProviderOperationResolutionAction.FALLBACK_RETRY
+        or pending.session_id != session_id
+        or pending.stage_id != source.stage_id
+        or pending.resolution_id != record.resolution_id
+        or pending.request_digest != record.request_digest
+        or pending.resolved_run_epoch != record.resolved_run_epoch
+        or record.source_run_epoch != source.source_run_epoch
+        or record.source_run_epoch > record.resolved_run_epoch
+        or record.resolved_run_epoch >= target_run_epoch
+        or pending.logical_step_id != source.logical_step_id
+        or record.logical_step_id != source.logical_step_id
+        or pending.source_dispatch_ordinal != source.dispatch_ordinal
+        or record.dispatch_ordinal != source.dispatch_ordinal
+        or pending.target_dispatch_ordinal != target_dispatch_ordinal
+        or record.preparation_digest != source.preparation_digest
+        or record.model_attempt_id != source.intent.get("model_attempt_id")
+        or record.execution_profile_fingerprint != execution_profile_fingerprint
+        or pending.execution_profile_fingerprint != execution_profile_fingerprint
+        or fallback_dispatch_ordinal_from_checkpoint(checkpoint, source.logical_step_id)
+        != target_dispatch_ordinal
+    ):
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation retry lost its exact accepted disposition."
+        )
+
+
 async def resolve_provider_operation_stage(
     session_store: SessionStore,
     request: ProviderOperationResolutionRequest,
@@ -2476,6 +2522,14 @@ async def resolve_provider_operation_stage(
                 "Another provider-operation disposition is still pending."
             )
         if request.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            from cayu.runtime._model_failover_stage import (
+                model_failover_retry_available_for_stored_stage,
+            )
+
+            if not model_failover_retry_available_for_stored_stage(session=_session, stage=stage):
+                raise ProviderOperationResolutionConflict(
+                    "The routed model step has exhausted its total attempt budget."
+                )
             raw_ordinals = updated.get(_PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY, {})
             if type(raw_ordinals) is not dict:
                 raise ProviderOperationEvidenceError(
@@ -2559,6 +2613,7 @@ async def inspect_provider_operation(
     active_stage = await session_store.load_active_model_completion_stage(session_id)
     resolution_stage_id: str | None = None
     resolution_run_epoch: int | None = None
+    retry_available = True
     if active_stage is not None:
         active_attempt_id = active_stage.stage.intent.get("model_attempt_id")
         if (
@@ -2572,6 +2627,19 @@ async def inspect_provider_operation(
                 )
             resolution_stage_id = active_stage.stage.stage_id
             resolution_run_epoch = session.run_epoch
+            from cayu.runtime._model_failover_stage import (
+                model_failover_retry_available_for_stored_stage,
+            )
+
+            retry_available = model_failover_retry_available_for_stored_stage(
+                session=session,
+                stage=active_stage.stage,
+            )
+    allowed_resolutions = (
+        (ProviderOperationResolutionAction.FALLBACK_RETRY, ProviderOperationResolutionAction.FAIL)
+        if retry_available
+        else (ProviderOperationResolutionAction.FAIL,)
+    )
     attempt_records = await session_store.query_events(
         EventQuery(
             session_id=session_id,
@@ -2772,10 +2840,7 @@ async def inspect_provider_operation(
             provider=provider,
             recovery_reason=recovery_reason,
             duplicate_request_risk=True,
-            allowed_resolutions=(
-                ProviderOperationResolutionAction.FALLBACK_RETRY,
-                ProviderOperationResolutionAction.FAIL,
-            ),
+            allowed_resolutions=allowed_resolutions,
             stage_id=resolution_stage_id,
             run_epoch=resolution_run_epoch,
         )
@@ -2947,10 +3012,7 @@ async def inspect_provider_operation(
             stream_protocol=state.stream_protocol,
             recovery_reason=recovery_reason,
             duplicate_request_risk=provider_operation_duplicate_request_risk(recovery_reason),
-            allowed_resolutions=(
-                ProviderOperationResolutionAction.FALLBACK_RETRY,
-                ProviderOperationResolutionAction.FAIL,
-            ),
+            allowed_resolutions=allowed_resolutions,
             stage_id=resolution_stage_id,
             run_epoch=resolution_run_epoch,
             cancellation_status=cancellation_status,
@@ -3003,10 +3065,7 @@ async def inspect_provider_operation(
             stream_protocol=state.stream_protocol,
             recovery_reason=recovery_reason,
             duplicate_request_risk=provider_operation_duplicate_request_risk(recovery_reason),
-            allowed_resolutions=(
-                ProviderOperationResolutionAction.FALLBACK_RETRY,
-                ProviderOperationResolutionAction.FAIL,
-            ),
+            allowed_resolutions=allowed_resolutions,
             stage_id=resolution_stage_id,
             run_epoch=resolution_run_epoch,
             cancellation_status=cancellation_status,
@@ -3046,10 +3105,7 @@ async def inspect_provider_operation(
             stream_protocol=state.stream_protocol,
             recovery_reason=recovery_reason,
             duplicate_request_risk=provider_operation_duplicate_request_risk(recovery_reason),
-            allowed_resolutions=(
-                ProviderOperationResolutionAction.FALLBACK_RETRY,
-                ProviderOperationResolutionAction.FAIL,
-            ),
+            allowed_resolutions=allowed_resolutions,
             stage_id=resolution_stage_id,
             run_epoch=resolution_run_epoch,
             cancellation_status=cancellation_status,

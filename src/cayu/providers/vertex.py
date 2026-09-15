@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from cayu._validation import require_clean_nonblank
+from cayu.context.thinking import ThinkingConfig
 from cayu.messages import Message
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
@@ -33,7 +34,7 @@ from cayu.providers._reasoning_state import (
     ANTHROPIC_REASONING_PROTOCOL,
     ReasoningStateProvenance,
 )
-from cayu.providers._thinking import validate_thinking_effort
+from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.anthropic import (
     _anthropic_overflow_message,
     _anthropic_tool,
@@ -308,6 +309,9 @@ class VertexProvider(ModelProvider):
     @property
     def stream_deadlines(self) -> ProviderStreamDeadlines:
         return self._stream_deadlines
+
+    def preflight_thinking(self, *, model: str, thinking: ThinkingConfig | None) -> None:
+        preflight_thinking_effort(thinking, protocol="anthropic", model=model)
 
     def preflight_portable_messages(
         self,

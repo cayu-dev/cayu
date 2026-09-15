@@ -8,14 +8,15 @@ from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
 from threading import Lock
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
-from cayu._validation import canonical_durable_json_bytes
+from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
 from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
 from cayu.providers.deadlines import _provider_deadline_material
+from cayu.providers.operations import ProviderOperationMode
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -27,15 +28,28 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileComponentIdentity,
     ExecutionProfileIdentity,
+    ExecutionProfileIdentityAvailability,
+    ExecutionProfileIdentityStrength,
+    ModelFailoverCandidateProfile,
+    ModelFailoverProfileBinding,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_matches_session_epoch,
     build_execution_profile_identity,
     changed_execution_profile_components,
     execution_profile_provider_adapter_component,
+    execution_profile_provider_target_component,
     execution_profile_with_component,
+    execution_profile_with_model_failover,
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._model_failover import (
+    ModelFailoverCandidate,
+    ModelFailoverPlan,
+    ModelFailoverPolicy,
+    ModelTarget,
+    copy_model_failover_policy,
+)
 from cayu.sessions.base import Session
 from cayu.tools.discovery import (
     ToolDiscoveryProjectionKind,
@@ -116,6 +130,7 @@ class ExecutionProfileContinuationPlan:
     snapshot: ActiveInvocationExecutionProfile
     candidate_profile: ExecutionProfileIdentity
     changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    model_failover: ModelFailoverProfileResolution | None = None
 
 
 def model_finalization_material(
@@ -688,6 +703,31 @@ def resolve_execution_profile_identity(
     )
 
 
+def require_matching_recovery_failover_policy(
+    *,
+    profile: ExecutionProfileIdentity,
+    requested_policy: ModelFailoverPolicy | None,
+) -> None:
+    """An explicit continuation request must agree with its recorded plan."""
+
+    if requested_policy is None:
+        return
+    requested_policy = copy_model_failover_policy(requested_policy)
+    binding = profile.model_failover
+    if (
+        binding is None
+        or requested_policy.max_total_attempts != binding.plan.max_total_attempts
+        or requested_policy.fallbacks
+        != tuple(
+            ModelTarget(provider_name=target.provider_name, model=target.model)
+            for target in binding.plan.candidates[1:]
+        )
+    ):
+        raise RuntimeError(
+            "A failover policy cannot change while model or tool recovery is pending."
+        )
+
+
 def prepare_execution_profile_continuation(
     *,
     session: Session,
@@ -696,6 +736,7 @@ def prepare_execution_profile_continuation(
     registered_provider: runtime_records.RegisteredProvider,
     runtime_version: str | None,
     redactor: SecretRedactor,
+    request_failover: ModelFailoverPolicy | None = None,
     runtime_build_provenance: RuntimeBuildProvenance | None = None,
     process_identity: str = "standalone-profile-builder",
     registered_environment: runtime_records.RegisteredEnvironment | None = None,
@@ -716,6 +757,11 @@ def prepare_execution_profile_continuation(
     finalization: Mapping[str, Any] | None = None,
     invocation_semantics_available: bool = False,
     tool_capability_ceiling: tuple[str, ...] | None = None,
+    resolve_provider: Callable[[str], runtime_records.RegisteredProvider] | None = None,
+    resolve_candidate_provider_options: Callable[
+        [runtime_records.RegisteredProvider, str], tuple[Mapping[str, Any] | None, bool]
+    ]
+    | None = None,
 ) -> ExecutionProfileContinuationPlan:
     """Reconstruct a pending invocation and fail closed on invalid authority."""
 
@@ -732,6 +778,9 @@ def prepare_execution_profile_continuation(
         raise RuntimeError(
             "Pending recovery state has no durable active invocation execution profile."
         )
+    require_matching_recovery_failover_policy(
+        profile=snapshot.profile, requested_policy=request_failover
+    )
     if snapshot.profile.schema_version < 4:
         raise ValueError("Recovery requires a profile with recorded invocation semantics.")
     if not active_invocation_execution_profile_matches_session_epoch(
@@ -775,11 +824,21 @@ def prepare_execution_profile_continuation(
         raise RuntimeError(
             "Pending recovery state does not reference the active invocation execution profile."
         )
-    if frozen_candidate_profile is None:
+
+    def candidate_profile(
+        provider: runtime_records.RegisteredProvider,
+        model: str,
+        expected: ExecutionProfileIdentity,
+    ) -> ExecutionProfileIdentity:
+        options, options_process_local = (
+            (provider_options, provider_options_process_local)
+            if resolve_candidate_provider_options is None
+            else resolve_candidate_provider_options(provider, model)
+        )
         candidate = resolve_execution_profile_identity(
             registered_agent=registered_agent,
-            provider_name=registered_provider.name,
-            model=session.model,
+            provider_name=provider.name,
+            model=model,
             durable_system_prompt=None,
             runtime_name="cayu",
             runtime_version=runtime_version,
@@ -795,9 +854,9 @@ def prepare_execution_profile_continuation(
             ),
             invocation_loop_policy_identities=invocation_loop_policy_identities,
             invocation_loop_policy_instance_identities=(invocation_loop_policy_instance_identities),
-            registered_provider=registered_provider,
-            provider_options=provider_options,
-            provider_options_process_local=provider_options_process_local,
+            registered_provider=provider,
+            provider_options=options,
+            provider_options_process_local=options_process_local,
             thinking=thinking,
             app_budget_limit_ids=app_budget_limit_ids,
             request_budget_limit_ids=request_budget_limit_ids,
@@ -807,25 +866,16 @@ def prepare_execution_profile_continuation(
             finalization={} if finalization is None else finalization,
             tool_capability_ceiling=tool_capability_ceiling,
         )
-    elif type(frozen_candidate_profile) is not ExecutionProfileIdentity:
-        raise TypeError("frozen_candidate_profile must be an ExecutionProfileIdentity or None.")
-    else:
-        candidate = frozen_candidate_profile
-    if (
-        frozen_candidate_profile is None
-        and invocation_loop_policies is None
-        and snapshot.profile.schema_version >= 2
-    ):
+        if invocation_loop_policies is None and expected.schema_version >= 2:
+            candidate = execution_profile_with_component(
+                candidate,
+                expected.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
+            )
         candidate = execution_profile_with_component(
             candidate,
-            snapshot.profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
+            expected.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
         )
-    if frozen_candidate_profile is None:
-        candidate = execution_profile_with_component(
-            candidate,
-            snapshot.profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
-        )
-        if snapshot.profile.schema_version >= 4 and not invocation_semantics_available:
+        if expected.schema_version >= 4 and not invocation_semantics_available:
             for component_class in (
                 ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
                 ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
@@ -834,8 +884,46 @@ def prepare_execution_profile_continuation(
             ):
                 candidate = execution_profile_with_component(
                     candidate,
-                    snapshot.profile.component(component_class),
+                    expected.component(component_class),
                 )
+        return candidate
+
+    model_failover = None
+    if frozen_candidate_profile is not None:
+        if type(frozen_candidate_profile) is not ExecutionProfileIdentity:
+            raise TypeError("frozen_candidate_profile must be an ExecutionProfileIdentity or None.")
+        candidate = frozen_candidate_profile
+    elif snapshot.profile.model_failover is not None:
+        binding = snapshot.profile.model_failover
+        if resolve_provider is None or resolve_candidate_provider_options is None:
+            raise ValueError(
+                "Failover continuation requires every candidate configuration resolver."
+            )
+        expected_profiles = {
+            (target.provider_name, target.model): stored.as_profile()
+            for target, stored in zip(
+                binding.plan.candidates, binding.candidate_profiles, strict=True
+            )
+        }
+        model_failover = resolve_model_failover_execution_profile(
+            policy=ModelFailoverPolicy(
+                fallbacks=tuple(
+                    ModelTarget(provider_name=target.provider_name, model=target.model)
+                    for target in binding.plan.candidates[1:]
+                ),
+                max_total_attempts=binding.plan.max_total_attempts,
+            ),
+            primary=ModelTarget(provider_name=registered_provider.name, model=session.model),
+            registered_primary=registered_provider,
+            resolve_provider=resolve_provider,
+            resolve_candidate_profile=lambda provider, model: candidate_profile(
+                provider, model, expected_profiles[(provider.name, model)]
+            ),
+            redactor=redactor,
+        )
+        candidate = model_failover.profile
+    else:
+        candidate = candidate_profile(registered_provider, session.model, snapshot.profile)
     return ExecutionProfileContinuationPlan(
         snapshot=snapshot,
         candidate_profile=candidate,
@@ -843,6 +931,7 @@ def prepare_execution_profile_continuation(
             snapshot.profile,
             candidate,
         ),
+        model_failover=model_failover,
     )
 
 
@@ -1714,6 +1803,238 @@ def _provider_adapter_material(
         registered_provider.provider.stream_deadlines
     )
     return entry, process_local, registered_provider.execution_profile_identity is not None
+
+
+def _failover_execution_mode(
+    registered: runtime_records.RegisteredProvider,
+) -> Literal["synchronous", "background"]:
+    mode = registered.provider.provider_operation_mode
+    if type(mode) is not ProviderOperationMode or mode not in {
+        ProviderOperationMode.SYNCHRONOUS,
+        ProviderOperationMode.BACKGROUND,
+    }:
+        raise ValueError("Failover requires a supported typed execution mode.")
+    return "synchronous" if mode is ProviderOperationMode.SYNCHRONOUS else "background"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ModelFailoverProfileResolution:
+    """Frozen candidate configuration, not authority to dispatch any candidate.
+
+    Registered collaborators are deliberately retained by identity like those
+    in InvocationContext. Value profiles are detached. The stage owner still
+    requires the admitted root context and exact durable predecessor.
+    """
+
+    plan: ModelFailoverPlan
+    candidate_profiles: tuple[ExecutionProfileIdentity, ...]
+    registered_providers: tuple[runtime_records.RegisteredProvider, ...]
+
+    def __post_init__(self) -> None:
+        plan = ModelFailoverPlan.model_validate(self.plan)
+        profiles = _copy_failover_candidate_profiles(self.candidate_profiles)
+        if type(self.registered_providers) is not tuple or len(self.registered_providers) != len(
+            plan.candidates
+        ):
+            raise ValueError("Failover requires one registered collaborator per candidate.")
+        for target, registered in zip(plan.candidates, self.registered_providers, strict=True):
+            if type(registered) is not runtime_records.RegisteredProvider:
+                raise TypeError("Failover requires exact registered provider snapshots.")
+            if registered.name != target.provider_name:
+                raise ValueError("Failover provider registration conflicts with its target.")
+            if _failover_execution_mode(registered) != target.execution_mode:
+                raise ValueError("Failover provider execution mode changed after admission.")
+        bind_model_failover_execution_profile(plan=plan, candidate_profiles=profiles)
+        object.__setattr__(self, "plan", plan)
+        object.__setattr__(self, "candidate_profiles", profiles)
+
+    @property
+    def profile(self) -> ExecutionProfileIdentity:
+        return bind_model_failover_execution_profile(
+            plan=self.plan, candidate_profiles=self.candidate_profiles
+        )
+
+    def __repr__(self) -> str:
+        return "ModelFailoverProfileResolution(<resolved>)"
+
+
+def resolve_model_failover_execution_profile(
+    *,
+    policy: ModelFailoverPolicy,
+    primary: ModelTarget,
+    registered_primary: runtime_records.RegisteredProvider,
+    resolve_provider: Callable[[str], runtime_records.RegisteredProvider],
+    resolve_candidate_profile: Callable[
+        [runtime_records.RegisteredProvider, str], ExecutionProfileIdentity
+    ],
+    redactor: SecretRedactor,
+) -> ModelFailoverProfileResolution:
+    """Resolve the ordered configuration through the ordinary profile builder.
+
+    Resolve all registrations before invoking adapter/profile callbacks, so a
+    callback cannot replace a later candidate's registered collaborator. This
+    does not replace full request preflight or the final per-attempt dispatch
+    fence, and does not probe providers or change the configured root target.
+    """
+
+    policy = copy_model_failover_policy(policy)
+    targets = policy.resolve_targets(primary)
+    for target in targets:
+        for value in (target.provider_name, target.model):
+            if redactor.redact_text(value) != value:
+                raise ValueError("Failover target identity contains a workload secret.")
+    providers = (
+        registered_primary,
+        *(resolve_provider(item.provider_name) for item in targets[1:]),
+    )
+    for target, registered in zip(targets, providers, strict=True):
+        if type(registered) is not runtime_records.RegisteredProvider:
+            raise TypeError("Failover requires exact registered provider snapshots.")
+        if registered.name != target.provider_name:
+            raise ValueError("Failover provider registration conflicts with its target.")
+    modes = tuple(_failover_execution_mode(registered) for registered in providers)
+    if len(set(modes)) != 1:
+        raise ValueError("Failover candidates must preserve the primary execution mode.")
+    profiles = _copy_failover_candidate_profiles(
+        tuple(
+            resolve_candidate_profile(registered, target.model)
+            for target, registered in zip(targets, providers, strict=True)
+        )
+    )
+    plan = ModelFailoverPlan(
+        candidates=tuple(
+            ModelFailoverCandidate(
+                provider_name=target.provider_name,
+                model=target.model,
+                execution_profile_fingerprint=profile.fingerprint,
+                execution_mode=mode,
+            )
+            for target, profile, mode in zip(targets, profiles, modes, strict=True)
+        ),
+        max_total_attempts=policy.max_total_attempts,
+    )
+    return ModelFailoverProfileResolution(
+        plan=plan, candidate_profiles=profiles, registered_providers=providers
+    )
+
+
+def reconstruct_model_failover_execution_profile(
+    *,
+    expected_profile: ExecutionProfileIdentity,
+    resolve_provider: Callable[[str], runtime_records.RegisteredProvider],
+    resolve_candidate_profile: Callable[
+        [runtime_records.RegisteredProvider, str], ExecutionProfileIdentity
+    ],
+    redactor: SecretRedactor,
+) -> ModelFailoverProfileResolution:
+    """Rebuild live candidates from the admitted plan, never current default routing.
+
+    The caller owns the stored profile's provenance and continuation admission.
+    This function checks configuration equality only, and grants no dispatch.
+    Candidate callbacks use the ordinary continuation profile owner, including
+    its recorded prompt/finalization material and live registration comparisons.
+    """
+
+    if type(expected_profile) is not ExecutionProfileIdentity:
+        raise TypeError("Failover reconstruction requires an exact execution profile.")
+    expected = cast(
+        "ExecutionProfileIdentity",
+        revalidate_model_input(expected_profile, ExecutionProfileIdentity),
+    )
+    binding = expected.model_failover
+    if binding is None:
+        raise ValueError("Execution profile has no admitted failover plan.")
+    targets = tuple(
+        ModelTarget(provider_name=item.provider_name, model=item.model)
+        for item in binding.plan.candidates
+    )
+    for target in targets:
+        if any(
+            redactor.redact_text(value) != value for value in (target.provider_name, target.model)
+        ):
+            raise ValueError("Failover target identity contains a workload secret.")
+    resolution = resolve_model_failover_execution_profile(
+        policy=ModelFailoverPolicy(
+            fallbacks=targets[1:], max_total_attempts=binding.plan.max_total_attempts
+        ),
+        primary=targets[0],
+        registered_primary=resolve_provider(targets[0].provider_name),
+        resolve_provider=resolve_provider,
+        resolve_candidate_profile=resolve_candidate_profile,
+        redactor=redactor,
+    )
+    if resolution.profile != expected:
+        raise ValueError(
+            "Reconstructed failover configuration conflicts with the admitted profile."
+        )
+    return resolution
+
+
+def _copy_failover_candidate_profiles(
+    profiles: tuple[ExecutionProfileIdentity, ...],
+) -> tuple[ExecutionProfileIdentity, ...]:
+    if type(profiles) is not tuple or not 2 <= len(profiles) <= 8:
+        raise ValueError("Failover requires two to eight resolved profiles.")
+    if any(type(profile) is not ExecutionProfileIdentity for profile in profiles):
+        raise TypeError("Failover requires resolved execution profiles.")
+    return tuple(
+        cast("ExecutionProfileIdentity", revalidate_model_input(profile, ExecutionProfileIdentity))
+        for profile in profiles
+    )
+
+
+def bind_model_failover_execution_profile(
+    *,
+    plan: ModelFailoverPlan,
+    candidate_profiles: tuple[ExecutionProfileIdentity, ...],
+) -> ExecutionProfileIdentity:
+    """Bind an ordered resolved plan without changing root tool/environment authority.
+
+    Candidate profiles are resolved by the ordinary admission owner *without*
+    failover applied. Binding after resolution avoids circular fingerprints and
+    preserves every candidate's adapter/options/capability identity, including
+    process-local strength. This is preparation, not a live profile replacement.
+    """
+
+    plan = ModelFailoverPlan.model_validate(plan)
+    candidate_profiles = _copy_failover_candidate_profiles(candidate_profiles)
+    if len(candidate_profiles) != len(plan.candidates):
+        raise ValueError("Failover requires one resolved profile per candidate.")
+    strengths = set()
+    validated_profiles = []
+    for candidate, profile in zip(plan.candidates, candidate_profiles, strict=True):
+        validated_profiles.append(profile)
+        if profile.fingerprint != candidate.execution_profile_fingerprint or profile.component(
+            ExecutionProfileComponentClass.PROVIDER_TARGET
+        ) != execution_profile_provider_target_component(candidate.provider_name, candidate.model):
+            raise ValueError("Failover candidate conflicts with its resolved execution profile.")
+        for component in profile.components:
+            if component.availability is not ExecutionProfileIdentityAvailability.AVAILABLE:
+                raise ValueError("Failover cannot freeze an unavailable execution profile.")
+            strengths.add(component.strength)
+    primary = validated_profiles[0]
+    component_class = ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+    strength = (
+        ExecutionProfileIdentityStrength.PROCESS_LOCAL
+        if ExecutionProfileIdentityStrength.PROCESS_LOCAL in strengths
+        else (
+            ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+            if ExecutionProfileIdentityStrength.APPLICATION_VERSIONED in strengths
+            else ExecutionProfileIdentityStrength.STRUCTURAL
+        )
+    )
+    return execution_profile_with_model_failover(
+        primary,
+        ModelFailoverProfileBinding(
+            plan=plan,
+            candidate_profiles=tuple(
+                ModelFailoverCandidateProfile.model_validate(profile.model_dump(mode="json"))
+                for profile in validated_profiles
+            ),
+            primary_request_policy=primary.component(component_class),
+            strength=strength,
+        ),
+    )
 
 
 def resolve_provider_adapter_component(

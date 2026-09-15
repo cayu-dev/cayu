@@ -19,8 +19,9 @@ from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from functools import partial
 from hashlib import sha256
-from typing import Any, Literal, Never, cast
+from typing import Any, Literal, Never, Protocol, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -143,6 +144,7 @@ from cayu.context.footprints import (
     analyze_request_context_pressure,
     analyze_request_footprint,
     copy_request_footprint_config,
+    targeted_tool_grant_footprint,
     tool_discovery_view_footprint,
 )
 from cayu.context.structured_output import (
@@ -164,6 +166,7 @@ from cayu.events import (
     Event,
     EventType,
     copy_event,
+    event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
@@ -195,6 +198,7 @@ from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers._stream_cleanup import (
     _LocalHttpCleanupObserver,
 )
+from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -288,6 +292,18 @@ from cayu.runtime._model_errors import (
     resolve_request_billing_identity,
     runtime_owned_model_stream_error_event,
 )
+from cayu.runtime._model_execution_selection import (
+    ModelExecutionSelection,
+    ModelFailoverAttempt,
+    ModelFailoverTransition,
+)
+from cayu.runtime._model_failover import (
+    FailoverDisposition,
+    FailoverObservation,
+    decide_model_failover,
+)
+from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
+from cayu.runtime._model_target import project_portable_transcript
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
@@ -388,6 +404,11 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._model_failover import (
+    MODEL_FAILOVER_CHECKPOINT_KEY,
+    ModelFailoverProgress,
+    copy_model_failover_state,
+)
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     CheckpointTransform,
@@ -452,7 +473,9 @@ from cayu.tools.grants import TargetedToolGrantRecord
 from cayu.tools.targeted_projection import (
     TargetedToolProjectionKind,
     openai_targeted_tool_projection,
+    persisted_targeted_tool_projection_marker_message,
     resolve_targeted_tool_projection,
+    targeted_tool_projection_marker_id,
 )
 from cayu.vaults.redaction import SecretRedactor
 
@@ -900,6 +923,64 @@ class ModelAttemptFailed(Exception):
         super().__init__(self.message)
 
 
+class _ModelFailoverCandidateExhausted(Exception):
+    """Private handoff after local retry exhaustion, never a public failure.
+
+    The route owner must confirm settlement and classify this live failure before
+    preparing a successor. Carry original exceptions; do not recreate authority
+    from event text or scan an arbitrary cause chain for an old provider error.
+    """
+
+    def __init__(
+        self,
+        *,
+        selection: ModelExecutionSelection,
+        identity: ModelAttemptIdentity,
+        failure: ModelAttemptFailed,
+        decision: RetryDecision,
+        provider_effect_observed: bool,
+        provider_operation_mode: ProviderOperationMode,
+    ) -> None:
+        self.selection = selection
+        self.identity = copy_model_attempt_identity(identity)
+        self.failure = failure
+        self.decision = RetryDecision.model_validate(
+            {name: getattr(decision, name) for name in RetryDecision.model_fields}
+        )
+        self.provider_effect_observed = provider_effect_observed
+        self.provider_operation_mode = provider_operation_mode
+        super().__init__("Selected model candidate exhausted its same-provider retries.")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ModelFailoverFinalEvidence:
+    event: Event
+
+
+class _ModelFailoverContextOverflow(Exception):
+    """Carry the exact prepared attempt across the context-rebuild boundary."""
+
+    def __init__(
+        self,
+        *,
+        selection: ModelExecutionSelection,
+        failure: ModelAttemptFailed,
+        dispatch: ModelCompletionDispatch,
+        provider_effect_observed: bool,
+    ) -> None:
+        if not isinstance(failure.cause, ModelContextOverflowError):
+            raise TypeError("Context recovery requires a typed context-overflow failure.")
+        selection.require_prepared_stage(dispatch.stage)
+        self.selection = selection
+        self.failure = failure
+        self.dispatch = dispatch
+        self.provider_effect_observed = provider_effect_observed
+        self.progress = ModelFailoverProgress.model_validate(
+            dispatch.stage.intent[MODEL_FAILOVER_CHECKPOINT_KEY]["successor"]
+        )
+        super().__init__("Selected model attempt requires context recovery.")
+
+
 def _provider_failure_proves_no_model_effect(failure: BaseException) -> bool:
     """Return whether typed provider evidence proves dispatch was rejected pre-effect."""
 
@@ -1290,6 +1371,7 @@ class ModelCompletionDispatch:
     request_fingerprint: str
     context_exposure: ContextExposure | None = None
     child_session_notifications_consumed: bool = True
+    prepared_events: tuple[Event, ...] = ()
 
     def __post_init__(self) -> None:
         stage = _copy_model_completion_stage(self.stage)
@@ -1314,6 +1396,15 @@ class ModelCompletionDispatch:
                 raise ValueError("Completion-stage intent does not match its context exposure.")
             validate_context_exposure_stage_scope(exposure, stage.intent)
         notifications_consumed = self.child_session_notifications_consumed
+        prepared_events = tuple(copy_event(event) for event in self.prepared_events)
+        if len(prepared_events) > 1 or any(
+            event.type is not EventType.MODEL_FAILOVER_SELECTED
+            or event.session_id != stage.session_id
+            or event.payload.get("stage_id") != stage.stage_id
+            for event in prepared_events
+        ):
+            raise ValueError("Model dispatch contains conflicting preparation events.")
+        object.__setattr__(self, "prepared_events", prepared_events)
         if type(notifications_consumed) is not bool:
             raise TypeError("child_session_notifications_consumed must be a boolean.")
         if (
@@ -1351,6 +1442,19 @@ class ModelCompletionDispatch:
         return copy_durable_json_object(self.stage.intent, "model_completion_intent")
 
 
+class ModelCompletionDispatchPreparer(Protocol):
+    def __call__(
+        self,
+        request: ModelRequest,
+        reference: MemoryEvidenceReference | None,
+        notifications: ChildSessionNotificationStageBinding | None,
+        consume_notifications: bool,
+        /,
+        *,
+        failover_attempt: ModelFailoverAttempt | None = None,
+    ) -> Awaitable[ModelCompletionDispatch]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ModelCompletionPublicationRequest:
     """Immutable, detached terminal material handed to the session owner."""
@@ -1374,6 +1478,7 @@ class ModelCompletionPublicationRequest:
             child_session_notifications_consumed=(
                 self.dispatch.child_session_notifications_consumed
             ),
+            prepared_events=self.dispatch.prepared_events,
         )
         if not dispatch.child_session_notifications_consumed:
             raise ValueError(
@@ -2604,12 +2709,17 @@ class ModelStepFlowOutcome:
 
     assistant_step_result: AssistantStepResult | None = None
     stop_session: bool = False
+    portable_history_cursor: int | None = None
 
     def __post_init__(self) -> None:
         if self.stop_session == (self.assistant_step_result is not None):
             raise ValueError(
                 "A model-step flow outcome must contain either a result or a stop signal."
             )
+        if self.portable_history_cursor is not None and (
+            type(self.portable_history_cursor) is not int or self.portable_history_cursor < 0
+        ):
+            raise ValueError("Portable model history requires a permanent transcript cursor.")
 
 
 _CONTEXT_TERMINATION_PERSIST_TIMEOUT_S = 5.0
@@ -2788,6 +2898,11 @@ class _ProviderOperationCancellationHeartbeat:
     task: asyncio.Task[None] | None = None
 
 
+def _provider_operation_target_model(session: Session, stage: ModelCompletionStage) -> str:
+    target = model_failover_target_for_stored_stage(session=session, stage=stage)
+    return session.model if target is None else target.model
+
+
 class ModelStepExecutor:
     """Build and execute provider requests for one logical model step."""
 
@@ -2963,7 +3078,7 @@ class ModelStepExecutor:
     ) -> ProviderOperationCancellationClaim | None:
         payload: dict[str, Any] = {
             "provider": registered_provider.name,
-            "model": session.model,
+            "model": _provider_operation_target_model(session, stage),
             "step": step,
             "attempt": attempt,
             "max_attempts": max_attempts,
@@ -3297,7 +3412,7 @@ class ModelStepExecutor:
             RecoverableProviderOperation(
                 interaction_id=interaction_id,
                 provider=registered_provider.name,
-                model=session.model,
+                model=_provider_operation_target_model(session, stage),
                 model_attempt_identity=model_attempt_identity,
                 state=state,
                 status=ProviderOperationStatus.IN_PROGRESS,
@@ -3596,13 +3711,27 @@ class ModelStepExecutor:
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
         invocation_context: InvocationContext | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ProviderOperationSnapshot | None:
         """Cancel one durably identified operation after its worker disappears."""
 
+        selected_model = _provider_operation_target_model(session, stage)
+        if model_execution_selection is not None:
+            model_execution_selection.require_recovery_scope(
+                session=session,
+                stage=stage,
+                invocation_context=invocation_context,
+                registered_provider=registered_provider,
+            )
+        elif model_failover_target_for_stored_stage(session=session, stage=stage) is not None:
+            raise RuntimeError("Routed provider-operation recovery requires admitted selection.")
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or registered_agent is not invocation_context.registered_agent
-            or registered_provider is not invocation_context.registered_provider
+            or (
+                model_execution_selection is None
+                and registered_provider is not invocation_context.registered_provider
+            )
             or environment_name
             != (
                 None
@@ -3625,7 +3754,7 @@ class ModelStepExecutor:
             )
         if operation.provider != registered_provider.name:
             raise RuntimeError("Provider-operation cancellation resolved a different provider.")
-        if operation.model != session.model:
+        if operation.model != selected_model:
             raise RuntimeError("Provider-operation cancellation resolved a different model.")
         if operation.model_attempt_identity.model_step_id != stage.logical_step_id:
             raise RuntimeError(
@@ -3813,13 +3942,27 @@ class ModelStepExecutor:
         environment_name: str | None,
         model_completion_publisher: ModelCompletionPublisher,
         invocation_context: InvocationContext | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ProviderOperationRecoveryResult:
         """Recover start-only evidence without persisting or replaying a raw request."""
 
+        selected_model = _provider_operation_target_model(session, stage)
+        if model_execution_selection is not None:
+            model_execution_selection.require_recovery_scope(
+                session=session,
+                stage=stage,
+                invocation_context=invocation_context,
+                registered_provider=registered_provider,
+            )
+        elif model_failover_target_for_stored_stage(session=session, stage=stage) is not None:
+            raise RuntimeError("Routed provider-operation recovery requires admitted selection.")
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or registered_agent is not invocation_context.registered_agent
-            or registered_provider is not invocation_context.registered_provider
+            or (
+                model_execution_selection is None
+                and registered_provider is not invocation_context.registered_provider
+            )
             or environment_name
             != (
                 None
@@ -3842,7 +3985,7 @@ class ModelStepExecutor:
             raise ProviderOperationEvidenceError(
                 "Provider-operation start recovery is unavailable."
             )
-        if start.provider != registered_provider.name or start.model != session.model:
+        if start.provider != registered_provider.name or start.model != selected_model:
             raise ProviderOperationEvidenceError(
                 "Provider-operation start recovery resolved a different provider scope."
             )
@@ -3854,7 +3997,7 @@ class ModelStepExecutor:
         ) -> ProviderOperationRecoveryResult:
             payload: dict[str, Any] = {
                 "provider": registered_provider.name,
-                "model": session.model,
+                "model": selected_model,
                 "step": start.step,
                 "attempt": start.attempt,
                 "max_attempts": start.max_attempts,
@@ -3957,7 +4100,7 @@ class ModelStepExecutor:
                 environment_name=environment_name,
                 payload={
                     "provider": registered_provider.name,
-                    "model": session.model,
+                    "model": selected_model,
                     "step": start.step,
                     "attempt": start.attempt,
                     "max_attempts": start.max_attempts,
@@ -4073,6 +4216,7 @@ class ModelStepExecutor:
             recovery_context=recovery_context,
             model_completion_publisher=model_completion_publisher,
             invocation_context=invocation_context,
+            model_execution_selection=model_execution_selection,
         )
         return ProviderOperationRecoveryResult(
             status=recovered.status,
@@ -4093,13 +4237,27 @@ class ModelStepExecutor:
         recovery_context: ModelCompletionRecoveryContext | None,
         model_completion_publisher: ModelCompletionPublisher,
         invocation_context: InvocationContext | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ProviderOperationRecoveryResult:
         """Retrieve and atomically publish one exact offline provider operation."""
 
+        selected_model = _provider_operation_target_model(session, stage)
+        if model_execution_selection is not None:
+            model_execution_selection.require_recovery_scope(
+                session=session,
+                stage=stage,
+                invocation_context=invocation_context,
+                registered_provider=registered_provider,
+            )
+        elif model_failover_target_for_stored_stage(session=session, stage=stage) is not None:
+            raise RuntimeError("Routed provider-operation recovery requires admitted selection.")
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or registered_agent is not invocation_context.registered_agent
-            or registered_provider is not invocation_context.registered_provider
+            or (
+                model_execution_selection is None
+                and registered_provider is not invocation_context.registered_provider
+            )
             or environment_name
             != (
                 None
@@ -4125,7 +4283,7 @@ class ModelStepExecutor:
             )
         if operation.provider != registered_provider.name:
             raise RuntimeError("Provider-operation recovery resolved a different provider.")
-        if operation.model != session.model:
+        if operation.model != selected_model:
             raise RuntimeError("Provider-operation recovery resolved a different model.")
         if operation.model_attempt_identity.model_step_id != stage.logical_step_id:
             raise RuntimeError("Provider-operation recovery belongs to a different model stage.")
@@ -4309,7 +4467,7 @@ class ModelStepExecutor:
         ) -> Event:
             payload: dict[str, Any] = {
                 "provider": registered_provider.name,
-                "model": session.model,
+                "model": selected_model,
                 "step": operation.step,
                 "attempt": operation.attempt,
                 "max_attempts": operation.max_attempts,
@@ -4441,6 +4599,8 @@ class ModelStepExecutor:
                                     "error_type": type(authoritative_deadline).__name__,
                                     **authoritative_deadline.error_payload_fields(),
                                 },
+                                execution_provider_name=registered_provider.name,
+                                requested_model=operation.model,
                                 step=operation.step,
                                 attempt=operation.attempt,
                                 max_attempts=operation.max_attempts,
@@ -4521,7 +4681,7 @@ class ModelStepExecutor:
                 candidate = _validate_stream_event(
                     raw_event,
                     provider_name=registered_provider.name,
-                    requested_model=session.model,
+                    requested_model=selected_model,
                     usage_dialect=registered_provider.usage_dialect,
                 ).event
                 if candidate == completed_event:
@@ -4530,7 +4690,7 @@ class ModelStepExecutor:
             boundary = _validate_stream_event(
                 raw_event,
                 provider_name=registered_provider.name,
-                requested_model=session.model,
+                requested_model=selected_model,
                 usage_dialect=registered_provider.usage_dialect,
             )
             assistant_boundary = _validate_assistant_stream_event(
@@ -4582,6 +4742,7 @@ class ModelStepExecutor:
                     runtime_event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
+                        requested_model=operation.model,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
                         provider_name=registered_provider.name,
@@ -4646,7 +4807,7 @@ class ModelStepExecutor:
                 hosted_part = _hosted_tool_call_part(
                     stream_event,
                     provider_name=registered_provider.name,
-                    model=session.model,
+                    model=selected_model,
                     model_attempt_identity=operation.model_attempt_identity,
                 )
                 if hosted_part is not None:
@@ -5106,6 +5267,7 @@ class ModelStepExecutor:
         completion_event = _model_stream_event_to_runtime_event(
             completed_event,
             session=session,
+            requested_model=operation.model,
             registered_agent=registered_agent,
             environment_name=environment_name,
             provider_name=registered_provider.name,
@@ -5367,6 +5529,7 @@ class ModelStepExecutor:
             ModelCompletionRecoveryContextFactory | None
         ) = None,
         model_completion_publisher: ModelCompletionPublisher | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ModelStepRun:
         return ModelStepRun(
             self,
@@ -5404,6 +5567,7 @@ class ModelStepExecutor:
                 )
             ),
             model_completion_publisher=model_completion_publisher,
+            model_execution_selection=model_execution_selection,
         )
 
     async def build_request(
@@ -5422,7 +5586,21 @@ class ModelStepExecutor:
         targeted_tool_native: TargetedToolProjectionRequest | None = None,
         tool_discovery_projection_kind: ToolDiscoveryProjectionKind | None = None,
         tool_discovery_native_tool_names: Iterable[str] | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> ModelRequest:
+        effective_model = session.model
+        if model_execution_selection is not None:
+            if type(model_execution_selection) is not ModelExecutionSelection:
+                raise TypeError("Model request selection must be runtime-owned.")
+            model_execution_selection.require_request_scope(
+                invocation_context=model_execution_selection.invocation_context,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=model_execution_selection.registered_provider,
+                execution_profile=model_execution_selection.invocation_context.profile,
+                model=model_execution_selection.model,
+            )
+            effective_model = model_execution_selection.model
         resolved_tool_exposure = (
             _all_registered_tool_exposure(registered_agent)
             if tool_exposure is None
@@ -5590,7 +5768,7 @@ class ModelStepExecutor:
                 targeted_tool_gateway=targeted_tool_gateway,
                 redactor=self._secret_redactor,
             )
-        if self._secret_redactor.redact_text(session.model) != session.model:
+        if self._secret_redactor.redact_text(effective_model) != effective_model:
             raise ValueError(
                 "Model identity contains a workload secret and cannot be sent to a provider."
             )
@@ -5665,7 +5843,7 @@ class ModelStepExecutor:
         if type(redacted_options) is not dict:
             raise AssertionError("Model request-option redaction returned a non-object.")
         return ModelRequest(
-            model=session.model,
+            model=effective_model,
             messages=redacted_messages,
             tools=redacted_tools,
             hosted_tools=registered_agent.hosted_tools,
@@ -5708,16 +5886,7 @@ class ModelStepExecutor:
         record_model_attempt_identity: Callable[[ModelAttemptIdentity], None],
         billing_identity: BillingIdentity | None = None,
         structured_output: StructuredOutputSpec | None = None,
-        prepare_model_completion_dispatch: Callable[
-            [
-                ModelRequest,
-                MemoryEvidenceReference | None,
-                ChildSessionNotificationStageBinding | None,
-                bool,
-            ],
-            Awaitable[ModelCompletionDispatch],
-        ]
-        | None = None,
+        prepare_model_completion_dispatch: ModelCompletionDispatchPreparer | None = None,
         model_completion_publisher: ModelCompletionPublisher | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
@@ -5728,8 +5897,81 @@ class ModelStepExecutor:
         native_tool_grant_ids: Mapping[str, str] | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
         child_session_notification_binding: ChildSessionNotificationStageBinding | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
+        prior_provider_effect_observed: bool = False,
+        context_overflow: _ModelFailoverContextOverflow | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
-        if invocation_context is not None and (
+        if type(prior_provider_effect_observed) is not bool:
+            raise TypeError("Prior model effect observation must be a boolean.")
+        provider_effect_observed = prior_provider_effect_observed
+        if context_overflow is not None:
+            if (
+                type(context_overflow) is not _ModelFailoverContextOverflow
+                or context_overflow.selection is not model_execution_selection
+                or context_overflow.progress.logical_step_id != model_step_identity.model_step_id
+            ):
+                raise ValueError("Context recovery changed its selected attempt authority.")
+            provider_effect_observed = (
+                provider_effect_observed or context_overflow.provider_effect_observed
+            )
+        selected_dispatch: ModelCompletionDispatch | None = None
+        if model_execution_selection is not None:
+            if type(model_execution_selection) is not ModelExecutionSelection:
+                raise TypeError("Model retry selection must be runtime-owned.")
+            model_execution_selection.require_request_scope(
+                invocation_context=invocation_context,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                execution_profile=execution_profile,
+                model=model_request.model,
+            )
+            if prepare_model_completion_dispatch is None or model_completion_publisher is None:
+                raise RuntimeError("Selected model execution requires durable completion stages.")
+            if provider is not registered_provider.provider:
+                raise ValueError("Model retry provider differs from its registered collaborator.")
+            prepare_selected_stage = prepare_model_completion_dispatch
+            selection = model_execution_selection
+
+            async def prepare_checked_selection(
+                request: ModelRequest,
+                reference: MemoryEvidenceReference | None,
+                notifications: ChildSessionNotificationStageBinding | None,
+                consume_notifications: bool,
+                *,
+                failover_attempt: ModelFailoverAttempt | None = None,
+            ) -> ModelCompletionDispatch:
+                nonlocal selected_dispatch
+                if failover_attempt is not None:
+                    raise ValueError("Selected attempt evidence is owned by the retry loop.")
+                expected_request_fingerprint = _model_request_fingerprint(
+                    provider_name=selection.registered_provider.name,
+                    model_request=request,
+                )
+                dispatch = await prepare_selected_stage(
+                    request,
+                    reference,
+                    notifications,
+                    consume_notifications,
+                    failover_attempt=ModelFailoverAttempt(
+                        selection=selection,
+                        identity=model_attempt_identity,
+                        prior_provider_effect_observed=provider_effect_observed,
+                    ),
+                )
+                selection.require_prepared_stage(dispatch.stage)
+                if dispatch.request_fingerprint != expected_request_fingerprint:
+                    raise ValueError("Selected model stage belongs to a different request.")
+                if any(
+                    dispatch.stage.intent.get(key) != value
+                    for key, value in model_attempt_identity.payload().items()
+                ):
+                    raise ValueError("Selected model stage belongs to a different live attempt.")
+                selected_dispatch = dispatch
+                return dispatch
+
+            prepare_model_completion_dispatch = prepare_checked_selection
+        elif invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
             or invocation_context.registered_provider is not registered_provider
@@ -5806,11 +6048,42 @@ class ModelStepExecutor:
             )
             discovery_view_footprint = tool_discovery_view_footprint(discovery_view)
         provider.preflight_model_target(model=model_request.model)
+        selected_operation_mode = ProviderOperationMode.SYNCHRONOUS
+        if model_execution_selection is not None:
+            selected_operation_mode = provider.provider_operation_mode
+            if type(selected_operation_mode) is not ProviderOperationMode:
+                raise TypeError("Model provider operation mode must be typed.")
         provider.preflight_hosted_tools(
             model=model_request.model,
             hosted_tools=model_request.hosted_tools,
             options=model_request.options,
         )
+        if model_execution_selection is not None:
+            preflight_model_thinking(
+                provider=provider,
+                model=model_request.model,
+                thinking=model_request.options.get("thinking"),
+                redactor=self._secret_redactor,
+            )
+            preflight_portable_model_material(
+                provider=provider,
+                model=model_request.model,
+                messages=model_request.messages,
+                tools=[
+                    *model_request.tools,
+                    *(
+                        ()
+                        if model_request.targeted_tool_projection is None
+                        else model_request.targeted_tool_projection.tools
+                    ),
+                    *(
+                        ()
+                        if model_request.tool_discovery_projection is None
+                        else model_request.tool_discovery_projection.loaded_tools
+                    ),
+                ],
+                redactor=self._secret_redactor,
+            )
         if model_request.targeted_tool_projection is not None:
             provider.preflight_targeted_tool_projection(
                 model=model_request.model,
@@ -5835,6 +6108,7 @@ class ModelStepExecutor:
         )
         file_attachment_attestations = _model_file_attachment_attestations(model_request)
         while True:
+            selected_dispatch = None
             model_attempt_identity = (
                 model_step_identity.new_attempt()
                 if next_model_attempt_identity is None
@@ -5927,124 +6201,125 @@ class ModelStepExecutor:
             if context_pressure_event is not None:
                 yield context_pressure_event, None
             deadline_admission: ProviderStreamDeadlineAdmission | None = None
-            pre_count_completion_dispatch: ModelCompletionDispatch | None = None
-            if (
-                memory_evidence_reference is not None
-                or child_session_notification_binding is not None
-            ) and self._context_counting.mode is not ContextCountingMode.OFF:
-                if prepare_model_completion_dispatch is None:
-                    raise RuntimeError(
-                        "Automatic recall requires durable model-completion staging before "
-                        "provider-backed context counting."
-                    )
-                # Provider-backed counters receive the complete request and may
-                # perform network I/O. Commit the same durable dispatch/evidence
-                # fence used by the model call before handing them recalled
-                # context, then reuse that exact dispatch below.
-                deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
-                await refresh_live_model_semantics()
-                try:
+            attempt_events = None
+            try:
+                pre_count_completion_dispatch: ModelCompletionDispatch | None = None
+                if (
+                    memory_evidence_reference is not None
+                    or child_session_notification_binding is not None
+                    or model_execution_selection is not None
+                ) and self._context_counting.mode is not ContextCountingMode.OFF:
+                    if prepare_model_completion_dispatch is None:
+                        raise RuntimeError(
+                            "Automatic recall requires durable model-completion staging before "
+                            "provider-backed context counting."
+                        )
+                    # Provider-backed counters receive the complete request and may
+                    # perform network I/O. Commit the same durable dispatch/evidence
+                    # fence used by the model call before handing them recalled
+                    # context, then reuse that exact dispatch below.
+                    deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
+                    await refresh_live_model_semantics()
                     pre_count_completion_dispatch = await prepare_model_completion_dispatch(
                         attempt_model_request,
                         memory_evidence_reference,
                         child_session_notification_binding,
                         False,
                     )
-                except BaseException:
-                    deadline_admission.close()
-                    raise
-            context_count_observation, context_count_event = await self._observe_context_count(
-                provider=provider,
-                model_request=attempt_model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                attempt=attempt,
-                max_attempts=retry_policy.max_attempts,
-                model_attempt_identity=model_attempt_identity,
-                execution_profile=execution_profile,
-                refresh_live_model_semantics=refresh_live_model_semantics,
-            )
-            if context_count_event is not None:
-                yield context_count_event, None
-            model_started = _event_with_model_identity_authority(
-                Event(
-                    type=EventType.MODEL_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    payload={
-                        "model": session.model,
-                        "provider": registered_provider.name,
-                        "step": step,
-                        "attempt": attempt,
-                        "max_attempts": retry_policy.max_attempts,
-                        **(
-                            {
-                                MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY: (
-                                    file_attachment_attestations
-                                )
-                            }
-                            if file_attachment_attestations
-                            else {}
-                        ),
-                        **model_attempt_identity.payload(),
-                    },
+                    for prepared_event in pre_count_completion_dispatch.prepared_events:
+                        yield prepared_event, None
+                context_count_observation, context_count_event = await self._observe_context_count(
+                    provider=provider,
+                    model_request=attempt_model_request,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
                     environment_name=environment_name,
-                ),
-                model_attempt_identity,
-            )
-            if file_attachment_attestations:
-                model_started = event_with_runtime_payload_authority(
-                    model_started,
-                    MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=retry_policy.max_attempts,
+                    model_attempt_identity=model_attempt_identity,
+                    execution_profile=execution_profile,
+                    refresh_live_model_semantics=refresh_live_model_semantics,
                 )
-            yield (
-                await self._event_writer.emit(
-                    event_with_execution_profile_authority(
+                if context_count_event is not None:
+                    yield context_count_event, None
+                model_started = _event_with_model_identity_authority(
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        payload={
+                            "model": model_request.model,
+                            "provider": registered_provider.name,
+                            "step": step,
+                            "attempt": attempt,
+                            "max_attempts": retry_policy.max_attempts,
+                            **(
+                                {
+                                    MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY: (
+                                        file_attachment_attestations
+                                    )
+                                }
+                                if file_attachment_attestations
+                                else {}
+                            ),
+                            **model_attempt_identity.payload(),
+                        },
+                        environment_name=environment_name,
+                    ),
+                    model_attempt_identity,
+                )
+                if file_attachment_attestations:
+                    model_started = event_with_runtime_payload_authority(
                         model_started,
-                        execution_profile,
+                        MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
                     )
-                ),
-                None,
-            )
-            if deadline_admission is None:
-                deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
-            assert deadline_admission is not None
-            attempt_events = self._run_once(
-                provider=provider,
-                deadline_admission=deadline_admission,
-                model_request=attempt_model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                attempt=attempt,
-                max_attempts=retry_policy.max_attempts,
-                retry_policy=retry_policy,
-                model_attempt_identity=model_attempt_identity,
-                transcript_cursor_before_request=transcript_cursor_before_request,
-                record_model_completion=record_model_completion,
-                before_provider_dispatch=before_provider_dispatch,
-                validate_live_model_semantics=validate_live_model_semantics,
-                refresh_live_model_semantics=refresh_live_model_semantics,
-                billing_identity=billing_identity,
-                structured_output=structured_output,
-                context_pressure_estimate=request_context_pressure,
-                prepare_model_completion_dispatch=prepare_model_completion_dispatch,
-                model_completion_publisher=model_completion_publisher,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-                tool_exposure=resolved_tool_exposure,
-                targeted_tool_gateway=targeted_tool_gateway,
-                native_tool_grant_ids=native_grant_ids,
-                memory_evidence_reference=memory_evidence_reference,
-                child_session_notification_binding=child_session_notification_binding,
-                prepared_model_completion_dispatch=pre_count_completion_dispatch,
-            )
-            try:
+                yield (
+                    await self._event_writer.emit(
+                        event_with_execution_profile_authority(
+                            model_started,
+                            execution_profile,
+                        )
+                    ),
+                    None,
+                )
+                if deadline_admission is None:
+                    deadline_admission = ProviderStreamDeadlineAdmission(provider.stream_deadlines)
+                assert deadline_admission is not None
+                attempt_events = self._run_once(
+                    provider=provider,
+                    deadline_admission=deadline_admission,
+                    model_request=attempt_model_request,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    environment_name=environment_name,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=retry_policy.max_attempts,
+                    retry_policy=retry_policy,
+                    model_attempt_identity=model_attempt_identity,
+                    transcript_cursor_before_request=transcript_cursor_before_request,
+                    record_model_completion=record_model_completion,
+                    before_provider_dispatch=before_provider_dispatch,
+                    validate_live_model_semantics=validate_live_model_semantics,
+                    refresh_live_model_semantics=refresh_live_model_semantics,
+                    billing_identity=billing_identity,
+                    structured_output=structured_output,
+                    context_pressure_estimate=request_context_pressure,
+                    prepare_model_completion_dispatch=prepare_model_completion_dispatch,
+                    model_completion_publisher=model_completion_publisher,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    model_execution_selection=model_execution_selection,
+                    tool_exposure=resolved_tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
+                    native_tool_grant_ids=native_grant_ids,
+                    memory_evidence_reference=memory_evidence_reference,
+                    child_session_notification_binding=child_session_notification_binding,
+                    prepared_model_completion_dispatch=pre_count_completion_dispatch,
+                )
                 result: AssistantStepResult | None = None
                 async for event, step_result in attempt_events:
                     if event is not None:
@@ -6060,6 +6335,7 @@ class ModelStepExecutor:
                                             event,
                                             observation=context_pressure_observation,
                                             session=session,
+                                            model=model_request.model,
                                             registered_agent=registered_agent,
                                             registered_provider=registered_provider,
                                             environment_name=environment_name,
@@ -6084,6 +6360,7 @@ class ModelStepExecutor:
                                             event,
                                             observation=context_count_observation,
                                             session=session,
+                                            model=model_request.model,
                                             registered_agent=registered_agent,
                                             registered_provider=registered_provider,
                                             environment_name=environment_name,
@@ -6104,6 +6381,16 @@ class ModelStepExecutor:
                 yield None, result
                 return
             except ModelAttemptFailed as exc:
+                provider_effect_observed = provider_effect_observed or exc.provider_effect_observed
+                if isinstance(exc.cause, ModelContextOverflowError):
+                    if model_execution_selection is None or selected_dispatch is None:
+                        _raise_terminal_model_attempt_failure(exc)
+                    raise _ModelFailoverContextOverflow(
+                        selection=model_execution_selection,
+                        failure=exc,
+                        dispatch=selected_dispatch,
+                        provider_effect_observed=provider_effect_observed,
+                    ) from exc
                 (
                     status_code,
                     retryable,
@@ -6138,6 +6425,8 @@ class ModelStepExecutor:
                             environment_name=environment_name,
                             payload=_retry_attempt_payload(
                                 exc.payload,
+                                execution_provider_name=registered_provider.name,
+                                requested_model=model_request.model,
                                 step=step,
                                 attempt=attempt,
                                 max_attempts=retry_policy.max_attempts,
@@ -6163,13 +6452,31 @@ class ModelStepExecutor:
                         emitted_error,
                         None,
                     )
-                if not decision.retry:
+                total_attempts_exhausted = False
+                if selected_dispatch is not None:
+                    selected_progress = ModelFailoverProgress.model_validate(
+                        selected_dispatch.stage.intent[MODEL_FAILOVER_CHECKPOINT_KEY]["successor"]
+                    )
+                    total_attempts_exhausted = (
+                        selected_progress.attempts_used == selected_progress.plan.max_total_attempts
+                    )
+                if not decision.retry or total_attempts_exhausted:
+                    if model_execution_selection is not None:
+                        raise _ModelFailoverCandidateExhausted(
+                            selection=model_execution_selection,
+                            identity=model_attempt_identity,
+                            failure=exc,
+                            decision=decision,
+                            provider_effect_observed=provider_effect_observed,
+                            provider_operation_mode=selected_operation_mode,
+                        ) from exc
                     _raise_terminal_model_attempt_failure(exc)
                 yield (
                     await self._event_writer.emit(
                         event_with_execution_profile_authority(
                             _model_retry_event(
                                 session=session,
+                                model=model_request.model,
                                 registered_agent=registered_agent,
                                 environment_name=environment_name,
                                 registered_provider=registered_provider,
@@ -6189,6 +6496,7 @@ class ModelStepExecutor:
                         event_with_execution_profile_authority(
                             _model_attempt_discarded_event(
                                 session=session,
+                                model=model_request.model,
                                 registered_agent=registered_agent,
                                 environment_name=environment_name,
                                 registered_provider=registered_provider,
@@ -6206,9 +6514,11 @@ class ModelStepExecutor:
                 attempt += 1
             finally:
                 try:
-                    await _close_async_iterator(attempt_events)
+                    if attempt_events is not None:
+                        await _close_async_iterator(attempt_events)
                 finally:
-                    deadline_admission.close()
+                    if deadline_admission is not None:
+                        deadline_admission.close()
 
     async def _observe_request_footprint(
         self,
@@ -6480,19 +6790,11 @@ class ModelStepExecutor:
         billing_identity: BillingIdentity | None,
         structured_output: StructuredOutputSpec | None,
         context_pressure_estimate: ContextPressureEstimate | None,
-        prepare_model_completion_dispatch: Callable[
-            [
-                ModelRequest,
-                MemoryEvidenceReference | None,
-                ChildSessionNotificationStageBinding | None,
-                bool,
-            ],
-            Awaitable[ModelCompletionDispatch],
-        ]
-        | None,
+        prepare_model_completion_dispatch: ModelCompletionDispatchPreparer | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None,
+        model_execution_selection: ModelExecutionSelection | None,
         tool_exposure: ResolvedToolExposure | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
         native_tool_grant_ids: Mapping[str, str],
@@ -6583,6 +6885,8 @@ class ModelStepExecutor:
                 child_session_notification_binding,
                 True,
             )
+            for prepared_event in completion_dispatch.prepared_events:
+                yield prepared_event, None
         # Durable dispatch admission and interruption-decision election share
         # one store-owned fence. If dispatch won that fence, interruption may
         # move the session to INTERRUPTING without yet electing a terminal
@@ -6761,6 +7065,7 @@ class ModelStepExecutor:
                 ),
                 model_completion_publisher=model_completion_publisher,
                 invocation_context=invocation_context,
+                model_execution_selection=model_execution_selection,
             )
             if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
                 raise ProviderOperationEvidenceError(
@@ -6857,7 +7162,7 @@ class ModelStepExecutor:
                         environment_name=environment_name,
                         payload={
                             "provider": registered_provider.name,
-                            "model": session.model,
+                            "model": model_request.model,
                             "step": step,
                             "attempt": attempt,
                             "max_attempts": max_attempts,
@@ -6920,7 +7225,7 @@ class ModelStepExecutor:
                             environment_name=environment_name,
                             payload={
                                 "provider": registered_provider.name,
-                                "model": session.model,
+                                "model": model_request.model,
                                 "step": step,
                                 "attempt": attempt,
                                 "max_attempts": max_attempts,
@@ -7294,7 +7599,7 @@ class ModelStepExecutor:
                 boundary_value = _validate_stream_event(
                     raw_stream_event,
                     provider_name=registered_provider.name,
-                    requested_model=session.model,
+                    requested_model=model_request.model,
                     usage_dialect=registered_provider.usage_dialect,
                 )
                 generated_tool_call_id = None
@@ -7384,6 +7689,7 @@ class ModelStepExecutor:
                     progress_runtime_event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
+                        requested_model=model_request.model,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
                         provider_name=registered_provider.name,
@@ -7424,7 +7730,7 @@ class ModelStepExecutor:
                         hosted_part = _hosted_tool_call_part(
                             stream_event,
                             provider_name=registered_provider.name,
-                            model=session.model,
+                            model=model_request.model,
                             model_attempt_identity=model_attempt_identity,
                         )
                         if hosted_part is not None:
@@ -7455,6 +7761,7 @@ class ModelStepExecutor:
                         progress_runtime_event = _model_stream_event_to_runtime_event(
                             stream_event,
                             session=session,
+                            requested_model=model_request.model,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
                             provider_name=registered_provider.name,
@@ -7503,6 +7810,7 @@ class ModelStepExecutor:
                             _model_stream_event_to_runtime_event(
                                 stream_event,
                                 session=session,
+                                requested_model=model_request.model,
                                 registered_agent=registered_agent,
                                 environment_name=environment_name,
                                 provider_name=registered_provider.name,
@@ -7708,6 +8016,7 @@ class ModelStepExecutor:
                     completion_event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
+                        requested_model=model_request.model,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
                         provider_name=registered_provider.name,
@@ -7876,6 +8185,7 @@ class ModelStepExecutor:
                         progress_runtime_event = _model_stream_event_to_runtime_event(
                             stream_event,
                             session=session,
+                            requested_model=model_request.model,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
                             provider_name=registered_provider.name,
@@ -7916,6 +8226,7 @@ class ModelStepExecutor:
                     event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
+                        requested_model=model_request.model,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
                         provider_name=registered_provider.name,
@@ -8356,6 +8667,8 @@ class ModelStepExecutor:
                                     environment_name=environment_name,
                                     payload=_retry_attempt_payload(
                                         error_payload,
+                                        execution_provider_name=registered_provider.name,
+                                        requested_model=model_request.model,
                                         step=step,
                                         attempt=attempt,
                                         max_attempts=max_attempts,
@@ -8626,6 +8939,8 @@ class ModelStepExecutor:
                         _model_context_overflow_error_event(
                             provider_control_failure,
                             session=session,
+                            provider_name=registered_provider.name,
+                            requested_model=model_request.model,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
                             step=step,
@@ -8639,6 +8954,16 @@ class ModelStepExecutor:
                 None,
             )
         if provider_control_failure is not None:
+            if isinstance(provider_control_failure, ModelContextOverflowError):
+                raise ModelAttemptFailed(
+                    message=str(provider_control_failure),
+                    payload=provider_control_failure.error_payload_fields(),
+                    emitted_error_event=True,
+                    cause=provider_control_failure,
+                    completion_observed=model_completed,
+                    provider_effect_observed=provider_effect_observed,
+                    automatic_retry_disabled=background_dispatch_invoked,
+                ) from None
             raise provider_control_failure from None
         if durable_stream_failure is not None:
             if background_dispatch_invoked and not durable_stream_failure.automatic_retry_disabled:
@@ -8688,6 +9013,17 @@ class ModelStepExecutor:
         await self._session_control.raise_if_interrupted(session_id)
 
 
+@dataclass(frozen=True)
+class _TargetedToolModelProjection:
+    """Request-local rendering and evidence from one authenticated grant read."""
+
+    gateway: TargetedToolGatewayProjection | None = None
+    native: TargetedToolProjectionRequest | None = None
+    native_grant_ids: dict[str, str] = field(default_factory=dict)
+    native_marker: Message | None = None
+    footprint: TargetedToolGrantFootprint | None = None
+
+
 class ModelStepRun:
     """Per-run model-step dependencies and accounting state."""
 
@@ -8722,6 +9058,7 @@ class ModelStepRun:
         interaction_id: str | None,
         model_completion_recovery_context_factory: ModelCompletionRecoveryContextFactory,
         model_completion_publisher: ModelCompletionPublisher | None = None,
+        model_execution_selection: ModelExecutionSelection | None = None,
     ) -> None:
         self._executor = executor
         self._provider = provider
@@ -8752,6 +9089,18 @@ class ModelStepRun:
         ):
             raise ValueError("Model-step execution lost frozen invocation authority.")
         self._invocation_context = invocation_context
+        if model_execution_selection is not None:
+            if type(model_execution_selection) is not ModelExecutionSelection:
+                raise TypeError("Model-step selection must be runtime-owned.")
+            model_execution_selection.require_request_scope(
+                invocation_context=invocation_context,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=model_execution_selection.registered_provider,
+                execution_profile=execution_profile,
+                model=model_execution_selection.model,
+            )
+        self._model_execution_selection = model_execution_selection
 
         def validate_live_execution_semantics() -> None:
             validate_live_model_semantics()
@@ -8854,19 +9203,25 @@ class ModelStepRun:
                 raise ValueError("Targeted tool grants require an active interaction identity.")
             interaction_id = require_durable_clean_nonblank(interaction_id, "interaction_id")
         self._interaction_id = interaction_id
+        self._refresh_request_configuration()
+
+    def _refresh_request_configuration(self) -> None:
+        """Recompute target-dependent projections without replacing root authority."""
+
         self._targeted_tool_projection_kind = resolve_targeted_tool_projection(
-            registered_agent.targeted_tool_mode,
-            provider=provider,
-            model=session.model,
+            self._registered_agent.targeted_tool_mode,
+            provider=self._request_provider,
+            model=self._request_model,
         )
         self._tool_discovery_projection_kind = resolve_tool_discovery_projection(
-            registered_agent.tool_discovery_mode,
-            provider=provider,
-            model=session.model,
+            self._registered_agent.tool_discovery_mode,
+            provider=self._request_provider,
+            model=self._request_model,
         )
         if (
-            targeted_tool_grants is not None
-            and targeted_tool_grants.projection is not self._targeted_tool_projection_kind
+            self._targeted_tool_grants is not None
+            and self._targeted_tool_grants.projection is not self._targeted_tool_projection_kind
+            and self._model_execution_selection is None
         ):
             raise ValueError(
                 "Targeted grant footprint conflicts with the resolved provider projection."
@@ -8882,10 +9237,37 @@ class ModelStepRun:
         self._deferred_contextual_price = any(
             has_deferred_contextual_price(
                 limit.pricing,
-                provider_name=(self._provider.billing_provider_name or self._session.provider_name),
-                model=self._session.model,
+                provider_name=(
+                    self._request_provider.billing_provider_name
+                    or self._request_registered_provider.name
+                ),
+                model=self._request_model,
             )
             for limit in contextual_limits
+        )
+
+    @property
+    def _request_registered_provider(self) -> runtime_records.RegisteredProvider:
+        return (
+            self._registered_provider
+            if self._model_execution_selection is None
+            else self._model_execution_selection.registered_provider
+        )
+
+    @property
+    def _request_provider(self) -> ModelProvider:
+        return (
+            self._provider
+            if self._model_execution_selection is None
+            else self._model_execution_selection.registered_provider.provider
+        )
+
+    @property
+    def _request_model(self) -> str:
+        return (
+            self._session.model
+            if self._model_execution_selection is None
+            else self._model_execution_selection.model
         )
 
     @property
@@ -8909,7 +9291,11 @@ class ModelStepRun:
             or current.binding.interaction_id == invocation_context.binding.interaction_id
         ):
             raise ValueError("Model-step queued handoff lost frozen invocation authority.")
+        selection = self._model_execution_selection
+        if selection is not None:
+            selection = replace(selection, invocation_context=invocation_context)
         self._invocation_context = invocation_context
+        self._model_execution_selection = selection
         self._interaction_id = invocation_context.binding.interaction_id
 
     def _resolve_tool_exposure(
@@ -8930,8 +9316,8 @@ class ModelStepRun:
         request = ToolExposurePolicyRequest(
             session_id=self._session.id,
             agent_name=self._registered_agent.spec.name,
-            provider_name=self._registered_provider.name,
-            model=self._session.model,
+            provider_name=self._request_registered_provider.name,
+            model=self._request_model,
             step=step,
             transcript_cursor=transcript_cursor,
             catalogue_revision=self._registered_agent.tool_catalogue.revision,
@@ -8996,24 +9382,24 @@ class ModelStepRun:
 
     async def _targeted_tool_projections(
         self,
-    ) -> tuple[
-        TargetedToolGatewayProjection | None,
-        TargetedToolProjectionRequest | None,
-        dict[str, str],
-    ]:
+    ) -> _TargetedToolModelProjection:
         records = await self._targeted_tool_projection_records()
         if not records:
-            return None, None, {}
+            return _TargetedToolModelProjection()
+        footprint = (
+            targeted_tool_grant_footprint(records, projection=self._targeted_tool_projection_kind)
+            if self._model_execution_selection is not None
+            else self._targeted_tool_grants
+        )
         observed_at = self._executor._clock()
         if self._targeted_tool_projection_kind is TargetedToolProjectionKind.CALL_TOOL:
-            return (
-                targeted_tool_gateway_projection(
+            return _TargetedToolModelProjection(
+                gateway=targeted_tool_gateway_projection(
                     records,
                     catalogue=self._registered_agent.tool_catalogue,
                     observed_at=observed_at,
                 ),
-                None,
-                {},
+                footprint=footprint,
             )
         if (
             self._targeted_tool_projection_kind
@@ -9023,7 +9409,14 @@ class ModelStepRun:
                 records,
                 catalogue=self._registered_agent.tool_catalogue,
             )
-            return None, projection, grant_ids_by_name
+            return _TargetedToolModelProjection(
+                native=projection,
+                native_grant_ids=grant_ids_by_name,
+                native_marker=persisted_targeted_tool_projection_marker_message(records)
+                if self._model_execution_selection is not None
+                else None,
+                footprint=footprint,
+            )
         raise RuntimeError("Targeted grants have no resolved provider projection.")
 
     async def _native_tool_discovery_grant_ids(
@@ -9195,7 +9588,195 @@ class ModelStepRun:
         source_transcript_cursor: int,
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
-    ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+    ) -> AsyncGenerator[tuple[Event | None, ModelStepFlowOutcome | None], None]:
+        task = asyncio.current_task()
+        cancellation_baseline = 0 if task is None else task.cancelling()
+        fallback: ModelFailoverTransition | None = None
+        portable_history_cursor: int | None = None
+        while True:
+            candidate_events = self._execute_candidate(
+                step=step,
+                messages=messages,
+                source_transcript_cursor=source_transcript_cursor,
+                model_step_identity=model_step_identity,
+                request_variant=request_variant,
+                fallback=fallback,
+            )
+            exhausted: _ModelFailoverCandidateExhausted | None = None
+            try:
+                async for event, outcome in candidate_events:
+                    if outcome is not None and portable_history_cursor is not None:
+                        outcome = replace(outcome, portable_history_cursor=portable_history_cursor)
+                    yield event, outcome
+            except _ModelFailoverCandidateExhausted as failure:
+                exhausted = failure
+            finally:
+                # This is our own candidate generator. Do not use the tolerant
+                # provider-disposal helper: failed cleanup forbids fallback.
+                try:
+                    await candidate_events.aclose()
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except BaseException as cleanup_failure:
+                    if exhausted is None:
+                        raise
+                    raise _combine_authoritative_model_failure(
+                        exhausted.failure.cause or exhausted.failure,
+                        cleanup_failure,
+                        message="Model candidate failure and cleanup both failed.",
+                    ) from None
+            if exhausted is None:
+                return
+
+            # Candidate iteration has finished its provider cleanup and budget
+            # settlement. A new cancellation or session interruption still wins
+            # before even preparing another target.
+            try:
+                await asyncio.sleep(0)
+                if task is not None and task.cancelling() > cancellation_baseline:
+                    raise credential_safe_provider_cancellation(
+                        "Model failover cancelled", preserve_empty_artifacts=False
+                    )
+                await self._executor._session_control.raise_if_interrupted(self._session.id)
+                current_execution_deadline().require_admission("model_dispatch")
+                try:
+                    disposition = await self._candidate_disposition(exhausted)
+                except Exception as transition_failure:
+                    raise _combine_authoritative_model_failure(
+                        exhausted.failure.cause or exhausted.failure,
+                        transition_failure,
+                        message="Model candidate failure and transition validation both failed.",
+                    ) from None
+            except (asyncio.CancelledError, GeneratorExit) as control:
+                raise control from (exhausted.failure.cause or exhausted.failure)
+            if isinstance(disposition, _ModelFailoverFinalEvidence):
+                yield disposition.event, None
+                _raise_terminal_model_attempt_failure(exhausted.failure)
+            fallback = disposition
+            if fallback is None:
+                _raise_terminal_model_attempt_failure(exhausted.failure)
+            selection = exhausted.selection
+            self._model_execution_selection = ModelExecutionSelection(
+                invocation_context=selection.invocation_context,
+                resolution=selection.resolution,
+                candidate_index=selection.candidate_index + 1,
+            )
+            self._refresh_request_configuration()
+            # No output was accepted anywhere in this logical step. All supplied
+            # history therefore precedes this switch. Keep semantic turns/files;
+            # never forward another provider's response IDs or signed thinking.
+            messages = list(project_portable_transcript(messages).messages)
+            portable_history_cursor = source_transcript_cursor
+
+    async def _candidate_disposition(
+        self, exhausted: _ModelFailoverCandidateExhausted
+    ) -> ModelFailoverTransition | _ModelFailoverFinalEvidence | None:
+        if exhausted.selection is not self._model_execution_selection:
+            raise ValueError("Candidate failure belongs to another model selection.")
+        checkpoint = await self._executor._session_store.load_checkpoint(self._session.id)
+        if checkpoint is None or MODEL_FAILOVER_CHECKPOINT_KEY not in checkpoint:
+            raise RuntimeError("Candidate failure lost its durable route preparation.")
+        progress = ModelFailoverProgress.model_validate(checkpoint[MODEL_FAILOVER_CHECKPOINT_KEY])
+        observation = FailoverObservation(
+            provider_name=exhausted.selection.registered_provider.name,
+            caller_cancelled=False,
+            completion_observed=exhausted.failure.completion_observed,
+            provider_effect_observed=exhausted.provider_effect_observed,
+            provider_operation_owned=(
+                exhausted.provider_operation_mode is not ProviderOperationMode.SYNCHRONOUS
+            ),
+            cleanup_settled=True,
+        )
+        failure = exhausted.failure.cause or exhausted.failure
+        decision = decide_model_failover(
+            failure=failure,
+            provider_name=exhausted.selection.registered_provider.name,
+            retry=exhausted.decision,
+            observation=observation,
+            candidate_index=exhausted.selection.candidate_index,
+            candidate_count=len(exhausted.selection.resolution.plan.candidates),
+            attempts_used=progress.attempts_used,
+            max_total_attempts=exhausted.selection.resolution.plan.max_total_attempts,
+        )
+        if decision.disposition is FailoverDisposition.SUPPRESSED:
+            return None
+        active = await self._executor._session_store.load_active_model_completion_stage(
+            self._session.id
+        )
+        if active is None or active.stage.stage_id != progress.stage_id:
+            raise RuntimeError("Candidate failure lost its active model preparation.")
+        stage = active.stage
+        exhausted.selection.require_prepared_stage(stage)
+        if (
+            stage.state != "in_flight"
+            or stage.intent[MODEL_FAILOVER_CHECKPOINT_KEY]["successor"] != progress.payload()
+            or any(
+                stage.intent.get(key) != value
+                for key, value in exhausted.identity.payload().items()
+            )
+        ):
+            raise ValueError("Candidate failure conflicts with its exact active attempt.")
+        if decision.disposition is FailoverDisposition.EXHAUSTED:
+            target = progress.plan.candidates[progress.candidate_index]
+            event = Event(
+                id="evt_failover_exhausted_" + stage.preparation_digest,
+                type=EventType.MODEL_FAILOVER_EXHAUSTED,
+                timestamp=self._executor._clock(),
+                session_id=self._session.id,
+                interaction_id=progress.interaction_id,
+                agent_name=self._session.agent_name,
+                environment_name=self._session.environment_name,
+                payload={
+                    "schema_version": 1,
+                    "route_id": progress.route_id,
+                    "route_generation": progress.generation,
+                    "stage_id": progress.stage_id,
+                    **exhausted.identity.payload(),
+                    "provider": target.provider_name,
+                    "model": target.model,
+                    "configured_provider": progress.plan.candidates[0].provider_name,
+                    "configured_model": progress.plan.candidates[0].model,
+                    "candidate_index": progress.candidate_index,
+                    "candidate_count": len(progress.plan.candidates),
+                    "attempts_used": progress.attempts_used,
+                    "max_total_attempts": progress.plan.max_total_attempts,
+                    "reason": (
+                        "attempt_limit"
+                        if progress.attempts_used == progress.plan.max_total_attempts
+                        else "candidate_chain"
+                    ),
+                },
+            )
+            event = event_with_runtime_generated_id(
+                _event_with_model_identity_authority(event, exhausted.identity)
+            )
+            event = event_with_execution_profile_authority(
+                event, exhausted.selection.invocation_context.profile
+            )
+            event = event_with_runtime_envelope_authority(event, "session_id", "interaction_id")
+            persisted = await self._executor._event_writer.persist_exact_replay(event)
+            await self._executor._event_writer.fan_out_persisted([persisted])
+            return _ModelFailoverFinalEvidence(persisted)
+        if decision.disposition is not FailoverDisposition.SELECT_NEXT:
+            raise ValueError("Unknown model failover disposition.")
+        return ModelFailoverTransition(
+            source=progress,
+            source_preparation_digest=stage.preparation_digest,
+            failure=failure,
+            retry=exhausted.decision,
+            observation=observation,
+        )
+
+    async def _execute_candidate(
+        self,
+        *,
+        step: int,
+        messages: list[Message],
+        source_transcript_cursor: int,
+        model_step_identity: ModelStepIdentity,
+        request_variant: RequestVariant,
+        fallback: ModelFailoverTransition | None,
+    ) -> AsyncGenerator[tuple[Event | None, ModelStepFlowOutcome | None], None]:
         if self._registered_environment is not None:
             if self._invocation_context is None or self._execution_profile is None:
                 raise RuntimeError(
@@ -9218,11 +9799,25 @@ class ModelStepRun:
             step=step,
             transcript_cursor=source_transcript_cursor,
         )
-        (
-            targeted_tool_gateway,
-            targeted_tool_native,
-            targeted_tool_native_grant_ids,
-        ) = await self._targeted_tool_projections()
+        targeted_projection = await self._targeted_tool_projections()
+        targeted_tool_gateway = targeted_projection.gateway
+        targeted_tool_native = targeted_projection.native
+        targeted_tool_native_grant_ids = targeted_projection.native_grant_ids
+        targeted_tool_native_marker = targeted_projection.native_marker
+        # Switching removes every old native state part, including Cayu's
+        # own acquisition marker. Rebuild only that current marker from the
+        # exact durable grant batch, before context preparation/counting.
+        # Never preserve arbitrary provider state or infer grant authority
+        # from a caller-supplied marker. Duplicate markers still fail later.
+        if (
+            targeted_tool_native is not None
+            and targeted_tool_native_marker is not None
+            and not any(
+                targeted_tool_projection_marker_id(message) == targeted_tool_native.marker_id
+                for message in messages
+            )
+        ):
+            messages = [*messages, targeted_tool_native_marker]
         discovery_native_grant_ids = await self._native_tool_discovery_grant_ids(
             tool_exposure=tool_exposure,
         )
@@ -9331,6 +9926,7 @@ class ModelStepRun:
                     settled_attempt_ids=settled_compaction_attempt_ids,
                     source_transcript_cursor=source_transcript_cursor,
                     allow_borrowed_stage=False,
+                    fallback=fallback,
                     lifecycle=automatic_compaction_lifecycle,
                 )
 
@@ -9368,6 +9964,7 @@ class ModelStepRun:
                 agent_spec=_session_agent_spec(
                     registered_agent=self._registered_agent,
                     session=self._session,
+                    model_execution_selection=self._model_execution_selection,
                 ),
                 messages=messages,
                 step=step,
@@ -9379,7 +9976,7 @@ class ModelStepRun:
                 knowledge_access_scope=self._knowledge_access_scope,
                 request_metadata=self._request_metadata,
                 pressure_overhead=_context_pressure_overhead(
-                    registered_provider=self._registered_provider,
+                    registered_provider=self._request_registered_provider,
                     registered_agent=self._registered_agent,
                     registered_environment=self._registered_environment,
                     structured_output=self._structured_output,
@@ -9588,6 +10185,7 @@ class ModelStepRun:
             targeted_tool_native=targeted_tool_native,
             tool_discovery_projection_kind=self._tool_discovery_projection_kind,
             tool_discovery_native_tool_names=discovery_native_tool_names,
+            model_execution_selection=self._model_execution_selection,
         )
         if self._execution_profile is None:
             raise RuntimeError("Tool exposure evidence requires an execution profile.")
@@ -9595,8 +10193,8 @@ class ModelStepRun:
             tool_exposure,
             profile_changed=exposure_profile_changed,
             step=step,
-            provider_name=self._registered_provider.name,
-            model=self._session.model,
+            provider_name=self._request_registered_provider.name,
+            model=self._request_model,
             model_step_id=model_step_identity.model_step_id,
             execution_profile_fingerprint=self._execution_profile.fingerprint,
         )
@@ -9626,7 +10224,9 @@ class ModelStepRun:
             child_session_notification_binding=child_session_notification_binding,
             memory_evidence_key=evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
+            targeted_tool_grants=targeted_projection.footprint,
             native_tool_grant_ids=native_grant_ids,
+            fallback=fallback,
         )
         try:
             async for event, outcome in request_events:
@@ -9649,9 +10249,15 @@ class ModelStepRun:
         child_session_notification_binding: ChildSessionNotificationStageBinding | None = None,
         memory_evidence_key: MemoryEvidenceKey | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+        targeted_tool_grants: TargetedToolGrantFootprint | None = None,
         native_tool_grant_ids: Mapping[str, str] | None = None,
+        fallback: ModelFailoverTransition | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        if targeted_tool_grants is None and self._targeted_tool_grants is not None:
+            if self._model_execution_selection is not None:
+                raise RuntimeError("Selected request lost its targeted grant footprint.")
+            targeted_tool_grants = self._targeted_tool_grants
         native_grant_ids = {} if native_tool_grant_ids is None else dict(native_tool_grant_ids)
         if (
             memory_evidence_reference is not None or child_session_notification_binding is not None
@@ -9671,8 +10277,8 @@ class ModelStepRun:
                 tool_exposure,
                 profile_changed=False,
                 step=step,
-                provider_name=self._registered_provider.name,
-                model=self._session.model,
+                provider_name=self._request_registered_provider.name,
+                model=self._request_model,
                 model_step_id=model_step_identity.model_step_id,
                 execution_profile_fingerprint=self._execution_profile.fingerprint,
             )
@@ -9690,9 +10296,9 @@ class ModelStepRun:
         await self._refresh_live_model_semantics()
         try:
             billing_identity = await resolve_request_billing_identity(
-                self._provider,
+                self._request_provider,
                 _detach_model_request(model_request),
-                provider_name=self._registered_provider.name,
+                provider_name=self._request_registered_provider.name,
             )
         except asyncio.CancelledError:
             raise
@@ -9713,6 +10319,8 @@ class ModelStepRun:
                             environment_name=self._environment_name,
                             payload=_retry_attempt_payload(
                                 payload,
+                                execution_provider_name=self._request_registered_provider.name,
+                                requested_model=self._request_model,
                                 step=step,
                                 attempt=1,
                                 max_attempts=self._retry_policy.max_attempts,
@@ -9726,7 +10334,14 @@ class ModelStepRun:
             )
             raise
         self._validate_live_model_semantics()
-        if billing_identity is not None or self._has_deferred_contextual_price():
+        if (
+            self._model_execution_selection is not None
+            or billing_identity is not None
+            or self._has_deferred_contextual_price()
+        ):
+            # The shared invocation gate retains root authority, not the
+            # selected target. Routed requests need its pricing preflight even
+            # without reservations or a contextual billing identity.
             should_stop: bool | None = None
             gate_events = self._billing_identity_budget_gate(
                 messages=messages,
@@ -9750,7 +10365,8 @@ class ModelStepRun:
         reservation_setup = await controller.reserve_for_model_step(
             session=self._session,
             agent_name=self._registered_agent.spec.name,
-            provider_name=self._registered_provider.name,
+            provider_name=self._request_registered_provider.name,
+            model=self._request_model,
             environment_name=self._environment_name,
             model_attempt_identity=initial_model_attempt_identity,
             budget_policy=self._budget_policy,
@@ -9863,7 +10479,8 @@ class ModelStepRun:
             retry_setup = await controller.reserve_for_model_step(
                 session=self._session,
                 agent_name=self._registered_agent.spec.name,
-                provider_name=self._registered_provider.name,
+                provider_name=self._request_registered_provider.name,
+                model=self._request_model,
                 environment_name=self._environment_name,
                 model_attempt_identity=model_attempt_identity,
                 budget_policy=self._budget_policy,
@@ -9911,10 +10528,12 @@ class ModelStepRun:
             evidence_reference: MemoryEvidenceReference | None,
             child_notification_binding: ChildSessionNotificationStageBinding | None,
             consume_child_session_notifications: bool,
+            *,
+            failover_attempt: ModelFailoverAttempt | None = None,
         ) -> ModelCompletionDispatch:
             nonlocal next_dispatch_ordinal
             request_fingerprint = _model_request_fingerprint(
-                provider_name=self._registered_provider.name,
+                provider_name=self._request_registered_provider.name,
                 model_request=attempt_model_request,
             )
             dispatch_ordinal = next_dispatch_ordinal
@@ -9928,6 +10547,54 @@ class ModelStepRun:
                     raise RuntimeError(
                         "Model completion stage attempt belongs to a different model step."
                     )
+                if (failover_attempt is None) != (self._model_execution_selection is None):
+                    raise ValueError("Selected model preparation lost its explicit attempt.")
+                route_admission = None
+                if failover_attempt is not None:
+                    if (
+                        failover_attempt.selection is not self._model_execution_selection
+                        or failover_attempt.identity != pending_model_attempt_identity
+                    ):
+                        raise ValueError(
+                            "Failover preparation changed its pending attempt authority."
+                        )
+                    checkpoint = await self._executor._session_store.load_checkpoint(
+                        self._session.id
+                    )
+                    previous = (
+                        None
+                        if checkpoint is None or MODEL_FAILOVER_CHECKPOINT_KEY not in checkpoint
+                        else copy_model_failover_state(checkpoint[MODEL_FAILOVER_CHECKPOINT_KEY])
+                    )
+                    source = (
+                        None
+                        if not isinstance(previous, ModelFailoverProgress)
+                        else await self._executor._session_store.load_model_completion_stage(
+                            self._session.id, previous.stage_id
+                        )
+                    )
+                    source_digest = None if source is None else source.preparation_digest
+                    if isinstance(previous, ModelFailoverProgress) and source is None:
+                        abandonment = await self._executor._session_store.load_model_completion_stage_abandonment(
+                            self._session.id, previous.stage_id
+                        )
+                        if abandonment is not None:
+                            source_digest = abandonment.preparation_digest
+                    route_admission = failover_attempt.stage_admission(
+                        previous=previous,
+                        source_preparation_digest=source_digest,
+                        source_transcript_cursor=source_transcript_cursor,
+                        request_fingerprint=request_fingerprint,
+                        fallback=(
+                            fallback
+                            if previous is not None
+                            and previous.candidate_index
+                            != failover_attempt.selection.candidate_index
+                            else None
+                        ),
+                    )
+                    dispatch_ordinal = route_admission.successor.dispatch_ordinal
+                    stage_id = route_admission.successor.stage_id
                 recovery_context = self._model_completion_recovery_context_factory(
                     billing_identity,
                     pending_reservations,
@@ -9976,7 +10643,7 @@ class ModelStepRun:
                     )
                 provider_operation_start: dict[str, Any] | None = None
                 self._validate_live_model_semantics()
-                provider_operation_mode = self._provider.provider_operation_mode
+                provider_operation_mode = self._request_provider.provider_operation_mode
                 if type(provider_operation_mode) is not ProviderOperationMode:
                     raise TypeError(
                         "ModelProvider.provider_operation_mode must return a ProviderOperationMode."
@@ -9994,7 +10661,7 @@ class ModelStepRun:
                         raise RuntimeError(
                             "Background hosted Tool Search requires durable recovery authority."
                         )
-                    operation_adapter = self._provider.provider_operations
+                    operation_adapter = self._request_provider.provider_operations
                     if not isinstance(operation_adapter, ProviderOperationAdapter):
                         raise RuntimeError(
                             "Background provider-operation mode requires a "
@@ -10033,7 +10700,7 @@ class ModelStepRun:
                             interaction_id=exposure_interaction_id,
                             model_request=attempt_model_request,
                             request_fingerprint_sha256=request_fingerprint,
-                            provider_name=self._registered_provider.name,
+                            provider_name=self._request_registered_provider.name,
                             model_attempt_identity=pending_model_attempt_identity,
                             execution_profile=self._execution_profile,
                             tool_exposure=tool_exposure,
@@ -10042,7 +10709,7 @@ class ModelStepRun:
                         )
                     intent = _model_completion_stage_intent(
                         model_attempt_identity=pending_model_attempt_identity,
-                        provider_name=self._registered_provider.name,
+                        provider_name=self._request_registered_provider.name,
                         requested_model=attempt_model_request.model,
                         source_transcript_cursor=source_transcript_cursor,
                         request_fingerprint=request_fingerprint,
@@ -10059,7 +10726,15 @@ class ModelStepRun:
                         ),
                         child_session_notifications=child_notification_binding,
                     )
-                    prepared = await self._executor._session_store.prepare_model_completion_stage(
+                    prepare_stage = (
+                        self._executor._session_store.prepare_model_completion_stage
+                        if route_admission is None
+                        else partial(
+                            self._executor._session_store._prepare_model_completion_stage_with_failover,
+                            admission=route_admission,
+                        )
+                    )
+                    prepared = await prepare_stage(
                         self._session.id,
                         request=ModelCompletionStageRequest(
                             stage_id=stage_id,
@@ -10129,6 +10804,7 @@ class ModelStepRun:
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
                         context_exposure=context_exposure,
+                        prepared_events=prepared.prepared_events,
                         child_session_notifications_consumed=(
                             child_notification_binding is None
                             or consume_child_session_notifications
@@ -10170,7 +10846,7 @@ class ModelStepRun:
                             "Budget reservation lease was lost before model dispatch."
                         ) from authoritative_exc
                     raise
-                next_dispatch_ordinal += 1
+                next_dispatch_ordinal = dispatch_ordinal + 1
                 return dispatch
 
         def record_model_completion(event: Event) -> Event:
@@ -10182,7 +10858,7 @@ class ModelStepRun:
 
         flow_outcome: ModelStepFlowOutcome | None = None
         model_step_events = self._run_with_context_overflow_recovery(
-            provider=self._provider,
+            provider=self._request_provider,
             model_request=model_request,
             messages=messages,
             step=step,
@@ -10207,6 +10883,7 @@ class ModelStepRun:
             child_session_notification_binding=child_session_notification_binding,
             memory_evidence_key=memory_evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
+            targeted_tool_grants=targeted_tool_grants,
             native_tool_grant_ids=native_grant_ids,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
@@ -10333,6 +11010,30 @@ class ModelStepRun:
                         claim=cancellation_claim,
                     )
             raise
+        except _ModelFailoverCandidateExhausted as exhausted:
+            # Ordinary failure settlement may attach a secondary failure as a
+            # note and preserve its primary. A candidate handoff is different:
+            # an accounting failure must prevent selection of another provider.
+            try:
+                async for event in controller.settle_after_model_failure(
+                    budget_reservations,
+                    lifecycle=lifecycle,
+                    session=self._session,
+                    agent_name=self._registered_agent.spec.name,
+                    environment_name=self._environment_name,
+                    release_reason="selected model candidate exhausted",
+                ):
+                    yield event, None
+            except (asyncio.CancelledError, GeneratorExit) as settlement_control:
+                raise settlement_control from (exhausted.failure.cause or exhausted.failure)
+            except BaseException as settlement_failure:
+                primary_failure = exhausted.failure.cause or exhausted.failure
+                raise _combine_authoritative_model_failure(
+                    primary_failure,
+                    settlement_failure,
+                    message="Model candidate failure and budget settlement both failed.",
+                ) from None
+            raise
         except Exception as provider_exc:
             async for event in controller.settlement_events_preserving_failure(
                 controller.settle_after_model_failure(
@@ -10386,16 +11087,7 @@ class ModelStepRun:
         ],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
-        prepare_model_completion_dispatch: Callable[
-            [
-                ModelRequest,
-                MemoryEvidenceReference | None,
-                ChildSessionNotificationStageBinding | None,
-                bool,
-            ],
-            Awaitable[ModelCompletionDispatch],
-        ]
-        | None,
+        prepare_model_completion_dispatch: ModelCompletionDispatchPreparer | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         tool_exposure: ResolvedToolExposure,
         tool_exposure_evidence: ToolExposure,
@@ -10403,6 +11095,7 @@ class ModelStepRun:
         child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         memory_evidence_key: MemoryEvidenceKey | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
+        targeted_tool_grants: TargetedToolGrantFootprint | None,
         native_tool_grant_ids: Mapping[str, str],
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
@@ -10420,6 +11113,7 @@ class ModelStepRun:
         settled_compaction_attempt_ids: set[str] = set()
         automatic_compaction_lifecycle = _AutomaticCompactionLifecycle()
         latest_model_attempt_identity: ModelAttemptIdentity | None = None
+        selected_context_overflow: _ModelFailoverContextOverflow | None = None
 
         async def publish_recall_telemetry(
             telemetry: ContextRecallTelemetry,
@@ -10445,6 +11139,7 @@ class ModelStepRun:
             child_notification_binding: ChildSessionNotificationStageBinding | None,
             initial_identity: ModelAttemptIdentity | None = None,
             attempt_variant: RequestVariant,
+            context_overflow: _ModelFailoverContextOverflow | None = None,
         ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
             request_native_grant_ids = _native_tool_grant_ids_for_request(
                 request,
@@ -10455,7 +11150,7 @@ class ModelStepRun:
                 model_request=request,
                 session=self._session,
                 registered_agent=self._registered_agent,
-                registered_provider=self._registered_provider,
+                registered_provider=self._request_registered_provider,
                 environment_name=self._environment_name,
                 step=step,
                 request_variant=attempt_variant,
@@ -10475,9 +11170,11 @@ class ModelStepRun:
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=self._execution_profile,
                 invocation_context=self._invocation_context,
+                model_execution_selection=self._model_execution_selection,
+                context_overflow=context_overflow,
                 tool_exposure=tool_exposure,
                 tool_exposure_evidence=tool_exposure_evidence,
-                targeted_tool_grants=self._targeted_tool_grants,
+                targeted_tool_grants=targeted_tool_grants,
                 targeted_tool_gateway=targeted_tool_gateway,
                 native_tool_grant_ids=request_native_grant_ids,
                 memory_evidence_reference=evidence_reference,
@@ -10501,7 +11198,20 @@ class ModelStepRun:
                         else None,
                     )
                 return
-            except ModelContextOverflowError as exc:
+            except (ModelContextOverflowError, _ModelFailoverContextOverflow) as caught:
+                if isinstance(caught, _ModelFailoverContextOverflow):
+                    if (
+                        overflow_policy is None
+                        or caught.progress.attempts_used == caught.progress.plan.max_total_attempts
+                        or caught.failure.completion_observed
+                        or caught.failure.automatic_retry_disabled
+                    ):
+                        _raise_terminal_model_attempt_failure(caught.failure)
+                    selected_context_overflow = caught
+                    assert isinstance(caught.failure.cause, ModelContextOverflowError)
+                    exc = caught.failure.cause
+                else:
+                    exc = caught
                 if overflow_policy is None:
                     raise
                 yield (
@@ -10613,6 +11323,7 @@ class ModelStepRun:
                 agent_spec=_session_agent_spec(
                     registered_agent=self._registered_agent,
                     session=self._session,
+                    model_execution_selection=self._model_execution_selection,
                 ),
                 messages=messages,
                 step=step,
@@ -10624,7 +11335,7 @@ class ModelStepRun:
                 knowledge_access_scope=self._knowledge_access_scope,
                 request_metadata=self._request_metadata,
                 pressure_overhead=_context_pressure_overhead(
-                    registered_provider=self._registered_provider,
+                    registered_provider=self._request_registered_provider,
                     registered_agent=self._registered_agent,
                     registered_environment=self._registered_environment,
                     structured_output=self._structured_output,
@@ -10897,6 +11608,7 @@ class ModelStepRun:
                 if model_request.tool_discovery_projection is None
                 else model_request.tool_discovery_projection.loaded_tool_names
             ),
+            model_execution_selection=self._model_execution_selection,
         )
         yield (
             await self._executor._event_writer.emit(
@@ -10932,6 +11644,7 @@ class ModelStepRun:
             evidence_reference=recovery_memory_evidence_reference,
             child_notification_binding=recovery_child_notification_binding,
             attempt_variant=RequestVariant.CONTEXT_OVERFLOW_RECOVERY,
+            context_overflow=selected_context_overflow,
         )
         try:
             try:
@@ -10942,7 +11655,12 @@ class ModelStepRun:
                         if result is not None
                         else None,
                     )
-            except ModelContextOverflowError as exc:
+            except (ModelContextOverflowError, _ModelFailoverContextOverflow) as caught:
+                if isinstance(caught, _ModelFailoverContextOverflow):
+                    assert isinstance(caught.failure.cause, ModelContextOverflowError)
+                    exc = caught.failure.cause
+                else:
+                    exc = caught
                 yield (
                     await self._executor._event_writer.emit(
                         event_with_execution_profile_authority(
@@ -10969,6 +11687,8 @@ class ModelStepRun:
                     ),
                     None,
                 )
+                if isinstance(caught, _ModelFailoverContextOverflow):
+                    _raise_terminal_model_attempt_failure(caught.failure)
                 raise
         finally:
             await _close_async_iterator(recovery_events)
@@ -11507,6 +12227,7 @@ class ModelStepRun:
         billing_identity: BillingIdentity | None,
         reservations: tuple[BudgetStepReservation, ...],
         allow_borrowed_stage: bool,
+        fallback: ModelFailoverTransition | None = None,
     ) -> _AutomaticCompactionDispatchAuthority:
         """Prepare exact recovery authority before the budget dispatch fence."""
 
@@ -11520,15 +12241,37 @@ class ModelStepRun:
         )
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         parent_model_step_identity = copy_model_step_identity(parent_model_step_identity)
+        if fallback is not None:
+            if type(fallback) is not ModelFailoverTransition:
+                raise TypeError("Compaction requires an exact live failover handoff.")
+            fallback = replace(fallback)
         active = await self._executor._session_store.load_active_model_completion_stage(
             self._session.id
         )
+        if fallback is not None and active is None:
+            raise RuntimeError("Fallback compaction lost its exact failed predecessor.")
         if active is not None:
             stage = active.stage
-            if not allow_borrowed_stage:
+            if not allow_borrowed_stage and fallback is None:
                 raise RuntimeError(
                     "Initial automatic compaction found an active model-completion stage."
                 )
+            if fallback is not None:
+                selection = self._model_execution_selection
+                if (
+                    selection is None
+                    or selection.candidate_index != fallback.source.candidate_index + 1
+                ):
+                    raise ValueError("Fallback compaction changed its selected successor.")
+                predecessor = replace(selection, candidate_index=fallback.source.candidate_index)
+                predecessor.require_prepared_stage(stage)
+                if (
+                    stage.state != "in_flight"
+                    or stage.preparation_digest != fallback.source_preparation_digest
+                    or stage.intent[MODEL_FAILOVER_CHECKPOINT_KEY]["successor"]
+                    != fallback.source.payload()
+                ):
+                    raise ValueError("Fallback compaction changed its exact failed predecessor.")
             if (
                 stage.purpose != "assistant-turn"
                 or stage.logical_step_id != parent_model_step_identity.model_step_id
@@ -12740,9 +13483,18 @@ class ModelStepRun:
         model_step_identity: ModelStepIdentity,
     ) -> AsyncIterator[tuple[Event | None, bool | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        pricing_provider_name = (
+            None
+            if self._model_execution_selection is None
+            else self._request_provider.billing_provider_name
+            or self._request_registered_provider.name
+        )
+        model = None if self._model_execution_selection is None else self._request_model
         budget_evaluation = await self._limit_gate.evaluate_budget(
             self._budget_policy,
             execution_identity=model_step_identity,
+            pricing_provider_name=pricing_provider_name,
+            model=model,
         )
         request = ModelStepBudgetEvaluationRequest(
             evaluation=budget_evaluation,
@@ -12768,6 +13520,8 @@ class ModelStepRun:
             return
         limit_evaluation = await self._limit_gate.evaluate_limits(
             execution_identity=model_step_identity,
+            pricing_provider_name=pricing_provider_name,
+            model=model,
         )
         request = ModelStepLimitEvaluationRequest(
             evaluation=limit_evaluation,
@@ -12798,10 +13552,19 @@ class ModelStepRun:
         model_attempt_identity: ModelAttemptIdentity,
     ) -> AsyncIterator[tuple[Event | None, bool | None]]:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        pricing_provider_name = (
+            None
+            if self._model_execution_selection is None
+            else self._request_provider.billing_provider_name
+            or self._request_registered_provider.name
+        )
+        model = None if self._model_execution_selection is None else self._request_model
         budget_evaluation = await self._limit_gate.evaluate_budget(
             self._budget_policy,
             billing_identity_state=resolved_billing_identity(billing_identity),
             execution_identity=model_attempt_identity,
+            pricing_provider_name=pricing_provider_name,
+            model=model,
         )
         request = ModelStepBudgetEvaluationRequest(
             evaluation=budget_evaluation,
@@ -12828,6 +13591,8 @@ class ModelStepRun:
         limit_evaluation = await self._limit_gate.evaluate_limits(
             billing_identity_state=resolved_billing_identity(billing_identity),
             execution_identity=model_attempt_identity,
+            pricing_provider_name=pricing_provider_name,
+            model=model,
         )
         request = ModelStepLimitEvaluationRequest(
             evaluation=limit_evaluation,
@@ -12904,6 +13669,7 @@ class ModelStepRun:
                 targeted_tool_native=targeted_tool_native,
                 tool_discovery_projection_kind=self._tool_discovery_projection_kind,
                 tool_discovery_native_tool_names=tool_discovery_native_tool_names,
+                model_execution_selection=self._model_execution_selection,
             )
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
@@ -12911,7 +13677,7 @@ class ModelStepRun:
                 await self._refresh_live_model_semantics()
             except Exception as authority_error:
                 raise _ContextCountAuthorityError(authority_error) from None
-            result = await self._provider.count_input_tokens(request)
+            result = await self._request_provider.count_input_tokens(request)
             return None if result is None else result.input_tokens
 
         return count_input_tokens
@@ -12941,6 +13707,7 @@ class ModelStepRun:
                 targeted_tool_native=targeted_tool_native,
                 tool_discovery_projection_kind=self._tool_discovery_projection_kind,
                 tool_discovery_native_tool_names=tool_discovery_native_tool_names,
+                model_execution_selection=self._model_execution_selection,
             )
 
         return build_cache_prefix_request
@@ -12962,6 +13729,7 @@ class ModelStepRun:
         source_transcript_cursor: int,
         allow_borrowed_stage: bool,
         lifecycle: _AutomaticCompactionLifecycle,
+        fallback: ModelFailoverTransition | None = None,
     ) -> CompactionResult:
         del messages
         model_step_identity = copy_model_step_identity(model_step_identity)
@@ -13009,6 +13777,7 @@ class ModelStepRun:
                 billing_identity=billing_identity,
                 reservations=reservations,
                 allow_borrowed_stage=allow_borrowed_stage,
+                fallback=fallback,
             )
             existing = dispatch_authorities.setdefault(
                 model_attempt_identity.model_attempt_id,
@@ -13755,11 +14524,18 @@ def _session_agent_spec(
     *,
     registered_agent: runtime_records.RegisteredAgentState,
     session: Session,
+    model_execution_selection: ModelExecutionSelection | None = None,
 ) -> AgentSpec:
     return AgentSpec(
         name=registered_agent.spec.name,
-        model=session.model,
-        provider_name=session.provider_name,
+        model=session.model
+        if model_execution_selection is None
+        else model_execution_selection.model,
+        provider_name=(
+            session.provider_name
+            if model_execution_selection is None
+            else model_execution_selection.registered_provider.name
+        ),
         system_prompt=registered_agent.spec.system_prompt,
         metadata=copy_durable_metadata(registered_agent.spec.metadata),
         provider_options=copy_json_value(
@@ -13767,6 +14543,54 @@ def _session_agent_spec(
             "provider_options",
         ),
     )
+
+
+def preflight_model_thinking(
+    *,
+    provider: ModelProvider,
+    model: str,
+    thinking: object,
+    redactor: SecretRedactor,
+) -> None:
+    """Validate detached neutral controls without rewriting request options."""
+
+    copied = copy_preflight_thinking(thinking)
+    if copied is not None:
+        payload = copied.model_dump()
+        if redactor.redact_json_values(payload) != payload:
+            raise ValueError("Thinking controls contain a workload secret and cannot be forwarded.")
+    provider.preflight_thinking(model=model, thinking=copied)
+
+
+def preflight_portable_model_material(
+    *,
+    provider: ModelProvider,
+    model: str,
+    messages: list[Message],
+    tools: list[dict[str, Any]],
+    redactor: SecretRedactor,
+) -> None:
+    """Validate neutral capability material without exposing mutable dispatch input.
+
+    This projection is only for preflight. The selected request retains native
+    continuation state according to its durable portable-history boundary.
+    """
+
+    projection = project_portable_transcript(messages)
+    hook_messages = [
+        redact_runtime_message_for_boundary(
+            message, redactor=redactor, field_name="portable_model_message"
+        )
+        for message in projection.messages
+    ]
+    hook_tools = _redacted_provider_tool_definitions(
+        tools, redactor=redactor, field_name="portable_model_tools"
+    )
+    try:
+        provider.preflight_portable_messages(model=model, messages=hook_messages, tools=hook_tools)
+    finally:
+        hook_messages.clear()
+        hook_tools.clear()
 
 
 def _model_request_tools(
@@ -14549,6 +15373,8 @@ def _model_context_overflow_error_event(
     error: ModelContextOverflowError,
     *,
     session: Session,
+    provider_name: str,
+    requested_model: str,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
     step: int,
@@ -14574,6 +15400,8 @@ def _model_context_overflow_error_event(
         environment_name=environment_name,
         payload=_retry_attempt_payload(
             payload,
+            execution_provider_name=provider_name,
+            requested_model=requested_model,
             step=step,
             attempt=attempt,
             max_attempts=max_attempts,
@@ -15136,6 +15964,7 @@ def _context_count_reconciled_event(
     *,
     observation: _ContextCountObservation,
     session: Session,
+    model: str,
     registered_agent: runtime_records.RegisteredAgentState,
     registered_provider: runtime_records.RegisteredProvider,
     environment_name: str | None,
@@ -15165,7 +15994,7 @@ def _context_count_reconciled_event(
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             payload={
-                "model": session.model,
+                "model": model,
                 "provider": registered_provider.name,
                 "step": step,
                 "attempt": attempt,
@@ -15188,6 +16017,7 @@ def _context_pressure_reconciled_event(
     *,
     observation: _ContextPressureObservation,
     session: Session,
+    model: str,
     registered_agent: runtime_records.RegisteredAgentState,
     registered_provider: runtime_records.RegisteredProvider,
     environment_name: str | None,
@@ -15215,7 +16045,7 @@ def _context_pressure_reconciled_event(
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             payload={
-                "model": session.model,
+                "model": model,
                 "provider": registered_provider.name,
                 "step": step,
                 "attempt": attempt,
@@ -15246,6 +16076,7 @@ def _model_stream_event_to_runtime_event(
     stream_event: ModelStreamEvent,
     *,
     session: Session,
+    requested_model: str,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
     provider_name: str | None,
@@ -15280,14 +16111,14 @@ def _model_stream_event_to_runtime_event(
         payload = {
             **_validated_hosted_tool_call_payload(stream_event.payload),
             "provider_name": provider_name,
-            "model": session.model,
+            "model": requested_model,
             "provider_operation_id": _provider_operation_id(model_attempt_identity),
         }
     elif stream_event.type == ModelStreamEventType.CITATION:
         event_type = EventType.MODEL_CITATION
         payload = {
             **_validated_citation_payload(stream_event.payload),
-            "model": session.model,
+            "model": requested_model,
             "provider_operation_id": _provider_operation_id(model_attempt_identity),
             "provenance": {
                 "provider_name": provider_name,
@@ -15322,9 +16153,9 @@ def _model_stream_event_to_runtime_event(
                     "rejected_usage_evidence",
                 )
             payload["usage_metrics_rejected"] = True
-        resolved_model = _payload_model(payload, fallback=session.model)
+        resolved_model = _payload_model(payload, fallback=requested_model)
         payload["model"] = resolved_model
-        payload["requested_model"] = session.model
+        payload["requested_model"] = requested_model
         if provider_name is None:
             payload.pop("provider_name", None)
         else:
@@ -15357,7 +16188,7 @@ def _model_stream_event_to_runtime_event(
                 normalize_usage_metrics(
                     provider_name=provider_name,
                     model=resolved_model,
-                    requested_model=session.model,
+                    requested_model=requested_model,
                     raw_usage=payload.get("usage"),
                     usage_dialect=usage_dialect,
                     billing_identity=billing_identity,
@@ -15408,6 +16239,8 @@ def _model_stream_event_to_runtime_event(
         raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
     payload = _retry_attempt_payload(
         payload,
+        execution_provider_name=provider_name if event_type is EventType.MODEL_ERROR else None,
+        requested_model=requested_model if event_type is EventType.MODEL_ERROR else None,
         step=step,
         attempt=attempt,
         max_attempts=max_attempts,
@@ -15421,8 +16254,8 @@ def _model_stream_event_to_runtime_event(
             payload,
             fallback_fields={
                 "provider_name": provider_name,
-                "requested_model": session.model,
-                "model": session.model,
+                "requested_model": requested_model,
+                "model": requested_model,
                 "step": step,
                 "attempt": attempt,
                 "max_attempts": max_attempts,
@@ -15682,6 +16515,7 @@ def _typed_retry_fields(
 def _model_retry_event(
     *,
     session: Session,
+    model: str,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
     registered_provider: runtime_records.RegisteredProvider,
@@ -15695,7 +16529,7 @@ def _model_retry_event(
     payload = retry_event_payload(
         decision=decision,
         provider_name=registered_provider.name,
-        model=session.model,
+        model=model,
         step=step,
         error=error,
     )
@@ -15722,6 +16556,7 @@ def _model_retry_event(
 def _model_attempt_discarded_event(
     *,
     session: Session,
+    model: str,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
     registered_provider: runtime_records.RegisteredProvider,
@@ -15737,7 +16572,7 @@ def _model_attempt_discarded_event(
             environment_name=environment_name,
             payload={
                 "provider": registered_provider.name,
-                "model": session.model,
+                "model": model,
                 "step": step,
                 "attempt": decision.attempt,
                 "next_attempt": decision.next_attempt,
@@ -15756,6 +16591,8 @@ def _model_attempt_discarded_event(
 def _retry_attempt_payload(
     payload: dict[str, Any],
     *,
+    execution_provider_name: str | None = None,
+    requested_model: str | None = None,
     step: int,
     attempt: int,
     max_attempts: int,
@@ -15769,6 +16606,12 @@ def _retry_attempt_payload(
     enriched["step"] = step
     enriched["attempt"] = attempt
     enriched["max_attempts"] = max_attempts
+    if execution_provider_name is not None:
+        enriched["provider_name"] = require_clean_nonblank(
+            execution_provider_name, "execution_provider_name"
+        )
+    if requested_model is not None:
+        enriched["requested_model"] = require_clean_nonblank(requested_model, "requested_model")
     if decision is not None:
         if type(decision) is not RetryDecision:
             raise TypeError("decision must be a RetryDecision or None.")

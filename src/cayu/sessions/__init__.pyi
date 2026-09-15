@@ -103,6 +103,7 @@ from cayu.sessions.base import ModelCompletionStageSettlement as ModelCompletion
 from cayu.sessions.base import (
     ModelCompletionStageSettlementRequest as ModelCompletionStageSettlementRequest,
 )
+from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.base import PendingActionIssue as PendingActionIssue
 from cayu.sessions.base import PendingActionIssueCode as PendingActionIssueCode

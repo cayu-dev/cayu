@@ -24,6 +24,18 @@ Google AI Studio automatically uses Gemini usage accounting. For Gemini through
 another OpenAI-compatible Vertex or gateway endpoint, pass
 `usage_dialect=UsageDialect.GEMINI` explicitly.
 
+## Explicit fallback targets
+
+Use `RunRequest.failover=ModelFailoverPolicy(...)` with explicit provider/model pairs
+in `fallbacks`. Register all candidates; `max_total_attempts` bounds each model step.
+Local retries run first. Only typed retryable service rejection before accepted
+output/effects permits fallback; cancellation, deadlines and ambiguity do not.
+All candidates must support required tools, files, output and thinking features.
+Resume retains selection; changing the chain requires profile adoption. Budgets,
+deadlines and root authority do not reset; actual target pricing/usage still applies.
+Tool auxiliary inference stays separate; custom stores must attest atomic selection.
+See `examples/provider_failover.py` for events and a network-free native-store example.
+
 ## Thinking effort compatibility
 
 Use `ThinkingConfig` for typed reasoning settings. Supported values, model/transport

@@ -20,6 +20,7 @@ from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import ExecutionDeadline
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.tasks.contracts import require_bounded_work_completion_document
 from cayu.tools.exposure import ToolCapabilityCeiling
 
@@ -45,12 +46,20 @@ class WorkAttemptRunSemantics(BaseModel):
     causal_budget_id: str | None = None
     tool_capability_ceiling: ToolCapabilityCeiling | None = None
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    failover: ModelFailoverPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
     request_metadata: dict[str, Any] = Field(default_factory=dict)
     deadline_expires_at: datetime | None = None
     deadline_source: str = "runtime"
     deadline_scope: str = "execution"
+
+    @field_validator("failover", mode="before")
+    @classmethod
+    def copy_failover(cls, value: object) -> ModelFailoverPolicy | None:
+        return copy_optional_model_failover_policy(value)
 
     @property
     def deadline(self) -> ExecutionDeadline:

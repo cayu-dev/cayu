@@ -185,6 +185,7 @@ class ForegroundParentContinuation(BaseModel):
             self.publication_id not in publications
             or self.request.session_id != intent.session_id
             or self.request.target is not None
+            or self.request.failover is not None
             or self.request.profile_adoption is not None
             or self.request.tool_grants
             or self.request.tool_capability_ceiling is not None

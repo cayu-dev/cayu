@@ -361,6 +361,11 @@ from cayu.sessions.base import (
     _model_completion_stage_winner_record,
     _model_completion_stage_winner_storage_key,
     _model_completion_terminal_advances_last_activity,
+    _model_failover_admission_storage_keys,
+    _model_failover_checkpoint_after_profile_admission,
+    _model_failover_predecessor_storage_keys,
+    _model_failover_preparation_checkpoint,
+    _model_failover_selection_event,
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
     _prepare_execution_profile_rejection,
@@ -368,6 +373,7 @@ from cayu.sessions.base import (
     _prepare_interaction_transition,
     _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
+    _prepare_profiled_fork_checkpoint_result,
     _prepare_queue_completion_checkpoint_mutation,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
@@ -434,8 +440,8 @@ from cayu.sessions.base import (
     _validate_model_completion_stage_release,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
+    _validate_model_failover_selection_replay,
     _validate_profiled_fork_authority,
-    _validate_profiled_fork_checkpoint_result,
     _validate_runner_observed_event_identity_snapshot,
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_event_references,
@@ -1969,6 +1975,7 @@ class SQLiteSessionStore(SessionStore):
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
+    model_failover_stage_version: ClassVar[int] = 1
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     invocation_lifecycle_command_version: ClassVar[int | None] = 1
     terminal_interaction_publication_version: ClassVar[int | None] = 1
@@ -4145,7 +4152,10 @@ class SQLiteSessionStore(SessionStore):
                             "checkpoint",
                         )
                 if profile_relationship is not None:
-                    _validate_profiled_fork_checkpoint_result(
+                    copied_checkpoint = _prepare_profiled_fork_checkpoint_result(
+                        supports_model_failover=self._supports_model_failover_stage_protocol(),
+                        fork=fork,
+                        transcript_cursor=len(copied_messages),
                         relationship=profile_relationship,
                         source_checkpoint_present=source_checkpoint_present,
                         copied_checkpoint=copied_checkpoint,
@@ -5873,6 +5883,31 @@ class SQLiteSessionStore(SessionStore):
                         metadata=transition_metadata,
                     )
                 transitioned = loaded.model_copy(update=transition_updates)
+                failover_keys = _model_failover_admission_storage_keys(
+                    current_checkpoint, prepared_execution_profile
+                )
+                if failover_keys:
+                    route_placeholders = ", ".join("?" for _ in failover_keys)
+                    route_rows = self._connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        f"WHERE session_id = ? AND idempotency_key IN ({route_placeholders})",
+                        (session_id, *failover_keys),
+                    ).fetchall()
+                    transformed_checkpoint = _model_failover_checkpoint_after_profile_admission(
+                        source_session=loaded,
+                        admitted_session=transitioned,
+                        source_checkpoint=current_checkpoint,
+                        admitted_checkpoint=transformed_checkpoint,
+                        candidate_profile=prepared_execution_profile,
+                        records={
+                            row["idempotency_key"]: _decode_model_completion_stage_record(
+                                row["record_json"]
+                            )
+                            for row in route_rows
+                        },
+                        transcript_cursor=_transcript_cursor(self._connection, session_id),
+                        supports_model_failover=self._supports_model_failover_stage_protocol(),
+                    )
                 if result_checkpoint_transform is not None:
                     result_checkpoint = result_checkpoint_transform(
                         transitioned,
@@ -9679,6 +9714,7 @@ class SQLiteSessionStore(SessionStore):
                 }
                 _validate_model_completion_stage_for_dispatch(
                     session=loaded,
+                    checkpoint=self._load_checkpoint_unlocked(session_id),
                     current_transcript_cursor=_transcript_cursor(connection, session_id),
                     stage=stage,
                     active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
@@ -9828,6 +9864,22 @@ class SQLiteSessionStore(SessionStore):
                     )
                     for row in rows
                 }
+                failover_source_keys = _model_failover_predecessor_storage_keys(prepared)
+                if failover_source_keys:
+                    source_placeholders = ", ".join("?" for _ in failover_source_keys)
+                    source_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        f"WHERE session_id = ? AND idempotency_key IN ({source_placeholders})",
+                        (session_id, *failover_source_keys),
+                    ).fetchall()
+                    records.update(
+                        {
+                            row["idempotency_key"]: _decode_model_completion_stage_record(
+                                row["record_json"]
+                            )
+                            for row in source_rows
+                        }
+                    )
                 stage = _reconstruct_model_completion_stage(
                     records.get(prepared.preparation_storage_key),
                     records.get(prepared.terminal_storage_key),
@@ -9898,6 +9950,27 @@ class SQLiteSessionStore(SessionStore):
                         winner_exists=winner_exists,
                         receipt_exists=receipt_exists,
                     )
+                    _model_failover_preparation_checkpoint(
+                        prepared,
+                        session=loaded,
+                        checkpoint=self._load_checkpoint_unlocked(session_id),
+                        current_transcript_cursor=_transcript_cursor(connection, session_id),
+                        active=active,
+                        records=records,
+                        replayed=True,
+                    )
+                    expected_selection = _model_failover_selection_event(
+                        prepared, session=loaded, prepared_at=stage.prepared_at
+                    )
+                    if expected_selection is not None:
+                        event_row = connection.execute(
+                            "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",
+                            (session_id, expected_selection.id),
+                        ).fetchone()
+                        _validate_model_failover_selection_replay(
+                            expected_selection,
+                            None if event_row is None else _event_from_row(event_row),
+                        )
                     connection.rollback()
                     return ModelCompletionStageResult(
                         stage=stage,
@@ -9938,11 +10011,23 @@ class SQLiteSessionStore(SessionStore):
 
                 if active is None:
                     _reject_new_work_after_steering(connection, loaded)
+                route_checkpoint = _model_failover_preparation_checkpoint(
+                    prepared,
+                    session=loaded,
+                    checkpoint=self._load_checkpoint_unlocked(session_id),
+                    current_transcript_cursor=current_cursor,
+                    active=active,
+                    records=records,
+                    replayed=False,
+                )
                 prepared_at = _next_runtime_publication_timestamp(loaded)
                 record = _model_completion_stage_preparation_record(
                     prepared,
                     source_session=loaded,
                     prepared_at=prepared_at,
+                )
+                selection_event = _model_failover_selection_event(
+                    prepared, session=loaded, prepared_at=prepared_at
                 )
                 stage = _reconstruct_model_completion_stage(
                     record,
@@ -9954,6 +10039,22 @@ class SQLiteSessionStore(SessionStore):
                 )
                 assert stage is not None
                 formatted_at = sqlite_support.format_datetime(prepared_at)
+                if route_checkpoint is not None:
+                    connection.execute(
+                        "INSERT INTO cayu_checkpoints (session_id, state_json, updated_at, "
+                        "pending_action_source_bytes, pending_action_tool_call_count, "
+                        "pending_action_flags, pending_action_metrics_ready) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(session_id) DO UPDATE SET "
+                        "state_json = excluded.state_json, updated_at = excluded.updated_at, "
+                        "pending_action_source_bytes = excluded.pending_action_source_bytes, "
+                        "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
+                        "pending_action_flags = excluded.pending_action_flags, "
+                        "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
+                        sqlite_support.checkpoint_row_values(
+                            session_id, route_checkpoint, prepared_at
+                        ),
+                    )
                 connection.execute(
                     "INSERT INTO cayu_session_operations "
                     "(session_id, idempotency_key, record_json, updated_at) "
@@ -10029,11 +10130,16 @@ class SQLiteSessionStore(SessionStore):
                 )
                 if cursor.rowcount != 1:
                     raise KeyError(f"Session not found: {session_id}")
+                if selection_event is not None:
+                    _append_events_in_transaction(
+                        connection, session_id, (selection_event,), activity_at=prepared_at
+                    )
                 connection.commit()
                 return ModelCompletionStageResult(
                     stage=stage,
                     replayed=False,
                     dispatch_authorized=True,
+                    prepared_events=() if selection_event is None else (selection_event,),
                 )
             except BaseException:
                 connection.rollback()
