@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- OpenAI Responses HTTP streams drain trailing data for at most a 50 ms grace
+  after the parser validates a terminal response, instead of requiring HTTP EOF.
+  Readily available protocol conflicts across chunk boundaries and response-close
+  failures remain errors; completion never authorizes a retry. Existing stream
+  deadlines still bound noncooperative transport reads and cleanup.
+
 ## v0.6.0
 
 Cayu adds durable lifecycle controls and portable evaluations, with public APIs

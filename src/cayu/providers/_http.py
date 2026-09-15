@@ -29,6 +29,8 @@ from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     _contains_fatal_signal,
+    _provider_stream_cleanup_error,
+    _raise_detached_provider_stream_cleanup_error,
     aclosing_provider_stream,
     credential_safe_provider_cancellation,
     provider_cancellation_failures,
@@ -67,6 +69,7 @@ MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
 OMITTED_PROVIDER_ERROR_BODY = "[provider response body omitted]"
 _PROVIDER_CA_BUNDLE_ENV = "CAYU_PROVIDER_CA_BUNDLE"
+_POST_TERMINAL_DRAIN_SECONDS = 0.05
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
 _RaiseContextOverflowFromStatus = Callable[[int], None]
 
@@ -78,6 +81,17 @@ class _TrustedSseJsonEvent(dict[str, Any]):
         super().__init__(event)
         self._retry_after_s = retry_after_s
         self._response_structure: ResponseStructureDiagnostic | None = None
+        self._terminal_accepted = False
+
+
+def _accept_sse_terminal(event: Mapping[str, Any]) -> None:
+    """Acknowledge a terminal only after the provider parser validates it.
+
+    Wire fields cannot set this flag. Raw transport consumers and custom event
+    iterators retain their existing EOF contract.
+    """
+    if type(event) is _TrustedSseJsonEvent:
+        event._terminal_accepted = True
 
 
 def _trusted_sse_retry_after_s(event: Mapping[str, Any]) -> float | None:
@@ -170,6 +184,8 @@ async def _read_bounded_identity_error_response(
 
 async def _aiter_unclosed_response_bytes(
     response: httpx.Response,
+    *,
+    terminal_accepted: Callable[[], bool] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """Yield raw identity bytes while leaving closure to the owned context."""
 
@@ -180,9 +196,48 @@ async def _aiter_unclosed_response_bytes(
     if not isinstance(response.stream, httpx.AsyncByteStream):
         raise RuntimeError("Attempted to call an async iterator on a sync stream.")
     response.is_stream_consumed = True
+    iterator = response.stream.__aiter__()
+    drain_deadline: float | None = None
+    loop = asyncio.get_running_loop()
     try:
-        async for chunk in response.stream:
+        while True:
+            if drain_deadline is None and terminal_accepted is not None and terminal_accepted():
+                drain_deadline = loop.time() + _POST_TERMINAL_DRAIN_SECONDS
+            if drain_deadline is not None and loop.time() >= drain_deadline:
+                return
+            deadline = asyncio.timeout_at(drain_deadline) if drain_deadline is not None else None
+            read_cancelled = False
+            read_cleanup_failed = False
+            try:
+                if deadline is None:
+                    chunk = await anext(iterator)
+                else:
+                    async with deadline:
+                        try:
+                            chunk = await anext(iterator)
+                        except asyncio.CancelledError as exc:
+                            # Observe the read outcome before asyncio converts its
+                            # own cancellation to TimeoutError. A transport's own
+                            # TimeoutError must never acquire drain-expiry authority.
+                            read_cancelled = True
+                            read_cleanup_failed = bool(provider_cancellation_failures(exc)) or (
+                                stream_cleanup_cancelled_after_provider_failure(exc)
+                            )
+                            raise
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                if deadline is not None and deadline.expired() and read_cancelled:
+                    if read_cleanup_failed:
+                        _raise_detached_provider_stream_cleanup_error(
+                            _provider_stream_cleanup_error()
+                        )
+                    return
+                raise
             yield chunk
+            # Drain readily available tails across HTTP chunk boundaries. The
+            # fixed deadline never refreshes for heartbeats or additional bytes.
+            # Existing stream clocks and ordered response closure still apply.
     except httpx.RequestError as exc:
         # Match ``Response.aiter_raw()`` by retaining request context on read
         # failures without inheriting its implicit response-close behavior.
@@ -211,6 +266,8 @@ async def _aiter_owned_stream_response(
     response_context: AbstractAsyncContextManager[httpx.Response],
     deadline_controller: ProviderStreamDeadlineController,
     close_trace: _HttpResponseCloseTrace | None = None,
+    *,
+    terminal_accepted: Callable[[], bool] | None = None,
 ) -> AsyncIterator[tuple[httpx.Response, AsyncGenerator[bytes, None]]]:
     """Own bytes and response closure together, after the interrupted read joins."""
 
@@ -220,7 +277,9 @@ async def _aiter_owned_stream_response(
     try:
         async with response_context as response:
             opened = True
-            response_bytes = _aiter_unclosed_response_bytes(response)
+            response_bytes = _aiter_unclosed_response_bytes(
+                response, terminal_accepted=terminal_accepted
+            )
             async with aclosing(response_bytes):
                 with suppress(GeneratorExit):
                     yield response, response_bytes
@@ -674,7 +733,13 @@ async def stream_sse_json_events(
         close_trace = _HttpResponseCloseTrace()
         request_kwargs["extensions"] = {"trace": close_trace}
         response_context = client.stream(method, url, **request_kwargs)
-        responses = _aiter_owned_stream_response(response_context, deadline_controller, close_trace)
+        terminal_accepted = False
+        responses = _aiter_owned_stream_response(
+            response_context,
+            deadline_controller,
+            close_trace,
+            terminal_accepted=lambda: terminal_accepted,
+        )
         interrupted_read: asyncio.Future[Any] | None = None
 
         def retain_interrupted_read(operation: asyncio.Future[Any]) -> None:
@@ -773,6 +838,7 @@ async def stream_sse_json_events(
                     envelope._response_structure = structure.snapshot()
                 _record_stream_error(event, headers=headers, response=response)
                 yield envelope
+                terminal_accepted = terminal_accepted or envelope._terminal_accepted
     except ProviderStreamDeadlineExceeded as exc:
         _record_transport_error(
             "ProviderStreamDeadlineExceeded", headers=headers, response=response

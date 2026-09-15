@@ -57,6 +57,7 @@ from cayu.providers._credential_boundary import (
 from cayu.providers._http import (
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
+    _accept_sse_terminal,
     _trusted_sse_response_structure,
     _trusted_sse_retry_after_s,
     aclose_transport,
@@ -3001,6 +3002,7 @@ async def _openai_background_stream_events(
                 )
             )
             observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            _accept_sse_terminal(event)
             for terminal_event in terminal_events:
                 if terminal_event.type is ModelStreamEventType.COMPLETED:
                     lifecycle.claim_completion()
@@ -3066,6 +3068,7 @@ async def _openai_background_stream_events(
                 )
             )
             observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            _accept_sse_terminal(event)
         yield _openai_background_event_with_recovery(
             normalized,
             cursor=cursor,
@@ -3743,6 +3746,7 @@ async def _openai_stream_events_impl(
                 )
             )
             observe_provider_semantic_progress(ProviderProgressKind.TERMINAL)
+            _accept_sse_terminal(event)
             for terminal_event in terminal_events:
                 if terminal_event.type is ModelStreamEventType.COMPLETED:
                     lifecycle.claim_completion()
