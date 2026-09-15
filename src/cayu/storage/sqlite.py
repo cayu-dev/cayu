@@ -184,7 +184,6 @@ from cayu.sessions.base import (
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
-    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
@@ -413,6 +412,7 @@ from cayu.sessions.base import (
     _terminal_publication_delete_block_reason,
     _terminal_session_evidence_expected_event_type,
     _tool_lifecycle_publication_identity,
+    _tool_round_lifecycle_event_limit,
     _validate_equivalent_queued_session_message,
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
@@ -10800,13 +10800,12 @@ class SQLiteSessionStore(SessionStore):
                     lifecycle_event_types = tuple(
                         sorted(str(event_type) for event_type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES)
                     )
-                    lookup_placeholders = ", ".join("?" for _ in lookup_keys)
                     event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
                     rows = connection.execute(
                         f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
                         "INDEXED BY idx_cayu_events_pending_action_lookup "
                         f"WHERE session_id = ? AND pending_action_lookup_key IN "
-                        f"({lookup_placeholders}) AND event_type IN "
+                        "(SELECT value FROM json_each(?)) AND event_type IN "
                         f"({event_type_placeholders}) AND "
                         f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
                         "AND (json_extract(payload_json, '$.tool_round_id') = ? "
@@ -10821,15 +10820,15 @@ class SQLiteSessionStore(SessionStore):
                         "ORDER BY sequence ASC LIMIT ?",
                         (
                             session_id,
-                            *lookup_keys,
+                            json.dumps(lookup_keys),
                             *lifecycle_event_types,
                             execution_identity.tool_round_id,
                             execution_identity.model_step_id,
                             execution_identity.model_attempt_id,
-                            RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                            _tool_round_lifecycle_event_limit(tool_call_ids) + 1,
                         ),
                     ).fetchall()
-                    if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                    if len(rows) > _tool_round_lifecycle_event_limit(tool_call_ids):
                         raise ValueError(
                             "Tool-round lifecycle evidence exceeds the publication limit."
                         )
@@ -11853,24 +11852,23 @@ class SQLiteSessionStore(SessionStore):
         def query(connection: sqlite3.Connection) -> list[Event]:
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            lookup_placeholders = ", ".join("?" for _ in lookup_keys)
             event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
             rows = connection.execute(
                 f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
                 "INDEXED BY idx_cayu_events_pending_action_lookup "
                 f"WHERE session_id = ? AND pending_action_lookup_key IN "
-                f"({lookup_placeholders}) AND event_type IN "
+                "(SELECT value FROM json_each(?)) AND event_type IN "
                 f"({event_type_placeholders}) AND "
                 f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
                 "ORDER BY sequence ASC LIMIT ?",
                 (
                     session_id,
-                    *lookup_keys,
+                    json.dumps(lookup_keys),
                     *lifecycle_event_types,
-                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                    _tool_round_lifecycle_event_limit(copied_ids) + 1,
                 ),
             ).fetchall()
-            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [_event_from_row(row) for row in rows]
 
@@ -11896,13 +11894,12 @@ class SQLiteSessionStore(SessionStore):
         def query(connection: sqlite3.Connection) -> list[Event]:
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            lookup_placeholders = ", ".join("?" for _ in lookup_keys)
             event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
             rows = connection.execute(
                 f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
                 "INDEXED BY idx_cayu_events_pending_action_lookup "
                 f"WHERE session_id = ? AND pending_action_lookup_key IN "
-                f"({lookup_placeholders}) AND event_type IN "
+                "(SELECT value FROM json_each(?)) AND event_type IN "
                 f"({event_type_placeholders}) AND "
                 f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
                 "AND (json_extract(payload_json, '$.tool_round_id') = ? "
@@ -11917,15 +11914,15 @@ class SQLiteSessionStore(SessionStore):
                 "ORDER BY sequence ASC LIMIT ?",
                 (
                     session_id,
-                    *lookup_keys,
+                    json.dumps(lookup_keys),
                     *lifecycle_event_types,
                     tool_round_identity.tool_round_id,
                     tool_round_identity.model_step_id,
                     tool_round_identity.model_attempt_id,
-                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                    _tool_round_lifecycle_event_limit(copied_ids) + 1,
                 ),
             ).fetchall()
-            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [_event_from_row(row) for row in rows]
 

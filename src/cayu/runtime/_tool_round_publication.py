@@ -50,8 +50,6 @@ from cayu.runtime._tool_round_recovery import (
     ready_assistant_publication_message,
 )
 from cayu.sessions.base import (
-    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
-    RUNTIME_PUBLICATION_MAX_TOOL_CALLS,
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionStatus,
@@ -135,21 +133,13 @@ def collect_tool_round_publication_evidence(
     session_id = require_clean_nonblank(session_id, "session_id")
     copied_pending_round = _copy_pending_round(pending_round)
     pending_calls = tuple(copied_pending_round.tool_calls)
-    if len(pending_calls) > RUNTIME_PUBLICATION_MAX_TOOL_CALLS:
-        raise ValueError(
-            "Pending tool round cannot contain more than "
-            f"{RUNTIME_PUBLICATION_MAX_TOOL_CALLS} tool calls."
-        )
     pending_calls_by_id = {call.tool_call_id: call for call in pending_calls}
     if len(pending_calls_by_id) != len(pending_calls):
         raise ValueError("Pending tool round cannot repeat tool call ids.")
 
     if type(durable_events) not in (list, tuple):
         raise TypeError("durable_events must be a list or tuple of Event values.")
-    maximum_evidence = min(
-        RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
-        len(pending_calls) * 2,
-    )
+    maximum_evidence = len(pending_calls) * 2
     if len(durable_events) > maximum_evidence:
         raise ValueError(
             "Tool-round durable evidence exceeds the maximum possible started "

@@ -259,7 +259,6 @@ from cayu.sessions.base import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
-    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
     SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
@@ -486,6 +485,7 @@ from cayu.sessions.base import (
     _terminal_publication_delete_block_reason,
     _terminal_session_evidence_expected_event_type,
     _tool_lifecycle_publication_identity,
+    _tool_round_lifecycle_event_limit,
     _validate_equivalent_queued_session_message,
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
@@ -34448,11 +34448,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 execution_identity.tool_round_id,
                                 execution_identity.model_step_id,
                                 execution_identity.model_attempt_id,
-                                RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                                _tool_round_lifecycle_event_limit(tool_call_ids) + 1,
                             ),
                         )
                         rows = await cur.fetchall()
-                        if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                        if len(rows) > _tool_round_lifecycle_event_limit(tool_call_ids):
                             raise ValueError(
                                 "Tool-round lifecycle evidence exceeds the publication limit."
                             )
@@ -35488,11 +35488,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     session_id,
                     lookup_keys,
                     lifecycle_event_types,
-                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                    _tool_round_lifecycle_event_limit(copied_ids) + 1,
                 ),
             )
             rows = await cur.fetchall()
-            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [Event(**_json_obj(row[0])) for row in rows]
 
@@ -35543,11 +35543,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     tool_round_identity.tool_round_id,
                     tool_round_identity.model_step_id,
                     tool_round_identity.model_attempt_id,
-                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                    _tool_round_lifecycle_event_limit(copied_ids) + 1,
                 ),
             )
             rows = await cur.fetchall()
-            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [Event(**_json_obj(row[0])) for row in rows]
 

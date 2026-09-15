@@ -5467,7 +5467,6 @@ RUNTIME_PUBLICATION_SCHEMA_VERSION = 2
 RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS = 128
 RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
 RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
-RUNTIME_PUBLICATION_MAX_TOOL_CALLS = 256
 PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY = "pending_completion_finalization"
 _PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
@@ -5882,10 +5881,11 @@ class RuntimePublicationRequest(BaseModel):
                 f"{RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES} messages."
             )
         event_binding_count = len(self.events) + len(self.referenced_events)
-        if event_binding_count > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+        event_binding_limit = _runtime_publication_event_limit(self.kind, self.intent)
+        if event_binding_count > event_binding_limit:
             raise ValueError(
                 "events and referenced_events cannot contain more than "
-                f"{RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS} total event bindings."
+                f"{event_binding_limit} total event bindings."
             )
         appended_event_ids = {event.id for event in self.events}
         referenced_event_ids = {reference.event_id for reference in self.referenced_events}
@@ -5993,10 +5993,9 @@ class RuntimePublicationReceipt(BaseModel):
             > RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES
         ):
             raise ValueError("Runtime publication receipt transcript span is too large.")
-        if (
-            len(self.appended_event_ids) + len(self.referenced_events)
-            > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS
-        ):
+        if len(self.appended_event_ids) + len(
+            self.referenced_events
+        ) > _runtime_publication_event_limit(self.kind, self.intent):
             raise ValueError("Runtime publication receipt event binding count is too large.")
         referenced_event_ids = {reference.event_id for reference in self.referenced_events}
         if set(self.appended_event_ids) & referenced_event_ids:
@@ -12117,7 +12116,7 @@ class SessionStore(ABC):
                 if record.event.payload.get("tool_call_id") not in selected_ids:
                     continue
                 lifecycle_events.append(copy_event(record.event))
-                if len(lifecycle_events) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                if len(lifecycle_events) > _tool_round_lifecycle_event_limit(copied_ids):
                     raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             after_sequence = records[-1].sequence
             if len(records) < 5000:
@@ -12170,7 +12169,7 @@ class SessionStore(ABC):
                 ):
                     continue
                 lifecycle_events.append(copy_event(event))
-                if len(lifecycle_events) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                if len(lifecycle_events) > _tool_round_lifecycle_event_limit(copied_ids):
                     raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             after_sequence = records[-1].sequence
             if len(records) < 5000:
@@ -20040,7 +20039,7 @@ class InMemorySessionStore(SessionStore):
                         execution_identity,
                     )
                 )
-            if len(durable_tool_events) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(durable_tool_events) > _tool_round_lifecycle_event_limit(tool_call_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
         _validate_tool_round_publication(
             request,
@@ -20240,7 +20239,7 @@ class InMemorySessionStore(SessionStore):
                 if record.event.type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES
             ]
             records.sort(key=lambda record: record.sequence)
-            if len(records) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(records) > _tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [copy_event(record.event) for record in records]
 
@@ -20271,7 +20270,7 @@ class InMemorySessionStore(SessionStore):
                 )
             ]
             records.sort(key=lambda record: record.sequence)
-            if len(records) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            if len(records) > _tool_round_lifecycle_event_limit(copied_ids):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [copy_event(record.event) for record in records]
 
@@ -26280,6 +26279,21 @@ def _validate_runtime_publication_event_references(
             )
 
 
+def _tool_round_lifecycle_event_limit(tool_call_ids: list[str] | tuple[str, ...]) -> int:
+    # At most one started and one terminal event per admitted call. Retain the
+    # historical allowance for small/legacy lookups; semantic validation still
+    # rejects duplicate or contradictory lifecycle evidence.
+    return max(RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS, 2 * len(tool_call_ids))
+
+
+def _runtime_publication_event_limit(kind: str, intent: dict[str, Any]) -> int:
+    if kind in {"tool-round", "user-input-close"}:
+        call_ids = intent.get("tool_call_ids")
+        if type(call_ids) is list or type(call_ids) is tuple:
+            return _tool_round_lifecycle_event_limit(call_ids)
+    return RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS
+
+
 def _validate_tool_round_call_ids(
     value: Any,
     field_name: str,
@@ -26289,10 +26303,8 @@ def _validate_tool_round_call_ids(
     tool_call_ids = tuple(
         require_clean_nonblank(tool_call_id, f"{field_name} item") for tool_call_id in value
     )
-    if not tool_call_ids or len(tool_call_ids) > RUNTIME_PUBLICATION_MAX_TOOL_CALLS:
-        raise ValueError(
-            f"{field_name} must contain between 1 and {RUNTIME_PUBLICATION_MAX_TOOL_CALLS} values."
-        )
+    if not tool_call_ids:
+        raise ValueError(f"{field_name} must contain at least one value.")
     if len(set(tool_call_ids)) != len(tool_call_ids):
         raise ValueError(f"{field_name} cannot repeat tool call ids.")
     return tool_call_ids

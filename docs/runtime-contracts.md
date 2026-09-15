@@ -5076,11 +5076,15 @@ Tool-round publication loads lifecycle evidence by both the provider call ids an
 the stable logical round id. A provider may reuse a call id in a later round;
 well-formed evidence from an older round is excluded, while roundless or
 malformed evidence remains visible so validation fails closed instead of
-silently treating it as unrelated. Built-in stores bound the exact-round result
-to 513 rows before event materialization (512 is the publication maximum) and
-use the pending-action lifecycle index rather than scanning a session's event
-history. The atomic publisher repeats the same scoped lookup under its store
-lock or transaction. After a published assistant tool-call message no longer
+silently treating it as unrelated. Lifecycle lookup and publication allowance
+scale with the admitted call set: `max(512, 2 * number_of_calls)` event bindings,
+with one extra lookup row used to detect overflow. Ordinary round validation
+still permits at most one started and one terminal event per call. A round with
+more than 256 calls is therefore not rejected solely for its size. Built-in
+stores use the pending-action lifecycle index rather than scanning session
+history. SQLite binds the call lookup keys as one JSON array, avoiding a growing
+number of SQL host parameters. The atomic publisher repeats the same scoped
+lookup under its store lock or transaction. After a published assistant tool-call message no longer
 has a pending round or pause marker, recovery also requires the immediately
 following transcript message to contain exactly one ordered tool result for
 each `(tool_call_id, tool_name)` pair before another provider dispatch.
