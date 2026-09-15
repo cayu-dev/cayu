@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-09-09",
-  "generated_at": "2026-09-09",
+  "catalog_version": "2026-09-15",
+  "generated_at": "2026-09-15",
   "models": [
     {
       "aliases": [],
@@ -671,7 +671,7 @@
       "model": "claude-fable-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-13",
+        "as_of": "2026-09-15",
         "source": "official",
         "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/fable-5"
       },
@@ -705,7 +705,7 @@
       "model": "claude-opus-4-8",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-13",
+        "as_of": "2026-09-15",
         "source": "official",
         "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/opus-4-8"
       },
@@ -770,7 +770,7 @@
       "model": "claude-sonnet-4-6",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-13",
+        "as_of": "2026-09-15",
         "source": "official",
         "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/sonnet-4-6"
       },
@@ -804,7 +804,7 @@
       "model": "claude-sonnet-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-08-13",
+        "as_of": "2026-09-15",
         "source": "official",
         "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/sonnet-5"
       },

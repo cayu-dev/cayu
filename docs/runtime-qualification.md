@@ -10,7 +10,7 @@ From a checkout matching the candidate build:
 ```sh
 uv build --wheel
 uv venv /tmp/cayu-qualification-env
-uv pip install --python /tmp/cayu-qualification-env/bin/python 'dist/cayu-0.5.2-py3-none-any.whl[dev]'
+uv pip install --python /tmp/cayu-qualification-env/bin/python 'dist/cayu-0.6.0-py3-none-any.whl[dev]'
 python scripts/run_runtime_qualification.py \
   --python /tmp/cayu-qualification-env/bin/python \
   --report runtime-qualification.json

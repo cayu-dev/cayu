@@ -224,8 +224,12 @@ def test_documentation_and_packaged_guides_use_current_module_paths():
     )
     for directory in ("docs", "examples", "src/cayu/guides"):
         for path in (_ROOT / directory).rglob("*.md"):
-            # The historical-to-current lookup table is the explicit migration boundary.
-            if path == _ROOT / "docs/public-concepts.md":
+            # Migration guidance must name removed imports; published release notes
+            # are immutable history, checked by verify_release_state.py.
+            if path in {
+                _ROOT / "docs/public-concepts.md",
+                _ROOT / "docs/release-notes.md",
+            }:
                 continue
             assert pattern.search(path.read_text()) is None, path
 

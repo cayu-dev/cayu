@@ -2,22 +2,44 @@
 
 ## Unreleased
 
-- Refresh-owned modern stdio MCP sources now subscribe to tool-list changes
-  through the existing shared reader and atomic refresh path. Subscription
-  establishment and cancellation are bounded; acknowledged subscriptions may
-  remain quiet without closing a healthy process. Graceful
-  completion re-subscribes without restarting the process or replaying calls.
+## v0.6.0
 
-- Refresh-owned modern HTTP MCP sources now use correlated tool-list
-  subscriptions. Acknowledgement and reconnect reconcile the catalogue through
-  the existing atomic refresh path; lost continuity fences stale dispatch.
-  Resource/prompt filters and response caching remain deferred.
+Cayu adds durable lifecycle controls and portable evaluations, with public APIs
+organized by the concepts applications use.
 
-- Add explicit pinned MCP `2026-07-28` stdio support through
-  `StdioMcpClient(protocol_era=McpProtocolEra.MODERN_2026_07_28)`, with discovery,
-  modern request metadata, validated results, and bounded process cleanup.
-  Legacy MCP remains the default; automatic fallback, response caching,
-  subscriptions, and MRTR are not included.
+- Public APIs move to concept-owned packages, with typed exports and a complete
+  import migration map. `cayu new` is the canonical application starting point.
+- Durable session closure exposes cleanup evidence and scoped drain, including
+  owned stores and descendants. Recovery retains interrupted tool, child,
+  cancellation, and deadline evidence.
+- Add one-shot task scheduling, durable human-attention notification integrations,
+  and operational health for persisted event side effects.
+- Add portable benchmark packages and native benchmark campaigns with retained
+  admissions, trial policies, results, and restart-aware inspection.
+- Add durable, opt-in provider failover for ordinary model steps.
+- OpenAI Responses supports explicit non-streaming mode. Provider diagnostics,
+  stream deadlines, and HTTP cleanup retain more actionable failure evidence.
+- Modern MCP stdio and HTTP sources support correlated tool-list subscriptions
+  through atomic refresh. Stdio supports explicitly pinned `2026-07-28`; legacy
+  MCP remains the default. Response caching and resource/prompt filters remain
+  deferred.
+- Register custom automatic-recall sources, account for tool-owned inference,
+  continue bounded compaction until context fits, and remove the arbitrary
+  256-step allowance ceiling.
+
+### Upgrade from v0.5.2
+
+Update the application and its dependencies together. Replace removed module
+imports, including `cayu.core`, using the
+[public API migration guide](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md).
+Historical pickle references to the old modules are unsupported; cross-version
+recovery is not guaranteed.
+
+This release requires storage revision **90** (previously **84**). Older populated
+stores may require recreation; inspect them with `cayu storage status` before
+upgrading. Server contract **44** and manifest/generator schema **17** remain
+unchanged. Refresh generated clients and test the complete application before
+adoption.
 
 ## v0.5.2
 
@@ -435,7 +457,7 @@ overflow rebuilding, typed provider outcomes, cancellation, and durable
 background recovery advance the original attempt lifecycles conservatively.
 
 `runtime_evidence(...)` schema 4 and standalone trajectory schema 4 now expose
-the same bounded `cayu.memory.attribution.v1` read model. It correlates receipts,
+the same bounded `cayu.memory_attribution.v1` read model. It correlates receipts,
 exposures, item links, and lifecycle truth through session-scoped HMAC aliases
 without publishing raw memory identity or content. Global count and byte bounds,
 lower-bound omission counts, and distinct unavailable, redacted, truncated,
