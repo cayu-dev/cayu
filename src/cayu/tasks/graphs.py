@@ -197,7 +197,7 @@ def task_graph_with_runtime_admission(
     return copy_task_graph_create(copied)
 
 
-def task_graph_request_sha256(request: TaskGraphCreate) -> str:
+def task_graph_authority_document(request: TaskGraphCreate) -> dict:
     request = copy_task_graph_create(request)
     document = request.model_dump(mode="json", warnings=False)
     document["submitted_request_sha256"] = request._submitted_request_sha256
@@ -225,7 +225,11 @@ def task_graph_request_sha256(request: TaskGraphCreate) -> str:
         }
         for node in request.nodes
     ]
-    canonical = canonical_durable_json_bytes(document, "graph")
+    return document
+
+
+def task_graph_request_sha256(request: TaskGraphCreate) -> str:
+    canonical = canonical_durable_json_bytes(task_graph_authority_document(request), "graph")
     if len(canonical) > TASK_GRAPH_MAX_BYTES:
         raise ValueError("Task graph authority exceeds its canonical byte limit.")
     return sha256(canonical).hexdigest()

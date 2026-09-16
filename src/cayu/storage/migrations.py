@@ -457,6 +457,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=90, kind=RevisionKind.BREAKING, compatible_from=90),
     # Every task writer must enforce immutable dependency readiness.
     Revision(revision=91, kind=RevisionKind.BREAKING, compatible_from=91),
+    # Group-aware writers must atomically settle policies with member outcomes.
+    Revision(revision=92, kind=RevisionKind.BREAKING, compatible_from=92),
 )
 
 #: The revision an empty database is initialized to.

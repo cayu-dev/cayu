@@ -31,6 +31,7 @@ from cayu.tasks.contracts import (
     WorkContractConflict,
 )
 from cayu.tasks.graphs import TaskGraphConflict, TaskGraphUnavailable
+from cayu.tasks.groups import TaskGroupConflict, TaskGroupUnavailable
 from cayu.tasks.scheduling import TaskScheduleConflict
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
@@ -493,6 +494,8 @@ def _detached_task_store_failure(
         TaskScheduleConflict,
         TaskGraphConflict,
         TaskGraphUnavailable,
+        TaskGroupConflict,
+        TaskGroupUnavailable,
         KeyError,
         ValueError,
         TypeError,
@@ -657,6 +660,8 @@ def _generic_task_store_failure(
         TaskScheduleConflict,
         TaskGraphConflict,
         TaskGraphUnavailable,
+        TaskGroupConflict,
+        TaskGroupUnavailable,
         KeyError,
         ValueError,
         TypeError,

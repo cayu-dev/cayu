@@ -42,6 +42,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Session-store targets](session-store-targets.md)
 - [Durable one-shot task scheduling](task-scheduling.md)
 - [Durable task dependencies](task-graphs.md)
+- [Durable task groups](task-groups.md)
 - [Triggering runs](triggering-runs.md)
 - [Virtual egress](virtual-egress.md)
 - [Web fetch](web-fetch.md)

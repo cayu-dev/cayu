@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
 
 
-async def create_task_graph(app: CayuApp, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
+def validate_graph_request(app: CayuApp, request: TaskGraphCreate) -> TaskGraphCreate:
     validation = capture_sensitive_validation(
         lambda value=request: copy_task_graph_create(value),
         operation_name="Task graph validation",
@@ -87,6 +87,13 @@ async def create_task_graph(app: CayuApp, request: TaskGraphCreate) -> TaskGraph
     ):
         del identities, copied
         raise ValueError("Task graph identity contains a workload secret.")
+    return copied
+
+
+async def create_task_graph(app: CayuApp, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
+    copied = validate_graph_request(app, request)
+    store = app.task_store
+    assert store is not None
     submitted_digest = task_graph_request_sha256(copied)
     existing = await load_task_graph(app, copied.graph_id)
     if existing is not None:
@@ -96,103 +103,8 @@ async def create_task_graph(app: CayuApp, request: TaskGraphCreate) -> TaskGraph
         ):
             raise TaskGraphConflict("Graph identity has different submission content.")
         return existing.receipt
-    prepared = []
-    for node in copied.nodes:
-        task = node.task
-        if (
-            task.session_id is not None
-            and task._verified_invocation_origin is None
-            and task._runtime_session_binding is None
-        ):
-            lookup = await capture_task_store_operation(
-                partial(app.session_store.load_invocation_snapshot, task.session_id),
-                operation_name="Graph session invocation lookup",
-                redactor=app._secret_redactor,
-            )
-            if lookup.failure is not None:
-                raise_task_store_operation_failure(lookup.failure)
-            snapshot = lookup.result
-            if snapshot is not None:
-                bound = capture_sensitive_validation(
-                    lambda task=task, snapshot=snapshot: task_create_with_runtime_invocation(
-                        task,
-                        source=task._runtime_invocation_source or TaskExecutionSource.SDK_TASK,
-                        session_invocation=snapshot,
-                    ),
-                    operation_name="Graph session invocation validation",
-                    redactor=app._secret_redactor,
-                )
-                if bound.failure is not None:
-                    raise_task_store_operation_failure(bound.failure)
-                if bound.result is None:
-                    raise TaskGraphConflict("Graph session invocation is unavailable.")
-                task = bound.result
-        prepared.append(TaskGraphNode(task=task, prerequisite_task_ids=node.prerequisite_task_ids))
-    prepared_request = TaskGraphCreate(graph_id=copied.graph_id, nodes=tuple(prepared))
-    member_ids = {node.task.task_id for node in prepared_request.nodes}
-    external_parents = sorted(
-        {
-            node.task.parent_task_id
-            for node in prepared_request.nodes
-            if node.task.parent_task_id is not None and node.task.parent_task_id not in member_ids
-        }
-    )
-    parents = {}
-    for identity in external_parents:
-        lookup = await capture_task_store_operation(
-            partial(store.load_invocation_snapshot, identity),
-            operation_name="Graph parent invocation lookup",
-            redactor=app._secret_redactor,
-        )
-        if lookup.failure is not None:
-            raise_task_store_operation_failure(lookup.failure)
-        value = lookup.result
-        if type(value) is not TaskInvocationSnapshot:
-            raise TaskGraphConflict("Graph parent invocation authority is unavailable.")
-        checked = capture_sensitive_validation(
-            lambda value=value: TaskInvocationSnapshot(
-                id=value.id,
-                session_id=value.session_id,
-                session_instance_id=value.session_instance_id,
-                invocation=value.invocation,
-            ),
-            operation_name="Graph parent invocation validation",
-            redactor=app._secret_redactor,
-        )
-        if checked.failure is not None:
-            raise_task_store_operation_failure(checked.failure)
-        if checked.result is None or checked.result.id != identity:
-            raise TaskGraphConflict("Graph parent invocation identity conflicts.")
-        parents[identity] = checked.result
-    prepared_request = task_graph_with_runtime_admission(
-        prepared_request,
-        submitted_request_sha256=submitted_digest,
-        parents=tuple(parents[identity] for identity in sorted(parents)),
-    )
+    prepared_request = await prepare_graph_request(app, copied)
     expected_digest = task_graph_request_sha256(prepared_request)
-    # Validate the whole batch (including inherited lineage and graph fields)
-    # before a custom store can publish even its first member. Store-owned
-    # contract registration and closure decisions remain in the transaction.
-    preview = capture_sensitive_validation(
-        lambda: prepare_graph_admission(
-            prepared_request,
-            digest=expected_digest,
-            now=datetime.now(UTC),
-            parents=parents,
-            validate_task=lambda request: None,
-        ),
-        operation_name="Graph admission preflight",
-        redactor=app._secret_redactor,
-    )
-    if preview.failure is not None:
-        raise_task_store_operation_failure(preview.failure)
-    if preview.result is None:
-        raise TaskGraphConflict("Graph admission preflight is unavailable.")
-    if any(
-        invocation_contains_secret_public_identity(task.invocation, app._secret_redactor)
-        for task in preview.result.tasks
-    ):
-        raise ValueError("Task graph inherited invocation authority contains a workload secret.")
     outcome = await capture_task_store_operation(
         partial(store.create_task_graph, prepared_request),
         operation_name="Task graph admission",
@@ -325,3 +237,108 @@ async def list_task_graph_events(
         ):
             raise TaskGraphConflict("Task graph event identity is unsafe.")
     return events
+
+
+async def prepare_graph_request(app: CayuApp, copied: TaskGraphCreate) -> TaskGraphCreate:
+    """Shared SDK provenance preparation; never publishes or replays admission."""
+    store = app.task_store
+    assert store is not None
+    submitted_digest = task_graph_request_sha256(copied)
+    prepared = []
+    for node in copied.nodes:
+        task = node.task
+        if (
+            task.session_id is not None
+            and task._verified_invocation_origin is None
+            and task._runtime_session_binding is None
+        ):
+            lookup = await capture_task_store_operation(
+                partial(app.session_store.load_invocation_snapshot, task.session_id),
+                operation_name="Graph session invocation lookup",
+                redactor=app._secret_redactor,
+            )
+            if lookup.failure is not None:
+                raise_task_store_operation_failure(lookup.failure)
+            snapshot = lookup.result
+            if snapshot is not None:
+                bound = capture_sensitive_validation(
+                    lambda task=task, snapshot=snapshot: task_create_with_runtime_invocation(
+                        task,
+                        source=task._runtime_invocation_source or TaskExecutionSource.SDK_TASK,
+                        session_invocation=snapshot,
+                    ),
+                    operation_name="Graph session invocation validation",
+                    redactor=app._secret_redactor,
+                )
+                if bound.failure is not None:
+                    raise_task_store_operation_failure(bound.failure)
+                if bound.result is None:
+                    raise TaskGraphConflict("Graph session invocation is unavailable.")
+                task = bound.result
+        prepared.append(TaskGraphNode(task=task, prerequisite_task_ids=node.prerequisite_task_ids))
+    prepared_request = TaskGraphCreate(graph_id=copied.graph_id, nodes=tuple(prepared))
+    member_ids = {node.task.task_id for node in prepared_request.nodes}
+    external_parents = sorted(
+        {
+            node.task.parent_task_id
+            for node in prepared_request.nodes
+            if node.task.parent_task_id is not None and node.task.parent_task_id not in member_ids
+        }
+    )
+    parents = {}
+    for identity in external_parents:
+        lookup = await capture_task_store_operation(
+            partial(store.load_invocation_snapshot, identity),
+            operation_name="Graph parent invocation lookup",
+            redactor=app._secret_redactor,
+        )
+        if lookup.failure is not None:
+            raise_task_store_operation_failure(lookup.failure)
+        value = lookup.result
+        if type(value) is not TaskInvocationSnapshot:
+            raise TaskGraphConflict("Graph parent invocation authority is unavailable.")
+        checked = capture_sensitive_validation(
+            lambda value=value: TaskInvocationSnapshot(
+                id=value.id,
+                session_id=value.session_id,
+                session_instance_id=value.session_instance_id,
+                invocation=value.invocation,
+            ),
+            operation_name="Graph parent invocation validation",
+            redactor=app._secret_redactor,
+        )
+        if checked.failure is not None:
+            raise_task_store_operation_failure(checked.failure)
+        if checked.result is None or checked.result.id != identity:
+            raise TaskGraphConflict("Graph parent invocation identity conflicts.")
+        parents[identity] = checked.result
+    prepared_request = task_graph_with_runtime_admission(
+        prepared_request,
+        submitted_request_sha256=submitted_digest,
+        parents=tuple(parents[identity] for identity in sorted(parents)),
+    )
+    expected_digest = task_graph_request_sha256(prepared_request)
+    # Validate the whole batch (including inherited lineage and graph fields)
+    # before a custom store can publish even its first member. Store-owned
+    # contract registration and closure decisions remain in the transaction.
+    preview = capture_sensitive_validation(
+        lambda: prepare_graph_admission(
+            prepared_request,
+            digest=expected_digest,
+            now=datetime.now(UTC),
+            parents=parents,
+            validate_task=lambda request: None,
+        ),
+        operation_name="Graph admission preflight",
+        redactor=app._secret_redactor,
+    )
+    if preview.failure is not None:
+        raise_task_store_operation_failure(preview.failure)
+    if preview.result is None:
+        raise TaskGraphConflict("Graph admission preflight is unavailable.")
+    if any(
+        invocation_contains_secret_public_identity(task.invocation, app._secret_redactor)
+        for task in preview.result.tasks
+    ):
+        raise ValueError("Task graph inherited invocation authority contains a workload secret.")
+    return prepared_request

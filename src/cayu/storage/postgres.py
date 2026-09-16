@@ -64,6 +64,12 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.tasks.groups import (
+        TaskGroupCreate,
+        TaskGroupCreationReceipt,
+        TaskGroupEvent,
+        TaskGroupSnapshot,
+    )
 
 try:
     from psycopg import AsyncConnection, sql
@@ -604,6 +610,7 @@ from cayu.storage._postgres_verified_work import (
 )
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._task_graph_schema import POSTGRES_TASK_GRAPH_DDL
+from cayu.storage._task_group_schema import POSTGRES_TASK_GROUP_DDL
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
@@ -1072,7 +1079,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 88
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 91
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 92
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
 
@@ -1405,6 +1412,7 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     90: POSTGRES_SCHEDULING_DDL,
+    92: POSTGRES_TASK_GROUP_DDL,
     91: POSTGRES_TASK_GRAPH_DDL,
     88: (
         """
@@ -5593,7 +5601,7 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
         ),
     ),
     # This pending-action index change is not registered in REVISIONS yet.
-    92: (
+    93: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -39340,6 +39348,25 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
+    supports_task_groups: ClassVar[bool] = True
+
+    async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
+        from cayu.storage._postgres_task_groups import create_group
+
+        return await create_group(self, request)
+
+    async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
+        from cayu.storage._postgres_task_groups import load_group
+
+        return await load_group(self, group_id)
+
+    async def list_task_group_events(
+        self, group_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGroupEvent]:
+        from cayu.storage._postgres_task_groups import list_events
+
+        return await list_events(self, group_id, after_sequence=after_sequence, limit=limit)
+
     supports_task_scheduling: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True

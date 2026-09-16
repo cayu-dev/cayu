@@ -50,6 +50,7 @@ from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
 )
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
+from cayu.storage._task_group_schema import SQLITE_TASK_GROUP_DDL
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
@@ -970,6 +971,7 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    92: SQLITE_TASK_GROUP_DDL,
     91: SQLITE_TASK_GRAPH_DDL,
     90: SQLITE_SCHEDULING_DDL,
     81: """

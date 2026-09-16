@@ -88,6 +88,10 @@ terminal, existing task/session deletion rules may remove live task records;
 minimal terminal member evidence and graph identity remain available. Retained
 member IDs cannot be reused for new work.
 
+For an explicit completion policy over selected tasks in a new graph, see
+[durable task groups](task-groups.md). Graph readiness remains independent of
+group success; an early group decision does not stop remaining graph work.
+
 The Python SDK and all three built-in task stores support graph operations.
 Custom task stores must implement the graph contract and explicitly expose
 `supports_task_graphs`; the base implementation refuses graph operations.

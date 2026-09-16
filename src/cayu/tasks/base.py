@@ -25,6 +25,12 @@ if TYPE_CHECKING:
         TaskGraphMember,
         TaskGraphSnapshot,
     )
+    from cayu.tasks.groups import (
+        TaskGroupCreate,
+        TaskGroupCreationReceipt,
+        TaskGroupEvent,
+        TaskGroupSnapshot,
+    )
 
 from pydantic import (
     BaseModel,
@@ -3451,6 +3457,21 @@ class TaskStore(ABC):
 
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_graphs: ClassVar[bool] = False
+    supports_task_groups: ClassVar[bool] = False
+
+    async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
+        """Atomically admit a new graph and immutable group, or replay its receipt."""
+        raise NotImplementedError("This TaskStore does not support task groups.")
+
+    async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
+        """Read the group decision and current selected-member states consistently."""
+        raise NotImplementedError("This TaskStore does not support task groups.")
+
+    async def list_task_group_events(
+        self, group_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGroupEvent]:
+        """Read bounded, ordered, task-store-owned group evidence."""
+        raise NotImplementedError("This TaskStore does not support task groups.")
 
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         """Atomically admit a bounded graph, or replay its exact creation receipt.
@@ -4526,6 +4547,25 @@ class InMemoryTaskStore(TaskStore):
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
+    supports_task_groups: ClassVar[bool] = True
+
+    async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
+        from cayu.tasks._memory_groups import create_group
+
+        return await create_group(self, request, submitted_digest=request._submitted_request_sha256)
+
+    async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
+        from cayu.tasks._memory_groups import load_group
+
+        return await load_group(self, group_id)
+
+    async def list_task_group_events(
+        self, group_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGroupEvent]:
+        from cayu.tasks._memory_groups import list_events
+
+        return await list_events(self, group_id, after_sequence=after_sequence, limit=limit)
+
     supports_task_scheduling: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
@@ -4554,6 +4594,9 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
         self._tasks: dict[str, Task] = {}
+        self._task_groups: dict[str, TaskGroupSnapshot] = {}
+        self._task_group_by_graph: dict[str, str] = {}
+        self._task_group_events: dict[str, list[TaskGroupEvent]] = {}
         self._task_graph_receipts: dict[str, TaskGraphCreationReceipt] = {}
         self._task_graph_members: dict[str, dict[str, tuple[str, ...]]] = {}
         self._task_graph_events: dict[str, list[TaskGraphEvent]] = {}

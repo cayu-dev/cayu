@@ -47,6 +47,12 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.tasks.groups import (
+        TaskGroupCreate,
+        TaskGroupCreationReceipt,
+        TaskGroupEvent,
+        TaskGroupSnapshot,
+    )
 
 from pydantic import ValidationError
 
@@ -761,7 +767,7 @@ from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 88
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 91
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 92
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -16060,6 +16066,24 @@ class SQLiteTaskStore(TaskStore):
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
+    supports_task_groups: ClassVar[bool] = True
+
+    async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
+        from cayu.storage._sqlite_task_groups import create_group
+
+        return await create_group(self, request)
+
+    async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
+        from cayu.storage._sqlite_task_groups import load_group
+
+        return await load_group(self, group_id)
+
+    async def list_task_group_events(
+        self, group_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGroupEvent]:
+        from cayu.storage._sqlite_task_groups import list_events
+
+        return await list_events(self, group_id, after_sequence=after_sequence, limit=limit)
 
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         from cayu.storage._sqlite_task_graphs import create_graph
@@ -21542,7 +21566,7 @@ class SQLiteTaskStore(TaskStore):
                 if schedule is not None:
                     updated = updated.model_copy(update={"schedule": schedule})
                     self._update_task_snapshot_unlocked(updated)
-                    self._record_task_transition_unlocked(prior, updated)
+                self._record_task_transition_unlocked(prior, updated)
                 self._connection.commit()
                 return updated.model_copy(deep=True)
             except BaseException:

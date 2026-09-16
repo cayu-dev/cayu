@@ -1,6 +1,16 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskGroupCreate": ("cayu.tasks.groups", "TaskGroupCreate"),
+    "TaskGroupPolicy": ("cayu.tasks.groups", "TaskGroupPolicy"),
+    "TaskGroupCreationReceipt": ("cayu.tasks.groups", "TaskGroupCreationReceipt"),
+    "TaskGroupSnapshot": ("cayu.tasks.groups", "TaskGroupSnapshot"),
+    "TaskGroupDecision": ("cayu.tasks.groups", "TaskGroupDecision"),
+    "TaskGroupStatus": ("cayu.tasks.groups", "TaskGroupStatus"),
+    "TaskGroupEvent": ("cayu.tasks.groups", "TaskGroupEvent"),
+    "TaskGroupEventType": ("cayu.tasks.groups", "TaskGroupEventType"),
+    "TaskGroupConflict": ("cayu.tasks.groups", "TaskGroupConflict"),
+    "TaskGroupUnavailable": ("cayu.tasks.groups", "TaskGroupUnavailable"),
     "TaskGraphConflict": ("cayu.tasks.graphs", "TaskGraphConflict"),
     "TaskGraphCreate": ("cayu.tasks.graphs", "TaskGraphCreate"),
     "TaskGraphCreationReceipt": ("cayu.tasks.graphs", "TaskGraphCreationReceipt"),
@@ -227,6 +237,16 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "TaskGroupCreate",
+    "TaskGroupPolicy",
+    "TaskGroupCreationReceipt",
+    "TaskGroupSnapshot",
+    "TaskGroupDecision",
+    "TaskGroupStatus",
+    "TaskGroupEvent",
+    "TaskGroupEventType",
+    "TaskGroupConflict",
+    "TaskGroupUnavailable",
     "TaskGraphCreate",
     "TaskGraphNode",
     "TaskGraphCreationReceipt",

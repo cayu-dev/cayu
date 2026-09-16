@@ -12,6 +12,7 @@ from cayu.tasks._graphs import (
     require_graph_membership,
     require_member_authority,
 )
+from cayu.tasks._groups import plan_group_transition, prepare_group_admission, require_group_replay
 from cayu.tasks.base import Task
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -25,17 +26,28 @@ from cayu.tasks.graphs import (
     graph_identifier,
     task_graph_request_sha256,
 )
+from cayu.tasks.groups import TaskGroupConflict, TaskGroupCreate
 
 if TYPE_CHECKING:
     from cayu.tasks.base import InMemoryTaskStore
 
 
 async def create_graph(
-    store: InMemoryTaskStore, request: TaskGraphCreate
+    store: InMemoryTaskStore,
+    request: TaskGraphCreate,
+    *,
+    group: TaskGroupCreate | None = None,
+    submitted_digest: str | None = None,
 ) -> TaskGraphCreationReceipt:
     request = copy_task_graph_create(request)
     digest = task_graph_request_sha256(request)
     async with store._lock:
+        if group is not None:
+            previous_group = store._task_groups.get(group.group_id)
+            if previous_group is not None:
+                require_group_replay(previous_group, group, submitted_digest)
+            elif request.graph_id in store._task_graph_receipts:
+                raise TaskGroupConflict("A group requires a newly admitted graph.")
         existing = store._task_graph_receipts.get(request.graph_id)
         if existing is not None:
             require_graph_membership(
@@ -79,6 +91,9 @@ async def create_graph(
         receipt = admission.receipt
         events = list(admission.events)
         writes = tuple(store._prepare_task_write(task) for task in prepared.values())
+        group_publication = (
+            None if group is None else prepare_group_admission(group, admission, submitted_digest)
+        )
         # All task construction, parent/contract resolution and event validation
         # precede publication. There are no awaits in the mutation section.
         for write in writes:
@@ -89,6 +104,11 @@ async def create_graph(
         store._task_graph_receipts[request.graph_id] = receipt
         store._task_graph_events[request.graph_id] = events
         store._task_graph_by_task.update({identity: request.graph_id for identity in prepared})
+        if group_publication is not None:
+            snapshot = group_publication.snapshot
+            store._task_groups[snapshot.receipt.group_id] = snapshot
+            store._task_group_by_graph[request.graph_id] = snapshot.receipt.group_id
+            store._task_group_events[snapshot.receipt.group_id] = list(group_publication.events)
     store._publish_task_admission_broadcast()
     return receipt.model_copy(deep=True)
 
@@ -142,12 +162,24 @@ def store_graph_task(
         for updated in transition.tasks
         if updated.status in GRAPH_TERMINAL_STATUSES
     }
+    group_id = store._task_group_by_graph.get(graph_id)
+    group_publication = (
+        None
+        if group_id is None
+        else plan_group_transition(
+            store._task_groups[group_id], transition, now=store._ownership_clock()
+        )
+    )
     for write in writes:
         store._publish_prepared_task_write(write)
     for receipt in transition.retry_settlements:
         store._retry_settlements[(receipt.task_id, receipt.idempotency_key)] = receipt
     store._task_graph_terminal_members.update(terminal_members)
     store._task_graph_events[graph_id].extend(transition.events)
+    if group_publication is not None:
+        group_id = group_publication.snapshot.receipt.group_id
+        store._task_groups[group_id] = group_publication.snapshot
+        store._task_group_events[group_id].extend(group_publication.events)
     if any(event.type is TaskGraphEventType.READY for event in transition.events):
         store._publish_task_admission_broadcast()
     return True

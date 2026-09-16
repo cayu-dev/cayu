@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.storage import _sqlite_support as sql
+from cayu.storage import _sqlite_task_groups as groups
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._graphs import (
     GRAPH_TERMINAL_STATUSES,
@@ -17,6 +18,7 @@ from cayu.tasks._graphs import (
     require_graph_membership,
     require_member_authority,
 )
+from cayu.tasks._groups import plan_group_transition, prepare_group_admission
 from cayu.tasks.base import Task, TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -31,18 +33,25 @@ from cayu.tasks.graphs import (
     graph_identifier,
     task_graph_request_sha256,
 )
+from cayu.tasks.groups import TaskGroupCreate
 
 if TYPE_CHECKING:
     from cayu.storage.sqlite import SQLiteTaskStore
 
 
 async def create_graph(
-    store: SQLiteTaskStore, request: TaskGraphCreate
+    store: SQLiteTaskStore,
+    request: TaskGraphCreate,
+    *,
+    group: TaskGroupCreate | None = None,
+    submitted_digest: str | None = None,
 ) -> TaskGraphCreationReceipt:
     request = copy_task_graph_create(request)
     digest = task_graph_request_sha256(request)
     async with store._lock:
         with store._verified_transaction_unlocked():
+            if group is not None:
+                groups.check_admission(store, group, submitted_digest)
             row = store._connection.execute(
                 "SELECT receipt_json FROM cayu_task_graphs WHERE graph_id = ?", (request.graph_id,)
             ).fetchone()
@@ -99,6 +108,11 @@ async def create_graph(
                 parents=parents,
                 validate_task=validate_task,
             )
+            group_publication = (
+                None
+                if group is None
+                else prepare_group_admission(group, admission, submitted_digest)
+            )
             for task in admission.tasks:
                 store._insert_task_unlocked(task)
                 store._connection.execute(
@@ -118,6 +132,8 @@ async def create_graph(
                 ],
             )
             insert_events(store, admission.events)
+            if group_publication is not None:
+                groups.publish(store, group_publication, creating=True)
     store._publish_task_admission_broadcast()
     return admission.receipt
 
@@ -205,6 +221,16 @@ def record_transition(store: SQLiteTaskStore, prior: Task | None, current: Task)
         first_sequence=sequence,
         now=store._ownership_clock(),
     )
+    group_row = store._connection.execute(
+        "SELECT group_id FROM cayu_task_groups WHERE graph_id = ?", (graph_id,)
+    ).fetchone()
+    group_publication = None
+    if group_row is not None:
+        snapshot = groups.read_group(store, group_row[0])
+        assert snapshot is not None
+        group_publication = plan_group_transition(
+            snapshot, transition, now=store._ownership_clock()
+        )
     for task in transition.tasks:
         store._update_task_snapshot_unlocked(task)
         if task.id != current.id:
@@ -228,6 +254,8 @@ def record_transition(store: SQLiteTaskStore, prior: Task | None, current: Task)
             ),
         )
     insert_events(store, transition.events)
+    if group_publication is not None:
+        groups.publish(store, group_publication)
     ready = next(
         (event for event in transition.events if event.type is TaskGraphEventType.READY), None
     )

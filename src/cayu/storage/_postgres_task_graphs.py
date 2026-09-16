@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, LiteralString
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.runtime import _verified_work_policy as verified
 from cayu.storage import _postgres_support as pg
+from cayu.storage import _postgres_task_groups as groups
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._graphs import (
     GRAPH_TERMINAL_STATUSES,
@@ -17,6 +18,7 @@ from cayu.tasks._graphs import (
     require_graph_membership,
     require_member_authority,
 )
+from cayu.tasks._groups import plan_group_transition, prepare_group_admission
 from cayu.tasks.base import Task, TaskInvocationSnapshot
 from cayu.tasks.graphs import (
     TASK_GRAPH_MAX_NODES,
@@ -32,6 +34,7 @@ from cayu.tasks.graphs import (
     graph_identifier,
     task_graph_request_sha256,
 )
+from cayu.tasks.groups import TaskGroupCreate
 
 if TYPE_CHECKING:
     from cayu.storage.postgres import PostgresTaskStore
@@ -139,14 +142,24 @@ async def notify_readiness(cur: Any) -> None:
 
 
 async def create_graph(
-    store: PostgresTaskStore, request: TaskGraphCreate
+    store: PostgresTaskStore,
+    request: TaskGraphCreate,
+    *,
+    group: TaskGroupCreate | None = None,
+    submitted_digest: str | None = None,
 ) -> TaskGraphCreationReceipt:
     request = copy_task_graph_create(request)
     digest = task_graph_request_sha256(request)
     await store._ensure_ready()
 
     async def operation(_conn: Any, cur: Any) -> TaskGraphCreationReceipt:
+        if group is not None:
+            # Admission alone needs a group-ID lock, before graph/task ownership.
+            # Existing group mutations exclusively use their graph lock.
+            await cur.execute("SELECT pg_advisory_xact_lock(843, hashtext(%s))", (group.group_id,))
         await lock_graph(cur, request.graph_id)
+        if group is not None:
+            await groups.check_admission(cur, group, submitted_digest)
         existing = await _receipt(cur, request.graph_id)
         if existing is not None:
             if (
@@ -226,6 +239,9 @@ async def create_graph(
             parents=parents,
             validate_task=lambda _request: None,
         )
+        group_publication = (
+            None if group is None else prepare_group_admission(group, admission, submitted_digest)
+        )
         await cur.execute(
             "INSERT INTO cayu_task_graphs (graph_id, receipt_json) VALUES (%s, %s)",
             (request.graph_id, admission.receipt.model_dump_json()),
@@ -241,6 +257,8 @@ async def create_graph(
             )
             await store._record_schedule_transition(cur, None, task)
         await insert_events(cur, admission.events)
+        if group_publication is not None:
+            await groups.publish(cur, group_publication, creating=True)
         await notify_readiness(cur)
         return admission.receipt
 
@@ -290,6 +308,15 @@ async def record_transition(
         first_sequence=sequence,
         now=await store._verified_evidence_now(cur),
     )
+    await cur.execute("SELECT group_id FROM cayu_task_groups WHERE graph_id = %s", (graph_id,))
+    group_row = await cur.fetchone()
+    group_publication = None
+    if group_row is not None:
+        snapshot = await groups.read_group(cur, group_row[0])
+        assert snapshot is not None
+        group_publication = plan_group_transition(
+            snapshot, transition, now=await store._verified_evidence_now(cur)
+        )
     for task in transition.tasks:
         await store._update_task_snapshot(cur, task)
         if task.id != current.id:
@@ -313,6 +340,8 @@ async def record_transition(
             ),
         )
     await insert_events(cur, transition.events)
+    if group_publication is not None:
+        await groups.publish(cur, group_publication)
     if any(event.type is TaskGraphEventType.READY for event in transition.events):
         await notify_readiness(cur)
 

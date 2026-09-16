@@ -693,6 +693,12 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 if TYPE_CHECKING:
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
+    from cayu.tasks.groups import (
+        TaskGroupCreate,
+        TaskGroupCreationReceipt,
+        TaskGroupEvent,
+        TaskGroupSnapshot,
+    )
 
 
 def _clear_untrusted_exception_traceback(error: BaseException) -> None:
@@ -6756,6 +6762,28 @@ class CayuApp:
             ) from None
         del copied_invocation_snapshot, parent_invocation_snapshot
         return task
+
+    async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
+        """Atomically create a graph and a completion policy over selected members."""
+        from cayu.runtime._task_groups import create_task_group
+
+        return await create_task_group(self, request)
+
+    async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
+        """Inspect a durable group decision without implying member quiescence."""
+        from cayu.runtime._task_groups import load_task_group
+
+        return await load_task_group(self, group_id)
+
+    async def list_task_group_events(
+        self, group_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGroupEvent]:
+        """Read ordered group evidence from the task store."""
+        from cayu.runtime._task_groups import list_task_group_events
+
+        return await list_task_group_events(
+            self, group_id, after_sequence=after_sequence, limit=limit
+        )
 
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         """Atomically submit a bounded self-contained graph through the Python SDK."""
