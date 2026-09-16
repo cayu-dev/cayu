@@ -272,3 +272,46 @@ def test_durable_number_and_nesting_boundaries_are_exact() -> None:
     with pytest.raises(DurableValueError) as raised:
         copy_durable_json_value(beyond_limit, "payload")
     assert raised.value.code == "nesting_too_deep"
+
+
+@given(value=st.text(), limit=st.integers(min_value=3, max_value=512))
+def test_bounded_diagnostic_label_preserves_printable_ascii_projection(value, limit):
+    from cayu._validation import _bounded_ascii_label
+
+    safe = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in value)
+    expected = (
+        "fallback" if not value else safe if len(safe) <= limit else safe[: limit - 3] + "..."
+    )
+    assert _bounded_ascii_label(value, limit=limit, fallback="fallback") == expected
+
+
+def test_generated_paths_do_not_require_python_character_sanitization(monkeypatch):
+    import cayu._validation as validation
+
+    def unexpected(value):
+        raise AssertionError("Printable ASCII diagnostic paths need no per-character Python work")
+
+    monkeypatch.setattr(validation, "ord", unexpected, raising=False)
+    path = "$"
+    for i in range(64):
+        path = validation._durable_child_path(path, i, object_value=bool(i % 2))
+    assert path.isascii() and path.isprintable()
+    assert len(path) <= validation._MAX_DURABLE_ERROR_PATH_CHARS
+
+
+def test_diagnostic_label_does_not_scan_omitted_suffix(monkeypatch):
+    import cayu._validation as validation
+
+    calls = []
+    original_ord = ord
+
+    def counted(value):
+        calls.append(value)
+        return original_ord(value)
+
+    monkeypatch.setattr(validation, "ord", counted, raising=False)
+    assert (
+        validation._bounded_ascii_label("é" * 100_000, limit=12, fallback="value")
+        == "?" * 9 + "..."
+    )
+    assert len(calls) == 9

@@ -404,10 +404,16 @@ def durable_json_object_from_pairs(
 def _bounded_ascii_label(value: object, *, limit: int, fallback: str) -> str:
     if type(value) is not str or not value:
         return fallback
-    safe = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in value)
-    if len(safe) <= limit:
-        return safe
-    return safe[: limit - 3] + "..."
+    truncated = len(value) > limit
+    prefix = value[: limit - 3] if truncated else value
+    # Generated JSON paths are already printable ASCII. Avoid a Python
+    # character walk at every node, and never scan an omitted label suffix.
+    safe = (
+        prefix
+        if prefix.isascii() and prefix.isprintable()
+        else "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in prefix)
+    )
+    return safe + "..." if truncated else safe
 
 
 class FrozenJsonDict(Mapping[str, Any]):
