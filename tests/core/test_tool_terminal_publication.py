@@ -206,6 +206,49 @@ def test_nested_bounded_admission_aggregates_and_rejects_before_wait(child_limit
     asyncio.run(scenario())
 
 
+def test_related_aggregate_oversize_uses_exclusive_family_until_release():
+    async def scenario():
+        governor = ToolTerminalPublicationGovernor(staged_capacity_bytes=100)
+        invocation = _invocation_root()
+        await governor._reserve_invocation_round(
+            session_id="parent",
+            tool_round_id="parent-round",
+            maximum_bytes=60,
+            invocation=invocation,
+        )
+        await governor._reserve_invocation_round(
+            session_id="child",
+            tool_round_id="child-round",
+            maximum_bytes=60,
+            invocation=invocation,
+        )
+        assert governor.snapshot().reserved_round_bytes == 120
+        assert governor.snapshot().active_exclusive_rounds == 2
+        competing = asyncio.create_task(
+            governor.reserve_round(
+                session_id="unrelated",
+                tool_round_id="unrelated",
+                maximum_bytes=20,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not competing.done()
+            governor.release_round(session_id="parent", tool_round_id="parent-round")
+            await asyncio.wait_for(competing, timeout=0.5)
+            assert governor.snapshot().reserved_round_bytes == 80
+            assert governor.snapshot().active_exclusive_rounds == 0
+            governor.release_round(session_id="child", tool_round_id="child-round")
+            governor.release_round(session_id="unrelated", tool_round_id="unrelated")
+            assert governor.snapshot().reserved_round_bytes == 0
+            assert governor.snapshot().active_round_reservations == 0
+        finally:
+            competing.cancel()
+            await asyncio.gather(competing, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_copy_event_reuses_validated_text_but_revalidates_mutation(monkeypatch) -> None:
     content = "large-validated-content-" + ("x" * 500_000)
     event = Event(

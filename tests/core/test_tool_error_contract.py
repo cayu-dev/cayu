@@ -257,7 +257,15 @@ def test_workspace_file_tools_reject_unknown_arguments_before_resource_lookup(to
     [
         (
             ReadFileTool(),
-            {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages"},
+            {
+                "path",
+                "artifact_id",
+                "max_bytes",
+                "offset",
+                "max_attachment_bytes",
+                "pages",
+                "image_region",
+            },
         ),
         (ListFilesTool(), {"pattern", "limit", "offset", "max_result_bytes"}),
         (ListArtifactsTool(), {"scope", "limit"}),
