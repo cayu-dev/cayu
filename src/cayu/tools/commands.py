@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from enum import StrEnum
 from inspect import isawaitable
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import (
     copy_json_value,
@@ -45,6 +46,14 @@ DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 MAX_OUTPUT_LIMIT_BYTES = 200_000
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 600
+
+
+def _safe_env_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= 128
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is not None
+    )
 
 
 class CommandPolicyDecision(StrEnum):
@@ -90,6 +99,29 @@ class CommandPolicyResult(BaseModel):
 
     decision: CommandPolicyDecision
     reason: str | None = None
+    denied_env_name: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    allowed_env_names: tuple[str, ...] | None = Field(
+        default=None, max_length=64, exclude_if=lambda value: value is None
+    )
+    allowed_env_names_truncated: bool = Field(default=False, exclude_if=lambda value: not value)
+
+    @field_validator("denied_env_name")
+    @classmethod
+    def validate_denied_env_name(cls, value: str | None) -> str | None:
+        if (
+            value is not None
+            and value != "<invalid-or-oversized-name>"
+            and not _safe_env_name(value)
+        ):
+            raise ValueError("denied_env_name must be a bounded environment identifier")
+        return value
+
+    @field_validator("allowed_env_names")
+    @classmethod
+    def validate_allowed_env_names(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is not None and any(not _safe_env_name(name) for name in value):
+            raise ValueError("allowed_env_names must contain bounded environment identifiers")
+        return value
 
     @field_validator("reason")
     @classmethod
@@ -110,6 +142,11 @@ class CommandPolicy(ABC):
     runner. Hosts that need an allow/deny/approval seam attach a policy via
     ``ExecCommandTool(policy=...)``.
     """
+
+    @property
+    def allowed_environment_names(self) -> tuple[str, ...] | None:
+        """Optional name-only discovery; None means this policy does not declare a list."""
+        return None
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
@@ -201,9 +238,21 @@ class ExecCommandTool(Tool):
         base_spec = type(self).spec if spec is None else spec
         schema = base_spec.input_schema
         schema["properties"]["timeout_s"]["default"] = default_timeout_seconds
-        super().__init__(base_spec.model_copy(update={"input_schema": schema}))
         if policy is not None and not isinstance(policy, CommandPolicy):
             raise TypeError("ExecCommandTool policy must implement CommandPolicy.")
+        names = None if policy is None else policy.allowed_environment_names
+        if names is not None:
+            safe_names = tuple(name for name in names if _safe_env_name(name))[:64]
+            schema["properties"]["env"]["description"] = (
+                "Configured policy environment names (values are never disclosed): "
+                + json.dumps(safe_names)
+                + (
+                    ". List truncated; policy still validates every override."
+                    if len(safe_names) != len(names)
+                    else ". The policy still validates values and execution authority."
+                )
+            )
+        super().__init__(base_spec.model_copy(update={"input_schema": schema}))
         self._policy = policy
         self._default_timeout_seconds = default_timeout_seconds
 
@@ -411,6 +460,19 @@ def _policy_refusal_result(
             ),
             "decision": str(verdict.decision),
             "reason": verdict.reason,
+            **(
+                {"allowed_env_names_truncated": True} if verdict.allowed_env_names_truncated else {}
+            ),
+            **(
+                {"denied_env_name": verdict.denied_env_name}
+                if verdict.denied_env_name is not None
+                else {}
+            ),
+            **(
+                {"allowed_env_names": list(verdict.allowed_env_names)}
+                if verdict.allowed_env_names is not None
+                else {}
+            ),
         },
         is_error=True,
     )

@@ -10322,11 +10322,22 @@ requires the live canonical cwd to be a segment-aware child of a configured
 canonical root. It independently bounds model-supplied environment names and
 values, stdin, and timeout. Shell is a separate capability and remains denied
 when process executables are enabled. Denial and command-approval results name
-only the rejected category; they do not persist argv, environment values,
+the rejected category and, for environment refusals, the offending variable
+name and permitted names; they do not persist argv, environment values,
 stdin, command output, or credentials. `REQUIRE_COMMAND_APPROVAL` is the
 command-policy seam's inline refusal, not the app-level durable approval
 checkpoint. Applications needing durable pause/resume approval should use the
 agent's `ToolPolicy`.
+
+`CommandPolicy.allowed_environment_names` optionally declares name-only discovery.
+`ProcessCommandPolicy` supplies it, and `ExecCommandTool` includes it in the `env`
+parameter description. Structured environment refusals retain `denied_env_name`
+and `allowed_env_names` even when denied arguments are suppressed. Diagnostics
+include at most 64 identifier-shaped names of at most 128 characters; omitted
+names are indicated by `allowed_env_names_truncated`, and an unsafe offending
+name becomes `<invalid-or-oversized-name>`. These are diagnostic bounds, not
+execution limits. Discovery never grants execution or discloses configured or
+submitted values. Custom policies may leave discovery unspecified (`None`).
 
 The general process policy deliberately does not interpret executable-specific
 arguments. A specialized policy composes through the existing `CommandPolicy`

@@ -492,3 +492,110 @@ def test_process_command_policy_runs_allowed_and_blocks_denied_command_in_cayu_a
 
 async def _collect_events(app: CayuApp, request: RunRequest):
     return [event async for event in app.run(request)]
+
+
+def test_environment_discovery_is_name_only_bounded_and_instance_local():
+    policy = ProcessCommandPolicy(
+        allowed_env_names={"CI"}, allowed_env_values={"TOKEN": "SECRET-configured"}
+    )
+    tool = ExecCommandTool(policy=policy)
+    description = tool.spec.input_schema["properties"]["env"]["description"]
+    assert '"CI"' in description and '"TOKEN"' in description
+    assert "SECRET-configured" not in description
+    assert "description" not in ExecCommandTool().spec.input_schema["properties"]["env"]
+    many = ProcessCommandPolicy(allowed_env_names={f"NAME_{i}" for i in range(100)})
+    assert (
+        "truncated"
+        in ExecCommandTool(policy=many).spec.input_schema["properties"]["env"]["description"]
+    )
+    many = ProcessCommandPolicy(
+        allowed_executables={"git"},
+        allowed_cwds={"/workspace"},
+        allowed_env_names={f"NAME_{i}" for i in range(100)},
+    )
+    verdict = _evaluate(many, _request("git").model_copy(update={"env": {"OTHER": "secret"}}))
+    assert verdict.allowed_env_names_truncated
+    assert len(verdict.allowed_env_names) == 64
+
+
+@pytest.mark.parametrize("name", ["PYTHONPATH", "BAD\nNAME", "X" * 129])
+def test_environment_denial_records_safe_name_not_values(name):
+    policy = ProcessCommandPolicy(
+        allowed_executables={"git"}, allowed_cwds={"/workspace"}, allowed_env_names={"CI"}
+    )
+    result = _evaluate(
+        policy, _request("git").model_copy(update={"env": {name: "SECRET-supplied"}})
+    )
+    assert result.denied_env_name == (
+        name if name == "PYTHONPATH" else "<invalid-or-oversized-name>"
+    )
+    assert result.allowed_env_names == ("CI",)
+    assert "SECRET-supplied" not in result.model_dump_json()
+    if name != "PYTHONPATH":
+        assert name not in result.model_dump_json()
+
+
+def test_environment_denial_survives_sqlite_reload_without_secret_values(tmp_path):
+    from cayu import SQLiteSessionStore
+
+    async def scenario():
+        path = tmp_path / "denial.sqlite"
+        store = SQLiteSessionStore(path)
+        marker = tmp_path / "must-not-run"
+        policy = ProcessCommandPolicy(
+            allowed_executables={sys.executable},
+            allowed_cwds={str(tmp_path)},
+            allowed_env_values={"TOKEN": "SECRET-configured"},
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="denied",
+                        name="exec_command",
+                        arguments={
+                            "argv": [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+                            "env": {"PYTHONPATH": "SECRET-supplied"},
+                        },
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("Done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), runner=LocalRunner(tmp_path)), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="agent", model="scripted-model"), tools=[ExecCommandTool(policy=policy)]
+        )
+        try:
+            events = await _collect_events(
+                app,
+                RunRequest(
+                    agent_name="agent", session_id="denial", messages=[Message.text("user", "test")]
+                ),
+            )
+            assert events[-1].type is EventType.SESSION_COMPLETED
+        finally:
+            await store.close()
+        reopened = SQLiteSessionStore(path)
+        try:
+            events = await reopened.load_events("denial")
+            blocked = next(e for e in events if e.type is EventType.TOOL_CALL_BLOCKED)
+            assert blocked.payload["arguments_state"] == "unavailable"
+            diagnostic = blocked.payload["result"]["structured"]
+            assert diagnostic["denied_env_name"] == "PYTHONPATH"
+            assert diagnostic["allowed_env_names"] == ["TOKEN"]
+            assert "SECRET-" not in blocked.model_dump_json()
+            assert "SECRET-" not in str(await reopened.load_transcript("denial"))
+            assert not marker.exists()
+        finally:
+            await reopened.close()
+
+    asyncio.run(scenario())

@@ -13,6 +13,7 @@ from cayu.tools.commands import (
     CommandPolicyDecision,
     CommandPolicyResult,
     CommandRequest,
+    _safe_env_name,
 )
 
 DEFAULT_MAX_ENV_VALUE_BYTES = 4096
@@ -81,6 +82,11 @@ class ProcessCommandPolicy(CommandPolicy):
             raise TypeError("shell_decision must be a CommandPolicyDecision.")
         self._shell_decision = shell_decision
 
+    @property
+    def allowed_environment_names(self) -> tuple[str, ...]:
+        """Discover allowed override names without exposing any configured values."""
+        return tuple(sorted(self._allowed_env_names))
+
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return public policy inputs without exposing exact environment values."""
 
@@ -122,7 +128,17 @@ class ProcessCommandPolicy(CommandPolicy):
 
         environment_denial = self._environment_denial(request.env)
         if environment_denial is not None:
-            return _deny(environment_denial)
+            reason, name = environment_denial
+            safe_names = tuple(
+                name for name in self.allowed_environment_names if _safe_env_name(name)
+            )[:64]
+            return CommandPolicyResult(
+                decision=CommandPolicyDecision.DENY,
+                reason=reason,
+                denied_env_name=name if _safe_env_name(name) else "<invalid-or-oversized-name>",
+                allowed_env_names=safe_names,
+                allowed_env_names_truncated=len(safe_names) != len(self.allowed_environment_names),
+            )
 
         if request.stdin is not None:
             if not self._allow_stdin:
@@ -166,15 +182,15 @@ class ProcessCommandPolicy(CommandPolicy):
             "Executable is not allowed by the process policy.",
         )
 
-    def _environment_denial(self, env: Mapping[str, str] | None) -> str | None:
+    def _environment_denial(self, env: Mapping[str, str] | None) -> tuple[str, str] | None:
         for name, value in (env or {}).items():
             if name not in self._allowed_env_names:
-                return "Environment name is not allowed by the process policy."
+                return "Environment name is not allowed by the process policy.", name
             if len(value.encode("utf-8")) > self._max_env_value_bytes:
-                return "Environment value exceeds the process policy byte limit."
+                return "Environment value exceeds the process policy byte limit.", name
             expected = self._allowed_env_values.get(name)
             if expected is not None and value != expected:
-                return "Environment value does not satisfy the process policy."
+                return "Environment value does not satisfy the process policy.", name
         return None
 
 
