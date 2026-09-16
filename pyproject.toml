@@ -19,6 +19,7 @@ dependencies = [
   "jsonschema>=4.23",
   "pydantic>=2.12",
   "referencing>=0.35",
+  "typing-extensions>=4.14.1",
   "tzdata>=2024.0; sys_platform == 'win32'",
 ]
 
