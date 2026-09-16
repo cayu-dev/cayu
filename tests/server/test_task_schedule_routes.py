@@ -129,4 +129,7 @@ def test_schedule_http_validation_is_secret_safe(bad_field, capsys, caplog, recw
     assert asyncio.run(store.list_tasks()) == []
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not recwarn, [
+        (warning.category.__name__, str(warning.message), warning.filename, warning.lineno)
+        for warning in recwarn
+    ]

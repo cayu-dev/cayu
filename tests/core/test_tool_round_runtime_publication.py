@@ -481,6 +481,9 @@ def test_pending_tool_round_recovery_does_not_retry_precommit_rejection() -> Non
     first_checkpoint = asyncio.run(store.load_checkpoint(session_id))
     assert first_checkpoint is not None
     assert first_checkpoint["pending_tool_round"]["tool_round_id"] == round_id
+    staged_terminal = first_checkpoint["pending_tool_round"]["staged_terminals"][0]
+    assert staged_terminal["hooks_state"] == "completed"
+    assert staged_terminal["event"]["payload"]["arguments_state"] == "finalized"
     assert Message.text("user", "continue") not in asyncio.run(store.load_transcript(session_id))
     deferred = asyncio.run(store.load_deferred_interaction_input(session_id))
     assert deferred is not None

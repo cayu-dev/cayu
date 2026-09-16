@@ -7280,7 +7280,13 @@ def test_server_session_events_validates_query() -> None:
     assert client.get("/api/sessions/%20/events").status_code == 422
 
 
-def test_server_exposes_paginated_session_transcript() -> None:
+@pytest.mark.parametrize(
+    ("arguments_state", "arguments"),
+    [("finalized", {"path": "notes/result.txt"}), ("unavailable", {})],
+)
+def test_server_exposes_paginated_session_transcript(arguments_state, arguments) -> None:
+    from cayu.messages import ToolCallPart
+
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -7299,9 +7305,14 @@ def test_server_exposes_paginated_session_transcript() -> None:
             [
                 Message.text("user", "hello"),
                 Message.tool_call(
-                    tool_call_id="call_1",
-                    tool_name="read_file",
-                    arguments={"path": "notes/result.txt"},
+                    calls=[
+                        ToolCallPart(
+                            tool_call_id="call_1",
+                            tool_name="read_file",
+                            arguments=arguments,
+                            arguments_state=arguments_state,
+                        )
+                    ]
                 ),
             ],
             interaction_id="interaction_1",
@@ -7350,8 +7361,8 @@ def test_server_exposes_paginated_session_transcript() -> None:
             "type": "tool_call",
             "tool_call_id": "call_1",
             "tool_name": "read_file",
-            "arguments": {"path": "notes/result.txt"},
-            "arguments_state": "finalized",
+            "arguments": arguments,
+            "arguments_state": arguments_state,
         }
     ]
 

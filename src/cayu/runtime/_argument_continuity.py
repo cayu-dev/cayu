@@ -309,7 +309,7 @@ async def materialize(
                     expected = canonical_durable_json_bytes(
                         original.continuation_arguments(), "omitted provider arguments"
                     ).decode("utf-8")
-                    if part.state.get("arguments") != expected:
+                    if part.state.get("arguments") not in ("{}", expected):
                         continue
                     provider_updates[id(part)] = part.model_copy(
                         update={

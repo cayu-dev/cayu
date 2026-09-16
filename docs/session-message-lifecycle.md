@@ -172,6 +172,19 @@ object. Replay still requires exact terminal argument evidence; unavailable hist
 is never replay authority. Older messages without this field retain the default
 `finalized` representation and do not gain any new replay authority.
 
+An explicitly authorized model-only argument-retention view may restore arguments
+and mark that detached view `finalized`. This does not change the unavailable
+audit transcript or make private arguments publishable. Provider-native history
+receives the same restored, redacted arguments only for its matching suppressed
+call envelope; unrelated submitted arguments are not overwritten.
+
+Recovery preserves sealed argument projections for static secret scopes and
+suppresses arguments when their dynamic secret scope is unavailable. It persists
+its final argument projection in staged terminal evidence before
+publishing the terminal event, including when terminal hooks already completed.
+A rejected later round publication can therefore resume from matching staged and
+durable evidence without repeating the tool or its completed hooks.
+
 ## Store extension guarantee
 
 The base `SessionStore.session_message_lifecycle_version` defaults to `None`.

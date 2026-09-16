@@ -17391,7 +17391,7 @@ class RecoveryCoordinator:
                 ),
                 deferred_terminal_finalizer=(
                     complete_recovered_terminal_hooks
-                    if hooks_state in {"pending", "finalized", "observational"}
+                    if hooks_state in {"pending", "finalized", "observational", "completed"}
                     and expected_outcome.call.id in staged_events_by_id
                     else None
                 ),

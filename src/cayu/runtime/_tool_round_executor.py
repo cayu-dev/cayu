@@ -7320,6 +7320,18 @@ class ToolRoundExecutor:
                 )
             return
         if hooks_already_completed:
+            if deferred_terminal_finalizer is not None:
+                # Recovery may conservatively suppress argument evidence even
+                # when hooks already completed. Persist that final projection
+                # before append, without invoking the hooks again.
+                event = await deferred_terminal_finalizer(event)
+                event = _restore_targeted_tool_invocation_event_authority(
+                    event, tool_call, redactor=resolved_redactor
+                )
+                stored_result = event.payload.get("result")
+                if type(stored_result) is not dict:
+                    raise RuntimeError("Finalized staged terminal lost its tool result.")
+                result = tool_results.tool_result_from_payload(stored_result)
             tool_event = await emit_terminal_event(event)
             yield (
                 tool_event,
