@@ -3808,7 +3808,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "phase provider_dispatch_disposition reason recent_message_count recovery_action "
         "represented_message_count represented_source_end retryable "
         "represented_source_start request_id requested_source_end requested_source_start "
-        "result_transcript_cursor source_run_epoch source_transcript_cursor summary_chars",
+        "result_transcript_cursor source_run_epoch source_transcript_cursor summary_chars "
+        "retained_target retained_target_enforced retained_target_met "
+        "estimated_context_input_tokens estimated_context_window_tokens "
+        "estimated_window_within_trigger",
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         owned_nested_paths=_resolution_actor_nested_paths("actor"),

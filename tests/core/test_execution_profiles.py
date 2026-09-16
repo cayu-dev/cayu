@@ -2246,6 +2246,7 @@ def test_nondefault_checkpoint_summary_prefix_is_private_process_local_material(
         {"max_recent_context_tokens": 650},
         {"reserved_output_tokens": 150},
         {"reserved_summary_tokens": 100},
+        {"enforce_recent_context_target": False},
         {"max_compaction_passes": 2},
     ],
 )
@@ -2280,6 +2281,7 @@ def test_zero_summary_headroom_preserves_selection_fingerprint() -> None:
         ).component(ExecutionProfileComponentClass.CONTEXT_SELECTION)
 
     assert component().fingerprint == component(reserved_summary_tokens=0).fingerprint
+    assert component().fingerprint == component(enforce_recent_context_target=True).fingerprint
 
 
 def test_queued_target_profile_uses_durable_request_controls() -> None:

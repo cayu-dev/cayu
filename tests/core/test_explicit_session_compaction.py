@@ -2732,7 +2732,10 @@ def test_size_based_compaction_reduces_context_when_fixed_overhead_exceeds_targe
     asyncio.run(run())
 
 
-def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() -> None:
+@pytest.mark.parametrize("enforce_target", [True, False])
+def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary(
+    enforce_target,
+) -> None:
     class OversizedSummaryCompactor(RecordingCompactor):
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             self.requests.append(request)
@@ -2773,6 +2776,7 @@ def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() 
         with pytest.raises(ContextBuildError, match="configured size bounds") as first_error:
             await CheckpointCompactionContextPolicy(
                 compactor=first_compactor,
+                enforce_recent_context_target=enforce_target,
                 compact_after_estimated_context_tokens=1_000,
                 max_recent_context_tokens=800,
                 reserved_output_tokens=100,
@@ -2787,6 +2791,7 @@ def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() 
         with pytest.raises(ContextBuildError, match="configured size bounds") as restarted_error:
             await CheckpointCompactionContextPolicy(
                 compactor=restarted_compactor,
+                enforce_recent_context_target=enforce_target,
                 compact_after_estimated_context_tokens=1_000,
                 max_recent_context_tokens=800,
                 reserved_output_tokens=100,
@@ -2806,6 +2811,7 @@ def test_size_based_compaction_fails_closed_and_checkpoints_oversized_summary() 
         with pytest.raises(ContextBuildError, match="configured size bounds"):
             await CheckpointCompactionContextPolicy(
                 compactor=exhausted_compactor,
+                enforce_recent_context_target=enforce_target,
                 compact_after_estimated_context_tokens=1_000,
                 max_recent_context_tokens=800,
                 reserved_output_tokens=100,

@@ -93,12 +93,15 @@ def policy_for(provider, **overrides):
     )
 
 
-def test_bounded_prefixes_fit_in_one_automatic_context_build():
+@pytest.mark.parametrize("enforce_target", [True, False])
+def test_bounded_prefixes_fit_in_one_automatic_context_build(enforce_target):
     async def exercise():
         provider = PrefixSummarizer()
         request = await context_request()
         original = request.model_dump(mode="json")
-        result = await policy_for(provider).build_with_checkpoint(request, checkpoint=None)
+        result = await policy_for(
+            provider, enforce_recent_context_target=enforce_target
+        ).build_with_checkpoint(request, checkpoint=None)
         assert len(provider.requests) == 6
         assert all(len(r.messages[-1].content[0].text) <= 10_000 for r in provider.requests)
         assert request.model_dump(mode="json") == original

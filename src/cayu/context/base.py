@@ -1298,7 +1298,14 @@ def sanitize_context_compaction_telemetry(
         ]
         integer_fields.append("compacted_transcript_cursor")
         if telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED:
-            integer_fields.append("summary_chars")
+            integer_fields.extend(
+                (
+                    "summary_chars",
+                    "retained_target",
+                    "estimated_context_input_tokens",
+                    "estimated_context_window_tokens",
+                )
+            )
         for key in integer_fields:
             value = _compaction_event_integer(source.get(key))
             if value is not None:
@@ -1319,6 +1326,15 @@ def sanitize_context_compaction_telemetry(
             value = _compaction_event_bool(source.get(key))
             if value is not None:
                 payload[key] = value
+        if telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED:
+            for key in (
+                "retained_target_enforced",
+                "retained_target_met",
+                "estimated_window_within_trigger",
+            ):
+                value = _compaction_event_bool(source.get(key))
+                if value is not None:
+                    payload[key] = value
         if telemetry.event_type == EventType.CONTEXT_COMPACTION_FAILED:
             phase = _compaction_event_text(source.get("phase"))
             if phase in {item.value for item in _AutomaticCompactionLifecyclePhase}:
@@ -5613,6 +5629,10 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
     ``max_compaction_passes`` bounds automatic continuation of partially covered
     prefixes in size-based mode. It does not retry failed provider calls or
     expand the selected source range; explicit compaction remains one pass.
+    ``enforce_recent_context_target=False`` makes the retained-size target
+    best-effort. The estimated window trigger (including output reservation)
+    remains a strict bound after size-triggered compaction; no evidence is
+    dropped to meet the target. The default retains strict target enforcement.
     """
 
     def __init__(
@@ -5625,6 +5645,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         max_recent_context_tokens: int | None = None,
         reserved_output_tokens: int = 0,
         reserved_summary_tokens: int = 0,
+        enforce_recent_context_target: bool = True,
         max_compaction_passes: int = 8,
         summary_prefix: str = _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         max_attachment_results: int = 1,
@@ -5682,6 +5703,11 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 "than compact_after_estimated_context_tokens."
             )
         self.max_user_turns = max_user_turns
+        if type(enforce_recent_context_target) is not bool:
+            raise TypeError("enforce_recent_context_target must be a boolean.")
+        if not enforce_recent_context_target and max_recent_context_tokens is None:
+            raise ValueError("Best-effort context targets require size-based compaction.")
+        self.enforce_recent_context_target = enforce_recent_context_target
         self.compact_after_messages = compact_after_messages
         self.compact_after_estimated_context_tokens = compact_after_estimated_context_tokens
         self.max_recent_context_tokens = max_recent_context_tokens
@@ -6225,7 +6251,8 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 reserved_output_tokens=self.reserved_output_tokens,
             )
             projection_exceeds_target = (
-                size_selection_target_satisfied
+                self.enforce_recent_context_target
+                and size_selection_target_satisfied
                 and effective_pressure.estimated_context_input_tokens
                 > self.max_recent_context_tokens
             )
@@ -6233,11 +6260,31 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 effective_pressure.estimated_context_window_tokens
                 >= self.compact_after_estimated_context_tokens
             )
+            if not self.enforce_recent_context_target:
+                # Add observations to existing completion events, not synthetic
+                # provider completions or claims that the desired target was met.
+                for item in compaction_telemetry:
+                    if item.event_type is EventType.CONTEXT_COMPACTION_COMPLETED:
+                        item.payload.update(
+                            retained_target_enforced=False,
+                            retained_target=self.max_recent_context_tokens,
+                            retained_target_met=(
+                                effective_pressure.estimated_context_input_tokens
+                                <= self.max_recent_context_tokens
+                            ),
+                            estimated_context_input_tokens=(
+                                effective_pressure.estimated_context_input_tokens
+                            ),
+                            estimated_context_window_tokens=(
+                                effective_pressure.estimated_context_window_tokens
+                            ),
+                            estimated_window_within_trigger=not projection_still_triggered,
+                        )
             if projection_exceeds_target or projection_still_triggered:
                 size_failure = (
                     f"estimated_input_tokens={effective_pressure.estimated_context_input_tokens}, "
                     f"retained_target={self.max_recent_context_tokens}, "
-                    f"target_enforced={size_selection_target_satisfied}, "
+                    f"target_enforced={self.enforce_recent_context_target and size_selection_target_satisfied}, "
                     f"estimated_window_tokens={effective_pressure.estimated_context_window_tokens}, "
                     f"trigger={self.compact_after_estimated_context_tokens}, "
                     f"represented_cursor={represented_cursor}, requested_cursor={compactable_cursor}"
@@ -6263,7 +6310,8 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         minimum_pressure.estimated_context_window_tokens
                         < self.compact_after_estimated_context_tokens
                         and (
-                            not size_selection_target_satisfied
+                            not self.enforce_recent_context_target
+                            or not size_selection_target_satisfied
                             or minimum_pressure.estimated_context_input_tokens
                             <= self.max_recent_context_tokens
                         )

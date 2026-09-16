@@ -14,7 +14,9 @@ from cayu.context.base import (
     ContextCompactor,
     ContextRequest,
     _estimate_model_facing_context_pressure,
+    copy_context_compaction_telemetry,
 )
+from cayu.events import EventType
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 
 
@@ -92,8 +94,39 @@ def test_summary_growth_headroom_keeps_full_atomic_suffix_within_actual_target(p
             "max_recent_context_tokens": target,
         }
         original = CheckpointCompactionContextPolicy(compactor=GrowingSummary(), **config)
-        with pytest.raises(ContextBuildError, match="within the configured size bounds"):
+        with pytest.raises(ContextBuildError, match="within the configured size bounds") as strict:
             await original.build_with_checkpoint(request, checkpoint=checkpoint)
+        best_effort_compactor = GrowingSummary()
+        best_effort = CheckpointCompactionContextPolicy(
+            compactor=best_effort_compactor, enforce_recent_context_target=False, **config
+        )
+        accepted = await best_effort.build_with_checkpoint(request, checkpoint=checkpoint)
+        assert len(best_effort_compactor.requests) == 1
+        assert accepted.checkpoint == strict.value.checkpoint
+        pressure = _estimate_model_facing_context_pressure(
+            request=request, messages=accepted.messages
+        )
+        assert target < pressure.estimated_context_input_tokens < target + 500
+        completed = [
+            item.payload
+            for item in accepted.compaction_telemetry
+            if item.event_type is EventType.CONTEXT_COMPACTION_COMPLETED
+        ]
+        assert len(completed) == 1
+        assert completed[0]["retained_target_enforced"] is False
+        assert completed[0]["retained_target_met"] is False
+        assert completed[0]["estimated_window_within_trigger"] is True
+        for event in accepted.compaction_telemetry:
+            if event.event_type is EventType.CONTEXT_COMPACTION_COMPLETED:
+                assert copy_context_compaction_telemetry(event).payload == event.payload
+        assert "y" * 1000 in str(accepted.messages)
+        assert "z" * 1000 in str(accepted.messages)
+        restarted_compactor = GrowingSummary()
+        restarted = await CheckpointCompactionContextPolicy(
+            compactor=restarted_compactor, enforce_recent_context_target=False, **config
+        ).build_with_checkpoint(request, checkpoint=accepted.checkpoint)
+        assert restarted.messages == accepted.messages
+        assert restarted_compactor.requests == []
         compactor = GrowingSummary()
         policy = CheckpointCompactionContextPolicy(
             compactor=compactor, reserved_summary_tokens=250, **config
@@ -140,3 +173,14 @@ def test_invalid_summary_headroom_is_rejected(reserve):
 def test_summary_headroom_requires_size_based_selection():
     with pytest.raises(ValueError, match="size-based"):
         CheckpointCompactionContextPolicy(reserved_summary_tokens=10)
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "false"])
+def test_best_effort_target_requires_an_explicit_boolean(value):
+    with pytest.raises(TypeError, match="must be a boolean"):
+        CheckpointCompactionContextPolicy(enforce_recent_context_target=value)
+
+
+def test_best_effort_target_requires_size_based_selection():
+    with pytest.raises(ValueError, match="size-based"):
+        CheckpointCompactionContextPolicy(enforce_recent_context_target=False)
