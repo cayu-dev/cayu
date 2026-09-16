@@ -41,7 +41,8 @@ class EvalSessionReferenceV1(_Model):
 
 class EvalProcessCaseInspectionV1(_Model):
     case_id: str
-    worker_index: int
+    worker_index: int | None
+    claim_state: Literal["queued", "claimed", "dispatching", "completed"] | None = None
     observed_state: Literal["not_observed", "started", "finished", "interrupted"] = "not_observed"
     observed_trial_status: EvalStatus | None = None
     observed_error: str | None = Field(default=None, max_length=4096)
@@ -98,7 +99,7 @@ class EvalProcessInspectionV1(_Model):
 
 
 class _Launch(_Model):
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     launch_id: str = Field(min_length=1, max_length=512)
     target: str = Field(min_length=1, max_length=4096)
     processes: StrictInt = Field(ge=1, le=256)
@@ -133,7 +134,7 @@ class _Launch(_Model):
     def validate_worker_count(self) -> _Launch:
         if self.processes > self.max_concurrency:
             raise ValueError("Admitted worker count exceeds case concurrency.")
-        if self.schema_version == 2 and (self.started_at is None or self.supervisor_pid is None):
+        if self.schema_version >= 2 and (self.started_at is None or self.supervisor_pid is None):
             raise ValueError("Version 2 launches require supervisor identity and start time.")
         return self
 
@@ -165,6 +166,7 @@ class _Start(_Model):
     launch_id: str
     fingerprint: str
     assignments: tuple[tuple[str, ...], ...] = Field(max_length=256)
+    scheduling: Literal["fixed", "dynamic_claims"] = "fixed"
 
 
 class _Terminal(_Model):
@@ -280,14 +282,39 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
         limitations.add("worker_admission_identities_disagree")
         identity = None
     assignments: tuple[tuple[str, ...], ...] = tuple(() for _ in range(launch.processes))
+    captured = {
+        index: {
+            kind: documents.read(f"{kind}-{index}.json")
+            for kind in ("admissions", "progress", "result")
+        }
+        for index in range(launch.processes)
+    }
+    claim_rows = None
     if start is not None:
         if identity is None or len(ready) != launch.processes:
             raise ValueError("Admission is missing exact worker readiness.")
         assignments = tuple(
             identity.case_ids[index :: launch.processes] for index in range(launch.processes)
         )
-        if start.fingerprint != identity.fingerprint or start.assignments != assignments:
+        if launch.schema_version == 3:
+            from cayu.evals._process_claims import validate_claims
+
+            if start.scheduling != "dynamic_claims" or start.assignments != tuple(
+                () for _ in range(launch.processes)
+            ):
+                raise ValueError("Dynamic claim admission cannot carry fixed assignments")
+            snapshot = validate_claims(
+                documents.read("claims.json", required=True), launch, identity
+            )
+            claim_rows = {row["case_id"]: row for row in snapshot["cases"]}
+            assignments = tuple(
+                tuple(row["case_id"] for row in snapshot["cases"] if row["worker"] == index)
+                for index in range(launch.processes)
+            )
+        elif start.scheduling != "fixed" or start.assignments != assignments:
             raise ValueError("Process assignments do not match the admitted plan.")
+        if start.fingerprint != identity.fingerprint:
+            raise ValueError("Process assignment fingerprint differs from the admitted plan")
         if len({item.pid for item in ready.values()}) != launch.processes:
             raise ValueError("Admitted worker PIDs are not distinct.")
     observed_admissions: list[TrialAdmission] = []
@@ -297,7 +324,7 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
     scores: list[float | None] = []
     for index in range(launch.processes):
         expected = assignments[index]
-        scheduling_document = documents.read(f"admissions-{index}.json")
+        scheduling_document = captured[index]["admissions"]
         if scheduling_document is not None:
             scheduling = LaunchScheduling.model_validate(scheduling_document)
             if scheduling.stagger_seconds != launch.stagger_seconds or any(
@@ -307,7 +334,7 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
                 raise ValueError("Worker scheduling evidence does not match its admission.")
             observed_admissions.extend(scheduling.admissions)
         item = ready.get(index)
-        progress_document = documents.read(f"progress-{index}.json")
+        progress_document = captured[index]["progress"]
         progress = (
             None if progress_document is None else _Progress.model_validate(progress_document)
         )
@@ -324,15 +351,32 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
                 if trial.case_id not in expected or trial.case_id in observations:
                     raise ValueError("Worker progress contains an unassigned or duplicate case.")
                 observations[trial.case_id] = trial
-        result_document = documents.read(f"result-{index}.json")
+        result_document = captured[index]["result"]
         result = None if result_document is None else EvalRun.model_validate(result_document)
+        worker_result = result
         result_cases = {}
+        expected_results = expected
+        if claim_rows is not None:
+            from cayu.evals._process_claims import combine_claim_results, read_claim_results
+
+            rows = [claim_rows[case_id] for case_id in expected]
+            result = combine_claim_results(
+                read_claim_results(documents, rows, identity, launch.max_concurrency),
+                worker_result.run_id if worker_result is not None else "unpublished-worker-summary",
+            )
+            expected_results = tuple(row["case_id"] for row in rows if row["state"] == "completed")
+            if worker_result is not None and (
+                result is None
+                or expected_results != expected
+                or worker_result.model_dump(mode="json") != result.model_dump(mode="json")
+            ):
+                raise ValueError("Worker aggregate differs from committed case evidence")
         if result is not None:
             if (
                 identity is None
                 or start is None
                 or not expected
-                or tuple(case.case_id for case in result.cases) != expected
+                or tuple(case.case_id for case in result.cases) != expected_results
                 or result.suite_id != identity.suite_id
                 or not _same_json(result.metadata, identity.metadata)
                 or result.run_contract is not None
@@ -350,7 +394,7 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
                 pid=None if item is None else item.pid,
                 ready=item is not None,
                 assigned_case_ids=expected,
-                result_run_id=None if result is None else result.run_id,
+                result_run_id=None if worker_result is None else worker_result.run_id,
                 progress_observed_at=None if progress is None else progress.observed_at,
             )
         )
@@ -360,6 +404,7 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
             cases[case_id] = EvalProcessCaseInspectionV1(
                 case_id=case_id,
                 worker_index=index,
+                claim_state=None if claim_rows is None else claim_rows[case_id]["state"],
                 observed_state="not_observed" if observation is None else observation.state,
                 observed_trial_status=None if observation is None else observation.status,
                 observed_error=None if observation is None else observation.error,
@@ -390,6 +435,12 @@ def _observe_documents(documents: ProcessDocuments) -> EvalProcessInspectionV1:
             if case is not None:
                 statuses.append(case.status)
                 scores.append(case.score)
+    if claim_rows is not None:
+        for case_id, row in claim_rows.items():
+            if row["state"] == "queued":
+                cases[case_id] = EvalProcessCaseInspectionV1(
+                    case_id=case_id, worker_index=None, claim_state="queued"
+                )
     if completed is not None and (start is None or len(statuses) != len(cases)):
         raise ValueError("Completed process receipt is missing admitted results.")
     phase = (

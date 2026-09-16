@@ -806,6 +806,34 @@ async def run_workflow_eval_suite(
 ) -> EvalRun:
     """Run a typed application-owned workflow as the root eval target."""
 
+    return await _run_workflow_eval_suite(
+        target,
+        suite,
+        retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
+        execution_capacity=execution_capacity,
+        trial_policy=trial_policy,
+    )
+
+
+async def _run_workflow_eval_suite(
+    target: WorkflowEvalTarget,
+    suite: EvalSuite,
+    *,
+    retain_trajectory: bool = False,
+    retain_final_output: bool = True,
+    max_concurrency: int | None = None,
+    case_timeout_seconds: float | None = None,
+    trials: int = 1,
+    execution_capacity: EvalExecutionCapacity | None = None,
+    trial_policy: EvalSuiteTrialPolicyV1 | None = None,
+    workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
+) -> EvalRun:
+    """Run workflow cases, optionally sharing ownership across a worker's claims."""
+
     from cayu.evals.execution import WorkflowEvalTarget
 
     if type(target) is not WorkflowEvalTarget:
@@ -834,6 +862,7 @@ async def run_workflow_eval_suite(
         public_output_preview_bytes=None,
         execution_capacity=execution_capacity,
         workflow_target=target,
+        workflow_instance_tracker=workflow_instance_tracker,
         workflow_execution_profile_fingerprint=execution_profile_fingerprint,
     )
     try:
@@ -969,6 +998,7 @@ async def _run_eval_suite(
     trial_completed: TrialCompletionCallback | None = None,
     workflow_target: WorkflowEvalTarget | None = None,
     workflow_execution_profile_fingerprint: str | None = None,
+    workflow_instance_tracker: _WorkflowInstanceTracker | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -1072,11 +1102,8 @@ async def _run_eval_suite(
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
         max_operations=max_concurrency
     )
-    workflow_instance_tracker = (
-        None
-        if workflow_target is None
-        else _WorkflowInstanceTracker(workflow_target.instance_scope.value)
-    )
+    if workflow_target is not None and workflow_instance_tracker is None:
+        workflow_instance_tracker = _WorkflowInstanceTracker(workflow_target.instance_scope.value)
     async with memory_attribution_read_lifecycle:
         results, public_data_by_case = await _run_suite_cases(
             app,

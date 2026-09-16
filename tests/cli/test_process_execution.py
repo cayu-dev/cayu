@@ -619,14 +619,17 @@ def build_eval():
         trial = case["trials"][0]
         assert trial["evidence_complete"] is True
         assert trial["execution_status"] == "completed"
+    expected_sessions = {
+        case["case_id"]: case["trials"][0]["session_id"] for case in result["cases"]
+    }
+    observed_sessions = {}
     for index in range(2):
         progress = json.loads((tmp_path / f"workers/progress-{index}.json").read_text())
-        observation = progress["trials"][0]
-        assert observation["state"] == "finished"
-        assert (
-            observation["session"]["session_id"]
-            == result["cases"][index]["trials"][0]["session_id"]
-        )
+        for observation in progress["trials"]:
+            assert observation["state"] == "finished"
+            assert observation["case_id"] not in observed_sessions
+            observed_sessions[observation["case_id"]] = observation["session"]["session_id"]
+    assert observed_sessions == expected_sessions
 
 
 def test_process_eval_status_observes_active_sqlite_cases_without_loading_target(tmp_path):
@@ -680,11 +683,11 @@ Provider.stream=gated_stream
             inspect_process_eval_run(tmp_path / "workers", include_sessions=True)
         )
         assert snapshot.phase == "admitted"
-        assert snapshot.counts["results_recorded"] == 2
+        assert snapshot.counts["results_recorded"] == 3
         assert snapshot.result_status is None
         assert snapshot.owner_liveness == "not_checked"
         assert snapshot.runtime_build_provenance is not None
-        active = next(case for case in snapshot.cases if case.case_id == "case-1")
+        active = next(case for case in snapshot.cases if case.worker_index == 1)
         assert active.observed_state == "started"
         assert active.session is not None and active.session.sqlite_path is not None
         assert active.session_inspection is not None

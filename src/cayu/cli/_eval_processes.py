@@ -148,7 +148,7 @@ async def run_process_eval(
     launch_id = str(uuid4())
     started_at = datetime.now(UTC)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "launch_id": launch_id,
         "started_at": started_at.isoformat(),
         "supervisor_pid": os.getpid(),
@@ -197,13 +197,17 @@ async def run_process_eval(
                     raise RuntimeError(
                         "Eval worker target/case admission differs; nothing dispatched."
                     )
-            assignments = [identity["case_ids"][index::count] for index in range(count)]
+            from cayu.evals._process_claims import initialize_claims
+
+            initialize_claims(directory, manifest, identity)
+            assignments = [[] for _ in range(count)]
             _write_json(
                 directory / "start.json",
                 {
                     "launch_id": launch_id,
                     "fingerprint": identity["fingerprint"],
                     "assignments": assignments,
+                    "scheduling": "dynamic_claims",
                 },
             )
 
@@ -220,6 +224,29 @@ async def run_process_eval(
             )
         if identity is None:
             raise RuntimeError("Process eval never reached admission.")
+        from types import SimpleNamespace
+
+        from cayu.evals._inspection_documents import ProcessDocuments
+        from cayu.evals._process_claims import read_claim_results, validate_claims
+
+        claims = validate_claims(
+            _read_json(directory / "claims.json"),
+            SimpleNamespace(**manifest),
+            SimpleNamespace(**identity),
+        )
+        if any(row["state"] != "completed" for row in claims["cases"]):
+            raise RuntimeError("Process eval retains incomplete case claims; no automatic replay")
+        committed_runs = read_claim_results(
+            ProcessDocuments(directory),
+            claims["cases"],
+            SimpleNamespace(**identity),
+            max_concurrency,
+        )
+        committed_cases = {case.case_id: case for run in committed_runs for case in run.cases}
+        assignments = [
+            [row["case_id"] for row in claims["cases"] if row["worker"] == index]
+            for index in range(count)
+        ]
         cases = {}
         provenance = []
         admissions = []
@@ -243,6 +270,10 @@ async def run_process_eval(
                 raise RuntimeError("Eval worker scheduling does not match its assigned cases.")
             admissions.extend(worker_scheduling.admissions)
             for case in run.cases:
+                if case.model_dump(mode="json") != committed_cases[case.case_id].model_dump(
+                    mode="json"
+                ):
+                    raise RuntimeError("Worker aggregate differs from committed case results")
                 if case.case_id in cases:
                     raise RuntimeError("Duplicate case in process eval results.")
                 cases[case.case_id] = case
@@ -338,6 +369,11 @@ async def _worker(directory: Path, index: int) -> None:
         ):
             raise RuntimeError("Process eval admission identity changed.")
         assert plan.suite is not None
+        if launch["schema_version"] == 3:
+            if admission.get("scheduling") != "dynamic_claims" or any(admission["assignments"]):
+                raise RuntimeError("Dynamic case launch has inconsistent admission")
+            await _dynamic_worker(directory, index, launch, identity, plan)
+            return
         assigned = admission["assignments"][index]
         expected = identity["case_ids"][index :: launch["processes"]]
         if assigned != expected:
@@ -391,6 +427,88 @@ async def _worker(directory: Path, index: int) -> None:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watcher
+
+
+async def _dynamic_worker(directory, index, launch, identity, plan):
+    from types import SimpleNamespace
+
+    from cayu.evals._inspection_documents import ProcessDocuments
+    from cayu.evals._process_claims import (
+        ProcessClaims,
+        combine_claim_results,
+        read_claim_results,
+        validate_claims,
+    )
+    from cayu.evals.runner import _run_workflow_eval_suite, _WorkflowInstanceTracker
+
+    claims = ProcessClaims(
+        directory, launch_id=launch["launch_id"], fingerprint=identity["fingerprint"], worker=index
+    )
+    by_id = {case.id: case for case in plan.suite.cases}
+    base, extra = divmod(launch["max_concurrency"], launch["processes"])
+    capacity = base + (index < extra)
+    policy = EvalSuiteTrialPolicyV1.create(trial_count=1, max_concurrency=launch["max_concurrency"])
+    progress = ProcessEvalProgress(
+        directory,
+        launch_id=launch["launch_id"],
+        index=index,
+        fingerprint=identity["fingerprint"],
+        case_ids=tuple(by_id),
+    )
+    pacing = LaunchAdmission(launch.get("stagger_seconds", 0), directory=directory, worker=index)
+
+    # One ownership history covers sequential claims and every concurrent slot.
+    workflow_instance_tracker = (
+        None
+        if plan.workflow_target is None
+        else _WorkflowInstanceTracker(plan.workflow_target.instance_scope.value)
+    )
+
+    async def slot_loop(slot):
+        while (case_id := await claims.claim(slot)) is not None:
+            suite = EvalSuite(
+                id=plan.suite.id, cases=[by_id[case_id]], metadata=plan.suite.metadata
+            )
+            await claims.dispatch(case_id, slot)
+            if plan.workflow_target is not None:
+                result = await _run_workflow_eval_suite(
+                    plan.workflow_target,
+                    suite,
+                    workflow_instance_tracker=workflow_instance_tracker,
+                    max_concurrency=1,
+                    case_timeout_seconds=launch["case_timeout_seconds"],
+                    trial_policy=policy,
+                )
+            else:
+                assert plan.app is not None
+                result = await run_eval_suite(
+                    plan.app,
+                    suite,
+                    max_concurrency=1,
+                    case_timeout_seconds=launch["case_timeout_seconds"],
+                    trial_policy=policy,
+                )
+            if await _plan_identity(plan) != identity:
+                raise RuntimeError("Process eval target changed during execution")
+            await claims.complete(case_id, slot, result)
+
+    with progress.activate(), admission_scope(pacing):
+        async with asyncio.TaskGroup() as group:
+            for slot in range(capacity):
+                group.create_task(slot_loop(slot))
+    documents = ProcessDocuments(directory)
+    snapshot = validate_claims(
+        documents.read("claims.json", required=True),
+        SimpleNamespace(**launch),
+        SimpleNamespace(**identity),
+    )
+    rows = [row for row in snapshot["cases"] if row["worker"] == index]
+    result = combine_claim_results(
+        read_claim_results(documents, rows, SimpleNamespace(**identity), launch["max_concurrency"]),
+        str(uuid4()),
+    )
+    if result is not None:
+        _write_json(directory / f"result-{index}.json", result.model_dump(mode="json"))
 
 
 if __name__ == "__main__":

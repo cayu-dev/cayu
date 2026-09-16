@@ -86,10 +86,19 @@ cayu eval run --processes 32 --max-concurrency 100 \
 Process mode constructs the target independently in fresh Python processes.
 `--max-concurrency` is the total trial limit, divided across processes; it is
 not multiplied by `--processes`. At most `min(processes, max_concurrency)`
-workers start. Each receives a fixed, disjoint round-robin case subset. This
-removes the single-interpreter CPU bottleneck, though provider limits, shared
-storage contention, and uneven case durations can still limit throughput.
-Finished workers do not steal another worker's remaining cases.
+workers start. Each available worker slot claims the next unstarted case from a
+launch-wide durable queue. A long case does not strand unstarted cases behind
+that worker; other available slots continue taking work. Provider limits and
+shared storage contention can still limit throughput.
+
+New process launches use version 3 receipts. `claims.json` records each case as
+`queued`, `claimed`, `dispatching`, or `completed`, together with its exact worker
+and slot. Completed claims reference immutable, hash-checked per-case result
+files. `cayu eval status` and `export` inspect those results even if a worker dies
+before publishing its aggregate. A queued case has no worker yet. Claimed or
+dispatching work is never automatically reassigned after a crash or observation
+timeout; completion is not inferred from silence. Existing version 1 and 2
+receipts retain their fixed-assignment interpretation.
 
 Before dispatch, every worker must agree on the complete suite, requests,
 assertions, application manifest, execution profiles, and workflow target

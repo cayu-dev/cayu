@@ -32781,8 +32781,8 @@
     "tests/core/test_large_tool_round_history.py::test_native_large_round_across_worker_processes[False]": 133.3376964150084,
     "tests/core/test_large_tool_round_history.py::test_native_large_round_across_worker_processes[True]": 142.59272704100295,
     "tests/core/test_large_tool_round_history.py::test_native_large_round_cancellation_recovers_every_admitted_call": 124.86228279200441,
-    "tests/core/test_large_step_allowance.py::test_deterministic_run_beyond_256_steps[257-False]": 448.2137150939999,
-    "tests/core/test_large_step_allowance.py::test_deterministic_run_beyond_256_steps[258-True]": 562.4366780129999,
+    "tests/core/test_large_step_allowance.py::test_deterministic_run_beyond_256_steps[257-False]": 554.549834816,
+    "tests/core/test_large_step_allowance.py::test_deterministic_run_beyond_256_steps[258-True]": 226.12,
     "tests/artifacts/test_aws_s3.py::test_s3_artifact_store_counts_all_metadata_with_bounded_selection": 0.0077705419971607625,
     "tests/artifacts/test_durable_limits.py::test_artifact_metadata_limit_precedes_publication_and_preserves_existing[local]": 0.05033791597816162,
     "tests/artifacts/test_durable_limits.py::test_artifact_metadata_limit_precedes_publication_and_preserves_existing[s3]": 0.013221750006778166,
@@ -32810,6 +32810,13 @@
     "tests/core/test_unavailable_tool_arguments.py::test_provider_history_distinguishes_unavailable_from_empty[build_bedrock_converse_payload]": 0.0009549170063110068,
     "tests/core/test_unavailable_tool_arguments.py::test_provider_history_distinguishes_unavailable_from_empty[build_chat_completions_payload]": 0.0010812919936142862,
     "tests/core/test_unavailable_tool_arguments.py::test_provider_history_distinguishes_unavailable_from_empty[build_openai_payload]": 0.0013362909958232194,
-    "tests/core/test_large_step_allowance.py::test_deterministic_run_beyond_256_steps[257-False]": 554.549834816,
-    "tests/core/test_large_step_allowance.py::test_deterministic_run_beyond_256_steps[258-True]": 226.12
+    "tests/cli/test_dynamic_eval_claims.py::test_free_worker_drains_queue_before_long_case_finishes[2]": 8.230865916004404,
+    "tests/cli/test_dynamic_eval_claims.py::test_free_worker_drains_queue_before_long_case_finishes[3]": 5.599302250018809,
+    "tests/cli/test_dynamic_eval_claims.py::test_worker_death_retains_claim_without_automatic_replay[claimed]": 4.5761782490008045,
+    "tests/cli/test_dynamic_eval_claims.py::test_worker_death_retains_claim_without_automatic_replay[completed]": 5.218762249991414,
+    "tests/cli/test_dynamic_eval_claims.py::test_worker_death_retains_claim_without_automatic_replay[dispatching]": 4.1541644589888165,
+    "tests/cli/test_dynamic_eval_claims.py::test_workflow_claims_preserve_per_trial_instance_isolation[False-1]": 11.78,
+    "tests/cli/test_dynamic_eval_claims.py::test_workflow_claims_preserve_per_trial_instance_isolation[False-4]": 8.13,
+    "tests/cli/test_dynamic_eval_claims.py::test_workflow_claims_preserve_per_trial_instance_isolation[True-4]": 6.82,
+    "tests/cli/test_dynamic_eval_claims.py::test_workflow_claims_preserve_per_trial_instance_isolation[True-1]": 6.8
 }
