@@ -66,12 +66,24 @@ def require_capability(
     The receiving owner supplies supported families; an arbitrary v1 declaration
     cannot enable an unknown family. This is not a substitute for conformance.
     """
-    descriptor = prepare_contract(CapabilityDescriptor, descriptor, redactor=redactor)
+    # Supported families are the receiving program's closed protocol controls,
+    # like Literal values in an owner schema. Validate structure first, then
+    # apply workload-secret validation to owner identities and any family not
+    # present in that trusted closed set. Never grant this exemption merely
+    # because an adapter advertised an arbitrary family string.
+    structural_redactor = SecretRedactor()
+    descriptor = prepare_contract(CapabilityDescriptor, descriptor, redactor=structural_redactor)
     expected_owner = prepare_contract(OwnerRef, expected_owner, redactor=redactor)
-    required = prepare_contract(FamilyVersion, required, redactor=redactor)
+    prepare_contract(OwnerRef, descriptor.owner, redactor=redactor)
+    required = prepare_contract(FamilyVersion, required, redactor=structural_redactor)
     if type(supported) is not tuple or len(supported) > MAX_ENTRIES:
         raise CollaborationCapabilityUnavailable("Invalid supported family contract.")
-    checked = tuple(prepare_contract(FamilyVersion, item, redactor=redactor) for item in supported)
+    checked = tuple(
+        prepare_contract(FamilyVersion, item, redactor=structural_redactor) for item in supported
+    )
+    for family in (*descriptor.mutations, *descriptor.readbacks, required):
+        if family not in checked:
+            prepare_contract(FamilyVersion, family, redactor=redactor)
     if type(access) is not str or access not in ("mutation", "readback"):
         raise CollaborationCapabilityUnavailable("Unknown capability access mode.")
     advertised = descriptor.mutations if access == "mutation" else descriptor.readbacks

@@ -594,6 +594,10 @@ from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migration_authority
 from cayu.storage import migrations as schema
+from cayu.storage._collaboration_schema import (
+    POSTGRES_COLLABORATION_DDL,
+    validate_postgres_collaboration_schema,
+)
 from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
 )
@@ -1413,6 +1417,7 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     90: POSTGRES_SCHEDULING_DDL,
     92: POSTGRES_TASK_GROUP_DDL,
+    93: POSTGRES_COLLABORATION_DDL,
     91: POSTGRES_TASK_GRAPH_DDL,
     88: (
         """
@@ -5601,7 +5606,8 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
         ),
     ),
     # This pending-action index change is not registered in REVISIONS yet.
-    93: (
+    # Keep it beyond the registered collaboration identity revision.
+    94: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -6872,6 +6878,8 @@ class _PostgresStoreBase:
 
     async def _validate_postgres_schema(self, cur: Any, state: schema.SchemaState) -> None:
         self._validate_postgres_revision(state)
+        if state.revision >= 93:
+            await validate_postgres_collaboration_schema(cur)
         if self._min_required_revision >= 36:
             await self._validate_session_invocation_column(cur)
         if self._min_required_revision >= 38:
@@ -7129,6 +7137,8 @@ class _PostgresStoreBase:
             await self._validate_child_session_lifecycle_schema(cur)
         if revision.revision == 88:
             await self._validate_task_closure_guard(cur)
+        if revision.revision == 93:
+            await validate_postgres_collaboration_schema(cur)
 
     async def _validate_task_closure_guard(self, cur: Any) -> None:
         await cur.execute(

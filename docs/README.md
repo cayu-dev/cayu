@@ -30,6 +30,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Private tool-argument continuity](private-argument-continuity.md)
 - [Model catalog](model-catalog.md)
 - [Operation outcomes](operation-outcomes.md)
+- [Participant identity administration](participant-identity.md)
 - [Named checks](named-checks.md)
 - [OpenAI subscription](openai-subscription.md)
 - [Project server](project-server.md)

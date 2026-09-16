@@ -459,6 +459,7 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=91, kind=RevisionKind.BREAKING, compatible_from=91),
     # Group-aware writers must atomically settle policies with member outcomes.
     Revision(revision=92, kind=RevisionKind.BREAKING, compatible_from=92),
+    Revision(revision=93, kind=RevisionKind.ADDITIVE, compatible_from=92),
 )
 
 #: The revision an empty database is initialized to.

@@ -129,32 +129,54 @@ class ConformanceCase(Generic[IntentT]):
     authority: object
 
 
-async def assert_exact_replay(
-    fixture: CollaborationFixture[IntentT, ReceiptT],
-    case: ConformanceCase[IntentT],
+class ExactMutationFixture(Protocol[IntentT, ReceiptT]):
+    """Atomic owners need not implement a speculative prepared-handoff lifecycle."""
+
+    async def apply(
+        self, command: ExpectedOperation[IntentT], *, authority: object
+    ) -> ReceiptT: ...
+    async def lookup(
+        self, expected: ExpectedOperation[IntentT], *, authority: object
+    ) -> ExactLookup[ReceiptT]: ...
+    async def inspect(self) -> ReceiverState: ...
+
+
+async def assert_exact_mutation_replay(
+    fixture: ExactMutationFixture[IntentT, ReceiptT],
+    original: ExpectedOperation[IntentT],
+    changed: ExpectedOperation[IntentT],
+    *,
+    authority: object,
 ) -> None:
     before = await fixture.inspect()
-    command = await fixture.prepare(case.slot, case.original, authority=case.authority)
-    first = await fixture.apply(command, authority=case.authority)
-    second = await fixture.apply(command, authority=case.authority)
-    found = await fixture.lookup(command, authority=case.authority)
+    first = await fixture.apply(original, authority=authority)
+    second = await fixture.apply(original, authority=authority)
+    found = await fixture.lookup(original, authority=authority)
     assert isinstance(found, ExactMatch), "Exact committed receipt is missing"
     assert found.receipt == first == second, "Exact replay changed its receipt"
     after = await fixture.inspect()
     assert after.effects - before.effects == 1, "Duplicate mutation"
     assert after.events - before.events == 1, "Duplicate publication"
-    conflict = await fixture.lookup(case.changed, authority=case.authority)
+    conflict = await fixture.lookup(changed, authority=authority)
     assert conflict.status == "conflict", "Changed-input replay was accepted"
     try:
-        await fixture.apply(case.changed, authority=case.authority)
+        await fixture.apply(changed, authority=authority)
     except CollaborationConflict:
         pass
     else:
         raise AssertionError("Changed-input mutation replay was accepted")
     assert await fixture.inspect() == after, "Conflicting mutation changed retained state"
-    replay = await fixture.lookup(command, authority=case.authority)
+    replay = await fixture.lookup(original, authority=authority)
     assert isinstance(replay, ExactMatch), "Conflict discarded the committed receipt"
     assert replay.receipt == first, "Conflict replaced the committed receipt"
+
+
+async def assert_exact_replay(
+    fixture: CollaborationFixture[IntentT, ReceiptT],
+    case: ConformanceCase[IntentT],
+) -> None:
+    command = await fixture.prepare(case.slot, case.original, authority=case.authority)
+    await assert_exact_mutation_replay(fixture, command, case.changed, authority=case.authority)
 
 
 async def assert_absence_is_not_exclusion(

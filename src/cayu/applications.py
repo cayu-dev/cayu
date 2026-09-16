@@ -77,6 +77,25 @@ from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
 )
+from cayu.collaboration._contracts import ExactLookup, ExpectedOperation
+from cayu.collaboration._coordinator import ParticipantCoordinator
+from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
+from cayu.collaboration.base import CollaborationStore
+from cayu.collaboration.participants import (
+    CollaborationInitialization,
+    ParticipantAlias,
+    ParticipantAliasChange,
+    ParticipantConfigure,
+    ParticipantCreate,
+    ParticipantCursor,
+    ParticipantEventCursor,
+    ParticipantEventPage,
+    ParticipantInspection,
+    ParticipantIntent,
+    ParticipantPage,
+    ParticipantReceipt,
+    ParticipantRef,
+)
 from cayu.configuration import (
     CayuConfig,
     CayuConfigSource,
@@ -881,6 +900,8 @@ class CayuApp:
         mcp_manifest_policy: McpManifestPolicy | None = None,
         human_review_policy: HumanReviewPolicy | None = None,
         session_message_access_policy: SessionMessageAccessPolicy | None = None,
+        collaboration_store: CollaborationStore | None = None,
+        collaboration: CollaborationRegistration | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
         completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
@@ -1401,6 +1422,73 @@ class CayuApp:
             enqueue=self._enqueue_session_message_private,
             fan_out=self._event_writer.fan_out_persisted,
         )
+        self._participant_coordinator = ParticipantCoordinator(
+            store=collaboration_store,
+            registration=collaboration,
+            redactor=self._secret_redactor,
+        )
+
+    async def initialize_collaboration(self) -> CollaborationInitialization:
+        """Explicitly provision or recover the exact registered collaboration owner."""
+        return await self._participant_coordinator.initialize()
+
+    async def create_participant(
+        self, request: ParticipantCreate, *, context: CollaborationAccessContext
+    ) -> ParticipantReceipt:
+        return await self._participant_coordinator.mutate(
+            ParticipantCreate, request, context=context
+        )
+
+    async def configure_participant(
+        self, request: ParticipantConfigure, *, context: CollaborationAccessContext
+    ) -> ParticipantReceipt:
+        return await self._participant_coordinator.mutate(
+            ParticipantConfigure, request, context=context
+        )
+
+    async def change_participant_alias(
+        self, request: ParticipantAliasChange, *, context: CollaborationAccessContext
+    ) -> ParticipantReceipt:
+        return await self._participant_coordinator.mutate(
+            ParticipantAliasChange, request, context=context
+        )
+
+    async def inspect_participant(
+        self, participant: ParticipantRef, *, context: CollaborationAccessContext
+    ) -> ParticipantInspection:
+        return await self._participant_coordinator.inspect(participant, context=context)
+
+    async def resolve_participant_alias(
+        self, alias: str, *, context: CollaborationAccessContext
+    ) -> ParticipantAlias | None:
+        return await self._participant_coordinator.resolve_alias(alias, context=context)
+
+    async def discover_participants(
+        self,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ParticipantCursor | None = None,
+        limit: int = 32,
+    ) -> ParticipantPage:
+        return await self._participant_coordinator.discover(
+            context=context, cursor=cursor, limit=limit
+        )
+
+    async def list_participant_events(
+        self,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ParticipantEventCursor | None = None,
+        limit: int = 32,
+    ) -> ParticipantEventPage:
+        return await self._participant_coordinator.events(
+            context=context, cursor=cursor, limit=limit
+        )
+
+    async def lookup_participant_operation(
+        self, expected: ExpectedOperation[ParticipantIntent], *, context: CollaborationAccessContext
+    ) -> ExactLookup[ParticipantReceipt]:
+        return await self._participant_coordinator.lookup(expected, context=context)
 
     @property
     def budget_policy(self) -> BudgetPolicy | None:

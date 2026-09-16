@@ -544,6 +544,33 @@ def test_capability_versions_owners_wrappers_and_readback() -> None:
             require_capability(descriptor, access="mutation", **(args | replacement))
 
 
+def test_supported_capability_controls_do_not_exempt_untrusted_owner_material() -> None:
+    owner = command().destination
+    family = FamilyVersion(family="fixture.apply", version=1)
+    descriptor = CapabilityDescriptor(owner=owner, mutations=(family,), readbacks=(family,))
+    args = dict(
+        expected_owner=owner,
+        required=family,
+        supported=(family,),
+        redactor=SecretRedactor("fixture.apply"),
+        access="mutation",
+    )
+    require_capability(descriptor, **args)
+    with pytest.raises(CollaborationContractError):
+        require_capability(
+            descriptor.model_copy(
+                update={"owner": owner.model_copy(update={"owner_id": "fixture.apply"})}
+            ),
+            **args,
+        )
+    unknown = FamilyVersion(family="fixture.apply.extra", version=1)
+    with pytest.raises(CollaborationContractError):
+        require_capability(
+            CapabilityDescriptor(owner=owner, mutations=(family,), readbacks=(family, unknown)),
+            **args,
+        )
+
+
 def test_import_is_inert() -> None:
     completed = subprocess.run(
         [

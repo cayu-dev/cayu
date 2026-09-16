@@ -1,5 +1,17 @@
-"""Internal collaboration contract foundation; no execution or public agent API.
+"""Durable participant identity administration; no implicit agent execution."""
 
-Receiving owners remain responsible for authentication, atomic publication and
-recovery. Importing this package does not register capabilities or start work.
-"""
+from typing import Any as _Any
+
+from cayu._api import resolve_export as _resolve_export
+from cayu.collaboration._exports import EXPORTS as _EXPORTS
+from cayu.collaboration._exports import PUBLIC_NAMES as _PUBLIC_NAMES
+
+__all__ = _PUBLIC_NAMES
+
+
+def __getattr__(name: str) -> _Any:
+    return _resolve_export(name, globals(), _EXPORTS)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))

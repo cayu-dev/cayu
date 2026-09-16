@@ -3,6 +3,7 @@
   "cayu.approvals",
   "cayu.artifacts",
   "cayu.budgets",
+  "cayu.collaboration",
   "cayu.context",
   "cayu.delivery",
   "cayu.egress",
