@@ -10,7 +10,7 @@ tool calls, time, or model budget.
 `WorkflowEvalTarget.capture_bounds` owns the live workflow child-tree policy. There
 is no plan or CLI override with competing precedence. The same target is used by
 `run_workflow_eval_suite`, `EvalPlan`, corpus compilation, CLI plans, and registered
-server targets. Set GAIA's target to:
+server targets. Configure a target with a larger event allowance as follows:
 
 ```python
 from cayu import SessionTrajectoryBounds, WorkflowEvalTarget
@@ -240,7 +240,7 @@ completed execution. Counts are not reconstructed through store reads after expi
 
 ## Import reports written before attempt anchors
 
-The two retained GAIA smoke reports predate the anchor field. Use
+For saved reports that predate the anchor field, use
 `import_workflow_eval_attempt` explicitly, providing the original `EvalRun`, target,
 case/trial slot, input, projected result, and the **exact known** attempt and
 completion event IDs read from the saved journal. This validates the deterministic
@@ -272,12 +272,6 @@ this import nor any recovery can prove that unseen bytes were never changed
 before that first seal. Preserve an immutable original store backup and report
 for historical attestation. Fresh reads still validate terminal and lineage
 consistency, and later recovery/scoring rejects mutations against the seal.
-
-Operational acceptance for GAIA requires separately recovering both retained
-smoke stores, applying their actual deterministic assertions, and recording their
-actual scores. Synthetic tests prove the API and no-dispatch behavior; they do not
-establish the smoke answers' correctness. Deployments or GAIA dependency updates
-must record the exact Runtime revision used for those results.
 
 For invocation health versus nonzero command exits, timeout, cancellation, and
 structured HTTP evidence, see [operation outcome monitoring](operation-outcomes.md).

@@ -135,7 +135,7 @@ def test_real_http_transport_emits_exact_effort(protocol, effort) -> None:
     asyncio.run(exercise())
 
 
-def test_gaia_luna_max_compatible_responses_wire() -> None:
+def test_luna_max_compatible_responses_wire() -> None:
     from tests.core.test_openai_provider import RecordingTransport
 
     async def exercise():
@@ -155,7 +155,7 @@ def test_gaia_luna_max_compatible_responses_wire() -> None:
             ]
         )
         provider = OpenAIProvider(
-            api_key="unit-test", base_url="https://codex-lb.cayu.ai", transport=transport
+            api_key="unit-test", base_url="https://responses.example.test", transport=transport
         )
         req = request(
             "gpt-5.6-luna", "max", openai={"reasoning": {"effort": "low", "summary": "detailed"}}
@@ -163,7 +163,7 @@ def test_gaia_luna_max_compatible_responses_wire() -> None:
         events = [event async for event in provider.stream(req)]
         assert events[-1].type == ModelStreamEventType.COMPLETED, events[-1].payload
         assert len(transport.calls) == 1
-        assert transport.calls[0]["url"] == "https://codex-lb.cayu.ai/v1/responses"
+        assert transport.calls[0]["url"] == "https://responses.example.test/v1/responses"
         payload = transport.calls[0]["payload"]
         assert payload["model"] == "gpt-5.6-luna"
         assert payload["reasoning"] == {"effort": "max", "summary": "detailed"}

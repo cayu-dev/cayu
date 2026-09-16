@@ -184,8 +184,8 @@ class _BlockingWorkflow(WorkflowBase):
         yield await ctx.completed({"answer": "unreachable"})
 
 
-class _GaiaShapedWorkflow(WorkflowBase):
-    spec = WorkflowSpec(name="gaia-shaped-workflow-eval")
+class _ParallelEvidenceWorkflow(WorkflowBase):
+    spec = WorkflowSpec(name="parallel-workflow-eval")
 
     async def run(self, session_id: str):
         ctx = self.context(session_id)
@@ -431,7 +431,7 @@ def test_workflow_eval_retains_root_children_tools_usage_and_typed_output(tmp_pa
     assert loaded_trajectory.workflow_output == trial.trajectory.workflow_output
 
 
-def test_gaia_shaped_parallel_workflow_retains_complete_bounded_child_evidence() -> None:
+def test_parallel_workflow_retains_complete_bounded_child_evidence() -> None:
     app = _register_app(
         [
             [
@@ -450,7 +450,7 @@ def test_gaia_shaped_parallel_workflow_retains_complete_bounded_child_evidence()
     )
     result = asyncio.run(
         run_workflow_eval_suite(
-            _target(app, _GaiaShapedWorkflow),
+            _target(app, _ParallelEvidenceWorkflow),
             _suite(
                 ChildSessionCompleted(min_count=6),
                 FinalOutputContains("final answer"),

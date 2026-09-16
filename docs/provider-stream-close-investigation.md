@@ -1,4 +1,4 @@
-# Provider stream-close exception investigation
+# Provider stream-close diagnostics
 
 Provider stream-close diagnostics distinguish the local close result from
 remote cancellation and settlement. A `close_exception` classified as
@@ -32,7 +32,7 @@ semantic idle deadlines, and delayed/failed/noncooperative closure. The new
 loopback test cancels the consumer again while its actual HTTP stream close is
 held open. It proves one local close owner, continued retention until release,
 caller cancellation, and eventual local/socket closure without upgrading remote
-settlement. It also passes against unchanged main.
+settlement.
 
 A deliberately reentrant Python async-generator close separately establishes the
 actual `aclose(): asynchronous generator is already running` message and verifies
@@ -40,7 +40,7 @@ its sanitized classification. This is an injected diagnostic control, not a
 reproduction of the original provider failure. Secret-bearing and hostile
 exceptions, malformed diagnostic fields, SQLite recovery/export, and owned
 cleanup handoffs are covered by the focused diagnostics and credential-boundary
-tests. No cleanup scheduling or cancellation behavior is changed by this PR.
+tests.
 
 With this checkout's `src` and root first in `PYTHONPATH`, run:
 
@@ -102,10 +102,9 @@ inspect the saved terminal both before and after releasing local cleanup. The
 immutable pending diagnostic is unchanged; it is an interruption-time snapshot,
 not a live resource-state query or evidence of permanently leaked work.
 
-These controls do not reproduce the historical `async generator ignored
-GeneratorExit` / `no running event loop` chain. Resolving that incident still
-requires one correlated local observation containing the session/epoch and tool
-round identities, the owner driving each generator, the suspension point when
-close/cancellation arrives, cancellation counts, and the finalizer outcome before
-the owning loop exits. Keep these observations content-free and bounded; unrelated
-pending-cleanup records or a successful synthetic close cannot supply this chain.
+To investigate a generator finalization failure, correlate the session/epoch and
+tool-round identities, the owner driving each generator, the suspension point
+when close/cancellation arrives, cancellation counts, and the finalizer outcome
+before the owning loop exits. Keep observations content-free and bounded.
+Unrelated pending-cleanup records or a successful synthetic close cannot
+establish the cause of a failure.

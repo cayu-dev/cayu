@@ -48,6 +48,3 @@ validated-report-set gate to both sides. Its verified denominator remains the
 three matched branch calls; source preparation, evaluator, and repair sessions
 stay visible in the surrounding scenario evidence but are not asymmetrically
 folded into that branch-call percentage.
-
-See [the live Anthropic Haiku benchmark](../../docs/anthropic-haiku-cost-savings-results.md)
-for a three-trial result, exact denominators, and pricing provenance.

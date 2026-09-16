@@ -28,12 +28,6 @@ benchmark claims.
 
 ## Current executable evidence
 
-The current live Haiku benchmark measured **66.17% aggregate savings** for
-prompt-cache compaction and **48.56% aggregate savings** across paired compacted
-research branch calls, with all six final trials passing their runtime and quality
-gates. See [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
-for the exact paired denominators, range, pricing provenance, and run IDs.
-
 Cayu currently has six advanced runtime product stories plus two deterministic
 measurement fixtures. Two product stories and both fixtures deliberately cover
 cost optimization:
@@ -211,10 +205,8 @@ explicit; neither should be silently treated as permission to spend.
   `uv run python examples/usage_cost_summary.py`.
 - Inspect all paired proof statuses with
   `uv run python examples/cost_quality_comparison.py`.
-- Review [Advanced runtime strategies](advanced-runtime-examples.md) for dated
-  live observations and proof boundaries.
-- Review [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
-  for the current paired benchmark and reproduction commands.
+- Review [Advanced runtime strategies](advanced-runtime-examples.md) for executable
+  examples and proof boundaries.
 - Review [Runtime contracts](runtime-contracts.md) for the complete accounting,
   pricing, budget, reservation, and recovery semantics.
 

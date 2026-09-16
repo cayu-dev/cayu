@@ -8,17 +8,11 @@ variants. API sources have a bounded nonblank `name` (up to 1,024 characters,
 portable durable text without surrounding whitespace), not a URL. The name is
 retained exactly; it is not an enum, a URL, or a citation target.
 
-A bounded direct Responses API comparison on September 7, 2026 returned this
-structure for weather and finance searches. A compatible HTTP path also received
-and forwarded these source fields unchanged:
+An API source has this shape (the name below is illustrative):
 
 ```json
-{"type": "api", "name": "redacted"}
+{"type": "api", "name": "example-source"}
 ```
-
-`redacted` is an explicit replacement, not an observed source-name value. The
-comparison did not retain exact names. This support follows observed wire fields;
-it does not claim that every published provider schema declares this variant.
 
 URL sources retain their existing constructor and validation. An omitted source
 discriminator still means `url`; explicit null is not omission. API sources are
@@ -40,7 +34,7 @@ an unsupported decoding contract. Malformed API names use the static diagnostic
 `output[].action.sources[].name`, and the existing bounded protocol retry policy.
 No source name or body is included in these diagnostics.
 
-The observed-shape fixture covers completed parsing, streaming item completion,
+The API-source fixture covers completed parsing, streaming item completion,
 terminal-only streams, mixed URL/API sources, durable readback, and provider-state
 replay. Synthetic malformed and unknown variants cover safe diagnostics and
 bounded retries. HTTP source compatibility does not qualify WebSocket ordering,

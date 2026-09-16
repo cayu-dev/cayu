@@ -1,8 +1,0 @@
-{"label": "base", "reader": "user_input_lifecycle_authority_from_checkpoint", "retained_records": 0, "full_checkpoint_admissions": 2, "container_frames_and_detached_containers": 4, "child_paths": 2}
-{"label": "base", "reader": "user_input_lifecycle_authority_from_checkpoint", "retained_records": 1000, "full_checkpoint_admissions": 2, "container_frames_and_detached_containers": 2004, "child_paths": 4002}
-{"label": "base", "reader": "pending_action_evidence_round_from_checkpoint", "retained_records": 0, "full_checkpoint_admissions": 4, "container_frames_and_detached_containers": 8, "child_paths": 4}
-{"label": "base", "reader": "pending_action_evidence_round_from_checkpoint", "retained_records": 1000, "full_checkpoint_admissions": 4, "container_frames_and_detached_containers": 4008, "child_paths": 8004}
-{"label": "candidate", "reader": "user_input_lifecycle_authority_from_checkpoint", "retained_records": 0, "full_checkpoint_admissions": 1, "container_frames_and_detached_containers": 2, "child_paths": 1}
-{"label": "candidate", "reader": "user_input_lifecycle_authority_from_checkpoint", "retained_records": 1000, "full_checkpoint_admissions": 1, "container_frames_and_detached_containers": 1002, "child_paths": 2001}
-{"label": "candidate", "reader": "pending_action_evidence_round_from_checkpoint", "retained_records": 0, "full_checkpoint_admissions": 1, "container_frames_and_detached_containers": 2, "child_paths": 1}
-{"label": "candidate", "reader": "pending_action_evidence_round_from_checkpoint", "retained_records": 1000, "full_checkpoint_admissions": 1, "container_frames_and_detached_containers": 1002, "child_paths": 2001}

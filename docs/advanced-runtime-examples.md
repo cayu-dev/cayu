@@ -191,34 +191,11 @@ ordinary tool once, and checks replay ordering. It establishes adapter and
 runtime composition only: it neither certifies a production model nor measures
 OpenAI prompt-cache behavior.
 
-## Observed live evidence
+## Interpreting cost measurements
 
-The following observations were recorded during credentialed verification on
-July 11, 2026. They are evidence that the examples exercised real provider and
-external boundaries; they are not universal benchmarks or pricing guarantees.
-
-| Scenario | Provider and model | Trials | Observed result |
-| --- | --- | ---: | --- |
-| Research council | Gemini `gemini-3.1-flash-lite` | 1 | Uncompacted branches reported 25,853 input tokens and compacted branches 11,228: 14,625 fewer, or 56.6%. Both sides completed in three model steps. |
-| Research council | OpenAI `gpt-5.4-mini` | 1 | First-attempt input fell from 18,146 to 10,151: 7,995 fewer, or 44.1%. The compacted side required two extra model steps, so total input was 17,487: only 659 fewer, or 3.6%. |
-| Counterfactual approval | OpenAI `gpt-5.4-mini` | 1 | All nine assertions passed across eight model requests; one protected mutation and one recovery receipt were recorded. |
-| Repository maintainer | OpenAI `gpt-5.4-mini` plus a private disposable GitHub repository | 1 | All twelve fake-and-real boundary assertions passed across five model requests; three real worktrees were gated, one commit was pushed, and one PR was created and recovered idempotently. |
-| Tainted incident response | OpenAI `gpt-5.4-mini` | 1 | All six assertions passed across nine model requests; the runtime blocked the protected mutation after `CayuApp` reconstruction, executed it zero times, and sent one sanitized notification. |
-
-Anthropic support is wired through the same scenario and credential-gated
-nightly registrations, but this dated observation set does not claim a live
-Anthropic result because an authorized key was not available for the run.
-
-### Reading the cost observation correctly
-
-The research example separates two different questions:
-
-1. **Did compaction make the first candidate request smaller?** Both observed
-   providers said yes.
-2. **Did the whole candidate branch use fewer input tokens after retries?** The
-   Gemini observation retained most of the reduction; the OpenAI observation
-   retained only 3.6% because extra attempts consumed most of the first-request
-   saving.
+Measure both first-request input reduction and total branch usage after retries.
+A smaller first request can still lead to greater total usage when additional
+attempts are needed.
 
 That distinction is why Cayu records provider-reported total usage instead of
 marketing a context-size estimate as realized savings. Dollar savings require a

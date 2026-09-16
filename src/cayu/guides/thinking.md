@@ -85,12 +85,10 @@ fallback. A successful fingerprint or payload build proves local validity and
 requested/emitted settings only. Keep requested identity, emitted request identity,
 and backend-reported identity separate.
 
-The GAIA `gpt-5.6-luna` / `max` compatible Responses path has credential-free
-transport coverage. Operational support through `codex-lb.cayu.ai` requires a
-**separately authorized bounded probe** confirming the emitted request and a
-successful backend response. Neither mocked responses nor launch metadata proves
-backend acceptance; even a successful real response does not prove internal
-reasoning allocation. No paid probe or evaluation is part of the unit tests.
+Compatible Responses unit tests establish request construction with mocked
+transports. Confirm support at the selected backend with a bounded live probe
+that checks the emitted request and successful response. A successful response
+does not prove internal reasoning allocation.
 
 Audit sources: OpenAI [Chat Completions schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
 [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning),

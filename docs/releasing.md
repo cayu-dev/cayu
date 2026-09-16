@@ -1,6 +1,6 @@
 # Releasing Cayu
 
-Prepare releases in `cayu-tech/cayu`; publish from `cayu-dev/cayu`.
+Publish releases from `cayu-dev/cayu` after the release commit passes validation.
 Only public `v*` tag pushes publish. Leave PR merges and release tags to a maintainer.
 
 1. Choose an unused version. Update `pyproject.toml`, `src/cayu/_version.py`,
@@ -38,5 +38,5 @@ matching release-note section verbatim.
 
 Never reuse a published version, move its tag, or edit its tagged release notes.
 If PyPI succeeds but GitHub release creation fails, rerun only the failed job.
-After release, give private `main` a distinct development version and one
+After release, give the development branch a distinct development version and one
 `## Unreleased` section.

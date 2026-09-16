@@ -1,10 +1,10 @@
-# Hosted-search event ordering investigation
+# Hosted-search event ordering diagnostics
 
-The hosted-search ordering investigation remains an investigation. Its historical
+The
 `web_search_lifecycle_arrived_before_output_item_added` diagnostic proves only
 that the native adapter had no pending search at the received output index.
 It cannot identify the original wire order or assign responsibility to a provider,
-proxy, or Runtime. No observed incident wire fixture is available here.
+proxy, or Runtime.
 
 ## Synthetic controls and state transitions
 
@@ -126,12 +126,11 @@ and malformed fields, bounded capture/exhaustion, hostile projection values,
 retry isolation, SQLite readback, and a synthetic change between boundaries.
 These controls are diagnostic evidence, not permission to reconcile identities.
 
-## Remaining evidence and fault ownership
+## Fault attribution
 
 These synthetic invalid inputs establish the rejection location and eliminate
-ambiguity in future diagnostics. They do not establish the cause of the original
-incident. Runtime compares decoded HTTP transport and native adapter input; this does
-not instrument an external upstream or proxy.
+ambiguity in diagnostics. Runtime compares decoded HTTP transport and native
+adapter input; this does not instrument an external upstream or proxy.
 
 For a fresh occurrence, compare bounded structural metadata at upstream egress,
 proxy ingress/egress (if present), and native adapter ingress for the **same
@@ -141,7 +140,7 @@ response dump or workload identifiers. If the relevant registration has fallen
 out of the 16-event window, the trace explicitly remains incomplete evidence.
 Matching malformed sequences across boundaries would locate where the sequence
 first appeared; a valid sequence arriving intact but misregistered would support
-an adapter defect. Neither outcome is yet established.
+an adapter defect.
 
 The rejection policy, retry caps, and hosted-effect accounting are unchanged.
 No buffering or permissive orphan handling is justified by these controls.
@@ -162,6 +161,6 @@ with reasoning and two client functions, including retry with reused synthetic
 IDs. Each completed search retains its exact call identity and sources once.
 These controls supplement the existing truncated-history and boundary-change
 fixtures. A dropped prefix cannot be reconstructed from the last 16 rows: the
-historical cause still requires a captured registration-to-rejection sequence at
+cause of a failure requires a captured registration-to-rejection sequence at
 each relevant boundary of the same response/attempt. Uncaptured upstream data
 must remain explicitly unavailable, even when downstream validation succeeds.

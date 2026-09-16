@@ -69,7 +69,3 @@ shape, paired-source, two-cycle, usage-accounting, and cache-read assertions
 passed. It does not establish a universal cost-savings percentage or cache
 lifetime. See [Cost optimization and governance](../../docs/cost-optimization.md)
 for the evidence standard and failure cases.
-
-See [the live Anthropic Haiku benchmark](../../docs/anthropic-haiku-cost-savings-results.md)
-for the current three-trial savings result, exact paired costs, and pricing
-provenance.

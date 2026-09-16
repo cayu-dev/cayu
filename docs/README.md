@@ -74,27 +74,12 @@ authoritative only where a maintained guide points to the implementation or the
 - [Architecture](architecture.md)
 - [Public concepts and source ownership](public-concepts.md)
 - [Internal collaboration contract foundation](collaboration-contracts.md)
-- [Function-call event ordering investigation](function-call-event-ordering.md)
-- [Hosted-search event ordering investigation](hosted-search-event-ordering.md)
+- [Function-call event ordering diagnostics](function-call-event-ordering.md)
+- [Hosted-search event ordering diagnostics](hosted-search-event-ordering.md)
 - [Hosted-search source diagnostics](hosted-search-source-diagnostics.md)
 - [Responses output-index collision diagnostics](responses-output-index-investigation.md)
 - [Database storage and migrations ADR](adr/0001-database-storage-and-migrations.md)
-- [AWS Bedrock and Lambda MicroVM implementation record](aws-bedrock-lambda-microvm-implementation-plan.md)
 - [AWS credentials](aws-credentials.md)
 - [Glossary](glossary.md)
 - [Project layout](project-layout.md)
 - [Runtime contracts](runtime-contracts.md)
-
-## Research evidence
-
-- [Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
-- [AWS Lambda MicroVM metadata-isolation research](aws-lambda-microvm-metadata-isolation-research.md)
-- [Coding workspace tooling comparison](research/coding-workspace-tooling-comparison.md)
-
-## Historical archive
-
-These records preserve the context of completed or superseded work; they are not
-current operating instructions.
-
-- [Anthropic prompt-cache compactor A/B observation](anthropic-prompt-cache-compactor-ab-results.md)
-- [Early repository plan](repo-plan.md)

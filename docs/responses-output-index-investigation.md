@@ -1,4 +1,4 @@
-# Responses output-index collision investigation
+# Responses output-index collision diagnostics
 
 A completed message at output index 7 followed by a function-call addition at
 index 7 remains a protocol error (`function_call_output_index_type_mismatch`).
