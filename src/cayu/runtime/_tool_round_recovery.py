@@ -748,6 +748,30 @@ def pending_tool_round_from_checkpoint(
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
+    try:
+        return _pending_tool_round_from_owned_checkpoint(
+            checkpoint,
+            copied_checkpoint,
+            redactor=redactor,
+            consume_on_rejection=consume_on_rejection,
+            runtime_session=runtime_session,
+        )
+    finally:
+        # The inner parser clears rejected private data. Do not retain the
+        # caller-owned source in this wrapper's exception traceback.
+        checkpoint = None
+        copied_checkpoint = None
+
+
+def _pending_tool_round_from_owned_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    copied_checkpoint: dict[str, Any],
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
+    runtime_session: Session | None = None,
+) -> PendingToolRound | None:
+    """Parse an immediately owned, validated snapshot; never retain or cache it."""
     value = copied_checkpoint.get(PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     if value is None:
         return None
@@ -764,7 +788,7 @@ def pending_tool_round_from_checkpoint(
             value.clear()
         value = None
         copied_checkpoint.clear()
-        if consume_on_rejection:
+        if consume_on_rejection and checkpoint is not None:
             checkpoint.clear()
         checkpoint = None
         raise ValueError(
@@ -783,7 +807,7 @@ def pending_tool_round_from_checkpoint(
         value.clear()
         value = None
         copied_checkpoint.clear()
-        if consume_on_rejection:
+        if consume_on_rejection and checkpoint is not None:
             checkpoint.clear()
         checkpoint = None
         raise ValueError(

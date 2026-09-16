@@ -850,6 +850,30 @@ def pending_user_input_from_checkpoint(
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
+    try:
+        return _pending_user_input_from_owned_checkpoint(
+            checkpoint,
+            copied_checkpoint,
+            redactor=redactor,
+            consume_on_rejection=consume_on_rejection,
+            runtime_session=runtime_session,
+        )
+    finally:
+        # The inner parser clears rejected private data. Do not retain the
+        # caller-owned source in this wrapper's exception traceback.
+        checkpoint = None
+        copied_checkpoint = None
+
+
+def _pending_user_input_from_owned_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    copied_checkpoint: dict[str, Any],
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
+    runtime_session: Session | None = None,
+) -> PendingUserInput | None:
+    """Parse an immediately owned, validated snapshot; never retain or cache it."""
     ambiguous = ambiguous_pending_user_input_from_checkpoint(copied_checkpoint)
     if ambiguous is not None:
         raise AmbiguousUserInputPauseAuthorityError(ambiguous.source_checkpoint_digest) from None
@@ -869,7 +893,7 @@ def pending_user_input_from_checkpoint(
             value.clear()
         value = None
         copied_checkpoint.clear()
-        if consume_on_rejection:
+        if consume_on_rejection and checkpoint is not None:
             checkpoint.clear()
         checkpoint = None
         raise ValueError(
@@ -892,7 +916,7 @@ def pending_user_input_from_checkpoint(
         value.clear()
         value = None
         copied_checkpoint.clear()
-        if consume_on_rejection:
+        if consume_on_rejection and checkpoint is not None:
             checkpoint.clear()
         checkpoint = None
         raise ValueError(
@@ -1342,6 +1366,18 @@ def user_input_resolution_intent_from_checkpoint(
     if checkpoint is None:
         return None
     copied = copy_durable_json_value(checkpoint, "checkpoint")
+    return _user_input_resolution_intent_from_owned_checkpoint(
+        copied, redactor=redactor, runtime_session=runtime_session
+    )
+
+
+def _user_input_resolution_intent_from_owned_checkpoint(
+    copied: dict[str, Any],
+    *,
+    redactor: SecretRedactor | None = None,
+    runtime_session: Session | None = None,
+) -> UserInputResolutionIntent | None:
+    """Parse an immediately owned, validated snapshot; never retain or cache it."""
     value = copied.get(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY)
     if value is None:
         return None
@@ -1412,16 +1448,55 @@ def user_input_lifecycle_authority_from_checkpoint(
     admission cannot reinterpret an orphan claim as ordinary checkpoint data.
     """
 
-    pending = pending_user_input_from_checkpoint(
-        checkpoint,
-        redactor=redactor,
-        consume_on_rejection=consume_on_rejection,
-        runtime_session=runtime_session,
-    )
-    intent = user_input_resolution_intent_from_checkpoint(
-        checkpoint,
-        redactor=redactor,
-        runtime_session=runtime_session,
+    if type(consume_on_rejection) is not bool:
+        raise TypeError("consume_on_rejection must be a bool.")
+    copied = None if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    try:
+        return _user_input_lifecycle_authority_from_owned_checkpoint(
+            checkpoint,
+            copied,
+            redactor=redactor,
+            consume_on_rejection=consume_on_rejection,
+            current_run_epoch=current_run_epoch,
+            runtime_session=runtime_session,
+        )
+    finally:
+        checkpoint = None
+        copied = None
+
+
+def _user_input_lifecycle_authority_from_owned_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    copied: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
+    current_run_epoch: int | None = None,
+    runtime_session: Session | None = None,
+) -> tuple[PendingUserInput | None, UserInputResolutionIntent | None]:
+    """Read both authorities from the same validated, detached snapshot."""
+    try:
+        pending = (
+            None
+            if copied is None
+            else _pending_user_input_from_owned_checkpoint(
+                checkpoint,
+                copied,
+                redactor=redactor,
+                consume_on_rejection=consume_on_rejection,
+                runtime_session=runtime_session,
+            )
+        )
+    finally:
+        checkpoint = None
+    intent = (
+        None
+        if copied is None
+        else _user_input_resolution_intent_from_owned_checkpoint(
+            copied,
+            redactor=redactor,
+            runtime_session=runtime_session,
+        )
     )
     if intent is not None:
         if pending is None:

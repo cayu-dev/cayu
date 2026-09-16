@@ -1533,8 +1533,9 @@ def _copy_json_value(value: Any, field_name: str, seen: set[int]) -> Any:
 
 def _durable_child_path(path: str, index: int, *, object_value: bool) -> str:
     marker = f"#{index}" if object_value else str(index)
-    return _bounded_ascii_label(
-        f"{path}/{marker}",
-        limit=_MAX_DURABLE_ERROR_PATH_CHARS,
-        fallback="$",
-    )
+    # The walker starts at "$" and appends only numeric indices, never caller
+    # keys. Re-sanitizing every ancestor character at every node is redundant.
+    child = f"{path}/{marker}"
+    if len(child) <= _MAX_DURABLE_ERROR_PATH_CHARS:
+        return child
+    return child[: _MAX_DURABLE_ERROR_PATH_CHARS - 3] + "..."
