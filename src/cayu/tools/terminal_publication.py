@@ -163,15 +163,18 @@ class ToolTerminalPublicationGovernor:
         grouped: dict[tuple[str, ...], list[_RoundReservation]] = {}
         for reservation in self._round_reservations.values():
             grouped.setdefault(reservation.group, []).append(reservation)
-        return {
-            group: (
+        usage = {}
+        for group, members in grouped.items():
+            weight = (
                 self.staged_capacity_bytes
                 if any(member.maximum_bytes is None for member in members)
-                else sum(member.weight for member in members),
-                any(member.exclusive for member in members),
+                else sum(member.weight for member in members)
             )
-            for group, members in grouped.items()
-        }
+            usage[group] = (
+                weight,
+                any(member.exclusive for member in members) or weight > self.staged_capacity_bytes,
+            )
+        return usage
 
     async def _reserve_round(
         self,
@@ -224,7 +227,13 @@ class ToolTerminalPublicationGovernor:
                         or any(member.maximum_bytes is None for member in members)
                         else prior_weight + weight
                     )
-                    group_exclusive = prior_exclusive or exclusive
+                    # A durable invocation family is one capacity domain. Its
+                    # aggregate can outgrow the budget just like one oversized
+                    # round; admit it exclusively when no other family owns
+                    # capacity instead of failing the child its parent awaits.
+                    group_exclusive = (
+                        prior_exclusive or exclusive or group_weight > self.staged_capacity_bytes
+                    )
                     others = [usage for identity, usage in groups.items() if identity != group]
                     admissible = (
                         not others
@@ -447,6 +456,7 @@ class ToolTerminalPublicationGovernor:
 
     def snapshot(self) -> ToolTerminalPublicationMetricsSnapshot:
         now = datetime.now(UTC)
+        groups = self._group_usage()
         with self._metrics_lock:
             oldest = max(
                 (
@@ -476,7 +486,8 @@ class ToolTerminalPublicationGovernor:
                 active_round_reservations=len(self._round_reservations),
                 round_reservation_waiters=len(self._round_waiters),
                 active_exclusive_rounds=sum(
-                    reservation.exclusive for reservation in self._round_reservations.values()
+                    groups[reservation.group][1]
+                    for reservation in self._round_reservations.values()
                 ),
                 active_publication_bytes=self._active_bytes,
                 maximum_active_publication_bytes=self._maximum_active_bytes,

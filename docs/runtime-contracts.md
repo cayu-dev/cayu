@@ -2526,9 +2526,11 @@ invocation root after validating the current session incarnation and run epoch.
 An inline subagent therefore does not wait behind its parent's exclusive lease.
 Each round retains its own payload declaration and release ownership; releasing
 the parent does not release an active child's reservation or vice versa.
-Bounded declarations aggregate across the family and unrelated families. If a
-related round cannot fit, or needs exclusivity while another family is active,
-admission fails before that round dispatches tools instead of waiting on its
+Bounded declarations aggregate across the family and unrelated families. A family
+whose aggregate exceeds capacity uses the same exclusive admission as one
+oversized round; exclusivity is recalculated as its members release. If a
+related round cannot fit because another family is active, admission fails
+before that round dispatches tools instead of waiting on its
 parent. An already exclusive family permits its related rounds to enter ahead
 of unrelated waiters; unrelated families remain excluded until that ownership
 has drained. Caller-supplied parent metadata does not establish this grouping.
