@@ -15,7 +15,7 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
-from cayu.artifacts._images import decode_verified_image_format
+from cayu.artifacts._images import ImageDecodePolicy, decode_verified_image_format
 from cayu.artifacts.base import ArtifactReadResult
 
 FILE_ATTACHMENT_TYPE = "cayu.file_attachment.v1"
@@ -264,6 +264,7 @@ def validate_file_attachment_bytes(
     kind: FileAttachmentKind,
     content: bytes,
     content_type: str | None = None,
+    image_decode_limits: Mapping[str, int] | None = None,
 ) -> None:
     """Validate that `content` is a parseable image/PDF for `kind`, raising `ValueError` if not.
 
@@ -272,6 +273,8 @@ def validate_file_attachment_bytes(
     dependencies are not installed — so a caller cannot store a prompt attachment whose bytes a
     provider would later fail to serialize. When `content_type` is given for an image, the format
     detected from the bytes must match it (rejecting e.g. JPEG bytes labeled `image/png`).
+    Optional host-owned `image_decode_limits` accepts positive integer `max_frame_bytes`,
+    `max_total_bytes` and `max_frames`; omitted keys retain protective defaults.
     """
     from importlib import import_module
     from io import BytesIO
@@ -285,7 +288,14 @@ def validate_file_attachment_bytes(
                 "Install cayu[files]."
             ) from exc
         try:
-            detected_format = decode_verified_image_format(image_module, content)
+            image_decode_policy = (
+                ImageDecodePolicy(**image_decode_limits)
+                if image_decode_limits is not None
+                else None
+            )
+            detected_format = decode_verified_image_format(
+                image_module, content, policy=image_decode_policy
+            )
         except Exception as exc:
             raise ValueError(f"File attachment bytes are not a valid image: {exc}") from exc
         detected_content_type = _IMAGE_FORMAT_CONTENT_TYPES.get(str(detected_format).upper())

@@ -1090,6 +1090,9 @@ class ToolContext(BaseModel):
         hide_input_in_errors=True,
     )
 
+    image_decode_limits: dict[str, int] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     session_id: str
     agent_name: str | None = None
     environment_name: str | None = None

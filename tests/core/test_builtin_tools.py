@@ -3407,7 +3407,7 @@ def test_read_file_returns_provider_neutral_image_attachment_without_base64(tmp_
     ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
     validation_threads: list[int] = []
 
-    def detect_image_content_type(_content: bytes) -> tuple[str, None]:
+    def detect_image_content_type(_content: bytes, _policy=None) -> tuple[str, None]:
         validation_threads.append(threading.get_ident())
         return "image/png", None
 
@@ -3541,7 +3541,7 @@ def test_read_file_rejects_mislabeled_image_attachment(tmp_path, monkeypatch):
     monkeypatch.setattr(
         files_module,
         "_detect_image_content_type",
-        lambda content: ("image/jpeg", None),
+        lambda content, policy=None: ("image/jpeg", None),
     )
 
     result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": artifact.id}))
@@ -3634,7 +3634,7 @@ def test_read_file_returns_error_for_image_parser_failures(tmp_path, monkeypatch
     monkeypatch.setattr(
         files_module,
         "_detect_image_content_type",
-        lambda content: ("image/png", None),
+        lambda content, policy=None: ("image/png", None),
     )
     monkeypatch.setattr(files_module, "_resize_image_bytes", fail_resize)
 

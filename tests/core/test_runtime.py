@@ -55810,17 +55810,18 @@ def test_attach_file_rejects_image_decompression_bomb_warning(tmp_path, monkeypa
         )
 
 
-def test_attach_file_rejects_image_over_decoded_size_limit(tmp_path, monkeypatch):
+def test_attach_file_rejects_image_over_decoded_size_limit(tmp_path):
     import io
 
     from PIL import Image
 
-    import cayu.artifacts._images as image_validation_module
+    from cayu import CayuConfig, ToolExecutionConfig
 
     buffer = io.BytesIO()
     Image.new("RGB", (15, 10), "white").save(buffer, format="PNG")
-    monkeypatch.setattr(image_validation_module, "MAX_IMAGE_DECODED_BYTES", 512)
-    app, _ = _app_with_artifact_store(tmp_path)
+    app, _ = _app_with_artifact_store(
+        tmp_path, config=CayuConfig(tool_execution=ToolExecutionConfig(image_max_frame_bytes=512))
+    )
 
     with pytest.raises(ValueError, match="not a valid image"):
         asyncio.run(

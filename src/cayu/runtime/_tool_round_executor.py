@@ -69,6 +69,7 @@ from cayu.approvals.user_input import (
     public_pending_user_input_prompt,
     user_input_lifecycle_authority_from_checkpoint,
 )
+from cayu.artifacts._images import ImageDecodePolicy
 from cayu.artifacts.base import ArtifactScope
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.artifacts.settlement import (
@@ -1494,6 +1495,7 @@ class ToolRoundExecutor:
         apply_limit_evaluation: LimitEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
         browser_control_service: BrowserControlService | None = None,
+        image_decode_policy: ImageDecodePolicy | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -1504,6 +1506,7 @@ class ToolRoundExecutor:
         self._mcp_manifest_policy = mcp_manifest_policy
         self._tool_result_projection_policy = tool_result_projection_policy
         self._secret_redactor = secret_redactor
+        self._image_decode_policy = image_decode_policy
         self._tool_timeout_seconds = tool_timeout_seconds
         self._max_parallel_tool_calls = max_parallel_tool_calls
         self._clock = clock
@@ -4441,6 +4444,9 @@ class ToolRoundExecutor:
             and registered_tool.tool.browser_profile is not None
         )
         tool_context = ToolContext(
+            image_decode_limits=(
+                self._image_decode_policy.as_dict() if self._image_decode_policy else None
+            ),
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,

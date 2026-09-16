@@ -17,7 +17,11 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Protocol
 
 from cayu._validation import require_nonblank, require_unicode_scalar_text
-from cayu.artifacts._images import decode_verified_image_format
+from cayu.artifacts._images import (
+    ImageDecodePolicy,
+    decode_verified_image_format,
+    effective_image_decode_policy,
+)
 from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     FILE_ATTACHMENT_IMAGE_CONTENT_TYPES,
@@ -79,7 +83,7 @@ _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
 _ARTIFACT_PAGE_METADATA_MAX_BYTES = 192
 
 _READ_FILE_ARGUMENTS = frozenset(
-    {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages"}
+    {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages", "image_region"}
 )
 _EDIT_FILE_ARGUMENTS = frozenset(
     {"path", "expected_revision", "edits", "max_bytes", "max_diff_bytes"}
@@ -140,6 +144,7 @@ class ReadFileOptions:
     max_attachment_bytes: int = DEFAULT_ATTACHMENT_LIMIT_BYTES
     max_attachment_validation_bytes: int = DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES
     pages: str | None = None
+    image_region: tuple[int, int, int, int] | None = None
     offset: int = 0
 
 
@@ -230,6 +235,18 @@ def _read_file_tool_spec(
                     "minimum": 1,
                     "maximum": max_attachment_limit_bytes,
                     "default": default_attachment_limit_bytes,
+                },
+                "image_region": {
+                    "type": "array",
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "items": {"type": "integer", "minimum": 0},
+                    "description": (
+                        "Image-only crop [left, top, right, bottom] in original source pixels; "
+                        "right/bottom are exclusive. Returns frame 0 at original resolution. "
+                        "Repeat with other coordinates on the source artifact to inspect more. "
+                        "Source decoding must fit the host image policy."
+                    ),
                 },
                 "pages": {
                     "type": "string",
@@ -337,6 +354,20 @@ class ReadFileTool(Tool):
                 maximum=self.max_attachment_limit_bytes,
             )
             pages = _optional_arg_string(args, "pages")
+            region = args.get("image_region")
+            if region is not None:
+                if (
+                    not isinstance(region, list)
+                    or len(region) != 4
+                    or any(type(value) is not int or value < 0 for value in region)
+                    or region[0] >= region[2]
+                    or region[1] >= region[3]
+                ):
+                    raise ValueError(
+                        "image_region must be [left, top, right, bottom] with positive area."
+                    )
+                region = tuple(region)
+
             if path is not None:
                 path = _validate_workspace_path_argument(path)
             options = ReadFileOptions(
@@ -344,6 +375,7 @@ class ReadFileTool(Tool):
                 max_attachment_bytes=max_attachment_bytes,
                 max_attachment_validation_bytes=self.max_attachment_limit_bytes,
                 pages=pages,
+                image_region=region,
                 offset=offset,
             )
         if path is not None:
@@ -553,6 +585,8 @@ async def _read_workspace_file(
             truncated=next_offset is not None,
             inspectable=False,
         )
+    if options.image_region is not None:
+        return invalid_tool_arguments_result(ValueError("image_region is only valid for images."))
     if options.pages is not None:
         return invalid_tool_arguments_result(
             ValueError("Tool argument `pages` is only valid for PDF files.")
@@ -1195,6 +1229,10 @@ class TextArtifactReader:
         return _is_text_content_type(artifact.content_type)
 
     async def read(self, request: ArtifactReadRequest) -> ToolResult:
+        if request.options.image_region is not None:
+            return invalid_tool_arguments_result(
+                ValueError("image_region is only valid for images.")
+            )
         if request.options.pages is not None:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `pages` is only valid for PDF artifacts.")
@@ -1357,12 +1395,26 @@ class ImageArtifactReader:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `pages` is only valid for PDF artifacts.")
             )
+        policy = effective_image_decode_policy(
+            ImageDecodePolicy(**request.ctx.image_decode_limits)
+            if request.ctx.image_decode_limits is not None
+            else None
+        )
+        if request.options.image_region is not None:
+            from cayu.tools._image_regions import read_image_region
+
+            return await read_image_region(request, policy)
+        structured = {
+            **request.structured,
+            "image_decode_limits": policy.as_dict(),
+            "semantic_inspection": "not_established_by_tool",
+        }
         artifact_store = request.artifact_store
         artifact = request.artifact
         if artifact.size_bytes == 0:
             return ToolResult(
                 content=f"Image artifact '{artifact.filename}' is empty and cannot be inspected.",
-                structured=request.structured,
+                structured=structured,
                 is_error=True,
             )
         result = await _read_artifact_store(
@@ -1385,23 +1437,31 @@ class ImageArtifactReader:
                         f"Image '{artifact.filename}' is too large to inspect "
                         f"({artifact.size_bytes} bytes)."
                     ),
-                    structured=request.structured,
+                    structured=structured,
                     is_error=True,
                 )
+            structured["source_sha256"] = _content_hash(source.content)
             detected_content_type, validation_error = await asyncio.to_thread(
                 _detect_image_content_type,
                 source.content,
+                policy,
             )
             if validation_error is not None:
                 return ToolResult(
-                    content=f"Image '{artifact.filename}' could not be inspected: {validation_error}",
-                    structured=request.structured,
+                    content=(
+                        f"Image '{artifact.filename}' could not be inspected: {validation_error}. "
+                        "Host configuration: ToolExecutionConfig.image_max_frame_bytes, "
+                        "image_max_total_bytes, image_max_frames. After source admission, "
+                        "use image_region for readable portions; attachment bytes do not "
+                        "change source decoding policy."
+                    ),
+                    structured=structured,
                     is_error=True,
                 )
             if detected_content_type is None:
                 return ToolResult(
                     content=f"Image '{artifact.filename}' could not be inspected: unknown image type.",
-                    structured=request.structured,
+                    structured=structured,
                     is_error=True,
                 )
             if detected_content_type != artifact.content_type:
@@ -1410,7 +1470,7 @@ class ImageArtifactReader:
                         f"Image '{artifact.filename}' content type mismatch: metadata says "
                         f"{artifact.content_type}, but bytes are {detected_content_type}."
                     ),
-                    structured=request.structured,
+                    structured=structured,
                     is_error=True,
                 )
             derivation_key = _derivation_key(
@@ -1436,7 +1496,7 @@ class ImageArtifactReader:
                 except Exception as exc:
                     return ToolResult(
                         content=f"Image '{artifact.filename}' could not be inspected: {exc}",
-                        structured=request.structured,
+                        structured=structured,
                         is_error=True,
                     )
                 if resized is None:
@@ -1446,7 +1506,7 @@ class ImageArtifactReader:
                             f"{request.options.max_attachment_bytes}. Install cayu[files] or "
                             "register a custom reader to resize this image."
                         ),
-                        structured=request.structured,
+                        structured=structured,
                         is_error=True,
                     )
                 image_bytes, content_type = resized
@@ -1467,20 +1527,28 @@ class ImageArtifactReader:
                     },
                 )
         else:
+            structured["source_sha256"] = _content_hash(result.content)
             detected_content_type, validation_error = await asyncio.to_thread(
                 _detect_image_content_type,
                 result.content,
+                policy,
             )
             if validation_error is not None:
                 return ToolResult(
-                    content=f"Image '{artifact.filename}' could not be inspected: {validation_error}",
-                    structured=request.structured,
+                    content=(
+                        f"Image '{artifact.filename}' could not be inspected: {validation_error}. "
+                        "Host configuration: ToolExecutionConfig.image_max_frame_bytes, "
+                        "image_max_total_bytes, image_max_frames. After source admission, "
+                        "use image_region for readable portions; attachment bytes do not "
+                        "change source decoding policy."
+                    ),
+                    structured=structured,
                     is_error=True,
                 )
             if detected_content_type is None:
                 return ToolResult(
                     content=f"Image '{artifact.filename}' could not be inspected: unknown image type.",
-                    structured=request.structured,
+                    structured=structured,
                     is_error=True,
                 )
             if detected_content_type != artifact.content_type:
@@ -1489,9 +1557,25 @@ class ImageArtifactReader:
                         f"Image '{artifact.filename}' content type mismatch: metadata says "
                         f"{artifact.content_type}, but bytes are {detected_content_type}."
                     ),
-                    structured=request.structured,
+                    structured=structured,
                     is_error=True,
                 )
+        source_bytes = source.content if result.truncated else result.content
+        from cayu.tools._image_regions import image_information
+
+        dimensions, frames = await asyncio.to_thread(image_information, source_bytes)
+        structured.update(
+            {
+                "source_sha256": _content_hash(source_bytes),
+                "source_dimensions": dimensions,
+                "source_frame_count": frames,
+                "source_artifact_id": artifact.id,
+                "representation": "original"
+                if attachment_artifact.id == artifact.id
+                else "resized_overview",
+                "region_operation": "read_file(artifact_id=source_artifact_id, image_region=[left, top, right, bottom])",
+            }
+        )
         attachment = file_attachment(
             artifact_id=attachment_artifact.id,
             kind=FileAttachmentKind.IMAGE,
@@ -1504,10 +1588,15 @@ class ImageArtifactReader:
             content=(
                 f"Attached image artifact {attachment_artifact.id}: "
                 f"{attachment_artifact.filename} ({attachment_artifact.content_type}, "
-                f"{attachment_artifact.size_bytes} bytes)."
+                f"{attachment_artifact.size_bytes} bytes). "
+                f"Source artifact {artifact.id}, SHA-256 {structured['source_sha256']}, "
+                f"dimensions {dimensions['width']} x {dimensions['height']}, "
+                f"representation {structured['representation']}. "
+                "For original-resolution portions, read the source artifact with "
+                "image_region=[left, top, right, bottom]."
             ),
             structured={
-                **request.structured,
+                **structured,
                 "attachment_artifact_id": attachment_artifact.id,
                 "attachment_content_type": attachment_artifact.content_type,
                 "attachment_bytes": attachment_artifact.size_bytes,
@@ -1521,6 +1610,10 @@ class PdfArtifactReader:
         return artifact.content_type == PDF_CONTENT_TYPE
 
     async def read(self, request: ArtifactReadRequest) -> ToolResult:
+        if request.options.image_region is not None:
+            return invalid_tool_arguments_result(
+                ValueError("image_region is only valid for images.")
+            )
         artifact_store = request.artifact_store
         artifact = request.artifact
         if artifact.size_bytes == 0:
@@ -2936,14 +3029,16 @@ def _resize_image_bytes(
     return None
 
 
-def _detect_image_content_type(content: bytes) -> tuple[str | None, str | None]:
+def _detect_image_content_type(
+    content: bytes, policy: ImageDecodePolicy | None = None
+) -> tuple[str | None, str | None]:
     try:
         image_module = import_module("PIL.Image")
     except ImportError:
         return None, "Install cayu[files] or register a custom image reader."
 
     try:
-        detected_format = decode_verified_image_format(image_module, content)
+        detected_format = decode_verified_image_format(image_module, content, policy=policy)
     except Exception as exc:
         return None, str(exc)
 

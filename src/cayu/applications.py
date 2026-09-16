@@ -50,6 +50,7 @@ from cayu.approvals.user_input import (
     copy_user_input_recovery_request,
     copy_user_input_response,
 )
+from cayu.artifacts._images import ImageDecodePolicy
 from cayu.artifacts.attachments import (
     FileAttachmentKind,
     file_attachment,
@@ -820,6 +821,9 @@ _CAYU_CONFIG_FIELD_OWNERS = {
     "tool_execution.max_file_attachment_bytes": "cayu.configuration.ToolExecutionConfig",
     "tool_execution.max_total_file_attachment_bytes": ("cayu.configuration.ToolExecutionConfig"),
     "tool_execution.max_file_attachments_per_request": ("cayu.configuration.ToolExecutionConfig"),
+    "tool_execution.image_max_frame_bytes": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.image_max_total_bytes": "cayu.configuration.ToolExecutionConfig",
+    "tool_execution.image_max_frames": "cayu.configuration.ToolExecutionConfig",
     "tool_execution.tool_timeout_seconds": "cayu.configuration.ToolExecutionConfig",
     "tool_execution.max_parallel_tool_calls": "cayu.configuration.ToolExecutionConfig",
     "operations.max_environment_lifecycle_owners": "cayu.configuration.OperationsConfig",
@@ -1037,6 +1041,11 @@ class CayuApp:
         self._max_file_attachment_bytes = tool_execution.max_file_attachment_bytes
         self._max_total_file_attachment_bytes = tool_execution.max_total_file_attachment_bytes
         self._max_file_attachments_per_request = tool_execution.max_file_attachments_per_request
+        self._image_decode_policy = ImageDecodePolicy(
+            max_frame_bytes=tool_execution.image_max_frame_bytes,
+            max_total_bytes=tool_execution.image_max_total_bytes,
+            max_frames=tool_execution.image_max_frames,
+        )
         self._tool_timeout_seconds = tool_execution.tool_timeout_seconds
         self._max_parallel_tool_calls = tool_execution.max_parallel_tool_calls
         self._max_environment_lifecycle_owners = operations.max_environment_lifecycle_owners
@@ -1220,6 +1229,7 @@ class CayuApp:
             mcp_manifest_policy=self._mcp_manifest_policy,
             tool_result_projection_policy=self._tool_result_projection_policy,
             secret_redactor=self._secret_redactor,
+            image_decode_policy=self._image_decode_policy,
             tool_timeout_seconds=self._tool_timeout_seconds,
             max_parallel_tool_calls=self._max_parallel_tool_calls,
             clock=self._clock,
@@ -3402,6 +3412,7 @@ class CayuApp:
             kind=resolved_kind,
             content=content,
             content_type=resolved_content_type,
+            image_decode_limits=self._image_decode_policy.as_dict(),
         )
         registered_environment = self._get_registered_environment(environment_name)
         artifact_store = _artifact_store(registered_environment)

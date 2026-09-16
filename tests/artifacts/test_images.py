@@ -173,3 +173,37 @@ def test_decode_verified_image_format_serializes_warning_filter_contexts(monkeyp
 
     assert second_entered.is_set()
     assert max_active_contexts == 1
+
+
+@pytest.mark.parametrize("field", ["max_frame_bytes", "max_total_bytes", "max_frames"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_image_decode_policy_rejects_invalid_resource_limits(field, value) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        image_validation.ImageDecodePolicy(**{field: value})
+
+
+def test_explicit_policy_admits_long_source_without_changing_defaults() -> None:
+    with Image.new("RGB", (1280, 19884), "white") as source:
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+    content = buffer.getvalue()
+    with pytest.raises(ValueError, match="101806080 > 67108864"):
+        image_validation.decode_verified_image_format(Image, content)
+    policy = image_validation.ImageDecodePolicy(max_frame_bytes=128 * 1024 * 1024)
+    assert image_validation.decode_verified_image_format(Image, content, policy=policy) == "PNG"
+    with pytest.raises(ValueError, match="101806080 > 67108864"):
+        image_validation.decode_verified_image_format(Image, content)
+
+
+def test_explicit_frame_override_preserves_aggregate_and_corruption_checks() -> None:
+    content = _animated_gif_bytes()
+    policy = image_validation.ImageDecodePolicy(max_frame_bytes=800, max_total_bytes=1199)
+    with pytest.raises(ValueError, match="1,200 > 1,199"):
+        image_validation.decode_verified_image_format(Image, content, policy=policy)
+    policy = image_validation.ImageDecodePolicy(max_frame_bytes=800, max_frames=2)
+    with pytest.raises(ValueError, match="more than 2 frames"):
+        image_validation.decode_verified_image_format(Image, content, policy=policy)
+    with pytest.raises(OSError):
+        image_validation.decode_verified_image_format(
+            Image, content[:-5], policy=image_validation.ImageDecodePolicy(max_frame_bytes=800)
+        )

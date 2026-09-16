@@ -105,6 +105,9 @@ class ToolExecutionConfig(BaseModel):
         default=DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
         ge=1,
     )
+    image_max_frame_bytes: StrictInt = Field(default=64 * 1024 * 1024, ge=1)
+    image_max_total_bytes: StrictInt = Field(default=256 * 1024 * 1024, ge=1)
+    image_max_frames: StrictInt = Field(default=1024, ge=1)
     tool_timeout_seconds: float | None = None
     max_parallel_tool_calls: StrictInt = Field(
         default=DEFAULT_MAX_PARALLEL_TOOL_CALLS,
