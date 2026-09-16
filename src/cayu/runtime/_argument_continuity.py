@@ -271,8 +271,14 @@ async def materialize(
         identity = canonical_durable_json_bytes(part.model_dump(mode="json"), "selected call")
         arguments = by_identity.get(identity)
         if arguments is not None:
+            # Only this identity-bound private view regains available arguments;
+            # the persisted audit projection remains unavailable.
             updates[id(part)] = part.model_copy(
-                update={"arguments": redactor.redact_json(arguments)}, deep=True
+                update={
+                    "arguments": redactor.redact_json(arguments),
+                    "arguments_state": "finalized",
+                },
+                deep=True,
             )
     if not updates:
         return messages
@@ -282,7 +288,7 @@ async def materialize(
     provider_updates: dict[int, ProviderStatePart] = {}
     for message in messages:
         restored = {
-            (part.tool_call_id, part.tool_name): updates[id(part)]
+            (part.tool_call_id, part.tool_name): (part, updates[id(part)])
             for part in message.content
             if isinstance(part, ToolCallPart) and id(part) in updates
         }
@@ -293,13 +299,18 @@ async def materialize(
                 isinstance(part, ProviderStatePart)
                 and part.provider == "openai"
                 and part.state.get("type") == "function_call"
-                and part.state.get("arguments") == "{}"
             ):
                 call_id, name = part.state.get("call_id"), part.state.get("name")
                 if type(call_id) is not str or type(name) is not str:
                     continue
-                call = restored.get((call_id, name))
-                if call is not None:
+                pair = restored.get((call_id, name))
+                if pair is not None:
+                    original, call = pair
+                    expected = canonical_durable_json_bytes(
+                        original.continuation_arguments(), "omitted provider arguments"
+                    ).decode("utf-8")
+                    if part.state.get("arguments") != expected:
+                        continue
                     provider_updates[id(part)] = part.model_copy(
                         update={
                             "state": {

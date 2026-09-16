@@ -2,11 +2,26 @@
 
 ## Unreleased
 
+## v0.6.1
+
 - OpenAI Responses HTTP streams drain trailing data for at most a 50 ms grace
   after the parser validates a terminal response, instead of requiring HTTP EOF.
   Readily available protocol conflicts across chunk boundaries and response-close
   failures remain errors; completion never authorizes a retry. Existing stream
   deadlines still bound noncooperative transport reads and cleanup.
+- Remove the fixed tool-round publication count ceiling.
+- Install ripgrep explicitly in qualification jobs so repository-maintenance
+  checks can run on public GitHub-hosted runners.
+- Preserve unavailable tool arguments in transcript projections, while restoring
+  authorized private arguments for model continuation, including native OpenAI
+  function-call history. Recovery preserves sealed argument projections across
+  a rejected tool-round publication and retry.
+- Refresh package, dashboard source, and sidecar release metadata for 0.6.1.
+
+Upgrade requirements remain as described in v0.6.0 below:
+storage revision **90**, server contract **44**, and manifest/generator schema
+**17**. Applications upgrading from 0.5.2 must follow the public import migration
+and storage guidance in that section.
 
 ## v0.6.0
 

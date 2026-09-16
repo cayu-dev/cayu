@@ -278,7 +278,7 @@ candidate wheel:
 
 ```sh
 uv build --wheel
-CAYU_BENCHMARK_WHEEL=/absolute/path/to/dist/cayu-0.6.0-py3-none-any.whl \
+CAYU_BENCHMARK_WHEEL=/absolute/path/to/dist/cayu-0.6.1-py3-none-any.whl \
   uv run pytest tests/qualification/test_benchmark_campaign_wheel.py -q
 ```
 

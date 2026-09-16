@@ -11400,6 +11400,15 @@
           "default": "tool_call",
           "title": "Type",
           "type": "string"
+        },
+        "arguments_state": {
+          "default": "finalized",
+          "enum": [
+            "finalized",
+            "unavailable"
+          ],
+          "title": "Arguments State",
+          "type": "string"
         }
       },
       "required": [

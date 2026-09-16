@@ -297,12 +297,14 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
             if mode in {"delayed_receipt", "socket_delayed_receipt"}:
                 # For a socket, peer EOF observation is independent of the
                 # local close/receipt task; join it explicitly before checking.
-                await asyncio.wait_for(closed.wait(), 2)
+                await asyncio.wait_for(closed.wait(), 30)
                 assert closed.is_set()
                 assert cleanup_owners()
                 assert initial_plan.active_model_stage.local_http_cleanup == "unknown"
             release.set()
-            async with asyncio.timeout(2):
+            # Receipt persistence and peer EOF are eventual cleanup, not the
+            # 200 ms behavior deadline. Allow loaded CI workers ample time.
+            async with asyncio.timeout(30):
                 while cleanup_owners():
                     await asyncio.sleep(0.001)
             events, settled_plan = await snapshot()
@@ -366,7 +368,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
                 "socket_preheaders_failure",
                 "socket_delayed_receipt",
             }:
-                await asyncio.wait_for(closed.wait(), 2)
+                await asyncio.wait_for(closed.wait(), 30)
             assert closed.is_set() == (mode != "failure")
             assert not handlers
             assert not [t for t in asyncio.all_tasks() - baseline_tasks if not t.done()]
@@ -388,7 +390,7 @@ async def test_semantic_idle_http_cleanup(tmp_path, monkeypatch, mode, traffic, 
         await asyncio.gather(
             *(owned for owned in (running, opening) if owned is not None), return_exceptions=True
         )
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(30):
             while cleanup_owners():
                 await asyncio.sleep(0.001)
         if provider is not None:

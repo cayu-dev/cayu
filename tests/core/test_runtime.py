@@ -520,15 +520,26 @@ class CancellationCleanupFailingBudgetProvider(BlockingBudgetProvider):
 
 
 class RejectingHeartbeatBudgetLedger(InMemoryBudgetLedger):
-    def __init__(self, *, successful_heartbeat_calls: int = 2) -> None:
-        super().__init__(reservation_ttl_seconds=1)
+    def __init__(
+        self,
+        *,
+        successful_heartbeat_calls: int = 2,
+        reject_after: asyncio.Event | None = None,
+    ) -> None:
+        # These tests inject heartbeat rejection; wall-clock expiry must not
+        # select a different failure path while a CI worker is descheduled.
+        now = datetime.now(UTC)
+        super().__init__(clock=lambda: now, reservation_ttl_seconds=1)
         self.successful_heartbeat_calls = successful_heartbeat_calls
+        self.reject_after = reject_after
         self.heartbeat_calls = 0
         self.rejected = asyncio.Event()
 
     async def heartbeat(self, *, reservation_id: str) -> bool:
         self.heartbeat_calls += 1
-        if self.heartbeat_calls <= self.successful_heartbeat_calls:
+        if self.heartbeat_calls <= self.successful_heartbeat_calls or (
+            self.reject_after is not None and not self.reject_after.is_set()
+        ):
             return await super().heartbeat(reservation_id=reservation_id)
         self.rejected.set()
         return False
@@ -11514,7 +11525,7 @@ def test_cayu_app_reconciles_all_limits_before_yielding_reconciliation_events() 
 def test_cayu_app_fails_closed_and_charges_reservation_when_heartbeat_is_lost() -> None:
     async def run():
         provider = BlockingBudgetProvider()
-        ledger = RejectingHeartbeatBudgetLedger()
+        ledger = RejectingHeartbeatBudgetLedger(reject_after=provider.started)
         limit = BudgetLimit(
             scope="app",
             max_estimated_cost=Decimal("1"),
@@ -11531,21 +11542,27 @@ def test_cayu_app_fails_closed_and_charges_reservation_when_heartbeat_is_lost() 
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        events = await collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_lost_reservation",
-                messages=[Message.text("user", "hello")],
+        events = await asyncio.wait_for(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_lost_reservation",
+                    messages=[Message.text("user", "hello")],
+                ),
             ),
+            timeout=30,
         )
         return provider, ledger, events
 
     provider, ledger, events = asyncio.run(run())
 
+    assert provider.started.is_set()
     assert provider.cancelled.is_set()
-    assert ledger.heartbeat_calls == 3
+    assert ledger.heartbeat_calls >= 3
+    assert ledger.rejected.is_set()
     assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error_type"] == "BudgetReservationLeaseLost"
     assert EventType.BUDGET_RESERVATION_RELEASED not in [event.type for event in events]
     reconciliation = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
     assert reconciliation.payload["actual_amount"] == "1"
@@ -11560,7 +11577,7 @@ def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -
         provider = CancellationCleanupFailingBudgetProvider(
             f"provider cancellation cleanup failed: {cleanup_secret}"
         )
-        ledger = RejectingHeartbeatBudgetLedger()
+        ledger = RejectingHeartbeatBudgetLedger(reject_after=provider.started)
         limit = BudgetLimit(
             scope="app",
             max_estimated_cost=Decimal("1"),
@@ -11601,7 +11618,8 @@ def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -
     event_types = [event.type for event in events]
     assert provider.started.is_set()
     assert provider.cancelled.is_set()
-    assert ledger.heartbeat_calls == 3
+    assert ledger.heartbeat_calls >= 3
+    assert ledger.rejected.is_set()
     assert events[-1].type == EventType.SESSION_FAILED
     assert events[-1].payload["error_type"] == "BudgetReservationLeaseLost"
     assert events[-1].payload["error"].startswith("Budget reservation lease was lost:")

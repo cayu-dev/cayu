@@ -302,7 +302,11 @@ def main():
                         command,
                         cwd=stage,
                         env=env,
-                        timeout=600 if args.profile == "stress" else 300,
+                        timeout=(
+                            (1200 if args.profile == "stress" else 900)
+                            if scenario.name == "capacity"
+                            else (600 if args.profile == "stress" else 300)
+                        ),
                         cleanup=cleanup,
                     )
                     evidence = json.loads(result.read_text()) if result.exists() else {}

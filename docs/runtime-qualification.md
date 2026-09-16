@@ -10,7 +10,7 @@ From a checkout matching the candidate build:
 ```sh
 uv build --wheel
 uv venv /tmp/cayu-qualification-env
-uv pip install --python /tmp/cayu-qualification-env/bin/python 'dist/cayu-0.6.0-py3-none-any.whl[dev]'
+uv pip install --python /tmp/cayu-qualification-env/bin/python 'dist/cayu-0.6.1-py3-none-any.whl[dev]'
 python scripts/run_runtime_qualification.py \
   --python /tmp/cayu-qualification-env/bin/python \
   --report runtime-qualification.json
@@ -28,7 +28,9 @@ non-Python guide and corpus assets, plus the staged project configuration and
 runner script. Temporary-directory names are not part of that identity.
 
 The default profile repeats every scenario twice. Each scenario process has a
-five-minute wall-clock bound (ten minutes for stress), followed by a bounded cleanup grace period. No provider credentials, paid calls, Docker, or
+five-minute wall-clock bound (ten minutes for stress), except capacity, which gets
+fifteen minutes (twenty minutes for stress) to allow for disk contention. Each
+scenario has a bounded cleanup grace period. No provider credentials, paid calls, Docker, or
 PostgreSQL are required. POSIX process groups and real SIGKILL are required for
 fresh-process recovery; unsupported hosts produce prerequisite failure, not a pass.
 

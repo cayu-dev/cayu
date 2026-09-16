@@ -249,7 +249,11 @@ def test_audit_and_model_argument_policies_are_independent(
             requests = [*prior_requests, *provider.requests]
             assert len(requests) == 2
             expected = arguments if publish_arguments or retain_arguments else {}
-            assert retained_call(requests[1]).arguments == expected
+            selected_call = retained_call(requests[1])
+            assert selected_call.arguments == expected
+            assert selected_call.arguments_state == (
+                "finalized" if publish_arguments or retain_arguments else "unavailable"
+            )
             from cayu.providers.openai import build_openai_payload
 
             payload = build_openai_payload(requests[1], stream=True, reasoning_state="inline")
@@ -257,7 +261,12 @@ def test_audit_and_model_argument_policies_are_independent(
                 item for item in payload["input"] if item.get("type") == "function_call"
             ]
             assert len(native_calls) == 1
-            assert json.loads(native_calls[0]["arguments"]) == expected
+            native_arguments = json.loads(native_calls[0]["arguments"])
+            if publish_arguments or retain_arguments:
+                assert native_arguments == expected
+            else:
+                assert set(native_arguments) == {"__cayu_arguments_unavailable__"}
+                assert canary not in repr(native_arguments)
             assert any(item.get("encrypted_content") == "opaque" for item in payload["input"])
             transcript = await store.load_transcript(session_id)
             checkpoint = await store.load_checkpoint(session_id)
@@ -520,6 +529,13 @@ def test_private_materialization_requires_exact_retained_authority(boundary):
 
         session = SimpleNamespace(id="session", instance_id="incarnation")
         message, continuity = _private_fixture()
+        message = message.model_copy(
+            update={
+                "content": (
+                    message.content[0].model_copy(update={"arguments_state": "unavailable"}),
+                )
+            }
+        )
         raw = append_record(
             None,
             continuity=continuity,
@@ -561,12 +577,15 @@ def test_private_materialization_requires_exact_retained_authority(boundary):
         )
         if boundary == "same":
             assert result[0].content[0].arguments == {"text": "private-0"}
+            assert result[0].content[0].arguments_state == "finalized"
+            assert result[0].content[0].continuation_arguments() == {"text": "private-0"}
             result[0].content[0].arguments["text"] = "mutated"
             assert "mutated" not in repr(raw)
         else:
             assert result == messages
         assert store.reads == (0 if boundary in {"compacted", "duplicate", "disabled"} else 1)
         assert message.content[0].arguments == {}
+        assert message.content[0].arguments_state == "unavailable"
 
     asyncio.run(run())
 

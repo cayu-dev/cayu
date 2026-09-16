@@ -5202,6 +5202,13 @@ def test_exec_command_tool_preserves_local_cwd_resolution_errors_before_policy_o
     assert marker.exists() is False
 
 
+_COMMAND_RECOVERY_INSTRUCTION = (
+    "Choose a command permitted by the configured command policy, or ask the "
+    "application operator to authorize the required capability. Do not retry "
+    "suppressed arguments from transcript history."
+)
+
+
 def test_exec_command_tool_policy_deny_blocks_runner():
     runner = RecordingRunner()
     runner.default_cwd = "/workspace"
@@ -5226,6 +5233,7 @@ def test_exec_command_tool_policy_deny_blocks_runner():
         "error": "command_denied",
         "decision": "deny",
         "reason": "Shell scripts are not allowed here.",
+        "recovery_instruction": _COMMAND_RECOVERY_INSTRUCTION,
     }
     assert result.model_dump() == {
         "content": "Command denied by policy. Shell scripts are not allowed here.",
@@ -5233,6 +5241,7 @@ def test_exec_command_tool_policy_deny_blocks_runner():
             "error": "command_denied",
             "decision": "deny",
             "reason": "Shell scripts are not allowed here.",
+            "recovery_instruction": _COMMAND_RECOVERY_INSTRUCTION,
         },
         "artifacts": [],
         "is_error": True,
@@ -5303,6 +5312,7 @@ def test_exec_command_tool_policy_require_approval_blocks_runner():
         "error": "command_approval_required",
         "decision": "require_command_approval",
         "reason": None,
+        "recovery_instruction": _COMMAND_RECOVERY_INSTRUCTION,
     }
     assert runner.command is None
 
@@ -5579,6 +5589,7 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
         "error": "command_denied",
         "decision": "deny",
         "reason": expected_reason,
+        "recovery_instruction": redactor.redact_text(_COMMAND_RECOVERY_INSTRUCTION),
     }
     observed_payload = dict(observed["payload"])
     observed_payload["tool_name"] = blocked.payload["tool_name"]

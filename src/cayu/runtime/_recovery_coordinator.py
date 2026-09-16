@@ -17349,11 +17349,21 @@ class RecoveryCoordinator:
                         ),
                     )
                 )
+            argument_projection = tool_argument_publication.unavailable_argument_projection()
+            hook_argument_projection = argument_projection
+            if expected_outcome.call.id in staged_events_by_id and publication_scope == "static":
+                # Only a static scope survives restart with argument authority.
+                # Dynamic scopes remain unavailable after their redactor is lost.
+                # The sealed stage already owns the public argument projection.
+                # Replacing it on retry would conflict with that same durable stage.
+                argument_projection, hook_argument_projection = (
+                    _staged_terminal_argument_projections(terminal_event)
+                )
             expected_public_outcome = runtime_records.ToolCallOutcome(
                 call=runtime_records.copy_tool_call_request(
                     expected_outcome.call,
-                    arguments={},
-                    arguments_state="unavailable",
+                    arguments=argument_projection.transcript_arguments(),
+                    arguments_state=argument_projection.state,
                 ),
                 result=expected_outcome.result,
             )
@@ -17369,6 +17379,8 @@ class RecoveryCoordinator:
                 result=expected_outcome.result,
                 task_id=pending_round.task_id,
                 execution_profile=execution_profile,
+                argument_projection=argument_projection,
+                hook_argument_projection=hook_argument_projection,
                 allow_modification=hooks_state == "pending",
                 publish_before_hooks=hooks_state == "observational",
                 deferred_terminal_projection_recorder=(

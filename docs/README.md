@@ -59,6 +59,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Nightly verification](nightly-verification.md)
 - [Private provider-error diagnostics](provider-error-diagnostics.md)
 - [Provider stream-close diagnostics](provider-stream-close-investigation.md)
+- [Provider terminal HTTP completion](provider-terminal-http.md)
 - [Runtime stability qualification](runtime-qualification.md)
 - [MCP client conformance coverage](mcp-conformance.md)
 - [Release notes](release-notes.md)

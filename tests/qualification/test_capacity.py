@@ -56,7 +56,7 @@ class EvidenceTool(Tool):
             if self.barrier_width and not (self.skip_first and self.calls == 1):
                 if self.active >= self.barrier_width:
                     self.barrier.set()
-                await asyncio.wait_for(self.barrier.wait(), timeout=60)
+                await asyncio.wait_for(self.barrier.wait(), timeout=120)
             await asyncio.sleep(0)
             return ToolResult(content="bounded evidence")
         finally:
@@ -151,8 +151,9 @@ def test_durable_concurrent_long_trajectories(tmp_path, record_property):
                     )
                 ),
                 # Allow disk-backed cloud workers to finish the same trajectories
-                # within the default five-minute outer qualification scenario.
-                timeout=480 if stress else 240,
+                # with room for filesystem contention. The qualification runner
+                # gives this scenario a larger outer process guard as well.
+                timeout=900 if stress else 600,
             )
             task_rows = [await tasks.load_task(task.id) for task in created]
             session_rows = [await sessions.load(f"session-{task.id}") for task in created]

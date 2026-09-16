@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -40,6 +41,15 @@ from cayu.tasks.contracts import (
 from cayu.vaults.redaction import SecretRedactor
 
 
+@pytest.fixture
+def schedule_warnings(recwarn):
+    # Finalize cycles left by preceding shard tests before attributing warnings
+    # to this operation. Keep all warnings emitted by the current test visible.
+    gc.collect()
+    recwarn.clear()
+    return recwarn
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -61,7 +71,7 @@ from cayu.vaults.redaction import SecretRedactor
     ],
 )
 def test_public_schedule_creation_rejects_valid_content_substitution(
-    field, capsys, caplog, recwarn
+    field, capsys, caplog, schedule_warnings
 ):
     canary = "private-schedule-substitution"
 
@@ -125,7 +135,7 @@ def test_public_schedule_creation_rejects_valid_content_substitution(
     asyncio.run(run())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert all(canary not in str(warning.message) for warning in recwarn)
+    assert all(canary not in str(warning.message) for warning in schedule_warnings)
 
 
 @pytest.mark.parametrize(
@@ -592,7 +602,9 @@ def test_public_schedule_mutations_replay_after_reconstruction(backend, tmp_path
 
 
 @pytest.mark.parametrize("field", ["task_id", "operation_id", "policy"])
-def test_public_schedule_rejects_mutated_input_without_diagnostics(field, capsys, caplog, recwarn):
+def test_public_schedule_rejects_mutated_input_without_diagnostics(
+    field, capsys, caplog, schedule_warnings
+):
     canary = "private-scheduling-input-canary"
 
     class PrivateValue:
@@ -620,10 +632,12 @@ def test_public_schedule_rejects_mutated_input_without_diagnostics(field, capsys
     asyncio.run(run())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not schedule_warnings, [str(warning.message) for warning in schedule_warnings]
 
 
-def test_public_schedule_rejects_secret_identity_before_store_access(capsys, caplog, recwarn):
+def test_public_schedule_rejects_secret_identity_before_store_access(
+    capsys, caplog, schedule_warnings
+):
     canary = "private-scheduling-identity-canary"
 
     async def run():
@@ -643,11 +657,11 @@ def test_public_schedule_rejects_secret_identity_before_store_access(capsys, cap
     asyncio.run(run())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not schedule_warnings, [str(warning.message) for warning in schedule_warnings]
 
 
 @pytest.mark.parametrize("malformed", [False, True])
-def test_public_schedule_rejects_wrong_store_receipt(malformed, capsys, caplog, recwarn):
+def test_public_schedule_rejects_wrong_store_receipt(malformed, capsys, caplog, schedule_warnings):
     canary = "private-scheduling-receipt-canary"
 
     class PrivateValue:
@@ -688,7 +702,7 @@ def test_public_schedule_rejects_wrong_store_receipt(malformed, capsys, caplog, 
     asyncio.run(run())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not schedule_warnings, [str(warning.message) for warning in schedule_warnings]
 
 
 @pytest.mark.parametrize("cancel_schedule", [False, True])
@@ -802,7 +816,7 @@ def test_public_schedule_keeps_expected_authority_separate_from_store_argument()
 
 
 @pytest.mark.parametrize("fault", ["other_task", "duplicate", "over_limit", "malformed"])
-def test_public_schedule_history_rejects_untrusted_page(fault, capsys, caplog, recwarn):
+def test_public_schedule_history_rejects_untrusted_page(fault, capsys, caplog, schedule_warnings):
     canary = "private-schedule-history-canary"
 
     class PrivateValue:
@@ -844,11 +858,13 @@ def test_public_schedule_history_rejects_untrusted_page(fault, capsys, caplog, r
     asyncio.run(run())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not schedule_warnings, [str(warning.message) for warning in schedule_warnings]
 
 
 @pytest.mark.parametrize("fault", ["identity", "missing", "digest", "malformed"])
-def test_public_schedule_creation_rejects_invalid_evidence(fault, capsys, caplog, recwarn):
+def test_public_schedule_creation_rejects_invalid_evidence(
+    fault, capsys, caplog, schedule_warnings
+):
     canary = "private-schedule-creation-canary"
 
     class PrivateValue:
@@ -886,4 +902,4 @@ def test_public_schedule_creation_rejects_invalid_evidence(fault, capsys, caplog
     asyncio.run(run())
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn
+    assert not schedule_warnings, [str(warning.message) for warning in schedule_warnings]

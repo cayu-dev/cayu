@@ -7351,6 +7351,7 @@ def test_server_exposes_paginated_session_transcript() -> None:
             "tool_call_id": "call_1",
             "tool_name": "read_file",
             "arguments": {"path": "notes/result.txt"},
+            "arguments_state": "finalized",
         }
     ]
 
