@@ -31,8 +31,11 @@ from itertools import pairwise
 from typing import Any, Protocol
 
 from cayu._validation import (
+    DurableJsonLimits,
     DurableValueError,
     copy_durable_json_object,
+    copy_durable_json_value,
+    copy_durable_record,
     durable_json_object_from_pairs,
     parse_durable_json_integer_literal,
     reject_nonportable_json_constant,
@@ -83,8 +86,23 @@ class _TextStream(Protocol):
     def write(self, data: str, /) -> Any: ...
 
 
-def _write_line(stream: _TextStream, obj: dict[str, Any]) -> None:
-    portable = copy_durable_json_object(obj, "JSONL record")
+def _copy_jsonl_object(value: Any, *, max_bytes: int | None = None) -> dict[str, Any]:
+    if max_bytes is None:
+        return copy_durable_json_object(value, "JSONL record")
+    # A session envelope aggregates independently validated durable records.
+    # Its node allowance scales with its explicit byte allowance: a JSON node
+    # needs at least one encoded byte. Individual model/value limits still apply
+    # when the snapshot is built or its components are imported.
+    copied = copy_durable_record(
+        value, "JSONL record", limits=DurableJsonLimits(max_bytes, max_bytes)
+    )
+    if type(copied) is not dict:
+        raise DurableValueError("invalid_json_object", "JSONL record")
+    return copied
+
+
+def _write_line(stream: _TextStream, obj: dict[str, Any], *, max_bytes: int | None = None) -> None:
+    portable = _copy_jsonl_object(obj, max_bytes=max_bytes)
     stream.write(json.dumps(portable, ensure_ascii=False, allow_nan=False) + "\n")
 
 
@@ -113,6 +131,7 @@ async def export_sessions(
     no transaction remains open while the line is written. Limits reject an
     oversized session before any part of its line is emitted.
     """
+    effective_limits = SessionExportLimits() if limits is None else limits
     count = 0
     cursor: str | None = None
     while True:
@@ -124,12 +143,12 @@ async def export_sessions(
             )
         )
         for session in result.sessions:
-            snapshot = await store.load_session_export_snapshot(session.id, limits=limits)
+            snapshot = await store.load_session_export_snapshot(session.id, limits=effective_limits)
             if snapshot is None:
                 continue  # Deleted after enumeration, before its snapshot.
             if type(snapshot) is not SessionExportSnapshot or snapshot.session.id != session.id:
                 raise ValueError("Session store returned another export snapshot identity.")
-            _write_line(stream, snapshot.document())
+            _write_line(stream, snapshot.document(), max_bytes=effective_limits.max_bytes)
             count += 1
         cursor = result.next_cursor
         if cursor is None:
@@ -197,11 +216,15 @@ class ImportedSession:
     boundary: SessionExportBoundary | None = None
 
 
-def _iter_json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
+def _iter_json_lines(
+    lines: Iterable[str], *, max_bytes: int | None = None
+) -> Iterator[dict[str, Any]]:
     """Parse non-blank JSONL lines into objects, rejecting non-object lines."""
     for raw in lines:
         if type(raw) is not str:
             raise DurableValueError("invalid_text_type", "JSONL record")
+        if max_bytes is not None and len(raw.encode("utf-8", errors="surrogatepass")) > max_bytes:
+            raise DurableValueError("json_value_too_large", "JSONL record", limit=max_bytes)
         raw = require_durable_text(raw, "JSONL record")
         stripped = raw.strip()
         if not stripped:
@@ -215,7 +238,7 @@ def _iter_json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
             )
         except RecursionError:
             raise DurableValueError("nesting_too_deep", "JSONL record") from None
-        yield copy_durable_json_object(obj, "JSONL record")
+        yield _copy_jsonl_object(obj, max_bytes=max_bytes)
 
 
 def _reject_nonportable_json_constant(value: str) -> None:
@@ -230,7 +253,9 @@ def _reject_duplicate_json_object_keys(pairs: list[tuple[str, Any]]) -> dict[str
     return durable_json_object_from_pairs(pairs, "JSONL record")
 
 
-def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
+def import_sessions(
+    lines: Iterable[str], *, max_bytes: int = SessionExportLimits().max_bytes
+) -> Iterator[ImportedSession]:
     """Parse ``{"type": "session", ...}`` JSONL lines into typed records.
 
     ``lines`` is any iterable of text lines (e.g. an open file, which iterates
@@ -245,7 +270,10 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
     fields so appending the imported events to another store preserves resume
     semantics. Do not restore JSONL from an untrusted source.
     """
-    for obj in _iter_json_lines(lines):
+    # Validate a caller's explicit envelope bound without changing the limits
+    # enforced by the imported Session/Event/Message/checkpoint models.
+    max_bytes = SessionExportLimits(max_bytes=max_bytes).max_bytes
+    for obj in _iter_json_lines(lines, max_bytes=max_bytes):
         record_type = obj.get("type")
         if record_type != "session":
             raise ValueError(f"Expected a session record, got type={record_type!r}.")
@@ -260,6 +288,23 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
             expected_fields = expected_fields | {"format_version", "snapshot"}
         if obj.keys() != expected_fields:
             raise ValueError("Session record contains missing or unsupported fields.")
+        # Increasing the aggregate envelope must not increase a component's
+        # portable-document allowance. The typed validators below additionally
+        # enforce the component-specific contracts and cross-record references.
+        for field in (
+            "session",
+            "checkpoint",
+            "deferred_interaction_input",
+            "targeted_tool_grant_state",
+        ):
+            obj[field] = copy_durable_json_value(obj[field], f"session export {field}")
+        for field in ("events", "transcript_records"):
+            if type(obj[field]) is not list:
+                raise ValueError(f"Session {field} must be a list.")
+            obj[field] = [
+                copy_durable_json_object(record, f"session export {field} record")
+                for record in obj[field]
+            ]
         boundary = None if version == 1 else SessionExportBoundary.model_validate(obj["snapshot"])
         session = Session.model_validate(obj["session"])
         checkpoint = decode_runtime_checkpoint(

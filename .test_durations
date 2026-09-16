@@ -33420,5 +33420,16 @@
     "tests/core/test_collaboration_contracts.py::test_strict_generation_before_canonicalization[True]": 0.001510250018327497,
     "tests/core/test_collaboration_contracts.py::test_unsupported_values[inf]": 0.0002911669871537015,
     "tests/core/test_collaboration_contracts.py::test_unsupported_values[nan]": 0.00027141699683852494,
-    "tests/core/test_collaboration_contracts.py::test_unsupported_values[value2]": 0.0002552090008975938
+    "tests/core/test_collaboration_contracts.py::test_unsupported_values[value2]": 0.0002552090008975938,
+    "tests/core/test_cli_storage.py::test_session_export_byte_options_are_validated_before_database_access": 0.029888876000768505,
+    "tests/core/test_cli_storage.py::test_session_export_cli_passes_explicit_limits": 0.0010501240176381543,
+    "tests/core/test_session_export_sizes.py::test_admitted_history_exceeds_single_value_limits_and_roundtrips[bytes-memory]": 4.490504957982921,
+    "tests/core/test_session_export_sizes.py::test_admitted_history_exceeds_single_value_limits_and_roundtrips[bytes-sqlite]": 4.648729041015031,
+    "tests/core/test_session_export_sizes.py::test_admitted_history_exceeds_single_value_limits_and_roundtrips[nodes-memory]": 22.005812208008138,
+    "tests/core/test_session_export_sizes.py::test_admitted_history_exceeds_single_value_limits_and_roundtrips[nodes-sqlite]": 21.59470945801877,
+    "tests/core/test_session_export_sizes.py::test_explicit_envelope_boundary_is_inclusive_and_never_truncates": 0.003550875000655651,
+    "tests/core/test_session_export_sizes.py::test_larger_session_envelope_keeps_individual_event_limits": 1.150563000002876,
+    "tests/core/test_session_export_sizes.py::test_larger_session_envelope_keeps_portable_number_validation[9223372036854775808]": 0.00024933200620580465,
+    "tests/core/test_session_export_sizes.py::test_larger_session_envelope_keeps_portable_number_validation[NaN]": 0.00025554200692567974,
+    "tests/core/test_session_export_sizes.py::test_native_cli_respects_explicit_session_size": 1.3514262920216424
 }

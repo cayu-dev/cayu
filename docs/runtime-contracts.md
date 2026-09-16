@@ -4437,7 +4437,16 @@ hydrating payloads; all backends charge components before retaining them and
 check the complete encoded output. Codec temporaries and typed-object overhead
 are additional to these serialized-byte ceilings. Exceeding a ceiling raises
 `SessionExportTooLarge` before writing any part of that session's line. Earlier
-complete lines remain valid. Custom stores must implement the snapshot contract;
+complete lines remain valid. The JSONL envelope uses the session export byte allowance, not the generic
+16 MiB durable-document ceiling or its per-document node allowance. Individual
+stored components still satisfy their existing durable-value and typed-model
+contracts. The CLI exposes `--max-session-bytes` and `--max-record-bytes` for
+explicitly larger histories; these options do not apply to `--tasks`.
+`import_sessions(lines, max_bytes=...)` accepts the corresponding per-line
+UTF-8 ceiling (including a supplied newline), defaulting to 64 MiB. Import still
+validates every component and rejects duplicate keys and nonportable values.
+A larger envelope allowance does not authorize an oversized individual event.
+Custom stores must implement the snapshot contract;
 independent component reads are not a safe fallback.
 
 The line's `snapshot` field records source event sequences, the included event

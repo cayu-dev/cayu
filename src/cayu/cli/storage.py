@@ -30,6 +30,7 @@ from cayu._version import package_version
 from cayu.build_provenance import current_runtime_build_provenance
 from cayu.cli._output import add_output_options
 from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
+from cayu.sessions.exports import SessionExportLimits
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import jsonl_export, migration_authority
 from cayu.storage import migrations as schema
@@ -64,6 +65,16 @@ def add_storage_parser(subparsers: Any) -> None:
         if name == "export":
             sub.add_argument(
                 "--tasks", action="store_true", help="Export tasks instead of sessions."
+            )
+            sub.add_argument(
+                "--max-session-bytes",
+                type=int,
+                help="Session export byte ceiling (default: 67108864); raise for large histories.",
+            )
+            sub.add_argument(
+                "--max-record-bytes",
+                type=int,
+                help="Session component byte ceiling (default: 8388608); does not change stored-value validation.",
             )
             add_output_options(sub, formats=("json", "jsonl"))
         else:
@@ -1479,6 +1490,18 @@ class _JsonArrayStream:
 
 
 def _export(args: argparse.Namespace) -> int:
+    overrides = {
+        field: value
+        for field, value in (
+            ("max_bytes", getattr(args, "max_session_bytes", None)),
+            ("max_record_bytes", getattr(args, "max_record_bytes", None)),
+        )
+        if value is not None
+    }
+    if args.tasks and overrides:
+        raise ValueError("Session byte limits do not apply to --tasks exports.")
+    limits = SessionExportLimits(**overrides)
+
     async def run() -> int:
         if args.tasks:
             store = _task_store(args)
@@ -1500,6 +1523,7 @@ def _export(args: argparse.Namespace) -> int:
                         store,
                         stream=stream,
                         output_format=args.output_format,
+                        limits=limits,
                     )
             finally:
                 await store.close()
@@ -1522,11 +1546,13 @@ def _export(args: argparse.Namespace) -> int:
         return 1
 
 
-async def _export_sessions(store: Any, *, stream: TextIO, output_format: str) -> int:
+async def _export_sessions(
+    store: Any, *, stream: TextIO, output_format: str, limits: SessionExportLimits | None = None
+) -> int:
     if output_format == "jsonl":
-        return await jsonl_export.export_sessions(store, stream=stream)
+        return await jsonl_export.export_sessions(store, stream=stream, limits=limits)
     adapter = _JsonArrayStream(stream)
-    count = await jsonl_export.export_sessions(store, stream=adapter)
+    count = await jsonl_export.export_sessions(store, stream=adapter, limits=limits)
     adapter.finish()
     return count
 

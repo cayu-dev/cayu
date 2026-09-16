@@ -1054,3 +1054,46 @@ def test_storage_export_connection_error_does_not_leak_dsn(capsys, monkeypatch):
     payload = json.loads(captured.out)
     assert payload["error"]["code"] == "STORAGE_COMMAND_FAILED"
     assert "s3cr3t" not in payload["error"]["message"]
+
+
+def test_session_export_byte_options_are_validated_before_database_access(tmp_path, capsys):
+    missing = tmp_path / "never-created.sqlite"
+    for extra in (
+        ["--max-session-bytes", "0"],
+        ["--max-record-bytes", "-1"],
+        ["--tasks", "--max-session-bytes", "1024"],
+    ):
+        assert main(["storage", "export", "--sqlite", str(missing), "--jsonl", *extra]) == 1
+        assert not missing.exists()
+        capsys.readouterr()
+
+
+def test_session_export_cli_passes_explicit_limits(monkeypatch, tmp_path):
+    import asyncio
+    import io
+    from types import SimpleNamespace
+
+    from cayu.cli import storage as storage_cli
+    from cayu.sessions.exports import SessionExportLimits
+
+    observed = []
+
+    async def export(store, *, stream, limits):
+        observed.append(limits)
+        stream.write('{"type":"session"}\n')
+        return 1
+
+    monkeypatch.setattr(storage_cli.jsonl_export, "export_sessions", export)
+    limits = SessionExportLimits(max_bytes=128 * 1024 * 1024, max_record_bytes=16 * 1024 * 1024)
+    for format in ["json", "jsonl"]:
+        output = io.StringIO()
+        assert (
+            asyncio.run(
+                storage_cli._export_sessions(
+                    SimpleNamespace(), stream=output, output_format=format, limits=limits
+                )
+            )
+            == 1
+        )
+        assert "session" in output.getvalue()
+    assert observed == [limits, limits]
