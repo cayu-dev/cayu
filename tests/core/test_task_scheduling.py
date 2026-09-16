@@ -611,8 +611,8 @@ def test_scheduled_attached_failure_recovery_preserves_terminal_history(
                 assert isinstance(store, SQLiteTaskStore)
                 record_transition = store._record_schedule_transition_unlocked
 
-                def fail_after_journal_write(previous, current):
-                    record_transition(previous, current)
+                def fail_after_journal_write(previous, current, *, operation_id=None):
+                    record_transition(previous, current, operation_id=operation_id)
                     raise RuntimeError("injected journal publication failure")
 
                 with monkeypatch.context() as patch:

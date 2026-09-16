@@ -14,8 +14,17 @@ from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
 from threading import Lock
-from typing import Any, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from cayu.tasks.graphs import (
+        TaskGraphCreate,
+        TaskGraphCreationReceipt,
+        TaskGraphEvent,
+        TaskGraphMember,
+        TaskGraphSnapshot,
+    )
 
 from pydantic import (
     BaseModel,
@@ -253,6 +262,8 @@ def _bounded_task_retry_decimal(
 
 class TaskStatus(StrEnum):
     PENDING = "pending"
+    WAITING_DEPENDENCIES = "waiting_dependencies"
+    DEPENDENCY_SKIPPED = "dependency_skipped"
     CLAIMED = "claimed"
     RUNNING = "running"
     PAUSED = "paused"
@@ -1514,6 +1525,8 @@ class Task(BaseModel):
     session_instance_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
+    graph_id: str | None = Field(default=None, frozen=True)
+    prerequisite_task_ids: tuple[str, ...] = Field(default=(), frozen=True)
     available_at: datetime | None = None
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
@@ -1532,6 +1545,31 @@ class Task(BaseModel):
     schedule: TaskScheduleState | None = None
     retry_series: TaskRetrySeriesSnapshot | None = None
     work_contract: WorkContractRef | None = Field(default=None, frozen=True)
+
+    @model_validator(mode="after")
+    def validate_graph_membership(self) -> Task:
+        from cayu.tasks.graphs import TASK_GRAPH_MAX_NODES, graph_identifier
+
+        if self.graph_id is None:
+            if self.prerequisite_task_ids or self.status in {
+                TaskStatus.WAITING_DEPENDENCIES,
+                TaskStatus.DEPENDENCY_SKIPPED,
+            }:
+                raise ValueError("Dependency state requires graph membership.")
+            return self
+        graph_identifier(self.graph_id)
+        graph_identifier(self.id)
+        if len(self.prerequisite_task_ids) > TASK_GRAPH_MAX_NODES:
+            raise ValueError("Graph prerequisite count exceeds its bound.")
+        dependencies = tuple(graph_identifier(identity) for identity in self.prerequisite_task_ids)
+        if dependencies != tuple(sorted(set(dependencies))) or self.id in dependencies:
+            raise ValueError("Graph prerequisites must be distinct ordered identities.")
+        if (
+            self.status in {TaskStatus.WAITING_DEPENDENCIES, TaskStatus.DEPENDENCY_SKIPPED}
+            and not dependencies
+        ):
+            raise ValueError("Dependency state requires prerequisites.")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -2363,6 +2401,23 @@ class TaskRetrySettlementResult(BaseModel):
             TaskRetrySeriesDisposition.SUCCEEDED: TaskStatus.COMPLETED,
             TaskRetrySeriesDisposition.CANCELLED: TaskStatus.CANCELLED,
         }.get(series.disposition, TaskStatus.FAILED)
+        if (
+            self.task.status is TaskStatus.DEPENDENCY_SKIPPED
+            and series.disposition is TaskRetrySeriesDisposition.NON_RETRYABLE_FAILURE
+            and self.task.graph_id is not None
+            and self.task.prerequisite_task_ids
+            and self.task.status_reason == "dependency_failed"
+            and isinstance(self.task.status_payload, dict)
+        ):
+            causes = self.task.status_payload.get("failed_prerequisite_task_ids")
+            if (
+                isinstance(causes, list)
+                and causes
+                and all(type(identity) is str for identity in causes)
+                and causes == sorted(set(causes))
+                and set(causes) <= set(self.task.prerequisite_task_ids)
+            ):
+                expected_status = TaskStatus.DEPENDENCY_SKIPPED
         if self.task.status is not expected_status:
             raise ValueError("Task retry receipt conflicts with its series disposition.")
 
@@ -2749,6 +2804,8 @@ class TaskStatusCounts(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pending: AggregateCount = Field(ge=0)
+    waiting_dependencies: AggregateCount = Field(default=0, ge=0)
+    dependency_skipped: AggregateCount = Field(default=0, ge=0)
     claimed: AggregateCount = Field(ge=0)
     running: AggregateCount = Field(ge=0)
     paused: AggregateCount = Field(ge=0)
@@ -3393,6 +3450,27 @@ class TaskStore(ABC):
     """
 
     supports_delayed_availability: ClassVar[bool] = False
+    supports_task_graphs: ClassVar[bool] = False
+
+    async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
+        """Atomically admit a bounded graph, or replay its exact creation receipt.
+
+        Preserve runtime-prepared invocation authority when copying requests.
+        Expected external parents must match inside the admission transaction;
+        receipts bind both the submitted request and resolved admission digests.
+        """
+        raise NotImplementedError("This TaskStore does not support task graphs.")
+
+    async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
+        """Read current graph members and retained terminal evidence atomically."""
+        raise NotImplementedError("This TaskStore does not support task graphs.")
+
+    async def list_task_graph_events(
+        self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGraphEvent]:
+        """Read one bounded page of durable, task-store-owned graph events."""
+        raise NotImplementedError("This TaskStore does not support task graphs.")
+
     supports_task_scheduling: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
     supports_idempotent_terminalization: ClassVar[bool] = False
@@ -4437,10 +4515,17 @@ class TaskStore(ABC):
         """Return expired claimed task leases to pending."""
 
 
+class _PreparedMemoryTaskWrite(NamedTuple):
+    task: Task
+    prior: Task | None
+    events: tuple[TaskScheduleEvent, ...]
+
+
 class InMemoryTaskStore(TaskStore):
     """In-process task store for tests, local development, and examples."""
 
     supports_delayed_availability: ClassVar[bool] = True
+    supports_task_graphs: ClassVar[bool] = True
     supports_task_scheduling: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
@@ -4469,6 +4554,11 @@ class InMemoryTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._ownership_clock = utc_clock(ownership_clock)
         self._tasks: dict[str, Task] = {}
+        self._task_graph_receipts: dict[str, TaskGraphCreationReceipt] = {}
+        self._task_graph_members: dict[str, dict[str, tuple[str, ...]]] = {}
+        self._task_graph_events: dict[str, list[TaskGraphEvent]] = {}
+        self._task_graph_by_task: dict[str, str] = {}
+        self._task_graph_terminal_members: dict[str, TaskGraphMember] = {}
         self._schedule_receipts: dict[tuple[str, str], TaskScheduleReceipt] = {}
         self._schedule_events: dict[str, list[TaskScheduleEvent]] = {}
         self._session_closure_claims: dict[str, TaskSessionClosureClaim] = {}
@@ -4516,6 +4606,23 @@ class InMemoryTaskStore(TaskStore):
         self._contracted_task_ids_by_session: dict[str, dict[str, None]] = {}
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
+
+    async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
+        from cayu.tasks._memory_graphs import create_graph
+
+        return await create_graph(self, request)
+
+    async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
+        from cayu.tasks._memory_graphs import load_graph
+
+        return await load_graph(self, graph_id)
+
+    async def list_task_graph_events(
+        self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGraphEvent]:
+        from cayu.tasks._memory_graphs import list_graph_events
+
+        return await list_graph_events(self, graph_id, after_sequence=after_sequence, limit=limit)
 
     async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
         contract = copy_work_contract(contract)
@@ -6263,6 +6370,9 @@ class InMemoryTaskStore(TaskStore):
     ) -> TaskSessionClosureClaim:
         claim = copy_task_session_closure_claim(claim)
         async with self._lock:
+            from cayu.tasks._memory_graphs import require_graph_deletion_ready
+
+            require_graph_deletion_ready(self, claim.task_ids)
             existing = self._session_closure_claims.get(claim.session_id)
             if existing is not None:
                 existing = copy_task_session_closure_claim(existing)
@@ -6280,7 +6390,12 @@ class InMemoryTaskStore(TaskStore):
                     raise ValueError("Task closure source is unavailable.")
                 if (
                     task.status
-                    not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                    not in {
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                        TaskStatus.DEPENDENCY_SKIPPED,
+                    }
                     or task.worker_id is not None
                     or task.lease_expires_at is not None
                 ):
@@ -6308,6 +6423,9 @@ class InMemoryTaskStore(TaskStore):
             if claim is not None and task_id_set != set(claim.task_ids):
                 raise ValueError("Task deletion conflicts with the retained closure set.")
             tasks = [self._tasks.get(task_id) for task_id in task_ids]
+            from cayu.tasks._memory_graphs import require_graph_deletion_ready
+
+            require_graph_deletion_ready(self, task_ids)
             if any(
                 (task is None and claim is None)
                 or (task is not None and task.session_id != session_id)
@@ -6316,7 +6434,13 @@ class InMemoryTaskStore(TaskStore):
                 raise ValueError("Task closure authority changed during deletion.")
             tasks = [task for task in tasks if task is not None]
             if any(
-                task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                task.status
+                not in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.DEPENDENCY_SKIPPED,
+                }
                 or task.worker_id is not None
                 or task.lease_expires_at is not None
                 for task in tasks
@@ -7277,7 +7401,9 @@ class InMemoryTaskStore(TaskStore):
                 now=now,
                 series_now=series_now,
             )
-            if successor is not None and successor.id in self._tasks:
+            if successor is not None and (
+                successor.id in self._tasks or successor.id in self._task_graph_by_task
+            ):
                 raise TaskTerminalizationConflict(
                     "Task retry successor identity is already occupied."
                 )
@@ -7575,7 +7701,7 @@ class InMemoryTaskStore(TaskStore):
                 }
             )
             self._store_task(updated)
-            return updated.model_copy(deep=True)
+            return self._require_task(task_id).model_copy(deep=True)
 
     async def claim_task(
         self,
@@ -7609,12 +7735,15 @@ class InMemoryTaskStore(TaskStore):
                     self._store_task(receipt.task)
                     self._retry_settlements[(receipt.task_id, receipt.idempotency_key)] = receipt
             for waiting in tuple(self._tasks.values()):
+                # A prior expiry in this batch may have skipped this member.
+                waiting = self._tasks[waiting.id]
                 if (
                     waiting.schedule is None
                     or waiting.schedule.admitted_at is not None
                     or waiting.status
                     not in {
                         TaskStatus.PENDING,
+                        TaskStatus.WAITING_DEPENDENCIES,
                         TaskStatus.PAUSED,
                         TaskStatus.BLOCKED,
                         TaskStatus.NEEDS_ATTENTION,
@@ -8461,6 +8590,22 @@ class InMemoryTaskStore(TaskStore):
         return candidates
 
     def _store_task(self, task: Task, *, schedule_operation_id: str | None = None) -> None:
+        from cayu.tasks._memory_graphs import store_graph_task
+
+        if store_graph_task(self, task, schedule_operation_id=schedule_operation_id):
+            return
+        self._store_task_without_graph(task, schedule_operation_id=schedule_operation_id)
+
+    def _store_task_without_graph(
+        self, task: Task, *, schedule_operation_id: str | None = None
+    ) -> None:
+        self._publish_prepared_task_write(
+            self._prepare_task_write(task, schedule_operation_id=schedule_operation_id)
+        )
+
+    def _prepare_task_write(
+        self, task: Task, *, schedule_operation_id: str | None = None
+    ) -> _PreparedMemoryTaskWrite:
         prior = self._tasks.get(task.id)
         for session_id in (task.session_id, None if prior is None else prior.session_id):
             if session_id is not None and session_id in self._session_closure_claims:
@@ -8477,13 +8622,41 @@ class InMemoryTaskStore(TaskStore):
             first_sequence=len(self._schedule_events.get(task.id, ())) + 1,
             operation_id=schedule_operation_id,
         )
-        prior = self._tasks.get(task.id)
-        prior_handoff_id = None if prior is None else prior.interrupted_handoff_id
         next_handoff_id = task.interrupted_handoff_id
         if next_handoff_id is not None:
             indexed_task_id = self._task_id_by_interrupted_handoff_id.get(next_handoff_id)
             if indexed_task_id is not None and indexed_task_id != task.id:
                 raise TaskClaimLost("Interrupted-task handoff generation is already in use.")
+        if prior is not None:
+            for index, scope_id in (
+                (self._task_keys_by_session, prior.session_id),
+                (self._task_keys_by_parent, prior.parent_task_id),
+            ):
+                if scope_id is None:
+                    continue
+                keys = index.get(scope_id, ())
+                key = (prior.created_at, prior.id)
+                position = bisect_left(keys, key)
+                if position >= len(keys) or keys[position] != key:
+                    raise TaskTopologyInconsistent(
+                        "The in-memory task topology index is incomplete."
+                    )
+            if (
+                prior.session_id is not None
+                and prior.work_contract is not None
+                and not self._task_contract_binding_is_retired(prior.id)
+                and prior.id not in self._contracted_task_ids_by_session.get(prior.session_id, {})
+            ):
+                raise TaskTopologyInconsistent(
+                    "The in-memory contracted-session index is incomplete."
+                )
+        return _PreparedMemoryTaskWrite(task, prior, tuple(events))
+
+    def _publish_prepared_task_write(self, prepared: _PreparedMemoryTaskWrite) -> None:
+        """Publish prevalidated state while retaining the preparation lock."""
+        task, prior, events = prepared
+        prior_handoff_id = None if prior is None else prior.interrupted_handoff_id
+        next_handoff_id = task.interrupted_handoff_id
         if prior_handoff_id != next_handoff_id:
             if prior_handoff_id is not None:
                 self._task_id_by_interrupted_handoff_id.pop(prior_handoff_id, None)
@@ -8988,6 +9161,8 @@ def copy_task(task: Task) -> Task:
         session_id=task.session_id,
         session_instance_id=task.session_instance_id,
         parent_task_id=task.parent_task_id,
+        graph_id=task.graph_id,
+        prerequisite_task_ids=task.prerequisite_task_ids,
         assigned_agent_name=task.assigned_agent_name,
         available_at=task.available_at,
         schedule=task.schedule,
@@ -12341,6 +12516,7 @@ def _ensure_task_status_can_transition(
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
+        TaskStatus.DEPENDENCY_SKIPPED,
     }:
         raise ValueError(f"Task {task_id} is already terminal: {status}")
     if next_status == TaskStatus.RUNNING and status != TaskStatus.PENDING:
@@ -12359,6 +12535,7 @@ def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
         raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
     if task.status not in {
         TaskStatus.PENDING,
+        TaskStatus.WAITING_DEPENDENCIES,
         TaskStatus.CLAIMED,
         TaskStatus.RUNNING,
         *_HELD_TASK_STATUSES,
@@ -12734,6 +12911,7 @@ _TERMINAL_TASK_STATUSES = {
     TaskStatus.COMPLETED,
     TaskStatus.FAILED,
     TaskStatus.CANCELLED,
+    TaskStatus.DEPENDENCY_SKIPPED,
 }
 
 _HELD_TASK_STATUSES = {

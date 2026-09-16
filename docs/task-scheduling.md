@@ -108,6 +108,13 @@ claimed, cancellation, execution, hold/resume, and terminal transitions as they
 occur. A successful journal write is part of the native task mutation, not an
 independent session-event write.
 
+A scheduled graph member that becomes `dependency_skipped` records
+`task.schedule_dependency_skipped`, including transitive dependency skips. This
+is distinct from the late-policy `task.schedule_skipped` and is not a misfire or
+an admission. Native stores commit the task outcome, graph evidence, and schedule
+history atomically. Exact graph replay and persistent-store reopening preserve
+that history without adding duplicate terminal events.
+
 Protected HTTP routes expose the same controls:
 
 - `POST /api/tasks/schedule/reschedule` — the typed reschedule request above.

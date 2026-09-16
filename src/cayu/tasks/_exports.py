@@ -1,6 +1,15 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskGraphConflict": ("cayu.tasks.graphs", "TaskGraphConflict"),
+    "TaskGraphCreate": ("cayu.tasks.graphs", "TaskGraphCreate"),
+    "TaskGraphCreationReceipt": ("cayu.tasks.graphs", "TaskGraphCreationReceipt"),
+    "TaskGraphEvent": ("cayu.tasks.graphs", "TaskGraphEvent"),
+    "TaskGraphEventType": ("cayu.tasks.graphs", "TaskGraphEventType"),
+    "TaskGraphMember": ("cayu.tasks.graphs", "TaskGraphMember"),
+    "TaskGraphNode": ("cayu.tasks.graphs", "TaskGraphNode"),
+    "TaskGraphSnapshot": ("cayu.tasks.graphs", "TaskGraphSnapshot"),
+    "TaskGraphUnavailable": ("cayu.tasks.graphs", "TaskGraphUnavailable"),
     "TaskMisfirePolicy": ("cayu.tasks.scheduling", "TaskMisfirePolicy"),
     "TaskRescheduleRequest": ("cayu.tasks.scheduling", "TaskRescheduleRequest"),
     "TaskScheduleCancelRequest": ("cayu.tasks.scheduling", "TaskScheduleCancelRequest"),
@@ -218,6 +227,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "TaskGraphCreate",
+    "TaskGraphNode",
+    "TaskGraphCreationReceipt",
+    "TaskGraphSnapshot",
+    "TaskGraphMember",
+    "TaskGraphEvent",
+    "TaskGraphEventType",
+    "TaskGraphConflict",
+    "TaskGraphUnavailable",
     "TaskSessionClosureClaim",
     "AdmittedCompletionProposalRequest",
     "CompletionConstraintOutcome",

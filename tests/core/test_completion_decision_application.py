@@ -20,6 +20,7 @@ from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionInvocationBinding,
+    TaskExecutionSource,
 )
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.base import (
@@ -29,6 +30,7 @@ from cayu.tasks.base import (
     TaskCreate,
     TaskStatus,
     TaskStore,
+    task_create_with_runtime_invocation,
 )
 from cayu.tasks.contracts import (
     CompletionContinuationPolicy,
@@ -59,6 +61,7 @@ from cayu.tasks.contracts import (
     copy_completion_decision_application_request,
     work_contract_from_draft,
 )
+from cayu.tasks.graphs import TaskGraphCreate, TaskGraphNode
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -252,6 +255,37 @@ def _app(store: TaskStore) -> CayuApp:
         session_store=InMemorySessionStore(),
         task_store=store,
         enable_logging=False,
+    )
+
+
+async def _running_graph_task(store: TaskStore) -> Task:
+    contract = await store.publish_work_contract(_contract())
+    binding = unattributed_session_invocation_binding("session:application")
+    await store.create_task_graph(
+        TaskGraphCreate(
+            graph_id="application-graph",
+            nodes=(
+                TaskGraphNode(task=TaskCreate(task_id="prerequisite", type="test")),
+                TaskGraphNode(
+                    task=task_create_with_runtime_invocation(
+                        TaskCreate(
+                            task_id="application-task",
+                            type="verified-work",
+                            session_id="session:application",
+                            work_contract=contract.reference(),
+                        ),
+                        source=TaskExecutionSource.SDK_TASK,
+                        session_invocation=binding,
+                    ),
+                    prerequisite_task_ids=("prerequisite",),
+                ),
+            ),
+        )
+    )
+    await store.complete_task("prerequisite", {})
+    return await store.start_task(
+        "application-task",
+        session_invocation=binding,
     )
 
 
@@ -1795,7 +1829,7 @@ def test_app_rejects_exact_receipt_with_forged_verifier_profile_fingerprint() ->
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("reconciliation", [False, True])
+@pytest.mark.parametrize("application_path", ["normal", "replay", "ackloss"])
 @pytest.mark.parametrize(
     "field_name",
     [
@@ -1807,10 +1841,14 @@ def test_app_rejects_exact_receipt_with_forged_verifier_profile_fingerprint() ->
         "session_instance_id",
         "input",
         "metadata",
+        "graph_id",
+        "added_graph_id",
+        "prerequisite_task_ids",
+        "empty_prerequisite_task_ids",
     ],
 )
 def test_app_rejects_receipt_with_forged_immutable_task_authority(
-    reconciliation: bool,
+    application_path: str,
     field_name: str,
 ) -> None:
     class ForgedImmutableReceiptStore(InMemoryTaskStore):
@@ -1830,7 +1868,7 @@ def test_app_rejects_receipt_with_forged_immutable_task_authority(
             applied = await super().apply_completion_decision(request)
             if self.raise_after_commit:
                 raise ConnectionError("application acknowledgement lost")
-            return applied
+            return self._forge_task(applied) if self.forge_receipts else applied
 
         async def load_completion_decision_application_receipt(
             self,
@@ -1843,10 +1881,13 @@ def test_app_rejects_receipt_with_forged_immutable_task_authority(
             )
             if receipt is None or not self.forge_receipts:
                 return receipt
+            return receipt.model_copy(update={"task": self._forge_task(receipt.task)})
+
+        def _forge_task(self, task: Task) -> Task:
             update: dict[str, object]
             if field_name == "invocation":
                 update = {
-                    "invocation": receipt.task.invocation.model_copy(
+                    "invocation": task.invocation.model_copy(
                         update={
                             "origin": InvocationOrigin(
                                 trust=InvocationOriginTrust.HOST_ASSERTED,
@@ -1860,25 +1901,34 @@ def test_app_rejects_receipt_with_forged_immutable_task_authority(
             elif field_name == "parent_task_id":
                 update = {"parent_task_id": "forged-safe-parent"}
             elif field_name == "available_at":
-                update = {"available_at": receipt.task.created_at + timedelta(days=1)}
+                update = {"available_at": task.created_at + timedelta(days=1)}
             elif field_name == "started_at":
-                assert receipt.task.started_at is not None
-                update = {"started_at": receipt.task.started_at + timedelta(seconds=1)}
+                assert task.started_at is not None
+                update = {"started_at": task.started_at + timedelta(seconds=1)}
             elif field_name == "session_instance_id":
                 update = {"session_instance_id": str(uuid4())}
             elif field_name == "input":
                 update = {"input": {"nested": {"value": True}}}
+            elif field_name in {"graph_id", "added_graph_id"}:
+                update = {"graph_id": "forged-safe-graph"}
+            elif field_name == "prerequisite_task_ids":
+                update = {"prerequisite_task_ids": ("forged-safe-prerequisite",)}
+            elif field_name == "empty_prerequisite_task_ids":
+                update = {"prerequisite_task_ids": ()}
             else:
                 update = {"metadata": {"nested": {"value": True}}}
-            return receipt.model_copy(update={"task": receipt.task.model_copy(update=update)})
+            return task.model_copy(update=update)
 
     async def scenario() -> tuple[WorkCompletionConflict, Task, int]:
         store = ForgedImmutableReceiptStore()
-        task = await _running_task(
-            store,
-            task_input={"nested": {"value": 1}} if field_name == "input" else None,
-            metadata={"nested": {"value": 1}} if field_name == "metadata" else None,
-        )
+        if field_name in {"graph_id", "prerequisite_task_ids", "empty_prerequisite_task_ids"}:
+            task = await _running_graph_task(store)
+        else:
+            task = await _running_task(
+                store,
+                task_input={"nested": {"value": 1}} if field_name == "input" else None,
+                metadata={"nested": {"value": 1}} if field_name == "metadata" else None,
+            )
         decision_id, reference = await _persist_decision(
             store,
             task=task,
@@ -1892,11 +1942,11 @@ def test_app_rejects_receipt_with_forged_immutable_task_authority(
             result=_result("1"),
             result_reference=reference,
         )
-        if not reconciliation:
+        if application_path == "replay":
             completed = await _app(store).apply_completion_decision(request)
             assert completed.status is TaskStatus.COMPLETED
         store.forge_receipts = True
-        store.raise_after_commit = reconciliation
+        store.raise_after_commit = application_path == "ackloss"
         calls_before = store.application_calls
 
         with pytest.raises(
@@ -1907,16 +1957,62 @@ def test_app_rejects_receipt_with_forged_immutable_task_authority(
 
         persisted = await store.load_task(task.id)
         assert persisted is not None
+        assert persisted.graph_id == task.graph_id
+        assert persisted.prerequisite_task_ids == task.prerequisite_task_ids
+        store.forge_receipts = False
+        receipt = await store.load_completion_decision_application_receipt(
+            task.id, request.idempotency_key
+        )
+        assert receipt is not None and receipt.task == persisted
         return captured.value, persisted, store.application_calls - calls_before
 
     error, persisted, application_calls = asyncio.run(scenario())
     assert persisted.status is TaskStatus.COMPLETED
-    assert application_calls == (1 if reconciliation else 0)
-    if reconciliation:
+    assert application_calls == (0 if application_path == "replay" else 1)
+    if application_path == "ackloss":
         assert type(error.__cause__) is ConnectionError
         assert str(error.__cause__) == "application acknowledgement lost"
     else:
         assert error.__cause__ is None
+
+
+@pytest.mark.parametrize("ackloss", [False, True])
+def test_app_preserves_legitimate_graph_authority_on_application_and_replay(ackloss: bool) -> None:
+    class GraphReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def apply_completion_decision(
+            self, request: CompletionDecisionApplicationRequest
+        ) -> Task:
+            applied = await super().apply_completion_decision(request)
+            if ackloss:
+                raise ConnectionError("application acknowledgement lost")
+            return applied
+
+    async def scenario() -> None:
+        store = GraphReceiptStore()
+        task = await _running_graph_task(store)
+        decision_id, reference = await _persist_decision(
+            store, task=task, ordinal=1, verdict=CompletionVerdict.ACCEPTED
+        )
+        request = CompletionDecisionApplicationRequest(
+            task_id=task.id,
+            decision_id=decision_id,
+            idempotency_key="application-legitimate-graph",
+            result=_result("1"),
+            result_reference=reference,
+        )
+        app = _app(store)
+        completed = await app.apply_completion_decision(request)
+        assert completed.status is TaskStatus.COMPLETED
+        assert completed.graph_id == task.graph_id == "application-graph"
+        assert completed.prerequisite_task_ids == task.prerequisite_task_ids == ("prerequisite",)
+        assert await store.load_task(task.id) == completed
+        events = await app.list_task_graph_events(task.graph_id)
+        assert await app.apply_completion_decision(request) == completed
+        assert await app.list_task_graph_events(task.graph_id) == events
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("reconciliation", [False, True])

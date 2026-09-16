@@ -1331,6 +1331,8 @@ class CompletionDecisionApplicationCoordinator:
             or task.title != authority_task.title
             or task.description != authority_task.description
             or task.parent_task_id != authority_task.parent_task_id
+            or task.graph_id != authority_task.graph_id
+            or task.prerequisite_task_ids != authority_task.prerequisite_task_ids
             or task.assigned_agent_name != authority_task.assigned_agent_name
             or task.available_at != authority_task.available_at
             or not _durable_json_equal(

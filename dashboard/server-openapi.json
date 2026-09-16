@@ -30758,7 +30758,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "44",
+            "default": "45",
             "title": "Contract Version",
             "type": "string"
           },
@@ -33137,6 +33137,7 @@
           "task.schedule_misfired",
           "task.schedule_expired",
           "task.schedule_skipped",
+          "task.schedule_dependency_skipped",
           "task.schedule_claimed",
           "task.schedule_cancellation_requested",
           "task.schedule_cancelled",
@@ -33183,6 +33184,8 @@
       "TaskStatus": {
         "enum": [
           "pending",
+          "waiting_dependencies",
+          "dependency_skipped",
           "claimed",
           "running",
           "paused",
@@ -33219,6 +33222,12 @@
             "title": "Completed",
             "type": "string"
           },
+          "dependency_skipped": {
+            "default": "0",
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Dependency Skipped",
+            "type": "string"
+          },
           "failed": {
             "pattern": "^(0|[1-9]\\d*)$",
             "title": "Failed",
@@ -33242,6 +33251,12 @@
           "running": {
             "pattern": "^(0|[1-9]\\d*)$",
             "title": "Running",
+            "type": "string"
+          },
+          "waiting_dependencies": {
+            "default": "0",
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Waiting Dependencies",
             "type": "string"
           }
         },
@@ -36469,7 +36484,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "44",
+            "default": "45",
             "title": "Contract Version",
             "type": "string"
           }

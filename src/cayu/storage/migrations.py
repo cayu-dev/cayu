@@ -455,6 +455,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=89, kind=RevisionKind.BREAKING, compatible_from=89),
     # Every task writer must preserve schedule revisions and admission policy.
     Revision(revision=90, kind=RevisionKind.BREAKING, compatible_from=90),
+    # Every task writer must enforce immutable dependency readiness.
+    Revision(revision=91, kind=RevisionKind.BREAKING, compatible_from=91),
 )
 
 #: The revision an empty database is initialized to.

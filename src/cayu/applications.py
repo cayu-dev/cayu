@@ -581,6 +581,12 @@ from cayu.tasks.dispatch import (
     copy_dispatch_request,
     redact_dispatch_request,
 )
+from cayu.tasks.graphs import (
+    TaskGraphCreate,
+    TaskGraphCreationReceipt,
+    TaskGraphEvent,
+    TaskGraphSnapshot,
+)
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -6750,6 +6756,28 @@ class CayuApp:
             ) from None
         del copied_invocation_snapshot, parent_invocation_snapshot
         return task
+
+    async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
+        """Atomically submit a bounded self-contained graph through the Python SDK."""
+        from cayu.runtime._task_graphs import create_task_graph
+
+        return await create_task_graph(self, request)
+
+    async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
+        """Inspect current graph state and retained terminal member evidence."""
+        from cayu.runtime._task_graphs import load_task_graph
+
+        return await load_task_graph(self, graph_id)
+
+    async def list_task_graph_events(
+        self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> list[TaskGraphEvent]:
+        """Read a bounded page of task-store-owned graph events."""
+        from cayu.runtime._task_graphs import list_task_graph_events
+
+        return await list_task_graph_events(
+            self, graph_id, after_sequence=after_sequence, limit=limit
+        )
 
     async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
         """Replace an unadmitted one-shot schedule at its exact durable revision."""

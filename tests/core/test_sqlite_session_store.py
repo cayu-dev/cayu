@@ -3354,6 +3354,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_payload_json",
         "invocation_json",
         "retry_series_json",
+        "graph_id",
+        "prerequisite_task_ids_json",
     }.issubset(task_columns)
     # The explicit catalog guards compatibility-floor regressions as new
     # additive and breaking revisions are appended.
@@ -3449,6 +3451,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (88, 88),
         (89, 89),
         (90, 90),
+        (91, 91),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

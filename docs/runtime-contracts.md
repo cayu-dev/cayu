@@ -6000,6 +6000,10 @@ filtering, billing authority, or permission to use a task payload. Tokens,
 credentials, webhook bodies, prompts, and arbitrary task metadata are not
 provenance fields.
 
+For atomic submission and exact prerequisite joins, see
+[durable task dependencies](task-graphs.md). Dependency waiting and skipping are
+separate from task lineage and independent scheduling/ownership gates.
+
 Opt-in managed one-shot scheduling adds revision-fenced edits,
 expiry/misfire decisions, and durable task-owned history; see
 [durable task scheduling](task-scheduling.md). The following base availability

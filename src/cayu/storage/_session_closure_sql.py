@@ -1,5 +1,37 @@
 """Content-free bounded SQL preflight for native closure record snapshots."""
 
+# Task writers must exclude closure, not one another. Row/graph ownership
+# serializes mutations. Exclusive writer locks here deadlock when propagation
+# visits the same sessions in opposite orders across independent graphs.
+POSTGRES_TASK_CLOSURE_GUARD_DDL = """
+CREATE OR REPLACE FUNCTION cayu_task_closure_admission_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    previous_session TEXT;
+    candidate_session TEXT;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        previous_session := OLD.session_id;
+    END IF;
+    FOR candidate_session IN
+        SELECT DISTINCT value FROM unnest(ARRAY[previous_session, NEW.session_id]) value
+        WHERE value IS NOT NULL ORDER BY value
+    LOOP
+        PERFORM pg_advisory_xact_lock_shared(
+            hashtextextended('cayu-task-session-closure:' || candidate_session, 0)
+        );
+        IF EXISTS (
+            SELECT 1 FROM cayu_task_session_closure_claims
+            WHERE session_id = candidate_session
+        ) THEN
+            RAISE EXCEPTION 'Task session is owned by closure.' USING ERRCODE = '23514';
+        END IF;
+    END LOOP;
+    RETURN NEW;
+END
+$$
+"""
+
 # Foreign-key discovery is not ownership evidence. Only these schema-owned
 # task dependencies may be explicitly removed by task closure. Unknown
 # restrictive references must retain their database-enforced protection.

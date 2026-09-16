@@ -49,6 +49,7 @@ from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
 )
+from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
@@ -969,6 +970,7 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    91: SQLITE_TASK_GRAPH_DDL,
     90: SQLITE_SCHEDULING_DDL,
     81: """
         CREATE TABLE IF NOT EXISTS cayu_event_watcher_settlements (
@@ -4490,6 +4492,10 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    91: (
+        ("cayu_tasks", "graph_id", "TEXT"),
+        ("cayu_tasks", "prerequisite_task_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ),
     90: (
         (
             "cayu_tasks",
@@ -11188,6 +11194,8 @@ def task_from_row(row: sqlite3.Row) -> Task:
     result_json = row["result_json"]
     error_json = row["error_json"]
     return Task(
+        graph_id=row["graph_id"],
+        prerequisite_task_ids=tuple(json.loads(row["prerequisite_task_ids_json"])),
         id=row["id"],
         type=row["type"],
         title=row["title"],

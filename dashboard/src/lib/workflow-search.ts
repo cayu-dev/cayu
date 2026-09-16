@@ -15,6 +15,7 @@ export const WORKFLOW_URL_MAX_BYTES = 4 * 1024
 
 export const WORKFLOW_STATUS_FILTERS = [
   "pending",
+  "waiting_dependencies",
   "claimed",
   "running",
   "interrupting",
@@ -25,6 +26,7 @@ export const WORKFLOW_STATUS_FILTERS = [
   "failed",
   "interrupted",
   "cancelled",
+  "dependency_skipped",
 ] as const
 
 export const WORKFLOW_NODE_TYPE_FILTERS = ["session", "task"] as const

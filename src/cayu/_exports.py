@@ -1,6 +1,15 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskGraphConflict": ("cayu.tasks.graphs", "TaskGraphConflict"),
+    "TaskGraphCreate": ("cayu.tasks.graphs", "TaskGraphCreate"),
+    "TaskGraphCreationReceipt": ("cayu.tasks.graphs", "TaskGraphCreationReceipt"),
+    "TaskGraphEvent": ("cayu.tasks.graphs", "TaskGraphEvent"),
+    "TaskGraphEventType": ("cayu.tasks.graphs", "TaskGraphEventType"),
+    "TaskGraphMember": ("cayu.tasks.graphs", "TaskGraphMember"),
+    "TaskGraphNode": ("cayu.tasks.graphs", "TaskGraphNode"),
+    "TaskGraphSnapshot": ("cayu.tasks.graphs", "TaskGraphSnapshot"),
+    "TaskGraphUnavailable": ("cayu.tasks.graphs", "TaskGraphUnavailable"),
     "AuxiliaryInferencePolicy": ("cayu.tools.inference", "AuxiliaryInferencePolicy"),
     "InferenceInvoker": ("cayu.tools.inference", "InferenceInvoker"),
     "InferenceLimits": ("cayu.tools.inference", "InferenceLimits"),
@@ -5723,6 +5732,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "TaskGraphCreate",
+    "TaskGraphNode",
+    "TaskGraphCreationReceipt",
+    "TaskGraphSnapshot",
+    "TaskGraphMember",
+    "TaskGraphEvent",
+    "TaskGraphEventType",
+    "TaskGraphConflict",
+    "TaskGraphUnavailable",
     "AuxiliaryInferencePolicy",
     "InferenceInvoker",
     "InferenceLimits",

@@ -643,6 +643,8 @@ class RuntimeEvidenceTask(BaseModel):
     parent_task_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
     status: Literal[
         "pending",
+        "waiting_dependencies",
+        "dependency_skipped",
         "claimed",
         "running",
         "paused",

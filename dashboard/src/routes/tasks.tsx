@@ -52,6 +52,7 @@ type TaskActionVariables = {
 const PAGE_LIMIT = 100
 const TASK_STATUSES: TaskStatusFilter[] = [
   "pending",
+  "waiting_dependencies",
   "claimed",
   "running",
   "paused",
@@ -60,9 +61,10 @@ const TASK_STATUSES: TaskStatusFilter[] = [
   "completed",
   "failed",
   "cancelled",
+  "dependency_skipped",
 ]
 const HELD_STATUSES = new Set(["paused", "blocked", "needs_attention"])
-const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"])
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "dependency_skipped"])
 const selectClassName =
   "h-8 min-w-32 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
 

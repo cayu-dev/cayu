@@ -880,7 +880,7 @@ export function workflowTopologyContainsMixedSnapshots(state: WorkflowTopologySt
 }
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "failed", "interrupted"])
-const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"])
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "dependency_skipped"])
 
 export function workflowTopologyContainsActiveNodes(state: WorkflowTopologyState): boolean {
   return (

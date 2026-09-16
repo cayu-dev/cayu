@@ -175,6 +175,33 @@ from cayu.tasks.dispatch import InlineDispatcher as InlineDispatcher
 from cayu.tasks.dispatch import TaskStoreDispatcher as TaskStoreDispatcher
 from cayu.tasks.dispatch import copy_dispatch_handle as copy_dispatch_handle
 from cayu.tasks.dispatch import copy_dispatch_request as copy_dispatch_request
+from cayu.tasks.graphs import (
+    TaskGraphConflict as TaskGraphConflict,
+)
+from cayu.tasks.graphs import (
+    TaskGraphCreate as TaskGraphCreate,
+)
+from cayu.tasks.graphs import (
+    TaskGraphCreationReceipt as TaskGraphCreationReceipt,
+)
+from cayu.tasks.graphs import (
+    TaskGraphEvent as TaskGraphEvent,
+)
+from cayu.tasks.graphs import (
+    TaskGraphEventType as TaskGraphEventType,
+)
+from cayu.tasks.graphs import (
+    TaskGraphMember as TaskGraphMember,
+)
+from cayu.tasks.graphs import (
+    TaskGraphNode as TaskGraphNode,
+)
+from cayu.tasks.graphs import (
+    TaskGraphSnapshot as TaskGraphSnapshot,
+)
+from cayu.tasks.graphs import (
+    TaskGraphUnavailable as TaskGraphUnavailable,
+)
 from cayu.tasks.scheduling import TaskMisfirePolicy as TaskMisfirePolicy
 from cayu.tasks.scheduling import TaskRescheduleRequest as TaskRescheduleRequest
 from cayu.tasks.scheduling import TaskScheduleCancelRequest as TaskScheduleCancelRequest

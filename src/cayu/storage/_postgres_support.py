@@ -821,6 +821,8 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
             else _dumps(task.work_contract.model_dump(mode="json", warnings=False))
         ),
         None if task.schedule is None else _dumps(task.schedule.model_dump(mode="json")),
+        task.graph_id,
+        _dumps(list(task.prerequisite_task_ids)),
     )
 
 
@@ -828,7 +830,8 @@ TASK_COLUMNS = (
     "id, type, title, description, status, session_id, session_instance_id, parent_task_id, "
     "assigned_agent_name, available_at, worker_id, lease_expires_at, interrupted_handoff_id, "
     "status_reason, status_payload, input, result, error, metadata, created_at, updated_at, "
-    "started_at, completed_at, invocation, retry_series, work_contract, schedule"
+    "started_at, completed_at, invocation, retry_series, work_contract, schedule, "
+    "graph_id, prerequisite_task_ids"
 )
 
 
@@ -865,6 +868,8 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
             None if row[25] is None else WorkContractRef.model_validate(_loads(row[25]))
         ),
         schedule=None if row[26] is None else TaskScheduleState.model_validate(_loads(row[26])),
+        graph_id=row[27],
+        prerequisite_task_ids=tuple(_loads(row[28])),
     )
 
 

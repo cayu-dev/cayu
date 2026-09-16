@@ -16681,7 +16681,7 @@ export type TaskScheduleCancelRequest = {
 /**
  * TaskScheduleEventType
  */
-export type TaskScheduleEventType = 'task.scheduled' | 'task.rescheduled' | 'task.schedule_eligible' | 'task.schedule_misfired' | 'task.schedule_expired' | 'task.schedule_skipped' | 'task.schedule_claimed' | 'task.schedule_cancellation_requested' | 'task.schedule_cancelled' | 'task.schedule_started' | 'task.schedule_held' | 'task.schedule_resumed' | 'task.schedule_completed' | 'task.schedule_failed';
+export type TaskScheduleEventType = 'task.scheduled' | 'task.rescheduled' | 'task.schedule_eligible' | 'task.schedule_misfired' | 'task.schedule_expired' | 'task.schedule_skipped' | 'task.schedule_dependency_skipped' | 'task.schedule_claimed' | 'task.schedule_cancellation_requested' | 'task.schedule_cancelled' | 'task.schedule_started' | 'task.schedule_held' | 'task.schedule_resumed' | 'task.schedule_completed' | 'task.schedule_failed';
 
 /**
  * TaskSchedulePolicy
@@ -16707,7 +16707,7 @@ export type TaskSchedulePolicy = {
 /**
  * TaskStatus
  */
-export type TaskStatus = 'pending' | 'claimed' | 'running' | 'paused' | 'blocked' | 'needs_attention' | 'completed' | 'failed' | 'cancelled';
+export type TaskStatus = 'pending' | 'waiting_dependencies' | 'dependency_skipped' | 'claimed' | 'running' | 'paused' | 'blocked' | 'needs_attention' | 'completed' | 'failed' | 'cancelled';
 
 /**
  * TaskStatusCounts
@@ -16732,6 +16732,10 @@ export type TaskStatusCounts = {
      */
     completed: string;
     /**
+     * Dependency Skipped
+     */
+    dependency_skipped?: string;
+    /**
      * Failed
      */
     failed: string;
@@ -16751,6 +16755,10 @@ export type TaskStatusCounts = {
      * Running
      */
     running: string;
+    /**
+     * Waiting Dependencies
+     */
+    waiting_dependencies?: string;
 };
 
 /**

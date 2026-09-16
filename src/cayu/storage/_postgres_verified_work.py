@@ -331,7 +331,7 @@ class PostgresVerifiedWorkMixin:
 
         async def _ensure_ready(self) -> None: ...
 
-        async def _record_schedule_transition(
+        async def _record_task_transition(
             self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None
         ) -> None: ...
 
@@ -496,6 +496,10 @@ class PostgresVerifiedWorkMixin:
     async def _lock_verified_work_task(self, cur: Any, task_id: str) -> None:
         """Give every mutation for one task the same first authority lock."""
 
+        from cayu.storage._postgres_task_graphs import lock_task_graphs
+
+        await lock_task_graphs(cur, (task_id,))
+
         await self._lock_verified_work_identity(cur, "task", task_id)
 
     async def _verified_evidence_now(self, cur: Any) -> datetime:
@@ -534,6 +538,9 @@ class PostgresVerifiedWorkMixin:
         return verified_work_support.require_contract_reference(contract, reference)
 
     async def _load_task_locked(self, cur: Any, task_id: str) -> Task:
+        from cayu.storage._postgres_task_graphs import lock_task_graphs
+
+        await lock_task_graphs(cur, (task_id,))
         await cur.execute(
             f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks WHERE id = %s FOR UPDATE",
             (task_id,),
@@ -1234,7 +1241,7 @@ class PostgresVerifiedWorkMixin:
                 }
             )
             await self._update_task_snapshot(cur, updated)
-            await self._record_schedule_transition(cur, task, updated)
+            await self._record_task_transition(cur, task, updated)
             return updated.model_copy(deep=True)
 
         return await self._run_verified_work_mutation(operation)
@@ -1564,7 +1571,7 @@ class PostgresVerifiedWorkMixin:
                 }
             )
             await self._update_task_snapshot(cur, updated_task)
-            await self._record_schedule_transition(cur, task, updated_task)
+            await self._record_task_transition(cur, task, updated_task)
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_admissions "
                 "(admission_id, attempt_id, task_id, session_id, interaction_id, state, "
@@ -1895,7 +1902,7 @@ class PostgresVerifiedWorkMixin:
             )
             encoded = receipt.model_dump_json(warnings=False)
             await self._update_task_snapshot(cur, updated)
-            await self._record_schedule_transition(cur, task, updated)
+            await self._record_task_transition(cur, task, updated)
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_preparation_holds "
                 "(hold_id, task_id, request_sha256, receipt_json) VALUES (%s, %s, %s, %s)",
@@ -2015,7 +2022,7 @@ class PostgresVerifiedWorkMixin:
             encoded = receipt.model_dump_json(warnings=False)
             await self._update_task_snapshot(cur, updated)
             await self._update_work_attempt_admission_row(cur, settled_admission)
-            await self._record_schedule_transition(cur, task, updated)
+            await self._record_task_transition(cur, task, updated)
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_lifecycle_receipts "
                 "(admission_id, settlement_id, task_id, request_sha256, retired_contract_binding, settled_at, receipt_json) "
@@ -3383,7 +3390,7 @@ class PostgresVerifiedWorkMixin:
             )
             if updated != task:
                 await self._update_task_snapshot(cur, updated)
-                await self._record_schedule_transition(cur, task, updated)
+                await self._record_task_transition(cur, task, updated)
             await cur.execute(
                 "INSERT INTO cayu_completion_decision_application_receipts "
                 "(task_id, idempotency_key, decision_id, request_sha256, applied_at, "

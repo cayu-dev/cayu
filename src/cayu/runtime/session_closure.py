@@ -899,7 +899,13 @@ class TaskSessionClosureStore:
         truncated = len(tasks) > policy.max_records
         visible = tasks[: policy.max_records]
         active = any(
-            task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            task.status
+            not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.DEPENDENCY_SKIPPED,
+            }
             or task.worker_id is not None
             or task.lease_expires_at is not None
             for task in visible

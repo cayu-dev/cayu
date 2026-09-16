@@ -229,6 +229,7 @@ class TaskScheduleEventType(StrEnum):
     MISFIRED = "task.schedule_misfired"
     EXPIRED = "task.schedule_expired"
     SKIPPED = "task.schedule_skipped"
+    DEPENDENCY_SKIPPED = "task.schedule_dependency_skipped"
     CLAIMED = "task.schedule_claimed"
     CANCELLATION_REQUESTED = "task.schedule_cancellation_requested"
     CANCELLED = "task.schedule_cancelled"

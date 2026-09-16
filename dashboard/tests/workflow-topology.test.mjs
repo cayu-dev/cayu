@@ -924,6 +924,36 @@ test("task availability and active-state refresh policy remain explicit", () => 
   )
 })
 
+test("dependency waiting stays active while dependency skips stop workflow polling", () => {
+  for (const [status, active] of [
+    ["waiting_dependencies", true],
+    ["dependency_skipped", false],
+  ]) {
+    const search = validateWorkflowSearch({ status: [status] })
+    assert.notEqual(search.invalid, true)
+    assert.deepEqual(search.status, [status])
+    const request = buildWorkflowTopologyRequest("focus", search)
+    const state = mergeWorkflowTopologyResponse(
+      undefined,
+      "focus",
+      request,
+      topologyResponse({
+        focus: sessionNode("focus"),
+        taskSessionBranches: [
+          {
+            session_id: "focus",
+            tasks: [taskNode("dependent", "focus", null, { status })],
+            next_cursor: null,
+            has_more: false,
+          },
+        ],
+      }),
+    )
+    assert.equal(workflowTopologyContainsActiveNodes(state), active)
+    assert.equal(workflowTaskNodes(state)[0].status, status)
+  }
+})
+
 test("generated-contract topology helper forwards encoded identity, body, and cancellation", async () => {
   const originalWindow = globalThis.window
   const originalFetch = globalThis.fetch

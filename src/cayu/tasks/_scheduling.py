@@ -82,7 +82,7 @@ def require_schedule_mutation(task: Task, expected_revision: int) -> TaskSchedul
     state = require_schedule(task)
     if state.revision != expected_revision:
         raise TaskScheduleConflict("Task schedule revision changed.")
-    if task.status in {"completed", "failed", "cancelled"}:
+    if task.status in {"completed", "failed", "cancelled", "dependency_skipped"}:
         raise TaskScheduleConflict("Terminal task schedules cannot be changed.")
     if task.status_reason in {"cancellation_requested", "retry_cancellation_requested"}:
         raise TaskScheduleConflict("Task schedule cancellation is already settling.")
@@ -96,7 +96,13 @@ def rescheduled_task(task: Task, request: TaskRescheduleRequest, *, now: datetim
     state = require_schedule_mutation(task, request.expected_revision)
     if state.admitted_at is not None or task.worker_id is not None or task.session_id is not None:
         raise TaskScheduleConflict("An admitted task cannot be rescheduled.")
-    if task.status not in {"pending", "paused", "blocked", "needs_attention"}:
+    if task.status not in {
+        "pending",
+        "waiting_dependencies",
+        "paused",
+        "blocked",
+        "needs_attention",
+    }:
         raise TaskScheduleConflict("Task is not waiting for schedule admission.")
     return task.model_copy(
         update={
@@ -211,12 +217,21 @@ def schedule_transition_events(
             kinds.append(TaskScheduleEventType.EXPIRED)
         elif current.status_reason == "schedule_skipped":
             kinds.append(TaskScheduleEventType.SKIPPED)
+        elif current.status == "waiting_dependencies" and prior.status in {
+            "paused",
+            "blocked",
+            "needs_attention",
+        }:
+            # Releasing an independent hold is a resume even when the graph
+            # still gates execution on unfinished prerequisites.
+            kinds.append(TaskScheduleEventType.RESUMED)
         else:
             kind = {
                 "claimed": TaskScheduleEventType.CLAIMED,
                 "completed": TaskScheduleEventType.COMPLETED,
                 "failed": TaskScheduleEventType.FAILED,
                 "cancelled": TaskScheduleEventType.CANCELLED,
+                "dependency_skipped": TaskScheduleEventType.DEPENDENCY_SKIPPED,
                 "paused": TaskScheduleEventType.HELD,
                 "blocked": TaskScheduleEventType.HELD,
                 "needs_attention": TaskScheduleEventType.HELD,
