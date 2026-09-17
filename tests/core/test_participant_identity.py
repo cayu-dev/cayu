@@ -1182,10 +1182,14 @@ async def test_receipt_rejects_corrupted_result_from_store(stores, monkeypatch):
 
 
 async def test_canonical_payload_accounting_matches_retained_rows(stores):
+    from cayu.collaboration._participant_state import ParticipantPermitState
     from cayu.collaboration._preparation import contract_bytes, prepare_contract
     from cayu.collaboration.base import _ANCHOR_BYTES, _Anchor
+    from cayu.collaboration.lifecycle import NamespaceSnapshot
     from cayu.collaboration.participants import (
+        ParticipantConfigurationEvidence,
         ParticipantEvent,
+        ParticipantLifecycleEvidence,
         ParticipantReceipt,
         ParticipantSnapshot,
     )
@@ -1221,7 +1225,12 @@ async def test_canonical_payload_accounting_matches_retained_rows(stores):
         anchor = prepare_contract(_Anchor, await tx.get("anchors", ()), redactor=redactor)
         values = [("participants", (ref.participant_id,), ParticipantSnapshot)]
         values += [
-            ("configurations", (ref.participant_id, version), ParticipantSnapshot)
+            ("participant_permits", (ref.participant_id,), ParticipantPermitState),
+            ("lifecycle_history", (ref.participant_id, 1), ParticipantLifecycleEvidence),
+        ]
+        values += [("namespaces", (initialized.namespace_incarnation, 1), NamespaceSnapshot)]
+        values += [
+            ("configurations", (ref.participant_id, version), ParticipantConfigurationEvidence)
             for version in (1, 2)
         ]
         values += [("events", (sequence,), ParticipantEvent) for sequence in range(1, 5)]
@@ -1487,9 +1496,9 @@ async def test_wrapper_cannot_bypass_page_access(stores, monkeypatch, events):
     policy.allowed = ()
 
     async def unfiltered(*args, **kwargs):
-        return (receipt.event,) if events else receipt.participants
+        return (1, (receipt.event,)) if events else receipt.participants
 
-    monkeypatch.setattr(store, "scan", unfiltered)
+    monkeypatch.setattr(store, "scan_events" if events else "scan", unfiltered)
     with pytest.raises(CollaborationAccessDenied):
         if events:
             await application.list_participant_events(context=CONTEXT)

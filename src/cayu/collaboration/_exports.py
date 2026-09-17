@@ -1,6 +1,26 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "CollaborationHistoryUnavailable": (
+        "cayu.collaboration.lifecycle",
+        "CollaborationHistoryUnavailable",
+    ),
+    "CollaborationNamespaceRetired": (
+        "cayu.collaboration.lifecycle",
+        "CollaborationNamespaceRetired",
+    ),
+    "LifecycleCommand": ("cayu.collaboration.lifecycle", "LifecycleCommand"),
+    "LifecycleIntent": ("cayu.collaboration.lifecycle", "LifecycleIntent"),
+    "LifecycleReceipt": ("cayu.collaboration.lifecycle", "LifecycleReceipt"),
+    "NamespaceInspection": ("cayu.collaboration.lifecycle", "NamespaceInspection"),
+    "NamespacePrune": ("cayu.collaboration.lifecycle", "NamespacePrune"),
+    "NamespaceRef": ("cayu.collaboration.lifecycle", "NamespaceRef"),
+    "NamespaceRetire": ("cayu.collaboration.lifecycle", "NamespaceRetire"),
+    "NamespaceRetirementEvidence": ("cayu.collaboration.lifecycle", "NamespaceRetirementEvidence"),
+    "NamespaceRotate": ("cayu.collaboration.lifecycle", "NamespaceRotate"),
+    "NamespaceSeal": ("cayu.collaboration.lifecycle", "NamespaceSeal"),
+    "NamespaceSnapshot": ("cayu.collaboration.lifecycle", "NamespaceSnapshot"),
+    "ParticipantLifecycleChange": ("cayu.collaboration.lifecycle", "ParticipantLifecycleChange"),
     "ParticipantCommand": ("cayu.collaboration.participants", "ParticipantCommand"),
     "CollaborationConflict": ("cayu.collaboration._contracts", "CollaborationConflict"),
     "CollaborationContractError": ("cayu.collaboration._contracts", "CollaborationContractError"),
@@ -45,6 +65,12 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ParticipantEventPage": ("cayu.collaboration.participants", "ParticipantEventPage"),
     "ParticipantInspection": ("cayu.collaboration.participants", "ParticipantInspection"),
     "ParticipantIntent": ("cayu.collaboration.participants", "ParticipantIntent"),
+    "ParticipantObligation": ("cayu.collaboration.obligations", "ParticipantObligation"),
+    "ParticipantObligationCursor": (
+        "cayu.collaboration.obligations",
+        "ParticipantObligationCursor",
+    ),
+    "ParticipantObligationPage": ("cayu.collaboration.obligations", "ParticipantObligationPage"),
     "ParticipantPage": ("cayu.collaboration.participants", "ParticipantPage"),
     "ParticipantReceipt": ("cayu.collaboration.participants", "ParticipantReceipt"),
     "ParticipantRef": ("cayu.collaboration.participants", "ParticipantRef"),

@@ -47,6 +47,7 @@ from cayu.storage import migrations as schema
 from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL, SQLITE_AUXILIARY_ACCOUNTING_DDL
 from cayu.storage._collaboration_schema import (
     SQLITE_COLLABORATION_DDL,
+    SQLITE_COLLABORATION_LIFECYCLE_DDL,
     validate_sqlite_collaboration_schema,
 )
 from cayu.storage._diagnostic_inspection import (
@@ -977,6 +978,7 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 _MIGRATION_STEPS: dict[int, str] = {
     92: SQLITE_TASK_GROUP_DDL,
     93: SQLITE_COLLABORATION_DDL,
+    94: SQLITE_COLLABORATION_LIFECYCLE_DDL,
     91: SQLITE_TASK_GRAPH_DDL,
     90: SQLITE_SCHEDULING_DDL,
     81: """
@@ -6309,7 +6311,7 @@ def reconcile_schema(
     if current.revision >= 88:
         _validate_revision_88_closure_schema(connection)
     if current.revision >= 93:
-        validate_sqlite_collaboration_schema(connection)
+        validate_sqlite_collaboration_schema(connection, lifecycle=current.revision >= 94)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
@@ -10985,6 +10987,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_88_closure_schema(connection)
         if rev.revision == 93:
             validate_sqlite_collaboration_schema(connection)
+        if rev.revision == 94:
+            validate_sqlite_collaboration_schema(connection, lifecycle=True)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

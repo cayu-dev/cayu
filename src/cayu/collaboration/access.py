@@ -15,7 +15,21 @@ from cayu.collaboration.participants import (
     ParticipantRef,
 )
 
-ParticipantAction = Literal["discover", "inspect", "readback", "create", "configure", "alias"]
+ParticipantAction = Literal[
+    "discover",
+    "inspect",
+    "readback",
+    "create",
+    "configure",
+    "alias",
+    "namespace_inspect",
+    "namespace_seal",
+    "namespace_rotate",
+    "namespace_retire",
+    "namespace_prune",
+    "participant_lifecycle",
+    "obligations",
+]
 
 
 class CollaborationAccessDenied(PermissionError):

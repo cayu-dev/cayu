@@ -5,9 +5,10 @@ worker, or credential. Multiple participants may name the same application
 configuration without becoming the same participant. An alias is a mutable
 lookup name; retain the returned `ParticipantRef` for identity-sensitive work.
 
-This API provides the identity foundation only. It does not send collaboration
-requests, create sessions, dispatch agents, or implement participant disable,
-retirement, namespace rotation, or pruning.
+This API administers identities, lifecycle admission, namespace retention and
+permit responsibility. It does not send collaboration requests, create sessions,
+dispatch agents, or stop remote work. A retained permit is bookkeeping for a
+qualified receiving owner, not a public execution grant.
 
 ## Initialize explicitly
 
@@ -54,6 +55,10 @@ IDs and read the current configuration on each page; concurrent insertion before
 the cursor may require a fresh scan. Event pages advance stable sequences, so
 new matching events after the cursor appear on later pages. Each page uses one
 transactional view and rechecks the current access selection.
+Event cursors additionally bind the retention revision. Pruning invalidates old
+event cursors with `CollaborationHistoryUnavailable`; a fresh page explicitly
+reports `history_complete=False` rather than presenting retained events as a
+complete history.
 The requested count is an upper bound: pages also fit the aggregate contract
 limits, including their cursor. A shortened page continues after its last
 returned record. If even one record plus its required cursor cannot fit, the
@@ -88,7 +93,7 @@ configuration snapshot cannot be silently treated as successful replay.
 
 Memory, SQLite and PostgreSQL implement the same typed `CollaborationStore`
 contract. Memory provides in-process durability only. Persistent adapters use
-the ordinary Cayu schema lifecycle and need schema revision 93. PostgreSQL
+the ordinary Cayu schema lifecycle and need schema revision 94. PostgreSQL
 serializes transactions within each application scope; SQLite uses a native
 write transaction. Distinct application scopes do not share operation keys.
 
@@ -116,8 +121,14 @@ counts canonical document payloads, with one 64 KiB reservation for the mutable
 anchor. It is not a physical database-file-size promise. Immutable receipt and
 configuration history remain charged; replacing a current-state row counts
 only its size delta. Exhaustion rejects a new mutation atomically, without
-evicting exact replay evidence. Namespace and lifecycle controls reserved by
-the bootstrap are for subsequent API slices; they are not implemented here.
+evicting exact replay evidence. New control operations also require capacity;
+their reserved allowance is not an unlimited administrative history. A registered
+permit reserves its settlement operation slot, event and bounded byte allowance
+before admission, so later optional work cannot consume those resources.
+Admission also checks the mandatory settlement receipt, snapshot, event and
+receiving-readback envelopes using worst-case JSON expansion of receipt identifiers
+and maximum generated counters. Aggregate reserved bytes do not replace these
+individual record bounds.
 
 All durable identity values pass bounded schema validation and the configured
 workload-secret checks. Known secrets are rejected rather than redacted into a
@@ -125,3 +136,67 @@ different authority. Keep application-supplied identity/configuration names
 secret-free.
 
 See [the runnable identity example](../examples/collaboration/identity.py).
+
+## Lifecycle admission and responsibility
+
+`change_participant_lifecycle` compares the exact participant incarnation and
+expected lifecycle revision. Active participants admit internal permits;
+draining and disabled participants reject new permits while permitting settlement.
+Re-enabling advances the admission generation. Replaying an old registration or
+active-state receipt cannot revive excluded work. Retirement is terminal and
+requires all outstanding obligations to be settled. An existing alias may be
+removed after retirement, but cannot grant the retired identity new authority.
+
+Disable captures the issued-permit frontier in the same transaction that closes
+admission. The returned receipt proves acceptance, not remote quiescence.
+`inspect_participant` separately reports current state, outstanding obligations
+and settled/unsettled status. `list_participant_obligations` provides bounded
+participant/position-ordered responsibility, pending-only by default. Its cursors
+bind principal, scope, participant incarnation, filter and retention revision.
+Settlements between pages can remove pending results; restart the scan when a
+complete current inventory is needed. Pruning invalidates stale cursors.
+
+Permit registration and settlement are internal store-owner entrances. Registration
+serializes with lifecycle elections and records the complete source operation,
+participant generation, destination owner/target, effect scope and settlement
+requirement. Settlement queries a trusted receiving-owner reader outside the
+transaction, then revalidates and commits exact positive receiving evidence inside
+the transaction. An absent target, expired worker claim, or raw caller-shaped
+receipt does not prove quiescence. Actual destination fencing adapters are not
+provided by this API.
+
+## Namespace maintenance and retained evidence
+
+Initialization always replays the original bootstrap; obtain the current generation
+with `inspect_collaboration_namespace`. Build new keys using that generation's
+`NamespaceRef.operation(...)` after rotation, not the original initialization.
+`seal_collaboration_namespace` closes new admission. Exact replay and already
+admitted settlement remain allowed. `rotate_collaboration_namespace` atomically
+seals the old generation and elects one successor.
+
+`retire_collaboration_namespace` requires the later current control generation, exact
+namespace revision, and the expected retired floor. It advances only the next
+contiguous settled generation; an unresolved older generation cannot be skipped.
+Retained receipts remain historical and readable after retirement.
+The current control generation may be open or sealed for retirement and pruning.
+This lets maintenance reclaim capacity before rotation even when the retained
+generation limit is full. Sealing still rejects new participant mutations and
+permit registration; maintenance does not reopen admission.
+
+`prune_collaboration_namespace` removes at most the requested operation-record
+count (1–32) from the next retired generation. Registration and settlement form an
+indivisible two-record permit bundle; a batch reaching that bundle needs two
+remaining slots. A batch too small to make any progress is rejected atomically.
+Each batch uses a fresh operation key and exact retention revision; retrying the
+same batch returns its immutable receipt. Events, indexes and unreferenced history
+are reclaimed in the same transaction. Current participant history and history
+referenced by another retained receipt remain available. Completed generations
+compact to monotonic rejection floors; event sequences are never reused.
+
+Exact lookup retains its four outcomes. Removed content returns unavailable, never
+not-found authority to execute again. `inspect_collaboration_retirement` separately
+returns retirement floors and `retained`, `partial`, or `pruned` content evidence
+for the exact namespace reference (or `None` for an elected non-retired generation).
+Unknown/future generations conflict. Retirement evidence is not an exact receipt.
+There is no hidden maintenance worker: applications invoke bounded batches and
+inspect their `complete`, `removed_records` and retention-frontier results.

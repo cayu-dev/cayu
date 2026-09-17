@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field, StrictInt, model_validator
+from pydantic import BeforeValidator, Field, StrictBool, StrictInt, model_validator
 
 from cayu.collaboration._contracts import (
     ContractValue,
@@ -120,9 +120,49 @@ class ParticipantSnapshot(ContractValue):
     reference: ParticipantRef
     configuration: ParticipantConfiguration
     configuration_revision: Generation
-    lifecycle: Literal["active"] = "active"
-    lifecycle_revision: VersionOne = 1
-    admission_generation: VersionOne = 1
+    lifecycle: Literal["active", "draining", "disabled", "retired"] = "active"
+    lifecycle_revision: Generation = 1
+    admission_generation: Generation = 1
+    covered_permit_frontier: Counter = 0
+    control_policy: Literal["settle_registered"] = "settle_registered"
+
+
+class ParticipantLifecycleEvidence(ContractValue):
+    """Immutable lifecycle revision; configuration changes cannot overwrite it."""
+
+    reference: ParticipantRef
+    lifecycle: Literal["active", "draining", "disabled", "retired"]
+    lifecycle_revision: Generation
+    admission_generation: Generation
+    covered_permit_frontier: Counter
+    control_policy: Literal["settle_registered"]
+
+    @classmethod
+    def from_snapshot(cls, value: ParticipantSnapshot) -> ParticipantLifecycleEvidence:
+        return cls(
+            reference=value.reference,
+            lifecycle=value.lifecycle,
+            lifecycle_revision=value.lifecycle_revision,
+            admission_generation=value.admission_generation,
+            covered_permit_frontier=value.covered_permit_frontier,
+            control_policy=value.control_policy,
+        )
+
+
+class ParticipantConfigurationEvidence(ContractValue):
+    """Immutable configuration revision, independent of lifecycle elections."""
+
+    reference: ParticipantRef
+    configuration: ParticipantConfiguration
+    configuration_revision: Generation
+
+    @classmethod
+    def from_snapshot(cls, value: ParticipantSnapshot) -> ParticipantConfigurationEvidence:
+        return cls(
+            reference=value.reference,
+            configuration=value.configuration,
+            configuration_revision=value.configuration_revision,
+        )
 
 
 class ParticipantAlias(ContractValue):
@@ -189,7 +229,19 @@ class ParticipantEvent(ContractValue):
     id: Identifier
     sequence: Generation
     operation: OperationRef | None
-    type: Literal["initialized", "created", "configured", "alias_changed"]
+    type: Literal[
+        "initialized",
+        "created",
+        "configured",
+        "alias_changed",
+        "namespace_sealed",
+        "namespace_rotated",
+        "namespace_retired",
+        "namespace_pruned",
+        "participant_lifecycle_changed",
+        "permit_registered",
+        "permit_settled",
+    ]
     participants: tuple[ParticipantRef, ...] = Field(max_length=2)
 
     @model_validator(mode="after")
@@ -197,7 +249,12 @@ class ParticipantEvent(ContractValue):
         if self.type == "initialized":
             if self.operation is not None or self.participants or self.sequence != 1:
                 raise ValueError("Initialization event evidence conflicts.")
-        elif self.operation is None or not self.participants or self.sequence < 2:
+        elif self.operation is None or self.sequence < 2:
+            raise ValueError("Participant event evidence is incomplete.")
+        elif self.type.startswith("namespace_"):
+            if self.participants:
+                raise ValueError("Namespace event cannot name participant mutations.")
+        elif not self.participants:
             raise ValueError("Participant event evidence is incomplete.")
         elif any(
             ref.owner.application_scope != self.operation.application_scope
@@ -250,6 +307,13 @@ class ParticipantReceipt(ContractValue):
                 return self
             if self.event.type != "created":
                 raise ValueError("Creation event conflicts.")
+            if (
+                snapshot.lifecycle != "active"
+                or snapshot.lifecycle_revision != 1
+                or snapshot.admission_generation != 1
+                or snapshot.covered_permit_frontier
+            ):
+                raise ValueError("Creation lifecycle conflicts.")
             target = snapshot.reference if request.alias is not None else None
         else:
             if (
@@ -278,6 +342,20 @@ class ParticipantReceipt(ContractValue):
 class ParticipantInspection(ContractValue):
     participant: ParticipantSnapshot
     alias_revision: Counter
+    issued_permit_frontier: Counter
+    outstanding_obligations: Counter
+    settlement: Literal["settled", "unsettled"]
+
+    @model_validator(mode="after")
+    def positive_settlement(self) -> ParticipantInspection:
+        if (
+            (self.settlement == "settled") != (self.outstanding_obligations == 0)
+            or self.participant.covered_permit_frontier > self.issued_permit_frontier
+            or self.outstanding_obligations > self.issued_permit_frontier
+            or (self.participant.lifecycle == "retired" and self.outstanding_obligations)
+        ):
+            raise ValueError("Participant settlement evidence conflicts.")
+        return self
 
 
 class ParticipantCursor(ContractValue):
@@ -297,8 +375,20 @@ class ParticipantEventCursor(ContractValue):
     principal: Identifier
     allowed: tuple[ParticipantRef, ...] | None
     after_sequence: Counter
+    retention_revision: Generation
 
 
 class ParticipantEventPage(ContractValue):
     events: tuple[ParticipantEvent, ...] = Field(max_length=64)
     next_cursor: ParticipantEventCursor | None
+    retention_revision: Generation
+    history_complete: StrictBool
+
+    @model_validator(mode="after")
+    def retained_history(self) -> ParticipantEventPage:
+        if self.history_complete != (self.retention_revision == 1) or (
+            self.next_cursor is not None
+            and self.next_cursor.retention_revision != self.retention_revision
+        ):
+            raise ValueError("Event page retention authority conflicts.")
+        return self

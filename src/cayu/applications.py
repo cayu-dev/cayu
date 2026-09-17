@@ -81,6 +81,19 @@ from cayu.collaboration._contracts import ExactLookup, ExpectedOperation
 from cayu.collaboration._coordinator import ParticipantCoordinator
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
 from cayu.collaboration.base import CollaborationStore
+from cayu.collaboration.lifecycle import (
+    LifecycleCommand,
+    LifecycleReceipt,
+    NamespaceInspection,
+    NamespacePrune,
+    NamespaceRef,
+    NamespaceRetire,
+    NamespaceRetirementEvidence,
+    NamespaceRotate,
+    NamespaceSeal,
+    ParticipantLifecycleChange,
+)
+from cayu.collaboration.obligations import ParticipantObligationCursor, ParticipantObligationPage
 from cayu.collaboration.participants import (
     CollaborationInitialization,
     ParticipantAlias,
@@ -1431,6 +1444,76 @@ class CayuApp:
     async def initialize_collaboration(self) -> CollaborationInitialization:
         """Explicitly provision or recover the exact registered collaboration owner."""
         return await self._participant_coordinator.initialize()
+
+    async def inspect_collaboration_namespace(
+        self, *, context: CollaborationAccessContext
+    ) -> NamespaceInspection:
+        return await self._participant_coordinator.inspect_namespace(context=context)
+
+    async def inspect_collaboration_retirement(
+        self,
+        namespace: NamespaceRef,
+        *,
+        context: CollaborationAccessContext,
+    ) -> NamespaceRetirementEvidence | None:
+        return await self._participant_coordinator.inspect_retirement(namespace, context=context)
+
+    async def seal_collaboration_namespace(
+        self, request: NamespaceSeal, *, context: CollaborationAccessContext
+    ) -> LifecycleReceipt:
+        return await self._participant_coordinator.mutate_lifecycle(
+            NamespaceSeal, request, context=context
+        )
+
+    async def rotate_collaboration_namespace(
+        self, request: NamespaceRotate, *, context: CollaborationAccessContext
+    ) -> LifecycleReceipt:
+        return await self._participant_coordinator.mutate_lifecycle(
+            NamespaceRotate, request, context=context
+        )
+
+    async def retire_collaboration_namespace(
+        self, request: NamespaceRetire, *, context: CollaborationAccessContext
+    ) -> LifecycleReceipt:
+        return await self._participant_coordinator.mutate_lifecycle(
+            NamespaceRetire, request, context=context
+        )
+
+    async def prune_collaboration_namespace(
+        self, request: NamespacePrune, *, context: CollaborationAccessContext
+    ) -> LifecycleReceipt:
+        return await self._participant_coordinator.mutate_lifecycle(
+            NamespacePrune, request, context=context
+        )
+
+    async def lookup_collaboration_lifecycle_operation(
+        self, expected: LifecycleCommand, *, context: CollaborationAccessContext
+    ) -> ExactLookup[LifecycleReceipt]:
+        return await self._participant_coordinator.lookup_lifecycle(expected, context=context)
+
+    async def change_participant_lifecycle(
+        self, request: ParticipantLifecycleChange, *, context: CollaborationAccessContext
+    ) -> LifecycleReceipt:
+        return await self._participant_coordinator.mutate_lifecycle(
+            ParticipantLifecycleChange, request, context=context
+        )
+
+    async def list_participant_obligations(
+        self,
+        participant: ParticipantRef,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ParticipantObligationCursor | None = None,
+        pending_only: bool = True,
+        limit: int = 32,
+    ) -> ParticipantObligationPage:
+        return await self._participant_coordinator.obligations(
+            participant,
+            context=context,
+            cursor=cursor,
+            pending_only=pending_only,
+            limit=limit,
+        )
 
     async def create_participant(
         self, request: ParticipantCreate, *, context: CollaborationAccessContext

@@ -5,10 +5,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from functools import partial
-from typing import ClassVar, Literal, Protocol
+from typing import ClassVar, Literal, Protocol, cast
 from uuid import uuid4
 
 from cayu.collaboration._capabilities import CapabilityDescriptor, FamilyVersion
+from cayu.collaboration._capacity import require_capacity
 from cayu.collaboration._contracts import (
     CollaborationConflict,
     CollaborationContractError,
@@ -19,10 +20,30 @@ from cayu.collaboration._contracts import (
     ExactNotFound,
     ExactUnavailable,
     ExpectedOperation,
+    Generation,
     OwnerRef,
 )
+from cayu.collaboration._history_references import HistoryKey
 from cayu.collaboration._ownership import _MutationOwners
+from cayu.collaboration._participant_state import ParticipantPermitState
+from cayu.collaboration._permits import (
+    PermitCommand,
+    PermitReceipt,
+    PermitSettlement,
+    PermitSettlementReader,
+    PermitSnapshot,
+)
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
+from cayu.collaboration.lifecycle import (
+    CollaborationHistoryUnavailable,
+    LifecycleCommand,
+    LifecycleReceipt,
+    NamespaceInspection,
+    NamespaceRef,
+    NamespaceRetirementEvidence,
+    NamespaceSnapshot,
+)
+from cayu.collaboration.obligations import ParticipantObligation
 from cayu.collaboration.participants import (
     CollaborationBootstrap,
     CollaborationCapacityExceeded,
@@ -33,20 +54,35 @@ from cayu.collaboration.participants import (
     ParticipantAlias,
     ParticipantAliasChange,
     ParticipantCommand,
+    ParticipantConfigurationEvidence,
     ParticipantConfigure,
     ParticipantCreate,
     ParticipantEvent,
     ParticipantInspection,
     ParticipantIntent,
+    ParticipantLifecycleEvidence,
     ParticipantReceipt,
     ParticipantRef,
     ParticipantSnapshot,
 )
 from cayu.vaults.redaction import SecretRedactor
 
-Table = Literal["anchors", "participants", "configurations", "aliases", "operations", "events"]
+Table = Literal[
+    "anchors",
+    "participants",
+    "configurations",
+    "aliases",
+    "operations",
+    "events",
+    "namespaces",
+    "lifecycle_history",
+    "participant_permits",
+    "permits",
+    "history_uses",
+]
 Key = tuple[str | int, ...]
 IDENTITY_FAMILY = FamilyVersion(family="participant.identity", version=1)
+LIFECYCLE_FAMILY = FamilyVersion(family="collaboration.lifecycle", version=1)
 # Reserve the maximum bounded anchor envelope once. Its counters can grow
 # without changing the admission decision that those same counters describe.
 _ANCHOR_BYTES = 64 * 1024
@@ -65,20 +101,49 @@ class _Repository(Protocol):
         allowed: tuple[str, ...] | None,
     ) -> list[object]: ...
 
+    async def scan_permits(
+        self, participant_id: str, *, after: int, limit: int, pending_only: bool
+    ) -> list[object]: ...
+
+    async def history_in_use(self, family: str, participant_id: str, revision: int) -> bool: ...
+
+    async def scan_operations(
+        self, namespace: str, generation: int, *, limit: int
+    ) -> list[object]: ...
+
 
 class _Anchor(ContractValue):
     initialization: CollaborationInitialization
-    participant_count: Counter = 0
-    alias_count: Counter = 0
-    operation_count: Counter = 0
-    event_count: Counter = 1
+    participant_count: Counter
+    alias_count: Counter
+    operation_count: Counter
+    event_count: Counter
+    event_sequence: Counter
+    current_generation: Generation
+    retained_generations: Generation
+    retired_through: Counter
+    pruned_through: Counter
+    retention_revision: Generation
+    permit_count: Counter
+    reserved_bytes: Counter
+    reserved_events: Counter
     retained_bytes: Counter
-    alias_revision: Counter = 0
+    alias_revision: Counter
 
 
-def _key(expected: ExpectedOperation[ParticipantIntent]) -> Key:
+def _key(expected: ExpectedOperation[ParticipantIntent] | LifecycleCommand | PermitCommand) -> Key:
     op = expected.operation
     return op.namespace_incarnation, op.generation, op.caller_key
+
+
+def _stored_mode(raw: object) -> object:
+    """Select a schema only; the selected record still requires full validation."""
+    if not isinstance(raw, dict):
+        return None
+    expected = cast("dict[object, object]", raw).get("expected")
+    if not isinstance(expected, dict):
+        return None
+    return cast("dict[object, object]", expected).get("mode")
 
 
 class CollaborationStore(ABC):
@@ -101,7 +166,9 @@ class CollaborationStore(ABC):
 
     def capabilities(self, owner: OwnerRef) -> CapabilityDescriptor:
         return CapabilityDescriptor(
-            owner=owner, mutations=(IDENTITY_FAMILY,), readbacks=(IDENTITY_FAMILY,)
+            owner=owner,
+            mutations=(IDENTITY_FAMILY, LIFECYCLE_FAMILY),
+            readbacks=(IDENTITY_FAMILY, LIFECYCLE_FAMILY),
         )
 
     async def initialize(
@@ -151,7 +218,21 @@ class CollaborationStore(ABC):
                 ),
                 redactor=redactor,
             )
-            size = _ANCHOR_BYTES + len(contract_bytes(event, redactor=redactor))
+            namespace = NamespaceSnapshot(
+                reference=NamespaceRef(
+                    owner=initialization.owner,
+                    namespace_incarnation=initialization.namespace_incarnation,
+                    generation=1,
+                ),
+                revision=1,
+                state="open",
+                outstanding_obligations=0,
+            )
+            size = (
+                _ANCHOR_BYTES
+                + len(contract_bytes(event, redactor=redactor))
+                + len(contract_bytes(namespace, redactor=redactor))
+            )
             limits = binding.limits
             if (
                 size > limits.retained_bytes - limits.control_bytes
@@ -161,10 +242,30 @@ class CollaborationStore(ABC):
             await tx.put(
                 "anchors",
                 (),
-                _Anchor(initialization=initialization, retained_bytes=size),
+                _Anchor(
+                    initialization=initialization,
+                    retained_bytes=size,
+                    participant_count=0,
+                    alias_count=0,
+                    operation_count=0,
+                    event_count=1,
+                    event_sequence=1,
+                    current_generation=1,
+                    retained_generations=1,
+                    retired_through=0,
+                    pruned_through=0,
+                    retention_revision=1,
+                    permit_count=0,
+                    reserved_bytes=0,
+                    reserved_events=0,
+                    alias_revision=0,
+                ),
                 insert=True,
             )
             await tx.put("events", (1,), event, insert=True)
+            await tx.put(
+                "namespaces", (initialization.namespace_incarnation, 1), namespace, insert=True
+            )
             return initialization
 
     async def _anchor(
@@ -204,7 +305,6 @@ class CollaborationStore(ABC):
             or expected.operation != request.operation
             or expected.operation.application_scope != initialized.binding.application_scope
             or expected.operation.namespace_incarnation != initialized.namespace_incarnation
-            or expected.operation.generation != initialized.generation
             or expected.kind != request.kind
             or expected.schema_version != 1
             or expected.mode != "identity"
@@ -223,6 +323,14 @@ class CollaborationStore(ABC):
         raw = await tx.get("operations", _key(expected))
         if raw is None:
             return ExactNotFound()
+        if _stored_mode(raw) == "lifecycle":
+            prepare_contract(LifecycleReceipt, raw, redactor=redactor)
+            return ExactConflict()
+        if _stored_mode(raw) == "permit":
+            from cayu.collaboration._permit_store import prepare_permit_record
+
+            prepare_permit_record(raw, redactor)
+            return ExactConflict()
         receipt = prepare_contract(ParticipantReceipt, raw, redactor=redactor)
         try:
             require_exact_contract(expected, receipt.expected, redactor=redactor)
@@ -237,18 +345,55 @@ class CollaborationStore(ABC):
             redactor=redactor,
         )
         for snapshot in receipt.participants:
-            stored = await tx.get(
-                "configurations",
-                (snapshot.reference.participant_id, snapshot.configuration_revision),
-            )
-            if stored is None:
-                raise CollaborationUnavailable("Participant receipt configuration is unavailable.")
-            require_exact_contract(
-                snapshot,
-                prepare_contract(ParticipantSnapshot, stored, redactor=redactor),
-                redactor=redactor,
-            )
+            await self._require_snapshot_history(tx, snapshot, redactor)
         return ExactMatch[ParticipantReceipt](receipt=receipt)
+
+    async def _require_snapshot_history(
+        self, tx: _Repository, snapshot: ParticipantSnapshot, redactor: SecretRedactor
+    ) -> None:
+        stored = await tx.get(
+            "configurations",
+            (
+                snapshot.reference.participant_id,
+                snapshot.configuration_revision,
+            ),
+        )
+        if stored is None:
+            raise CollaborationUnavailable("Participant configuration history is unavailable.")
+        configuration = prepare_contract(
+            ParticipantConfigurationEvidence, stored, redactor=redactor
+        )
+        if (
+            configuration.reference != snapshot.reference
+            or configuration.configuration != snapshot.configuration
+            or configuration.configuration_revision != snapshot.configuration_revision
+        ):
+            raise CollaborationUnavailable("Participant configuration history conflicts.")
+        raw = await tx.get(
+            "lifecycle_history",
+            (
+                snapshot.reference.participant_id,
+                snapshot.lifecycle_revision,
+            ),
+        )
+        if raw is None:
+            raise CollaborationUnavailable("Participant lifecycle history is unavailable.")
+        require_exact_contract(
+            ParticipantLifecycleEvidence.from_snapshot(snapshot),
+            prepare_contract(ParticipantLifecycleEvidence, raw, redactor=redactor),
+            redactor=redactor,
+        )
+
+    async def _permit_state(
+        self, tx: _Repository, ref: ParticipantRef, redactor: SecretRedactor
+    ) -> ParticipantPermitState:
+        raw = await tx.get("participant_permits", (ref.participant_id,))
+        if raw is None:
+            raise CollaborationUnavailable("Participant permit frontier is unavailable.")
+        state = prepare_contract(ParticipantPermitState, raw, redactor=redactor)
+        if state.reference != ref:
+            raise CollaborationUnavailable("Participant permit frontier authority conflicts.")
+        return state
 
     async def lookup(
         self,
@@ -281,12 +426,38 @@ class CollaborationStore(ABC):
     ) -> ExactLookup[ParticipantReceipt]:
         try:
             async with self._transaction(initialized.binding.application_scope, write=False) as tx:
-                await self._anchor(tx, initialized, redactor)
-                return await self._receipt(tx, expected, redactor)
+                anchor = await self._anchor(tx, initialized, redactor)
+                result = await self._receipt(tx, expected, redactor)
+                if isinstance(result, ExactNotFound):
+                    return await self._missing_operation(
+                        tx,
+                        anchor,
+                        expected.operation.generation,
+                        redactor,
+                    )
+                return result
         except CollaborationConflict:
             return ExactConflict()
         except (CollaborationUnavailable, CollaborationContractError):
             return ExactUnavailable()
+
+    async def _missing_operation(
+        self,
+        tx: _Repository,
+        anchor: _Anchor,
+        generation: int,
+        redactor: SecretRedactor,
+    ) -> ExactNotFound | ExactConflict | ExactUnavailable:
+        from cayu.collaboration._namespace_store import load_namespace
+
+        if generation <= anchor.pruned_through:
+            return ExactUnavailable()
+        if generation > anchor.current_generation:
+            return ExactConflict()
+        namespace = await load_namespace(tx, anchor, generation, redactor)
+        if namespace.content == "partial":
+            return ExactUnavailable()
+        return ExactNotFound()
 
     async def _participant(
         self, tx: _Repository, ref: ParticipantRef, owner: OwnerRef, redactor: SecretRedactor
@@ -299,6 +470,7 @@ class CollaborationStore(ABC):
         snapshot = prepare_contract(ParticipantSnapshot, raw, redactor=redactor)
         if snapshot.reference != ref:
             raise CollaborationConflict("Participant incarnation conflicts.")
+        await self._require_snapshot_history(tx, snapshot, redactor)
         return snapshot
 
     async def apply(
@@ -331,10 +503,14 @@ class CollaborationStore(ABC):
                 return replay.receipt
             if isinstance(replay, ExactConflict):
                 raise CollaborationConflict("Operation key already has different intent.")
+            from cayu.collaboration._namespace_store import require_open_namespace
+
+            await require_open_namespace(tx, anchor, expected.operation, redactor)
             request = expected.intent.request
             participants: tuple[ParticipantSnapshot, ...]
             alias: ParticipantAlias | None = None
             added_participant = 0
+            superseded_histories: tuple[HistoryKey, ...] = ()
             alias_delta = 0
             revision = anchor.alias_revision
             if isinstance(request, ParticipantCreate):
@@ -368,11 +544,21 @@ class CollaborationStore(ABC):
                 )
                 if current.configuration_revision != request.expected_configuration_revision:
                     raise CollaborationConflict("Participant configuration revision changed.")
+                if current.lifecycle == "retired":
+                    raise CollaborationConflict("Retired participant cannot be reconfigured.")
+                superseded_histories = (
+                    (
+                        "configurations",
+                        current.reference.participant_id,
+                        current.configuration_revision,
+                    ),
+                )
                 participants = (
-                    ParticipantSnapshot(
-                        reference=current.reference,
-                        configuration=request.configuration,
-                        configuration_revision=current.configuration_revision + 1,
+                    current.model_copy(
+                        update={
+                            "configuration": request.configuration,
+                            "configuration_revision": current.configuration_revision + 1,
+                        }
                     ),
                 )
                 event_type = "configured"
@@ -396,6 +582,8 @@ class CollaborationStore(ABC):
                 participants = tuple(
                     [await self._participant(tx, ref, initialized.owner, redactor) for ref in refs]
                 )
+                if request.target is not None and participants[-1].lifecycle == "retired":
+                    raise CollaborationConflict("Alias cannot bind a retired participant.")
                 revision += 1
                 alias_delta = int(request.target is not None) - int(current_alias is not None)
                 alias = (
@@ -408,7 +596,7 @@ class CollaborationStore(ABC):
                 event_type = "alias_changed"
             event = ParticipantEvent(
                 id=uuid4().hex,
-                sequence=anchor.event_count + 1,
+                sequence=anchor.event_sequence + 1,
                 operation=expected.operation,
                 type=event_type,
                 participants=tuple(p.reference for p in participants),
@@ -424,14 +612,33 @@ class CollaborationStore(ABC):
                 ),
                 redactor=redactor,
             )
-            # Count canonical retained document payloads once. Immutable history
-            # is never removed; mutable replacements contribute only their delta.
+            # Count canonical retained document payloads once. Mutable replacements
+            # contribute their delta; unreferenced history is reclaimed below.
             charge = len(contract_bytes(receipt, redactor=redactor)) + len(
                 contract_bytes(event, redactor=redactor)
             )
+            if isinstance(request, ParticipantCreate):
+                charge += len(
+                    contract_bytes(
+                        ParticipantLifecycleEvidence.from_snapshot(participants[0]),
+                        redactor=redactor,
+                    )
+                ) + len(
+                    contract_bytes(
+                        ParticipantPermitState(
+                            reference=participants[0].reference, issued_frontier=0, outstanding=0
+                        ),
+                        redactor=redactor,
+                    )
+                )
             if not isinstance(request, ParticipantAliasChange):
                 snapshot = participants[0]
-                charge += 2 * len(contract_bytes(snapshot, redactor=redactor))
+                charge += len(contract_bytes(snapshot, redactor=redactor)) + len(
+                    contract_bytes(
+                        ParticipantConfigurationEvidence.from_snapshot(snapshot),
+                        redactor=redactor,
+                    )
+                )
                 previous = await tx.get("participants", (snapshot.reference.participant_id,))
                 if previous is not None:
                     charge -= len(
@@ -454,26 +661,18 @@ class CollaborationStore(ABC):
                     )
                 if alias is not None:
                     charge += len(contract_bytes(alias, redactor=redactor))
-            limits = initialized.binding.limits
-            updated = _Anchor(
-                initialization=initialized,
-                participant_count=anchor.participant_count + added_participant,
-                alias_count=anchor.alias_count + alias_delta,
-                operation_count=anchor.operation_count + 1,
-                event_count=event.sequence,
-                retained_bytes=anchor.retained_bytes + charge,
-                alias_revision=revision,
+            updated = anchor.model_copy(
+                update={
+                    "participant_count": anchor.participant_count + added_participant,
+                    "alias_count": anchor.alias_count + alias_delta,
+                    "operation_count": anchor.operation_count + 1,
+                    "event_count": anchor.event_count + 1,
+                    "event_sequence": event.sequence,
+                    "retained_bytes": anchor.retained_bytes + charge,
+                    "alias_revision": revision,
+                }
             )
-            if (
-                updated.participant_count > limits.participants
-                or updated.alias_count > limits.aliases
-                or updated.operation_count > limits.operations - limits.control_operations
-                or updated.event_count > limits.events - limits.control_events
-                or updated.retained_bytes > limits.retained_bytes - limits.control_bytes
-            ):
-                raise CollaborationCapacityExceeded(
-                    "Participant admission exceeds retained capacity."
-                )
+            updated = prepare_contract(_Anchor, updated, redactor=redactor)
             if not isinstance(request, ParticipantAliasChange):
                 participant = receipt.participants[0]
                 await tx.put(
@@ -485,9 +684,24 @@ class CollaborationStore(ABC):
                 await tx.put(
                     "configurations",
                     (participant.reference.participant_id, participant.configuration_revision),
-                    participant,
+                    ParticipantConfigurationEvidence.from_snapshot(participant),
                     insert=True,
                 )
+                if isinstance(request, ParticipantCreate):
+                    await tx.put(
+                        "lifecycle_history",
+                        (participant.reference.participant_id, 1),
+                        ParticipantLifecycleEvidence.from_snapshot(participant),
+                        insert=True,
+                    )
+                    await tx.put(
+                        "participant_permits",
+                        (participant.reference.participant_id,),
+                        ParticipantPermitState(
+                            reference=participant.reference, issued_frontier=0, outstanding=0
+                        ),
+                        insert=True,
+                    )
             if isinstance(request, ParticipantAliasChange) or (
                 isinstance(request, ParticipantCreate) and request.alias is not None
             ):
@@ -498,8 +712,223 @@ class CollaborationStore(ABC):
                     await tx.put("aliases", (receipt.alias.alias,), receipt.alias, insert=False)
             await tx.put("operations", _key(expected), receipt, insert=True)
             await tx.put("events", (event.sequence,), receipt.event, insert=True)
+            if superseded_histories:
+                from cayu.collaboration._retention_store import release_unused_history
+
+                released = await release_unused_history(tx, superseded_histories, redactor)
+                updated = prepare_contract(
+                    _Anchor,
+                    updated.model_copy(
+                        update={
+                            "retained_bytes": updated.retained_bytes - released,
+                        }
+                    ),
+                    redactor=redactor,
+                )
+            require_capacity(updated, ordinary=True)
             await tx.put("anchors", (), updated, insert=False)
             return receipt
+
+    async def inspect_namespace(
+        self, initialized: CollaborationInitialization, *, redactor: SecretRedactor
+    ) -> NamespaceInspection:
+        from cayu.collaboration._namespace_store import inspect_namespace
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        return await inspect_namespace(self, initialized, redactor)
+
+    async def inspect_retirement(
+        self,
+        initialized: CollaborationInitialization,
+        namespace: NamespaceRef,
+        *,
+        redactor: SecretRedactor,
+    ) -> NamespaceRetirementEvidence | None:
+        from cayu.collaboration._namespace_store import inspect_retirement
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        namespace = prepare_contract(NamespaceRef, namespace, redactor=redactor)
+        return await inspect_retirement(self, initialized, namespace, redactor)
+
+    async def _register_permit(
+        self,
+        initialized: CollaborationInitialization,
+        expected: PermitCommand,
+        *,
+        redactor: SecretRedactor,
+    ) -> PermitReceipt:
+        """Trusted owner integration only; registration never dispatches execution."""
+        from cayu.collaboration._permit_store import prepare_permit, register_permit
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        expected = prepare_permit(initialized, expected, redactor)
+        return await self._owners.run(
+            partial(register_permit, self, initialized, expected, redactor),
+            key=("mutation", initialized.binding.application_scope, *_key(expected)),
+            expectation=contract_bytes(expected, redactor=redactor),
+            redactor=redactor,
+        )
+
+    async def scan_obligations(
+        self,
+        initialized: CollaborationInitialization,
+        participant: ParticipantRef,
+        *,
+        after: int,
+        limit: int,
+        pending_only: bool,
+        retention_revision: int | None,
+        redactor: SecretRedactor,
+    ) -> tuple[int, tuple[ParticipantObligation, ...]]:
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        participant = prepare_contract(ParticipantRef, participant, redactor=redactor)
+        if (
+            type(after) is not int
+            or not 0 <= after <= 2**53 - 1
+            or type(limit) is not int
+            or not 1 <= limit <= 64
+            or type(pending_only) is not bool
+            or (
+                retention_revision is not None
+                and (
+                    type(retention_revision) is not int or not 1 <= retention_revision <= 2**53 - 1
+                )
+            )
+        ):
+            raise ValueError("Invalid obligation query bounds.")
+        async with self._transaction(initialized.binding.application_scope, write=False) as tx:
+            anchor = await self._anchor(tx, initialized, redactor)
+            await self._participant(tx, participant, initialized.owner, redactor)
+            if retention_revision is not None and retention_revision != anchor.retention_revision:
+                raise CollaborationHistoryUnavailable(
+                    "Obligation cursor predates retained history."
+                )
+            records = await tx.scan_permits(
+                participant.participant_id, after=after, limit=limit, pending_only=pending_only
+            )
+            results = []
+            previous = after
+            for raw in records:
+                value = prepare_contract(PermitSnapshot, raw, redactor=redactor)
+                request = value.expected.intent.request
+                if (
+                    request.participant != participant
+                    or value.position <= previous
+                    or (pending_only and value.state != "pending")
+                ):
+                    raise CollaborationUnavailable("Obligation query evidence conflicts.")
+                results.append(
+                    prepare_contract(
+                        ParticipantObligation,
+                        ParticipantObligation(
+                            participant=request.participant,
+                            position=value.position,
+                            operation=request.operation,
+                            source_operation=request.source_operation,
+                            settlement_operation=request.settlement_operation,
+                            admission_generation=request.admission_generation,
+                            target=request.target,
+                            target_state=request.target_state,
+                            effect_scope=request.effect_scope,
+                            required_settlement=request.required_settlement,
+                            state=value.state,
+                            outcome=None if value.settlement is None else value.settlement.outcome,
+                        ),
+                        redactor=redactor,
+                    )
+                )
+                previous = value.position
+            return anchor.retention_revision, tuple(results)
+
+    async def _settle_permit(
+        self,
+        initialized: CollaborationInitialization,
+        expected: PermitCommand,
+        *,
+        reader: PermitSettlementReader,
+        redactor: SecretRedactor,
+    ) -> PermitSettlement:
+        """Consume trusted receiving-owner readback, never a caller-supplied proof."""
+        from cayu.collaboration._permit_store import prepare_permit, settle_permit
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        expected = prepare_permit(initialized, expected, redactor)
+        operation = expected.intent.request.settlement_operation
+        return await self._owners.run(
+            partial(settle_permit, self, initialized, expected, reader, redactor),
+            key=(
+                "mutation",
+                initialized.binding.application_scope,
+                operation.namespace_incarnation,
+                operation.generation,
+                operation.caller_key,
+            ),
+            expectation=contract_bytes(expected, redactor=redactor),
+            redactor=redactor,
+        )
+
+    async def apply_lifecycle(
+        self,
+        initialized: CollaborationInitialization,
+        expected: LifecycleCommand,
+        *,
+        redactor: SecretRedactor,
+    ) -> LifecycleReceipt:
+        from cayu.collaboration._namespace_store import apply_lifecycle, prepare_lifecycle
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        expected = prepare_lifecycle(initialized, expected, redactor)
+        return await self._owners.run(
+            partial(apply_lifecycle, self, initialized, expected, redactor),
+            key=("mutation", initialized.binding.application_scope, *_key(expected)),
+            expectation=contract_bytes(expected, redactor=redactor),
+            redactor=redactor,
+        )
+
+    async def lookup_lifecycle(
+        self,
+        initialized: CollaborationInitialization,
+        expected: LifecycleCommand,
+        *,
+        redactor: SecretRedactor,
+    ) -> ExactLookup[LifecycleReceipt]:
+        from cayu.collaboration._namespace_store import prepare_lifecycle
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        try:
+            expected = prepare_lifecycle(initialized, expected, redactor)
+        except CollaborationConflict:
+            return ExactConflict()
+        material = contract_bytes(expected, redactor=redactor)
+        return await self._owners.run(
+            partial(self._lookup_lifecycle, initialized, expected, redactor=redactor),
+            key=("readback", initialized.binding.application_scope, *_key(expected), material),
+            expectation=material,
+            redactor=redactor,
+        )
+
+    async def _lookup_lifecycle(
+        self,
+        initialized: CollaborationInitialization,
+        expected: LifecycleCommand,
+        *,
+        redactor: SecretRedactor,
+    ) -> ExactLookup[LifecycleReceipt]:
+        from cayu.collaboration._namespace_store import lifecycle_replay
+
+        try:
+            async with self._transaction(initialized.binding.application_scope, write=False) as tx:
+                anchor = await self._anchor(tx, initialized, redactor)
+                receipt = await lifecycle_replay(self, tx, expected, redactor)
+                if receipt is not None:
+                    return ExactMatch[LifecycleReceipt](receipt=receipt)
+                return await self._missing_operation(
+                    tx, anchor, expected.operation.generation, redactor
+                )
+        except CollaborationConflict:
+            return ExactConflict()
+        except (CollaborationUnavailable, CollaborationContractError):
+            return ExactUnavailable()
 
     async def inspect(
         self,
@@ -512,9 +941,14 @@ class CollaborationStore(ABC):
         participant = prepare_contract(ParticipantRef, participant, redactor=redactor)
         async with self._transaction(initialized.binding.application_scope, write=False) as tx:
             anchor = await self._anchor(tx, initialized, redactor)
+            snapshot = await self._participant(tx, participant, initialized.owner, redactor)
+            permits = await self._permit_state(tx, participant, redactor)
             return ParticipantInspection(
-                participant=await self._participant(tx, participant, initialized.owner, redactor),
+                participant=snapshot,
                 alias_revision=anchor.alias_revision,
+                issued_permit_frontier=permits.issued_frontier,
+                outstanding_obligations=permits.outstanding,
+                settlement="unsettled" if permits.outstanding else "settled",
             )
 
     async def resolve_alias(
@@ -552,7 +986,54 @@ class CollaborationStore(ABC):
         allowed: tuple[ParticipantRef, ...] | None,
         redactor: SecretRedactor,
     ) -> tuple[ParticipantSnapshot | ParticipantEvent, ...]:
+        _, records = await self._scan_page(
+            initialized,
+            table=table,
+            after=after,
+            limit=limit,
+            allowed=allowed,
+            retention_revision=None,
+            redactor=redactor,
+        )
+        return records
+
+    async def scan_events(
+        self,
+        initialized: CollaborationInitialization,
+        *,
+        after: int,
+        limit: int,
+        allowed: tuple[ParticipantRef, ...] | None,
+        retention_revision: int | None,
+        redactor: SecretRedactor,
+    ) -> tuple[int, tuple[ParticipantEvent, ...]]:
+        revision, records = await self._scan_page(
+            initialized,
+            table="events",
+            after=after,
+            limit=limit,
+            allowed=allowed,
+            retention_revision=retention_revision,
+            redactor=redactor,
+        )
+        return revision, cast("tuple[ParticipantEvent, ...]", records)
+
+    async def _scan_page(
+        self,
+        initialized: CollaborationInitialization,
+        *,
+        table: Literal["participants", "events"],
+        after: str | int,
+        limit: int,
+        allowed: tuple[ParticipantRef, ...] | None,
+        retention_revision: int | None,
+        redactor: SecretRedactor,
+    ) -> tuple[int, tuple[ParticipantSnapshot | ParticipantEvent, ...]]:
         initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        if retention_revision is not None and (
+            type(retention_revision) is not int or not 1 <= retention_revision <= 2**53 - 1
+        ):
+            raise ValueError("Invalid retention revision.")
         if (
             type(limit) is not int
             or not 1 <= limit <= 64
@@ -572,7 +1053,9 @@ class CollaborationStore(ABC):
             if any(ref.owner != initialized.owner for ref in allowed):
                 raise CollaborationConflict("Participant selection belongs to another owner.")
         async with self._transaction(initialized.binding.application_scope, write=False) as tx:
-            await self._anchor(tx, initialized, redactor)
+            anchor = await self._anchor(tx, initialized, redactor)
+            if retention_revision is not None and retention_revision != anchor.retention_revision:
+                raise CollaborationHistoryUnavailable("Event cursor predates retained history.")
             ids = None if allowed is None else tuple(ref.participant_id for ref in allowed)
             rows = await tx.scan(table, after=after, limit=limit, allowed=ids)
             schema = ParticipantSnapshot if table == "participants" else ParticipantEvent
@@ -590,4 +1073,4 @@ class CollaborationStore(ABC):
                     raise CollaborationUnavailable(
                         "Participant query evidence conflicts with scope."
                     )
-            return values
+            return anchor.retention_revision, values

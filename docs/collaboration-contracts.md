@@ -6,8 +6,10 @@ Cayu has internal shared collaboration value types, bounded preparation,
 complete-value comparison, typed exact-lookup outcomes and versioned capability
 descriptors under `cayu.collaboration`. These private modules are implementation
 infrastructure, not a public agent API. Importing the package starts no work and
-registers no owner. There is no production CollaborationStore or collaboration
-coordinator supplied by this foundation.
+registers no owner. The [participant identity API](participant-identity.md) builds
+on this foundation with a production CollaborationStore for scoped identities,
+lifecycle admission, permit responsibility and namespace retention. It does not
+dispatch collaboration requests or create participant-bound sessions.
 
 Existing SessionStore, TaskStore, execution/resource owners and BudgetLedger keep
 their current authority. Colocating them in one database does not make separate
