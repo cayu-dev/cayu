@@ -35202,5 +35202,12 @@
     "tests/core/test_provider_rejection_diagnostics.py::test_unrecognized_and_sensitive_fields[body3-absent_details]": 0.000198333989828825,
     "tests/core/test_provider_rejection_diagnostics.py::test_unrecognized_and_sensitive_fields[body4-absent_details]": 0.0001945000549312681,
     "tests/core/test_provider_rejection_diagnostics.py::test_unrecognized_and_sensitive_fields[body5-malformed_body]": 0.00020241699530743062,
-    "tests/core/test_provider_rejection_diagnostics.py::test_unrecognized_and_sensitive_fields[body6-body_too_large]": 0.0005582069861702621
+    "tests/core/test_provider_rejection_diagnostics.py::test_unrecognized_and_sensitive_fields[body6-body_too_large]": 0.0005582069861702621,
+    "tests/evals/test_workflow_root_hash.py::test_completed_large_history_evaluates_and_recovers": 7.146450499014463,
+    "tests/evals/test_workflow_root_hash.py::test_framed_root_identity_and_record_at_a_time_encoding": 0.2134800420026295,
+    "tests/evals/test_workflow_root_hash.py::test_invalid_individual_document_is_still_rejected[payload0]": 0.087768875004258,
+    "tests/evals/test_workflow_root_hash.py::test_invalid_individual_document_is_still_rejected[payload1]": 0.09400054198340513,
+    "tests/evals/test_workflow_root_hash.py::test_large_history_changed_during_scoring_cannot_publish": 3.302835625014268,
+    "tests/evals/test_workflow_root_hash.py::test_root_retains_canonical_numeric_semantics": 0.0892833749530837,
+    "tests/evals/test_workflow_root_hash.py::test_unversioned_saved_anchor_keeps_legacy_digest": 0.11446099999011494
 }

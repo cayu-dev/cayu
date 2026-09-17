@@ -166,6 +166,7 @@ async def import_workflow_eval_attempt(
         completion_event_id=completion_event_id,
         completion_sequence=completion.sequence,
         root_sha256=_workflow_root_sha256(session, records),
+        root_hash_version="framed-v2",
         final_output_sha256=workflow_eval_output_sha256(output.final_output),
         structured_output_sha256=_workflow_structured_sha256(output.structured_output),
     )
@@ -278,7 +279,8 @@ async def _read_workflow_attempt_root(
         or attempt != anchor.attempt_id
         or completion.event.id != anchor.completion_event_id
         or completion.sequence != anchor.completion_sequence
-        or _workflow_root_sha256(session, records) != anchor.root_sha256
+        or _workflow_root_sha256(session, records, version=anchor.root_hash_version)
+        != anchor.root_sha256
     ):
         _reject(anchor)
     return session, records

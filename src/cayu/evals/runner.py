@@ -1883,18 +1883,49 @@ def _current_workflow_completion(
     return attempt_id, completion
 
 
-def _workflow_root_sha256(session: Session, records: tuple[EventRecord, ...]) -> str:
+def _workflow_root_sha256(
+    session: Session,
+    records: tuple[EventRecord, ...],
+    *,
+    version: str = "framed-v2",
+) -> str:
     from cayu._validation import canonical_durable_json_bytes
 
-    return hashlib.sha256(
-        canonical_durable_json_bytes(
-            {
-                "session": session.model_dump(mode="json"),
-                "records": [record.model_dump(mode="json") for record in records],
-            },
-            "workflow attempt root",
+    if version == "document-v1":
+        # Saved anchors without a version used this exact bounded document.
+        return hashlib.sha256(
+            canonical_durable_json_bytes(
+                {
+                    "session": session.model_dump(mode="json"),
+                    "records": [record.model_dump(mode="json") for record in records],
+                },
+                "workflow attempt root",
+            )
+        ).hexdigest()
+    if version != "framed-v2":
+        raise ValueError("Unsupported workflow root hash version.")
+
+    from cayu.events import validate_event_envelope
+
+    # Domain separation, followed by one session frame and ordered record frames.
+    # Each frame is an unsigned 8-byte big-endian byte length and canonical JSON.
+    # Only one record's encoding is materialized; durable limits still apply to
+    # each document, never to the accumulated history.
+    digest = hashlib.sha256(b"cayu.workflow-attempt-root.framed-v2\0")
+    encoded = canonical_durable_json_bytes(session.model_dump(mode="json"), "workflow session")
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+    del encoded
+    for record in records:
+        # Validate before JSON-mode serialization can normalize invalid values.
+        validate_event_envelope(record.event)
+        encoded = canonical_durable_json_bytes(
+            record.model_dump(mode="json"), "workflow event record"
         )
-    ).hexdigest()
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        del encoded
+    return digest.hexdigest()
 
 
 def _workflow_structured_sha256(value: dict[str, Any] | None) -> str:
@@ -2237,6 +2268,7 @@ async def _run_workflow_case_once_with_public_projection(
                 completion_event_id=completion.event.id,
                 completion_sequence=completion.sequence,
                 root_sha256=_workflow_root_sha256(workflow_session, latest_records),
+                root_hash_version="framed-v2",
                 final_output_sha256=output_evidence.final_output_sha256,
                 structured_output_sha256=_workflow_structured_sha256(structured_output),
             )

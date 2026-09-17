@@ -128,6 +128,8 @@ class WorkflowAttemptAnchor(BaseModel):
     completion_event_id: str
     completion_sequence: int
     root_sha256: str
+    # Missing versions in saved reports retain the original document hash semantics.
+    root_hash_version: Literal["document-v1", "framed-v2"] = "document-v1"
     final_output_sha256: str
     structured_output_sha256: str
 

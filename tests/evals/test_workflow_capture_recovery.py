@@ -268,6 +268,7 @@ def test_legacy_import_is_explicit_and_does_not_replace_existing_anchor():
         original = legacy.model_dump_json()
         imported = await import_workflow_eval_attempt(target, legacy, **kwargs)
         assert imported.workflow_attempt.origin == "saved_store_import"
+        assert imported.workflow_attempt.root_hash_version == "framed-v2"
         assert imported.workflow_attempt.source_report_sha256
         assert legacy.model_dump_json() == original
         capture = await capture_workflow_eval_attempt(

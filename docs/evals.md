@@ -1028,6 +1028,19 @@ for the current durable workflow attempt. Its bounded typed result is bound to
 that completion event and target/projector revisions. A missing, conflicting, or
 superseded completion, invalid projector output, or failed/expired `close`
 callback produces a stable error diagnostic and cannot publish candidate output.
+Workflow attempt anchors record `root_hash_version`. New execution and saved-store
+import anchors use `framed-v2`: SHA-256 starts with the UTF-8 bytes
+`cayu.workflow-attempt-root.framed-v2` and a NUL byte, then hashes the canonical
+durable JSON session followed by each complete EventRecord in journal order.
+Each JSON value is prefixed by its byte length as an unsigned 8-byte big-endian
+integer. Sequence numbers and every session/event field remain part of the hash.
+Encoding uses one record at a time, so accumulated history has no single-document
+ceiling; individual durable-record limits and explicit capture bounds still apply.
+Saved anchors lacking this field use `document-v1`, the original canonical JSON
+object containing `session` and `records`, with its original validation limits.
+Recovery never reinterprets an old digest as the new format; unknown versions
+are rejected. Both recovery and post-scoring revalidation use the saved version.
+
 The retained root trajectory contains the workflow journal, complete admitted
 child tree, aggregate child usage, workflow-wide tool/process evidence, and the
 typed structured output. Workspace or artifact evidence fails unavailable when
