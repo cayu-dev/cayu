@@ -1,4 +1,4 @@
-# Private provider-error diagnostics
+# Provider-error diagnostics
 
 Normal Cayu events deliberately omit raw provider error bodies and arbitrary
 request IDs. Such fields can echo credentials or customer input. Error identity,
@@ -93,3 +93,65 @@ explanation while ordinary durable events keep the privacy-safe failure state.
 Capture records what the provider actually supplies. An absent explanation or
 request ID remains explicitly absent; it cannot reconstruct discarded historical
 details or reveal the provider's internal root cause.
+
+## Durable rejection diagnostics
+
+Bundled OpenAI (including subscription), Chat Completions, Anthropic, and Vertex
+HTTP failures now carry a bounded safe projection in normal `model.error`
+events. Their recognized streaming error envelopes use the same projection.
+For example, a synthetic HTTP 400 with `Unsupported parameter: 'temperature'.`
+retains:
+
+```json
+{
+  "provider_rejection_reason": "unsupported_parameter",
+  "provider_rejection_parameter": "temperature",
+  "provider_rejection_explanation": "Remove this parameter; the endpoint or model does not support it."
+}
+```
+
+These are untrusted diagnostic claims. Runtime generates the explanatory sentence
+from a finite vocabulary; it never copies provider prose. A recognized flat
+`code` and `param` pair can supply `unsupported_parameter`,
+`missing_required_parameter`, `invalid_value`, or `positive_integer_required`.
+Without such a pair, only complete, exact messages match: `Unsupported parameter:
+'<param>'.`, `Missing required parameter: '<param>'.`, `<param>: Input should be
+a valid integer`, and `<param>: must be a positive integer`. There is no substring
+matching, arbitrary numeric constraint retention, or extraction of echoed values.
+
+Parameters must exactly match one of: `temperature`, `top_p`, `max_tokens`,
+`max_output_tokens`, `max_completion_tokens`, `messages`, `input`, `model`, `tools`,
+`tool_choice`, `response_format`, `stream`, `stop`, `seed`, `reasoning_effort`,
+`previous_response_id`, or `metadata`. Unknown codes and parameter paths are not
+copied. Known credentials overlapping these labels suppress the diagnostic.
+This fixed-vocabulary policy also works before credential resolution; it does not
+assume replacement of known API keys can sanitize arbitrary customer data.
+
+`provider_rejection_unavailable_reason` distinguishes `absent_body` and
+`absent_details` from `body_unavailable` (including unread, encoded, stalled, or
+transport-omitted bodies), `body_too_large`, `non_json_body`, `malformed_body`,
+`unrecognized_details`, `unsafe_parameter`, and `credential_overlap`. HTTP
+projection decodes at most 64 KiB; message matching examines at most 512
+characters. Nested arbitrary details are ignored. Output has at most five fixed
+fields and no unbounded values. Malformed JSON and nesting failures leave HTTP
+status and retry classification intact.
+
+`provider_rejection_request_id_state` is `absent`, `omitted_untrusted`, or
+`unavailable`. No raw, truncated, or hashed upstream identifier is made durable:
+its format cannot prove it is not a credential or customer identifier. Use the
+existing session ID, model attempt ID, and workflow child failure's session and
+terminal-event references to locate the durable failure. For upstream/gateway
+correlation, use the explicitly authorized private capture above, with one scope
+per request and an application-owned association to these local identities.
+
+Inspect retained details with:
+
+```sh
+cayu session events SESSION_ID --sqlite data/cayu.db --include-payload 10000
+```
+
+The CLI omits payloads unless requested. These diagnostic fields do not change
+HTTP status, retry disposition, recovery authority, or dispatch count. A
+non-retryable 400 still stops after one dispatch. They cannot recover explanations
+from historical events that were already sanitized, and a recognized claim does
+not establish whether the provider or a gateway caused the rejection.

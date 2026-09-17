@@ -56,6 +56,11 @@ from cayu.providers._http import (
     stream_sse_json_events,
     validate_url,
 )
+from cayu.providers._rejection_diagnostics import (
+    project_rejection_error,
+    project_rejection_response,
+    retain_rejection_diagnostic,
+)
 from cayu.providers._stream_lifecycle import (
     StreamLifecycle,
     StreamPhase,
@@ -682,13 +687,16 @@ class ChatCompletionsProvider(ModelProvider):
                     provider_name="chat_completions",
                     credential_values=credential_values,
                 )
-                overflow_failure = ChatCompletionsContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                overflow_failure = retain_rejection_diagnostic(
+                    ChatCompletionsContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         except Exception as exc:
             credential_values = credential_sanitization_values(
@@ -1303,7 +1311,7 @@ def _stream_error_chunk_exception(
     )
     if identity_conflict:
         retryable = False
-    return ChatCompletionsAPIError(
+    failure = ChatCompletionsAPIError(
         safe_message,
         status_code=status_code,
         error_type=error_type,
@@ -1313,6 +1321,9 @@ def _stream_error_chunk_exception(
         retry_after_s=retry_after_s,
         response_body=None,
     )
+
+    failure.rejection_diagnostic = project_rejection_error(error) if type(error) is dict else {}
+    return failure
 
 
 _CHAT_ERROR_TYPE_CLASSIFICATION = {
@@ -2205,7 +2216,7 @@ def _chat_api_error_from_response(
     request_id = optional_error_string(error.get("request_id"))
     if request_id is None and decoded is not None:
         request_id = optional_error_string(decoded.get("request_id"))
-    return ChatCompletionsAPIError(
+    failure = ChatCompletionsAPIError(
         message,
         status_code=status_code,
         error_type=error_type,
@@ -2215,6 +2226,9 @@ def _chat_api_error_from_response(
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
+
+    failure.rejection_diagnostic = project_rejection_response(response)
+    return failure
 
 
 def _raise_chat_context_overflow_if_applicable(response: httpx.Response) -> None:

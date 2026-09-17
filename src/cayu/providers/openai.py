@@ -88,6 +88,11 @@ from cayu.providers._openai_search_trace import (
     SearchStreamDiagnostic,
     SearchStreamTrace,
 )
+from cayu.providers._rejection_diagnostics import (
+    project_rejection_error,
+    project_rejection_response,
+    retain_rejection_diagnostic,
+)
 from cayu.providers._stream_lifecycle import (
     StreamLifecycle,
     StreamPhase,
@@ -1010,15 +1015,18 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
             )
         if isinstance(exc, ProviderOperationMalformedError):
             return ProviderOperationMalformedError(str(safe))
-        return OpenAIAPIError(
-            str(safe),
-            status_code=safe.status_code,
-            error_type=safe.error_type,
-            error_code=safe.error_code,
-            request_id=safe.request_id,
-            retryable=safe.retryable,
-            retry_after_s=safe.retry_after_s,
-            response_body=None,
+        return retain_rejection_diagnostic(
+            OpenAIAPIError(
+                str(safe),
+                status_code=safe.status_code,
+                error_type=safe.error_type,
+                error_code=safe.error_code,
+                request_id=safe.request_id,
+                retryable=safe.retryable,
+                retry_after_s=safe.retry_after_s,
+                response_body=None,
+            ),
+            safe.rejection_diagnostic,
         )
 
 
@@ -1422,13 +1430,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     provider_name="openai",
                     credential_values=credential_values,
                 )
-                overflow_failure = OpenAIContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                overflow_failure = retain_rejection_diagnostic(
+                    OpenAIContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         except OpenAIProtocolError as exc:
             credential_values = credential_sanitization_values(
@@ -1571,24 +1582,30 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 ),
             )
             if isinstance(safe, ModelContextOverflowError):
-                failure = OpenAIContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                failure = retain_rejection_diagnostic(
+                    OpenAIContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
             else:
-                failure = OpenAIAPIError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    retryable=safe.retryable,
-                    retry_after_s=safe.retry_after_s,
-                    response_body=None,
+                failure = retain_rejection_diagnostic(
+                    OpenAIAPIError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        retryable=safe.retryable,
+                        retry_after_s=safe.retry_after_s,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         if cancellation is not None:
             raise cancellation
@@ -5468,7 +5485,7 @@ def _openai_error_value_exception(
     if status_conflict:
         status_code = None
         retryable = False
-    return OpenAIAPIError(
+    failure = OpenAIAPIError(
         safe_message,
         classification_origin="stream",
         classification_reason=_openai_classification_reason(
@@ -5483,6 +5500,9 @@ def _openai_error_value_exception(
         retry_after_s=retry_after_s,
         response_body=None,
     )
+
+    failure.rejection_diagnostic = project_rejection_error(error_mapping)
+    return failure
 
 
 def _openai_stream_status_code(
@@ -7286,7 +7306,7 @@ def _openai_api_error_from_response(
         error_type=error_type,
         error_code=error_code,
     )
-    return OpenAIAPIError(
+    failure = OpenAIAPIError(
         message,
         classification_origin="http",
         classification_reason=_openai_classification_reason(
@@ -7301,6 +7321,9 @@ def _openai_api_error_from_response(
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
+
+    failure.rejection_diagnostic = project_rejection_response(response)
+    return failure
 
 
 def _raise_openai_context_overflow_if_applicable(response: httpx.Response) -> None:

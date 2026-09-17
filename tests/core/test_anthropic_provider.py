@@ -1529,6 +1529,8 @@ async def test_anthropic_provider_stream_emits_typed_api_error_payload() -> None
         "provider": "anthropic",
         "model_provider_error": True,
         "status_code": 429,
+        "provider_rejection_request_id_state": "unavailable",
+        "provider_rejection_unavailable_reason": "body_unavailable",
         "provider_error_type": "rate_limit_error",
         "retryable": True,
         "retry_after_s": 1.5,

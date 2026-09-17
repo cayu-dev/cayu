@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 from collections.abc import AsyncIterator, Mapping
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
+
+import httpx
 
 from cayu._validation import require_clean_nonblank
 from cayu.context.thinking import ThinkingConfig
@@ -33,6 +35,10 @@ from cayu.providers._http import (
 from cayu.providers._reasoning_state import (
     ANTHROPIC_REASONING_PROTOCOL,
     ReasoningStateProvenance,
+)
+from cayu.providers._rejection_diagnostics import (
+    project_rejection_response,
+    retain_rejection_diagnostic,
 )
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.anthropic import (
@@ -64,9 +70,6 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlines,
     _resolve_provider_stream_deadlines,
 )
-
-if TYPE_CHECKING:
-    import httpx
 
 DEFAULT_VERTEX_REGION = "global"
 DEFAULT_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
@@ -497,13 +500,16 @@ class VertexProvider(ModelProvider):
                     provider_name="vertex",
                     credential_values=credential_values,
                 )
-                overflow_failure = VertexContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                overflow_failure = retain_rejection_diagnostic(
+                    VertexContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         except Exception as exc:
             credential_values = (token,) if token is not None else ()
@@ -593,24 +599,30 @@ class VertexProvider(ModelProvider):
                 credential_values=(token,) if token is not None else (),
             )
             if isinstance(safe, ModelContextOverflowError):
-                failure = VertexContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                failure = retain_rejection_diagnostic(
+                    VertexContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
             else:
-                failure = VertexAPIError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    retryable=safe.retryable,
-                    retry_after_s=safe.retry_after_s,
-                    response_body=None,
+                failure = retain_rejection_diagnostic(
+                    VertexAPIError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        retryable=safe.retryable,
+                        retry_after_s=safe.retry_after_s,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         token = None
         if cancellation is not None:
@@ -732,7 +744,7 @@ def _decoded_gcp_error(response: httpx.Response) -> Mapping[str, Any] | None:
         return None
     try:
         decoded = response.json()
-    except ValueError:
+    except (ValueError, RecursionError, httpx.ResponseNotRead):
         return None
     if isinstance(decoded, list) and decoded:
         decoded = decoded[0]
@@ -853,7 +865,7 @@ def _vertex_api_error_from_response(
         transport_status_code=response.status_code,
         error_type=error_type,
     )
-    return VertexAPIError(
+    failure = VertexAPIError(
         message,
         status_code=status_code,
         error_type=error_type,
@@ -861,6 +873,9 @@ def _vertex_api_error_from_response(
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
+
+    failure.rejection_diagnostic = project_rejection_response(response)
+    return failure
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:

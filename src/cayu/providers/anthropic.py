@@ -59,6 +59,11 @@ from cayu.providers._reasoning_state import (
     reasoning_state,
     reasoning_state_matches,
 )
+from cayu.providers._rejection_diagnostics import (
+    project_rejection_error,
+    project_rejection_response,
+    retain_rejection_diagnostic,
+)
 from cayu.providers._stream_lifecycle import (
     StreamLifecycle,
     StreamPhase,
@@ -652,13 +657,16 @@ class AnthropicProvider(ModelProvider):
                     provider_name="anthropic",
                     credential_values=credential_values,
                 )
-                overflow_failure = AnthropicContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                overflow_failure = retain_rejection_diagnostic(
+                    AnthropicContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         except Exception as exc:
             credential_values = credential_sanitization_values(
@@ -761,24 +769,30 @@ class AnthropicProvider(ModelProvider):
                 ),
             )
             if isinstance(safe, ModelContextOverflowError):
-                failure = AnthropicContextOverflowError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    response_body=None,
+                failure = retain_rejection_diagnostic(
+                    AnthropicContextOverflowError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
             else:
-                failure = AnthropicAPIError(
-                    str(safe),
-                    status_code=safe.status_code,
-                    error_type=safe.error_type,
-                    error_code=safe.error_code,
-                    request_id=safe.request_id,
-                    retryable=safe.retryable,
-                    retry_after_s=safe.retry_after_s,
-                    response_body=None,
+                failure = retain_rejection_diagnostic(
+                    AnthropicAPIError(
+                        str(safe),
+                        status_code=safe.status_code,
+                        error_type=safe.error_type,
+                        error_code=safe.error_code,
+                        request_id=safe.request_id,
+                        retryable=safe.retryable,
+                        retry_after_s=safe.retry_after_s,
+                        response_body=None,
+                    ),
+                    safe.rejection_diagnostic,
                 )
         resolved_api_key = None
         if cancellation is not None:
@@ -1445,6 +1459,8 @@ async def anthropic_stream_events(
                 request_id=request_id,
                 retry_after_s=retry_after_s,
             )
+            if isinstance(failure, ModelProviderError) and type(raw_error) is dict:
+                failure.rejection_diagnostic = project_rejection_error(raw_error)
             # The exported parser serves both Anthropic and Vertex. Clear the
             # untrusted envelope and source iterator before exposing failure.
             raw_error = None
@@ -1961,7 +1977,7 @@ def _anthropic_api_error_from_response(
         transport_status_code=response.status_code,
         error_type=error_type,
     )
-    return AnthropicAPIError(
+    failure = AnthropicAPIError(
         message,
         status_code=status_code,
         error_type=error_type,
@@ -1971,6 +1987,9 @@ def _anthropic_api_error_from_response(
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
+
+    failure.rejection_diagnostic = project_rejection_response(response)
+    return failure
 
 
 def _is_anthropic_context_overflow(

@@ -37,6 +37,11 @@ from cayu.providers._credential_boundary import (
     stream_cleanup_cancelled_after_provider_failure,
 )
 from cayu.providers._openai_search_trace import ResponseStructureDiagnostic, ResponseStructureTrace
+from cayu.providers._rejection_diagnostics import (
+    project_rejection_response,
+    rejection_fields,
+    retain_rejection_diagnostic,
+)
 from cayu.providers._sse import (
     DEFAULT_SSE_MAX_EVENT_BYTES,
     SseEventLimitError,
@@ -908,7 +913,10 @@ def _response_api_error(
 ) -> Exception:
     retry_after_s = retry_after_seconds(response)
     if api_error_from_response is not None:
-        return api_error_from_response(response, message, retry_after_s)
+        error = api_error_from_response(response, message, retry_after_s)
+        if isinstance(error, ModelProviderError) and not error.rejection_diagnostic:
+            error.rejection_diagnostic = project_rejection_response(response)
+        return error
     return api_error(
         message,
         status_code=response.status_code,
@@ -1072,7 +1080,7 @@ def response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
         return None
     try:
         decoded = response.json()
-    except ValueError:
+    except (ValueError, RecursionError, httpx.ResponseNotRead):
         return None
     if not isinstance(decoded, Mapping):
         return None
@@ -1238,16 +1246,19 @@ def credential_safe_post_completion_failure(
     )
     if isinstance(safe, ProviderStreamCleanupError):
         return safe
-    return ModelProviderError(
-        str(safe),
-        provider=provider_name,
-        status_code=safe.status_code,
-        error_type=safe.error_type,
-        error_code=safe.error_code,
-        request_id=safe.request_id,
-        retryable=False,
-        retry_after_s=safe.retry_after_s,
-        response_body=None,
+    return retain_rejection_diagnostic(
+        ModelProviderError(
+            str(safe),
+            provider=provider_name,
+            status_code=safe.status_code,
+            error_type=safe.error_type,
+            error_code=safe.error_code,
+            request_id=safe.request_id,
+            retryable=False,
+            retry_after_s=safe.retry_after_s,
+            response_body=None,
+        ),
+        safe.rejection_diagnostic,
     )
 
 
@@ -1321,6 +1332,10 @@ def credential_safe_provider_exception(
     return ModelProviderError(
         message,
         **common,
+        rejection_diagnostic=rejection_fields(
+            getattr(exc, "rejection_diagnostic", None),
+            credential_values=tuple(credential_values),
+        ),
         retryable=source.retryable if source is not None else None,
         retry_after_s=source.retry_after_s if source is not None else None,
     )

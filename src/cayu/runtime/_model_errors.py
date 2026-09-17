@@ -27,6 +27,7 @@ from cayu.budgets.billing import (
     completed_billing_identity,
     copy_billing_identity,
 )
+from cayu.providers._rejection_diagnostics import rejection_fields
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProvider,
@@ -871,6 +872,7 @@ def copy_model_provider_error_control(error: ModelProviderError) -> ModelProvide
         return ModelProviderError(
             message,
             **error_kwargs,
+            rejection_diagnostic=rejection_fields(payload),
             retryable=payload.get("retryable"),
             retry_after_s=payload.get("retry_after_s"),
         )
@@ -1048,6 +1050,7 @@ def model_provider_error_from_payload(
         error_type=_clean_payload_string(payload.get("provider_error_type")),
         error_code=_clean_payload_string(payload.get("provider_error_code")),
         request_id=_clean_payload_string(payload.get("request_id")),
+        rejection_diagnostic=rejection_fields(payload),
         retryable=_payload_retryable(payload.get("retryable")),
         retry_after_s=_payload_retry_after_s(payload.get("retry_after_s")),
     )

@@ -1,5 +1,7 @@
 """Bounded diagnostic labels; these never grant retry or settlement authority."""
 
+from cayu.providers._rejection_diagnostics import rejection_fields, unavailable
+
 API_CLASSIFICATION_REASONS = frozenset(
     {
         "explicit_status_conflict",
@@ -17,7 +19,12 @@ API_CLASSIFICATION_ORIGINS = frozenset({"http", "stream"})
 def api_error_diagnostic_fields(
     exc: Exception, *, credential_values: tuple[str, ...] = ()
 ) -> dict[str, str]:
-    fields = {}
+    fields = rejection_fields(
+        getattr(exc, "rejection_diagnostic", None), credential_values=credential_values
+    )
+    status = getattr(exc, "status_code", None)
+    if not fields and type(status) is int and status >= 400:
+        fields = unavailable("body_unavailable")
     for attribute, vocabulary in (
         ("classification_reason", API_CLASSIFICATION_REASONS),
         ("classification_origin", API_CLASSIFICATION_ORIGINS),

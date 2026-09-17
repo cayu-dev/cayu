@@ -36,6 +36,7 @@ from cayu.messages import (
     ToolResultPart,
     detach_message,
 )
+from cayu.providers._rejection_diagnostics import rejection_fields
 from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
 from cayu.providers.deadlines import (
@@ -350,6 +351,7 @@ class ModelProviderError(RuntimeError):
         retryable: bool | None = None,
         retry_after_s: float | None = None,
         response_body: str | None = None,
+        rejection_diagnostic: dict[str, str] | None = None,
     ) -> None:
         super().__init__(require_nonblank(message, "message"))
         self.provider = require_clean_nonblank(provider, "provider")
@@ -375,6 +377,7 @@ class ModelProviderError(RuntimeError):
                 raise ValueError("retry_after_s must be a finite non-negative number.")
         self.retry_after_s = retry_after_s
         self.response_body = response_body
+        self.rejection_diagnostic = rejection_fields(rejection_diagnostic)
 
     def error_payload_fields(self) -> dict[str, Any]:
         """JSON-safe structured fields for model stream error payloads.
@@ -384,6 +387,7 @@ class ModelProviderError(RuntimeError):
         it cannot collide with the Python-exception ``error_type`` key.
         """
         payload: dict[str, Any] = {"provider": self.provider}
+        payload.update(rejection_fields(self.rejection_diagnostic))
         if self.status_code is not None:
             payload["status_code"] = self.status_code
         if self.error_type is not None:
