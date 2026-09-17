@@ -34,6 +34,7 @@ from cayu.tools._operation_boundary import (
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.base import (
     _COMMAND_POLICY_DENIAL_SOURCE,
+    _POLICY_DENIAL_TEXT_MAX_BYTES,
     Tool,
     ToolContext,
     ToolEffect,
@@ -41,6 +42,7 @@ from cayu.tools.base import (
     ToolSpec,
     _bound_policy_denial_result,
 )
+from cayu.tools.process_diagnostics import ProcessCommandCapabilities, ProcessCommandDiagnostic
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 MAX_OUTPUT_LIMIT_BYTES = 200_000
@@ -99,6 +101,9 @@ class CommandPolicyResult(BaseModel):
 
     decision: CommandPolicyDecision
     reason: str | None = None
+    process_diagnostic: ProcessCommandDiagnostic | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     denied_env_name: str | None = Field(default=None, exclude_if=lambda value: value is None)
     allowed_env_names: tuple[str, ...] | None = Field(
         default=None, max_length=64, exclude_if=lambda value: value is None
@@ -110,7 +115,7 @@ class CommandPolicyResult(BaseModel):
     def validate_denied_env_name(cls, value: str | None) -> str | None:
         if (
             value is not None
-            and value != "<invalid-or-oversized-name>"
+            and value not in {"<invalid-or-oversized-name>", "<withheld-name>"}
             and not _safe_env_name(value)
         ):
             raise ValueError("denied_env_name must be a bounded environment identifier")
@@ -142,6 +147,11 @@ class CommandPolicy(ABC):
     runner. Hosts that need an allow/deny/approval seam attach a policy via
     ``ExecCommandTool(policy=...)``.
     """
+
+    @property
+    def process_capabilities(self) -> ProcessCommandCapabilities | None:
+        """Optional public capability snapshot; discovery never grants authority."""
+        return None
 
     @property
     def allowed_environment_names(self) -> tuple[str, ...] | None:
@@ -249,8 +259,19 @@ class ExecCommandTool(Tool):
                 + (
                     ". List truncated; policy still validates every override."
                     if len(safe_names) != len(names)
+                    or (
+                        policy is not None
+                        and policy.process_capabilities is not None
+                        and policy.process_capabilities.environment_names_withheld
+                    )
                     else ". The policy still validates values and execution authority."
                 )
+            )
+        capabilities = None if policy is None else policy.process_capabilities
+        if capabilities is not None:
+            schema["description"] = (
+                "Effective process policy capabilities (unpublished names and cwd paths are withheld): "
+                + capabilities.model_dump_json()
             )
         super().__init__(base_spec.model_copy(update={"input_schema": schema}))
         self._policy = policy
@@ -434,6 +455,29 @@ class ExecCommandTool(Tool):
         )
 
 
+def _process_diagnostic_content(prefix: str, diagnostic: ProcessCommandDiagnostic) -> str:
+    """Fit public name lists to the text budget without dropping correction limits."""
+    prefix += (
+        " "
+        + diagnostic.correction_hint
+        + " Do not replay suppressed arguments from transcript history.\n"
+    )
+    snapshot = diagnostic.model_dump(mode="json")
+    capabilities = snapshot["capabilities"]
+    name_fields = ("allowed_executables", "approval_required_executables", "allowed_env_names")
+    while True:
+        content = prefix + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        if len(content.encode("utf-8")) <= _POLICY_DENIAL_TEXT_MAX_BYTES:
+            return content
+        populated = [field for field in name_fields if capabilities[field]]
+        if not populated:
+            # Arbitrary custom-policy reasons remain subject to the ordinary bound.
+            return content
+        largest = max(populated, key=lambda field: len(json.dumps(capabilities[field])))
+        capabilities[largest].pop()
+        snapshot["capability_names_truncated"] = True
+
+
 def _policy_refusal_result(
     verdict: CommandPolicyResult,
     *,
@@ -449,6 +493,9 @@ def _policy_refusal_result(
     reason = verdict.reason or content
     if verdict.reason is not None:
         content = f"{content} {verdict.reason}"
+    if verdict.process_diagnostic is not None:
+        # Providers may serialize only content, omitting structured tool data.
+        content = _process_diagnostic_content(content, verdict.process_diagnostic)
     raw_result = ToolResult(
         content=content,
         structured={
@@ -457,6 +504,15 @@ def _policy_refusal_result(
                 "Choose a command permitted by the configured command policy, or ask the "
                 "application operator to authorize the required capability. Do not retry "
                 "suppressed arguments from transcript history."
+            ),
+            **(
+                {
+                    "process_diagnostic": verdict.process_diagnostic.model_dump(mode="json"),
+                    "recovery_instruction": verdict.process_diagnostic.correction_hint
+                    + " Do not replay suppressed arguments from transcript history.",
+                }
+                if verdict.process_diagnostic is not None
+                else {}
             ),
             "decision": str(verdict.decision),
             "reason": verdict.reason,

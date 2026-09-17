@@ -4428,6 +4428,9 @@ from cayu.tools.policy import ToolPolicyRequest as ToolPolicyRequest
 from cayu.tools.policy import ToolPolicyResult as ToolPolicyResult
 from cayu.tools.policy import metadata_with_taint_labels as metadata_with_taint_labels
 from cayu.tools.policy import taint_labels_from_metadata as taint_labels_from_metadata
+from cayu.tools.process_diagnostics import ProcessCommandCapabilities as ProcessCommandCapabilities
+from cayu.tools.process_diagnostics import ProcessCommandDenialCode as ProcessCommandDenialCode
+from cayu.tools.process_diagnostics import ProcessCommandDiagnostic as ProcessCommandDiagnostic
 from cayu.tools.result_projection import (
     ARTIFACT_EXTERNALIZING_TOOL_RESULT_POLICY_ID as ARTIFACT_EXTERNALIZING_TOOL_RESULT_POLICY_ID,
 )

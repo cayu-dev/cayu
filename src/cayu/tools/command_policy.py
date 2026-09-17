@@ -13,7 +13,13 @@ from cayu.tools.commands import (
     CommandPolicyDecision,
     CommandPolicyResult,
     CommandRequest,
-    _safe_env_name,
+)
+from cayu.tools.process_diagnostics import (
+    ProcessCommandCapabilities,
+    ProcessCommandDiagnostic,
+)
+from cayu.tools.process_diagnostics import (
+    ProcessCommandDenialCode as Code,
 )
 
 DEFAULT_MAX_ENV_VALUE_BYTES = 4096
@@ -28,12 +34,21 @@ class ProcessCommandPolicy(CommandPolicy):
     Executable identities are matched exactly. Working-directory roots are
     compared against the runner-resolved ``canonical_cwd`` supplied by
     :class:`~cayu.tools.commands.ExecCommandTool`.
+
+    ``public_executable_names`` and ``public_environment_names`` explicitly attest
+    names safe for tool discovery and durable diagnostics; they grant no authority.
+    Unlisted names and all cwd paths and input values remain withheld.
+    ``diagnostic_profile_id`` is an optional public application label, not an
+    execution-profile fingerprint. Never put private values in publication fields.
     """
 
     def __init__(
         self,
         *,
         allowed_executables: Iterable[str] = (),
+        public_executable_names: Iterable[str] = (),
+        public_environment_names: Iterable[str] = (),
+        diagnostic_profile_id: str | None = None,
         approval_required_executables: Iterable[str] = (),
         allowed_cwds: Iterable[str] = (),
         allowed_env_names: Iterable[str] = (),
@@ -81,11 +96,74 @@ class ProcessCommandPolicy(CommandPolicy):
         if type(shell_decision) is not CommandPolicyDecision:
             raise TypeError("shell_decision must be a CommandPolicyDecision.")
         self._shell_decision = shell_decision
+        self._public_executable_names = _public_names(public_executable_names)
+        self._public_environment_names = _public_names(public_environment_names, environment=True)
+        self._diagnostic_profile_id = diagnostic_profile_id
+        # Validate the declared public profile at configuration time.
+        _ = self.process_capabilities
+
+    @property
+    def process_capabilities(self) -> ProcessCommandCapabilities:
+        allowed = tuple(sorted(self._allowed_executables & self._public_executable_names))[:64]
+        approval = tuple(
+            sorted(self._approval_required_executables & self._public_executable_names)
+        )[:64]
+        env = self.allowed_environment_names[:64]
+        return ProcessCommandCapabilities(
+            profile_id=self._diagnostic_profile_id,
+            allowed_executables=allowed,
+            approval_required_executables=approval,
+            executable_names_withheld=(
+                len(allowed) + len(approval)
+                != len(self._allowed_executables | self._approval_required_executables)
+            ),
+            allowed_env_names=env,
+            environment_names_withheld=len(env) != len(self._allowed_env_names),
+            max_env_value_bytes=self._max_env_value_bytes,
+            allow_stdin=self._allow_stdin,
+            max_stdin_bytes=self._max_stdin_bytes,
+            max_timeout_s=self._max_timeout_s,
+            shell_decision=self._shell_decision.value,
+        )
+
+    def _deny(self, reason: str, code: Code, *, name: str | None = None) -> CommandPolicyResult:
+        public_names = (
+            self._public_executable_names
+            if code in {Code.EXECUTABLE, Code.COMMAND_APPROVAL}
+            else self._public_environment_names
+        )
+        published = name is not None and name in public_names
+        named = code in {
+            Code.EXECUTABLE,
+            Code.COMMAND_APPROVAL,
+            Code.ENVIRONMENT_NAME,
+            Code.ENVIRONMENT_VALUE,
+            Code.ENVIRONMENT_VALUE_SIZE,
+        }
+        diagnostic = ProcessCommandDiagnostic(
+            code=code,
+            rejected_name=name if published else None,
+            value_state="published_by_policy"
+            if published
+            else (
+                "withheld_not_declared_public"
+                if named
+                else (
+                    "not_applicable"
+                    if code in {Code.TIMEOUT, Code.COMMAND_KIND}
+                    else "withheld_private_value"
+                )
+            ),
+            capabilities=self.process_capabilities,
+        )
+        return CommandPolicyResult(
+            decision=CommandPolicyDecision.DENY, reason=reason, process_diagnostic=diagnostic
+        )
 
     @property
     def allowed_environment_names(self) -> tuple[str, ...]:
         """Discover allowed override names without exposing any configured values."""
-        return tuple(sorted(self._allowed_env_names))
+        return tuple(sorted(self._allowed_env_names & self._public_environment_names))
 
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return public policy inputs without exposing exact environment values."""
@@ -95,6 +173,9 @@ class ProcessCommandPolicy(CommandPolicy):
         if self._allowed_env_values:
             return None
         return {
+            "public_executable_names": sorted(self._public_executable_names),
+            "public_environment_names": sorted(self._public_environment_names),
+            "diagnostic_profile_id": self._diagnostic_profile_id,
             "allowed_executables": sorted(self._allowed_executables),
             "approval_required_executables": sorted(self._approval_required_executables),
             "allowed_cwds": sorted(self._allowed_cwds),
@@ -114,7 +195,17 @@ class ProcessCommandPolicy(CommandPolicy):
         del ctx
         decision, decision_reason = self._command_decision(request)
         if decision is CommandPolicyDecision.DENY:
-            return _deny(decision_reason)
+            code = (
+                Code.SHELL
+                if request.command.kind == "shell"
+                else (Code.EXECUTABLE if request.command.kind == "process" else Code.COMMAND_KIND)
+            )
+            name = (
+                request.command.argv[0]
+                if request.command.kind == "process" and request.command.argv
+                else None
+            )
+            return self._deny(decision_reason, code, name=name)
 
         canonical_cwd = request.canonical_cwd
         if (
@@ -124,31 +215,46 @@ class ProcessCommandPolicy(CommandPolicy):
             or posixpath.normpath(canonical_cwd) != canonical_cwd
             or not any(is_same_or_child(canonical_cwd, root) for root in self._allowed_cwds)
         ):
-            return _deny("Canonical cwd is not allowed by the process policy.")
+            return self._deny(
+                "Canonical cwd is not allowed by the process policy.", Code.WORKING_DIRECTORY
+            )
 
         environment_denial = self._environment_denial(request.env)
         if environment_denial is not None:
-            reason, name = environment_denial
-            safe_names = tuple(
-                name for name in self.allowed_environment_names if _safe_env_name(name)
-            )[:64]
-            return CommandPolicyResult(
-                decision=CommandPolicyDecision.DENY,
-                reason=reason,
-                denied_env_name=name if _safe_env_name(name) else "<invalid-or-oversized-name>",
-                allowed_env_names=safe_names,
-                allowed_env_names_truncated=len(safe_names) != len(self.allowed_environment_names),
+            reason, name, code = environment_denial
+            result = self._deny(reason, code, name=name)
+            # Keep legacy name-only fields, now gated by explicit publication consent.
+            result.denied_env_name = (
+                name if name in self._public_environment_names else "<withheld-name>"
             )
+            result.allowed_env_names = self.process_capabilities.allowed_env_names
+            result.allowed_env_names_truncated = (
+                self.process_capabilities.environment_names_withheld
+            )
+            return result
 
         if request.stdin is not None:
             if not self._allow_stdin:
-                return _deny("Stdin is not allowed by the process policy.")
+                return self._deny("Stdin is not allowed by the process policy.", Code.STDIN)
             if len(request.stdin.encode("utf-8")) > self._max_stdin_bytes:
-                return _deny("Stdin exceeds the process policy byte limit.")
+                return self._deny("Stdin exceeds the process policy byte limit.", Code.STDIN_SIZE)
 
         if request.timeout_s > self._max_timeout_s:
-            return _deny("Timeout exceeds the process policy ceiling.")
+            return self._deny("Timeout exceeds the process policy ceiling.", Code.TIMEOUT)
 
+        if decision is CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL:
+            name = (
+                request.command.argv[0]
+                if request.command.kind == "process" and request.command.argv
+                else None
+            )
+            result = self._deny(
+                decision_reason,
+                Code.SHELL if request.command.kind == "shell" else Code.COMMAND_APPROVAL,
+                name=name,
+            )
+            result.decision = decision
+            return result
         return CommandPolicyResult(
             decision=decision,
             reason=decision_reason or None,
@@ -182,15 +288,27 @@ class ProcessCommandPolicy(CommandPolicy):
             "Executable is not allowed by the process policy.",
         )
 
-    def _environment_denial(self, env: Mapping[str, str] | None) -> tuple[str, str] | None:
+    def _environment_denial(self, env: Mapping[str, str] | None) -> tuple[str, str, Code] | None:
         for name, value in (env or {}).items():
             if name not in self._allowed_env_names:
-                return "Environment name is not allowed by the process policy.", name
+                return (
+                    "Environment name is not allowed by the process policy.",
+                    name,
+                    Code.ENVIRONMENT_NAME,
+                )
             if len(value.encode("utf-8")) > self._max_env_value_bytes:
-                return "Environment value exceeds the process policy byte limit.", name
+                return (
+                    "Environment value exceeds the process policy byte limit.",
+                    name,
+                    Code.ENVIRONMENT_VALUE_SIZE,
+                )
             expected = self._allowed_env_values.get(name)
             if expected is not None and value != expected:
-                return "Environment value does not satisfy the process policy.", name
+                return (
+                    "Environment value does not satisfy the process policy.",
+                    name,
+                    Code.ENVIRONMENT_VALUE,
+                )
         return None
 
 
@@ -256,8 +374,14 @@ def _positive_int(value: int, *, field_name: str) -> int:
     return value
 
 
-def _deny(reason: str) -> CommandPolicyResult:
-    return CommandPolicyResult(
-        decision=CommandPolicyDecision.DENY,
-        reason=reason,
+def _public_names(values: Iterable[str], *, environment: bool = False) -> frozenset[str]:
+    names = (
+        _validated_env_names(values)
+        if environment
+        else _validated_strings(values, field_name="public_executable_names")
     )
+    if len(names) > 64 or any(len(name) > 128 or not name.isprintable() for name in names):
+        raise ValueError(
+            "Public names must contain at most 64 printable names of at most 128 characters."
+        )
+    return names

@@ -10322,22 +10322,86 @@ requires the live canonical cwd to be a segment-aware child of a configured
 canonical root. It independently bounds model-supplied environment names and
 values, stdin, and timeout. Shell is a separate capability and remains denied
 when process executables are enabled. Denial and command-approval results name
-the rejected category and, for environment refusals, the offending variable
-name and permitted names; they do not persist argv, environment values,
+the rejected category and explicitly public names; they do not persist argv, environment values,
 stdin, command output, or credentials. `REQUIRE_COMMAND_APPROVAL` is the
 command-policy seam's inline refusal, not the app-level durable approval
 checkpoint. Applications needing durable pause/resume approval should use the
 agent's `ToolPolicy`.
 
-`CommandPolicy.allowed_environment_names` optionally declares name-only discovery.
-`ProcessCommandPolicy` supplies it, and `ExecCommandTool` includes it in the `env`
-parameter description. Structured environment refusals retain `denied_env_name`
-and `allowed_env_names` even when denied arguments are suppressed. Diagnostics
-include at most 64 identifier-shaped names of at most 128 characters; omitted
-names are indicated by `allowed_env_names_truncated`, and an unsafe offending
-name becomes `<invalid-or-oversized-name>`. These are diagnostic bounds, not
-execution limits. Discovery never grants execution or discloses configured or
-submitted values. Custom policies may leave discovery unspecified (`None`).
+`ProcessCommandPolicy.process_capabilities` exposes a typed
+`ProcessCommandCapabilities` snapshot, also included in the `ExecCommandTool`
+input schema description. It declares stdin, environment-value and timeout
+limits, shell authority, and explicitly published allowed/approval-required
+executable and environment names. Discovery is informational: all restrictions
+still apply together, and an executable list does not authorize arbitrary argv
+in a specialized policy that adds argument restrictions.
+
+Applications explicitly attest which names are public with
+`public_executable_names=` and `public_environment_names=`. These sets grant no
+execution authority and may include known rejected names for diagnostics.
+Authorization still uses `allowed_executables`, `approval_required_executables`,
+`allowed_env_names` and `allowed_env_values`. Each public set is limited to 64
+printable names of at most 128 characters; environment names must also be valid
+identifiers. Private executable paths and even identifier-shaped environment
+names are withheld by default. Do not put secrets or private paths in these
+publication sets. Neither submitted nor configured environment **values**,
+argv tails, shell text, stdin, or cwd paths are published by this contract.
+
+`diagnostic_profile_id=` optionally declares an application-owned public profile
+label (1–128 characters). The snapshot always identifies
+`policy_type=process_command_policy`; `profile_id=null` explicitly means no
+public application profile identity was declared. This label is not an authority
+fingerprint or a substitute for the Runtime execution-profile identity. Changes
+to diagnostic publication configuration participate in built-in execution-profile
+admission; exact environment values retain their existing process-local identity
+rules. Wrappers may delegate `process_capabilities` for discovery, while retaining
+responsibility for documenting their additional restrictions.
+
+`CommandPolicyResult.process_diagnostic` carries a typed
+`ProcessCommandDiagnostic`. `ExecCommandTool` publishes the same diagnostic in
+`tool.call.blocked.result.structured.process_diagnostic` and the model's tool
+result, including the capability snapshot at the time of refusal. To fit the
+4 KiB denial-text budget, the text projection may shorten published name lists
+and set `capability_names_truncated=true`; correction limits and complete JSON
+are retained. The structured diagnostic retains the full snapshot. Its closed
+`ProcessCommandDenialCode` vocabulary is `executable`, `command_kind`, `shell`,
+`working_directory`, `environment_name`, `environment_value_size`,
+`environment_value`, `stdin`, `stdin_size`, `timeout`, and `command_approval`.
+`recovery_instruction` gives the corresponding Runtime-owned correction and warns
+against replaying suppressed input. A `rejected_name` appears only after exact
+membership in the applicable public set. `value_state` distinguishes
+`published_by_policy`, `withheld_not_declared_public`, `withheld_private_value`,
+and `not_applicable`. Working-directory hints identify the policy-root restriction
+and direct the agent to obtain an admitted directory from the operator; they do
+not disclose roots or suggest that runner containment alone grants permission.
+
+These results survive durable event queries, transcript inspection, JSONL export
+and continuation after reopening the session store. Denied input remains
+`arguments_state=unavailable`, `arguments_exact=false`, and non-replayable, not
+an empty `{}` request. A nonzero subprocess exit remains a completed execution
+with an `exit_code`, separate from a policy denial. Custom-policy exceptions do
+not acquire trusted diagnostic status through this field.
+
+Migration from the earlier environment-name diagnostics: explicitly add public
+names to retain their publication. `CommandPolicy.allowed_environment_names`
+remains optional (`None` for unspecified custom discovery); the process policy
+now returns only the intersection with `public_environment_names`.
+Legacy `denied_env_name` becomes `<withheld-name>` when unpublished;
+`allowed_env_names_truncated` indicates configured names omitted from the public
+list. A declaration such as the following preserves useful name-only discovery
+without publishing values:
+
+```python
+policy = ProcessCommandPolicy(
+    allowed_executables={"python", "git"},
+    allowed_cwds={"/workspace"},
+    allowed_env_names={"CI"},
+    public_executable_names={"python", "git"},
+    public_environment_names={"CI", "PYTHONPATH"},
+    diagnostic_profile_id="workspace-process-v1",
+    max_timeout_s=30,
+)
+```
 
 The general process policy deliberately does not interpret executable-specific
 arguments. A specialized policy composes through the existing `CommandPolicy`

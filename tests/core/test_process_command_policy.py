@@ -477,16 +477,10 @@ def test_process_command_policy_runs_allowed_and_blocks_denied_command_in_cayu_a
     assert denied.payload["decision"] == "deny"
     assert denied.payload["metadata"] == {}
     assert all(event.type is not EventType.TOOL_CALL_FAILED for event in events)
-    assert denied.payload["result"]["structured"] == {
-        "error": "command_denied",
-        "decision": "deny",
-        "reason": "Executable is not allowed by the process policy.",
-        "recovery_instruction": (
-            "Choose a command permitted by the configured command policy, or ask the "
-            "application operator to authorize the required capability. Do not retry "
-            "suppressed arguments from transcript history."
-        ),
-    }
+    diagnostic = denied.payload["result"]["structured"]["process_diagnostic"]
+    assert diagnostic["code"] == "executable"
+    assert diagnostic["value_state"] == "withheld_not_declared_public"
+    assert diagnostic["rejected_name"] is None
     assert not denied_marker.exists()
 
 
@@ -496,14 +490,19 @@ async def _collect_events(app: CayuApp, request: RunRequest):
 
 def test_environment_discovery_is_name_only_bounded_and_instance_local():
     policy = ProcessCommandPolicy(
-        allowed_env_names={"CI"}, allowed_env_values={"TOKEN": "SECRET-configured"}
+        allowed_env_names={"CI"},
+        allowed_env_values={"TOKEN": "SECRET-configured"},
+        public_environment_names={"CI", "TOKEN"},
     )
     tool = ExecCommandTool(policy=policy)
     description = tool.spec.input_schema["properties"]["env"]["description"]
     assert '"CI"' in description and '"TOKEN"' in description
     assert "SECRET-configured" not in description
     assert "description" not in ExecCommandTool().spec.input_schema["properties"]["env"]
-    many = ProcessCommandPolicy(allowed_env_names={f"NAME_{i}" for i in range(100)})
+    many = ProcessCommandPolicy(
+        allowed_env_names={f"NAME_{i}" for i in range(100)},
+        public_environment_names={f"NAME_{i}" for i in range(64)},
+    )
     assert (
         "truncated"
         in ExecCommandTool(policy=many).spec.input_schema["properties"]["env"]["description"]
@@ -512,6 +511,7 @@ def test_environment_discovery_is_name_only_bounded_and_instance_local():
         allowed_executables={"git"},
         allowed_cwds={"/workspace"},
         allowed_env_names={f"NAME_{i}" for i in range(100)},
+        public_environment_names={f"NAME_{i}" for i in range(64)},
     )
     verdict = _evaluate(many, _request("git").model_copy(update={"env": {"OTHER": "secret"}}))
     assert verdict.allowed_env_names_truncated
@@ -521,14 +521,15 @@ def test_environment_discovery_is_name_only_bounded_and_instance_local():
 @pytest.mark.parametrize("name", ["PYTHONPATH", "BAD\nNAME", "X" * 129])
 def test_environment_denial_records_safe_name_not_values(name):
     policy = ProcessCommandPolicy(
-        allowed_executables={"git"}, allowed_cwds={"/workspace"}, allowed_env_names={"CI"}
+        allowed_executables={"git"},
+        allowed_cwds={"/workspace"},
+        allowed_env_names={"CI"},
+        public_environment_names={"CI", "PYTHONPATH"},
     )
     result = _evaluate(
         policy, _request("git").model_copy(update={"env": {name: "SECRET-supplied"}})
     )
-    assert result.denied_env_name == (
-        name if name == "PYTHONPATH" else "<invalid-or-oversized-name>"
-    )
+    assert result.denied_env_name == (name if name == "PYTHONPATH" else "<withheld-name>")
     assert result.allowed_env_names == ("CI",)
     assert "SECRET-supplied" not in result.model_dump_json()
     if name != "PYTHONPATH":
@@ -546,6 +547,7 @@ def test_environment_denial_survives_sqlite_reload_without_secret_values(tmp_pat
             allowed_executables={sys.executable},
             allowed_cwds={str(tmp_path)},
             allowed_env_values={"TOKEN": "SECRET-configured"},
+            public_environment_names={"TOKEN", "PYTHONPATH"},
         )
         provider = ScriptedModelProvider(
             [
