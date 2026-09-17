@@ -39,6 +39,7 @@ from cayu.budgets.usage import (
 )
 from cayu.deadlines import ExecutionDeadline, execution_deadline_scope
 from cayu.evals._admission import admission_scope, current_launch_admission
+from cayu.evals._exception_diagnostics import workflow_exception_diagnostic
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
@@ -137,7 +138,7 @@ from cayu.evals.workflow_target import (
     workflow_eval_trial_session_id,
 )
 from cayu.events import Event, EventType, event_durable_sequence
-from cayu.failure_evidence import FailureEvidence, exception_evidence
+from cayu.failure_evidence import FailureEvidence
 from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -2163,7 +2164,9 @@ async def _run_workflow_case_once_with_public_projection(
                     if emitted.type == EventType.WORKFLOW_STARTED and failure_started is None:
                         failure_started = emitted
             except Exception as exc:
-                failure_evidence = exception_evidence(exc)
+                summary, failure_evidence = workflow_exception_diagnostic(
+                    exc, phase="execution", stage=capture_stage
+                )
                 if exception_tree_contains(exc, (WorkflowSupersededError,)):
                     raise WorkflowEvalFailure(
                         WorkflowEvalFailureCode.ATTEMPT_SUPERSEDED,
@@ -2171,7 +2174,7 @@ async def _run_workflow_case_once_with_public_projection(
                     ) from None
                 raise WorkflowEvalFailure(
                     WorkflowEvalFailureCode.EXECUTION_FAILED,
-                    f"Workflow execution failed ({type(exc).__name__}).",
+                    summary,
                 ) from None
 
             capture_stage = "terminal_load"
@@ -2435,7 +2438,9 @@ async def _run_workflow_case_once_with_public_projection(
         case_timed_out = True
         if execution_status != "completed" and execution is not None:
             execution_status = "failed"
-            failure_evidence = exception_evidence(exc)
+            _, failure_evidence = workflow_exception_diagnostic(
+                exc, phase="execution", stage=capture_stage
+            )
             await observe_failure()
         run_error = f"Eval case timed out after {timeout_seconds} seconds (phase={capture_stage})."
         if execution_status == "completed":
@@ -2487,7 +2492,9 @@ async def _run_workflow_case_once_with_public_projection(
         final_output = ""
         structured_output = None
     except Exception as exc:
-        run_error = f"Workflow eval evidence preparation failed ({type(exc).__name__})."
+        run_error, _ = workflow_exception_diagnostic(
+            exc, phase="evidence_preparation", stage=capture_stage
+        )
         diagnostic_code = EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED
         public_output = EvalTrialOutputPreviewV1.unavailable()
         trajectory = None

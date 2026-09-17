@@ -275,3 +275,29 @@ consistency, and later recovery/scoring rejects mutations against the seal.
 
 For invocation health versus nonzero command exits, timeout, cancellation, and
 structured HTTP evidence, see [operation outcome monitoring](operation-outcomes.md).
+
+## Generic exception diagnostics
+
+Workflow execution and eval preparation failures retain a version-1 JSON suffix
+in the existing `error` string, after `Workflow execution failed: ` or
+`Workflow eval evidence preparation failed: `. Saved report readers remain
+compatible with the existing report schema. `cayu eval report REPORT.json
+--format json` and HTML reports display the same summary without rerunning work.
+
+The suffix identifies the execution or evidence-preparation `phase`, capture
+`stage`, bounded `exception_type`, and `projection` availability. Existing typed
+`failure_evidence` preserves child-session/terminal-event references and parallel
+branch evidence when available. Generic application exceptions do not acquire an
+invented child cause. Preparation failure after successful execution does not set
+the trial's execution status to failed. Exceptions handled by the workflow do not
+produce terminal failure summaries.
+
+Recognized direct or Pydantic-wrapped durable-value errors also retain
+`durable_value.code`, the safe ordinal `path`, `limit`, and
+`observed_lower_bound`. Caller-supplied field labels, raw exception messages,
+tracebacks, and rejected values are omitted. Unknown or malformed durable details
+use the existing safe-helper fallbacks; unavailable numeric bounds are `null`.
+The summary is limited to 64 KiB and 4,096 JSON nodes. If evidence projection fails
+or produces invalid/oversized metadata, `projection` is `unavailable` and the
+original exception type and safely available durable details remain. This is
+diagnostic evidence, not recovery or replay authority.
