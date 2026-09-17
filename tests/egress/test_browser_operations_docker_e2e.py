@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import http.server
+import json
 import os
+import re
 import shlex
 import threading
 import types
@@ -48,6 +50,12 @@ pytestmark = [
 @pytest.mark.parametrize(
     "case",
     [
+        "rendered-text",
+        "rendered-text-model",
+        "rendered-text-xml",
+        "rendered-text-frame",
+        "rendered-text-refusal",
+        "rendered-text-truncated",
         "delayed-upload",
         "post-204",
         "reload-race",
@@ -64,7 +72,9 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
     class Fixture(http.server.BaseHTTPRequestHandler):
         def reply(self, body: bytes) -> None:
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
+            self.send_header(
+                "Content-Type", "application/xml" if case == "rendered-text-xml" else "text/html"
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -88,6 +98,22 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
                 <form action="/post" method="post"><button>Submit POST</button></form>"""
             if case in {"upload-disconnection", "upload-ack-loss"}:
                 body += b"<script>file.onchange=()=>fetch('/effect/upload-selected')</script>"
+            if case.startswith("rendered-text"):
+                body = b"""<!doctype html><title>Rendered text</title><main id="content"></main>
+                <script>
+                for(let i=0;i<6;i++) {
+                    const p=document.createElement('p');
+                    p.textContent=String.fromCharCode(945).repeat(30000)+i;
+                    content.append(p);
+                }
+                content.firstChild.textContent = String.fromCharCode(69,65,82,76,89,45,69,86,73,68,69,78,67,69) + content.firstChild.textContent;
+                content.lastChild.textContent += String.fromCharCode(76,65,84,69,45,69,86,73,68,69,78,67,69);
+                </script>"""
+                assert b"LATE-EVIDENCE" not in body
+                if case == "rendered-text-xml":
+                    body = b"<document><p>XML document text</p></document>"
+                if case == "rendered-text-frame":
+                    body = b'<html><p>main text</p><iframe sandbox srcdoc="frame content"></iframe></html>'
             self.reply(body)
 
         def do_POST(self) -> None:
@@ -152,6 +178,9 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
         )
         allocation = None
         try:
+            if case == "rendered-text-model":
+                await _run_rendered_text_model(factory, store, tmp_path)
+                return
             allocation = await factory.create(
                 EnvironmentFactoryRequest(
                     session_id="operations-e2e",
@@ -174,7 +203,17 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
                 artifact_store=store,
                 artifact_store_id=store.id,
             )
-            tool = BrowserSessionTool(expected_runner_candidate="docker", max_wait_ms=1000)
+            tool = BrowserSessionTool(
+                expected_runner_candidate="docker",
+                max_wait_ms=1000,
+                max_artifact_bytes=(
+                    1024
+                    if case == "rendered-text-refusal"
+                    else 200000
+                    if case == "rendered-text-truncated"
+                    else 8 * 1024 * 1024
+                ),
+            )
             control = None
             backend_evidence: list[tuple[str, str | None, str]] = []
             if case == "reload-race":
@@ -289,6 +328,70 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
                     state = dict(result.structured or {})
                 return result
 
+            if case in {
+                "rendered-text-xml",
+                "rendered-text-frame",
+                "rendered-text-refusal",
+                "rendered-text-truncated",
+            }:
+                exported = await action("export_text")
+                if case == "rendered-text-refusal":
+                    assert exported.is_error, exported
+                    assert exported.structured["error"] == "oversized_artifact"
+                    assert not exported.artifacts
+                else:
+                    assert not exported.is_error, exported
+                    source = exported.artifacts[0]["source"]
+                    if case == "rendered-text-xml":
+                        read = await store.read_bytes(exported.artifacts[0]["artifact_id"])
+                        assert b"XML document text" in read.content
+                        assert source["method"] in {"innerText", "document_textContent"}
+                    elif case == "rendered-text-truncated":
+                        assert not source["complete"] and source["truncated"]
+                        assert source["size_bytes"] <= 200000
+                    else:
+                        assert not source["complete"]
+                        assert source["omitted_frames"] == 1
+                return
+            if case == "rendered-text":
+                assert "EARLY-EVIDENCE" in opened.content
+                assert "LATE-EVIDENCE" not in opened.content
+                exported = await action("export_text")
+                assert not exported.is_error, exported
+                artifact = exported.artifacts[0]
+                assert artifact["artifact_id"] in exported.content
+                assert artifact["source"]["complete"]
+                assert artifact["source"]["size_bytes"] > 128000
+                # Reopen the artifact store; readback owns no live browser handle.
+                reopened = LocalArtifactStore(tmp_path / "artifacts", store_id=store.id)
+                reader_context = ToolContext(
+                    session_id=context.session_id,
+                    agent_name="agent",
+                    environment_name="browser",
+                    artifact_store=reopened,
+                    artifact_store_id=reopened.id,
+                )
+                args = {
+                    "operation": "read_text",
+                    "artifact_id": artifact["artifact_id"],
+                    "session_id": state["session_id"],
+                    "page_id": state["page_id"],
+                    "expected_revision": state["revision"],
+                    "query": "LATE-EVIDENCE",
+                }
+                read = await BrowserSessionTool().run(reader_context, args)
+                assert not read.is_error, read
+                assert read.structured["text"] == "LATE-EVIDENCE"
+                assert read.structured["historical_evidence"]
+                for key in ("session_id", "page_id", "expected_revision"):
+                    denied = await tool.run(reader_context, {**args, key: "different"})
+                    assert denied.is_error
+                changed = await action("reload")
+                assert not changed.is_error, changed
+                historical = await tool.run(reader_context, args)
+                assert not historical.is_error
+                assert historical.structured["source"] == artifact["source"]
+                return
             if control is not None:
                 failed = await action(
                     "upload", "File", artifact_ids=["art_11111111111111111111111111111111"]
@@ -376,3 +479,89 @@ def test_public_browser_upload_and_committed_navigation(tmp_path: Path, case: st
             thread.join(timeout=5)
 
     asyncio.run(scenario())
+
+
+async def _run_rendered_text_model(factory, artifact_store, tmp_path):
+    from cayu import AgentSpec, CayuApp, EnvironmentSpec, Message, RunRequest, SQLiteSessionStore
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.providers.base import ModelStreamEvent
+    from cayu.sessions.outcomes import run_to_completion
+
+    step = 0
+
+    def respond(request):
+        nonlocal step
+        prior = [
+            part
+            for message in request.messages
+            for part in message.content
+            if part.type == "tool_result"
+        ]
+        if step == 0:
+            args = {
+                "operation": "navigate",
+                "operation_id": "model-open",
+                "url": "https://operations.browser.test/",
+            }
+        elif step == 1:
+            assert not prior[-1].is_error, prior[-1]
+            content = prior[-1].content
+            state = json.loads(
+                re.search(r"<cayu_browser_state>(.*?)</cayu_browser_state>", content).group(1)
+            )
+            args = {"operation": "export_text", "operation_id": "model-export", **state}
+        elif step == 2:
+            assert not prior[-1].is_error, prior[-1]
+            # Deliberately consume only model-visible content, never structured metadata.
+            retained = (
+                prior[-1]
+                .content.split("Retained browser text (historical evidence): ", 1)[1]
+                .split("\n", 1)[0]
+            )
+            artifact = json.loads(retained)[0]
+            source = artifact["source"]
+            args = {
+                "operation": "read_text",
+                "operation_id": "model-read",
+                "artifact_id": artifact["artifact_id"],
+                "session_id": source["session_id"],
+                "page_id": source["page_id"],
+                "expected_revision": source["revision"],
+                "query": "LATE-EVIDENCE",
+            }
+        else:
+            assert not prior[-1].is_error, prior[-1]
+            assert "LATE-EVIDENCE" in prior[-1].content
+            return [
+                ModelStreamEvent.text_delta("Late rendered evidence recovered."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        step += 1
+        return [
+            ModelStreamEvent.tool_call(id=f"text-{step}", name="browser_session", arguments=args),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+
+    sessions = SQLiteSessionStore(tmp_path / "model-sessions.sqlite")
+    app = CayuApp(session_store=sessions, enable_logging=False)
+    app.register_provider(ScriptedModelProvider(response_factory=respond), default=True)
+    app.register_environment_factory(
+        EnvironmentSpec(name="browser"), factory, artifact_store=artifact_store, default=True
+    )
+    app.register_agent(
+        AgentSpec(name="agent", model="test-model"),
+        tools=[BrowserSessionTool(expected_runner_candidate="docker")],
+    )
+    try:
+        outcome = await run_to_completion(
+            app,
+            RunRequest(
+                session_id="text-model",
+                agent_name="agent",
+                messages=[Message.text("user", "Recover late rendered evidence.")],
+            ),
+        )
+        assert outcome.ok, outcome
+        assert step == 3
+    finally:
+        await sessions.close()

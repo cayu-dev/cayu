@@ -124,7 +124,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "13"
+INTERACTIVE_WORKER_VERSION = "14"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -783,6 +783,7 @@ class _InteractiveRequest:
         "select",
         "press",
         "wait",
+        "export_text",
         "screenshot",
         "download",
         "list_pages",
@@ -1166,6 +1167,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
             "scroll",
             "hover",
             "upload",
+            "export_text",
             "screenshot",
             "download",
             "list_pages",
@@ -1206,6 +1208,7 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
         "scroll": revision | {"amount", "direction", "repeat_count"},
         "hover": revision | {"ref"},
         "upload": revision | {"artifact_ids", "ref", "upload_files"},
+        "export_text": revision,
         "screenshot": revision,
         "download": revision | {"ref"},
         "list_pages": base | {"operation_id"},
@@ -5619,6 +5622,7 @@ class _InteractiveDaemon:
                 "profile_state": owned_state,
             }
         if self.profile_output_values is not None and request.operation in {
+            "export_text",
             "screenshot",
             "download",
             "observe_visual",
@@ -5724,7 +5728,12 @@ class _InteractiveDaemon:
             ).hexdigest()
             if request.operation not in {"navigate", "observe", "observe_visual"}:
                 state.control_epoch += 1
-            if request.operation in {"screenshot", "download", "observe_visual"} and (
+            if request.operation in {
+                "screenshot",
+                "download",
+                "observe_visual",
+                "export_text",
+            } and (
                 state.artifact_count >= request.limits.max_artifacts_per_page
                 or self.total_artifacts >= request.limits.max_total_artifacts
             ):
@@ -6067,6 +6076,7 @@ class _InteractiveDaemon:
         *,
         visual_policy: dict[str, Any] | None = None,
         visual_artifacts: list[bytes] | None = None,
+        text_artifacts: list[bytes] | None = None,
     ) -> dict[str, Any]:
         if (
             state.observation_count >= limits.max_observations_per_page
@@ -6082,6 +6092,7 @@ class _InteractiveDaemon:
                 browser_version=self.browser_version,
                 visual_policy=visual_policy,
                 visual_artifacts=visual_artifacts,
+                **({"text_artifacts": text_artifacts} if text_artifacts is not None else {}),
             )
         except BaseException as primary:
             if state.observation_cleanup_disposition is None:
@@ -7576,7 +7587,12 @@ class _InteractiveDaemon:
                 if action_target is None:  # pragma: no cover - parser invariant
                     raise _GuestFailure("incompatible_browser")
                 return await self._download_and_observe(state, request, action_target)
-            elif request.operation not in {"observe", "screenshot", "observe_visual"}:
+            elif request.operation not in {
+                "observe",
+                "screenshot",
+                "observe_visual",
+                "export_text",
+            }:
                 raise _GuestFailure("incompatible_browser")
             _raise_interactive_dialog_failure(state, request.operation)
         except BaseException as exc:
@@ -7644,6 +7660,17 @@ class _InteractiveDaemon:
                 "kind": "screenshot",
                 "filename": "browser-visual.png",
                 "content_type": "image/png",
+                "content_base64": base64.b64encode(captures[0]).decode("ascii"),
+            }
+            state.artifact_count += 1
+            self.total_artifacts += 1
+        elif request.operation == "export_text":
+            captures = []
+            observation = await self._observe_page(state, request.limits, text_artifacts=captures)
+            artifact = {
+                "kind": "rendered_text",
+                "filename": "browser-text.txt",
+                "content_type": "text/plain",
                 "content_base64": base64.b64encode(captures[0]).decode("ascii"),
             }
             state.artifact_count += 1
@@ -8687,6 +8714,70 @@ async def _interactive_frame_snapshot_census(
     )
 
 
+async def _interactive_rendered_text(
+    page: Any,
+    cdp: Any,
+    limits: _InteractiveLimits,
+) -> tuple[bytes, dict[str, Any]]:
+    """Capture bounded main-document text while observation scripts are frozen."""
+    tree = await cdp.send("Page.getFrameTree")
+    context_id = await _create_isolated_world(cdp, tree["frameTree"]["frame"]["id"])
+    expression = """(({maxNodes, maxBytes}) => {
+            const root = document.documentElement;
+            if (!root) return {text: '', truncated: false, method: 'empty'};
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ALL);
+            let node = root, nodes = 0, chars = 0;
+            do {
+                if (++nodes > maxNodes) return {refused: true};
+                if (node.nodeType === Node.TEXT_NODE) chars += node.length;
+                if (chars > maxBytes) return {refused: true};
+            } while ((node = walker.nextNode()));
+            const rendered = root instanceof HTMLElement;
+            const text = rendered ? root.innerText : (root.textContent || '');
+            const bytes = new TextEncoder().encode(text);
+            let end = Math.min(bytes.length, maxBytes);
+            while (end < bytes.length && end > 0 && (bytes[end] & 0xc0) === 0x80) --end;
+            return {text: new TextDecoder().decode(bytes.slice(0, end)),
+                    truncated: end < bytes.length,
+                    method: rendered ? 'innerText' : 'document_textContent'};
+        })(__LIMITS__)""".replace(
+        "__LIMITS__",
+        json.dumps(
+            {
+                "maxNodes": limits.max_dom_nodes,
+                "maxBytes": limits.max_artifact_bytes,
+            }
+        ),
+    )
+    captured = await cdp.send(
+        "Runtime.evaluate",
+        {
+            "contextId": context_id,
+            "expression": expression,
+            "returnByValue": True,
+        },
+    )
+    value = captured.get("result", {}).get("value")
+    if type(value) is not dict or value.get("refused"):
+        raise _GuestFailure("oversized_artifact")
+    content = value["text"].encode("utf-8")
+    if len(content) > limits.max_artifact_bytes:
+        raise _GuestFailure("oversized_artifact")
+    omitted_frames = max(0, len(page.frames) - 1)
+    return content, {
+        "observed_at": datetime.now(UTC).isoformat(),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+        "scope": "main_document_light_dom",
+        "method": value["method"],
+        "truncated": value["truncated"],
+        "omitted_frames": omitted_frames,
+        "complete": not value["truncated"]
+        and omitted_frames == 0
+        and value["method"] == "innerText",
+    }
+
+
 async def _interactive_observation(
     state: _InteractivePage,
     limits: _InteractiveLimits,
@@ -8694,6 +8785,7 @@ async def _interactive_observation(
     browser_version: str,
     visual_policy: dict[str, Any] | None = None,
     visual_artifacts: list[bytes] | None = None,
+    text_artifacts: list[bytes] | None = None,
 ) -> dict[str, Any]:
     page = state.page
     blocked = state.access_evidence is not None
@@ -8705,6 +8797,7 @@ async def _interactive_observation(
     visual_candidate = None
     visual_evidence = None
     revision = f"br_{secrets.token_hex(16)}"
+    text_evidence = None
     try:
         scripts_disabled = True
         await state.cdp.send("Emulation.setScriptExecutionDisabled", {"value": True})
@@ -8715,7 +8808,17 @@ async def _interactive_observation(
         )
         if type(freeze_result) is not dict:
             raise _GuestFailure("browser_crash")
-        if blocked:
+        if blocked and text_artifacts is not None:
+            raise _GuestFailure("access_blocked")
+        if text_artifacts is not None:
+            content, text_evidence = await _interactive_rendered_text(page, state.cdp, limits)
+            text_artifacts.append(content)
+            snapshot = ""
+            refs = {}
+            ref_targets = {}
+            ref_metadata = {}
+            truncation = ["snapshot"]
+        elif blocked:
             snapshot = ""
             refs: dict[str, str] = {}
             ref_targets: dict[str, Any] = {}
@@ -8730,7 +8833,7 @@ async def _interactive_observation(
                     visual_policy,
                     max_dom_nodes=limits.max_dom_nodes,
                 )
-            raw_snapshot = await page.locator("body").aria_snapshot(
+            raw_snapshot = await page.locator(":root").aria_snapshot(
                 mode="ai",
                 depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
                 timeout=max(1_000, limits.max_wait_ms),
@@ -8900,6 +9003,7 @@ async def _interactive_observation(
     state.ref_targets = ref_targets
     return {
         **({"visual": visual_evidence} if visual_evidence is not None else {}),
+        **({"rendered_text": text_evidence} if text_evidence is not None else {}),
         "session_id": state.session_id,
         "page_id": state.page_id,
         "revision": state.revision,

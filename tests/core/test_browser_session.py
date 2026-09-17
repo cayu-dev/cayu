@@ -95,7 +95,7 @@ _IDENTITY = BrowserBackendIdentity(
     browser="chromium",
     browser_version="test-chromium",
     worker_protocol="cayu.browser-session.v4",
-    worker_version="13",
+    worker_version="14",
 )
 
 
@@ -964,7 +964,7 @@ class _WireRunner:
             stdout=json.dumps(
                 {
                     "protocol_version": "cayu.browser-session.v4",
-                    "worker_version": "13",
+                    "worker_version": "14",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -988,7 +988,7 @@ class _WireRunner:
                             "browser": "chromium",
                             "browser_version": "test-chromium",
                             "worker_protocol": "cayu.browser-session.v4",
-                            "worker_version": "13",
+                            "worker_version": "14",
                         },
                     },
                     "page_set": {
@@ -1069,7 +1069,7 @@ class _ProfileWireRunner(_WireRunner):
                     stdout=json.dumps(
                         {
                             "protocol_version": "cayu.browser-session.v4",
-                            "worker_version": "13",
+                            "worker_version": "14",
                             "playwright_version": "1.62.0",
                             "kind": "error",
                             "allocation_disposition": "retired",
@@ -1081,7 +1081,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "13",
+                        "worker_version": "14",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -1094,7 +1094,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "13",
+                        "worker_version": "14",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -1107,7 +1107,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "13",
+                        "worker_version": "14",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -1295,7 +1295,7 @@ def _browser_profile_binding(
         ),
         destination_policy=BrowserProfileDestinationPolicy.build(("https://example.test",)),
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="13",
+        browser_worker_version="14",
         store=store,
         key_authority=AESGCMBrowserProfileKeyAuthority(
             authority_id="browser-profile-test-key",
@@ -1729,7 +1729,7 @@ def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "visual_policy": None,
         "protocol_version": "cayu.browser-session.v4",
-        "worker_version": "13",
+        "worker_version": "14",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -5073,7 +5073,7 @@ def test_profile_guest_response_protects_page_evidence(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "13",
+                "worker_version": "14",
             },
         }
 
@@ -7553,7 +7553,7 @@ def test_interactive_guest_retires_before_materializing_oversized_snapshot() -> 
             self.locator_owner = _Locator()
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return self.locator_owner
 
         async def close(self) -> None:
@@ -7625,7 +7625,7 @@ def test_interactive_guest_retires_before_materializing_oversized_accessible_tex
             self.locator_owner = _Locator()
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return self.locator_owner
 
         async def close(self) -> None:
@@ -7676,7 +7676,7 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
             self.calls += 1
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "13",
+                "worker_version": "14",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -7802,7 +7802,7 @@ def test_interactive_guest_admits_switches_closes_and_tracks_popup_lineage() -> 
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "13",
+                    "worker_version": "14",
                 },
             }
 
@@ -8504,7 +8504,7 @@ def test_interactive_guest_retires_before_materializing_amplified_accessibility(
             self.locator_owner = _Locator()
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return self.locator_owner
 
         async def close(self) -> None:
@@ -8568,7 +8568,7 @@ def test_interactive_guest_owns_one_stable_snapshot_window() -> None:
             self.cdp = cdp
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             assert self.cdp.scripts_disabled is True
             return _Locator(self.cdp)
 
@@ -8628,7 +8628,7 @@ def test_interactive_guest_observation_cleanup_preserves_owner_cancellation() ->
         url = "https://example.test"
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return _Locator()
 
         async def title(self) -> str:
@@ -8669,7 +8669,7 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
         async def _execute_locked(self, request):
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "13",
+                "worker_version": "14",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -9280,7 +9280,7 @@ def test_interactive_guest_rechecks_response_limit_after_final_observation() -> 
             self.handlers[event] = callback
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return _Locator()
 
         async def title(self) -> str:
@@ -9554,7 +9554,7 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "13",
+                "worker_version": "14",
             },
         }
 
@@ -9853,7 +9853,7 @@ def test_interactive_guest_popup_guard_bounds_one_effect_before_target_admission
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "13",
+                    "worker_version": "14",
                 },
             }
 
@@ -11211,7 +11211,7 @@ def test_interactive_guest_bounds_url_before_advancing_revision() -> None:
         url = "https://example.test/?" + "x" * 9000
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return _Locator()
 
         async def title(self) -> str:
@@ -11301,7 +11301,7 @@ def test_interactive_guest_projects_data_url_to_last_admitted_https_url() -> Non
         url = "data:text/html," + "x" * 9000
 
         def locator(self, selector: str) -> _Locator:
-            assert selector == "body"
+            assert selector == ":root"
             return _Locator()
 
         async def title(self) -> str:

@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:13-playwright-1.62.0` image, the
-`cayu.browser-session.v4` protocol and worker version 9, brokered deny-by-default egress,
+`cayu-browser-fetch:14-playwright-1.62.0` image, the
+`cayu.browser-session.v4` protocol and worker version 14, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -791,3 +791,67 @@ authority does not become compatible merely by retagging an image.
 Applications can opt into [Docker browser recording](browser-recording.md) for
 private post-run playback. Recording is separate from live viewing, visual model
 attachments and browser-profile checkpoint consent.
+
+### Retained rendered text
+
+Use `export_text` with the current `session_id`, `page_id`, `expected_revision`,
+`expected_control_epoch` and a fresh `operation_id`. Runtime captures the current
+main document in a private isolated browser world while observation scripts are
+frozen. It retains UTF-8 text in the admitted session ArtifactStore and publishes a
+new observation revision. This operation deliberately returns an empty bounded
+snapshot/ref set with `snapshot` truncation; it does not change ordinary observation
+bounds. Use `observe` again for actionable refs.
+
+The model-visible result contains an artifact ID and source identity: browser
+session/page/revision, URL, capture time, SHA-256, retained byte count, extraction
+method, truncation and omitted-frame count. Artifacts are immutable historical
+observations; subsequent page revisions never overwrite them. Retention is managed
+by the application's session ArtifactStore policy. Each export consumes the existing
+per-page and aggregate artifact/observation budgets. `max_artifact_bytes` bounds each
+export (8 MiB default, 32 MiB maximum), and `max_dom_nodes` bounds its census. Excess
+source material is refused as `oversized_artifact` before text materialization;
+UTF-8 output truncation is explicitly reported.
+
+`innerText` covers main-document DOM text, not OCR, CSS-generated content or shadow
+root contents. Child frames are omitted, including inaccessible frames, and prevent
+`complete=true`. XML/document roots without `innerText` use a labelled
+`document_textContent` fallback and never claim complete rendered-text coverage.
+The completeness flag describes `main_document_light_dom` extraction;
+`full_document_coverage=false` explicitly disclaims coverage of all visual page content. Blocked destinations cannot export denial-page text. Profile-bound or
+secret-bearing invocations refuse text artifact capture under the same rules as
+other browser artifacts.
+
+Read or search without a live browser by calling the native `read_text` operation:
+
+```json
+{
+  "operation": "read_text",
+  "operation_id": "read-late-evidence",
+  "artifact_id": "<returned artifact_id>",
+  "session_id": "<source browser session>",
+  "page_id": "<source page>",
+  "expected_revision": "<source revision>",
+  "query": "decisive phrase",
+  "max_bytes": 16384
+}
+```
+
+Omit `query` for paged reading. `offset` and `next_offset` are UTF-8 byte offsets;
+use the returned continuation to avoid splitting a character. Read pages are capped
+at 64 KiB (16 KiB default). Search is a literal, case-sensitive UTF-8 search starting
+at `offset`; `match_offset=-1` means absent from the retained extraction, not from
+omitted/truncated content. The result explicitly labels historical evidence and
+repeats source identity. Readback validates parent session scope, browser source
+identity and the content hash, and works after session/artifact stores reopen.
+It grants no authority to act on an old page revision. `ReadFileTool` also supports
+ordinary paged artifact reads when registered by the application.
+
+The deterministic Docker operations test includes a document with over 128k
+JavaScript-generated rendered characters and a scripted model which obtains the
+readback reference from tool-result text, exports, then searches late evidence.
+No paid model or external website is required:
+
+```sh
+CAYU_RUN_BROWSER_OPERATIONS_ACCEPTANCE=1 uv run pytest \
+  tests/egress/test_browser_operations_docker_e2e.py -k rendered-text
+```

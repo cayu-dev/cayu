@@ -47,6 +47,8 @@ _OPERATIONS = {
     "switch_page": _PAGE,
     "close_page": _PAGE,
     "close": {"session_id": "bs_test"},
+    "export_text": _ACTION,
+    "read_text": {**_PAGE, "expected_revision": "br_test", "artifact_id": "art_" + "5" * 32},
 }
 
 
@@ -83,24 +85,29 @@ def test_portable_browser_schema_keeps_runtime_required_fields(
         backend = _FakeBrowserBackend()
         tool = BrowserSessionTool(_backend=backend)
         context = _context(tmp_path)
-        complete = {"operation": operation, "operation_id": "schema-check", **fields}
+        complete = {"operation": operation, **fields}
+        # Historical reads do not dispatch a durable browser operation.
+        if operation != "read_text":
+            complete["operation_id"] = "schema-check"
+
+        async def assert_rejected(arguments: dict[str, object]) -> None:
+            result = await tool.run(context, arguments)
+            assert result.is_error, arguments
+            if arguments.get("operation") == "read_text":
+                assert result.content == "Invalid browser text read arguments."
+            else:
+                assert result.structured is not None
+                assert result.structured["error"] == "invalid_arguments", arguments
+                assert result.structured["execution"]["dispatch"] == "not_started"
+            assert backend.calls == []
+
         for missing in complete:
             incomplete = {key: value for key, value in complete.items() if key != missing}
-            result = await tool.run(context, incomplete)
-            assert result.is_error, (operation, missing)
-            assert result.structured is not None
-            assert result.structured["error"] == "invalid_arguments", (operation, missing)
-            assert result.structured["execution"]["dispatch"] == "not_started"
-            assert backend.calls == []
+            await assert_rejected(incomplete)
 
         # A schema-known field belonging to another operation must not become
         # usable merely because the provider sees the union of all properties.
         extra = {"ref": "ref_test"} if operation == "navigate" else {"url": "https://example.test/"}
-        result = await tool.run(context, {**complete, **extra})
-        assert result.is_error
-        assert result.structured is not None
-        assert result.structured["error"] == "invalid_arguments"
-        assert result.structured["execution"]["dispatch"] == "not_started"
-        assert backend.calls == []
+        await assert_rejected({**complete, **extra})
 
     asyncio.run(exercise())

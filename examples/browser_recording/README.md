@@ -9,7 +9,7 @@ From the repository root, with Docker running and FFmpeg installed on the host:
 
 ```sh
 uv sync --extra dev --extra server --extra browser --extra recording
-docker build -f examples/browser_fetch/Dockerfile -t cayu-browser-fetch:13-playwright-1.62.0 .
+docker build -f examples/browser_fetch/Dockerfile -t cayu-browser-fetch:14-playwright-1.62.0 .
 docker build -f examples/browser_recording/Dockerfile -t cayu-browser-recording:local .
 uv run python -m examples.browser_recording.run /tmp/cayu-recording-demo
 ```
