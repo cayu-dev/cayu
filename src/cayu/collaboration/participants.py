@@ -241,6 +241,7 @@ class ParticipantEvent(ContractValue):
         "participant_lifecycle_changed",
         "permit_registered",
         "permit_settled",
+        "permit_excluded",
     ]
     participants: tuple[ParticipantRef, ...] = Field(max_length=2)
 

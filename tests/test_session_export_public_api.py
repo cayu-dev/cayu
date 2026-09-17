@@ -25,6 +25,8 @@ PUBLIC_EXPORT_NAMES = {
     "SessionExportPolicy",
     "SessionExportProjector",
     "SessionExportReceipt",
+    "SessionExportRuntimeOrigin",
+    "SessionExportReconciliation",
     "SessionExportRef",
     "SessionExportRegistration",
     "SessionExportRequest",
@@ -79,6 +81,32 @@ def test_all_user_facing_export_contract_classes_are_manifested() -> None:
     definitions = ast.parse(Path(exports.__file__).read_text())
     classes = {node.name for node in definitions.body if isinstance(node, ast.ClassDef)}
     assert classes | {"SessionExportAction"} == PUBLIC_EXPORT_NAMES
+
+
+@pytest.mark.parametrize("package_name", ["cayu", "cayu.collaboration"])
+@pytest.mark.parametrize("family", ["mandates", "releases"])
+def test_registered_authority_and_release_contracts_are_public(package_name, family):
+    module = importlib.import_module("cayu.collaboration." + family)
+    package = importlib.import_module(package_name)
+    manifest = importlib.import_module(package_name + "._exports")
+    source = ast.parse(Path(module.__file__).read_text())
+    names = {node.name for node in source.body if isinstance(node, ast.ClassDef)}
+    if family == "mandates":
+        names |= {"MandateAction", "InputChannel"}
+    declarations = ast.parse(Path(package.__file__).with_suffix(".pyi").read_text())
+    declared = {
+        alias.asname or alias.name
+        for node in declarations.body
+        if isinstance(node, ast.ImportFrom) and node.module == module.__name__
+        for alias in node.names
+    }
+    assert declared == names
+    assert {
+        name for name, (owner, _) in manifest.EXPORTS.items() if owner == module.__name__
+    } == names
+    for name in names:
+        assert name in package.__all__
+        assert getattr(package, name) is getattr(module, name)
 
 
 def test_session_export_example_imports_only_public_contracts() -> None:

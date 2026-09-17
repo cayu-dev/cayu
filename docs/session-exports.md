@@ -1,15 +1,20 @@
 # Registered session exports
 
-Session exports publish bounded, deterministic projections of selected transcript
-rows from an ordinary session. No participant enrollment or participant/session
-binding is required. The supported contract does not provide released prose,
-model-generated export content, delegation, pruning, or a transport to the
-receiving audience.
+Session exports publish bounded deterministic projections or exactly reviewed
+prose from an ordinary session. No participant enrollment or participant/session
+binding is required for the ordinary-session route. Optional registered mandate
+resolution narrows permission; it does not supply a transport to the receiving
+audience, automatic content review, or external-resource retention.
 
 Run the [ordinary-session example](../examples/collaboration/session_export.py)
 from the repository with `PYTHONPATH=src python examples/collaboration/session_export.py`.
-It uses `InMemorySessionStore`, performs no model calls, and exports only a row
-count. In-memory state does not survive process restart.
+It uses `InMemorySessionStore`, performs no model calls, and exports a row count,
+an exact host-approved report reference/decision, and an explicitly reviewed
+standalone announcement with no selected private source. Its report projector rejects
+extra fields, attachments, changed revisions and unrelated reports rather than
+copying schema-shaped content. Its review owner holds an exact approval, not an
+automatic text sanitizer. Both example authorities are process-local; in-memory
+state does not survive process restart.
 
 ## Registration and public entrances
 
@@ -18,6 +23,8 @@ Register trusted host implementations with
 `CayuApp(session_store=store, session_exports=registration)`, where
 `registration` is a `SessionExportRegistration` containing an owner, policy,
 projectors, `ExportLimits`, and optional receiving-owner acceptance readers.
+`release_readers` registers exact reviewed-content owners; `mandates` registers
+a trusted mandate resolver; `resource_owners` registers qualified subtree owners.
 This API is separate from the existing session snapshot/backup export API.
 Readiness requires native store capability attestation, not merely a caller-set
 capability version or boolean. Registration alone cannot enable an unsupported
@@ -29,9 +36,11 @@ All context arguments below are keyword-only:
 | --- | --- |
 | `initialize_session_exports(session_id, context=context)` | Stable `SessionExportNamespace` for the exact session instance. |
 | `export_session(request, context=context)` | `SessionExportReceipt` for a new publication or exact historical replay. |
+| `export_session(request, context=context, invocation=ctx)` | Runtime export from a live runtime-issued `ToolContext`, with a separately authorized runtime policy. |
 | `lookup_session_export(request, context=context)` | Exact lookup result; inspect its `status` before accessing a matching `receipt`. No output payload. |
 | `read_session_export(request, context=context)` | Authorized retained output as a `dict`; unavailable or conflicting requests raise. |
 | `settle_session_export(settlement, context=context)` | `SessionExportSettlementReceipt` for release or retirement. |
+| `reconcile_session_export(request, context=context)` | Finish participant admission settlement for a published export, or permanently exclude a prepared export before settling its permit. Never reruns projection. |
 | `drain_session_exports()` | Seal the export owner against new calls and drain owned work, including work still running after its observer was cancelled. |
 
 Construct `SessionExportRef` using the returned session ID, session instance ID,
@@ -75,6 +84,95 @@ Its independent `validate(source, output, audience)` must return literal `True`
 for the exact approved output. That output-validation boolean is not policy
 authority. Registered references must identify the implementation and
 configuration; do not silently change behavior under the same reference.
+
+### Runtime requester provenance
+
+A trusted tool implementation may pass its runtime-issued `ToolContext` as
+`invocation`. Cayu derives the requesting session incarnation, run epoch, root
+invocation, interaction, model/tool identities, argument commitment and execution
+profile from the existing private runtime authority. It checks the live owner
+and stored requester before admitting work. Copying or reconstructing the
+context does not retain that authority, and a context from an ended invocation
+cannot start another export. Admission ends when the originating tool call
+finishes, including for child tasks holding a copied execution context. Exports
+already handed to the retained owner continue settling independently of that
+admission lifetime. The requester may differ from the exported source.
+
+The registered policy must explicitly implement `acquire_runtime(context,
+origin=..., session_id=..., session_instance_id=..., actions=..., audience=...)`.
+The default refuses. Authenticate the requested principal against this origin
+and apply the same held source/action guard; host-asserted origin is not
+server-verified identity. Policy-returned values cannot inject runtime provenance.
+The durable receipt retains historical origin, not a reusable runtime grant.
+An authorized host can inspect that receipt after restart without recreating a
+live tool context. Host-only read, settlement and administrative APIs still
+require trusted application context; do not expose them as unauthenticated tools.
+
+### Mandates and participant admission
+
+When `mandates` is registered, supply a `MandateAccessContext` in the access
+context. Its references are proposals, not credentials. The registered
+`MandateResolver.acquire()` must authenticate the issuer/principal mapping and
+entire root-to-leaf chain, holding current revocation until the operation settles.
+Cayu checks its pinned resolver identity, action/audience/scope permissions,
+ancestor expiry at store time, exact lineage, shrinking depth and permissions,
+unchanged sponsor, and preservation of inherited budget references. These
+references do not replace `BudgetLedger` admission or authorize external spend.
+Resolver `MandateDenied` and participant `CollaborationAccessDenied` refusals
+surface as `SessionExportDenied`, not transient readback unavailability.
+
+Exact `ResourceSelector` values require pinned owner revisions. A bounded tuple
+expresses a union. Subtree containment requires a registered
+`ResourceSelectorOwner`; aliases must already match its canonical result and
+`contains()` must return literal `True`. Textual prefixes, globs and regexes
+provide no containment authority. Selected transcript rows use source-owner
+references with kind `session_transcript_row` and revision equal to row index
+plus one. Reviewed exposure occurrences also undergo channel, resource and
+exclusion checks, including when no transcript rows are selected.
+Every ancestor's excluded sources must also match the registered resource
+owner's canonical identity. Cayu rejects aliases rather than rewriting
+authenticated restrictions.
+
+Participant-attributed operations use the actual participant access boundary and
+durable permit admission before projection. The source retains an exact prepared
+handoff so acknowledgement loss can be reconciled. A participant identity does
+not prove ownership of a session, and this route does not create or backfill a
+participant/session ownership binding. A registered admission can settle after
+disable; a new admission cannot bypass current lifecycle fencing.
+If native settlement commits before its source acknowledgement, reconciliation
+can discharge the published export's admission using authenticated retirement
+evidence for its exact collaboration namespace, even after permit pruning.
+Missing evidence or another namespace's evidence leaves the source fenced;
+retirement does not manufacture an exact permit settlement receipt.
+
+If native permit admission was rejected at capacity, source reconciliation still
+records permanent source exclusion using its reserved envelope. A new negative
+permit record cannot spend namespace maintenance reserves. If ordinary native
+capacity is exhausted, reconciliation reports capacity and keeps the source
+deletion fence. An authorized operator can rotate and retire that collaboration
+namespace, then retry the exact source reconciliation: permanent namespace
+retirement proves the old permit can never register, without inventing a receipt
+or rerunning projection. Registered permits instead settle using capacity reserved
+when they were admitted. Do not delete the source while either responsibility is
+pending.
+
+### Exactly reviewed prose
+
+Set `mode="reviewed_prose"` and supply a `ContentReleaseRequest` referencing the
+authorized decision. Its commitments bind exact UTF-8 text, selected source and
+bounded source/channel exposure manifest; the export request binds audience and
+policy/validator versions. In this mode `projector` identifies a registered
+`ContentReleaseReader`, not a deterministic projector. Its held `acquire()` must
+load positive application-owned review evidence and return `ReleasedContent`.
+Echoing a caller's approval-shaped value does not authenticate it.
+
+Cayu compares the full release expectation, source commitment, exact text digest,
+issuer, expiry and audience before publishing `{"text": ...}`. Reads require
+current release permission and exact retained approval, as well as source
+exposure permission. A byte edit, different exposure or broader audience requires
+a different authorized decision. Receipt-only lookup does not re-review or
+regenerate the output. This verifies binding to an approval; the application's
+reviewer remains responsible for the content's suitability and confidentiality.
 
 ## Retention, replay, and settlement
 

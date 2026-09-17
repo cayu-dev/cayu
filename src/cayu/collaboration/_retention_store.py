@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import cast
 from uuid import uuid4
 
 from cayu.collaboration._capacity import require_capacity
@@ -12,8 +13,13 @@ from cayu.collaboration._namespace_store import (
     load_namespace,
     require_maintenance_namespace,
 )
-from cayu.collaboration._permit_store import prepare_permit_record, registered_receipt
+from cayu.collaboration._permit_store import (
+    prepare_permit_record,
+    registered_receipt,
+    require_event,
+)
 from cayu.collaboration._permits import (
+    PermitExclusion,
     PermitSettlement,
     PermitSnapshot,
     ReservedPermitSettlement,
@@ -116,6 +122,14 @@ async def prune_namespace(
             item = prepare_contract(LifecycleReceipt, raw, redactor=redactor)
             if await lifecycle_replay(store, tx, item.expected, redactor) != item:
                 raise CollaborationUnavailable("Pruning lacks exact lifecycle evidence.")
+            bundle = (item,)
+        elif (
+            mode == "permit"
+            and isinstance(raw, dict)
+            and cast("dict[object, object]", raw).get("record_type") == "permit_excluded"
+        ):
+            item = prepare_contract(PermitExclusion, raw, redactor=redactor)
+            await require_event(tx, item.event, redactor)
             bundle = (item,)
         elif mode == "permit":
             item = prepare_permit_record(raw, redactor)

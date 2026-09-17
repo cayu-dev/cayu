@@ -180,9 +180,14 @@ class Harness:
         redactor=None,
         projectors=None,
         readers=(),
+        release_readers=(),
+        mandates=None,
+        resource_owners=(),
         store_type=None,
         policy=None,
         owner=OWNER,
+        collaboration=None,
+        collaboration_store=None,
     ):
         store = self.factory(store_type)
         if store not in self.stores:
@@ -198,12 +203,17 @@ class Harness:
             limits=limits
             or ExportLimits(max_exports=16, max_pending=8, max_retained_bytes=1024 * 1024),
             readers=readers,
+            release_readers=release_readers,
+            mandates=mandates,
+            resource_owners=resource_owners,
         )
         app = CayuApp(
             session_store=store,
             session_exports=registration,
             enable_logging=False,
             secret_redactor=redactor,
+            collaboration=collaboration,
+            collaboration_store=collaboration_store,
         )
         self.apps.append(app)
         return app, store, policy, projector
@@ -240,8 +250,9 @@ class Harness:
 
     async def close(self):
         for projector in self.projectors:
-            if projector.release is not None:
-                projector.release.set()
+            release = getattr(projector, "release", None)
+            if release is not None:
+                release.set()
         for app in self.apps:
             await app.drain_session_exports()
         for store in self.stores:

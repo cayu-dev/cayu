@@ -11,6 +11,7 @@ from tests.core.test_session_export_contracts import limits, object_ref, owner
 from tests.core.test_session_export_snapshot import _store
 
 from cayu.applications import CayuApp
+from cayu.collaboration._capabilities import FamilyVersion
 from cayu.collaboration._contracts import OperationRef
 from cayu.collaboration._session_export_store import ROOT_KEY, read_scope
 from cayu.collaboration.exports import (
@@ -22,6 +23,7 @@ from cayu.collaboration.exports import (
     SessionExportRef,
     SessionExportRegistration,
     SessionExportRequest,
+    SessionExportUnavailable,
 )
 from cayu.messages import Message
 from cayu.runtime._checkpoint_store import (
@@ -208,6 +210,39 @@ def test_export_capability_rejects_instance_override_and_boolean_version():
     assert not store._supports_session_export_protocol()
     boolean_type = type("BooleanStore", (InMemorySessionStore,), {"session_export_version": True})
     assert not boolean_type()._supports_session_export_protocol()
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_source_family_descriptor_requires_native_owner_qualification(qualified):
+    class Unqualified(InMemorySessionStore):
+        async def publish_session_operation_guarded_with_store_time(self, *args, **kwargs):
+            raise AssertionError("Unqualified publication must never dispatch.")
+
+    store = InMemorySessionStore() if qualified else Unqualified()
+    application = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        session_exports=SessionExportRegistration(
+            owner=owner(),
+            policy=_Policy(),
+            projectors=(),
+            limits=limits(),
+        ),
+    )
+    source = application._session_export_coordinator
+    descriptor = source.capabilities()
+    assert descriptor.owner == owner()
+    assert (
+        descriptor.mutations
+        == descriptor.readbacks
+        == ((FamilyVersion(family="session.export", version=1),) if qualified else ())
+    )
+    for access in ("mutation", "readback"):
+        if qualified:
+            assert source.ready(access=access) is source.registration
+        else:
+            with pytest.raises(SessionExportUnavailable):
+                source.ready(access=access)
 
 
 def test_native_sqlite_connection_resource_is_not_a_method_override(tmp_path):

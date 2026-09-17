@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 from cayu import (
     CayuApp,
+    ContentReleaseExpectation,
+    ContentReleaseReader,
+    ContentReleaseRequest,
     ExportLimits,
     InMemorySessionStore,
     Message,
+    ReleasedContent,
     RunRequest,
     SessionExportAccessContext,
     SessionExportAuthorization,
@@ -107,6 +113,121 @@ class RowCountProjector(SessionExportProjector):
         )
 
 
+class ApprovedReportProjector(SessionExportProjector):
+    """Project one host-approved immutable report, not arbitrary report-shaped text.
+
+    The application obtains this exact report/revision from its own trusted report
+    owner before registration. New approved material needs a new configuration
+    reference. This small example has no remote report store or implicit retrieval.
+    Source tool names and matching shapes are not authentication.
+    """
+
+    def __init__(self, *, reference, audience, report_reference, passed):
+        if type(passed) is not bool or report_reference.revision is None:
+            raise ValueError("A pinned report and strict boolean decision are required.")
+        self._ref = reference
+        self.audience = audience
+        self._approved = json.dumps(
+            {"report": report_reference.model_dump(mode="json"), "passed": passed},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @property
+    def ref(self):
+        return self._ref
+
+    def approved_source(self):
+        return json.loads(self._approved)
+
+    def _selected(self, source):
+        if len(source) != 1 or len(source[0].message.content) != 1:
+            raise SessionExportDenied()
+        part = source[0].message.content[0]
+        if (
+            part.type != "tool_result"
+            or part.is_error
+            or part.content
+            or part.artifacts
+            or type(part.structured) is not dict
+            or set(part.structured) != {"report", "passed"}
+            or type(part.structured["passed"]) is not bool
+            or json.dumps(part.structured, sort_keys=True, separators=(",", ":")) != self._approved
+        ):
+            raise SessionExportDenied()
+        # Return the detached owner-approved record, never copy untrusted titles,
+        # URLs, attachment material or unselected private source into the output.
+        return self.approved_source()
+
+    def project(self, source):
+        return self._selected(source)
+
+    def validate(self, source, output, audience):
+        return (
+            audience == self.audience
+            and type(output.get("passed")) is bool
+            and json.dumps(output, sort_keys=True, separators=(",", ":"))
+            == json.dumps(self._selected(source), sort_keys=True, separators=(",", ":"))
+        )
+
+
+class LocalReviewOwner(ContentReleaseReader):
+    """One explicit host-reviewed announcement, with a held revocation guard.
+
+    This local example keeps review evidence in memory. A deployment must load
+    its real durable review decision; reconstructing a caller proposal is not
+    approval. No source content is selected for this standalone announcement.
+    """
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.lock = asyncio.Lock()
+        self.approved = None
+
+    @property
+    def ref(self):
+        return self.policy.ref.model_copy(update={"kind": "review", "object_id": "announcement"})
+
+    def approve(self, request, text):
+        expectation = ContentReleaseExpectation(
+            request=request.release,
+            source_owner=self.policy.identity.issuer,
+            session_id=request.ref.session_id,
+            session_instance_id=request.ref.session_instance_id,
+            source_indices=request.source_indices,
+            audience=request.audience,
+            validator=request.projector,
+            policy=request.policy,
+        )
+        self.approved = ReleasedContent.model_validate(
+            {
+                "receipt": {
+                    "expected": expectation,
+                    "reviewer": {
+                        "issuer": self.policy.identity.issuer,
+                        "principal": "example-reviewer",
+                        "participant": None,
+                        "mandate": None,
+                        "invocation_id": None,
+                        "interaction_id": None,
+                    },
+                    "authorization_revision": 1,
+                    "expires_at_ms": int(
+                        (datetime.now(UTC) + timedelta(minutes=5)).timestamp() * 1000
+                    ),
+                },
+                "text": text,
+            }
+        )
+
+    @asynccontextmanager
+    async def acquire(self, expected):
+        async with self.lock:
+            if self.approved is None or self.approved.receipt.expected != expected:
+                raise SessionExportDenied()
+            yield self.approved
+
+
 async def main() -> None:
     store = InMemorySessionStore()
     session = await store.create(
@@ -116,10 +237,26 @@ async def main() -> None:
     await store.append_transcript_messages(session.id, [Message.text("user", "Example input")])
     policy = LocalPolicy(session)
     projector = RowCountProjector(policy)
+    review = LocalReviewOwner(policy)
+    report = ApprovedReportProjector(
+        reference=policy.ref.model_copy(update={"kind": "projector", "object_id": "report-v1"}),
+        audience=policy.identity.issuer,
+        report_reference=policy.ref.model_copy(update={"kind": "report", "object_id": "checks"}),
+        passed=True,
+    )
+    await store.append_transcript_messages(
+        session.id,
+        [
+            Message.tool_result(
+                tool_call_id="checks", tool_name="checks", structured=report.approved_source()
+            )
+        ],
+    )
     registration = SessionExportRegistration(
         owner=policy.identity.issuer,
         policy=policy,
-        projectors=(projector,),
+        projectors=(projector, report),
+        release_readers=(review,),
         limits=ExportLimits(max_exports=4, max_pending=2, max_retained_bytes=4 * 65536),
     )
     app = CayuApp(session_store=store, session_exports=registration, enable_logging=False)
@@ -148,6 +285,70 @@ async def main() -> None:
         )
         receipt = await app.export_session(request, context=context)
         assert await app.export_session(request, context=context) == receipt
+        announcement = "The report is ready for authorized inspection."
+        announcement_request = request.model_copy(
+            update={
+                "ref": request.ref.model_copy(
+                    update={
+                        "operation": request.ref.operation.model_copy(
+                            update={"caller_key": "announcement"}
+                        )
+                    }
+                ),
+                "source_indices": (),
+                "mode": "reviewed_prose",
+                "projector": review.ref,
+                "release": ContentReleaseRequest(
+                    decision=review.ref.model_copy(update={"kind": "review-decision"}),
+                    source_commitment=sha256(b"[]").hexdigest(),
+                    text_commitment=sha256(announcement.encode("utf-8")).hexdigest(),
+                    exposure=(),
+                ),
+            }
+        )
+        # Explicit trusted-host review precedes the export call. An agent cannot
+        # obtain approval merely by submitting these same bytes or reference.
+        review.approve(announcement_request, announcement)
+        await app.export_session(announcement_request, context=context)
+        assert await app.read_session_export(announcement_request, context=context) == {
+            "text": announcement
+        }
+        await app.settle_session_export(
+            SessionExportSettlementRequest(
+                request=announcement_request,
+                operation=request.ref.operation.model_copy(
+                    update={"caller_key": "retire-announcement"}
+                ),
+                mode="retire",
+            ),
+            context=context,
+        )
+        report_request = request.model_copy(
+            update={
+                "ref": request.ref.model_copy(
+                    update={
+                        "operation": request.ref.operation.model_copy(
+                            update={"caller_key": "report"}
+                        )
+                    }
+                ),
+                "source_indices": (1,),
+                "projector": report.ref,
+            }
+        )
+        await app.export_session(report_request, context=context)
+        assert (
+            await app.read_session_export(report_request, context=context)
+            == report.approved_source()
+        )
+        await app.settle_session_export(
+            SessionExportSettlementRequest(
+                request=report_request,
+                operation=request.ref.operation.model_copy(update={"caller_key": "retire-report"}),
+                mode="retire",
+            ),
+            context=context,
+        )
         lookup = await app.lookup_session_export(request, context=context)
         assert lookup.status == "match" and lookup.receipt == receipt
         assert await app.read_session_export(request, context=context) == {"record_count": 1}

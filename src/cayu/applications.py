@@ -86,6 +86,7 @@ from cayu.collaboration.exports import (
     SessionExportAccessContext,
     SessionExportNamespace,
     SessionExportReceipt,
+    SessionExportReconciliation,
     SessionExportRegistration,
     SessionExportRequest,
     SessionExportSettlementReceipt,
@@ -1455,6 +1456,7 @@ class CayuApp:
             store=self.session_store,
             registration=session_exports,
             redactor=self._secret_redactor,
+            participants=self._participant_coordinator,
         )
 
     async def initialize_session_exports(
@@ -1470,8 +1472,11 @@ class CayuApp:
         request: SessionExportRequest,
         *,
         context: SessionExportAccessContext,
+        invocation: ToolContext | None = None,
     ) -> SessionExportReceipt:
-        return await self._session_export_coordinator.export(request, context=context)
+        return await self._session_export_coordinator.export(
+            request, context=context, invocation=invocation
+        )
 
     async def lookup_session_export(
         self,
@@ -1496,6 +1501,15 @@ class CayuApp:
         context: SessionExportAccessContext,
     ) -> SessionExportSettlementReceipt:
         return await self._session_export_coordinator.settle(request, context=context)
+
+    async def reconcile_session_export(
+        self,
+        request: SessionExportRequest,
+        *,
+        context: SessionExportAccessContext,
+    ) -> SessionExportReconciliation:
+        """Settle published admission or exclude a retained unpublished preparation."""
+        return await self._session_export_coordinator.reconcile(request, context=context)
 
     async def drain_session_exports(self) -> None:
         """Seal new export work and drain retained owners before closing the store."""

@@ -28,10 +28,12 @@ from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration._participant_state import ParticipantPermitState
 from cayu.collaboration._permits import (
     PermitCommand,
+    PermitExclusion,
     PermitReceipt,
     PermitSettlement,
     PermitSettlementReader,
     PermitSnapshot,
+    RetiredPermitExclusion,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
 from cayu.collaboration.lifecycle import (
@@ -863,6 +865,26 @@ class CollaborationStore(ABC):
                 operation.generation,
                 operation.caller_key,
             ),
+            expectation=contract_bytes(expected, redactor=redactor),
+            redactor=redactor,
+        )
+
+    async def _exclude_permit(
+        self,
+        initialized: CollaborationInitialization,
+        expected: PermitCommand,
+        *,
+        reader: PermitSettlementReader,
+        redactor: SecretRedactor,
+    ) -> PermitExclusion | PermitSettlement | RetiredPermitExclusion:
+        """Qualified receiver exclusion, not a caller-supplied abort assertion."""
+        from cayu.collaboration._permit_store import exclude_permit, prepare_permit
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        expected = prepare_permit(initialized, expected, redactor)
+        return await self._owners.run(
+            partial(exclude_permit, self, initialized, expected, reader, redactor),
+            key=("permit_exclusion", initialized.binding.application_scope, *_key(expected)),
             expectation=contract_bytes(expected, redactor=redactor),
             redactor=redactor,
         )

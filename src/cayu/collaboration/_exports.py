@@ -1,6 +1,26 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "SessionExportRuntimeOrigin": ("cayu.collaboration.exports", "SessionExportRuntimeOrigin"),
+    "CollaborationMandate": ("cayu.collaboration.mandates", "CollaborationMandate"),
+    "InputChannel": ("cayu.collaboration.mandates", "InputChannel"),
+    "MandateAccessContext": ("cayu.collaboration.mandates", "MandateAccessContext"),
+    "MandateAction": ("cayu.collaboration.mandates", "MandateAction"),
+    "MandateChain": ("cayu.collaboration.mandates", "MandateChain"),
+    "MandateDenied": ("cayu.collaboration.mandates", "MandateDenied"),
+    "MandateResolution": ("cayu.collaboration.mandates", "MandateResolution"),
+    "MandateResolver": ("cayu.collaboration.mandates", "MandateResolver"),
+    "MandateRestrictions": ("cayu.collaboration.mandates", "MandateRestrictions"),
+    "PrincipalResolution": ("cayu.collaboration.mandates", "PrincipalResolution"),
+    "ResourceSelector": ("cayu.collaboration.mandates", "ResourceSelector"),
+    "ResourceSelectorOwner": ("cayu.collaboration.mandates", "ResourceSelectorOwner"),
+    "ContentExposure": ("cayu.collaboration.releases", "ContentExposure"),
+    "ContentReleaseExpectation": ("cayu.collaboration.releases", "ContentReleaseExpectation"),
+    "ContentReleaseReader": ("cayu.collaboration.releases", "ContentReleaseReader"),
+    "ContentReleaseReceipt": ("cayu.collaboration.releases", "ContentReleaseReceipt"),
+    "ContentReleaseRequest": ("cayu.collaboration.releases", "ContentReleaseRequest"),
+    "ReleasedContent": ("cayu.collaboration.releases", "ReleasedContent"),
+    "SessionExportReconciliation": ("cayu.collaboration.exports", "SessionExportReconciliation"),
     "ExportLimits": ("cayu.collaboration.exports", "ExportLimits"),
     "SessionExportAcceptance": ("cayu.collaboration.exports", "SessionExportAcceptance"),
     "SessionExportAcceptanceReader": (

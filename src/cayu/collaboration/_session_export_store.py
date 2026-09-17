@@ -14,15 +14,20 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictBool, StrictInt, model_validator
 
 from cayu._validation import canonical_bounded_durable_json_bytes
-from cayu.collaboration._contracts import ContractValue
+from cayu.collaboration._contracts import ContractValue, InitiatorBinding
+from cayu.collaboration._permits import PermitCommand
 from cayu.collaboration._preparation import contract_bytes
+from cayu.collaboration._session_export_bounds import initiator_bytes
 from cayu.collaboration.exports import (
+    ExportDigest,
+    SessionExportAuthorization,
     SessionExportConflict,
     SessionExportNamespace,
     SessionExportReceipt,
+    SessionExportRequest,
     SessionExportSettlementReceipt,
 )
 from cayu.vaults.redaction import SecretRedactor
@@ -61,6 +66,55 @@ class ExportRoot(ContractValue):
     export_count: StrictInt = Field(ge=0, le=1024)
     pending_count: StrictInt = Field(ge=0, le=64)
     retained_bytes: StrictInt = Field(ge=0, le=64 * 1024 * 1024)
+    admission_count: StrictInt = Field(default=0, ge=0, le=64)
+
+
+class ExportAdmission(ContractValue):
+    request: SessionExportRequest
+    authorization: SessionExportAuthorization
+    source_commitment: ExportDigest
+    permit: PermitCommand
+    settled: StrictBool = False
+
+    @model_validator(mode="after")
+    def exact_permit(self) -> ExportAdmission:
+        mandate = self.authorization.mandate
+        permit = self.permit.intent.request
+        if (
+            mandate is None
+            or mandate.chain.entries[-1].participant != permit.participant
+            or permit.source_operation != self.request.ref.operation
+            or permit.target.kind != "session_export"
+            or permit.target.object_id != operation_key(self.request.ref.operation)
+            or permit.target.incarnation != self.request.ref.session_instance_id
+            or permit.target_state != "future"
+            or permit.effect_scope != "source_export"
+            or permit.required_settlement != "exclusion"
+        ):
+            raise ValueError("Participant export admission authority conflicts.")
+        return self
+
+
+class ExportPreparation(ContractValue):
+    admission: ExportAdmission
+    state: Literal["prepared", "excluded"] = "prepared"
+    reserved_bytes: StrictInt = Field(ge=1, le=64 * 1024 * 1024)
+    excluded_by: InitiatorBinding | None = None
+    exclusion_mandate_commitment: ExportDigest | None = None
+
+    @model_validator(mode="after")
+    def exact_exclusion(self) -> ExportPreparation:
+        if (self.state == "excluded") != (self.excluded_by is not None):
+            raise ValueError("Export preparation exclusion authority conflicts.")
+        if self.state == "prepared" and self.admission.settled:
+            raise ValueError("Prepared export cannot discharge its participant admission.")
+        if self.excluded_by is not None:
+            initiator_bytes(self.excluded_by)
+        if (self.excluded_by is not None and self.excluded_by.mandate is not None) != (
+            self.exclusion_mandate_commitment is not None
+        ):
+            raise ValueError("Exclusion must bind its initiating mandate.")
+        return self
 
 
 class ExportRecord(ContractValue):
@@ -69,10 +123,12 @@ class ExportRecord(ContractValue):
     state: Literal["pending", "released", "retired"] = "pending"
     settlement: SessionExportSettlementReceipt | None = None
     reserved_bytes: StrictInt = Field(ge=1, le=64 * 1024 * 1024)
+    admission: ExportAdmission | None = None
 
     @model_validator(mode="after")
     def consistent_evidence(self) -> ExportRecord:
         expected = self.receipt.expected
+        initiator_bytes(expected.initiator)
         authorization = expected.intent.authorization
         payload = json.loads(self.payload_json)
         if (
@@ -80,19 +136,27 @@ class ExportRecord(ContractValue):
             or encoded(payload).decode() != self.payload_json
             or len(encoded(payload)) > 8192
             or digest(payload) != expected.intent.output_commitment
-            or expected.initiator.issuer != authorization.issuer
-            or expected.initiator.principal != authorization.principal
-            or any(
-                value is not None
-                for value in (
-                    expected.initiator.participant,
-                    expected.initiator.mandate,
-                    expected.initiator.invocation_id,
-                    expected.initiator.interaction_id,
-                )
-            )
+            or expected.initiator != authorization.initiating_identity()
         ):
             raise ValueError("Conflicting export evidence.")
+        if (expected.initiator.participant is not None) != (self.admission is not None):
+            raise ValueError("Participant export requires exact retained admission.")
+        if self.admission is not None and (
+            self.admission.request != expected.intent.request
+            or self.admission.authorization != authorization
+            or self.admission.source_commitment != expected.intent.source_commitment
+            or self.admission.permit.intent.request.target.owner != expected.source
+        ):
+            raise ValueError("Export receipt conflicts with participant admission.")
+        release = expected.intent.release_receipt
+        if release is not None and (
+            release.expected.source_owner != expected.source
+            or set(payload) != {"text"}
+            or type(payload["text"]) is not str
+            or sha256(payload["text"].encode("utf-8")).hexdigest()
+            != release.expected.request.text_commitment
+        ):
+            raise ValueError("Payload conflicts with exact reviewed content.")
         if self.state == "pending":
             if self.settlement is not None:
                 raise ValueError("Pending export carries terminal evidence.")
@@ -226,6 +290,7 @@ def import_history_checkpoint(
         root.namespace.session_id != session.id
         or root.namespace.session_instance_id != session.instance_id
         or root.pending_count != 0
+        or root.admission_count != 0
     ):
         raise SessionExportConflict()
     return {key: value for key, value in checkpoint.items() if key != ROOT_KEY}
@@ -318,12 +383,26 @@ def require_erasure_quiescence(
     settlements = {
         key: SettlementRecord.model_validate(raw).settlement
         for key, raw in owned.items()
-        if key != NAMESPACE_KEY and "receipt" not in raw
+        if key != NAMESPACE_KEY and "settlement" in raw and "receipt" not in raw
     }
+    preparations = [
+        ExportPreparation.model_validate(raw)
+        for key, raw in owned.items()
+        if key != NAMESPACE_KEY and "admission" in raw and "receipt" not in raw
+    ]
+    if len(records) + len(settlements) + len(preparations) + 1 != len(owned):
+        raise SessionExportConflict()
     if (
-        len(records) != root.export_count
-        or sum(record.state == "pending" for record in records) != root.pending_count
-        or sum(record.reserved_bytes for record in records) != root.retained_bytes
+        len(records) + len(preparations) != root.export_count
+        or sum(record.state == "pending" for record in records)
+        + sum(record.state == "prepared" for record in preparations)
+        != root.pending_count
+        or sum(record.reserved_bytes for record in (*records, *preparations)) != root.retained_bytes
+        or sum(
+            record.admission is not None and not record.admission.settled
+            for record in (*records, *preparations)
+        )
+        != root.admission_count
         or any((record.state == "pending") != (record.settlement is None) for record in records)
         or len(settlements) != sum(record.settlement is not None for record in records)
         or any(
@@ -334,5 +413,5 @@ def require_erasure_quiescence(
         )
     ):
         raise SessionExportConflict()
-    if root.pending_count:
+    if root.pending_count or root.admission_count:
         raise SessionExportConflict()

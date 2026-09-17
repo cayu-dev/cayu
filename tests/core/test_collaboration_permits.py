@@ -72,6 +72,7 @@ class Receiver(PermitSettlementReader):
         self.available = True
         self.entered = asyncio.Event()
         self.release = None
+        self.outcome = "quiescent"
 
     @property
     def owner(self):
@@ -90,9 +91,100 @@ class Receiver(PermitSettlementReader):
                 expected=expected,
                 receiving_owner=self.owner,
                 receipt_id="receiver-receipt",
-                outcome="quiescent",
+                outcome=self.outcome,
             )
         )
+
+
+@pytest.mark.parametrize("registration_wins", [False, True])
+async def test_receiving_exclusion_fences_or_settles_concurrent_registration(
+    stores, registration_wins
+):
+    from cayu.collaboration._permits import (
+        PermitExclusion,
+        PermitSettlement,
+        RetiredPermitExclusion,
+    )
+    from cayu.collaboration.lifecycle import CollaborationNamespaceRetired, NamespacePrune
+
+    store = stores()
+    reg = registration()
+    application = app(store, reg)
+    initialized = await application.initialize_collaboration()
+    _, created = await create(application, initialized)
+    ref = created.participants[0].reference
+    original = permit(initialized, ref)
+    expected = original.model_copy(
+        update={
+            "intent": original.intent.model_copy(
+                update={
+                    "request": original.intent.request.model_copy(
+                        update={"required_settlement": "exclusion"}
+                    )
+                }
+            )
+        }
+    )
+    reader = Receiver(expected)
+    reader.outcome = "excluded"
+    reader.release = asyncio.Event()
+    exclusion = asyncio.create_task(
+        store._exclude_permit(initialized, expected, reader=reader, redactor=REDACTOR)
+    )
+    await reader.entered.wait()
+    if registration_wins:
+        await stores()._register_permit(initialized, expected, redactor=REDACTOR)
+    reader.release.set()
+    result = await exclusion
+    assert isinstance(result, PermitSettlement if registration_wins else PermitExclusion)
+    assert result.receiving_receipt.outcome == "excluded"
+    inspected = await application.inspect_participant(ref, context=CONTEXT)
+    assert inspected.outstanding_obligations == 0
+    assert inspected.issued_permit_frontier == int(registration_wins)
+    reopened = stores()
+    assert (
+        await reopened._exclude_permit(initialized, expected, reader=reader, redactor=REDACTOR)
+        == result
+    )
+    if not registration_wins:
+        with pytest.raises(CollaborationConflict):
+            await reopened._register_permit(initialized, expected, redactor=REDACTOR)
+    before = await application.inspect_collaboration_namespace(context=CONTEXT)
+    rotated = await application.rotate_collaboration_namespace(
+        NamespaceRotate(
+            operation=before.current.reference.operation("rotate"),
+            namespace=before.current.reference,
+            expected_revision=before.current.revision,
+        ),
+        context=CONTEXT,
+    )
+    await application.retire_collaboration_namespace(
+        NamespaceRetire(
+            operation=rotated.successor.reference.operation("retire"),
+            namespace=rotated.namespace.reference,
+            expected_revision=rotated.namespace.revision,
+            expected_retired_through=0,
+        ),
+        context=CONTEXT,
+    )
+    retained = await application.inspect_collaboration_namespace(context=CONTEXT)
+    pruned = await application.prune_collaboration_namespace(
+        NamespacePrune(
+            operation=rotated.successor.reference.operation("prune"),
+            namespace=rotated.namespace.reference,
+            expected_retention_revision=retained.retention_revision,
+            max_records=32,
+        ),
+        context=CONTEXT,
+    )
+    assert pruned.complete
+    rejected = await reopened._exclude_permit(
+        initialized, expected, reader=reader, redactor=REDACTOR
+    )
+    assert isinstance(rejected, RetiredPermitExclusion)
+    assert rejected.expected == expected
+    with pytest.raises(CollaborationNamespaceRetired):
+        await reopened._register_permit(initialized, expected, redactor=REDACTOR)
 
 
 async def test_disable_is_accepted_before_settlement_and_reenable_does_not_revive_permits(stores):

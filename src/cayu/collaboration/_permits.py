@@ -23,6 +23,7 @@ from cayu.collaboration._contracts import (
     OperationRef,
     OwnerRef,
 )
+from cayu.collaboration.lifecycle import NamespaceRetirementEvidence
 from cayu.collaboration.participants import (
     CollaborationLimits,
     ParticipantEvent,
@@ -171,4 +172,50 @@ class PermitSettlement(ContractValue):
             or self.event.participants != (self.expected.intent.request.participant,)
         ):
             raise ValueError("Permit settlement event conflicts.")
+        return self
+
+
+class PermitExclusion(ContractValue):
+    """Exact negative admission, authenticated by the receiving owner's exclusion.
+
+    This occupies the registration key; it is never an execution permit. No
+    participant responsibility was admitted, so no obligation counter changes.
+    """
+
+    record_type: Literal["permit_excluded"] = "permit_excluded"
+    expected: PermitCommand
+    receiving_receipt: ReceivingSettlementReceipt
+    event: ParticipantEvent
+
+    @model_validator(mode="after")
+    def exact_exclusion(self) -> PermitExclusion:
+        if (
+            self.receiving_receipt.expected != self.expected
+            or self.receiving_receipt.outcome != "excluded"
+            or self.event.operation != self.expected.operation
+            or self.event.type != "permit_excluded"
+            or self.event.participants != (self.expected.intent.request.participant,)
+        ):
+            raise ValueError("Permit exclusion evidence conflicts.")
+        return self
+
+
+class RetiredPermitExclusion(ContractValue):
+    """Retired namespace proves rejection; this is not an exact registration receipt."""
+
+    expected: PermitCommand
+    receiving_receipt: ReceivingSettlementReceipt
+    retirement: NamespaceRetirementEvidence
+
+    @model_validator(mode="after")
+    def exact_retirement(self) -> RetiredPermitExclusion:
+        namespace = self.retirement.namespace
+        if (
+            self.receiving_receipt.expected != self.expected
+            or self.receiving_receipt.outcome != "excluded"
+            or namespace.owner != self.expected.source
+            or namespace.namespace_incarnation != self.expected.operation.namespace_incarnation
+            or namespace.generation != self.expected.operation.generation
+        ):
+            raise ValueError("Permit retirement exclusion authority conflicts.")
         return self

@@ -37,6 +37,7 @@ from cayu.runtime._isolated_tool_process import (
     isolated_tool_execution_contract,
 )
 from cayu.runtime._tool_identity import tool_idempotency_key as tool_idempotency_key
+from cayu.tools._invocation_lifetime import tool_invocation_lifetime
 from cayu.tools._runner import (
     is_current_runner_cancellation_group,
     sanitize_runner_failure_group,
@@ -513,8 +514,10 @@ async def _run_tool(
             if type(tool) is not ProcessIsolatedTool:
                 if inference_scope is not None:
                     async with inference_scope.lifetime():
-                        return await tool.run(ctx, arguments)
-                return await tool.run(ctx, arguments)
+                        with tool_invocation_lifetime(ctx):
+                            return await tool.run(ctx, arguments)
+                with tool_invocation_lifetime(ctx):
+                    return await tool.run(ctx, arguments)
             if registered_schema is None:
                 raise IsolatedToolPreDispatchFailure("registered_schema_missing")
             if registered_execution_contract is None:

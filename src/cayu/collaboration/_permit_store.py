@@ -18,16 +18,22 @@ from cayu.collaboration._namespace_store import load_namespace, require_open_nam
 from cayu.collaboration._participant_state import ParticipantPermitState
 from cayu.collaboration._permits import (
     PermitCommand,
+    PermitExclusion,
     PermitReceipt,
     PermitSettlement,
     PermitSettlementReader,
     PermitSnapshot,
     ReceivingSettlementReceipt,
     ReservedPermitSettlement,
+    RetiredPermitExclusion,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
 from cayu.collaboration.base import CollaborationStore, _Anchor, _key, _Repository
-from cayu.collaboration.lifecycle import NamespaceSnapshot
+from cayu.collaboration.lifecycle import (
+    NamespaceRef,
+    NamespaceRetirementEvidence,
+    NamespaceSnapshot,
+)
 from cayu.collaboration.participants import (
     CollaborationInitialization,
     CollaborationUnavailable,
@@ -93,6 +99,21 @@ def prepare_permit(
         {"expected": expected, "receiving_receipt": maximum, "event": event},
         redactor=probe_redactor,
     )
+    if expected.intent.request.required_settlement == "exclusion":
+        prepare_contract(
+            PermitExclusion,
+            {
+                "expected": expected,
+                "receiving_receipt": maximum.model_copy(update={"outcome": "excluded"}),
+                "event": event.model_copy(
+                    update={
+                        "operation": expected.operation,
+                        "type": "permit_excluded",
+                    }
+                ),
+            },
+            redactor=probe_redactor,
+        )
     prepare_contract(
         _ReceivingReadback,
         {"result": {"status": "match", "receipt": maximum}},
@@ -103,7 +124,7 @@ def prepare_permit(
 
 def prepare_permit_record(
     raw: object, redactor: SecretRedactor
-) -> PermitReceipt | ReservedPermitSettlement | PermitSettlement:
+) -> PermitReceipt | ReservedPermitSettlement | PermitSettlement | PermitExclusion:
     tag = cast("dict[object, object]", raw).get("record_type") if isinstance(raw, dict) else None
     if tag == "permit_registered":
         return prepare_contract(PermitReceipt, raw, redactor=redactor)
@@ -111,6 +132,8 @@ def prepare_permit_record(
         return prepare_contract(ReservedPermitSettlement, raw, redactor=redactor)
     if tag == "permit_settled":
         return prepare_contract(PermitSettlement, raw, redactor=redactor)
+    if tag == "permit_excluded":
+        return prepare_contract(PermitExclusion, raw, redactor=redactor)
     raise CollaborationContractError("Unknown permit operation evidence.")
 
 
@@ -290,6 +313,123 @@ async def register_permit(
         await tx.put("events", (event.sequence,), event, insert=True)
         await tx.put("anchors", (), updated, insert=False)
         return receipt
+
+
+async def exclude_permit(
+    store: CollaborationStore,
+    initialized: CollaborationInitialization,
+    expected: PermitCommand,
+    reader: PermitSettlementReader,
+    redactor: SecretRedactor,
+) -> PermitExclusion | PermitSettlement | RetiredPermitExclusion:
+    """Fence a never-admitted registration, or settle the registration winner.
+
+    The receiving owner's permanent exclusion precedes this operation. Its read
+    happens outside our transaction; the competing registration is decided by
+    the native transaction, not by an earlier not-found lookup.
+    """
+    if (
+        not isinstance(reader, PermitSettlementReader)
+        or reader.owner != expected.intent.request.target.owner
+    ):
+        raise CollaborationConflict("Exact trusted receiving-owner reader is required.")
+    found = prepare_contract(
+        _ReceivingReadback, {"result": await reader.lookup(expected)}, redactor=redactor
+    ).result
+    if not isinstance(found, ExactMatch) or found.receipt.outcome != "excluded":
+        raise CollaborationUnavailable("Positive receiving exclusion is unavailable.")
+    require_exact_contract(expected, found.receipt.expected, redactor=redactor)
+    async with store._transaction(initialized.binding.application_scope, write=True) as tx:
+        anchor = await store._anchor(tx, initialized, redactor)
+        raw = await tx.get("operations", _key(expected))
+        if raw is not None:
+            from cayu.collaboration.base import _stored_mode
+
+            if _stored_mode(raw) != "permit":
+                raise CollaborationConflict("Operation key already has different intent.")
+            retained = prepare_permit_record(raw, redactor)
+            require_exact_contract(expected, retained.expected, redactor=redactor)
+            if isinstance(retained, PermitExclusion):
+                await require_event(tx, retained.event, redactor)
+                return retained
+            # Fully validate all existing registration/settlement representations.
+            await registered_receipt(tx, expected, redactor)
+        else:
+            if expected.operation.generation <= anchor.retired_through:
+                # Retirement is permanent admission rejection, including after
+                # exact history pruning. It is not fabricated receipt matching.
+                content = "pruned"
+                if expected.operation.generation > anchor.pruned_through:
+                    content = (
+                        await load_namespace(tx, anchor, expected.operation.generation, redactor)
+                    ).content
+                return prepare_contract(
+                    RetiredPermitExclusion,
+                    {
+                        "expected": expected,
+                        "receiving_receipt": found.receipt,
+                        "retirement": NamespaceRetirementEvidence(
+                            namespace=NamespaceRef(
+                                owner=initialized.owner,
+                                namespace_incarnation=initialized.namespace_incarnation,
+                                generation=expected.operation.generation,
+                            ),
+                            retired_through=anchor.retired_through,
+                            pruned_through=anchor.pruned_through,
+                            content=content,
+                        ),
+                    },
+                    redactor=redactor,
+                )
+            namespace = await load_namespace(tx, anchor, expected.operation.generation, redactor)
+            if namespace.state == "retired":
+                raise CollaborationUnavailable(
+                    "Retired namespace cannot retain new exclusion evidence."
+                )
+            await store._participant(
+                tx, expected.intent.request.participant, initialized.owner, redactor
+            )
+            event = prepare_contract(
+                ParticipantEvent,
+                {
+                    "id": uuid4().hex,
+                    "sequence": anchor.event_sequence + 1,
+                    "operation": expected.operation,
+                    "type": "permit_excluded",
+                    "participants": (expected.intent.request.participant,),
+                },
+                redactor=redactor,
+            )
+            excluded = prepare_contract(
+                PermitExclusion,
+                {"expected": expected, "receiving_receipt": found.receipt, "event": event},
+                redactor=redactor,
+            )
+            updated = prepare_contract(
+                _Anchor,
+                anchor.model_copy(
+                    update={
+                        "operation_count": anchor.operation_count + 1,
+                        "event_count": anchor.event_count + 1,
+                        "event_sequence": event.sequence,
+                        "retained_bytes": anchor.retained_bytes
+                        + len(contract_bytes(excluded, redactor=redactor))
+                        + len(contract_bytes(event, redactor=redactor)),
+                    }
+                ),
+                redactor=redactor,
+            )
+            # A never-admitted command has no reserved settlement slot. Its new
+            # negative record is ordinary admission; preserve maintenance capacity
+            # so a full namespace can still retire and prove permanent rejection.
+            require_capacity(updated, ordinary=True)
+            await tx.put("operations", _key(expected), excluded, insert=True)
+            await tx.put("events", (event.sequence,), event, insert=True)
+            await tx.put("anchors", (), updated, insert=False)
+            return excluded
+    # Registration won the transaction. Its pre-reserved settlement capacity and
+    # exact receiving readback now discharge that obligation through the usual path.
+    return await settle_permit(store, initialized, expected, reader, redactor)
 
 
 async def settle_permit(
