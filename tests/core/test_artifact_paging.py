@@ -176,14 +176,27 @@ class _PagingProvider(_ReadbackProvider):
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+@pytest.mark.parametrize("store_kind", ["explicit", "short", "long", "unicode"])
 @pytest.mark.parametrize("inline_bytes", [2048, 8192])
 def test_runtime_externalization_pages_to_redacted_tail_and_survives_store_reconstruction(
-    tmp_path, inline_bytes
+    tmp_path, inline_bytes, store_kind
 ):
     secret = "synthetic-private-value"
     original = "a" * 1850 + "🙂é" * 350 + secret + "z" * 5500 + "TAIL-SENTINEL"
     redacted = SecretRedactor(secret).redact_text(original)
-    store = LocalArtifactStore(tmp_path / "artifacts", store_id="paging")
+    root = tmp_path / "artifacts"
+    if store_kind == "long":
+        root = root / ("a" * 100) / ("b" * 100)
+    elif store_kind == "unicode":
+        root = root / ("é" * 70) / ("ü" * 70)
+    if store_kind in {"long", "unicode"}:
+        assert len(str(root.resolve()).encode("utf-8")) > 256
+    else:
+        assert len(str(root.resolve()).encode("utf-8")) < 256
+    store_id = "paging" if store_kind == "explicit" else None
+    store = LocalArtifactStore(root, store_id=store_id)
+    assert len(store.id.encode("utf-8")) <= 256
+    assert store.id != LocalArtifactStore(root.parent / "other-root", store_id=None).id
     provider = _PagingProvider(inline_bytes)
     app = CayuApp(
         enable_logging=False,
@@ -218,7 +231,16 @@ def test_runtime_externalization_pages_to_redacted_tail_and_survives_store_recon
     for event in events:
         if event.type is EventType.TOOL_CALL_COMPLETED and event.tool_name == "read_file":
             assert event.payload["tool_result_projection"]["status"] == "unchanged"
-    reconstructed = LocalArtifactStore(tmp_path / "artifacts", store_id="paging")
+    reconstructed = LocalArtifactStore(root, store_id=store_id)
+    assert reconstructed.id == store.id
+    denied = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="other", environment_name="local", artifact_store=reconstructed),
+            provider.readback_arguments,
+        )
+    )
+    assert denied.is_error
+    assert "TAIL-SENTINEL" not in denied.content
     ctx = ToolContext(session_id="session", environment_name="local", artifact_store=reconstructed)
     offset = 0
     observed = []

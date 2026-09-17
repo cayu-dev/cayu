@@ -728,12 +728,14 @@ def test_artifact_externalizing_policy_fails_bounded_without_artifact_store() ->
     assert projection.result.is_error is result.is_error
 
 
+@pytest.mark.parametrize("store_id", ["s" * 257, "é" * 129])
 def test_artifact_externalizing_policy_bounds_the_store_identity_before_persistence(
     tmp_path,
+    store_id,
 ) -> None:
     store = LocalArtifactStore(
         tmp_path / "long-store-id",
-        store_id="store-" + ("s" * 1_000),
+        store_id=store_id,
     )
     policy = ArtifactExternalizingToolResultPolicy(
         max_inline_bytes=256,
@@ -750,7 +752,11 @@ def test_artifact_externalizing_policy_bounds_the_store_identity_before_persiste
     )
 
     assert projection.record.status == "failed"
-    assert projection.record.failure_type == "ValueError"
+    assert projection.record.failure_type == "artifact_store_id_too_long"
+    assert projection.record.store_id_bytes == len(store_id.encode("utf-8"))
+    assert projection.record.store_id_max_bytes == 256
+    assert "Configure a stable, distinct store_id" in projection.result.content
+    assert store_id not in projection.result.content
     assert projection.record.projected_bytes < 1024
     assert asyncio.run(store.list(session_id="sess_projection")).artifacts == ()
 
@@ -3321,5 +3327,113 @@ def test_sqlite_session_store_preserves_projected_tool_results(tmp_path) -> None
             )
         finally:
             await session_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_id", ["s" * 256, "é" * 128])
+def test_projection_accepts_store_identity_at_utf8_byte_limit(tmp_path, store_id):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id=store_id)
+    projection = asyncio.run(
+        ArtifactExternalizingToolResultPolicy(max_inline_bytes=256).project(
+            _request(result=ToolResult(content="x" * 19000), artifact_store=store)
+        )
+    )
+    assert projection.record.status == "externalized"
+    assert projection.result.artifacts[0]["store_id"] == store_id
+
+
+def test_store_identity_failure_retains_safe_durable_delivery_diagnostics(tmp_path):
+    secret = "private-store-path"
+    store = LocalArtifactStore(tmp_path / secret, store_id=secret + "é" * 150)
+    app, _, provider, tool, events = _run_tool_result(
+        tmp_path=tmp_path,
+        content="private-result" * 2000,
+        store=store,
+        secret_redactor=SecretRedactor(secret),
+        policy=ArtifactExternalizingToolResultPolicy(max_inline_bytes=256),
+    )
+    assert tool.calls == 1
+    terminal = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    durable = asyncio.run(app.session_store.load_events("sess_runtime_projection"))
+    persisted = next(event for event in durable if event.type == EventType.TOOL_CALL_COMPLETED)
+    for event in (terminal, persisted):
+        record = event.payload["tool_result_projection"]
+        assert record["status"] == "failed"
+        assert record["failure_type"] == "artifact_store_id_too_long"
+        assert record["store_id_bytes"] == len(store.id.encode("utf-8"))
+        assert record["store_id_max_bytes"] == 256
+        assert event.payload["result"]["is_error"] is False
+    transcript = asyncio.run(app.session_store.load_transcript("sess_runtime_projection"))
+    serialized = json.dumps(
+        {
+            "events": [event.model_dump(mode="json") for event in durable],
+            "transcript": [message.model_dump(mode="json") for message in transcript],
+            "request": provider.requests[1].model_dump(mode="json"),
+        }
+    )
+    assert secret not in serialized
+    assert str(store.root) not in serialized
+    assert "private-result" not in serialized
+    assert asyncio.run(store.list(session_id="sess_runtime_projection")).artifacts == ()
+
+
+def test_store_identity_failure_survives_sqlite_reopen(tmp_path, sqlite_resources):
+    async def scenario():
+        async with sqlite_resources as resources:
+            database = resources.path()
+            sessions = resources.own(SQLiteSessionStore(database))
+            artifacts = LocalArtifactStore(tmp_path / "artifacts", store_id="é" * 129)
+            provider = _FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="call", name="result_tool", arguments={}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            )
+            app = CayuApp(
+                enable_logging=False,
+                session_store=sessions,
+                tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
+                    max_inline_bytes=256,
+                ),
+            )
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(EnvironmentSpec(name="local"), artifact_store=artifacts),
+                default=True,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[_ResultTool(ToolResult(content="x" * 19000))],
+            )
+            await _collect(
+                app.run(
+                    RunRequest(
+                        session_id="session",
+                        agent_name="assistant",
+                        messages=[Message.text("user", "run")],
+                    )
+                )
+            )
+            await sessions.close()
+            reopened = resources.own(SQLiteSessionStore(database))
+            events = await reopened.load_events("session")
+            terminal = next(
+                event for event in events if event.type == EventType.TOOL_CALL_COMPLETED
+            )
+            record = ToolResultProjectionRecord.model_validate(
+                terminal.payload["tool_result_projection"]
+            )
+            assert record.status == "failed"
+            assert record.failure_type == "artifact_store_id_too_long"
+            assert record.store_id_bytes == 258
+            assert record.store_id_max_bytes == 256
+            assert terminal.payload["result"]["is_error"] is False
 
     asyncio.run(scenario())

@@ -1500,6 +1500,8 @@ _TOOL_RESULT_PROJECTION_RECORD_FIELDS = frozenset(
         "artifact_sha256",
         "artifact_write_settlement",
         "failure_type",
+        "store_id_bytes",
+        "store_id_max_bytes",
         "logical_identity_sha256",
         "original_bytes",
         "original_token_estimate",

@@ -213,15 +213,16 @@ def test_local_claim_waits_for_dispatched_write_after_owner_cancellation(tmp_pat
     asyncio.run(run())
 
 
-def test_local_closure_reopens_exact_claim_and_fences_new_publication(tmp_path):
+@pytest.mark.parametrize("store_id", [None, "local"])
+def test_local_closure_reopens_exact_claim_and_fences_new_publication(tmp_path, store_id):
     async def run():
-        store = LocalArtifactStore(tmp_path / "artifacts", store_id="local")
+        store = LocalArtifactStore(tmp_path / "artifacts", store_id=store_id)
         artifact = await store.put_bytes(b"owned", filename="owned.txt", session_id="session")
         claim = await store.claim_session_closure(
             "session", "a" * 64, max_records=10, max_bytes=10000
         )
         assert [item.artifact_id for item in claim.artifacts] == [artifact.id]
-        reopened = LocalArtifactStore(store.root, store_id="local")
+        reopened = LocalArtifactStore(store.root, store_id=store_id)
         assert await reopened.load_session_closure_claim("session") == claim
         with pytest.raises(ValueError, match="fenced"):
             await reopened.put_bytes(b"late", filename="late.txt", session_id="session")

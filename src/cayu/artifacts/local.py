@@ -152,7 +152,7 @@ class LocalArtifactStore(ArtifactStore):
             )
 
         if store_id is None:
-            self.id = str(root_path)
+            self.id = "local-sha256:" + hashlib.sha256(os.fsencode(root_path)).hexdigest()
         else:
             clean_store_id = require_clean_nonblank(store_id, "store_id")
             self.id = require_unicode_scalar_text(clean_store_id, "store_id")

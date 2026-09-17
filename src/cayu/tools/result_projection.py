@@ -73,6 +73,8 @@ _TOOL_RESULT_PROJECTION_PUBLIC_STRUCTURE_KEYS = _BUILTIN_TOOL_RESULT_ARTIFACT_RE
     "artifact_sha256",
     "artifact_write_settlement",
     "failure_type",
+    "store_id_bytes",
+    "store_id_max_bytes",
     "logical_identity_sha256",
     "original_bytes",
     "original_token_estimate",
@@ -134,6 +136,8 @@ class ToolResultProjectionRecord(BaseModel):
     logical_identity_sha256: str | None = None
     tool_call_id_sha256: str | None = None
     failure_type: str | None = None
+    store_id_bytes: StrictInt | None = Field(default=None, ge=0)
+    store_id_max_bytes: StrictInt | None = Field(default=None, ge=1)
     artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None
 
     @field_validator("policy_id", "token_estimation_method")
@@ -220,6 +224,15 @@ class ToolResultProjectionRecord(BaseModel):
             raise ValueError("Only failed projection records can include failure_type.")
         elif self.artifact_write_settlement is not None:
             raise ValueError("Only failed projection records can include settlement evidence.")
+        sizes = (self.store_id_bytes, self.store_id_max_bytes)
+        if any(value is not None for value in sizes) and (
+            self.status is not ToolResultProjectionStatus.FAILED
+            or self.failure_type != "artifact_store_id_too_long"
+            or self.store_id_bytes is None
+            or self.store_id_max_bytes is None
+            or self.store_id_bytes <= self.store_id_max_bytes
+        ):
+            raise ValueError("Store identity sizes require an oversized store identity failure.")
         return self
 
 
@@ -449,9 +462,15 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
                 require_clean_nonblank(artifact_store.id, "artifact_store.id"),
                 "artifact_store.id",
             )
-            if len(store_id.encode("utf-8")) > _ARTIFACT_STORE_ID_MAX_BYTES:
-                raise ValueError(
-                    "artifact_store.id exceeds the tool-result reference safety bound."
+            store_id_bytes = len(store_id.encode("utf-8"))
+            if store_id_bytes > _ARTIFACT_STORE_ID_MAX_BYTES:
+                return self._failed_projection(
+                    request=request,
+                    original_bytes=original_bytes,
+                    original_token_estimate=original_tokens,
+                    failure_type="artifact_store_id_too_long",
+                    store_id_bytes=store_id_bytes,
+                    store_id_max_bytes=_ARTIFACT_STORE_ID_MAX_BYTES,
                 )
             artifact = await artifact_store.put_bytes(
                 content,
@@ -543,10 +562,20 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
         original_bytes: int,
         original_token_estimate: int,
         failure_type: str,
+        store_id_bytes: int | None = None,
+        store_id_max_bytes: int | None = None,
         artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None,
     ) -> ToolResultProjection:
         projected_result = ToolResult(
-            content=_projection_failure_content(self.identity),
+            content=(
+                "Cayu could not deliver this oversized tool result: "
+                f"artifact_store_id_too_long ({store_id_bytes} UTF-8 bytes; "
+                f"maximum {store_id_max_bytes}). Configure a stable, distinct store_id "
+                f"of at most {store_id_max_bytes} UTF-8 bytes, then retry. "
+                "The original content was not added to the durable transcript or model request."
+                if failure_type == "artifact_store_id_too_long"
+                else _projection_failure_content(self.identity)
+            ),
             structured=request.result.structured,
             artifacts=request.result.artifacts,
             is_error=request.result.is_error,
@@ -559,6 +588,8 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
                 projected_result=projected_result,
                 original_token_estimate=original_token_estimate,
                 failure_type=failure_type,
+                store_id_bytes=store_id_bytes,
+                store_id_max_bytes=store_id_max_bytes,
                 artifact_write_settlement=artifact_write_settlement,
             ),
         )
@@ -575,6 +606,8 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
         logical_identity_sha256: str | None = None,
         tool_call_id_sha256: str | None = None,
         failure_type: str | None = None,
+        store_id_bytes: int | None = None,
+        store_id_max_bytes: int | None = None,
         artifact_write_settlement: ArtifactWriteSettlementEvidence | None = None,
     ) -> ToolResultProjectionRecord:
         return ToolResultProjectionRecord(
@@ -590,6 +623,8 @@ class ArtifactExternalizingToolResultPolicy(ToolResultProjectionPolicy):
             logical_identity_sha256=logical_identity_sha256,
             tool_call_id_sha256=tool_call_id_sha256,
             failure_type=failure_type,
+            store_id_bytes=store_id_bytes,
+            store_id_max_bytes=store_id_max_bytes,
             artifact_write_settlement=artifact_write_settlement,
         )
 

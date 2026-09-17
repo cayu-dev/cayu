@@ -12590,6 +12590,22 @@ registration fails before dispatch, and draining the retained record permits
 deliberate reuse.
 
 `LocalArtifactStore` is available for local filesystem-backed artifact storage.
+Its default public identity is `local-sha256:` followed by the SHA-256 digest of
+its resolved absolute root's filesystem bytes. This bounded identity does not
+publish the root path, distinguishes roots, and remains stable when reopening
+the same resolved root. An explicit `store_id` is preserved unchanged. Existing
+applications that must retain the former path-based identity for persisted
+references or closure claims must pass that identity explicitly when reopening;
+changing a store identity does not migrate existing references or claims.
+
+Tool-result externalization requires store identities of at most 256 UTF-8
+bytes. An oversized explicit/custom identity fails before artifact publication
+with `failure_type="artifact_store_id_too_long"`, `store_id_bytes`, and
+`store_id_max_bytes` in the durable projection record. The bounded delivery
+message recommends a stable, distinct `store_id` within the limit without
+revealing the identity, path, or exception text. Projection status `failed`
+records delivery failure separately from the underlying tool's `is_error`.
+
 It stores each artifact as content plus JSON metadata under one root. Writes
 prepare both files in a private staging directory, flush and synchronize both
 regular files and the staging directory, atomically rename the complete
