@@ -539,6 +539,8 @@ def runtime_checkpoint_writer_view(
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     projected = copy_durable_json_object(current, "checkpoint")
+    if "session_exports" in projected:
+        raise ValueError("Session export authority cannot be represented by an older writer.")
     if MODEL_FAILOVER_CHECKPOINT_KEY in projected:
         raise ValueError("Model failover authority cannot be represented by an older writer.")
     if writer_version == 9:

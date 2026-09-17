@@ -20,6 +20,8 @@ from cayu.egress.authority import (
     EgressAuthorityTransitionState,
 )
 from cayu.events import (
+    SESSION_EXPORT_EVENT_FIELDS,
+    SESSION_EXPORT_EVENT_TYPES,
     Event,
     EventType,
     copy_event,
@@ -27,6 +29,7 @@ from cayu.events import (
     event_id_is_runtime_generated,
     event_nested_payload_authority_is_runtime_generated,
     event_payload_authority_is_runtime_generated,
+    validate_session_export_event,
 )
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.providers.base import ModelFinishReason
@@ -234,6 +237,7 @@ _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = (
     | _TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS
     | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
     | _TOOL_TERMINAL_TIMING_KEYS
+    | SESSION_EXPORT_EVENT_FIELDS
 )
 _TOOL_EVENT_TYPES = frozenset(
     {
@@ -3480,6 +3484,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
     )
+    # Public digests are metadata, not export receipts or disclosure authority.
+    for event_type in SESSION_EXPORT_EVENT_TYPES:
+        policies[event_type] = _policy(
+            *SESSION_EXPORT_EVENT_FIELDS,
+            authority_keys=SESSION_EXPORT_EVENT_FIELDS,
+            public_authority_keys=SESSION_EXPORT_EVENT_FIELDS,
+        )
     policies[EventType.SESSION_FORKED] = _policy(
         "agent_name",
         "causal_budget_id",
@@ -4145,6 +4156,8 @@ def _event_without_malformed_provider_cancellation_diagnostics(event: Event) -> 
 def prepare_new_runtime_event(event: Event, *, redactor: SecretRedactor) -> Event:
     """Validate and redact one event before its first durable append."""
 
+    # Reject before copying/redaction can erase unsafe fields or render values.
+    validate_session_export_event(event)
     provider_failures, _ = _validated_provider_cancellation_event_failures(
         event,
         reject_malformed=True,
@@ -4555,6 +4568,22 @@ def _project_runtime_event(
     """Apply the shared public projection with an internal persisted-record capability."""
 
     _validate_inputs(event, redactor)
+    if event.type in SESSION_EXPORT_EVENT_TYPES:
+        # Never expose extra source/inline/principal data, even from a malformed
+        # stored record. Only canonical digests enter the common projector.
+        payload = event.payload
+        event = event.model_copy(
+            update={
+                "payload": {
+                    key: payload[key]
+                    for key in SESSION_EXPORT_EVENT_FIELDS
+                    if type(payload) is dict
+                    and type(payload.get(key)) is str
+                    and len(payload[key]) == 64
+                    and all(character in "0123456789abcdef" for character in payload[key])
+                }
+            }
+        )
     provider_failures, had_provider_failures = _validated_provider_cancellation_event_failures(
         event,
         reject_malformed=False,
@@ -5263,6 +5292,7 @@ def _reject_secret_authority_values(
             "handoff_id",
             "pause_digest",
             "resolution_request_digest",
+            *SESSION_EXPORT_EVENT_FIELDS,
             *_TOOL_TERMINAL_TIMING_KEYS,
             *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
         } and (
@@ -5375,6 +5405,12 @@ def _public_authority_is_trusted(
     if field_name not in _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS:
         return True
     value = event.payload.get(field_name)
+    if field_name in SESSION_EXPORT_EVENT_FIELDS and not (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return False
     if field_name == "execution_profile_fingerprint" and not (
         type(value) is str
         and len(value) == 64

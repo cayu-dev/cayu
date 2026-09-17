@@ -79,8 +79,18 @@ from cayu.budgets.usage import (
 )
 from cayu.collaboration._contracts import ExactLookup, ExpectedOperation
 from cayu.collaboration._coordinator import ParticipantCoordinator
+from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
 from cayu.collaboration.base import CollaborationStore
+from cayu.collaboration.exports import (
+    SessionExportAccessContext,
+    SessionExportNamespace,
+    SessionExportReceipt,
+    SessionExportRegistration,
+    SessionExportRequest,
+    SessionExportSettlementReceipt,
+    SessionExportSettlementRequest,
+)
 from cayu.collaboration.lifecycle import (
     LifecycleCommand,
     LifecycleReceipt,
@@ -915,6 +925,7 @@ class CayuApp:
         session_message_access_policy: SessionMessageAccessPolicy | None = None,
         collaboration_store: CollaborationStore | None = None,
         collaboration: CollaborationRegistration | None = None,
+        session_exports: SessionExportRegistration | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
         completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
@@ -1440,6 +1451,55 @@ class CayuApp:
             registration=collaboration,
             redactor=self._secret_redactor,
         )
+        self._session_export_coordinator = SessionExportCoordinator(
+            store=self.session_store,
+            registration=session_exports,
+            redactor=self._secret_redactor,
+        )
+
+    async def initialize_session_exports(
+        self,
+        session_id: str,
+        *,
+        context: SessionExportAccessContext,
+    ) -> SessionExportNamespace:
+        return await self._session_export_coordinator.initialize(session_id, context=context)
+
+    async def export_session(
+        self,
+        request: SessionExportRequest,
+        *,
+        context: SessionExportAccessContext,
+    ) -> SessionExportReceipt:
+        return await self._session_export_coordinator.export(request, context=context)
+
+    async def lookup_session_export(
+        self,
+        request: SessionExportRequest,
+        *,
+        context: SessionExportAccessContext,
+    ) -> ExactLookup[SessionExportReceipt]:
+        return await self._session_export_coordinator.lookup(request, context=context)
+
+    async def read_session_export(
+        self,
+        request: SessionExportRequest,
+        *,
+        context: SessionExportAccessContext,
+    ) -> dict[str, Any]:
+        return await self._session_export_coordinator.lookup(request, context=context, expose=True)
+
+    async def settle_session_export(
+        self,
+        request: SessionExportSettlementRequest,
+        *,
+        context: SessionExportAccessContext,
+    ) -> SessionExportSettlementReceipt:
+        return await self._session_export_coordinator.settle(request, context=context)
+
+    async def drain_session_exports(self) -> None:
+        """Seal new export work and drain retained owners before closing the store."""
+        await self._session_export_coordinator.close()
 
     async def initialize_collaboration(self) -> CollaborationInitialization:
         """Explicitly provision or recover the exact registered collaboration owner."""

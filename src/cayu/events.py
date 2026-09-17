@@ -86,6 +86,9 @@ class EventType(StrEnum):
     SESSION_AWAITING_USER_INPUT = "session.awaiting_user_input"
     SESSION_CHECKPOINTED = "session.checkpointed"
     SESSION_FORKED = "session.forked"
+    SESSION_EXPORT_PUBLISHED = "session.export.published"
+    SESSION_EXPORT_RELEASED = "session.export.released"
+    SESSION_EXPORT_RETIRED = "session.export.retired"
     SESSION_LIMIT_REACHED = "session.limit_reached"
     SESSION_MESSAGE_QUEUED = "session.message.queued"
     SESSION_MESSAGE_DELIVERED = "session.message.delivered"
@@ -246,6 +249,16 @@ class EventType(StrEnum):
     )
 
 
+SESSION_EXPORT_EVENT_TYPES = frozenset(
+    {
+        EventType.SESSION_EXPORT_PUBLISHED,
+        EventType.SESSION_EXPORT_RELEASED,
+        EventType.SESSION_EXPORT_RETIRED,
+    }
+)
+SESSION_EXPORT_EVENT_FIELDS = frozenset({"export_commitment", "output_commitment"})
+
+
 class Event(BaseModel):
     """Append-only runtime event.
 
@@ -281,6 +294,9 @@ class Event(BaseModel):
         default_factory=_empty_runtime_authority
     )
     _durable_sequence: int | None = PrivateAttr(default=None)
+    # Exact bytes admitted by the explicit trusted JSONL history boundary.
+    # This is not export mutation authority and is invalid after any edit.
+    _trusted_export_history: bytes | None = PrivateAttr(default=None)
     # A content-independent structural stamp lets runtime-owned copies reuse
     # already-validated immutable strings without trusting a caller-mutated
     # payload. ``model_copy(update=...)`` and any nested mutation change the
@@ -372,6 +388,39 @@ class Event(BaseModel):
         return _validate_custom_event_type(value)
 
 
+def validate_session_export_event(event: Event) -> None:
+    """Require exact producer-attested metadata before export event publication.
+
+    Producers attest both commitments with ``event_with_runtime_payload_authority``
+    only after the export owner has verified the operation. This is projection
+    provenance, never a receipt, disclosure grant, or replay permission. Store
+    ingestion must enforce this boundary too; ordinary deserialization does not
+    restore producer provenance.
+    """
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    if event.type not in SESSION_EXPORT_EVENT_TYPES:
+        return
+    payload = event.payload
+    if (
+        type(payload) is not dict
+        or any(type(key) is not str for key in payload)
+        or set(payload) != SESSION_EXPORT_EVENT_FIELDS
+    ):
+        raise ValueError("Session export events require exactly two commitment fields.")
+    for field_name in SESSION_EXPORT_EVENT_FIELDS:
+        value = payload[field_name]
+        if not (
+            type(value) is str
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            and event_payload_authority_is_runtime_generated(
+                event, field_name=field_name, value=value
+            )
+        ):
+            raise ValueError("Session export events require runtime-attested SHA-256 commitments.")
+
+
 def event_durable_envelope(event: Event) -> dict[str, Any]:
     """One explicit envelope, including every durable correlation field."""
 
@@ -451,6 +500,7 @@ def copy_event(event: Event) -> Event:
     copied._runtime_nested_payload_authority = event._runtime_nested_payload_authority
     copied._runtime_envelope_authority = event._runtime_envelope_authority
     copied._durable_sequence = event._durable_sequence
+    copied._trusted_export_history = event._trusted_export_history
     return copied
 
 

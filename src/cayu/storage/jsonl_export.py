@@ -41,6 +41,10 @@ from cayu._validation import (
     reject_nonportable_json_constant,
     require_durable_text,
 )
+from cayu.collaboration._session_export_store import (
+    import_history_checkpoint,
+    restore_export_history_event,
+)
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.base import (
@@ -327,10 +331,12 @@ def import_sessions(
         if any(record.session_id != session.id for record in targeted_tool_grant_state.records):
             raise ValueError("Targeted grant state belongs to a different session.")
         events = [
-            restore_persisted_event_authority(
-                Event.model_validate(event),
-                input_contract_runtime_owned=True,
-                file_attachment_attestations_runtime_owned=True,
+            restore_export_history_event(
+                restore_persisted_event_authority(
+                    Event.model_validate(event),
+                    input_contract_runtime_owned=True,
+                    file_attachment_attestations_runtime_owned=True,
+                )
             )
             for event in obj["events"]
         ]
@@ -352,6 +358,7 @@ def import_sessions(
                 checkpoint=checkpoint,
                 boundary=boundary,
             )
+        checkpoint = import_history_checkpoint(checkpoint, session=session)
         records_by_interaction: dict[str, list] = {}
         for record in targeted_tool_grant_state.records:
             records_by_interaction.setdefault(record.interaction_id, []).append(record)

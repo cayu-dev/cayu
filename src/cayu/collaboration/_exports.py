@@ -1,6 +1,38 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ExportLimits": ("cayu.collaboration.exports", "ExportLimits"),
+    "SessionExportAcceptance": ("cayu.collaboration.exports", "SessionExportAcceptance"),
+    "SessionExportAcceptanceReader": (
+        "cayu.collaboration.exports",
+        "SessionExportAcceptanceReader",
+    ),
+    "SessionExportAccessContext": ("cayu.collaboration.exports", "SessionExportAccessContext"),
+    "SessionExportAction": ("cayu.collaboration.exports", "SessionExportAction"),
+    "SessionExportAuthorization": ("cayu.collaboration.exports", "SessionExportAuthorization"),
+    "SessionExportCapacityExceeded": (
+        "cayu.collaboration.exports",
+        "SessionExportCapacityExceeded",
+    ),
+    "SessionExportConflict": ("cayu.collaboration.exports", "SessionExportConflict"),
+    "SessionExportDenied": ("cayu.collaboration.exports", "SessionExportDenied"),
+    "SessionExportIntent": ("cayu.collaboration.exports", "SessionExportIntent"),
+    "SessionExportNamespace": ("cayu.collaboration.exports", "SessionExportNamespace"),
+    "SessionExportPolicy": ("cayu.collaboration.exports", "SessionExportPolicy"),
+    "SessionExportProjector": ("cayu.collaboration.exports", "SessionExportProjector"),
+    "SessionExportReceipt": ("cayu.collaboration.exports", "SessionExportReceipt"),
+    "SessionExportRef": ("cayu.collaboration.exports", "SessionExportRef"),
+    "SessionExportRegistration": ("cayu.collaboration.exports", "SessionExportRegistration"),
+    "SessionExportRequest": ("cayu.collaboration.exports", "SessionExportRequest"),
+    "SessionExportSettlementReceipt": (
+        "cayu.collaboration.exports",
+        "SessionExportSettlementReceipt",
+    ),
+    "SessionExportSettlementRequest": (
+        "cayu.collaboration.exports",
+        "SessionExportSettlementRequest",
+    ),
+    "SessionExportUnavailable": ("cayu.collaboration.exports", "SessionExportUnavailable"),
     "CollaborationHistoryUnavailable": (
         "cayu.collaboration.lifecycle",
         "CollaborationHistoryUnavailable",

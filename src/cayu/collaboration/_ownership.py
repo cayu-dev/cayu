@@ -28,6 +28,7 @@ class _MutationOwners:
         key: tuple[object, ...],
         expectation: bytes,
         redactor: SecretRedactor,
+        failure_snapshot: Callable[[BaseException], BaseException] | None = None,
     ) -> T:
         cancelled = False
         try:
@@ -70,7 +71,11 @@ class _MutationOwners:
             if task.done() and not task.cancelled():
                 error = task.exception()
                 if error is not None:
-                    diagnostic = safe_failure(error, redactor=redactor)
+                    diagnostic = (
+                        safe_failure(error, redactor=redactor)
+                        if failure_snapshot is None
+                        else failure_snapshot(error)
+                    )
             raise asyncio.CancelledError(
                 "Collaboration observation cancelled; reconcile the exact operation."
             ) from diagnostic

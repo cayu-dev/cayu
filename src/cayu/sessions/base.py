@@ -649,6 +649,9 @@ UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.SESSION_COMPLETED,
         EventType.SESSION_FAILED,
         EventType.SESSION_INTERRUPTED,
+        EventType.SESSION_EXPORT_PUBLISHED,
+        EventType.SESSION_EXPORT_RELEASED,
+        EventType.SESSION_EXPORT_RETIRED,
         EventType.HOOK_STARTED,
         EventType.HOOK_COMPLETED,
         EventType.HOOK_FAILED,
@@ -4911,10 +4914,19 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     replacement: dict[str, Any],
     *,
     preserve_completion_result_publications: bool = True,
+    preserve_session_exports: bool = True,
     session_id: str,
 ) -> dict[str, Any]:
     """Replace caller state while retaining decoded runtime-owned checkpoint authority."""
 
+    from cayu.collaboration import _session_export_store as session_exports
+
+    # Validate before decoding can normalize caller-controlled authority.
+    export_root = (
+        session_exports.project_checkpoint_root(current, replacement, session_id=session_id)
+        if preserve_session_exports
+        else None
+    )
     authoritative_current = current
     if current is not None and not (
         type(current.get(CHECKPOINT_SCHEMA_VERSION_KEY)) is int
@@ -5013,6 +5025,9 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
             # Retained authority therefore remains attached only to current-schema
             # ordinary state.
             assert updated[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+    updated.pop(session_exports.ROOT_KEY, None)
+    if export_root is not None:
+        updated[session_exports.ROOT_KEY] = export_root
     # Restored private authority counts toward the same complete document
     # ceiling as the callback's ordinary state, before either side is written.
     return copy_durable_json_object(updated, "checkpoint")
@@ -5024,6 +5039,8 @@ def _copy_checkpoint_for_transform(
     session_id: str,
 ) -> dict[str, Any] | None:
     """Validate and detach callback-visible state from store-owned authority."""
+
+    from cayu.collaboration import _session_export_store as session_exports
 
     if checkpoint is None:
         return None
@@ -5048,6 +5065,8 @@ def _copy_checkpoint_for_transform(
         copied.pop(BROWSER_CONTROLS_CHECKPOINT_KEY, None)
     if not lifecycle_authority_allowed:
         copied.pop(MODEL_FAILOVER_CHECKPOINT_KEY, None)
+    if not session_exports.checkpoint_visible(session_id=session_id):
+        copied.pop(session_exports.ROOT_KEY, None)
     return copied
 
 
@@ -5450,6 +5469,7 @@ def transform_fork_checkpoint(
         return _replace_checkpoint_preserving_completion_result_event_publications(
             None,
             transformed,
+            preserve_session_exports=False,
             session_id=source_session.id,
         )
     except BaseException:
@@ -9922,6 +9942,85 @@ def _authenticated_public_authority_alias_private_value(
     return private_value if authenticated else None
 
 
+_SESSION_EXPORT_OWNER_METHODS = (
+    "__getattr__",
+    "load",
+    "load_checkpoint",
+    "load_session_operation",
+    "load_transcript_window",
+    "create",
+    "create_fork",
+    "create_fork_with_transcript_validation",
+    "create_profiled_fork",
+    "_create_fork",
+    "checkpoint",
+    "transform_checkpoint",
+    "transform_checkpoint_with_store_time",
+    "transition_status_and_checkpoint",
+    "admit_session_invocation",
+    "admit_execution_profile_resume",
+    "fence_run_and_transform_checkpoint",
+    "replace_initial_transcript_messages",
+    "append_transcript_messages_and_transform_checkpoint",
+    "append_event",
+    "append_events",
+    "publish_checkpoint_and_events",
+    "publish_checkpoint_and_events_with_store_time",
+    "_publish_checkpoint_and_events",
+    "publish_session_operation",
+    "publish_session_operation_guarded",
+    "publish_session_operation_guarded_with_store_time",
+    "_publish_session_operation",
+    "publish_runtime_publication",
+    "_publish_runtime_publication_atomic",
+    "_prepare_checkpoint_store_unlocked",
+    "_apply_checkpoint_store_unlocked",
+    "_store_checkpoint_unlocked",
+    "_upsert_checkpoint",
+    "_prepare_event_append_unlocked",
+    "_append_events_unlocked",
+    "_append_events_with_cursor",
+    "_load_checkpoint_unlocked",
+    "_load_checkpoint",
+    "_load_unlocked",
+    "_load_for_update",
+    "_publish_completion_result_event_publication",
+    "delete_session",
+    "validate_session_closure_admission",
+    "claim_session_closure_progress",
+    "_require_session_erasure_quiescence_unlocked",
+    "_require_session_erasure_quiescence",
+    "_run_write",
+    "_run_read",
+    "_connection",
+)
+
+
+def _session_export_methods_owned(store: object) -> bool:
+    """An override must explicitly re-attest the complete export owner boundary."""
+    mro = type(store).__mro__
+    capability_owner = next(
+        (index for index, owner in enumerate(mro) if "session_export_version" in vars(owner)),
+        len(mro),
+    )
+    if capability_owner == len(mro):
+        return False
+    instance_fields = vars(store)
+    if "session_export_version" in instance_fields:
+        return False
+    for method in _SESSION_EXPORT_OWNER_METHODS:
+        method_owner = next(
+            (index for index, owner in enumerate(mro) if method in vars(owner)), len(mro)
+        )
+        # SQLite's _connection is an owned resource field, whereas PostgreSQL's
+        # is a method. Only the latter can be shadowed as a method override.
+        if method in instance_fields and not (method == "_connection" and method_owner == len(mro)):
+            return False
+        if method_owner < capability_owner:
+            return False
+    return True
+
+
 class SessionStore(ABC):
     """Persistent store for sessions and append-only events.
 
@@ -9939,6 +10038,7 @@ class SessionStore(ABC):
 
     # Custom stores must opt into optional capabilities explicitly. Conservative
     # defaults keep discovery truthful for inherited methods that fail closed.
+    session_export_version: ClassVar[int] = 0
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False
@@ -11351,6 +11451,14 @@ class SessionStore(ABC):
         expected_transcript_cursor: int | None = None,
     ) -> Session:
         """Atomically publish a checkpoint, events, and terminal operation records."""
+
+    def _supports_session_export_protocol(self) -> bool:
+        """Qualify exact owner methods, not an inherited version flag alone."""
+        return (
+            type(self.session_export_version) is int
+            and self.session_export_version == 1
+            and _session_export_methods_owned(self)
+        )
 
     def _supports_owned_off_thread_session_commit_guard_protocol(self) -> bool:
         """Return whether this exact guarded-publication override owns its capability."""
@@ -13124,6 +13232,7 @@ def _validate_closure_progress_update(existing: dict[str, Any], proposed: dict[s
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
+    session_export_version: ClassVar[int] = 1
     supports_session_closure_receipts: ClassVar[bool] = True
     supports_session_closure_detachment: ClassVar[bool] = True
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
@@ -15545,9 +15654,19 @@ class InMemorySessionStore(SessionStore):
 
     def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
+        from cayu.collaboration import _session_export_store as session_exports
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
 
         session_id = session.id
+        session_exports.require_erasure_quiescence(
+            session=session,
+            checkpoint=self._checkpoints.get(session_id),
+            export_records={
+                key: value
+                for key, value in self._session_operation_records.get(session_id, {}).items()
+                if key.startswith(session_exports.OPERATION_PREFIX)
+            },
+        )
         for key, raw in self._session_operation_records.get(session_id, {}).items():
             if key.startswith("tool-effect:"):
                 require_terminal_protected_effect(session_id, session.instance_id, key, raw)
@@ -18990,6 +19109,7 @@ class InMemorySessionStore(SessionStore):
             "idempotency_key",
             browser_control_read=True,
         )
+        _require_session_export_target(session_id, idempotency_key)
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
@@ -19165,6 +19285,7 @@ class InMemorySessionStore(SessionStore):
         )
         if (operation_transform is None) == (store_time_operation_transform is None):
             raise TypeError("Exactly one session operation transform is required.")
+        _require_session_export_target(session_id, idempotency_key)
         allowed_statuses = (
             None
             if expected_statuses is None
@@ -19200,10 +19321,18 @@ class InMemorySessionStore(SessionStore):
             current_record = self._session_operation_records.get(session_id, {}).get(
                 idempotency_key
             )
+            from cayu.collaboration import _session_export_store as session_exports
+
             callback_session = session.model_copy(deep=True)
             callback_checkpoint = (
                 None if current_checkpoint is None else deepcopy(current_checkpoint)
             )
+            # Keep the raw operation callback's existing view of sibling state;
+            # only the newly private export root changes visibility here.
+            if callback_checkpoint is not None and not session_exports.checkpoint_visible(
+                session_id=session_id
+            ):
+                callback_checkpoint.pop(session_exports.ROOT_KEY, None)
             callback_record = (
                 None
                 if current_record is None
@@ -19243,6 +19372,31 @@ class InMemorySessionStore(SessionStore):
                 "operation_records",
             )
             _validate_session_operation_record_keys(copied_records)
+
+            indices = session_exports.selected_transcript_indices(session_id=session_id)
+            if (
+                indices
+                or session_exports.checkpoint_visible(session_id=session_id)
+                or any(key.startswith(session_exports.OPERATION_PREFIX) for key in copied_records)
+            ):
+                messages = self._transcripts.get(session_id, [])
+                interaction_ids = self._transcript_interaction_ids.get(session_id, [])
+                session_exports.validate_publication(
+                    session=session,
+                    current_checkpoint=current_checkpoint,
+                    proposed_checkpoint=copied_checkpoint,
+                    operation_records=copied_records,
+                    selected_transcript_rows=tuple(
+                        TranscriptRecord(
+                            index=index,
+                            interaction_id=interaction_ids[index],
+                            message=detach_message(messages[index]),
+                        )
+                        for index in sorted(set(indices))
+                        if 0 <= index < len(messages)
+                    ),
+                    events=copied_events,
+                )
             release = publication.model_completion_stage_release
             if release is not None:
                 operation_records = self._session_operation_records.get(session_id, {})
@@ -25314,10 +25468,12 @@ def validate_profiled_fork_evidence(
 def _reject_reserved_runtime_publication_key(
     value: str, field_name: str, *, browser_control_read: bool = False
 ) -> str:
+    from cayu.collaboration._session_export_store import require_operation_key_access
     from cayu.runtime._argument_continuity import require_private_key_access
     from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
 
     value = require_clean_nonblank(value, field_name)
+    require_operation_key_access(value, read=browser_control_read)
     require_private_key_access(value, read=browser_control_read)
     if not browser_control_read:
         require_browser_control_operation_owner(value)
@@ -25334,6 +25490,15 @@ def _reject_reserved_runtime_publication_key(
     if value.startswith(CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved child-notification namespace.")
     return value
+
+
+def _require_session_export_target(session_id: str, key: str) -> None:
+    """Bind private key access to its target before returning callback input."""
+    from cayu.collaboration._session_export_store import OPERATION_PREFIX, checkpoint_visible
+    from cayu.collaboration.exports import SessionExportConflict
+
+    if key.startswith(OPERATION_PREFIX) and not checkpoint_visible(session_id=session_id):
+        raise SessionExportConflict()
 
 
 def _interaction_transition_storage_key(event_id: str) -> str:
@@ -25877,11 +26042,13 @@ def _validate_invocation_release_settlement_receipt_authority(
 
 
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
+    from cayu.collaboration._session_export_store import require_operation_record_owner
     from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
 
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")
         require_browser_control_operation_owner(key, records[key])
+        require_operation_record_owner(key, records[key])
 
 
 def _prepare_initial_session_operation_records(
@@ -25904,6 +26071,10 @@ def _prepare_initial_session_operation_records(
         dict(raw_records),
         "initial_session_operation_records",
     )
+    from cayu.collaboration._session_export_store import OPERATION_PREFIX
+
+    if any(key.startswith(OPERATION_PREFIX) for key in copied):
+        raise ValueError("Session export records require their publication owner.")
     _validate_session_operation_record_keys(copied)
     for record in copied.values():
         if type(record) is not dict:
@@ -26161,10 +26332,14 @@ def _apply_runtime_publication_checkpoint_mutation(
     mutation: RuntimePublicationMutation,
     checkpoint: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    from cayu.collaboration._session_export_store import ROOT_KEY
+
     if checkpoint is None and not mutation.operations:
         return None
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
     for operation in mutation.operations:
+        if operation.key == ROOT_KEY:
+            raise ValueError("Session export authority requires its publication owner.")
         if operation.key == MODEL_FAILOVER_CHECKPOINT_KEY:
             raise ValueError("Only model-stage preparation may mutate model failover authority.")
         present = operation.key in updated
@@ -26211,8 +26386,12 @@ def _apply_runtime_publication_operation_record_mutations(
     mutations: tuple[RuntimePublicationOperationRecordMutation, ...],
     records: Mapping[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    from cayu.collaboration._session_export_store import OPERATION_PREFIX
+
     updated = dict(records)
     for mutation in mutations:
+        if mutation.key.startswith(OPERATION_PREFIX):
+            raise ValueError("Session export records require their publication owner.")
         current = updated.get(mutation.key)
         matches = (
             current is None
@@ -31463,6 +31642,12 @@ def _validate_runtime_publication_durable_material(
 
 
 def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str, ...]:
+    if event_type in {
+        EventType.SESSION_EXPORT_PUBLISHED,
+        EventType.SESSION_EXPORT_RELEASED,
+        EventType.SESSION_EXPORT_RETIRED,
+    }:
+        return ("export_commitment", "output_commitment")
     if event_type == EventType.SESSION_STARTED:
         return (
             "parent_session_id",
@@ -31527,8 +31712,16 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
 def _copy_event_for_session_store(event: Event) -> Event:
     """Strip caller-authored durable authority before persistence."""
 
+    from cayu.collaboration._session_export_store import require_event_publication
+
+    # Check provenance and exact owner bytes before copying can normalize input,
+    # then recheck the detached value that is actually sent to persistence.
+    # Leave rejection of non-exact events to the existing copy_event contract.
+    if type(event) is Event:
+        require_event_publication(event)
     copied = copy_event(event)
     validate_event_envelope(copied)
+    require_event_publication(copied)
     authority_fields = _persisted_event_authority_fields(copied.type)
     if not authority_fields:
         return copied

@@ -406,6 +406,7 @@ from cayu.sessions.base import (
     _require_invocation_release_settlement_record,
     _require_invocation_release_terminal_session_event,
     _require_live_incomplete_recovery_claim_for_run_epoch_transfer,
+    _require_session_export_target,
     _runtime_publication_json_equal,
     _runtime_publication_receipt_record,
     _runtime_publication_referenced_event_ids,
@@ -2000,6 +2001,7 @@ class SQLiteSessionStore(SessionStore):
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
+    session_export_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -5190,15 +5192,18 @@ class SQLiteSessionStore(SessionStore):
     def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
+        from cayu.collaboration import _session_export_store as session_exports
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
 
         session_id = session.id
+        export_records: dict[str, dict[str, Any]] = {}
         # Allow JSON escaping/whitespace overhead; the shared validator applies
         # the durable document limit before model reconstruction.
         rows = self._connection.execute(
             "SELECT idempotency_key, CASE WHEN length(CAST(record_json AS BLOB)) <= ? "
             "THEN record_json END FROM cayu_session_operations "
-            "WHERE session_id = ? AND idempotency_key GLOB 'tool-effect:*'",
+            "WHERE session_id = ? AND (idempotency_key GLOB 'tool-effect:*' "
+            "OR idempotency_key GLOB 'session-export:*')",
             (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id),
         )
         try:
@@ -5209,7 +5214,12 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(
                         "Session closure requires settled protected tool effects."
                     ) from None
-                require_terminal_protected_effect(session_id, session.instance_id, key, value)
+                if key.startswith(session_exports.OPERATION_PREFIX):
+                    if type(value) is not dict:
+                        raise ValueError("Session export retention evidence is malformed.")
+                    export_records[key] = value
+                else:
+                    require_terminal_protected_effect(session_id, session.instance_id, key, value)
         finally:
             rows.close()
         if session.status in DELETE_BLOCKED_SESSION_STATUSES:
@@ -5225,6 +5235,9 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = self._load_checkpoint_unlocked(session_id)
         deletion_now = self._ownership_clock()
+        session_exports.require_erasure_quiescence(
+            session=session, checkpoint=checkpoint, export_records=export_records
+        )
         active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
             checkpoint,
             now=deletion_now,
@@ -9429,6 +9442,7 @@ class SQLiteSessionStore(SessionStore):
             "idempotency_key",
             browser_control_read=True,
         )
+        _require_session_export_target(session_id, idempotency_key)
 
         checkpoint_root_key = (
             "__cayu_no_checkpoint_root_guard__"
@@ -11218,6 +11232,11 @@ class SQLiteSessionStore(SessionStore):
             operation_transform is not None or store_time_operation_transform is not None
         ) and operation_idempotency_key is None:
             raise TypeError("operation_idempotency_key is required.")
+        from cayu.collaboration import _session_export_store as session_exports
+
+        if operation_idempotency_key is not None:
+            session_exports.require_operation_key_access(operation_idempotency_key, read=False)
+            _require_session_export_target(session_id, operation_idempotency_key)
         allowed_statuses = (
             None
             if expected_statuses is None
@@ -11302,6 +11321,41 @@ class SQLiteSessionStore(SessionStore):
                     )
                     model_completion_stage_release = publication.model_completion_stage_release
                     _validate_session_operation_record_keys(operation_records)
+                    indices = session_exports.selected_transcript_indices(session_id=session_id)
+                    if (
+                        indices
+                        or session_exports.checkpoint_visible(session_id=session_id)
+                        or any(
+                            key.startswith(session_exports.OPERATION_PREFIX)
+                            for key in operation_records
+                        )
+                    ):
+                        selected_rows: tuple[TranscriptRecord, ...] = ()
+                        if indices:
+                            placeholders = ",".join("?" for _ in indices)
+                            rows = connection.execute(
+                                "SELECT session_order - 1 AS transcript_index, "
+                                "interaction_id, message_json FROM cayu_transcript_messages "
+                                f"WHERE session_id = ? AND session_order IN ({placeholders}) "
+                                "ORDER BY session_order",
+                                (session_id, *(index + 1 for index in indices)),
+                            ).fetchall()
+                            selected_rows = tuple(
+                                TranscriptRecord(
+                                    index=row["transcript_index"],
+                                    interaction_id=row["interaction_id"],
+                                    message=Message(**json.loads(row["message_json"])),
+                                )
+                                for row in rows
+                            )
+                        session_exports.validate_publication(
+                            session=loaded,
+                            current_checkpoint=current_checkpoint,
+                            proposed_checkpoint=transformed,
+                            operation_records=operation_records,
+                            selected_transcript_rows=selected_rows,
+                            events=copied_events,
+                        )
                 else:
                     if checkpoint_transform is not None:
                         transformed = checkpoint_transform(loaded, callback_checkpoint)

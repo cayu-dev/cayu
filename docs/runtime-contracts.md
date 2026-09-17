@@ -4488,6 +4488,12 @@ resume semantics when appended to another store. Do not restore JSONL obtained
 from an untrusted source. JSONL should not be the primary Cayu session store;
 live execution requires indexed queries and transactional state updates.
 
+For registered session exports, trusted JSONL restores exact event history,
+not the private source-owned export namespace or output/receipt records. Import
+rejects pending export responsibilities; settle them at the source first.
+Settled namespace roots are omitted on import, without granting export replay
+or payload access at the destination. See [session exports](session-exports.md).
+
 Session stores expose two read surfaces:
 
 - `load_events(session_id)` returns the full event list for one session.

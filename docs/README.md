@@ -38,6 +38,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Approved remote Git delivery](remote-git-delivery.md)
 - [Process-isolated host tools](process-isolated-tools.md)
 - [Server configuration](server-configuration.md)
+- [Registered session exports](session-exports.md)
 - [Session inspection](session-inspection.md)
 - [Session-message lifecycle](session-message-lifecycle.md)
 - [Session-store targets](session-store-targets.md)

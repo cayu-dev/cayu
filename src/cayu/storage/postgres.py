@@ -478,6 +478,7 @@ from cayu.sessions.base import (
     _require_invocation_release_settlement_record,
     _require_invocation_release_terminal_session_event,
     _require_live_incomplete_recovery_claim_for_run_epoch_transfer,
+    _require_session_export_target,
     _run_session_commit_guard_owned,
     _runtime_publication_json_equal,
     _runtime_publication_receipt_record,
@@ -25153,6 +25154,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
+    session_export_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -28381,9 +28383,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def _require_session_erasure_quiescence(self, cur, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
+        from cayu.collaboration import _session_export_store as session_exports
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
 
         session_id = session.id
+        export_records: dict[str, dict[str, Any]] = {}
         after_key = ""
         while True:
             # Read one bounded document at a time, allowing JSON text overhead.
@@ -28391,13 +28395,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             await cur.execute(
                 "SELECT idempotency_key, CASE WHEN octet_length(record::text) <= %s "
                 "THEN record END FROM cayu_session_operations "
-                "WHERE session_id = %s AND idempotency_key LIKE 'tool-effect:%%' "
+                "WHERE session_id = %s AND (idempotency_key LIKE 'tool-effect:%%' "
+                "OR idempotency_key LIKE 'session-export:%%') "
                 "AND idempotency_key > %s ORDER BY idempotency_key LIMIT 1",
                 (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id, after_key),
             )
             effects = await cur.fetchall()
             for key, raw in effects:
-                require_terminal_protected_effect(session_id, session.instance_id, key, raw)
+                if key.startswith(session_exports.OPERATION_PREFIX):
+                    if type(raw) is not dict:
+                        raise ValueError("Session export retention evidence is malformed.")
+                    export_records[key] = raw
+                else:
+                    require_terminal_protected_effect(session_id, session.instance_id, key, raw)
             if not effects:
                 break
             after_key = effects[-1][0]
@@ -28412,6 +28422,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = await self._load_checkpoint(cur, session_id)
         deletion_now = await self._session_store_now(cur)
+        session_exports.require_erasure_quiescence(
+            session=session, checkpoint=checkpoint, export_records=export_records
+        )
         active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
             checkpoint,
             now=deletion_now,
@@ -33050,6 +33063,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             "idempotency_key",
             browser_control_read=True,
         )
+        _require_session_export_target(session_id, idempotency_key)
         await self._ensure_ready()
         checkpoint_root_key = (
             "__cayu_no_checkpoint_root_guard__"
@@ -34861,6 +34875,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             operation_transform is not None or store_time_operation_transform is not None
         ) and operation_idempotency_key is None:
             raise TypeError("operation_idempotency_key is required.")
+        from cayu.collaboration import _session_export_store as session_exports
+
+        if operation_idempotency_key is not None:
+            session_exports.require_operation_key_access(operation_idempotency_key, read=False)
+            _require_session_export_target(session_id, operation_idempotency_key)
         allowed_statuses = (
             None
             if expected_statuses is None
@@ -34951,6 +34970,40 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                         model_completion_stage_release = publication.model_completion_stage_release
                         _validate_session_operation_record_keys(operation_records)
+                        indices = session_exports.selected_transcript_indices(session_id=session_id)
+                        if (
+                            indices
+                            or session_exports.checkpoint_visible(session_id=session_id)
+                            or any(
+                                key.startswith(session_exports.OPERATION_PREFIX)
+                                for key in operation_records
+                            )
+                        ):
+                            selected_rows: tuple[TranscriptRecord, ...] = ()
+                            if indices:
+                                await cur.execute(
+                                    "SELECT session_order - 1, interaction_id, message "
+                                    "FROM cayu_transcript_messages "
+                                    "WHERE session_id = %s AND session_order = ANY(%s) "
+                                    "ORDER BY session_order",
+                                    (session_id, [index + 1 for index in indices]),
+                                )
+                                selected_rows = tuple(
+                                    TranscriptRecord(
+                                        index=row[0],
+                                        interaction_id=row[1],
+                                        message=Message(**_json_obj(row[2])),
+                                    )
+                                    for row in await cur.fetchall()
+                                )
+                            session_exports.validate_publication(
+                                session=loaded,
+                                current_checkpoint=current_checkpoint,
+                                proposed_checkpoint=transformed,
+                                operation_records=operation_records,
+                                selected_transcript_rows=selected_rows,
+                                events=copied_events,
+                            )
                     else:
                         if checkpoint_transform is not None:
                             transformed = checkpoint_transform(loaded, callback_checkpoint)
