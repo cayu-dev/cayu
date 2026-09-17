@@ -68,6 +68,7 @@ from cayu.egress.policy import BrowserEgressPolicy as BrowserEgressPolicy
 from cayu.egress.policy import EgressPolicy as EgressPolicy
 from cayu.egress.policy import EgressRequest as EgressRequest
 from cayu.egress.policy import HttpEgressPolicy as HttpEgressPolicy
+from cayu.egress.policy import PublicWebEgressPolicy as PublicWebEgressPolicy
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure as VpcTaskProxyExposure
 from cayu.egress.runtime import VIRTUAL_EGRESS_EVENT_TYPES as VIRTUAL_EGRESS_EVENT_TYPES
 from cayu.egress.runtime import VIRTUAL_EGRESS_RECONNECT_VERSION as VIRTUAL_EGRESS_RECONNECT_VERSION

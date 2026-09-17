@@ -1468,3 +1468,65 @@ reports a bounded, secret-free error; calling `close()` again resumes or retries
 the same cleanup tasks. Only a completed teardown is marked closed. Prepare and
 factory rollback use the same deadline and annotate the original failure with
 safe cleanup-phase/type evidence if rollback remains incomplete.
+
+### Credentialless public-web research
+
+Applications may explicitly admit public HTTPS research without enumerating future
+hosts. Keep this environment separate from credentialed integrations:
+
+```python
+from cayu import PublicWebEgressPolicy, VirtualEgressEnvironmentFactory
+from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
+
+research = VirtualEgressEnvironmentFactory(
+    policies={"research-v1": PublicWebEgressPolicy(name="research-v1")},
+    public_web_policy="research-v1",
+    runner_kind="docker",
+    image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+)
+```
+
+`public_web_policy` is application configuration. A model URL only requests a
+destination. Every navigation, redirect, popup and subresource still passes through
+the enforcing adapter and broker. Existing applications retain concrete-destination,
+deny-by-default behavior. Browser popup admission remains an additional independent
+restriction; public research does not implicitly enable popups.
+
+This mode permits only bodyless GET/HEAD over HTTPS port 443, using canonical FQDNs.
+IP literals and ambiguous authorities are rejected. Before each upstream connection,
+the owned resolver validates **every** returned address as public, and the transport
+connects to that checked address while retaining the original TLS hostname. Redirects
+are not followed by the upstream client: their subsequent browser requests undergo
+the same checks. Private, loopback, link-local and metadata addresses, including DNS
+rebinding to them, fail before an upstream connection. Browser request/redirect,
+response-byte, operation and lifetime limits and broker concurrency/time limits
+continue to apply.
+
+Public research cannot be combined with credentials, a secret resolver or approved
+integration destinations. Origin request headers (including authorization, cookies,
+referer and custom headers) are replaced with fixed public-research headers before
+forwarding; no credential resolution occurs. Do not place workload secrets in a
+research workspace or application-authored URLs. Routing/transport overrides and
+alternate upstream implementations are refused in this mode. The optional resolver
+is trusted application infrastructure and its answers still undergo public-IP checks.
+
+The durable egress authority records `kind="public_web"` with no concrete bindings.
+Its policy name, authority generation and policy version participate in the stable
+fingerprint. Reconnect requires that exact authority; policy changes require the
+existing governed authority replacement path. Comparisons with changed research
+policies are conservative (`incomparable`), never inferred narrowing. Each concrete
+request decision uses the ordinary egress audit stream, including denial and upstream
+failure. Revocation drains in-flight work and closes new CONNECT/request admission;
+renewal reopens only the same authority. No discovered-host grants are cached or
+restored as independent permission. A reserved `.invalid` hostname is used solely
+for the adapter's local CONNECT/TLS preflight; no upstream request resolves it.
+
+Qualification without external websites:
+
+```sh
+CAYU_RUN_PUBLIC_WEB_ACCEPTANCE=1 uv run pytest tests/egress/test_public_web_docker.py
+```
+
+The fixture uses the real broker and pinned browser. Test-owned synthetic DNS answers
+exercise production IP validation before routing admitted public addresses to a local
+fixture server. No production route override is enabled.

@@ -41,7 +41,12 @@ from cayu.egress.destinations import (
 )
 from cayu.egress.errors import VirtualCredentialError
 from cayu.egress.grants import VirtualCredentialGrant, VirtualCredentialRegistry
-from cayu.egress.policy import BrowserEgressPolicy, EgressPolicy, EgressRequest
+from cayu.egress.policy import (
+    BrowserEgressPolicy,
+    EgressPolicy,
+    EgressRequest,
+    PublicWebEgressPolicy,
+)
 from cayu.vaults import (
     REDACTED_SECRET,
     ResolvedSecret,
@@ -828,6 +833,7 @@ class TransparentEgressBroker:
         resolver: SecretResolver | None = None,
         policies: Mapping[str, EgressPolicy],
         approved_destinations: Sequence[ApprovedEgressDestination] = (),
+        public_web_policy: str | None = None,
         upstream: EgressUpstream | None = None,
         audit: Callable[[EgressDecision], None] | None = None,
         require_test_mode_credentials: bool = True,
@@ -847,6 +853,24 @@ class TransparentEgressBroker:
         self._resolver = resolver
         self._policies = dict(policies)
         self._approved_destinations = _approved_destination_map(approved_destinations)
+        self._public_web_policy = public_web_policy
+        if public_web_policy is not None:
+            if type(policies.get(public_web_policy)) is not PublicWebEgressPolicy:
+                raise ValueError("public_web_policy must name a PublicWebEgressPolicy.")
+            if (
+                resolver is not None
+                or approved_destinations
+                or registry.active_grants()
+                or len(policies) != 1
+            ):
+                raise ValueError("Public research requires a separate credentialless broker.")
+            if upstream is not None and type(upstream) is not HttpxUpstream:
+                raise ValueError("Public research requires the checked, pinned HttpxUpstream.")
+            if upstream is not None and (upstream._routes or upstream._transport is not None):
+                raise ValueError("Public research cannot override upstream routing or transport.")
+
+        elif any(type(policy) is PublicWebEgressPolicy for policy in policies.values()):
+            raise ValueError("PublicWebEgressPolicy requires explicit public_web_policy admission.")
         self._credentialless_authority_active = True
         self._credentialless_active_requests = 0
         self._credentialless_idle = asyncio.Event()
@@ -883,7 +907,7 @@ class TransparentEgressBroker:
     def has_credentialless_destinations(self) -> bool:
         """Whether the broker requires an isolated, independently authenticated transport."""
 
-        return bool(self._approved_destinations)
+        return bool(self._approved_destinations) or self._public_web_policy is not None
 
     async def authorize_connect_destination(self, *, host: str, port: int) -> bool:
         """Return positive coarse authority before the proxy mints a leaf certificate.
@@ -959,6 +983,10 @@ class TransparentEgressBroker:
             normalized_host = normalize_egress_hostname(host, field_name="CONNECT host")
         except (TypeError, ValueError):
             return None
+        if self._credentialless_authority_active and self._public_web_policy is not None:
+            return (
+                normalized_host if PublicWebEgressPolicy.admits_hostname(normalized_host) else None
+            )
         destination = self._approved_destinations.get((normalized_host, "https", port))
         if (
             self._credentialless_authority_active
@@ -979,6 +1007,10 @@ class TransparentEgressBroker:
         if type(request) is not CapturedRequest:
             raise TypeError("request must be a CapturedRequest instance.")
         request = CapturedRequest(**request.model_dump(mode="python", warnings=False))
+        if self._public_web_policy is not None:
+            # Never let a discovered host enter credential resolution, even if
+            # a workload presents a virtual credential or an origin cookie.
+            return await self._handle_credentialless(request)
         presented = extract_presented_credential(request.headers)
         if presented is None:
             if self._approved_destinations:
@@ -1108,7 +1140,9 @@ class TransparentEgressBroker:
                     policy_name=policy.name,
                     authorization_kind="virtual_credential",
                     secrets=(real_secret,),
-                    require_identity_encoding=isinstance(policy, BrowserEgressPolicy),
+                    require_identity_encoding=isinstance(
+                        policy, (BrowserEgressPolicy, PublicWebEgressPolicy)
+                    ),
                 ),
                 ensure_authority=lease.ensure_active,
             )
@@ -1121,6 +1155,17 @@ class TransparentEgressBroker:
     ) -> ApprovedEgressDestination | None:
         if not self._credentialless_authority_active:
             return None
+        if self._public_web_policy is not None:
+            if (
+                request.protocol != "https"
+                or request.port != 443
+                or not PublicWebEgressPolicy.admits_hostname(request.host)
+            ):
+                return None
+            return ApprovedEgressDestination(
+                destination=request.host,
+                policy_name=self._public_web_policy,
+            )
         return self._approved_destinations.get(
             (request.host, request.protocol, request.port),
         )
@@ -1269,14 +1314,24 @@ class TransparentEgressBroker:
                     authorization_kind="credentialless",
                     error_code="destination_denied",
                 )
+            forwarded = request
+            if self._public_web_policy is not None:
+                forwarded = CapturedRequest.model_validate(
+                    {
+                        **request.model_dump(mode="python"),
+                        "headers": {"Accept": "*/*", "User-Agent": "Cayu-Public-Research"},
+                    }
+                )
             return await self._forward_authorized(
                 request=request,
-                upstream_request=request,
+                upstream_request=forwarded,
                 authorization=_ForwardingAuthorization(
                     grant_id=None,
                     policy_name=policy.name,
                     authorization_kind="credentialless",
-                    require_identity_encoding=isinstance(policy, BrowserEgressPolicy),
+                    require_identity_encoding=isinstance(
+                        policy, (BrowserEgressPolicy, PublicWebEgressPolicy)
+                    ),
                 ),
                 ensure_authority=self._ensure_credentialless_authority,
             )

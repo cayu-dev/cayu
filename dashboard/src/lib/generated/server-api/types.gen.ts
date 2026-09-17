@@ -4723,7 +4723,7 @@ export type EgressAuthorityPolicyIdentity = {
     /**
      * Kind
      */
-    kind: 'http' | 'browser' | 'opaque';
+    kind: 'http' | 'browser' | 'opaque' | 'public_web';
     /**
      * Name
      */

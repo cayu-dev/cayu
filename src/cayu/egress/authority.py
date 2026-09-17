@@ -18,7 +18,12 @@ from pydantic import (
 
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 from cayu.egress.destinations import normalize_egress_hostname
-from cayu.egress.policy import BrowserEgressPolicy, EgressPolicy, HttpEgressPolicy
+from cayu.egress.policy import (
+    BrowserEgressPolicy,
+    EgressPolicy,
+    HttpEgressPolicy,
+    PublicWebEgressPolicy,
+)
 
 EGRESS_AUTHORITY_SCHEMA_VERSION = 1
 EGRESS_AUTHORITY_TEXT_MAX_BYTES = 256
@@ -96,7 +101,7 @@ class EgressAuthorityPolicyIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     name: str = Field(max_length=EGRESS_AUTHORITY_TEXT_MAX_BYTES)
-    kind: Literal["http", "browser", "opaque"]
+    kind: Literal["http", "browser", "opaque", "public_web"]
     allowed_destinations: tuple[str, ...] = ()
     operations: tuple[EgressAuthorityOperation, ...] = ()
     denied_path_prefixes: tuple[str, ...] = ()
@@ -154,7 +159,7 @@ class EgressAuthorityPolicyIdentity(BaseModel):
 
     @model_validator(mode="after")
     def validate_comparison(self) -> EgressAuthorityPolicyIdentity:
-        if self.kind == "opaque":
+        if self.kind in {"opaque", "public_web"}:
             if self.comparison_available:
                 raise ValueError("Opaque egress policies cannot claim semantic comparison.")
             if self.allowed_destinations or self.operations or self.denied_path_prefixes:
@@ -237,7 +242,7 @@ class EgressAuthorityIdentity(BaseModel):
     @classmethod
     def validate_bindings(cls, value: Any) -> tuple[EgressAuthorityBindingIdentity, ...]:
         bindings = tuple(value)
-        if not bindings or len(bindings) > EGRESS_AUTHORITY_MAX_BINDINGS:
+        if len(bindings) > EGRESS_AUTHORITY_MAX_BINDINGS:
             raise ValueError("Egress authority must contain a bounded non-empty binding set.")
         copied = tuple(
             item
@@ -266,6 +271,10 @@ class EgressAuthorityIdentity(BaseModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> EgressAuthorityIdentity:
+        if not self.bindings and not (
+            len(self.policies) == 1 and self.policies[0].kind == "public_web"
+        ):
+            raise ValueError("Only public-web authority may omit concrete destination bindings.")
         policy_names = {policy.name for policy in self.policies}
         if any(binding.policy_name not in policy_names for binding in self.bindings):
             raise ValueError("Egress authority bindings must reference a declared policy.")
@@ -551,6 +560,12 @@ def build_egress_authority_identity(
                 ),
                 denied_path_prefixes=policy.denied_prefixes,
                 comparison_available=True,
+            )
+        elif type(policy) is PublicWebEgressPolicy:
+            identity = EgressAuthorityPolicyIdentity(
+                name=name,
+                kind="public_web",
+                comparison_available=False,
             )
         else:
             identity = EgressAuthorityPolicyIdentity(

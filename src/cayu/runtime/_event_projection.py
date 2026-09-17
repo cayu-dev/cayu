@@ -507,7 +507,7 @@ _PROVIDER_OPERATION_RESOLUTION_ACTION_VALUES = frozenset(
 )
 _EGRESS_AUTHORITY_CHANGE_VALUES = frozenset(item.value for item in EgressAuthorityChangeKind)
 _EGRESS_AUTHORITY_STRATEGY_VALUES = frozenset(item.value for item in EgressAuthorityCutoverStrategy)
-_EGRESS_AUTHORITY_POLICY_KIND_VALUES = frozenset({"http", "browser", "opaque"})
+_EGRESS_AUTHORITY_POLICY_KIND_VALUES = frozenset({"http", "browser", "opaque", "public_web"})
 _EGRESS_AUTHORITY_OPERATION_MATCH_VALUES = frozenset({"exact", "prefix"})
 _RESOLUTION_ACTOR_SOURCE_VALUES = frozenset(item.value for item in ResolutionActorSource)
 _EGRESS_AUTHORITY_EVENT_STATES = {

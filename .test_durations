@@ -35129,5 +35129,16 @@
     "tests/core/test_tool_result_projection.py::test_runtime_large_tool_result_is_settled_before_durable_event_admission[True]": 3.2091956259973813,
     "tests/core/test_tool_result_projection.py::test_runtime_retains_artifact_evidence_when_projected_envelope_is_too_large": 1.2853085019742139,
     "tests/core/test_tool_result_projection.py::test_store_identity_failure_retains_safe_durable_delivery_diagnostics": 0.9533452909963671,
-    "tests/core/test_tool_result_projection.py::test_store_identity_failure_survives_sqlite_reopen": 1.0672375409922097
+    "tests/core/test_tool_result_projection.py::test_store_identity_failure_survives_sqlite_reopen": 1.0672375409922097,
+    "tests/egress/test_public_web.py::test_broker_public_admission_rebinding_methods_secrets_and_revocation": 0.004247542034136131,
+    "tests/egress/test_public_web.py::test_public_reconnect_refuses_missing_or_stale_authority_before_adapter_access[None]": 0.0011092080094385892,
+    "tests/egress/test_public_web.py::test_public_reconnect_refuses_missing_or_stale_authority_before_adapter_access[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]": 0.0007833319832570851,
+    "tests/egress/test_public_web.py::test_public_web_is_explicit_and_durable": 0.029432292038109154,
+    "tests/egress/test_public_web_docker.py::test_public_web_discovery_and_private_redirect": 9.00132845796179,
+    "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[False-False-True]": 0.07646304101217538,
+    "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[False-True-False]": 0.07559033299912699,
+    "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[False-True-True]": 0.8390984160068911,
+    "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[True-False-True]": 0.07984745799330994,
+    "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[True-True-False]": 0.08022508301655762,
+    "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[True-True-True]": 0.07042449997970834
 }

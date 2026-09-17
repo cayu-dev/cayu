@@ -317,3 +317,33 @@ def _require_unambiguous_browser_path(path: str, *, field_name: str) -> str:
     if any(segment in {".", ".."} for segment in decoded.split("/")):
         raise ValueError(f"{field_name} contains a dot path segment.")
     return decoded
+
+
+class PublicWebEgressPolicy(EgressPolicy):
+    """Application-owned, credentialless public HTTPS GET/HEAD research.
+
+    Hostnames supplied by a workload are requests. The broker and its pinned
+    upstream remain responsible for public IP admission on every connection.
+    This policy has fixed semantics; changing its name changes durable authority.
+    """
+
+    def __init__(self, *, name: str) -> None:
+        self._name = require_clean_nonblank(name, "name")
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @staticmethod
+    def admits_hostname(host: str) -> bool:
+        # Numeric final labels are ambiguous IPv4 forms in browser URL parsers.
+        # Public DNS research requires a named top-level domain.
+        final_label = host.rsplit(".", 1)[-1]
+        return not final_label.isdecimal() and not final_label.startswith("0x")
+
+    def authorize(self, request: EgressRequest) -> ProxyAuthorizationResult:
+        if not self.admits_hostname(request.host):
+            return _deny("Public research requires an unambiguous FQDN.", policy=self.name)
+        if request.method not in {"GET", "HEAD"} or request.body:
+            return _deny("Public research permits only bodyless GET/HEAD.", policy=self.name)
+        return ProxyAuthorizationResult(allowed=True, metadata={"policy": self.name})

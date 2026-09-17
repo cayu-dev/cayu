@@ -245,7 +245,7 @@ _RECONNECT_COMMON_FIELDS = {
     "environment_name",
     "capability",
 }
-_RECONNECT_OPTIONAL_FIELDS = {"allocation_fingerprint"}
+_RECONNECT_OPTIONAL_FIELDS = {"allocation_fingerprint", "public_web_authority_fingerprint"}
 _SUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | _RECONNECT_OPTIONAL_FIELDS | {"identity"}
 _UNSUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | _RECONNECT_OPTIONAL_FIELDS | {"reason"}
 _REPLAYABLE_AUTHORITY_KEY_PARTS = {
@@ -489,6 +489,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         policies: Mapping[str, EgressPolicy],
         credentials: Sequence[VirtualCredentialSpec] = (),
         approved_destinations: Sequence[ApprovedEgressDestination] = (),
+        public_web_policy: str | None = None,
         resolver: SecretResolver | None = None,
         image: str = DEFAULT_SANDBOX_IMAGE,
         setup_commands: Sequence[str] = (),
@@ -512,7 +513,28 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         egress_authority_scope: str = "session",
         egress_policy_version: str | None = None,
     ) -> None:
-        if not credentials and not approved_destinations:
+        from cayu.egress.policy import PublicWebEgressPolicy
+
+        self._public_web_policy = public_web_policy
+        if public_web_policy is not None:
+            if type(policies.get(public_web_policy)) is not PublicWebEgressPolicy:
+                raise ValueError("public_web_policy must name a PublicWebEgressPolicy.")
+            if credentials or resolver is not None or approved_destinations or len(policies) != 1:
+                raise ValueError("Public research requires a separate credentialless environment.")
+            if upstream is not None:
+                from cayu.egress.broker import HttpxUpstream
+
+                if (
+                    type(upstream) is not HttpxUpstream
+                    or upstream._routes
+                    or upstream._transport is not None
+                ):
+                    raise ValueError(
+                        "Public research cannot override upstream routing or transport."
+                    )
+        elif any(type(policy) is PublicWebEgressPolicy for policy in policies.values()):
+            raise ValueError("PublicWebEgressPolicy requires explicit public_web_policy admission.")
+        if not credentials and not approved_destinations and public_web_policy is None:
             raise ValueError(
                 "VirtualEgressEnvironmentFactory requires at least one credential or "
                 "approved destination."
@@ -763,7 +785,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
             # The sealed handoff proves the exact active target before the
             # retained runner acquires this factory's admission authority.
-            managed_runner._execution_environment_authority = self._execution_environment_authority
+            self._bind_adopted_authority(factory_result, managed_runner)
             return result
         registry = VirtualCredentialRegistry()
         grants = tuple(
@@ -792,6 +814,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             resolver=self._resolver,
             policies=self._policies,
             approved_destinations=self._approved_destinations,
+            public_web_policy=self._public_web_policy,
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
@@ -802,6 +825,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         target_egress_destinations = _ordered_destinations(
             grants,
             self._approved_destinations,
+            self._public_web_policy,
         )
         target_redactor = SecretRedactor(tuple(grant.presented_value for grant in grants))
         if persisted.state is not EgressAuthorityTransitionState.AUTHORIZED:
@@ -827,8 +851,23 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             coordinator=coordinator,
         )
         # Preserve the allocation while rebinding its verified target owner.
-        managed_runner._execution_environment_authority = self._execution_environment_authority
+        self._bind_adopted_authority(factory_result, managed_runner)
         return result
+
+    def _bind_adopted_authority(
+        self,
+        factory_result: EnvironmentFactoryResult,
+        managed_runner: _EgressManagedRunner,
+    ) -> None:
+        # Called only after sealing the adapter-verified active handoff. Retain
+        # the exact result/allocation while advancing its reconnect authority.
+        if self._public_web_policy is not None:
+            factory_result.reconnect_metadata["public_web_authority_fingerprint"] = (
+                self._egress_authority_identity.fingerprint
+            )
+        else:
+            factory_result.reconnect_metadata.pop("public_web_authority_fingerprint", None)
+        managed_runner._execution_environment_authority = self._execution_environment_authority
 
     async def renew_parked_authority(
         self,
@@ -885,7 +924,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
         broker = managed_runner._authority_revoker._broker
         revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
-        destinations = _ordered_destinations(grants, self._approved_destinations)
+        destinations = _ordered_destinations(
+            grants, self._approved_destinations, self._public_web_policy
+        )
         await managed_runner._renew_egress_authority(
             authority=expected_authority,
             target_grants=grants,
@@ -1063,6 +1104,19 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             raw_configuration,
             "egress_configuration",
         )
+        if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            stored_public_authority = request.reconnect_metadata.get(
+                "public_web_authority_fingerprint"
+            )
+            expected_public_authority = (
+                self._egress_authority_identity.fingerprint
+                if self._public_web_policy is not None
+                else None
+            )
+            if stored_public_authority != expected_public_authority:
+                raise InvalidEgressReconnectMetadataError(
+                    "Public-web reconnect authority fingerprint changed or is missing."
+                )
         reconnect_identity = _parse_reconnect_metadata(
             request,
             runner_kind=runner_kind,
@@ -1101,6 +1155,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             resolver=self._resolver,
             policies=self._policies,
             approved_destinations=self._approved_destinations,
+            public_web_policy=self._public_web_policy,
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
@@ -1159,6 +1214,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 egress_destinations=_ordered_destinations(
                     grants,
                     self._approved_destinations,
+                    self._public_web_policy,
                 ),
                 session_id=request.session_id,
                 environment_name=request.environment_name,
@@ -1213,6 +1269,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 supported=adapter.supports_reconnect,
                 allocation_fingerprint=stable_environment_fingerprint,
             )
+            if self._public_web_policy is not None:
+                reconnect_metadata["public_web_authority_fingerprint"] = (
+                    self._egress_authority_identity.fingerprint
+                )
             if allocation is not None:
                 if allocation.state is EnvironmentAllocationState.DISPATCHED:
                     await allocation.acknowledge(reconnect_metadata)
@@ -5132,7 +5192,12 @@ def _duplicate_env_names(credentials: Sequence[VirtualCredentialSpec]) -> tuple[
 def _ordered_destinations(
     grants: Sequence[VirtualCredentialGrant],
     approved_destinations: Sequence[ApprovedEgressDestination],
+    public_web_policy: str | None = None,
 ) -> tuple[str, ...]:
+    # This reserved name is only the adapter TLS/CONNECT probe. It is never
+    # resolved or contacted upstream and does not represent the research scope.
+    if public_web_policy is not None:
+        return ("public-web-preflight.invalid",)
     return tuple(
         dict.fromkeys(
             [

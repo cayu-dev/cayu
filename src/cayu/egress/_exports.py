@@ -3,6 +3,7 @@
 EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovedEgressDestination": ("cayu.egress.destinations", "ApprovedEgressDestination"),
     "BrowserEgressPolicy": ("cayu.egress.policy", "BrowserEgressPolicy"),
+    "PublicWebEgressPolicy": ("cayu.egress.policy", "PublicWebEgressPolicy"),
     "CapturedRequest": ("cayu.egress.broker", "CapturedRequest"),
     "CapturedResponse": ("cayu.egress.broker", "CapturedResponse"),
     "CredentialKind": ("cayu.egress.credential_kinds", "CredentialKind"),
@@ -127,6 +128,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
 PUBLIC_NAMES = [
     "ApprovedEgressDestination",
     "BrowserEgressPolicy",
+    "PublicWebEgressPolicy",
     "CapturedRequest",
     "CapturedResponse",
     "CredentialKind",

@@ -9492,7 +9492,8 @@
             "enum": [
               "http",
               "browser",
-              "opaque"
+              "opaque",
+              "public_web"
             ],
             "title": "Kind",
             "type": "string"

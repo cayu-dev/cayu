@@ -705,6 +705,7 @@ from cayu.egress.errors import (
 )
 from cayu.egress.policy import BrowserEgressPolicy as BrowserEgressPolicy
 from cayu.egress.policy import HttpEgressPolicy as HttpEgressPolicy
+from cayu.egress.policy import PublicWebEgressPolicy as PublicWebEgressPolicy
 from cayu.egress.runtime import VIRTUAL_EGRESS_RECONNECT_VERSION as VIRTUAL_EGRESS_RECONNECT_VERSION
 from cayu.egress.runtime import VirtualCredentialSpec as VirtualCredentialSpec
 from cayu.egress.runtime import VirtualEgressEnvironmentFactory as VirtualEgressEnvironmentFactory
