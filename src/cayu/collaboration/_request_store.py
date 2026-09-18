@@ -6,6 +6,7 @@ Only the authenticated request coordinator exposes them as a public capability.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from uuid import uuid4
 
 from cayu.collaboration._capacity import require_capacity
@@ -45,6 +46,7 @@ from cayu.collaboration.participants import (
 from cayu.collaboration.requests import (
     MAX_CONTROL_INITIATOR_BYTES,
     CollaborationRequest,
+    RequestAdmissionReceipt,
     RequestAlias,
     RequestCommand,
     RequestControl,
@@ -54,6 +56,9 @@ from cayu.collaboration.requests import (
     RequestDuePage,
     RequestEvent,
     RequestIntent,
+    RequestObservationReceipt,
+    RequestOutcomeReceipt,
+    RequestProgressReceipt,
     RequestReceipt,
     RequestRef,
     RequestSelection,
@@ -124,6 +129,12 @@ async def retained_request(
     )
     require_exact_contract(receipt, snapshot.receipt, redactor=redactor)
     await require_request_event(tx, receipt.event, redactor)
+    for sequence in snapshot.event_sequences:
+        event = prepare_contract(
+            RequestEvent, await tx.get("request_events", (sequence,)), redactor=redactor
+        )
+        if event.sequence != sequence or event.request != receipt.event.request:
+            raise CollaborationUnavailable("Request event frontier has conflicting evidence.")
     if snapshot.terminal is not None:
         terminal = prepare_contract(
             RequestControlReceipt,
@@ -132,7 +143,71 @@ async def retained_request(
         )
         require_exact_contract(snapshot.terminal, terminal, redactor=redactor)
         await require_request_event(tx, terminal.event, redactor)
+    admission = None
+    if snapshot.admission_operation is not None:
+        admission = prepare_contract(
+            RequestAdmissionReceipt,
+            await tx.get("operations", operation_key(snapshot.admission_operation)),
+            redactor=redactor,
+        )
+        require_exact_contract(receipt.expected, admission.command.expected, redactor=redactor)
+        if (
+            admission.command.operation != snapshot.admission_operation
+            or admission.command.generation != snapshot.admission_generation
+            or admission.command.decision != snapshot.admission_decision
+            or admission.revision > snapshot.revision
+            or (snapshot.state == "open" and admission.state != snapshot.admission)
+        ):
+            raise CollaborationUnavailable("Request admission contradicts its receipt.")
+        await require_request_event(tx, admission.event, redactor)
+    elif snapshot.admission_generation:
+        raise CollaborationUnavailable("Request lacks its admission receipt identity.")
+    for progress in snapshot.progress:
+        retained = prepare_contract(
+            RequestProgressReceipt,
+            await tx.get("operations", operation_key(progress.command.operation)),
+            redactor=redactor,
+        )
+        require_exact_contract(progress, retained, redactor=redactor)
+        require_exact_contract(receipt.expected, retained.command.expected, redactor=redactor)
+        await require_request_event(tx, retained.event, redactor)
+    if snapshot.outcome is not None:
+        outcome = prepare_contract(
+            RequestOutcomeReceipt,
+            await tx.get("operations", operation_key(snapshot.outcome.command.operation)),
+            redactor=redactor,
+        )
+        require_exact_contract(snapshot.outcome, outcome, redactor=redactor)
+        if outcome.command.outcome == "answered" and (
+            admission is None
+            or admission.command.source_export is None
+            or outcome.command.source_receipt is None
+            or outcome.command.source_receipt.expected.intent.request.ref
+            != admission.command.source_export
+        ):
+            raise CollaborationUnavailable("Answer conflicts with its admitted export identity.")
+        await require_request_event(tx, outcome.event, redactor)
+    for observation in snapshot.observations:
+        operation = observation_operation(receipt.expected, observation.key)
+        registration = prepare_contract(
+            RequestObservationReceipt,
+            await tx.get("operations", operation_key(operation)),
+            redactor=redactor,
+        )
+        require_exact_contract(receipt.expected, registration.expected, redactor=redactor)
+        require_exact_contract(observation, registration.observation, redactor=redactor)
+        if registration.operation != operation:
+            raise CollaborationUnavailable("Observation operation identity conflicts.")
+        await require_request_event(tx, registration.event, redactor)
     return snapshot
+
+
+def observation_operation(expected: RequestCommand, key: str) -> OperationRef:
+    """Reconstruct the bounded, request-scoped exact registration identity."""
+    identity = expected.intent.selection.reference.request_id + ":" + key
+    return expected.operation.model_copy(
+        update={"caller_key": "observation:" + sha256(identity.encode()).hexdigest()}
+    )
 
 
 async def control_in_transaction(
@@ -142,6 +217,7 @@ async def control_in_transaction(
     expected: RequestControlCommand,
     *,
     authority_expires_at_ms: int,
+    settlement: ReceivingSettlementReceipt | None = None,
     redactor: SecretRedactor,
 ) -> RequestControlReceipt:
     expected = prepare_contract(RequestControlCommand, expected, redactor=redactor)
@@ -169,6 +245,20 @@ async def control_in_transaction(
     require_exact_contract(original, prior.receipt.expected, redactor=redactor)
     if prior.state != "open" or prior.revision != expected.intent.expected_revision:
         raise CollaborationConflict("Request already closed or revision changed.")
+    if expected.intent.source_receipt is not None:
+        if prior.admission_operation is None:
+            raise CollaborationConflict("Control source lacks an admitted export identity.")
+        admission = prepare_contract(
+            RequestAdmissionReceipt,
+            await tx.get("operations", operation_key(prior.admission_operation)),
+            redactor=redactor,
+        )
+        if (
+            admission.command.source_export is None
+            or expected.intent.source_receipt.expected.intent.request.ref
+            != admission.command.source_export
+        ):
+            raise CollaborationConflict("Control source does not match the admitted export.")
     now = await tx.now_ms()
     if type(authority_expires_at_ms) is not int or now >= authority_expires_at_ms:
         raise CollaborationConflict("Control authority expired before election.")
@@ -205,28 +295,25 @@ async def control_in_transaction(
                 "admission": "closed",
                 "delivery": "excluded",
                 "next_due_at_ms": 0,
+                "event_sequences": (*prior.event_sequences, event.sequence),
             }
         ),
         redactor=redactor,
     )
-    # This slice has no preparation, delivery or execution dispatcher. Positive
-    # local UNDECIDED state is the receiving owner's proof of quiescence. Later
-    # admission states must retain their own obligations instead of taking this path.
-    if prior.admission != "undecided" or prior.delivery != "pending":
-        raise CollaborationUnavailable("Request responsibility needs receiving-owner settlement.")
-    await settle_permit_in_transaction(
-        store,
-        tx,
-        initialized,
-        prior.permit,
-        ReceivingSettlementReceipt(
+    # Undecided requests have no admitted producer responsibility. Once an
+    # admission decision exists, only the registered receiving owner may prove
+    # that the outstanding responsibility is quiescent before cancellation or
+    # expiry is committed.
+    if prior.admission == "undecided" and prior.delivery == "pending":
+        settlement = ReceivingSettlementReceipt(
             expected=prior.permit,
             receiving_owner=initialized.owner,
             receipt_id=event.id,
             outcome="quiescent",
-        ),
-        redactor,
-    )
+        )
+    if settlement is None:
+        raise CollaborationUnavailable("Request responsibility needs receiving-owner settlement.")
+    await settle_permit_in_transaction(store, tx, initialized, prior.permit, settlement, redactor)
     anchor = await store._anchor(tx, initialized, redactor)
     if not anchor.reserved_operations or not anchor.reserved_events:
         raise CollaborationUnavailable("Request lacks reserved terminal responsibility.")
@@ -368,6 +455,7 @@ def preflight_control(snapshot: RequestSnapshot, redactor: SecretRedactor) -> No
                     "delivery": "excluded",
                     "terminal": candidate,
                     "next_due_at_ms": 0,
+                    "event_sequences": (*snapshot.event_sequences, candidate.event.sequence),
                 }
             ),
             redactor=SecretRedactor(),
@@ -514,6 +602,7 @@ async def accept_in_transaction(
             delivery="pending",
             terminal=None,
             next_due_at_ms=expected.intent.selection.accepted_at_ms,
+            event_sequences=(event.sequence,),
         ),
         redactor=redactor,
     )

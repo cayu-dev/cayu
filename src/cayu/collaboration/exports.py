@@ -27,6 +27,7 @@ from cayu.collaboration._contracts import (
     OperationRef,
     OwnerRef,
 )
+from cayu.collaboration._permits import PermitCommand, ReceivingSettlementReceipt
 from cayu.collaboration._session_export_bounds import initiator_bytes
 from cayu.collaboration.mandates import (
     MandateAccessContext,
@@ -402,6 +403,16 @@ class SessionExportAcceptanceReader(ABC):
     @abstractmethod
     async def lookup(self, receipt: SessionExportReceipt) -> ExactLookup[SessionExportAcceptance]:
         """Resolve exact authenticated acceptance without disclosing payload."""
+
+    async def settlement(
+        self,
+        receipt: SessionExportReceipt,
+        expected: PermitCommand,
+    ) -> ExactLookup[ReceivingSettlementReceipt]:
+        """Resolve exact receiving settlement; acceptance alone is insufficient."""
+        from cayu.collaboration._contracts import ExactUnavailable
+
+        return ExactUnavailable()
 
 
 class SessionExportSettlementReceipt(ContractValue):

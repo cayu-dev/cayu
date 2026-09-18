@@ -31,9 +31,16 @@ from cayu.collaboration._mandate_validation import (
 )
 from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
+from cayu.collaboration._request_arbitration import (
+    admit_in_transaction,
+    outcome_in_transaction,
+    progress_in_transaction,
+    register_observation_in_transaction,
+)
 from cayu.collaboration._request_store import (
     accept_in_transaction,
     control_in_transaction,
+    observation_operation,
     require_request_absence,
     require_request_event,
     retained_request,
@@ -63,9 +70,15 @@ from cayu.collaboration.participants import (
     ParticipantAlias,
     ParticipantRef,
 )
-from cayu.collaboration.request_access import RequestRegistration
+from cayu.collaboration.request_access import (
+    RequestReceivingAuthorization,
+    RequestReceivingOwner,
+    RequestRegistration,
+)
 from cayu.collaboration.requests import (
     CollaborationRequest,
+    RequestAdmissionCommand,
+    RequestAdmissionReceipt,
     RequestAlias,
     RequestCommand,
     RequestControl,
@@ -73,6 +86,14 @@ from cayu.collaboration.requests import (
     RequestControlReceipt,
     RequestDueCursor,
     RequestDuePage,
+    RequestEvent,
+    RequestObservation,
+    RequestObservationPage,
+    RequestObservationReceipt,
+    RequestOutcomeCommand,
+    RequestOutcomeReceipt,
+    RequestProgressCommand,
+    RequestProgressReceipt,
     RequestReceipt,
     RequestSnapshot,
 )
@@ -132,12 +153,18 @@ def _safe_request_failure(error: BaseException, redactor: SecretRedactor) -> Bas
 class _Submission(ContractValue):
     request: CollaborationRequest | RequestCommand | RequestControl | RequestControlCommand
     context: MandateAccessContext
+    observation: RequestObservation | None = None
 
 
 class _DueQuery(ContractValue):
     context: MandateAccessContext
     cursor: RequestDueCursor
     limit: Annotated[StrictInt, Field(ge=1, le=64)]
+
+
+class _ReceivingSubmission(ContractValue):
+    command: RequestAdmissionCommand | RequestProgressCommand | RequestOutcomeCommand
+    context: MandateAccessContext
 
 
 def _initiator(context: MandateAccessContext) -> InitiatorBinding:
@@ -177,6 +204,7 @@ class RequestCoordinator:
         )
         self._resource_owners = {}
         self._resolver_ref = None
+        self._receiving_ref = None
         if registration is not None:
             if (
                 type(registration) is not RequestRegistration
@@ -190,6 +218,14 @@ class RequestCoordinator:
             self._resolver_ref = prepare_contract(
                 ObjectRef, registration.mandates.ref, redactor=redactor
             )
+            if registration.receiving_owner is not None:
+                if not isinstance(registration.receiving_owner, RequestReceivingOwner):
+                    raise CollaborationContractError("Invalid receiving owner registration.")
+                self._receiving_ref = prepare_contract(
+                    ObjectRef, registration.receiving_owner.ref, redactor=redactor
+                )
+                if self._receiving_ref.revision is None:
+                    raise CollaborationContractError("Receiving owner must have a pinned revision.")
             for owner in registration.resource_owners:
                 if (
                     not isinstance(owner, ResourceSelectorOwner)
@@ -432,6 +468,176 @@ class RequestCoordinator:
         assert isinstance(result, RequestControlReceipt)
         return result
 
+    async def admit(
+        self, command: RequestAdmissionCommand, *, context: MandateAccessContext
+    ) -> RequestAdmissionReceipt:
+        return await self._trusted_mutation(
+            command, context=context, operation=admit_in_transaction
+        )
+
+    async def progress(
+        self, command: RequestProgressCommand, *, context: MandateAccessContext
+    ) -> RequestProgressReceipt:
+        return await self._trusted_mutation(
+            command, context=context, operation=progress_in_transaction
+        )
+
+    async def outcome(
+        self, command: RequestOutcomeCommand, *, context: MandateAccessContext
+    ) -> RequestOutcomeReceipt:
+        return await self._trusted_mutation(
+            command, context=context, operation=outcome_in_transaction
+        )
+
+    async def observe(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestObservationReceipt:
+        expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
+        observation = prepare_contract(RequestObservation, observation, redactor=self._redactor)
+        value = prepare_contract(
+            _Submission,
+            {"request": expected, "context": context, "observation": observation},
+            redactor=self._redactor,
+        )
+        return await self._run(value, mode="register_observation")
+
+    async def read_observation(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestObservationPage:
+        expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
+        observation = prepare_contract(RequestObservation, observation, redactor=self._redactor)
+        value = prepare_contract(
+            _Submission,
+            {"request": expected, "context": context, "observation": observation},
+            redactor=self._redactor,
+        )
+        result = await self._run(value, mode="read_observation")
+        assert isinstance(result, RequestObservationPage)
+        return result
+
+    async def _trusted_mutation(self, command, *, context, operation):
+        if self._registration is None:
+            raise CollaborationNotInitialized("No collaboration request owner is registered.")
+        value = prepare_contract(
+            _ReceivingSubmission,
+            {"command": command, "context": context},
+            redactor=self._redactor,
+        )
+
+        async def owned():
+            return await self._dependency(lambda: self._receive_held(value, operation))
+
+        return await self._observe(
+            self._owners.run(
+                owned,
+                key=("request_receiver", object()),
+                expectation=contract_bytes(value, redactor=self._redactor),
+                redactor=self._redactor,
+                failure_snapshot=lambda error: _safe_request_failure(error, self._redactor),
+            )
+        )
+
+    async def _receive_held(self, value: _ReceivingSubmission, operation):
+        registration = self._registration
+        assert registration is not None
+        receiver = registration.receiving_owner
+        if receiver is None or self._receiving_ref is None:
+            raise CollaborationUnavailable("No qualified receiving owner is registered.")
+        command, context = value.command, value.context
+        initiating = (
+            command.publisher if isinstance(command, RequestProgressCommand) else command.initiator
+        )
+        require_exact_contract(initiating, _initiator(context), redactor=self._redactor)
+        selected = command.expected.intent.selection
+        if context.participant != selected.recipient.reference:
+            raise CollaborationAccessDenied("Receiving principal is not the selected recipient.")
+        store, initialized = self._participants._ready()
+        self._participants._capability(store, initialized, mutation=False, family=REQUEST_FAMILY)
+        _, grant = self._participants._authorize(
+            CollaborationAccessContext(principal=context.principal), "request_readback"
+        )
+        self._participants._require_refs(
+            grant, (selected.sender.reference, selected.recipient.reference)
+        )
+        require_exact_contract(
+            self._receiving_ref,
+            prepare_contract(ObjectRef, receiver.ref, redactor=self._redactor),
+            redactor=self._redactor,
+        )
+        # A committed operation is replayed from the collaboration store before
+        # consulting the producer.  Producer authority may have expired or
+        # been retired after the durable receipt was published; replay must not
+        # turn that acknowledgement-loss/retry path into a new source read.
+        key = (
+            command.operation.namespace_incarnation,
+            command.operation.generation,
+            command.operation.caller_key,
+        )
+        async with store._transaction(initialized.binding.application_scope, write=False) as tx:
+            if await tx.get("operations", key) is not None:
+                return await operation(store, tx, initialized, command, redactor=self._redactor)
+        async with receiver.acquire(command, context=context) as raw:
+            authority = prepare_contract(
+                RequestReceivingAuthorization, raw, redactor=self._redactor
+            )
+            require_exact_contract(command, authority.command, redactor=self._redactor)
+            require_exact_contract(self._receiving_ref, authority.receiver, redactor=self._redactor)
+            async with store._transaction(initialized.binding.application_scope, write=False) as tx:
+                if await tx.now_ms() >= authority.expires_at_ms:
+                    raise CollaborationAccessDenied("Receiving read authority expired.")
+            settlement = authority.settlement
+            if settlement is None and (
+                isinstance(command, RequestOutcomeCommand)
+                or (isinstance(command, RequestAdmissionCommand) and command.decision == "decline")
+            ):
+                async with store._transaction(
+                    initialized.binding.application_scope, write=False
+                ) as tx:
+                    prior = await retained_request(
+                        store,
+                        tx,
+                        initialized,
+                        command.expected.intent.request,
+                        command.expected.initiator,
+                        self._redactor,
+                    )
+                if prior is None:
+                    raise CollaborationUnavailable("Request responsibility is unavailable.")
+                settlement = await receiver.settlement(command, prior.permit, context=context)
+            self._participants._capability(store, initialized, mutation=True, family=REQUEST_FAMILY)
+            async with store._transaction(initialized.binding.application_scope, write=True) as tx:
+                if await tx.now_ms() >= authority.expires_at_ms:
+                    raise CollaborationAccessDenied(
+                        "Receiving authority expired before publication."
+                    )
+                if isinstance(command, RequestAdmissionCommand):
+                    return await operation(
+                        store,
+                        tx,
+                        initialized,
+                        command,
+                        settlement=settlement,
+                        redactor=self._redactor,
+                    )
+                if isinstance(command, RequestOutcomeCommand):
+                    return await operation(
+                        store,
+                        tx,
+                        initialized,
+                        command,
+                        settlement=settlement,
+                        redactor=self._redactor,
+                    )
+                return await operation(store, tx, initialized, command, redactor=self._redactor)
+
     async def _run(self, value: _Submission, *, mode: str):
         if self._registration is None:
             raise CollaborationNotInitialized("No collaboration request owner is registered.")
@@ -515,9 +721,12 @@ class RequestCoordinator:
         if isinstance(raw_request, CollaborationRequest):
             request = raw_request
         else:
-            assert command is not None
+            assert isinstance(command, RequestCommand)
             request = command.intent.request
+            selected = command.intent.selection
         assert isinstance(request, CollaborationRequest)
+        if command is None:
+            selected = None
         if request.sender.owner != initialized.owner:
             raise CollaborationConflict("Request belongs to another collaboration owner.")
         _, read_grant = self._participants._authorize(
@@ -525,10 +734,10 @@ class RequestCoordinator:
         )
         declared = (
             (
-                command.intent.selection.sender.reference,
-                command.intent.selection.recipient.reference,
+                selected.sender.reference,
+                selected.recipient.reference,
             )
-            if command is not None
+            if selected is not None
             else (request.sender, request.target)
             if isinstance(request.target, ParticipantRef)
             else (request.sender,)
@@ -602,11 +811,12 @@ class RequestCoordinator:
                     return found
             elif mode == "inspect":
                 assert command is not None
+                assert selected is not None
                 self._participants._require_refs(
                     read_grant,
                     (
-                        command.intent.selection.sender.reference,
-                        command.intent.selection.recipient.reference,
+                        selected.sender.reference,
+                        selected.recipient.reference,
                     ),
                 )
                 return None
@@ -639,6 +849,99 @@ class RequestCoordinator:
                     if await tx.now_ms() >= permission_deadline:
                         raise CollaborationAccessDenied("Read authority expired during replay.")
                     return replay
+            if mode == "register_observation":
+                if found is None or command is None or value.observation is None:
+                    raise CollaborationUnavailable(
+                        "Observation requires retained request authority."
+                    )
+                self._participants._capability(
+                    store, initialized, mutation=True, family=REQUEST_FAMILY
+                )
+                async with store._transaction(
+                    initialized.binding.application_scope, write=True
+                ) as tx:
+                    if await tx.now_ms() >= permission_deadline:
+                        raise CollaborationAccessDenied("Observation authority expired.")
+                    return await register_observation_in_transaction(
+                        store,
+                        tx,
+                        initialized,
+                        command,
+                        value.observation,
+                        initiator=_initiator(context),
+                        redactor=self._redactor,
+                    )
+            if mode == "read_observation":
+                if found is None or command is None or value.observation is None:
+                    raise CollaborationUnavailable(
+                        "Observation requires retained request authority."
+                    )
+                wanted = value.observation
+                operation = observation_operation(command, wanted.key)
+                async with store._transaction(
+                    initialized.binding.application_scope, write=False
+                ) as tx:
+                    # Reload under the same transaction as the source frontier.
+                    # The earlier permission lookup is not a coverage snapshot.
+                    anchor = await store._anchor(tx, initialized, self._redactor)
+                    current_request = await retained_request(
+                        store, tx, initialized, request, original_initiator, self._redactor
+                    )
+                    if current_request is None:
+                        raise CollaborationUnavailable("Observation request is unavailable.")
+                    current = next(
+                        (item for item in current_request.observations if item.key == wanted.key),
+                        None,
+                    )
+                    if current is None:
+                        raise CollaborationUnavailable("Observation registration is unavailable.")
+                    raw = await tx.get(
+                        "operations",
+                        (
+                            operation.namespace_incarnation,
+                            operation.generation,
+                            operation.caller_key,
+                        ),
+                    )
+                    if raw is None:
+                        raise CollaborationUnavailable("Observation receipt is unavailable.")
+                    registration = prepare_contract(
+                        RequestObservationReceipt, raw, redactor=self._redactor
+                    )
+                    require_exact_contract(registration.expected, command, redactor=self._redactor)
+                    require_exact_contract(registration.intent, wanted, redactor=self._redactor)
+                    require_exact_contract(
+                        registration.observation, current, redactor=self._redactor
+                    )
+                    await require_request_event(tx, registration.event, self._redactor)
+                    known_sequences = tuple(
+                        sequence
+                        for sequence in current_request.event_sequences
+                        if wanted.after_sequence < sequence <= anchor.event_sequence
+                    )
+                    if len(known_sequences) > 64:
+                        raise CollaborationUnavailable("Observation frontier is too large to read.")
+                    events_list = []
+                    for sequence in known_sequences:
+                        raw_event = await tx.get("request_events", (sequence,))
+                        if raw_event is None:
+                            raise CollaborationUnavailable(
+                                "Observation frontier has a durable gap."
+                            )
+                        event = prepare_contract(RequestEvent, raw_event, redactor=self._redactor)
+                        if event.type != "request_observation_registered":
+                            events_list.append(event)
+                    events = tuple(events_list)
+                    if await tx.now_ms() >= permission_deadline:
+                        raise CollaborationAccessDenied(
+                            "Observation authority expired during read."
+                        )
+                    return RequestObservationPage(
+                        registration=registration,
+                        events=events,
+                        coverage_sequence=anchor.event_sequence,
+                        complete=True,
+                    )
             if mode == "control":
                 assert isinstance(raw_request, RequestControl)
                 if found is None:
@@ -682,6 +985,50 @@ class RequestCoordinator:
                 self._participants._require_refs(
                     grant, (chosen.sender.reference, chosen.recipient.reference)
                 )
+                if found.admission != "undecided" or found.delivery != "pending":
+                    receiver = registration.receiving_owner
+                    if receiver is None or self._receiving_ref is None:
+                        raise CollaborationUnavailable(
+                            "No qualified receiving owner is registered."
+                        )
+                    require_exact_contract(
+                        self._receiving_ref,
+                        prepare_contract(ObjectRef, receiver.ref, redactor=self._redactor),
+                        redactor=self._redactor,
+                    )
+                    # Keep both guards in the same retained task. Control is
+                    # authorized by the administrator's mandate, not by posing
+                    # as the producer; the receiver authenticates settlement.
+                    async with receiver.acquire(control, context=context) as raw:
+                        authority = prepare_contract(
+                            RequestReceivingAuthorization, raw, redactor=self._redactor
+                        )
+                        require_exact_contract(control, authority.command, redactor=self._redactor)
+                        require_exact_contract(
+                            self._receiving_ref, authority.receiver, redactor=self._redactor
+                        )
+                        settlement = authority.settlement
+                        if settlement is None:
+                            settlement = await receiver.settlement(
+                                control, found.permit, context=context
+                            )
+                        async with store._transaction(
+                            initialized.binding.application_scope, write=True
+                        ) as tx:
+                            await self._require_retained_read_grant(
+                                tx, control.operation, read_grant
+                            )
+                            return await control_in_transaction(
+                                store,
+                                tx,
+                                initialized,
+                                control,
+                                authority_expires_at_ms=min(
+                                    permission_deadline, authority.expires_at_ms
+                                ),
+                                settlement=settlement,
+                                redactor=self._redactor,
+                            )
                 expiry = min(
                     resolution.principal.expires_at_ms,
                     *(item.expires_at_ms for item in resolution.chain.entries),

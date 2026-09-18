@@ -125,12 +125,21 @@ from cayu.collaboration.participants import (
 from cayu.collaboration.request_access import RequestRegistration
 from cayu.collaboration.requests import (
     CollaborationRequest,
+    RequestAdmissionCommand,
+    RequestAdmissionReceipt,
     RequestCommand,
     RequestControl,
     RequestControlCommand,
     RequestControlReceipt,
     RequestDueCursor,
     RequestDuePage,
+    RequestObservation,
+    RequestObservationPage,
+    RequestObservationReceipt,
+    RequestOutcomeCommand,
+    RequestOutcomeReceipt,
+    RequestProgressCommand,
+    RequestProgressReceipt,
     RequestReceipt,
     RequestSnapshot,
 )
@@ -1516,6 +1525,42 @@ class CayuApp:
 
     async def drain_collaboration_requests(self) -> None:
         await self._request_coordinator.close()
+
+    async def admit_collaboration_request(
+        self, command: RequestAdmissionCommand, *, context: MandateAccessContext
+    ) -> RequestAdmissionReceipt:
+        """Record a trusted receiving-owner admission decision; never launch work."""
+        return await self._request_coordinator.admit(command, context=context)
+
+    async def record_collaboration_progress(
+        self, command: RequestProgressCommand, *, context: MandateAccessContext
+    ) -> RequestProgressReceipt:
+        return await self._request_coordinator.progress(command, context=context)
+
+    async def publish_collaboration_outcome(
+        self, command: RequestOutcomeCommand, *, context: MandateAccessContext
+    ) -> RequestOutcomeReceipt:
+        return await self._request_coordinator.outcome(command, context=context)
+
+    async def register_collaboration_observation(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestObservationReceipt:
+        return await self._request_coordinator.observe(expected, observation, context=context)
+
+    async def read_collaboration_observation(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestObservationPage:
+        return await self._request_coordinator.read_observation(
+            expected, observation, context=context
+        )
 
     async def list_due_collaboration_requests(
         self,

@@ -5038,6 +5038,13 @@ def test_cancelled_queue_task_retains_terminal_receipt_until_hooks_release_profi
         completed = await processing
         assert completed is not None
         assert completed.status is DispatchStatus.CANCELLED
+        assert (
+            await restarted_dispatcher.process_next(
+                h.app,
+                worker_id="worker_reconcile_after_terminal_hook",
+            )
+            is None
+        )
         checkpoint = await h.store.load_checkpoint(session_id)
         assert checkpoint is None or "queued_dispatch_terminal_receipts" not in checkpoint
 

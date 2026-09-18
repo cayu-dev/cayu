@@ -15,6 +15,7 @@ from cayu.collaboration._contracts import (
     InitiatorBinding,
     ObjectRef,
 )
+from cayu.collaboration._permits import ReceivingSettlementReceipt
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration._request_store import (
     accept_in_transaction,
@@ -31,13 +32,21 @@ from cayu.collaboration.mandates import (
     MandateRestrictions,
     PrincipalResolution,
 )
-from cayu.collaboration.request_access import RequestRegistration
+from cayu.collaboration.request_access import (
+    RequestReceivingAuthorization,
+    RequestReceivingOwner,
+    RequestRegistration,
+)
 from cayu.collaboration.requests import (
     CollaborationRequest,
+    RequestAdmissionCommand,
     RequestAlias,
     RequestControl,
     RequestControlCommand,
     RequestControlReceipt,
+    RequestObservation,
+    RequestOutcomeCommand,
+    RequestProgressCommand,
     RequestReceipt,
     RequestSnapshot,
 )
@@ -148,6 +157,397 @@ async def test_atomic_acceptance_and_exact_replay(stores):
     assert (
         prepare_contract(RequestSnapshot, first.model_dump(mode="json"), redactor=REDACTOR) == first
     )
+
+
+@pytest.mark.parametrize("decision", ("continue", "fork", "fresh", "defer", "clarify", "decline"))
+@pytest.mark.parametrize("terminal_path", ("outcome", "control", "answer"))
+async def test_admission_progress_outcome_and_observation_are_exactly_replayable(
+    stores, decision, terminal_path
+):
+    store = stores()
+    reg = registration()
+    values = await setup(store, reg=reg)
+    application, initialized, _, _, request, initiator = values
+    accepted = await accept(store, values)
+    resolver = RequestResolver(request)
+    context = resolver.context.model_copy(
+        update={"participant": accepted.receipt.expected.intent.selection.recipient.reference}
+    )
+    initiator = initiator.model_copy(
+        update={
+            "participant": ObjectRef(
+                owner=context.participant.owner,
+                kind="participant",
+                object_id=context.participant.participant_id,
+                incarnation=context.participant.incarnation,
+            )
+        }
+    )
+
+    class Receiver(RequestReceivingOwner):
+        permitted = []
+
+        @property
+        def ref(self):
+            return ObjectRef(
+                owner=initialized.owner,
+                kind="receiver",
+                object_id="test",
+                incarnation="one",
+                revision=1,
+            )
+
+        @asynccontextmanager
+        async def acquire(self, command, *, context):
+            from cayu.collaboration.access import CollaborationAccessDenied
+
+            if command not in self.permitted:
+                raise CollaborationAccessDenied("No authenticated producer occurrence.")
+            settlement = None
+            if isinstance(command, (RequestOutcomeCommand, RequestControlCommand)) or (
+                isinstance(command, RequestAdmissionCommand) and command.decision == "decline"
+            ):
+                settlement = ReceivingSettlementReceipt(
+                    expected=accepted.permit,
+                    receiving_owner=initialized.owner,
+                    receipt_id="settled",
+                    outcome="quiescent",
+                )
+            yield RequestReceivingAuthorization(
+                receiver=self.ref,
+                command=command,
+                expires_at_ms=4102444800000,
+                settlement=settlement,
+            )
+
+    receiver = Receiver()
+    application = app(
+        store,
+        reg,
+        collaboration_requests=RequestRegistration(
+            mandates=resolver,
+            max_ttl_ms=60_000,
+            receiving_owner=receiver,
+        ),
+    )
+    await application.initialize_collaboration()
+    from cayu.collaboration._contracts import ExpectedOperation
+    from cayu.collaboration.exports import (
+        ExportLimits,
+        SessionExportAuthorization,
+        SessionExportIntent,
+        SessionExportReceipt,
+        SessionExportRef,
+        SessionExportRequest,
+    )
+
+    export_request = SessionExportRequest(
+        ref=SessionExportRef(
+            session_id="answer-session",
+            session_instance_id="answer-instance",
+            operation=initialized.operation("answer-export"),
+        ),
+        source_indices=(0,),
+        audience=initialized.owner,
+        projector=accepted.receipt.expected.intent.request.output_contract,
+        policy=accepted.receipt.expected.intent.request.disclosure_policy,
+    )
+    source = SessionExportReceipt(
+        expected=ExpectedOperation[SessionExportIntent](
+            operation=export_request.ref.operation,
+            kind="session_export",
+            schema_version=1,
+            mode="source",
+            source=initialized.owner,
+            destination=initialized.owner,
+            initiator=accepted.receipt.expected.initiator,
+            receipt_stage="published",
+            intent=SessionExportIntent(
+                request=export_request,
+                limits=ExportLimits(max_exports=16, max_retained_bytes=65536, max_pending=16),
+                source_commitment="a" * 64,
+                output_commitment="b" * 64,
+                authorization=SessionExportAuthorization(
+                    issuer=initialized.owner,
+                    principal=accepted.receipt.expected.initiator.principal,
+                    policy=accepted.receipt.expected.intent.request.disclosure_policy,
+                    revision=1,
+                    expires_at_ms=4102444800000,
+                ),
+            ),
+        ),
+        event_id="answer-export-event",
+    )
+    admission = RequestAdmissionCommand(
+        operation=initialized.operation("admission"),
+        expected=accepted.receipt.expected,
+        expected_revision=1,
+        generation=1,
+        decision=decision,
+        source_export=export_request.ref if decision in {"continue", "fork", "fresh"} else None,
+        source_receipt=source if decision in {"continue", "fork", "fresh"} else None,
+        evidence=(
+            ObjectRef(
+                owner=initialized.owner,
+                kind="evidence",
+                object_id="admission",
+                incarnation="one",
+                revision=1,
+            ),
+        ),
+        initiator=initiator,
+    )
+    from cayu.collaboration.access import CollaborationAccessDenied
+
+    with pytest.raises(CollaborationAccessDenied):
+        await application.admit_collaboration_request(admission, context=context)
+    receiver.permitted.append(admission)
+    first_admission = await application.admit_collaboration_request(admission, context=context)
+    expected_state = {
+        "continue": "admitted",
+        "fork": "admitted",
+        "fresh": "admitted",
+        "defer": "deferred",
+        "clarify": "clarifying",
+        "decline": "closed",
+    }[decision]
+    assert first_admission.state == expected_state
+    assert (
+        await application.admit_collaboration_request(admission, context=context) == first_admission
+    )
+    if decision == "decline":
+        inspected = await application.inspect_collaboration_request(
+            accepted.receipt.expected, context=resolver.context
+        )
+        assert inspected is not None and inspected.state == "declined"
+        assert (
+            await application.inspect_participant(
+                accepted.receipt.expected.intent.selection.recipient.reference,
+                context=CONTEXT,
+            )
+        ).outstanding_obligations == 0
+        return
+    if terminal_path == "control":
+        control = RequestControl(
+            operation=initialized.operation("cancel-admitted"),
+            expected=accepted.receipt.expected,
+            expected_revision=2,
+            kind="cancel",
+        )
+        expected_control = RequestControlCommand(
+            operation=control.operation,
+            source=initialized.owner,
+            destination=initialized.owner,
+            initiator=values[5],
+            kind="cancel",
+            intent=control,
+        )
+        with pytest.raises(CollaborationAccessDenied):
+            await application.control_collaboration_request(control, context=resolver.context)
+        before = await application.inspect_participant(values[3].reference, context=CONTEXT)
+        assert before.outstanding_obligations == 1
+        receiver.permitted.append(expected_control)
+        terminal = await application.control_collaboration_request(
+            control, context=resolver.context
+        )
+        assert terminal.state == "cancelled"
+        receiver.permitted.clear()
+        assert (
+            await application.control_collaboration_request(control, context=resolver.context)
+            == terminal
+        )
+        after = await application.inspect_participant(values[3].reference, context=CONTEXT)
+        assert after.outstanding_obligations == 0
+        return
+    if decision in {"defer", "clarify"}:
+        inspected = await application.inspect_collaboration_request(
+            accepted.receipt.expected, context=resolver.context
+        )
+        assert inspected.admission == {"defer": "deferred", "clarify": "clarifying"}[decision]
+        rejected_progress = RequestProgressCommand(
+            operation=initialized.operation("progress-after-" + decision),
+            expected=accepted.receipt.expected,
+            expected_revision=2,
+            admission_generation=1,
+            publisher=initiator,
+            sequence=1,
+            kind="started",
+            commitment="c" * 64,
+        )
+        receiver.permitted.append(rejected_progress)
+        with pytest.raises(CollaborationConflict):
+            await application.record_collaboration_progress(rejected_progress, context=context)
+        rejected_outcome = RequestOutcomeCommand(
+            operation=initialized.operation("outcome-after-" + decision),
+            expected=accepted.receipt.expected,
+            expected_revision=2,
+            outcome="failed",
+            initiator=initiator,
+        )
+        receiver.permitted.append(rejected_outcome)
+        with pytest.raises(CollaborationConflict):
+            await application.publish_collaboration_outcome(rejected_outcome, context=context)
+        expire = RequestControl(
+            operation=initialized.operation("expire-after-" + decision),
+            expected=accepted.receipt.expected,
+            expected_revision=2,
+            kind="expire",
+        )
+        expected_expire = RequestControlCommand(
+            operation=expire.operation,
+            source=initialized.owner,
+            destination=initialized.owner,
+            initiator=values[5],
+            kind="expire",
+            intent=expire,
+        )
+        receiver.permitted.append(expected_expire)
+        with pytest.raises(CollaborationConflict):
+            await application.control_collaboration_request(expire, context=resolver.context)
+        cancel = expire.model_copy(
+            update={
+                "operation": initialized.operation("cancel-after-" + decision),
+                "kind": "cancel",
+            }
+        )
+        expected_cancel = expected_expire.model_copy(
+            update={"operation": cancel.operation, "kind": "cancel", "intent": cancel}
+        )
+        receiver.permitted.append(expected_cancel)
+        terminal = await application.control_collaboration_request(cancel, context=resolver.context)
+        assert terminal.state == "cancelled"
+        assert (
+            await application.inspect_participant(values[3].reference, context=CONTEXT)
+        ).outstanding_obligations == 0
+        return
+    progress = RequestProgressCommand(
+        operation=initialized.operation("progress"),
+        expected=accepted.receipt.expected,
+        expected_revision=2,
+        admission_generation=1,
+        publisher=initiator,
+        sequence=1,
+        kind="started",
+        commitment="b" * 64,
+        source_receipt=source,
+    )
+    receiver.permitted.append(progress)
+    first_progress = await application.record_collaboration_progress(progress, context=context)
+    assert (
+        await application.record_collaboration_progress(progress, context=context) == first_progress
+    )
+    outcome = RequestOutcomeCommand(
+        operation=initialized.operation("outcome"),
+        expected=accepted.receipt.expected,
+        expected_revision=3,
+        outcome="answered" if terminal_path == "answer" else "failed",
+        commitment="b" * 64 if terminal_path == "answer" else None,
+        source_receipt=source if terminal_path == "answer" else None,
+        initiator=initiator,
+    )
+    if terminal_path == "answer":
+        # Equal audience/content is not proof of the admitted source operation.
+        for field, replacement in (
+            ("session_id", "other-session"),
+            ("session_instance_id", "other-instance"),
+            ("operation", initialized.operation("other-export")),
+        ):
+            wrong_ref = export_request.ref.model_copy(update={field: replacement})
+            wrong_source = source.model_copy(
+                update={
+                    "expected": source.expected.model_copy(
+                        update={
+                            "operation": wrong_ref.operation,
+                            "intent": source.expected.intent.model_copy(
+                                update={
+                                    "request": export_request.model_copy(update={"ref": wrong_ref})
+                                }
+                            ),
+                        }
+                    )
+                }
+            )
+            wrong_outcome = outcome.model_copy(update={"source_receipt": wrong_source})
+            receiver.permitted.append(wrong_outcome)
+            with pytest.raises(CollaborationConflict):
+                await application.publish_collaboration_outcome(wrong_outcome, context=context)
+            current = await application.inspect_collaboration_request(
+                accepted.receipt.expected, context=resolver.context
+            )
+            assert current.state == "open" and current.revision == 3
+            participant = await application.inspect_participant(
+                values[3].reference, context=CONTEXT
+            )
+            assert participant.outstanding_obligations == 1
+    receiver.permitted.append(outcome)
+    first_outcome = await application.publish_collaboration_outcome(outcome, context=context)
+    assert (
+        await application.publish_collaboration_outcome(outcome, context=context) == first_outcome
+    )
+    observation = RequestObservation(
+        key="reader",
+        filter_commitment="f" * 64,
+        projection_commitment="p" * 64,
+        after_sequence=0,
+        coverage_sequence=0,
+        revision=1,
+    )
+    first_observation = await application.register_collaboration_observation(
+        accepted.receipt.expected, observation, context=resolver.context
+    )
+    assert (
+        await application.register_collaboration_observation(
+            accepted.receipt.expected, observation, context=resolver.context
+        )
+        == first_observation
+    )
+    page = await application.read_collaboration_observation(
+        accepted.receipt.expected, observation, context=resolver.context
+    )
+    assert page.registration == first_observation
+    assert page.complete
+    assert [event.type for event in page.events] == [
+        "request_accepted",
+        "request_admission",
+        "request_progress",
+        "request_answered" if terminal_path == "answer" else "request_failed",
+    ]
+    async with store._transaction(initialized.binding.application_scope, write=False) as tx:
+        inspected = await retained_request(
+            store,
+            tx,
+            initialized,
+            request,
+            values[5],
+            REDACTOR,
+        )
+    assert inspected is not None and inspected.state == outcome.outcome
+    assert len(inspected.progress) == 1 and len(inspected.observations) == 1
+    assert inspected.admission_operation == admission.operation
+    participant = await application.inspect_participant(
+        accepted.receipt.expected.intent.selection.recipient.reference, context=CONTEXT
+    )
+    assert participant.outstanding_obligations == 0
+    async with store._transaction(initialized.binding.application_scope, write=False) as tx:
+        anchor = await store._anchor(tx, initialized, REDACTOR)
+        assert anchor.reserved_operations == 0
+        assert anchor.reserved_events == 0
+    assert (
+        await application.inspect_collaboration_request(
+            accepted.receipt.expected, context=resolver.context
+        )
+        == inspected
+    )
+    # Terminal readback authenticates every referenced occurrence, not merely
+    # the mutable snapshot's embedded copy.
+    async with store._transaction(initialized.binding.application_scope, write=True) as tx:
+        await tx.delete("request_events", (first_progress.event.sequence,))
+    from cayu.collaboration._contracts import CollaborationContractError
+
+    with pytest.raises(CollaborationContractError):
+        await application.inspect_collaboration_request(
+            accepted.receipt.expected, context=resolver.context
+        )
 
 
 async def test_acceptance_rollback_does_not_leak_permit_or_capacity(stores):
@@ -415,6 +815,64 @@ async def public_setup(store, *, reg=None, **kwargs):
     )
     await application.initialize_collaboration()
     return application, resolver, values
+
+
+@pytest.mark.parametrize("publication", ["before", "concurrent", "after"])
+async def test_observation_reconciles_publication_from_independent_owner(stores, publication):
+    store = stores()
+    application, resolver, values = await public_setup(store)
+    receipt = await application.accept_collaboration_request(values[4], context=resolver.context)
+    other = app(
+        store,
+        values[0]._participant_coordinator._registration,
+        collaboration_requests=RequestRegistration(mandates=resolver, max_ttl_ms=300_000),
+    )
+    await other.initialize_collaboration()
+    observation = RequestObservation(
+        key="live-reader",
+        filter_commitment="all",
+        projection_commitment="events",
+        after_sequence=0,
+        coverage_sequence=0,
+        revision=1,
+    )
+    control = RequestControl(
+        operation=values[1].operation("later-control"),
+        expected=receipt.expected,
+        expected_revision=1,
+        kind="cancel",
+    )
+
+    async def register():
+        return await application.register_collaboration_observation(
+            receipt.expected, observation, context=resolver.context
+        )
+
+    async def publish():
+        return await other.control_collaboration_request(control, context=resolver.context)
+
+    if publication == "before":
+        terminal = await publish()
+        registered = await register()
+    elif publication == "concurrent":
+        registered, terminal = await asyncio.gather(register(), publish())
+    else:
+        registered = await register()
+        page = await application.read_collaboration_observation(
+            receipt.expected, observation, context=resolver.context
+        )
+        assert [event.type for event in page.events] == ["request_accepted"]
+        terminal = await publish()
+        assert terminal.event.sequence > page.coverage_sequence
+    assert await register() == registered
+    page = await other.read_collaboration_observation(
+        receipt.expected, observation, context=resolver.context
+    )
+    assert page.complete
+    assert page.registration == registered
+    assert page.coverage_sequence >= terminal.event.sequence
+    assert [event.type for event in page.events] == ["request_accepted", "request_cancelled"]
+    assert len({event.sequence for event in page.events}) == 2
 
 
 @pytest.mark.parametrize("kind", ["question", "contribution"])

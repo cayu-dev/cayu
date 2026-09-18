@@ -5,6 +5,16 @@ does not create a session, invoke an agent, deliver a message, or start backgrou
 work. Admission planning and authenticated answer publication are separate
 capabilities.
 
+When a request is answered from a retained session export, register a
+`SessionExportRequestReceivingOwner` as the receiving owner. Its acceptance
+reader must implement both exact operations: `lookup(receipt)` authenticates
+the source export, and `settlement(receipt, expected_permit)` returns a
+`ReceivingSettlementReceipt` issued by the receiving boundary. Acceptance is
+not converted into settlement locally, and a missing settlement result fails
+closed. The request coordinator holds receiving authorization through store
+publication, so a lost acknowledgement can replay the answer without
+rerunning the export.
+
 ## Registration and authority
 
 Configure the existing collaboration store and participant registration, plus
@@ -86,12 +96,21 @@ terminal = await app.control_collaboration_request(control, context=context)
 The authority resolver must authorize a new control. Replaying its exact committed
 receipt requires current read permission, not a new administration grant.
 
+For an admitted session-export request, admission and terminal commands carry
+the exact source export receipt. This is required for continue, fork, fresh,
+answer, cancellation, and failure paths; a source reference without its
+authenticated receipt is not enough to authorize or settle the request.
+
 ## State, receipts, and recovery
 
-This acceptance slice retains `open`, `cancelled`, and `expired` states.
-Admission remains `undecided` until closed by a control. Delivery is pending,
-then excluded when unstarted responsibility is closed. Neither receipt stage
-claims that a recipient ran or read the contribution.
+The request lifecycle retains `open`, `answered`, `failed`, `declined`,
+`cancelled`, and `expired` states. While a request is open, its admission has
+an independent state machine: it begins `undecided`, may enter `planning` or
+`preparing`, and can become `deferred`, `clarifying`, `admitted`, or `closed`
+through the corresponding authenticated admission decision and terminal
+commands. Admission state is not the same as the request's terminal outcome.
+Delivery is pending, then excluded when unstarted responsibility is closed.
+Neither receipt stage claims that a recipient ran or read the contribution.
 
 Acceptance atomically records the resolved participants, original addressing
 intent, owner-time deadline, permit, receipt, event, and mandatory control
@@ -127,3 +146,10 @@ shutdown, call `drain_collaboration_requests()` before closing the collaboration
 store. Draining closes new operations on that shared collaboration owner and
 waits boundedly for retained operations; an unavailable result means draining
 must be observed again.
+
+Observation reads reconcile against the current owner event frontier in the
+same store transaction as readback. Publication before registration, during
+registration, or after a previous read is returned at the next current
+frontier; the registration event itself is metadata and is not reported as
+request work. Missing frontier evidence returns unavailable rather than
+silently reporting a complete page.

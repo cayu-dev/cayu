@@ -15,10 +15,12 @@ from cayu.collaboration._contracts import (
 )
 from cayu.collaboration._history_references import history_references
 from cayu.collaboration._permits import PermitSnapshot
+from cayu.collaboration._request_receipts import record_operation
 from cayu.collaboration.base import Key, Table
 from cayu.collaboration.participants import ParticipantEvent
 from cayu.collaboration.requests import RequestSnapshot
 from cayu.storage._collaboration_schema import EXTRA_COLUMNS, KEYS
+from cayu.vaults.redaction import SecretRedactor
 
 
 class _SQLRepository:
@@ -53,6 +55,25 @@ class _SQLRepository:
         for row in rows:
             value = self._decode(row[0])
             self._require_request_projection(value, tuple(row[1:5]), tuple(row[5:]))
+            result.append(value)
+        return result
+
+    async def scan_request_events(self, *, after: int, limit: int) -> list[object]:
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT sequence, substr(document, 1, {MAX_ENVELOPE_BYTES + 1}) "
+                "FROM cayu_collaboration_request_events "
+                "WHERE scope=? AND sequence>? ORDER BY sequence LIMIT ?",
+                (self.scope, after, limit),
+            )
+        )
+        result = []
+        for sequence, document in rows:
+            value = self._decode(document)
+            if not isinstance(value, dict):
+                raise CollaborationContractError("Request event is not an object.")
+            if cast("dict[str, Any]", value)["sequence"] != sequence:
+                raise CollaborationContractError("Request event index contradicts its record.")
             result.append(value)
         return result
 
@@ -223,18 +244,12 @@ class _SQLRepository:
             if not isinstance(value, dict):
                 raise CollaborationContractError("Operation index record is malformed.")
             value = cast("dict[str, Any]", value)
-            # Reserved/final permit settlement records bind their parent command;
-            # their own index is the pre-reserved settlement operation.
-            operation = (
-                value["expected"]["intent"]["request"]["settlement_operation"]
-                if value.get("record_type") in ("permit_settlement_reserved", "permit_settled")
-                else value["expected"]["operation"]
-            )
+            operation = record_operation(value, redactor=SecretRedactor())
             if (
-                operation["application_scope"],
-                operation["namespace_incarnation"],
-                operation["generation"],
-                operation["caller_key"],
+                operation.application_scope,
+                operation.namespace_incarnation,
+                operation.generation,
+                operation.caller_key,
             ) != (self.scope, namespace, generation, caller_key):
                 raise CollaborationContractError("Operation index contradicts its authority.")
             records.append(value)

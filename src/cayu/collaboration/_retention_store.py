@@ -6,7 +6,7 @@ from typing import cast
 from uuid import uuid4
 
 from cayu.collaboration._capacity import require_capacity
-from cayu.collaboration._contracts import CollaborationConflict, ExactMatch
+from cayu.collaboration._contracts import CollaborationConflict, ContractValue, ExactMatch
 from cayu.collaboration._history_references import HistoryKey, history_references
 from cayu.collaboration._namespace_store import (
     lifecycle_replay,
@@ -25,6 +25,8 @@ from cayu.collaboration._permits import (
     ReservedPermitSettlement,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract
+from cayu.collaboration._request_receipts import request_receipt_metadata
+from cayu.collaboration._request_store import retained_request
 from cayu.collaboration.base import CollaborationStore, _Anchor, _key, _Repository, _stored_mode
 from cayu.collaboration.lifecycle import LifecycleCommand, LifecycleReceipt, NamespacePrune
 from cayu.collaboration.participants import (
@@ -36,7 +38,15 @@ from cayu.collaboration.participants import (
     ParticipantReceipt,
     ParticipantSnapshot,
 )
-from cayu.collaboration.requests import RequestControlReceipt, RequestReceipt
+from cayu.collaboration.requests import (
+    RequestAdmissionReceipt,
+    RequestControlReceipt,
+    RequestEvent,
+    RequestObservationReceipt,
+    RequestOutcomeReceipt,
+    RequestProgressReceipt,
+    RequestReceipt,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -114,20 +124,23 @@ async def prune_namespace(
         if removed >= request.max_records:
             break
         mode = _stored_mode(raw)
-        if mode in ("request", "request_control"):
-            from cayu.collaboration._request_store import retained_request
-
-            request_item = prepare_contract(
-                RequestReceipt if mode == "request" else RequestControlReceipt,
-                raw,
-                redactor=redactor,
-            )
-            command = (
-                request_item.expected
-                if isinstance(request_item, RequestReceipt)
-                else request_item.expected.intent.expected
-            )
-            if _key(command) in processed_requests:
+        metadata = request_receipt_metadata(raw, redactor=redactor)
+        if metadata is not None or mode in ("request", "request_control"):
+            command = metadata.expected if metadata is not None else None
+            if metadata is None:
+                request_item = prepare_contract(
+                    RequestReceipt if mode == "request" else RequestControlReceipt,
+                    raw,
+                    redactor=redactor,
+                )
+                command = (
+                    request_item.expected
+                    if isinstance(request_item, RequestReceipt)
+                    else request_item.expected.intent.expected
+                )
+            assert command is not None
+            request_key = _key(command)
+            if request_key in processed_requests:
                 continue
             snapshot = await retained_request(
                 store,
@@ -137,29 +150,108 @@ async def prune_namespace(
                 command.initiator,
                 redactor,
             )
-            if snapshot is None or snapshot.terminal is None:
+            if snapshot is None or snapshot.state == "open":
                 raise CollaborationUnavailable("Retired namespace retains an open request.")
-            if removed + 2 > request.max_records:
+            related: list[ContractValue] = []
+            references: list[HistoryKey] = []
+            previous_sequence = 0
+            for sequence in snapshot.event_sequences:
+                raw_event = await tx.get("request_events", (sequence,))
+                if raw_event is None:
+                    raise CollaborationUnavailable("Request event evidence is unavailable.")
+                event = prepare_contract(RequestEvent, raw_event, redactor=redactor)
+                if (
+                    event.sequence != sequence
+                    or event.request != snapshot.receipt.event.request
+                    or sequence <= previous_sequence
+                ):
+                    raise CollaborationUnavailable(
+                        "Request event frontier conflicts with evidence."
+                    )
+                previous_sequence = sequence
+                raw_receipt = await tx.get(
+                    "operations",
+                    (
+                        event.operation.namespace_incarnation,
+                        event.operation.generation,
+                        event.operation.caller_key,
+                    ),
+                )
+                if raw_receipt is None:
+                    raise CollaborationUnavailable("Request receipt evidence is unavailable.")
+                receipt_metadata = request_receipt_metadata(raw_receipt, redactor=redactor)
+                receipt: ContractValue
+                if receipt_metadata is not None:
+                    receipt = receipt_metadata.receipt
+                elif _stored_mode(raw_receipt) == "request":
+                    receipt = prepare_contract(RequestReceipt, raw_receipt, redactor=redactor)
+                elif _stored_mode(raw_receipt) == "request_control":
+                    receipt = prepare_contract(
+                        RequestControlReceipt, raw_receipt, redactor=redactor
+                    )
+                else:
+                    raise CollaborationUnavailable("Request receipt family is malformed.")
+                retained_event = getattr(receipt, "event", None)
+                if retained_event != event:
+                    raise CollaborationUnavailable(
+                        "Request receipt event conflicts with its index."
+                    )
+                parent = (
+                    receipt.expected
+                    if isinstance(receipt, RequestReceipt)
+                    else receipt.expected.intent.expected
+                    if isinstance(receipt, RequestControlReceipt)
+                    else receipt.command.expected
+                    if isinstance(
+                        receipt,
+                        (RequestAdmissionReceipt, RequestProgressReceipt, RequestOutcomeReceipt),
+                    )
+                    else receipt.expected
+                )
+                if parent != command:
+                    raise CollaborationUnavailable(
+                        "Request receipt parent conflicts with its snapshot."
+                    )
+                related.append(receipt)
+                references.extend(history_references(receipt))
+            if not related or related[0] != snapshot.receipt:
+                raise CollaborationUnavailable(
+                    "Request acceptance is not the first retained event."
+                )
+            if removed + len(related) > request.max_records:
                 if not removed:
                     raise CollaborationCapacityExceeded(
-                        "A request requires a pruning batch of at least two records."
+                        "Request receipt family exceeds the pruning batch."
                     )
                 break
-            for request_record in (snapshot.receipt, snapshot.terminal):
-                await tx.delete("operations", _key(request_record.expected))
-                await tx.delete("request_events", (request_record.event.sequence,))
-                released += len(contract_bytes(request_record, redactor=redactor))
-                released += len(contract_bytes(request_record.event, redactor=redactor))
+            for record in related:
+                if isinstance(record, RequestObservationReceipt):
+                    operation = record.operation
+                elif isinstance(
+                    record,
+                    (RequestAdmissionReceipt, RequestProgressReceipt, RequestOutcomeReceipt),
+                ):
+                    operation = record.command.operation
+                elif isinstance(record, (RequestReceipt, RequestControlReceipt)):
+                    operation = record.expected.operation
+                await tx.delete(
+                    "operations",
+                    (operation.namespace_incarnation, operation.generation, operation.caller_key),
+                )
+                event = cast(
+                    "RequestReceipt | RequestControlReceipt | RequestAdmissionReceipt | RequestProgressReceipt | RequestOutcomeReceipt | RequestObservationReceipt",
+                    record,
+                ).event
+                await tx.delete("request_events", (event.sequence,))
+                released += len(contract_bytes(record, redactor=redactor)) + len(
+                    contract_bytes(event, redactor=redactor)
+                )
                 removed += 1
                 events_removed += 1
             await tx.delete("requests", _key(command))
             released += len(contract_bytes(snapshot, redactor=redactor))
-            request_history = (
-                *history_references(snapshot.receipt),
-                *history_references(snapshot.terminal),
-            )
-            released += await release_unused_history(tx, request_history, redactor)
-            processed_requests.add(_key(command))
+            released += await release_unused_history(tx, tuple(references), redactor)
+            processed_requests.add(request_key)
             continue
         if mode == "identity":
             item = prepare_contract(ParticipantReceipt, raw, redactor=redactor)

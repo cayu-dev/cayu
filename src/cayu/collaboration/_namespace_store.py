@@ -10,6 +10,7 @@ from uuid import uuid4
 from cayu.collaboration._capacity import require_capacity
 from cayu.collaboration._contracts import CollaborationConflict, OperationRef
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
+from cayu.collaboration._request_receipts import request_receipt_metadata
 from cayu.collaboration.base import CollaborationStore, _Anchor, _key, _Repository, _stored_mode
 from cayu.collaboration.lifecycle import (
     CollaborationNamespaceRetired,
@@ -144,6 +145,8 @@ async def lifecycle_replay(
     raw = await tx.get("operations", _key(expected))
     if raw is None:
         return None
+    if request_receipt_metadata(raw, redactor=redactor) is not None:
+        raise CollaborationConflict("Operation key already carries request arbitration.")
     if _stored_mode(raw) == "permit":
         from cayu.collaboration._permit_store import prepare_permit_record
 

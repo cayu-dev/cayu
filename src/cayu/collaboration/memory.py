@@ -107,6 +107,15 @@ class _MemoryRepository:
         values.sort(key=lambda item: item["receipt"]["event"]["sequence"])
         return deepcopy(values[:limit])
 
+    async def scan_request_events(self, *, after, limit):
+        values = [
+            (key[0], value)
+            for (family, key), value in self.rows.items()
+            if family == "request_events" and key[0] > after
+        ]
+        values.sort(key=lambda item: item[0])
+        return deepcopy([value for _, value in values[:limit]])
+
 
 class InMemoryCollaborationStore(CollaborationStore):
     request_contract_version = 1

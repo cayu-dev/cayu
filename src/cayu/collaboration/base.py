@@ -36,6 +36,7 @@ from cayu.collaboration._permits import (
     RetiredPermitExclusion,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
+from cayu.collaboration._request_receipts import request_receipt_metadata
 from cayu.collaboration.lifecycle import (
     CollaborationHistoryUnavailable,
     LifecycleCommand,
@@ -128,6 +129,8 @@ class _Repository(Protocol):
 
     async def scan_due_requests(self, *, after: int, now_ms: int, limit: int) -> list[object]: ...
 
+    async def scan_request_events(self, *, after: int, limit: int) -> list[object]: ...
+
 
 class _Anchor(ContractValue):
     initialization: CollaborationInitialization
@@ -165,6 +168,14 @@ def _stored_mode(raw: object) -> object:
     if not isinstance(raw, dict):
         return None
     expected = cast("dict[object, object]", raw).get("expected")
+    direct = cast("dict[object, object]", raw).get("mode")
+    if isinstance(direct, str):
+        return direct
+    command = cast("dict[object, object]", raw).get("command")
+    if isinstance(command, dict):
+        command_map = cast("dict[str, object]", command)
+        if isinstance(command_map.get("mode"), str):
+            return command_map["mode"]
     if not isinstance(expected, dict):
         return None
     return cast("dict[object, object]", expected).get("mode")
@@ -351,6 +362,8 @@ class CollaborationStore(ABC):
         raw = await tx.get("operations", _key(expected))
         if raw is None:
             return ExactNotFound()
+        if request_receipt_metadata(raw, redactor=redactor) is not None:
+            return ExactConflict()
         if _stored_mode(raw) == "lifecycle":
             prepare_contract(LifecycleReceipt, raw, redactor=redactor)
             return ExactConflict()

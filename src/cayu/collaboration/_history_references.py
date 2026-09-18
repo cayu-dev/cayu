@@ -6,7 +6,14 @@ from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration._permits import PermitReceipt
 from cayu.collaboration.lifecycle import LifecycleReceipt
 from cayu.collaboration.participants import ParticipantReceipt
-from cayu.collaboration.requests import RequestControlReceipt, RequestReceipt
+from cayu.collaboration.requests import (
+    RequestAdmissionReceipt,
+    RequestControlReceipt,
+    RequestObservationReceipt,
+    RequestOutcomeReceipt,
+    RequestProgressReceipt,
+    RequestReceipt,
+)
 
 HistoryFamily = Literal["configurations", "lifecycle_history"]
 HistoryKey = tuple[HistoryFamily, str, int]
@@ -18,9 +25,27 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
         snapshots = value.participants
     elif isinstance(value, LifecycleReceipt) and value.participant is not None:
         snapshots = (value.participant,)
-    elif isinstance(value, (RequestReceipt, RequestControlReceipt)):
+    elif isinstance(
+        value,
+        (
+            RequestReceipt,
+            RequestControlReceipt,
+            RequestAdmissionReceipt,
+            RequestProgressReceipt,
+            RequestOutcomeReceipt,
+            RequestObservationReceipt,
+        ),
+    ):
         command = (
-            value.expected if isinstance(value, RequestReceipt) else value.expected.intent.expected
+            value.expected
+            if isinstance(value, RequestReceipt)
+            else value.expected.intent.expected
+            if isinstance(value, RequestControlReceipt)
+            else value.command.expected
+            if isinstance(
+                value, (RequestAdmissionReceipt, RequestProgressReceipt, RequestOutcomeReceipt)
+            )
+            else value.expected
         )
         selected = command.intent.selection
         snapshots = (selected.sender, selected.recipient)

@@ -7,6 +7,7 @@ settle participant responsibility. No database transaction spans both owners.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from cayu.collaboration._contracts import (
@@ -25,6 +26,7 @@ from cayu.collaboration._permits import (
     PermitSettlementReader,
     ReceivingSettlementReceipt,
 )
+from cayu.collaboration._preparation import prepare_contract, require_exact_contract
 from cayu.collaboration._session_export_store import (
     ExportAdmission,
     ExportPreparation,
@@ -37,6 +39,8 @@ from cayu.collaboration._session_export_store import (
 from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.base import LIFECYCLE_FAMILY
 from cayu.collaboration.exports import (
+    SessionExportAcceptance,
+    SessionExportAcceptanceReader,
     SessionExportAuthorization,
     SessionExportCapacityExceeded,
     SessionExportConflict,
@@ -50,6 +54,17 @@ from cayu.collaboration.lifecycle import (
     NamespaceRetirementEvidence,
 )
 from cayu.collaboration.participants import CollaborationUnavailable
+from cayu.collaboration.request_access import (
+    RequestReceivingAuthorization,
+    RequestReceivingCommand,
+    RequestReceivingOwner,
+)
+from cayu.collaboration.requests import (
+    RequestAdmissionCommand,
+    RequestControlCommand,
+    source_export_matches_request,
+)
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.collaboration._coordinator import ParticipantCoordinator
@@ -464,12 +479,6 @@ class ExportParticipantAdapter:
                 )
             )
         except CollaborationUnavailable:
-            # Publication at the source proves this exact permit was admitted.
-            # Native settlement can commit before the source records its ACK, and
-            # legitimate maintenance may then prune the native receipt. Positive
-            # retirement of that exact namespace proves no obligations remain and
-            # no future registration can reopen it. Absence alone proves nothing;
-            # this discharges source responsibility, never fabricates a receipt.
             operation = admission.permit.operation
             namespace = NamespaceRef(
                 owner=admission.permit.source,
@@ -487,3 +496,89 @@ class ExportParticipantAdapter:
             return
         if result.expected != admission.permit:
             raise SessionExportUnavailable()
+
+
+class SessionExportRequestReceivingOwner(RequestReceivingOwner):
+    """Authenticate terminal session-export evidence for request settlement."""
+
+    def __init__(
+        self,
+        *,
+        audience: OwnerRef,
+        reader: SessionExportAcceptanceReader,
+        redactor: SecretRedactor | None = None,
+    ):
+        self.redactor = SecretRedactor() if redactor is None else redactor
+        self.audience = prepare_contract(OwnerRef, audience, redactor=self.redactor)
+        self.reader = reader
+        require_exact_contract(audience, reader.owner, redactor=self.redactor)
+
+    @property
+    def ref(self) -> ObjectRef:
+        return ObjectRef(
+            owner=self.audience,
+            kind="request_receiving_owner",
+            object_id="session_export",
+            incarnation=self.audience.incarnation,
+            revision=1,
+        )
+
+    @asynccontextmanager
+    async def acquire(self, command: RequestReceivingCommand, *, context):
+        source = (
+            command.intent.source_receipt
+            if isinstance(command, RequestControlCommand)
+            else command.source_receipt
+        )
+        expected = (
+            command.intent.expected
+            if isinstance(command, RequestControlCommand)
+            else command.expected
+        )
+        if expected.intent.selection.recipient.reference.owner != self.audience:
+            raise SessionExportDenied()
+        if source is None:
+            if not (
+                isinstance(command, RequestAdmissionCommand)
+                and command.decision in {"defer", "clarify", "decline"}
+            ):
+                raise SessionExportDenied()
+            yield RequestReceivingAuthorization(
+                receiver=self.ref,
+                command=command,
+                expires_at_ms=expected.intent.selection.expires_at_ms,
+            )
+            return
+        if not source_export_matches_request(source, expected.intent.request, expected.initiator):
+            raise SessionExportConflict()
+        checked = await self.reader.lookup(source)
+        if not isinstance(checked, ExactMatch):
+            raise SessionExportUnavailable()
+        acceptance = prepare_contract(
+            SessionExportAcceptance, checked.receipt, redactor=self.redactor
+        )
+        if acceptance.export_receipt != source or acceptance.receiving_owner != self.audience:
+            raise SessionExportConflict()
+        yield RequestReceivingAuthorization(
+            receiver=self.ref,
+            command=command,
+            expires_at_ms=source.expected.intent.authorization.expires_at_ms,
+        )
+
+    async def settlement(self, command, expected, *, context):
+        source = (
+            command.intent.source_receipt
+            if isinstance(command, RequestControlCommand)
+            else command.source_receipt
+        )
+        if source is None:
+            return None
+        checked = await self.reader.settlement(source, expected)
+        if not isinstance(checked, ExactMatch):
+            raise SessionExportUnavailable()
+        settlement = prepare_contract(
+            ReceivingSettlementReceipt, checked.receipt, redactor=self.redactor
+        )
+        if settlement.expected != expected or settlement.receiving_owner != self.audience:
+            raise SessionExportConflict()
+        return settlement

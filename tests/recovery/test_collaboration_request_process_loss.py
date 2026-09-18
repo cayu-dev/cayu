@@ -28,6 +28,48 @@ pytestmark = [pytest.mark.anyio, pytest.mark.process]
         pytest.param("postgres", marks=[pytest.mark.postgres, pytest.mark.postgres_recovery]),
     ],
 )
+async def test_answer_commit_survives_process_loss_and_fresh_process_replay(
+    backend, tmp_path, request
+):
+    address = (
+        str(tmp_path / "answer.sqlite")
+        if backend == "sqlite"
+        else request.getfixturevalue("postgres_dsn")
+    )
+    output = tmp_path / "answer.json"
+    root = Path(__file__).resolve().parents[2]
+    env = dict(
+        os.environ,
+        CAYU_REQUEST_TEST_STORE=address,
+        PYTHONPATH=str(root / "src") + os.pathsep + str(root),
+    )
+    for mode, expected_code in (("publish", 19), ("recover", 0)):
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "tests.recovery.collaboration_answer_worker",
+                backend,
+                mode,
+                str(output),
+            ],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            timeout=60,
+        )
+        assert child.returncode == expected_code, child.stderr.decode()
+        if mode == "recover":
+            assert b"answer-replay-ok" in child.stdout
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "sqlite",
+        pytest.param("postgres", marks=[pytest.mark.postgres, pytest.mark.postgres_recovery]),
+    ],
+)
 async def test_control_process_loss_replays_without_another_acceptance(backend, tmp_path, request):
     address = (
         str(tmp_path / "request.sqlite")
