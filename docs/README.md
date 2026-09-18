@@ -75,6 +75,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Architecture](architecture.md)
 - [Public concepts and source ownership](public-concepts.md)
 - [Internal collaboration contract foundation](collaboration-contracts.md)
+- [Durable collaboration request acceptance](collaboration-requests.md)
 - [Function-call event ordering diagnostics](function-call-event-ordering.md)
 - [Hosted-search event ordering diagnostics](hosted-search-event-ordering.md)
 - [Hosted-search source diagnostics](hosted-search-source-diagnostics.md)

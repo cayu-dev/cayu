@@ -22,7 +22,7 @@ def require_capacity(anchor: _Anchor, *, ordinary: bool) -> None:
         or anchor.alias_count > limits.aliases
         or anchor.permit_count > limits.obligations
         or anchor.retained_generations > limits.generations
-        or anchor.operation_count
+        or anchor.operation_count + anchor.reserved_operations
         > limits.operations - (limits.control_operations if ordinary else 0)
         or anchor.event_count + anchor.reserved_events
         > limits.events - (limits.control_events if ordinary else 0)

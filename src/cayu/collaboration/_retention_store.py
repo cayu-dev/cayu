@@ -36,6 +36,7 @@ from cayu.collaboration.participants import (
     ParticipantReceipt,
     ParticipantSnapshot,
 )
+from cayu.collaboration.requests import RequestControlReceipt, RequestReceipt
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -108,10 +109,58 @@ async def prune_namespace(
     )
     released = removed = events_removed = permits_removed = 0
     processed = set()
+    processed_requests = set()
     for raw in records:
         if removed >= request.max_records:
             break
         mode = _stored_mode(raw)
+        if mode in ("request", "request_control"):
+            from cayu.collaboration._request_store import retained_request
+
+            request_item = prepare_contract(
+                RequestReceipt if mode == "request" else RequestControlReceipt,
+                raw,
+                redactor=redactor,
+            )
+            command = (
+                request_item.expected
+                if isinstance(request_item, RequestReceipt)
+                else request_item.expected.intent.expected
+            )
+            if _key(command) in processed_requests:
+                continue
+            snapshot = await retained_request(
+                store,
+                tx,
+                anchor.initialization,
+                command.intent.request,
+                command.initiator,
+                redactor,
+            )
+            if snapshot is None or snapshot.terminal is None:
+                raise CollaborationUnavailable("Retired namespace retains an open request.")
+            if removed + 2 > request.max_records:
+                if not removed:
+                    raise CollaborationCapacityExceeded(
+                        "A request requires a pruning batch of at least two records."
+                    )
+                break
+            for request_record in (snapshot.receipt, snapshot.terminal):
+                await tx.delete("operations", _key(request_record.expected))
+                await tx.delete("request_events", (request_record.event.sequence,))
+                released += len(contract_bytes(request_record, redactor=redactor))
+                released += len(contract_bytes(request_record.event, redactor=redactor))
+                removed += 1
+                events_removed += 1
+            await tx.delete("requests", _key(command))
+            released += len(contract_bytes(snapshot, redactor=redactor))
+            request_history = (
+                *history_references(snapshot.receipt),
+                *history_references(snapshot.terminal),
+            )
+            released += await release_unused_history(tx, request_history, redactor)
+            processed_requests.add(_key(command))
+            continue
         if mode == "identity":
             item = prepare_contract(ParticipantReceipt, raw, redactor=redactor)
             found = await store._receipt(tx, item.expected, redactor)

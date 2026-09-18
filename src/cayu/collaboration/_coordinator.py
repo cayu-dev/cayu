@@ -35,7 +35,12 @@ from cayu.collaboration.access import (
     CollaborationRegistration,
     ParticipantAction,
 )
-from cayu.collaboration.base import IDENTITY_FAMILY, LIFECYCLE_FAMILY, CollaborationStore
+from cayu.collaboration.base import (
+    IDENTITY_FAMILY,
+    LIFECYCLE_FAMILY,
+    REQUEST_FAMILY,
+    CollaborationStore,
+)
 from cayu.collaboration.lifecycle import (
     CollaborationHistoryUnavailable,
     CollaborationNamespaceRetired,
@@ -156,6 +161,8 @@ class ParticipantCoordinator:
             )
         except CollaborationConflict:
             failure = CollaborationConflict("Collaboration authority or intent conflicts.")
+        except CollaborationAccessDenied:
+            failure = CollaborationAccessDenied("Collaboration access was denied.")
         except CollaborationCapacityExceeded:
             failure = CollaborationCapacityExceeded(
                 "Collaboration admission capacity is exhausted."
@@ -254,7 +261,7 @@ class ParticipantCoordinator:
             store.capabilities(initialized.owner),
             expected_owner=initialized.owner,
             required=family,
-            supported=(IDENTITY_FAMILY, LIFECYCLE_FAMILY),
+            supported=(IDENTITY_FAMILY, LIFECYCLE_FAMILY, REQUEST_FAMILY),
             access="mutation" if mutation else "readback",
             redactor=self._redactor,
         )

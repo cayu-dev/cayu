@@ -31,6 +31,7 @@ from cayu.collaboration.participants import (
     ParticipantEvent,
     ParticipantReceipt,
 )
+from cayu.collaboration.requests import RequestControlReceipt, RequestReceipt
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -151,6 +152,12 @@ async def lifecycle_replay(
     if _stored_mode(raw) == "identity":
         prepare_contract(ParticipantReceipt, raw, redactor=redactor)
         raise CollaborationConflict("Operation key already has different intent.")
+    if _stored_mode(raw) == "request":
+        prepare_contract(RequestReceipt, raw, redactor=redactor)
+        raise CollaborationConflict("Operation key already carries a request.")
+    if _stored_mode(raw) == "request_control":
+        prepare_contract(RequestControlReceipt, raw, redactor=redactor)
+        raise CollaborationConflict("Operation key already carries request control.")
     receipt = prepare_contract(LifecycleReceipt, raw, redactor=redactor)
     require_exact_contract(expected, receipt.expected, redactor=redactor)
     event = await tx.get("events", (receipt.event.sequence,))

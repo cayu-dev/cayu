@@ -79,6 +79,7 @@ from cayu.budgets.usage import (
 )
 from cayu.collaboration._contracts import ExactLookup, ExpectedOperation
 from cayu.collaboration._coordinator import ParticipantCoordinator
+from cayu.collaboration._request_coordinator import RequestCoordinator
 from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
 from cayu.collaboration.base import CollaborationStore
@@ -104,6 +105,7 @@ from cayu.collaboration.lifecycle import (
     NamespaceSeal,
     ParticipantLifecycleChange,
 )
+from cayu.collaboration.mandates import MandateAccessContext
 from cayu.collaboration.obligations import ParticipantObligationCursor, ParticipantObligationPage
 from cayu.collaboration.participants import (
     CollaborationInitialization,
@@ -119,6 +121,18 @@ from cayu.collaboration.participants import (
     ParticipantPage,
     ParticipantReceipt,
     ParticipantRef,
+)
+from cayu.collaboration.request_access import RequestRegistration
+from cayu.collaboration.requests import (
+    CollaborationRequest,
+    RequestCommand,
+    RequestControl,
+    RequestControlCommand,
+    RequestControlReceipt,
+    RequestDueCursor,
+    RequestDuePage,
+    RequestReceipt,
+    RequestSnapshot,
 )
 from cayu.configuration import (
     CayuConfig,
@@ -926,6 +940,7 @@ class CayuApp:
         session_message_access_policy: SessionMessageAccessPolicy | None = None,
         collaboration_store: CollaborationStore | None = None,
         collaboration: CollaborationRegistration | None = None,
+        collaboration_requests: RequestRegistration | None = None,
         session_exports: SessionExportRegistration | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
@@ -1452,12 +1467,63 @@ class CayuApp:
             registration=collaboration,
             redactor=self._secret_redactor,
         )
+        self._request_coordinator = RequestCoordinator(
+            participants=self._participant_coordinator,
+            registration=collaboration_requests,
+            redactor=self._secret_redactor,
+        )
         self._session_export_coordinator = SessionExportCoordinator(
             store=self.session_store,
             registration=session_exports,
             redactor=self._secret_redactor,
             participants=self._participant_coordinator,
         )
+
+    async def accept_collaboration_request(
+        self,
+        request: CollaborationRequest,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestReceipt:
+        """Retain a question/contribution; never launch an agent or session."""
+        return await self._request_coordinator.accept(request, context=context)
+
+    async def inspect_collaboration_request(
+        self,
+        expected: RequestCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestSnapshot | None:
+        return await self._request_coordinator.inspect(expected, context=context)
+
+    async def lookup_collaboration_request(
+        self,
+        expected: RequestCommand | RequestControlCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> ExactLookup[RequestReceipt | RequestControlReceipt]:
+        return await self._request_coordinator.lookup(expected, context=context)
+
+    async def control_collaboration_request(
+        self,
+        request: RequestControl,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestControlReceipt:
+        return await self._request_coordinator.control(request, context=context)
+
+    async def drain_collaboration_requests(self) -> None:
+        await self._request_coordinator.close()
+
+    async def list_due_collaboration_requests(
+        self,
+        *,
+        context: MandateAccessContext,
+        cursor: RequestDueCursor | None = None,
+        limit: int = 32,
+    ) -> RequestDuePage:
+        """Inspect retained responsibilities without claiming or dispatching work."""
+        return await self._request_coordinator.due(context=context, cursor=cursor, limit=limit)
 
     async def initialize_session_exports(
         self,

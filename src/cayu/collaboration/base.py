@@ -67,6 +67,12 @@ from cayu.collaboration.participants import (
     ParticipantRef,
     ParticipantSnapshot,
 )
+from cayu.collaboration.requests import (
+    RequestCommand,
+    RequestControlCommand,
+    RequestControlReceipt,
+    RequestReceipt,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 Table = Literal[
@@ -81,16 +87,23 @@ Table = Literal[
     "participant_permits",
     "permits",
     "history_uses",
+    "requests",
+    "request_events",
 ]
 Key = tuple[str | int, ...]
 IDENTITY_FAMILY = FamilyVersion(family="participant.identity", version=1)
 LIFECYCLE_FAMILY = FamilyVersion(family="collaboration.lifecycle", version=1)
+REQUEST_FAMILY = FamilyVersion(family="collaboration.request.acceptance", version=1)
 # Reserve the maximum bounded anchor envelope once. Its counters can grow
 # without changing the admission decision that those same counters describe.
 _ANCHOR_BYTES = 64 * 1024
 
 
 class _Repository(Protocol):
+    async def now_ms(self) -> int:
+        """Physical owner time sampled after acquiring transaction ownership."""
+        ...
+
     async def get(self, table: Table, key: Key) -> object | None: ...
     async def put(self, table: Table, key: Key, value: ContractValue, *, insert: bool) -> None: ...
     async def delete(self, table: Table, key: Key) -> None: ...
@@ -113,6 +126,8 @@ class _Repository(Protocol):
         self, namespace: str, generation: int, *, limit: int
     ) -> list[object]: ...
 
+    async def scan_due_requests(self, *, after: int, now_ms: int, limit: int) -> list[object]: ...
+
 
 class _Anchor(ContractValue):
     initialization: CollaborationInitialization
@@ -131,9 +146,16 @@ class _Anchor(ContractValue):
     reserved_events: Counter
     retained_bytes: Counter
     alias_revision: Counter
+    reserved_operations: Counter = 0
 
 
-def _key(expected: ExpectedOperation[ParticipantIntent] | LifecycleCommand | PermitCommand) -> Key:
+def _key(
+    expected: ExpectedOperation[ParticipantIntent]
+    | LifecycleCommand
+    | PermitCommand
+    | RequestCommand
+    | RequestControlCommand,
+) -> Key:
     op = expected.operation
     return op.namespace_incarnation, op.generation, op.caller_key
 
@@ -156,6 +178,7 @@ class CollaborationStore(ABC):
     """
 
     identity_contract_version: ClassVar[int] = 1
+    request_contract_version: ClassVar[int] = 0
     _owners: _MutationOwners
 
     @abstractmethod
@@ -167,10 +190,13 @@ class CollaborationStore(ABC):
     async def close(self) -> None: ...
 
     def capabilities(self, owner: OwnerRef) -> CapabilityDescriptor:
+        families = (IDENTITY_FAMILY, LIFECYCLE_FAMILY)
+        if type(self.request_contract_version) is int and self.request_contract_version == 1:
+            families += (REQUEST_FAMILY,)
         return CapabilityDescriptor(
             owner=owner,
-            mutations=(IDENTITY_FAMILY, LIFECYCLE_FAMILY),
-            readbacks=(IDENTITY_FAMILY, LIFECYCLE_FAMILY),
+            mutations=families,
+            readbacks=families,
         )
 
     async def initialize(
@@ -332,6 +358,12 @@ class CollaborationStore(ABC):
             from cayu.collaboration._permit_store import prepare_permit_record
 
             prepare_permit_record(raw, redactor)
+            return ExactConflict()
+        if _stored_mode(raw) == "request":
+            prepare_contract(RequestReceipt, raw, redactor=redactor)
+            return ExactConflict()
+        if _stored_mode(raw) == "request_control":
+            prepare_contract(RequestControlReceipt, raw, redactor=redactor)
             return ExactConflict()
         receipt = prepare_contract(ParticipantReceipt, raw, redactor=redactor)
         try:

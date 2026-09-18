@@ -1,6 +1,21 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "RequestDueCursor": ("cayu.collaboration.requests", "RequestDueCursor"),
+    "RequestDuePage": ("cayu.collaboration.requests", "RequestDuePage"),
+    "RequestRegistration": ("cayu.collaboration.request_access", "RequestRegistration"),
+    "CollaborationRequest": ("cayu.collaboration.requests", "CollaborationRequest"),
+    "RequestAlias": ("cayu.collaboration.requests", "RequestAlias"),
+    "RequestRef": ("cayu.collaboration.requests", "RequestRef"),
+    "RequestIntent": ("cayu.collaboration.requests", "RequestIntent"),
+    "RequestSelection": ("cayu.collaboration.requests", "RequestSelection"),
+    "RequestEvent": ("cayu.collaboration.requests", "RequestEvent"),
+    "RequestCommand": ("cayu.collaboration.requests", "RequestCommand"),
+    "RequestControl": ("cayu.collaboration.requests", "RequestControl"),
+    "RequestControlCommand": ("cayu.collaboration.requests", "RequestControlCommand"),
+    "RequestControlReceipt": ("cayu.collaboration.requests", "RequestControlReceipt"),
+    "RequestReceipt": ("cayu.collaboration.requests", "RequestReceipt"),
+    "RequestSnapshot": ("cayu.collaboration.requests", "RequestSnapshot"),
     "SessionExportRuntimeOrigin": ("cayu.collaboration.exports", "SessionExportRuntimeOrigin"),
     "CollaborationMandate": ("cayu.collaboration.mandates", "CollaborationMandate"),
     "InputChannel": ("cayu.collaboration.mandates", "InputChannel"),

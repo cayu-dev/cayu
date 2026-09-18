@@ -6,6 +6,7 @@ from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration._permits import PermitReceipt
 from cayu.collaboration.lifecycle import LifecycleReceipt
 from cayu.collaboration.participants import ParticipantReceipt
+from cayu.collaboration.requests import RequestControlReceipt, RequestReceipt
 
 HistoryFamily = Literal["configurations", "lifecycle_history"]
 HistoryKey = tuple[HistoryFamily, str, int]
@@ -17,6 +18,12 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
         snapshots = value.participants
     elif isinstance(value, LifecycleReceipt) and value.participant is not None:
         snapshots = (value.participant,)
+    elif isinstance(value, (RequestReceipt, RequestControlReceipt)):
+        command = (
+            value.expected if isinstance(value, RequestReceipt) else value.expected.intent.expected
+        )
+        selected = command.intent.selection
+        snapshots = (selected.sender, selected.recipient)
     refs: set[HistoryKey] = set()
     for snapshot in snapshots:
         refs.add(

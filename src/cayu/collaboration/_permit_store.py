@@ -201,118 +201,129 @@ async def register_permit(
     redactor: SecretRedactor,
 ) -> PermitReceipt:
     async with store._transaction(initialized.binding.application_scope, write=True) as tx:
-        anchor = await store._anchor(tx, initialized, redactor)
-        replay = await registered_receipt(tx, expected, redactor)
-        if replay is not None:
-            return replay
-        namespace = await require_open_namespace(tx, anchor, expected.operation, redactor)
-        request = expected.intent.request
-        participant = await store._participant(tx, request.participant, initialized.owner, redactor)
-        if (
-            participant.lifecycle != "active"
-            or participant.lifecycle_revision != request.expected_lifecycle_revision
-            or participant.admission_generation != request.admission_generation
-        ):
-            raise CollaborationConflict("Participant no longer admits this permit authority.")
-        settlement_key = (
-            request.settlement_operation.namespace_incarnation,
-            request.settlement_operation.generation,
-            request.settlement_operation.caller_key,
-        )
-        if await tx.get("operations", settlement_key) is not None:
-            raise CollaborationConflict("Settlement key already carries different responsibility.")
-        current = await store._permit_state(tx, participant.reference, redactor)
-        updated_permits = prepare_contract(
-            ParticipantPermitState,
-            current.model_copy(
-                update={
-                    "issued_frontier": current.issued_frontier + 1,
-                    "outstanding": current.outstanding + 1,
-                }
-            ),
-            redactor=redactor,
-        )
-        updated_namespace = prepare_contract(
-            NamespaceSnapshot,
-            namespace.model_copy(
-                update={
-                    "outstanding_obligations": namespace.outstanding_obligations + 1,
-                }
-            ),
-            redactor=redactor,
-        )
-        event = ParticipantEvent(
-            id=uuid4().hex,
-            sequence=anchor.event_sequence + 1,
-            operation=expected.operation,
-            type="permit_registered",
-            participants=(participant.reference,),
-        )
-        receipt = prepare_contract(
-            PermitReceipt,
-            PermitReceipt(
-                expected=expected,
-                position=updated_permits.issued_frontier,
-                event=event,
-            ),
-            redactor=redactor,
-        )
-        snapshot = prepare_contract(
-            PermitSnapshot,
-            PermitSnapshot(
-                expected=expected,
-                position=receipt.position,
-                state="pending",
-                settlement=None,
-            ),
-            redactor=redactor,
-        )
-        reserved = ReservedPermitSettlement(expected=expected)
-        charge = sum(
-            len(contract_bytes(v, redactor=redactor))
-            for v in (
-                receipt,
-                snapshot,
-                reserved,
-                event,
-                updated_permits,
-                updated_namespace,
-            )
-        ) - sum(len(contract_bytes(v, redactor=redactor)) for v in (current, namespace))
-        updated = prepare_contract(
-            _Anchor,
-            anchor.model_copy(
-                update={
-                    "operation_count": anchor.operation_count + 2,
-                    "permit_count": anchor.permit_count + 1,
-                    "event_count": anchor.event_count + 1,
-                    "event_sequence": event.sequence,
-                    "reserved_events": anchor.reserved_events + 1,
-                    "retained_bytes": anchor.retained_bytes + charge,
-                    "reserved_bytes": anchor.reserved_bytes + PERMIT_SETTLEMENT_BYTES,
-                }
-            ),
-            redactor=redactor,
-        )
-        require_capacity(updated, ordinary=True)
-        await tx.put("operations", _key(expected), receipt, insert=True)
-        await tx.put("operations", settlement_key, reserved, insert=True)
-        await tx.put("permits", _key(expected), snapshot, insert=True)
-        await tx.put(
-            "participant_permits",
-            (participant.reference.participant_id,),
+        return await register_permit_in_transaction(store, tx, initialized, expected, redactor)
+
+
+async def register_permit_in_transaction(
+    store: CollaborationStore,
+    tx: _Repository,
+    initialized: CollaborationInitialization,
+    expected: PermitCommand,
+    redactor: SecretRedactor,
+) -> PermitReceipt:
+    """Compose permit admission with the receiving owner's atomic mutation."""
+    anchor = await store._anchor(tx, initialized, redactor)
+    replay = await registered_receipt(tx, expected, redactor)
+    if replay is not None:
+        return replay
+    namespace = await require_open_namespace(tx, anchor, expected.operation, redactor)
+    request = expected.intent.request
+    participant = await store._participant(tx, request.participant, initialized.owner, redactor)
+    if (
+        participant.lifecycle != "active"
+        or participant.lifecycle_revision != request.expected_lifecycle_revision
+        or participant.admission_generation != request.admission_generation
+    ):
+        raise CollaborationConflict("Participant no longer admits this permit authority.")
+    settlement_key = (
+        request.settlement_operation.namespace_incarnation,
+        request.settlement_operation.generation,
+        request.settlement_operation.caller_key,
+    )
+    if await tx.get("operations", settlement_key) is not None:
+        raise CollaborationConflict("Settlement key already carries different responsibility.")
+    current = await store._permit_state(tx, participant.reference, redactor)
+    updated_permits = prepare_contract(
+        ParticipantPermitState,
+        current.model_copy(
+            update={
+                "issued_frontier": current.issued_frontier + 1,
+                "outstanding": current.outstanding + 1,
+            }
+        ),
+        redactor=redactor,
+    )
+    updated_namespace = prepare_contract(
+        NamespaceSnapshot,
+        namespace.model_copy(
+            update={
+                "outstanding_obligations": namespace.outstanding_obligations + 1,
+            }
+        ),
+        redactor=redactor,
+    )
+    event = ParticipantEvent(
+        id=uuid4().hex,
+        sequence=anchor.event_sequence + 1,
+        operation=expected.operation,
+        type="permit_registered",
+        participants=(participant.reference,),
+    )
+    receipt = prepare_contract(
+        PermitReceipt,
+        PermitReceipt(
+            expected=expected,
+            position=updated_permits.issued_frontier,
+            event=event,
+        ),
+        redactor=redactor,
+    )
+    snapshot = prepare_contract(
+        PermitSnapshot,
+        PermitSnapshot(
+            expected=expected,
+            position=receipt.position,
+            state="pending",
+            settlement=None,
+        ),
+        redactor=redactor,
+    )
+    reserved = ReservedPermitSettlement(expected=expected)
+    charge = sum(
+        len(contract_bytes(v, redactor=redactor))
+        for v in (
+            receipt,
+            snapshot,
+            reserved,
+            event,
             updated_permits,
-            insert=False,
-        )
-        await tx.put(
-            "namespaces",
-            (namespace.reference.namespace_incarnation, namespace.reference.generation),
             updated_namespace,
-            insert=False,
         )
-        await tx.put("events", (event.sequence,), event, insert=True)
-        await tx.put("anchors", (), updated, insert=False)
-        return receipt
+    ) - sum(len(contract_bytes(v, redactor=redactor)) for v in (current, namespace))
+    updated = prepare_contract(
+        _Anchor,
+        anchor.model_copy(
+            update={
+                "operation_count": anchor.operation_count + 2,
+                "permit_count": anchor.permit_count + 1,
+                "event_count": anchor.event_count + 1,
+                "event_sequence": event.sequence,
+                "reserved_events": anchor.reserved_events + 1,
+                "retained_bytes": anchor.retained_bytes + charge,
+                "reserved_bytes": anchor.reserved_bytes + PERMIT_SETTLEMENT_BYTES,
+            }
+        ),
+        redactor=redactor,
+    )
+    require_capacity(updated, ordinary=True)
+    await tx.put("operations", _key(expected), receipt, insert=True)
+    await tx.put("operations", settlement_key, reserved, insert=True)
+    await tx.put("permits", _key(expected), snapshot, insert=True)
+    await tx.put(
+        "participant_permits",
+        (participant.reference.participant_id,),
+        updated_permits,
+        insert=False,
+    )
+    await tx.put(
+        "namespaces",
+        (namespace.reference.namespace_incarnation, namespace.reference.generation),
+        updated_namespace,
+        insert=False,
+    )
+    await tx.put("events", (event.sequence,), event, insert=True)
+    await tx.put("anchors", (), updated, insert=False)
+    return receipt
 
 
 async def exclude_permit(
@@ -470,109 +481,132 @@ async def settle_permit(
         raise CollaborationUnavailable("Positive exact receiving settlement is unavailable.")
     require_exact_contract(expected, found.receipt.expected, redactor=redactor)
     async with store._transaction(initialized.binding.application_scope, write=True) as tx:
-        anchor = await store._anchor(tx, initialized, redactor)
-        if await registered_receipt(tx, expected, redactor) is None:
-            raise CollaborationUnavailable("Permit registration is unavailable.")
-        reserved = prepare_permit_record(await tx.get("operations", settlement_key), redactor)
-        require_exact_contract(expected, reserved.expected, redactor=redactor)
-        if isinstance(reserved, PermitSettlement):
-            await require_event(tx, reserved.event, redactor)
-            return reserved
-        if not isinstance(reserved, ReservedPermitSettlement):
-            raise CollaborationConflict("Settlement key has another operation kind.")
-        prior = prepare_contract(
-            PermitSnapshot, await tx.get("permits", _key(expected)), redactor=redactor
+        return await settle_permit_in_transaction(
+            store, tx, initialized, expected, found.receipt, redactor
         )
-        if prior.state != "pending":
-            raise CollaborationUnavailable("Permit settlement representations conflict.")
-        current = await store._permit_state(tx, request.participant, redactor)
-        namespace = await load_namespace(tx, anchor, expected.operation.generation, redactor)
-        if not current.outstanding or not namespace.outstanding_obligations:
-            raise CollaborationUnavailable("Permit accounting lacks retained responsibility.")
-        event = ParticipantEvent(
-            id=uuid4().hex,
-            sequence=anchor.event_sequence + 1,
-            operation=request.settlement_operation,
-            type="permit_settled",
-            participants=(request.participant,),
-        )
-        receipt = prepare_contract(
-            PermitSettlement,
-            PermitSettlement(
-                expected=expected,
-                receiving_receipt=found.receipt,
-                event=event,
-            ),
-            redactor=redactor,
-        )
-        snapshot = prepare_contract(
-            PermitSnapshot,
-            prior.model_copy(
-                update={
-                    "state": "settled",
-                    "settlement": found.receipt,
-                }
-            ),
-            redactor=redactor,
-        )
-        updated_permits = prepare_contract(
-            ParticipantPermitState,
-            current.model_copy(
-                update={
-                    "outstanding": current.outstanding - 1,
-                }
-            ),
-            redactor=redactor,
-        )
-        updated_namespace = prepare_contract(
-            NamespaceSnapshot,
-            namespace.model_copy(
-                update={
-                    "outstanding_obligations": namespace.outstanding_obligations - 1,
-                }
-            ),
-            redactor=redactor,
-        )
-        charge = sum(
-            len(contract_bytes(v, redactor=redactor))
-            for v in (
-                receipt,
-                snapshot,
-                event,
-                updated_permits,
-                updated_namespace,
-            )
-        ) - sum(
-            len(contract_bytes(v, redactor=redactor)) for v in (reserved, prior, current, namespace)
-        )
-        updated = prepare_contract(
-            _Anchor,
-            anchor.model_copy(
-                update={
-                    "event_count": anchor.event_count + 1,
-                    "event_sequence": event.sequence,
-                    "reserved_events": anchor.reserved_events - 1,
-                    "retained_bytes": anchor.retained_bytes + charge,
-                    "reserved_bytes": anchor.reserved_bytes - PERMIT_SETTLEMENT_BYTES,
-                }
-            ),
-            redactor=redactor,
-        )
-        require_capacity(updated, ordinary=False)
-        await tx.put("operations", settlement_key, receipt, insert=False)
-        await tx.put("permits", _key(expected), snapshot, insert=False)
-        await tx.put(
-            "participant_permits",
-            (request.participant.participant_id,),
+
+
+async def settle_permit_in_transaction(
+    store: CollaborationStore,
+    tx: _Repository,
+    initialized: CollaborationInitialization,
+    expected: PermitCommand,
+    receiving: ReceivingSettlementReceipt,
+    redactor: SecretRedactor,
+) -> PermitSettlement:
+    """Commit already-authenticated receiver evidence with its local terminal mutation.
+
+    Callers must authenticate receiving evidence before entering this private seam;
+    constructing ReceivingSettlementReceipt alone is never receiving authority.
+    """
+    receiving = prepare_contract(ReceivingSettlementReceipt, receiving, redactor=redactor)
+    require_exact_contract(expected, receiving.expected, redactor=redactor)
+    request = expected.intent.request
+    operation = request.settlement_operation
+    settlement_key = (operation.namespace_incarnation, operation.generation, operation.caller_key)
+    anchor = await store._anchor(tx, initialized, redactor)
+    if await registered_receipt(tx, expected, redactor) is None:
+        raise CollaborationUnavailable("Permit registration is unavailable.")
+    reserved = prepare_permit_record(await tx.get("operations", settlement_key), redactor)
+    require_exact_contract(expected, reserved.expected, redactor=redactor)
+    if isinstance(reserved, PermitSettlement):
+        await require_event(tx, reserved.event, redactor)
+        return reserved
+    if not isinstance(reserved, ReservedPermitSettlement):
+        raise CollaborationConflict("Settlement key has another operation kind.")
+    prior = prepare_contract(
+        PermitSnapshot, await tx.get("permits", _key(expected)), redactor=redactor
+    )
+    if prior.state != "pending":
+        raise CollaborationUnavailable("Permit settlement representations conflict.")
+    current = await store._permit_state(tx, request.participant, redactor)
+    namespace = await load_namespace(tx, anchor, expected.operation.generation, redactor)
+    if not current.outstanding or not namespace.outstanding_obligations:
+        raise CollaborationUnavailable("Permit accounting lacks retained responsibility.")
+    event = ParticipantEvent(
+        id=uuid4().hex,
+        sequence=anchor.event_sequence + 1,
+        operation=request.settlement_operation,
+        type="permit_settled",
+        participants=(request.participant,),
+    )
+    receipt = prepare_contract(
+        PermitSettlement,
+        PermitSettlement(
+            expected=expected,
+            receiving_receipt=receiving,
+            event=event,
+        ),
+        redactor=redactor,
+    )
+    snapshot = prepare_contract(
+        PermitSnapshot,
+        prior.model_copy(
+            update={
+                "state": "settled",
+                "settlement": receiving,
+            }
+        ),
+        redactor=redactor,
+    )
+    updated_permits = prepare_contract(
+        ParticipantPermitState,
+        current.model_copy(
+            update={
+                "outstanding": current.outstanding - 1,
+            }
+        ),
+        redactor=redactor,
+    )
+    updated_namespace = prepare_contract(
+        NamespaceSnapshot,
+        namespace.model_copy(
+            update={
+                "outstanding_obligations": namespace.outstanding_obligations - 1,
+            }
+        ),
+        redactor=redactor,
+    )
+    charge = sum(
+        len(contract_bytes(v, redactor=redactor))
+        for v in (
+            receipt,
+            snapshot,
+            event,
             updated_permits,
-            insert=False,
-        )
-        await tx.put(
-            "namespaces",
-            (namespace.reference.namespace_incarnation, namespace.reference.generation),
             updated_namespace,
-            insert=False,
         )
-        await tx.put("events", (event.sequence,), event, insert=True)
-        await tx.put("anchors", (), updated, insert=False)
-        return receipt
+    ) - sum(
+        len(contract_bytes(v, redactor=redactor)) for v in (reserved, prior, current, namespace)
+    )
+    updated = prepare_contract(
+        _Anchor,
+        anchor.model_copy(
+            update={
+                "event_count": anchor.event_count + 1,
+                "event_sequence": event.sequence,
+                "reserved_events": anchor.reserved_events - 1,
+                "retained_bytes": anchor.retained_bytes + charge,
+                "reserved_bytes": anchor.reserved_bytes - PERMIT_SETTLEMENT_BYTES,
+            }
+        ),
+        redactor=redactor,
+    )
+    require_capacity(updated, ordinary=False)
+    await tx.put("operations", settlement_key, receipt, insert=False)
+    await tx.put("permits", _key(expected), snapshot, insert=False)
+    await tx.put(
+        "participant_permits",
+        (request.participant.participant_id,),
+        updated_permits,
+        insert=False,
+    )
+    await tx.put(
+        "namespaces",
+        (namespace.reference.namespace_incarnation, namespace.reference.generation),
+        updated_namespace,
+        insert=False,
+    )
+    await tx.put("events", (event.sequence,), event, insert=True)
+    await tx.put("anchors", (), updated, insert=False)
+    return receipt

@@ -29,6 +29,9 @@ ParticipantAction = Literal[
     "namespace_prune",
     "participant_lifecycle",
     "obligations",
+    "request_accept",
+    "request_readback",
+    "request_control",
 ]
 
 

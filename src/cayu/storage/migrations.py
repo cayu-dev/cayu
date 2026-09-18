@@ -462,6 +462,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=93, kind=RevisionKind.ADDITIVE, compatible_from=92),
     # Collaboration writers must enforce elected namespaces and lifecycle fences.
     Revision(revision=94, kind=RevisionKind.BREAKING, compatible_from=94),
+    # Collaboration writers must preserve mandatory request-control reservations.
+    Revision(revision=95, kind=RevisionKind.BREAKING, compatible_from=95),
 )
 
 #: The revision an empty database is initialized to.

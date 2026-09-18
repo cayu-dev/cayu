@@ -15,10 +15,28 @@ KEYS = {
     "lifecycle_history": ("participant_id", "revision"),
     "participant_permits": ("participant_id",),
     "permits": ("namespace", "generation", "caller_key"),
+    "requests": ("namespace", "generation", "caller_key"),
+    "request_events": ("sequence",),
+}
+_REQUEST_TABLES = frozenset({"requests", "request_events"})
+_REQUEST_INDEXES = {
+    "cayu_collaboration_request_recipient_idx": (
+        "cayu_collaboration_requests",
+        ("scope", "participant_id", "state", "position"),
+        False,
+    ),
+    "cayu_collaboration_request_due_idx": (
+        "cayu_collaboration_requests",
+        ("scope", "state", "next_due_at_ms", "position"),
+        False,
+    ),
 }
 _LIFECYCLE_TABLES = frozenset({"namespaces", "lifecycle_history", "participant_permits", "permits"})
-EXTRA_COLUMNS = {"permits": ("participant_id", "position", "state")}
-_NUMERIC_COLUMNS = frozenset({"generation", "revision", "sequence", "position"})
+EXTRA_COLUMNS = {
+    "permits": ("participant_id", "position", "state"),
+    "requests": ("participant_id", "position", "state", "next_due_at_ms"),
+}
+_NUMERIC_COLUMNS = frozenset({"generation", "revision", "sequence", "position", "next_due_at_ms"})
 _LIFECYCLE_INDEXES = {
     "cayu_collaboration_permit_position_idx": (
         "cayu_collaboration_permits",
@@ -54,7 +72,7 @@ def _record_ddl(family: str, columns: tuple[str, ...], postgres: bool) -> str:
 def _ddl(postgres: bool) -> tuple[str, ...]:
     statements = []
     for family, columns in KEYS.items():
-        if family in _LIFECYCLE_TABLES:
+        if family in _LIFECYCLE_TABLES or family in _REQUEST_TABLES:
             continue
         statements.append(_record_ddl(family, columns, postgres))
     statements.append("""CREATE TABLE IF NOT EXISTS cayu_collaboration_event_participants (
@@ -98,9 +116,23 @@ POSTGRES_COLLABORATION_LIFECYCLE_DDL = _lifecycle_ddl(True)
 SQLITE_COLLABORATION_LIFECYCLE_DDL = ";\n".join(_lifecycle_ddl(False)) + ";"
 
 
-def _tables(*, lifecycle: bool):
+def _request_ddl(postgres: bool) -> tuple[str, ...]:
+    return (
+        *(_record_ddl(family, KEYS[family], postgres) for family in sorted(_REQUEST_TABLES)),
+        "CREATE INDEX IF NOT EXISTS cayu_collaboration_request_recipient_idx ON cayu_collaboration_requests(scope, participant_id, state, position)",
+        "CREATE INDEX IF NOT EXISTS cayu_collaboration_request_due_idx ON cayu_collaboration_requests(scope, state, next_due_at_ms, position)",
+    )
+
+
+POSTGRES_COLLABORATION_REQUEST_DDL = _request_ddl(True)
+SQLITE_COLLABORATION_REQUEST_DDL = ";\n".join(_request_ddl(False)) + ";"
+
+
+def _tables(*, lifecycle: bool, requests: bool = False):
     for family, columns in KEYS.items():
         if family in _LIFECYCLE_TABLES and not lifecycle:
+            continue
+        if family in _REQUEST_TABLES and not requests:
             continue
         primary = ("scope", *columns)
         yield (
@@ -123,8 +155,10 @@ def _tables(*, lifecycle: bool):
         yield "cayu_collaboration_history_uses", primary, primary
 
 
-def validate_sqlite_collaboration_schema(connection: Any, *, lifecycle: bool = False) -> None:
-    for table, columns, primary in _tables(lifecycle=lifecycle):
+def validate_sqlite_collaboration_schema(
+    connection: Any, *, lifecycle: bool = False, requests: bool = False
+) -> None:
+    for table, columns, primary in _tables(lifecycle=lifecycle, requests=requests):
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
         expected = [
             (
@@ -142,8 +176,12 @@ def validate_sqlite_collaboration_schema(connection: Any, *, lifecycle: bool = F
     ).fetchall()
     if tuple(row[2] for row in rows) != ("scope", "participant_id", "sequence"):
         raise SchemaError("Collaboration event lookup index is unavailable.")
-    if lifecycle:
-        for name, (table, columns, unique) in _LIFECYCLE_INDEXES.items():
+    if lifecycle or requests:
+        indexes_to_check = {
+            **(_LIFECYCLE_INDEXES if lifecycle else {}),
+            **(_REQUEST_INDEXES if requests else {}),
+        }
+        for name, (table, columns, unique) in indexes_to_check.items():
             indexes = {row[1]: row for row in connection.execute(f"PRAGMA index_list({table})")}
             rows = connection.execute(f"PRAGMA index_info({name})").fetchall()
             if (
@@ -155,8 +193,10 @@ def validate_sqlite_collaboration_schema(connection: Any, *, lifecycle: bool = F
                 raise SchemaError("Collaboration permit lookup index is unavailable.")
 
 
-async def validate_postgres_collaboration_schema(cursor: Any, *, lifecycle: bool = False) -> None:
-    for table, columns, primary in _tables(lifecycle=lifecycle):
+async def validate_postgres_collaboration_schema(
+    cursor: Any, *, lifecycle: bool = False, requests: bool = False
+) -> None:
+    for table, columns, primary in _tables(lifecycle=lifecycle, requests=requests):
         await cursor.execute(
             """SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull
             FROM pg_attribute a WHERE a.attrelid=to_regclass(%s)
@@ -188,8 +228,12 @@ async def validate_postgres_collaboration_schema(cursor: Any, *, lifecycle: bool
         AND i.indisvalid AND i.indpred IS NULL GROUP BY i.indexrelid""")
     if await cursor.fetchall() != [(["scope", "participant_id", "sequence"],)]:
         raise SchemaError("Collaboration event lookup index is unavailable.")
-    if lifecycle:
-        for name, (table, columns, unique) in _LIFECYCLE_INDEXES.items():
+    if lifecycle or requests:
+        indexes_to_check = {
+            **(_LIFECYCLE_INDEXES if lifecycle else {}),
+            **(_REQUEST_INDEXES if requests else {}),
+        }
+        for name, (table, columns, unique) in indexes_to_check.items():
             await cursor.execute(
                 """SELECT array_agg(a.attname ORDER BY k.ordinality)
                 FROM pg_index i

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, cast
@@ -17,6 +18,9 @@ from cayu.collaboration.participants import CollaborationUnavailable
 class _MemoryRepository:
     def __init__(self, rows: dict[tuple[Table, Key], object]) -> None:
         self.rows = rows
+
+    async def now_ms(self) -> int:
+        return time.time_ns() // 1_000_000
 
     async def get(self, table: Table, key: Key) -> object | None:
         return deepcopy(self.rows.get((table, key)))
@@ -87,8 +91,26 @@ class _MemoryRepository:
         values.sort(key=lambda value: value["position"])
         return deepcopy(values[:limit])
 
+    async def scan_due_requests(self, *, after, now_ms, limit):
+        values = []
+        for (family, _), raw in self.rows.items():
+            if family != "requests":
+                continue
+            assert isinstance(raw, dict)
+            value = cast("dict[str, Any]", raw)
+            if (
+                value["state"] == "open"
+                and value["receipt"]["event"]["sequence"] > after
+                and value["next_due_at_ms"] <= now_ms
+            ):
+                values.append(value)
+        values.sort(key=lambda item: item["receipt"]["event"]["sequence"])
+        return deepcopy(values[:limit])
+
 
 class InMemoryCollaborationStore(CollaborationStore):
+    request_contract_version = 1
+
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._scopes: dict[str, dict[tuple[Table, Key], object]] = {}
@@ -97,6 +119,8 @@ class InMemoryCollaborationStore(CollaborationStore):
     @asynccontextmanager
     async def _transaction(self, scope: str, *, write: bool):
         async with self._lock:
+            if self._owners.closed and asyncio.current_task() not in self._owners.pending:
+                raise CollaborationUnavailable("Collaboration store is closing.")
             rows = deepcopy(self._scopes.get(scope, {}))
             yield _MemoryRepository(rows)
             if write:

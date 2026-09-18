@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from contextlib import suppress
 from typing import Any, Literal, cast
 
@@ -16,6 +17,7 @@ from cayu.collaboration._history_references import history_references
 from cayu.collaboration._permits import PermitSnapshot
 from cayu.collaboration.base import Key, Table
 from cayu.collaboration.participants import ParticipantEvent
+from cayu.collaboration.requests import RequestSnapshot
 from cayu.storage._collaboration_schema import EXTRA_COLUMNS, KEYS
 
 
@@ -24,6 +26,35 @@ class _SQLRepository:
         self.connection = connection
         self.scope = scope
         self.postgres = postgres
+
+    async def now_ms(self) -> int:
+        if not self.postgres:
+            return time.time_ns() // 1_000_000
+        rows = await self._rows(
+            await self._execute(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint"
+            )
+        )
+        value = rows[0][0]
+        if type(value) is not int or not 1 <= value <= 2**53 - 1:
+            raise CollaborationContractError("Collaboration owner time is unavailable.")
+        return value
+
+    async def scan_due_requests(self, *, after: int, now_ms: int, limit: int) -> list[object]:
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), participant_id, position, state, next_due_at_ms, namespace, generation, caller_key "
+                "FROM cayu_collaboration_requests WHERE scope=? AND state='open' "
+                "AND next_due_at_ms<=? AND position>? ORDER BY position LIMIT ?",
+                (self.scope, now_ms, after, limit),
+            )
+        )
+        result = []
+        for row in rows:
+            value = self._decode(row[0])
+            self._require_request_projection(value, tuple(row[1:5]), tuple(row[5:]))
+            result.append(value)
+        return result
 
     async def _execute(self, sql: str, args: tuple = ()):
         if self.postgres:
@@ -60,7 +91,35 @@ class _SQLRepository:
         value = self._decode(rows[0][0])
         if table == "permits":
             self._require_permit_projection(value, tuple(rows[0][1:]), key)
+        elif table == "requests":
+            self._require_request_projection(value, tuple(rows[0][1:]), key)
         return value
+
+    def _require_request_projection(self, value: object, projection: tuple, key: Key) -> None:
+        matches = False
+        if isinstance(value, dict):
+            document = cast("dict[str, Any]", value)
+            with suppress(TypeError, KeyError):
+                expected = document["receipt"]["expected"]
+                operation = expected["operation"]
+                matches = (
+                    projection
+                    == (
+                        expected["intent"]["selection"]["recipient"]["reference"]["participant_id"],
+                        document["receipt"]["event"]["sequence"],
+                        document["state"],
+                        document["next_due_at_ms"],
+                    )
+                    and operation["application_scope"] == self.scope
+                    and key
+                    == (
+                        operation["namespace_incarnation"],
+                        operation["generation"],
+                        operation["caller_key"],
+                    )
+                )
+        if not matches:
+            raise CollaborationContractError("Request lookup index contradicts its record.")
 
     def _require_permit_projection(self, value: object, projection: tuple, key: Key) -> None:
         matches = False
@@ -97,6 +156,15 @@ class _SQLRepository:
                 value.expected.intent.request.participant.participant_id,
                 value.position,
                 value.state,
+            )
+        elif table == "requests":
+            if not isinstance(value, RequestSnapshot):
+                raise CollaborationContractError("Request record requires its typed projection.")
+            extra_values = (
+                value.receipt.expected.intent.selection.recipient.reference.participant_id,
+                value.receipt.event.sequence,
+                value.state,
+                value.next_due_at_ms,
             )
         document = json.dumps(
             snapshot_input(value), ensure_ascii=False, separators=(",", ":"), sort_keys=True
