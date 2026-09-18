@@ -13864,13 +13864,12 @@ class InMemorySessionStore(SessionStore):
         additional_event_records: tuple[EventRecord, ...] = (),
     ) -> _PreparedInMemoryCheckpointStore:
         from cayu.sessions.pending_actions import (
+            _pending_action_checkpoint_index_state,
             checkpoint_has_pending_action_candidate,
-            pending_action_checkpoint_lookup_ids,
             pending_action_event_has_unknown_round_call,
             pending_action_event_is_from_different_tool_round,
             pending_action_event_lookup_id,
             pending_action_event_retains_history,
-            pending_action_evidence_round_from_checkpoint,
             pending_action_lookup_key,
             project_pending_action_event_record,
             retain_pending_action_index_record,
@@ -13882,14 +13881,8 @@ class InMemorySessionStore(SessionStore):
                 has_pending_action=False,
             )
 
-        lookup_keys = frozenset(
-            pending_action_lookup_key(identifier)
-            for identifier in pending_action_checkpoint_lookup_ids(checkpoint)
-        )
-        try:
-            pending_round = pending_action_evidence_round_from_checkpoint(checkpoint)
-        except (TypeError, ValueError):
-            pending_round = None
+        lookup_ids, pending_round = _pending_action_checkpoint_index_state(checkpoint)
+        lookup_keys = frozenset(pending_action_lookup_key(identifier) for identifier in lookup_ids)
         index_scope = (
             lookup_keys,
             None if pending_round is None else pending_round.model_step_id,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from contextlib import suppress
 from hashlib import sha256
 from typing import Any
 
@@ -150,6 +151,15 @@ def pending_action_evidence_round_from_checkpoint(
     approval = approval_support._pending_approval_from_owned_checkpoint(checkpoint, owned)
     pending_input, _ = _user_input_lifecycle_authority_from_owned_checkpoint(checkpoint, owned)
     pending_round = tool_round_recovery._pending_tool_round_from_owned_checkpoint(checkpoint, owned)
+    return _pending_action_evidence_round(approval, pending_input, pending_round)
+
+
+def _pending_action_evidence_round(
+    approval: PendingToolApproval | None,
+    pending_input: PendingUserInput | None,
+    pending_round: tool_round_recovery.PendingToolRound | None,
+) -> tool_round_recovery.PendingToolRound | None:
+    """Resolve already parsed candidates without changing conflict semantics."""
     if approval is not None and pending_round is not None:
         if (
             pending_input is not None
@@ -361,18 +371,48 @@ def pending_action_checkpoint_lookup_ids(
     checkpoint: dict[str, Any] | None,
 ) -> frozenset[str]:
     """Return the durable identifiers needed to resolve one current action."""
+    identifiers, _ = _pending_action_checkpoint_index_state(checkpoint)
+    return identifiers
+
+
+def _pending_action_checkpoint_index_state(
+    checkpoint: dict[str, Any] | None,
+) -> tuple[frozenset[str], tool_round_recovery.PendingToolRound | None]:
+    """Read lookup IDs and evidence once for one checkpoint indexing operation.
+
+    Invalid individual candidates still permit independent lookup IDs, but
+    cannot produce compound round evidence. Never retain the owned snapshot.
+    """
+    from cayu.approvals.user_input import _user_input_lifecycle_authority_from_owned_checkpoint
+
+    if checkpoint is None:
+        return frozenset(), None
     try:
-        approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
+        owned = copy_durable_json_object(checkpoint, "checkpoint")
+    except (TypeError, ValueError):
+        return frozenset(), None
+    invalid = False
+    try:
+        approval = approval_support._pending_approval_from_owned_checkpoint(checkpoint, owned)
+    except (TypeError, ValueError):
         approval = None
+        invalid = True
     try:
-        pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
+        pending_input, _ = _user_input_lifecycle_authority_from_owned_checkpoint(checkpoint, owned)
+    except (TypeError, ValueError):
         pending_input = None
+        invalid = True
     try:
-        evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
-        evidence_round = None
+        pending_round = tool_round_recovery._pending_tool_round_from_owned_checkpoint(
+            checkpoint, owned
+        )
+    except (TypeError, ValueError):
+        pending_round = None
+        invalid = True
+    evidence_round = None
+    if not invalid:
+        with suppress(TypeError, ValueError):
+            evidence_round = _pending_action_evidence_round(approval, pending_input, pending_round)
 
     identifiers: set[str] = set()
     if approval is not None:
@@ -382,7 +422,7 @@ def pending_action_checkpoint_lookup_ids(
     if evidence_round is not None:
         identifiers.add(evidence_round.tool_round_id)
         identifiers.update(call.tool_call_id for call in evidence_round.tool_calls)
-    return frozenset(identifiers)
+    return frozenset(identifiers), evidence_round
 
 
 def pending_action_event_lookup_id(event: Event) -> str | None:
@@ -690,12 +730,9 @@ def select_pending_action_indexed_records(
 ) -> tuple[list[EventRecord], bool]:
     """Select bounded current-action records from identifier/event-type indexes."""
     selected: dict[int, EventRecord] = {}
-    try:
-        evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
-        evidence_round = None
+    lookup_ids, evidence_round = _pending_action_checkpoint_index_state(checkpoint)
     ledger_too_complex = False
-    for lookup_id in pending_action_checkpoint_lookup_ids(checkpoint):
+    for lookup_id in lookup_ids:
         lookup_key = pending_action_lookup_key(lookup_id)
         ledger_count = 0
         for record in records_by_lookup_key.get(lookup_key, {}).values():

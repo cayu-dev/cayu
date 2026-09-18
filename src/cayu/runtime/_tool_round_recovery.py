@@ -475,7 +475,7 @@ def checkpoint_with_assistant_publication_snapshot(
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     )
     tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
-    pending_round = pending_tool_round_from_checkpoint(copied_checkpoint)
+    pending_round = _pending_tool_round_from_owned_checkpoint(checkpoint, copied_checkpoint)
     if pending_round is not None:
         if pending_tool_round_identity(pending_round) != copy_tool_round_identity(
             tool_round_identity
@@ -556,7 +556,7 @@ def checkpoint_with_assistant_publication_redactor(
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     )
     tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
-    pending_round = pending_tool_round_from_checkpoint(copied_checkpoint)
+    pending_round = _pending_tool_round_from_owned_checkpoint(checkpoint, copied_checkpoint)
     if pending_round is not None:
         if pending_tool_round_identity(pending_round) != copy_tool_round_identity(
             tool_round_identity

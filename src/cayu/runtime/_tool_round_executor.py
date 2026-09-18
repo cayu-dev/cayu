@@ -1414,10 +1414,13 @@ class _ToolRoundPublicationCoordinator:
                     redactor=redactor,
                 )
             )
-            existing_stages = tool_round_recovery.checkpoint_staged_terminals(
-                updated,
-                tool_round_identity=identity,
+            # The projection has changed the checkpoint. Admit that result once,
+            # then share its owner between reading and replacing staged terminals.
+            updated = copy_durable_json_object(updated, "checkpoint")
+            owner_key, owner = tool_round_recovery._staged_terminal_owner_from_owned_checkpoint(
+                updated, tool_round_identity=identity
             )
+            existing_stages = owner.staged_terminals
             projected = (
                 [
                     item.model_copy(
@@ -1457,10 +1460,8 @@ class _ToolRoundPublicationCoordinator:
                         else item
                         for item in projected
                     ]
-            return tool_round_recovery.checkpoint_with_staged_terminals(
-                updated,
-                tool_round_identity=identity,
-                staged_terminals=projected,
+            return tool_round_recovery._replace_owned_staged_terminals(
+                updated, owner_key, owner, projected
             )
 
         return transform

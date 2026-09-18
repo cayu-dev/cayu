@@ -15,13 +15,20 @@ from cayu.approvals.user_input import (
 )
 from cayu.runtime._approval_support import pending_approval_from_checkpoint
 from cayu.runtime._tool_round_recovery import PendingToolRound, pending_tool_round_from_checkpoint
-from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
+from cayu.sessions.pending_actions import (
+    _pending_action_checkpoint_index_state,
+    pending_action_evidence_round_from_checkpoint,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 
 @pytest.mark.parametrize(
     "reader",
-    [user_input_lifecycle_authority_from_checkpoint, pending_action_evidence_round_from_checkpoint],
+    [
+        user_input_lifecycle_authority_from_checkpoint,
+        pending_action_evidence_round_from_checkpoint,
+        _pending_action_checkpoint_index_state,
+    ],
 )
 @pytest.mark.parametrize("size", [0, 1000])
 def test_compound_reader_admits_full_checkpoint_once(monkeypatch, reader, size):
@@ -56,7 +63,14 @@ def test_readers_still_reject_malformed_unrelated_retained_data(reader):
         reader({"retained": {"invalid": object()}})
 
 
-def test_shared_snapshot_result_is_detached_and_never_cached():
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pending_action_evidence_round_from_checkpoint,
+        lambda checkpoint: _pending_action_checkpoint_index_state(checkpoint)[1],
+    ],
+)
+def test_shared_snapshot_result_is_detached_and_never_cached(reader):
     pending = PendingToolRound(
         model_step_id="mstep_" + "1" * 32,
         model_attempt_id="matt_" + "2" * 32,
@@ -70,14 +84,14 @@ def test_shared_snapshot_result_is_detached_and_never_cached():
     )
     checkpoint = {"pending_tool_round": pending.model_dump(mode="json")}
     original = deepcopy(checkpoint)
-    result = pending_action_evidence_round_from_checkpoint(checkpoint)
+    result = reader(checkpoint)
     assert result is not None
     result.tool_calls[0].arguments["nested"].append("changed result")
     assert checkpoint == original
     checkpoint["pending_tool_round"]["tool_calls"][0]["arguments"]["nested"].append(
         "changed source"
     )
-    fresh = pending_action_evidence_round_from_checkpoint(checkpoint)
+    fresh = reader(checkpoint)
     assert fresh is not None
     assert fresh.tool_calls[0].arguments["nested"] == ["before", "changed source"]
     assert result.tool_calls[0].arguments["nested"] == ["before", "changed result"]
@@ -141,3 +155,33 @@ def test_reader_wrappers_do_not_retain_rejected_secret_in_tracebacks(reader, key
             ]
         traceback = traceback.tb_next
     assert (not checkpoint) == consume
+
+
+@pytest.mark.parametrize("change", ["none", "invalid_round", "invalid_retained", "conflict"])
+def test_index_state_preserves_independent_approval_lookup(change):
+    from tests.core.test_approval_from_event import _pending
+    from tests.core.test_tool_round_publication import _pending_round
+
+    approval = _pending()
+    checkpoint = {"pending_tool_approval": approval.model_dump(mode="json")}
+    if change == "invalid_round":
+        checkpoint["pending_tool_round"] = {"invalid": True}
+    elif change == "invalid_retained":
+        checkpoint["retained"] = object()
+    elif change == "conflict":
+        checkpoint["pending_tool_round"] = _pending_round().model_dump(mode="json")
+    ids, evidence = _pending_action_checkpoint_index_state(checkpoint)
+    if change == "none":
+        assert evidence is not None
+        assert ids == frozenset(
+            {
+                approval.approval_id,
+                evidence.tool_round_id,
+                *(call.tool_call_id for call in evidence.tool_calls),
+            }
+        )
+    else:
+        assert evidence is None
+        assert ids == (
+            frozenset() if change == "invalid_retained" else frozenset({approval.approval_id})
+        )

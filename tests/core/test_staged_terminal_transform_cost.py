@@ -118,7 +118,7 @@ def test_public_model_constructed_stage_is_not_trusted():
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("count", [1, 10])
+@pytest.mark.parametrize("count", [1, 10, 20])
 def test_native_round_delivers_all_results_with_bounded_parse_work(
     tmp_path, monkeypatch, backend, count
 ):
@@ -136,6 +136,7 @@ def test_native_round_delivers_all_results_with_bounded_parse_work(
         RunRequest,
         ScriptedModelProvider,
     )
+    from cayu.messages import ToolResultPart
     from cayu.storage.sqlite import SQLiteSessionStore
 
     parses = 0
@@ -187,9 +188,21 @@ def test_native_round_delivers_all_results_with_bounded_parse_work(
                 f"call-{i}" for i in range(count)
             }
             assert len(completed) == count
-            # The pre-fix memory path performs 29 + 32*N parses. Retain the
-            # transition saving without a machine-dependent wall-time limit.
-            assert parses <= 29 + 30 * count
+            # Verify the continuation receives every result, not only events.
+            assert len(provider.requests) == 2
+            results = [
+                part
+                for message in provider.requests[-1].messages
+                for part in message.content
+                if isinstance(part, ToolResultPart)
+            ]
+            assert len(results) == count
+            assert {part.tool_call_id: part.content for part in results} == {
+                f"call-{i}": f"result-{i}" for i in range(count)
+            }
+            # Bound actual round parses separately for each native backend.
+            # Base e829882e5 needs 29 + 30*N (memory), 9 + 13*N (SQLite).
+            assert parses <= (29 + 22 * count if backend == "memory" else 9 + 11 * count)
         finally:
             if isinstance(store, SQLiteSessionStore):
                 await store.close()
