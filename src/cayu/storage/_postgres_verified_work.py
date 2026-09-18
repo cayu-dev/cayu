@@ -106,6 +106,7 @@ from cayu.tasks.contracts import (
     WorkContract,
     WorkContractConflict,
     WorkContractRef,
+    _GroupVerificationAdmissionRefused,
     completion_decision_application_request_sha256,
     completion_decision_request_sha256,
     completion_gap_fingerprint,
@@ -332,7 +333,13 @@ class PostgresVerifiedWorkMixin:
         async def _ensure_ready(self) -> None: ...
 
         async def _record_task_transition(
-            self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None
+            self,
+            cur: Any,
+            prior: Task | None,
+            current: Task,
+            *,
+            operation_id: str | None = None,
+            settled_execution: tuple[str, str, datetime] | None = None,
         ) -> None: ...
 
         def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]: ...
@@ -1333,6 +1340,8 @@ class PostgresVerifiedWorkMixin:
         self,
         request: WorkAttemptAdmissionPrepare,
     ) -> WorkAttemptAdmission:
+        from cayu.storage._postgres_task_groups import read_cancellation_requested
+
         request = copy_work_attempt_admission_prepare(request)
         if request.generation != 1:
             raise WorkAttemptAdmissionConflict(
@@ -1434,6 +1443,10 @@ class PostgresVerifiedWorkMixin:
                     "Task already has an unreleased work-attempt admission."
                 )
             contract = await self._require_task_contract(cur, task, request.contract)
+            if await read_cancellation_requested(cur, task.id):
+                raise WorkAttemptAdmissionConflict(
+                    "A decided group loser cannot admit another execution."
+                )
             continuation = await self._work_attempt_continuation_context(
                 cur,
                 task,
@@ -1796,6 +1809,8 @@ class PostgresVerifiedWorkMixin:
     async def enter_work_attempt_execution(
         self, request: WorkAttemptExecutionEntryRequest
     ) -> WorkAttemptExecutionEntryResult:
+        from cayu.storage._postgres_task_groups import read_cancellation_requested
+
         request = copy_work_attempt_execution_entry_request(request)
         await self._ensure_ready()
 
@@ -1810,7 +1825,11 @@ class PostgresVerifiedWorkMixin:
             await self._lock_verified_work_task(cur, admission.task_id)
             task = await self._load_task_locked(cur, admission.task_id)
             result = plan_work_attempt_execution_entry(
-                request, admission=admission, task=task, now=await self._database_now(cur)
+                request,
+                admission=admission,
+                task=task,
+                now=await self._database_now(cur),
+                group_cancelled=await read_cancellation_requested(cur, admission.task_id),
             )
             if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED:
                 await self._update_work_attempt_admission_row(cur, result.admission)
@@ -1878,6 +1897,8 @@ class PostgresVerifiedWorkMixin:
     async def hold_work_attempt_preparation(
         self, request: WorkAttemptPreparationHold
     ) -> WorkAttemptPreparationHoldReceipt:
+        from cayu.storage._postgres_task_groups import read_cancellation_requested
+
         request = copy_work_attempt_preparation_hold(request)
         digest = work_attempt_preparation_hold_sha256(request)
         await self._ensure_ready()
@@ -1898,11 +1919,22 @@ class PostgresVerifiedWorkMixin:
             has_attempt = await self._latest_attempt_id(cur, task.id) is not None
             now = await self._database_now(cur)
             updated, receipt = plan_work_attempt_preparation_hold(
-                request, task=task, has_attempt=has_attempt, now=now
+                request,
+                task=task,
+                has_attempt=has_attempt,
+                now=now,
+                group_cancelled=await read_cancellation_requested(cur, task.id),
             )
             encoded = receipt.model_dump_json(warnings=False)
             await self._update_task_snapshot(cur, updated)
-            await self._record_task_transition(cur, task, updated)
+            await self._record_task_transition(
+                cur,
+                task,
+                updated,
+                settled_execution=(task.id, request.worker_id, task.started_at)
+                if task.started_at is not None
+                else None,
+            )
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_preparation_holds "
                 "(hold_id, task_id, request_sha256, receipt_json) VALUES (%s, %s, %s, %s)",
@@ -2009,6 +2041,8 @@ class PostgresVerifiedWorkMixin:
             application = await self._load_application_receipt(
                 cur, task.id, request.application_idempotency_key or ""
             )
+            from cayu.storage._postgres_task_groups import read_cancellation_requested
+
             updated, settled_admission, receipt = plan_work_attempt_lifecycle_settlement(
                 request,
                 task=task,
@@ -2018,11 +2052,22 @@ class PostgresVerifiedWorkMixin:
                 decision=decision,
                 application=application,
                 now=await self._verified_lease_now(cur),
+                group_cancelled=await read_cancellation_requested(cur, task.id),
+                verification_claim=None
+                if proposal is None
+                else await self._load_current_claim(cur, proposal.proposal_id),
             )
             encoded = receipt.model_dump_json(warnings=False)
             await self._update_task_snapshot(cur, updated)
             await self._update_work_attempt_admission_row(cur, settled_admission)
-            await self._record_task_transition(cur, task, updated)
+            await self._record_task_transition(
+                cur,
+                task,
+                updated,
+                settled_execution=(task.id, admission.claim.worker_id, task.started_at)
+                if task.started_at is not None
+                else None,
+            )
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_lifecycle_receipts "
                 "(admission_id, settlement_id, task_id, request_sha256, retired_contract_binding, settled_at, receipt_json) "
@@ -2230,6 +2275,14 @@ class PostgresVerifiedWorkMixin:
             if request.generation != current.generation + 1:
                 raise WorkAttemptAdmissionConflict(
                     "Recovery must advance the execution generation exactly once."
+                )
+            from cayu.storage._postgres_task_groups import read_cancellation_requested
+
+            # Exact live replay above does not acquire new authority. A losing
+            # execution must retain its original owner until positive settlement.
+            if await read_cancellation_requested(cur, admission.task_id):
+                raise WorkAttemptAdmissionConflict(
+                    "Task-group cancellation forbids replacement execution authority."
                 )
             await cur.execute(
                 "SELECT 1 FROM cayu_completion_proposals WHERE attempt_id = %s",
@@ -2588,6 +2641,8 @@ class PostgresVerifiedWorkMixin:
         self,
         request: AdmittedCompletionProposalRequest,
     ) -> CompletionProposal:
+        from cayu.storage._postgres_task_groups import read_cancellation_requested
+
         request = copy_admitted_completion_proposal_request(request)
         proposal_request = request.proposal
         proposal_sha256 = completion_proposal_request_sha256(proposal_request)
@@ -2656,6 +2711,10 @@ class PostgresVerifiedWorkMixin:
             task = await self._load_task_locked(cur, admission.task_id)
             now = await self._verified_lease_now(cur)
             self._ensure_live_work_attempt_admission_claim(admission, now=now)
+            if await read_cancellation_requested(cur, task.id):
+                raise WorkAttemptAdmissionConflict(
+                    "A decided group loser cannot submit a new proposal."
+                )
             if existing is not None:
                 if existing.request_sha256 != proposal_sha256:
                     raise WorkCompletionConflict(
@@ -2880,6 +2939,8 @@ class PostgresVerifiedWorkMixin:
         self,
         request: CompletionVerificationClaimRequest,
     ) -> CompletionVerificationClaim:
+        from cayu.storage._postgres_task_groups import read_cancellation_requested
+
         request = copy_completion_verification_claim_request(request)
         request_sha256 = completion_verification_claim_request_sha256(request)
         await self._ensure_ready()
@@ -2945,6 +3006,10 @@ class PostgresVerifiedWorkMixin:
                 request.proposal_id,
                 for_update=True,
             )
+            if decision is None and await read_cancellation_requested(cur, proposal.task_id):
+                raise _GroupVerificationAdmissionRefused(
+                    "A decided group loser cannot dispatch verification."
+                )
             if (
                 current is not None
                 and current.claim_id == request.claim_id

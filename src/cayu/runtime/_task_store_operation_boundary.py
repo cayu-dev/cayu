@@ -22,6 +22,7 @@ from cayu.tasks.admission import (
     WorkAttemptAdmissionConflict,
     WorkAttemptExecutionClaimLost,
     WorkAttemptRecoveryRequired,
+    _GroupExecutionEntryRefused,
 )
 from cayu.tasks.base import TaskClaimLost, TaskStore
 from cayu.tasks.contracts import (
@@ -29,9 +30,14 @@ from cayu.tasks.contracts import (
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
     WorkContractConflict,
+    _GroupVerificationAdmissionRefused,
 )
 from cayu.tasks.graphs import TaskGraphConflict, TaskGraphUnavailable
-from cayu.tasks.groups import TaskGroupConflict, TaskGroupUnavailable
+from cayu.tasks.groups import (
+    TaskGroupConflict,
+    TaskGroupResultResolutionPending,
+    TaskGroupUnavailable,
+)
 from cayu.tasks.scheduling import TaskScheduleConflict
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
@@ -266,6 +272,29 @@ def task_store_work_attempt_admission_capability_is_complete(
     )
 
 
+def task_store_group_quiescence_capability_is_complete(task_store: TaskStore) -> bool:
+    """Refuse partial opt-in before accepting durable group ownership."""
+    if task_store.supports_task_group_quiescence is not True:
+        return False
+    return all(
+        _task_store_method_has_stable_concrete_implementation(task_store, method)
+        for method in (
+            "create_task_group",
+            "load_task_group",
+            "list_task_group_events",
+            "list_task_group_reconciliation_candidates",
+            "reconcile_task_group",
+            "resolve_task_group_quiescence",
+            "_settle_task_group_execution",
+            "_observe_task_group_invocation",
+            "_observe_task_group_result_resolution",
+            "_task_group_cancellation_requested",
+            "_task_group_retains_execution",
+            "mark_claimed_task_execution_started",
+        )
+    )
+
+
 def task_store_verified_task_worker_capability_is_complete(task_store: TaskStore) -> bool:
     """Require the entire worker family before any queue claim or callback."""
     declarations = type.__getattribute__(type(task_store), "__dict__")
@@ -486,15 +515,18 @@ def _detached_task_store_failure(
         TaskClaimLost,
         WorkAttemptAdmissionConflict,
         WorkAttemptExecutionClaimLost,
+        _GroupExecutionEntryRefused,
         WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
         TaskCompletionDecisionRequired,
         WorkContractConflict,
         WorkCompletionConflict,
+        _GroupVerificationAdmissionRefused,
         TaskScheduleConflict,
         TaskGraphConflict,
         TaskGraphUnavailable,
         TaskGroupConflict,
+        TaskGroupResultResolutionPending,
         TaskGroupUnavailable,
         KeyError,
         ValueError,
@@ -652,15 +684,18 @@ def _generic_task_store_failure(
         TaskClaimLost,
         WorkAttemptAdmissionConflict,
         WorkAttemptExecutionClaimLost,
+        _GroupExecutionEntryRefused,
         WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
         TaskCompletionDecisionRequired,
         WorkContractConflict,
         WorkCompletionConflict,
+        _GroupVerificationAdmissionRefused,
         TaskScheduleConflict,
         TaskGraphConflict,
         TaskGraphUnavailable,
         TaskGroupConflict,
+        TaskGroupResultResolutionPending,
         TaskGroupUnavailable,
         KeyError,
         ValueError,

@@ -927,6 +927,7 @@ test("task availability and active-state refresh policy remain explicit", () => 
 test("dependency waiting stays active while dependency skips stop workflow polling", () => {
   for (const [status, active] of [
     ["waiting_dependencies", true],
+    ["waiting_group", true],
     ["dependency_skipped", false],
   ]) {
     const search = validateWorkflowSearch({ status: [status] })

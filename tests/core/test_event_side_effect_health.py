@@ -17,6 +17,165 @@ from cayu import Event, EventType, Message
 from cayu.runtime import PersistedEventSideEffectQuery, RunRequest, SessionIdentity
 
 
+@pytest.mark.parametrize("advanced", [None, "failed", "leased", "delivered"])
+def test_first_event_claim_never_retries_a_changed_snapshot(session_store_case, advanced):
+    async def run():
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(messages=[Message.text("user", "hello")], agent_name="test"),
+                identity=SessionIdentity(provider_name="fake", model="fake"),
+            )
+            event = Event(type=EventType.INTERACTION_INTERRUPTED, session_id=session.id)
+            await store.append_event(session.id, event)
+            expected = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id, event_id=event.id
+            )
+            for field, value in {
+                "session_id": "different",
+                "event_id": "different",
+                "event_sequence": expected.event_sequence + 1,
+                "last_error": "different",
+                "next_attempt_at": datetime.now(UTC),
+                "updated_at": expected.updated_at + timedelta(seconds=1),
+            }.items():
+                assert (
+                    await store.claim_first_persisted_event_side_effect(
+                        expected.model_copy(update={field: value})
+                    )
+                    is None
+                )
+            for update in ({"attempts": False}, {"attempts": 1}, {"claim_id": "active"}):
+                with pytest.raises(ValueError):
+                    await store.claim_first_persisted_event_side_effect(
+                        expected.model_copy(update=update)
+                    )
+            if advanced is None:
+                claim = await store.claim_first_persisted_event_side_effect(expected)
+                assert claim.attempt == 1 and claim.event.id == event.id
+                assert await store.claim_first_persisted_event_side_effect(expected) is None
+                return
+            original = await store.claim_persisted_event_side_effect(
+                session_id=session.id, event_id=event.id, lease_seconds=0.001
+            )
+            if advanced == "failed":
+                await store.mark_persisted_event_side_effect_failed(
+                    original, error="Returned failure", max_attempts=3, retry_delay_seconds=0
+                )
+            elif advanced == "delivered":
+                await store.mark_persisted_event_side_effect_delivered(original)
+            else:
+                await asyncio.sleep(0.02)
+            before = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id, event_id=event.id
+            )
+            assert await store.claim_first_persisted_event_side_effect(expected) is None
+            assert (
+                await store.get_persisted_event_side_effect_delivery(
+                    session_id=session.id, event_id=event.id
+                )
+                == before
+            )
+            if advanced != "delivered":
+                # The ordinary retry API remains independently usable.
+                retried = await store.claim_persisted_event_side_effect(
+                    session_id=session.id, event_id=event.id
+                )
+                assert retried.attempt == 2
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("winner", ["retirement", "retry", "concurrent"])
+def test_first_failed_delivery_retirement_is_exact_and_excludes_retry(session_store_case, winner):
+    async def run():
+        store = await _open_store(session_store_case)
+        peer = store
+        try:
+            session = await store.create(
+                RunRequest(
+                    messages=[Message.text("user", "hello")], agent_name="test", session_id="retire"
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake"),
+            )
+            event = Event(type=EventType.MODEL_COMPLETED, session_id=session.id)
+            await store.append_event(session.id, event)
+            claim = await store.claim_persisted_event_side_effect(
+                session_id=session.id, event_id=event.id
+            )
+            failed = await store.mark_persisted_event_side_effect_failed(
+                claim,
+                error="Returned sink failure",
+                max_attempts=3,
+                retry_delay_seconds=0,
+            )
+            for field, value in {
+                "event_sequence": failed.event_sequence + 1,
+                "last_error": "different failure",
+                "next_attempt_at": failed.next_attempt_at + timedelta(seconds=1),
+                "updated_at": failed.updated_at + timedelta(seconds=1),
+            }.items():
+                assert (
+                    await store.retire_failed_first_event_delivery(
+                        failed.model_copy(update={field: value})
+                    )
+                    is None
+                )
+                assert (
+                    await store.get_persisted_event_side_effect_delivery(
+                        session_id=session.id, event_id=event.id
+                    )
+                    == failed
+                )
+            for update in ({"attempts": 2}, {"attempts": True}, {"claim_id": "active"}):
+                with pytest.raises(ValueError):
+                    await store.retire_failed_first_event_delivery(failed.model_copy(update=update))
+
+            if session_store_case[0] != "memory":
+                peer = type(store)(
+                    session_store_case[1] / "sessions.sqlite"
+                    if session_store_case[0] == "sqlite"
+                    else session_store_case[2],
+                    public_authority_alias_codec=_public_authority_alias_codec(),
+                )
+
+            async def retry():
+                return await peer.claim_persisted_event_side_effect(
+                    session_id=session.id, event_id=event.id
+                )
+
+            if winner == "retirement":
+                retired = await store.retire_failed_first_event_delivery(failed)
+                retried = await retry()
+            elif winner == "retry":
+                retried = await retry()
+                retired = await store.retire_failed_first_event_delivery(failed)
+            else:
+                retired, retried = await asyncio.gather(
+                    store.retire_failed_first_event_delivery(failed), retry()
+                )
+            assert (retired is None) != (retried is None)
+            recorded = await peer.get_persisted_event_side_effect_delivery(
+                session_id=session.id, event_id=event.id
+            )
+            if retired is not None:
+                assert recorded == retired
+                assert recorded.status.value == "dead_lettered" and recorded.attempts == 1
+                assert recorded.last_error == failed.last_error
+                assert await retry() is None
+            else:
+                assert recorded.status.value == "leased" and recorded.attempts == 2
+            assert await store.retire_failed_first_event_delivery(failed) is None
+        finally:
+            if peer is not store:
+                await _close_store(peer)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 @pytest.mark.usefixtures("session_store_case")
 def test_health_lifecycle_and_inspection(session_store_case):
     async def run():

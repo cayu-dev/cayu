@@ -16707,7 +16707,7 @@ export type TaskSchedulePolicy = {
 /**
  * TaskStatus
  */
-export type TaskStatus = 'pending' | 'waiting_dependencies' | 'dependency_skipped' | 'claimed' | 'running' | 'paused' | 'blocked' | 'needs_attention' | 'completed' | 'failed' | 'cancelled';
+export type TaskStatus = 'pending' | 'waiting_dependencies' | 'waiting_group' | 'dependency_skipped' | 'claimed' | 'running' | 'paused' | 'blocked' | 'needs_attention' | 'completed' | 'failed' | 'cancelled';
 
 /**
  * TaskStatusCounts
@@ -16759,6 +16759,10 @@ export type TaskStatusCounts = {
      * Waiting Dependencies
      */
     waiting_dependencies?: string;
+    /**
+     * Waiting Group
+     */
+    waiting_group?: string;
 };
 
 /**

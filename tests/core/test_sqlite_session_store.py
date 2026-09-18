@@ -3456,8 +3456,51 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (93, 92),
         (94, 94),
         (95, 95),
+        (96, 96),
     ]
     assert version == schema_migrations.LATEST_REVISION
+
+
+def test_sqlite_revision_95_migrates_task_group_quiescence_schema(tmp_path, monkeypatch) -> None:
+    """A real revision-95 database can install the revision-96 barrier schema."""
+
+    db_path = tmp_path / "revision-95-task-group-quiescence.sqlite"
+    revisions = schema_migrations.REVISIONS
+    monkeypatch.setattr(
+        schema_migrations,
+        "REVISIONS",
+        tuple(revision for revision in revisions if revision.revision <= 95),
+    )
+    historical = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(historical))
+    monkeypatch.setattr(schema_migrations, "REVISIONS", revisions)
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (95,)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(cayu_task_groups)")}
+        assert "barrier_status" not in columns
+        assert "barrier_deadline" not in columns
+
+    migrated = SQLiteTaskStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(migrated))
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            schema_migrations.LATEST_REVISION,
+        )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(cayu_task_groups)")}
+        assert {"barrier_status", "barrier_deadline"} <= columns
+        index = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_task_group_barriers'"
+        ).fetchone()
+        assert index is not None
 
 
 def test_sqlite_revision_fifty_nine_migrates_an_empty_verified_work_registry(

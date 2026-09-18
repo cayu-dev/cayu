@@ -251,6 +251,7 @@ class TaskGraphCreationReceipt(BaseModel):
 
 
 class TaskGraphEventType(StrEnum):
+    WAITING_GROUP = "task.group_waiting"
     CREATED = "task.graph_created"
     WAITING = "task.dependency_waiting"
     READY = "task.dependencies_satisfied"
@@ -288,6 +289,7 @@ class TaskGraphEvent(BaseModel):
             if self.task_id is None or self.status is None or self.sequence == 1:
                 raise ValueError("Graph member event requires member evidence.")
             expected = {
+                TaskGraphEventType.WAITING_GROUP: TaskStatus.WAITING_GROUP,
                 TaskGraphEventType.WAITING: TaskStatus.WAITING_DEPENDENCIES,
                 TaskGraphEventType.READY: TaskStatus.PENDING,
                 TaskGraphEventType.SKIPPED: TaskStatus.DEPENDENCY_SKIPPED,

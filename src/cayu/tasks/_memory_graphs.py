@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.tasks._graphs import (
     GRAPH_TERMINAL_STATUSES,
+    GraphTransition,
     member_from_task,
     plan_graph_transition,
     require_graph_membership,
     require_member_authority,
 )
-from cayu.tasks._groups import plan_group_transition, prepare_group_admission, require_group_replay
+from cayu.tasks._group_quiescence import (
+    plan_group_graph_transition,
+    require_group_mutation,
+    waiting_finalizer,
+)
+from cayu.tasks._groups import prepare_group_admission, require_group_replay
 from cayu.tasks.base import Task
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -26,7 +33,7 @@ from cayu.tasks.graphs import (
     graph_identifier,
     task_graph_request_sha256,
 )
-from cayu.tasks.groups import TaskGroupConflict, TaskGroupCreate
+from cayu.tasks.groups import TaskGroupConflict, TaskGroupCreate, TaskGroupInvocationObligation
 
 if TYPE_CHECKING:
     from cayu.tasks.base import InMemoryTaskStore
@@ -60,7 +67,10 @@ async def create_graph(
             return existing.model_copy(deep=True)
         ids = tuple(node.task.task_id for node in request.nodes)
         if any(
-            identity in store._tasks or identity in store._task_graph_by_task for identity in ids
+            identity in store._tasks
+            or identity in store._task_graph_by_task
+            or identity in store._task_group_retry_lineage
+            for identity in ids
         ):
             raise TaskGraphConflict("A graph member identity is already occupied.")
         from cayu.tasks._graph_admission import prepare_graph_admission
@@ -86,6 +96,7 @@ async def create_graph(
             now=store._clock(),
             parents=parents,
             validate_task=validate_task,
+            finalizer_task_id=None if group is None else group.finalizer_task_id,
         )
         prepared = {task.id: task for task in admission.tasks}
         receipt = admission.receipt
@@ -127,27 +138,93 @@ def graph_tasks(store: InMemoryTaskStore, graph_id: str) -> dict[str, Task]:
 
 
 def store_graph_task(
-    store: InMemoryTaskStore, task: Task, *, schedule_operation_id: str | None
+    store: InMemoryTaskStore,
+    task: Task,
+    *,
+    schedule_operation_id: str | None,
+    settled_execution: tuple[str, str, datetime] | None = None,
+    invocation: TaskGroupInvocationObligation | None = None,
+    resolve_attention: bool = False,
+    retry_successor: Task | None = None,
 ) -> bool:
     graph_id = store._task_graph_by_task.get(task.id)
+    lineage_scope = store._task_group_retry_lineage.get(task.id)
+    if graph_id is None and lineage_scope is not None:
+        graph_id = lineage_scope[0]
     if graph_id is None:
         if task.graph_id is not None or task.prerequisite_task_ids:
             raise TaskGraphUnavailable("Graph task has no admission authority.")
         return False
     if task.id not in store._tasks:
         raise TaskGraphConflict("Retained graph member identity cannot be reused.")
-    transition = plan_graph_transition(
-        graph_id=graph_id,
-        prerequisites=store._task_graph_members[graph_id],
-        current=graph_tasks(store, graph_id),
-        proposed=task,
-        proposed_readiness_recorded=any(
-            event.type is TaskGraphEventType.READY and event.task_id == task.id
-            for event in store._task_graph_events[graph_id]
-        ),
-        first_sequence=len(store._task_graph_events[graph_id]) + 1,
-        now=store._ownership_clock(),
+    group_id = store._task_group_by_graph.get(graph_id)
+    snapshot = None if group_id is None else store._task_groups[group_id]
+    if snapshot is not None:
+        require_group_mutation(
+            snapshot,
+            store._tasks[task.id],
+            task,
+            root_task_id=None if lineage_scope is None else lineage_scope[1],
+        )
+    current = graph_tasks(store, graph_id)
+    transition = (
+        GraphTransition(tasks=(task,), events=(), retry_settlements=())
+        if lineage_scope is not None
+        else plan_graph_transition(
+            graph_id=graph_id,
+            prerequisites=store._task_graph_members[graph_id],
+            current=current,
+            proposed=task,
+            proposed_readiness_recorded=any(
+                event.type is TaskGraphEventType.READY and event.task_id == task.id
+                for event in store._task_graph_events[graph_id]
+            ),
+            first_sequence=len(store._task_graph_events[graph_id]) + 1,
+            now=store._ownership_clock(),
+            group_waiting_task_id=None if snapshot is None else waiting_finalizer(snapshot),
+        )
     )
+    group_publication = None
+    lineage_roots = {
+        identity: scope[1]
+        for identity, scope in store._task_group_retry_lineage.items()
+        if scope[0] == graph_id
+    }
+    current.update({identity: store._require_task(identity) for identity in lineage_roots})
+    added_lineage = None
+    if retry_successor is not None:
+        transition = GraphTransition(
+            tasks=(*transition.tasks, retry_successor),
+            events=transition.events,
+            retry_settlements=transition.retry_settlements,
+        )
+        if (
+            snapshot is not None
+            and snapshot.receipt.quiescence is not None
+            and (task.id in snapshot.receipt.member_task_ids or lineage_scope is not None)
+        ):
+            root = task.id if lineage_scope is None else lineage_scope[1]
+            lineage_roots[retry_successor.id] = root
+            added_lineage = (retry_successor.id, (graph_id, root))
+    if snapshot is not None:
+        planned = plan_group_graph_transition(
+            snapshot,
+            transition,
+            current=current,
+            prerequisites=store._task_graph_members[graph_id],
+            first_sequence=len(store._task_graph_events[graph_id]) + 1,
+            now=store._ownership_clock(),
+            settled_execution=settled_execution,
+            invocation=invocation,
+            resolve_attention=resolve_attention,
+            lineage_roots=lineage_roots,
+            unsettled_effects=frozenset(
+                identity
+                for identity in (*snapshot.receipt.member_task_ids, *lineage_roots)
+                if store._task_has_unsettled_local_execution_attempt(identity)
+            ),
+        )
+        transition, group_publication = planned.transition, planned.group
     for updated in transition.tasks:
         if updated.session_id in store._session_closure_claims:
             raise TaskGraphConflict("Graph member is owned by session closure.")
@@ -161,17 +238,12 @@ def store_graph_task(
         updated.id: member_from_task(updated)
         for updated in transition.tasks
         if updated.status in GRAPH_TERMINAL_STATUSES
+        and updated.id in store._task_graph_members[graph_id]
     }
-    group_id = store._task_group_by_graph.get(graph_id)
-    group_publication = (
-        None
-        if group_id is None
-        else plan_group_transition(
-            store._task_groups[group_id], transition, now=store._ownership_clock()
-        )
-    )
     for write in writes:
         store._publish_prepared_task_write(write)
+    if added_lineage is not None:
+        store._task_group_retry_lineage[added_lineage[0]] = added_lineage[1]
     for receipt in transition.retry_settlements:
         store._retry_settlements[(receipt.task_id, receipt.idempotency_key)] = receipt
     store._task_graph_terminal_members.update(terminal_members)
@@ -215,11 +287,21 @@ async def load_graph(store: InMemoryTaskStore, graph_id: str) -> TaskGraphSnapsh
 
 
 def require_graph_deletion_ready(store: InMemoryTaskStore, task_ids: tuple[str, ...]) -> None:
+    from cayu.tasks._group_quiescence import require_group_deletion_ready
+
     for graph_id in {
         store._task_graph_by_task[identity]
         for identity in task_ids
         if identity in store._task_graph_by_task
+    } | {
+        store._task_group_retry_lineage[identity][0]
+        for identity in task_ids
+        if identity in store._task_group_retry_lineage
     }:
+        group_id = store._task_group_by_graph.get(graph_id)
+        if group_id is not None:
+            snapshot = store._task_groups[group_id]
+            require_group_deletion_ready(snapshot)
         if any(
             identity not in store._task_graph_terminal_members
             for identity in store._task_graph_members[graph_id]

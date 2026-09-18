@@ -754,6 +754,7 @@ if TYPE_CHECKING:
         TaskGroupCreate,
         TaskGroupCreationReceipt,
         TaskGroupEvent,
+        TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
 
@@ -1227,6 +1228,7 @@ class CayuApp:
         )
         self._completion_result_resolver_coordinator = CompletionResultResolverCoordinator(
             application_coordinator=self._completion_decision_application_coordinator,
+            task_store=self.task_store,
             session_store=self._runtime_session_store,
             event_writer=self._event_writer,
             secret_redactor=self._secret_redactor,
@@ -6210,7 +6212,19 @@ class CayuApp:
                 terminal_event_id=envelope.terminal_event_id,
             )
 
-        await self.session_store.transform_checkpoint(private_session_id, acknowledge)
+        # A terminal session writer may finish its final checkpoint publication just
+        # after the task terminalization acknowledgement starts.  Repeat this exact,
+        # idempotent removal with read-after-write confirmation so that a late writer
+        # cannot leave the queue-owned receipt stranded after this method returns.
+        for _attempt in range(3):
+            await self.session_store.transform_checkpoint(private_session_id, acknowledge)
+            checkpoint = await self.session_store.load_checkpoint(private_session_id)
+            receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
+            if envelope.dispatch_operation_id not in receipts:
+                return
+        raise RuntimeError(
+            "Queued dispatch terminal receipt remained after bounded acknowledgement retry."
+        )
 
     async def _list_queued_dispatch_terminal_receipts(
         self,
@@ -6679,6 +6693,13 @@ class CayuApp:
         del admission_id, decision_id, worker_id, lease_seconds
         return await operation
 
+    async def _reconcile_completion_result_group_settlement(
+        self, task_id: str, decision_id: str
+    ) -> None:
+        await self._completion_result_resolver_coordinator.reconcile_group_settlement(
+            task_id, decision_id
+        )
+
     async def resolve_completion_result(
         self,
         request: CompletionResultResolutionRequest,
@@ -7085,6 +7106,21 @@ class CayuApp:
         from cayu.runtime._task_groups import load_task_group
 
         return await load_task_group(self, group_id)
+
+    async def reconcile_task_group(self, group_id: str) -> TaskGroupSnapshot:
+        """Advance the durable barrier without overriding a timeout latch."""
+        from cayu.runtime._task_groups import reconcile_task_group
+
+        return await reconcile_task_group(self, group_id)
+
+    async def resolve_task_group_quiescence(
+        self,
+        request: TaskGroupQuiescenceResolution,
+    ) -> TaskGroupSnapshot:
+        """Release timed-out group work only from positive exact settlement evidence."""
+        from cayu.runtime._task_groups import resolve_task_group_quiescence
+
+        return await resolve_task_group_quiescence(self, request)
 
     async def list_task_group_events(
         self, group_id: str, *, after_sequence: int = 0, limit: int = 100

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
@@ -13,12 +14,13 @@ from cayu.storage import _sqlite_task_groups as groups
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._graphs import (
     GRAPH_TERMINAL_STATUSES,
+    GraphTransition,
     member_from_task,
     plan_graph_transition,
     require_graph_membership,
     require_member_authority,
 )
-from cayu.tasks._groups import plan_group_transition, prepare_group_admission
+from cayu.tasks._groups import prepare_group_admission
 from cayu.tasks.base import Task, TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -33,7 +35,7 @@ from cayu.tasks.graphs import (
     graph_identifier,
     task_graph_request_sha256,
 )
-from cayu.tasks.groups import TaskGroupCreate
+from cayu.tasks.groups import TaskGroupCreate, TaskGroupInvocationObligation
 
 if TYPE_CHECKING:
     from cayu.storage.sqlite import SQLiteTaskStore
@@ -107,6 +109,7 @@ async def create_graph(
                 now=store._clock(),
                 parents=parents,
                 validate_task=validate_task,
+                finalizer_task_id=None if group is None else group.finalizer_task_id,
             )
             group_publication = (
                 None
@@ -141,11 +144,38 @@ async def create_graph(
 def require_unreserved_identity(store: SQLiteTaskStore, task_id: str) -> None:
     if (
         store._connection.execute(
-            "SELECT 1 FROM cayu_task_graph_members WHERE task_id = ?", (task_id,)
+            "SELECT 1 FROM cayu_task_graph_members WHERE task_id = ? "
+            "UNION ALL SELECT 1 FROM cayu_task_group_retry_lineage WHERE task_id = ?",
+            (task_id, task_id),
         ).fetchone()
         is not None
     ):
         raise TaskGraphConflict("Retained graph member identity cannot be reused.")
+
+
+def register_retry_successor(store: SQLiteTaskStore, source: Task, successor: Task) -> None:
+    """Called only by automatic retry settlement, within its native transaction."""
+    row = store._connection.execute(
+        "SELECT graph_id, task_id FROM cayu_task_graph_members WHERE task_id = ? "
+        "UNION ALL SELECT graph_id, root_task_id FROM cayu_task_group_retry_lineage WHERE task_id = ?",
+        (source.id, source.id),
+    ).fetchone()
+    if row is None:
+        return
+    group = store._connection.execute(
+        "SELECT group_id FROM cayu_task_groups WHERE graph_id = ?", (row[0],)
+    ).fetchone()
+    snapshot = None if group is None else groups.read_group(store, group[0])
+    if (
+        snapshot is None
+        or snapshot.receipt.quiescence is None
+        or row[1] not in snapshot.receipt.member_task_ids
+    ):
+        return
+    store._connection.execute(
+        "INSERT INTO cayu_task_group_retry_lineage (task_id, graph_id, root_task_id) VALUES (?, ?, ?)",
+        (successor.id, row[0], row[1]),
+    )
 
 
 def insert_events(store: SQLiteTaskStore, events: tuple[TaskGraphEvent, ...]) -> None:
@@ -176,9 +206,25 @@ def _notify_committed_readiness(store: SQLiteTaskStore, event: TaskGraphEvent) -
         return
 
 
-def record_transition(store: SQLiteTaskStore, prior: Task | None, current: Task) -> None:
+def record_transition(
+    store: SQLiteTaskStore,
+    prior: Task | None,
+    current: Task,
+    *,
+    settled_execution: tuple[str, str, datetime] | None = None,
+    invocation: TaskGroupInvocationObligation | None = None,
+    resolve_attention: bool = False,
+) -> None:
+    from cayu.tasks._group_quiescence import (
+        plan_group_graph_transition,
+        require_group_mutation,
+        waiting_finalizer,
+    )
+
     row = store._connection.execute(
-        "SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ?", (current.id,)
+        "SELECT graph_id, task_id FROM cayu_task_graph_members WHERE task_id = ? "
+        "UNION ALL SELECT graph_id, root_task_id FROM cayu_task_group_retry_lineage WHERE task_id = ?",
+        (current.id, current.id),
     ).fetchone()
     if row is None:
         if current.graph_id is not None:
@@ -189,6 +235,7 @@ def record_transition(store: SQLiteTaskStore, prior: Task | None, current: Task)
     if not store._connection.in_transaction:
         raise TaskGraphUnavailable("Graph publication requires an owned transaction.")
     graph_id = row[0]
+    root_id = row[1]
     rows = store._connection.execute(
         "SELECT task_id, prerequisites_json FROM cayu_task_graph_members WHERE graph_id = ? ORDER BY task_id",
         (graph_id,),
@@ -212,30 +259,73 @@ def record_transition(store: SQLiteTaskStore, prior: Task | None, current: Task)
         "FROM cayu_task_graph_events WHERE graph_id = ?",
         (str(TaskGraphEventType.READY), current.id, graph_id),
     ).fetchone()
-    transition = plan_graph_transition(
-        graph_id=graph_id,
-        prerequisites=prerequisites,
-        current=tasks,
-        proposed=current,
-        proposed_readiness_recorded=bool(readiness_recorded),
-        first_sequence=sequence,
-        now=store._ownership_clock(),
-    )
     group_row = store._connection.execute(
         "SELECT group_id FROM cayu_task_groups WHERE graph_id = ?", (graph_id,)
     ).fetchone()
-    group_publication = None
-    if group_row is not None:
-        snapshot = groups.read_group(store, group_row[0])
-        assert snapshot is not None
-        group_publication = plan_group_transition(
-            snapshot, transition, now=store._ownership_clock()
+    snapshot = None if group_row is None else groups.read_group(store, group_row[0])
+    if snapshot is not None:
+        require_group_mutation(snapshot, prior, current, root_task_id=root_id)
+    transition = (
+        GraphTransition(tasks=(current,), events=(), retry_settlements=())
+        if current.id not in prerequisites
+        else plan_graph_transition(
+            graph_id=graph_id,
+            prerequisites=prerequisites,
+            current=tasks,
+            proposed=current,
+            proposed_readiness_recorded=bool(readiness_recorded),
+            first_sequence=sequence,
+            now=store._ownership_clock(),
+            group_waiting_task_id=None if snapshot is None else waiting_finalizer(snapshot),
         )
+    )
+    group_publication = None
+    if snapshot is not None:
+        lineage_roots = dict(
+            store._connection.execute(
+                "SELECT task_id, root_task_id FROM cayu_task_group_retry_lineage WHERE graph_id = ? ORDER BY task_id",
+                (graph_id,),
+            ).fetchall()
+        )
+        if lineage_roots:
+            rows = store._connection.execute(
+                "SELECT * FROM cayu_tasks WHERE id IN ("
+                "SELECT task_id FROM cayu_task_group_retry_lineage WHERE graph_id = ?)",
+                (graph_id,),
+            ).fetchall()
+            descendants = {task.id: task for task in map(sql.task_from_row, rows)}
+            if descendants.keys() != lineage_roots.keys():
+                raise TaskGraphUnavailable("Retry descendant evidence is missing.")
+            tasks.update(descendants)
+        tasks[prior.id] = prior
+        effect_rows = store._connection.execute(
+            "SELECT DISTINCT member.task_id FROM cayu_task_graph_members member "
+            "JOIN cayu_tasks task ON task.id = member.task_id "
+            "JOIN cayu_local_execution_attempts effect ON "
+            "(effect.task_id = task.id OR effect.retry_series_id = "
+            "json_extract(task.retry_series_json, '$.series_id')) "
+            "WHERE member.graph_id = ? AND effect.retry_admissible = 0",
+            (graph_id,),
+        ).fetchall()
+        planned = plan_group_graph_transition(
+            snapshot,
+            transition,
+            current=tasks,
+            prerequisites=prerequisites,
+            first_sequence=sequence,
+            now=store._ownership_clock(),
+            settled_execution=settled_execution,
+            invocation=invocation,
+            resolve_attention=resolve_attention,
+            unsettled_effects=frozenset(row[0] for row in effect_rows),
+            lineage_roots=lineage_roots,
+        )
+        transition, group_publication = planned.transition, planned.group
     for task in transition.tasks:
         store._update_task_snapshot_unlocked(task)
         if task.id != current.id:
             store._record_schedule_transition_unlocked(tasks[task.id], task)
-        if task.status in GRAPH_TERMINAL_STATUSES:
+        if task.status in GRAPH_TERMINAL_STATUSES and task.id in prerequisites:
             store._connection.execute(
                 "UPDATE cayu_task_graph_members SET terminal_json = ? WHERE task_id = ?",
                 (member_from_task(task).model_dump_json(), task.id),
@@ -344,12 +434,28 @@ async def list_events(
 
 
 def require_deletion_ready(store: SQLiteTaskStore, task_ids: tuple[str, ...]) -> None:
+    from cayu.tasks._group_quiescence import require_group_deletion_ready
+
+    checked_groups: set[str] = set()
     for identity in task_ids:
+        for row in store._connection.execute(
+            "SELECT group_id FROM cayu_task_groups WHERE graph_id IN "
+            "(SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ? "
+            "UNION SELECT graph_id FROM cayu_task_group_retry_lineage WHERE task_id = ?)",
+            (identity, identity),
+        ).fetchall():
+            if row[0] in checked_groups:
+                continue
+            snapshot = groups.read_group(store, row[0])
+            assert snapshot is not None
+            require_group_deletion_ready(snapshot)
+            checked_groups.add(row[0])
         if (
             store._connection.execute(
-                "SELECT 1 FROM cayu_task_graph_members WHERE graph_id = "
-                "(SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ?) AND terminal_json IS NULL LIMIT 1",
-                (identity,),
+                "SELECT 1 FROM cayu_task_graph_members WHERE graph_id IN "
+                "(SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ? "
+                "UNION SELECT graph_id FROM cayu_task_group_retry_lineage WHERE task_id = ?) AND terminal_json IS NULL LIMIT 1",
+                (identity, identity),
             ).fetchone()
             is not None
         ):

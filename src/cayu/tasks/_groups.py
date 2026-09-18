@@ -17,6 +17,9 @@ from cayu.tasks.groups import (
     TaskGroupDecision,
     TaskGroupEvent,
     TaskGroupEventType,
+    TaskGroupFinalizerStatus,
+    TaskGroupQuiescence,
+    TaskGroupQuiescenceStatus,
     TaskGroupSnapshot,
     TaskGroupStatus,
     TaskGroupUnavailable,
@@ -39,6 +42,8 @@ def require_group_replay(
         or receipt.graph.graph_id != request.graph.graph_id
         or receipt.member_task_ids != request.member_task_ids
         or receipt.policy != request.policy
+        or receipt.quiescence != request.quiescence
+        or receipt.finalizer_task_id != request.finalizer_task_id
         or receipt.request_sha256 != task_group_request_sha256(request)
         or receipt.submitted_request_sha256
         != (submitted_digest or task_group_request_sha256(request))
@@ -62,6 +67,8 @@ def prepare_group_admission(
         graph=admission.receipt,
         member_task_ids=request.member_task_ids,
         policy=request.policy,
+        quiescence=request.quiescence,
+        finalizer_task_id=request.finalizer_task_id,
         request_sha256=digest,
         submitted_request_sha256=submitted_digest or digest,
     )
@@ -70,6 +77,14 @@ def prepare_group_admission(
         receipt=receipt,
         members=tuple(member_from_task(tasks[identity]) for identity in receipt.member_task_ids),
         last_sequence=1,
+        quiescence=TaskGroupQuiescence(
+            status=TaskGroupQuiescenceStatus.NOT_REQUESTED
+            if request.quiescence is None
+            else TaskGroupQuiescenceStatus.WAITING_DECISION,
+            finalizer_status=TaskGroupFinalizerStatus.ABSENT
+            if request.finalizer_task_id is None
+            else TaskGroupFinalizerStatus.WAITING,
+        ),
     )
     return GroupPublication(
         snapshot,
@@ -150,6 +165,7 @@ def plan_group_transition(
             receipt=snapshot.receipt,
             members=tuple(members.values()),
             decision=decision,
+            quiescence=snapshot.quiescence,
             last_sequence=snapshot.last_sequence + len(events),
         ),
         tuple(events),

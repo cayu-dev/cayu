@@ -39,6 +39,7 @@ from cayu.sessions.base import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     SessionStore,
+    _copy_pending_first_event_delivery,
     _mark_session_invocation_terminal_event,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
@@ -327,6 +328,27 @@ class RuntimeEventWriter:
                 delivered_event, _ = await self._deliver_persisted_side_effect_claim(claim)
             copied_events.append(delivered_event)
         return copied_events
+
+    async def fan_out_first_persisted(self, expected: PersistedEventSideEffectDelivery) -> None:
+        """Deliver only an atomically claimed exact first attempt, never a retry."""
+        expected = _copy_pending_first_event_delivery(expected)
+        claim = await self._session_store.claim_first_persisted_event_side_effect(expected)
+        if claim is None:
+            return
+        if (
+            type(claim) is not PersistedEventSideEffectClaim
+            or claim.session_id != expected.session_id
+            or claim.event_id != expected.event_id
+            or type(claim.event_sequence) is not int
+            or claim.event_sequence != expected.event_sequence
+            or type(claim.attempt) is not int
+            or claim.attempt != 1
+            or type(claim.event) is not Event
+            or claim.event.session_id != expected.session_id
+            or claim.event.id != expected.event_id
+        ):
+            raise RuntimeError("First event delivery returned conflicting claim authority.")
+        await self._deliver_persisted_side_effect_claim(claim)
 
     async def recover_persisted_side_effects(self, *, limit: int = 100) -> list[Event]:
         """Deliver a bounded batch of committed event side effects after a crash."""

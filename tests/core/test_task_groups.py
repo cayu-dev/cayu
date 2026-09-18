@@ -203,7 +203,9 @@ async def test_publication_failure_rolls_back_tasks_graph_and_group(store, monke
     before_graph = await app.load_task_graph(request.graph.graph_id)
     with monkeypatch.context() as patch:
         if isinstance(store, InMemoryTaskStore):
-            name = "prepare_group_admission" if phase == "admission" else "plan_group_transition"
+            name = (
+                "prepare_group_admission" if phase == "admission" else "plan_group_graph_transition"
+            )
             original = getattr(_memory_graphs, name)
 
             def failing(*args, **kwargs):

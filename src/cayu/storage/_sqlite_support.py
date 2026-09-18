@@ -56,7 +56,10 @@ from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
 )
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
-from cayu.storage._task_group_schema import SQLITE_TASK_GROUP_DDL
+from cayu.storage._task_group_schema import (
+    SQLITE_TASK_GROUP_DDL,
+    SQLITE_TASK_GROUP_QUIESCENCE_DDL,
+)
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
@@ -981,6 +984,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     93: SQLITE_COLLABORATION_DDL,
     94: SQLITE_COLLABORATION_LIFECYCLE_DDL,
     95: SQLITE_COLLABORATION_REQUEST_DDL,
+    96: SQLITE_TASK_GROUP_QUIESCENCE_DDL,
     91: SQLITE_TASK_GRAPH_DDL,
     90: SQLITE_SCHEDULING_DDL,
     81: """
@@ -4503,6 +4507,10 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    96: (
+        ("cayu_task_groups", "barrier_status", "TEXT NOT NULL DEFAULT 'not_requested'"),
+        ("cayu_task_groups", "barrier_deadline", "TEXT"),
+    ),
     91: (
         ("cayu_tasks", "graph_id", "TEXT"),
         ("cayu_tasks", "prerequisite_task_ids_json", "TEXT NOT NULL DEFAULT '[]'"),

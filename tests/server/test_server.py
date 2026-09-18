@@ -10659,6 +10659,15 @@ def test_interrupt_before_observer_start_cancels_environment_factory() -> None:
 
 
 def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
+    class RecordingProvider(OneShotProvider):
+        def __init__(self) -> None:
+            self.dispatches = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.dispatches += 1
+            async for event in super().stream(request):
+                yield event
+
     class BlockingTaskStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
@@ -10677,7 +10686,8 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
 
     task_store = BlockingTaskStore()
     app = CayuApp(task_store=task_store, enable_logging=False)
-    app.register_provider(OneShotProvider(), default=True)
+    provider = RecordingProvider()
+    app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     session_id = "session_interrupt_during_acceptance_bookkeeping"
 
@@ -10733,17 +10743,35 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
         assert await app.drain_background_interruptions(timeout_s=1) is True
         tasks = await task_store.list_tasks()
         assert [task.id for task in tasks] == ["task_interrupt_during_acceptance_bookkeeping"]
+        assert tasks[0].session_id == session_id
+        assert tasks[0].status is TaskStatus.RUNNING
+        assert provider.dispatches == 0
+        records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        assert [record.event.type for record in records] == [
+            json.loads(message["data"])["type"] for message in observed
+        ]
         return interrupt_events, observed, state.status
 
     interrupt_events, observed, status = asyncio.run(exercise())
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     observed_types = [json.loads(message["data"])["type"] for message in observed]
-    assert observed_types[:2] == [
-        EventType.INTERACTION_STARTED,
-        EventType.SESSION_STARTED,
-    ]
-    assert observed_types[-1] == EventType.SESSION_INTERRUPTED
+    # Acceptance is interaction.started, not session.started. Deferred
+    # interruption can arrive at the group-membership read before startup or
+    # at the next await after startup; neither ordering may lose bookkeeping.
+    assert observed_types in (
+        [
+            EventType.INTERACTION_STARTED,
+            EventType.INTERACTION_INTERRUPTED,
+            EventType.SESSION_INTERRUPTED,
+        ],
+        [
+            EventType.INTERACTION_STARTED,
+            EventType.SESSION_STARTED,
+            EventType.INTERACTION_INTERRUPTED,
+            EventType.SESSION_INTERRUPTED,
+        ],
+    )
     assert status is SessionStatus.INTERRUPTED
 
 

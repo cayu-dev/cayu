@@ -16,6 +16,7 @@ export const WORKFLOW_URL_MAX_BYTES = 4 * 1024
 export const WORKFLOW_STATUS_FILTERS = [
   "pending",
   "waiting_dependencies",
+  "waiting_group",
   "claimed",
   "running",
   "interrupting",

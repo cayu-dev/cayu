@@ -40,8 +40,10 @@ from cayu.runtime._verified_task_decision_coordinator import verified_task_opera
 from cayu.runtime.completion_verifiers import CompletionVerifierExecutionRequest
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
+    WorkAttemptPreEntrySettlementEvidence,
     WorkAttemptPreparationHold,
     WorkAttemptStopReason,
+    pre_entry_settlement_authority,
     runtime_stop_reason_for_execution_stop,
     work_attempt_admission_authority_sha256,
 )
@@ -50,6 +52,7 @@ from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,
     WorkAttemptAdmission,
     WorkAttemptAdmissionConflict,
+    WorkAttemptAdmissionPrepare,
     WorkAttemptAdmissionState,
     WorkAttemptClaimRenewalRequest,
     WorkAttemptExecutionClaimLost,
@@ -58,7 +61,9 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequest,
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
+    _GroupExecutionEntryRefused,
     require_work_attempt_admission_result,
+    work_attempt_admission_prepare_sha256,
 )
 from cayu.tasks.base import (
     Task,
@@ -80,12 +85,15 @@ from cayu.tasks.contracts import (
     WorkAttempt,
     WorkCompletionConflict,
     WorkContract,
+    WorkContractRef,
+    _GroupVerificationAdmissionRefused,
     completion_proposal_request_sha256,
     copy_completion_decision,
     copy_completion_proposal,
     copy_work_contract,
     require_bounded_work_completion_document,
 )
+from cayu.tasks.groups import TaskGroupResultResolutionPending
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
@@ -99,6 +107,29 @@ _VERIFIER_TIMEOUT_SECONDS = 30.0
 class _RetainedVerifier:
     execution: CompletionVerifierOwnedExecution
     observation: asyncio.Task[CapturedAwaitableOutcome[tuple[BaseException | None]]] | None = None
+
+
+@dataclass(slots=True)
+class _PreparationAdmission:
+    request: WorkAttemptExecutionRequest
+    contract: WorkContractRef
+    session_id: str
+    source_request_sha256: str
+    execution_owner_id: str
+    operation: asyncio.Task[CapturedAwaitableOutcome[WorkAttemptAdmission]]
+
+
+@dataclass(slots=True)
+class _RetainedPreparationSettlement:
+    claim: Task
+    started: Task | None = None
+    settlement: asyncio.Task[CapturedAwaitableOutcome[Task | None]] | None = None
+    hold: WorkAttemptPreparationHold | None = None
+    admission: _PreparationAdmission | None = None
+
+
+class _PreparationOwnershipTransferred(WorkAttemptRecoveryRequired):
+    """Only store-authenticated admission readback produces this local handoff."""
 
 
 async def _capture_owned_task_outcome(
@@ -217,12 +248,17 @@ class _LeaseOwner:
 
     def __init__(self, worker: VerifiedTaskWorker, state: Task | WorkAttemptAdmission) -> None:
         self.worker = worker
-        self.state = state
+        self.state: Task | WorkAttemptAdmission | _RetainedPreparationSettlement = state
         self.lock = asyncio.Lock()
 
     async def heartbeat(self) -> bool:
         async with self.lock:
             state = self.state
+            if isinstance(state, _RetainedPreparationSettlement):
+                # Callback work has ended and its exact hold owns the handoff.
+                # Renewing now would invalidate the retained lease tuple after
+                # a failed or still-pending publication.
+                return True
             if type(state) is WorkAttemptAdmission:
                 if state.state is WorkAttemptAdmissionState.RELEASED:
                     # A following continuation may acquire the next admission
@@ -239,7 +275,7 @@ class _LeaseOwner:
                 )
                 return False
             assert type(state) is Task
-            if state.status is TaskStatus.NEEDS_ATTENTION:
+            if state.status in {TaskStatus.NEEDS_ATTENTION, TaskStatus.CANCELLED}:
                 # Only the validated preparation-hold receipt installs this
                 # state; no heartbeat may race that completed handoff.
                 return True
@@ -320,8 +356,14 @@ class VerifiedTaskWorker:
         self.callback_timeout_seconds = callback_timeout_seconds
         self._running: asyncio.Task[CapturedAwaitableOutcome[int]] | None = None
         self._verification: _RetainedVerifier | None = None
+        self._preparation_settlement: _RetainedPreparationSettlement | None = None
+        self._pre_entry_settlement: WorkAttemptLifecycleSettlement | None = None
+        self._pre_entry_publication: asyncio.Task | None = None
         self._closed = False
         self._recovery_cursor: str | None = None
+        from cayu.tasks._group_maintenance import TaskGroupMaintenance
+
+        self._group_maintenance = TaskGroupMaintenance()
 
     def _validate(self, factory: Callable[[], _T], name: str) -> _T:
         captured = capture_sensitive_result_validation(
@@ -380,7 +422,33 @@ class VerifiedTaskWorker:
         del captured, detach, factory
         return CapturedAwaitableOutcome(error=checked.failure)
 
-    async def _callback(self, factory: Callable[[], Awaitable[_T]], name: str) -> _T:
+    async def _group_cancellation_requested(self, task_id: str) -> bool:
+        value = await self._operation(
+            lambda: self.store._task_group_cancellation_requested(task_id),
+            name="Verified task group cancellation observation",
+        )
+        if type(value) is not bool:
+            raise WorkCompletionConflict(
+                "Group cancellation observation must be authoritative boolean evidence."
+            )
+        return value
+
+    async def _group_owns_callback(self, task: Task) -> bool:
+        if not self.store.supports_task_group_quiescence:
+            return False
+        value = await self._operation(
+            lambda: self.store._task_group_retains_execution(task.id),
+            name="Verified callback group ownership",
+        )
+        if type(value) is not bool:
+            raise WorkCompletionConflict(
+                "Verified callback requires authoritative group ownership."
+            )
+        return value
+
+    async def _callback(
+        self, factory: Callable[[], Awaitable[_T]], name: str, *, retain_until_settled: bool = False
+    ) -> _T:
         child = asyncio.create_task(self._capture_callback(factory, name))
         cancellation = None
         expired = False
@@ -389,7 +457,7 @@ class VerifiedTaskWorker:
             expired = not done
         except asyncio.CancelledError as error:
             cancellation = error
-        if expired or cancellation is not None:
+        if (expired or cancellation is not None) and not retain_until_settled:
             child.cancel()
         outcome = await await_shielded_task_outcome(child, cancellation=cancellation)
         restore_task_cancellation_requests(
@@ -416,6 +484,271 @@ class VerifiedTaskWorker:
         if outcome.result is None or outcome.result.result is None:
             raise TypeError("Verified task callback returned no typed result.")
         return outcome.result.result
+
+    async def _settle_cancelled_group_callback(
+        self, owner: _LeaseOwner, contract: WorkContract, cancellation: asyncio.CancelledError
+    ) -> None:
+        """Retain current cancellation while recording a naturally drained callback.
+
+        Only preparation/proposal callers use this after their callback owner
+        has settled. Cancellation of model execution is not this evidence.
+        """
+
+        async def settle():
+            state = owner.state
+            assert isinstance(state, (Task, WorkAttemptAdmission))
+            if isinstance(state, Task):
+                async with owner.lock:
+                    # Retain the naturally drained callback's exact proof even
+                    # if the election readback or acknowledgement write fails.
+                    state = self._retain_drained_preparation(owner)
+                    if await self._group_cancellation_requested(state.id):
+                        owner.state = state
+                        await self._hold_preparation_locked(
+                            owner, contract, "work_contract_group_cancelled"
+                        )
+                    else:
+                        await self._consume_preparation_settlement(self.callback_timeout_seconds)
+                        owner.state = state
+            elif await self._group_cancellation_requested(state.task_id):
+                await self._settle_runtime_stop(owner, "work_contract_group_cancelled")
+
+        work = asyncio.create_task(_capture_owned_task_outcome(settle))
+        result = await await_shielded_task_outcome(work, cancellation=cancellation)
+        cleanup = result.error or (None if result.result is None else result.result.error)
+        failure = _merge_worker_failures(cancellation, cleanup)
+        failure = _merge_worker_failures(failure, result.cancellation)
+        restore_task_cancellation_requests(
+            result.cancellation_requests_consumed, cancellation=cancellation
+        )
+        assert failure is not None
+        raise failure from exception_cause(failure)
+
+    def _retain_drained_preparation(self, owner: _LeaseOwner) -> Task:
+        """Transfer a completed callback's proof while holding the lease lock."""
+        state = owner.state
+        assert isinstance(state, Task)
+        assert self._preparation_settlement is None
+        retained = _RetainedPreparationSettlement(claim=copy_task(state), started=copy_task(state))
+        self._preparation_settlement = retained
+        owner.state = retained
+        return state
+
+    async def _settle_preparation_execution(self, task: Task) -> None:
+        authority = copy_task(task)
+        await self._operation(
+            lambda: self.store._settle_task_group_execution(authority),
+            name="Verified preparation execution settlement",
+            mutation="_settle_task_group_execution",
+        )
+
+    async def _reconcile_preparation_entry(
+        self, retained: _RetainedPreparationSettlement
+    ) -> Task | None:
+        admitted = None
+        if retained.admission is not None:
+            # Cancellation only stops observation. Absence is not non-admission
+            # proof until the one original operation has naturally settled.
+            outcome = await asyncio.shield(retained.admission.operation)
+            admitted = outcome.result
+        if retained.hold is not None or retained.admission is not None:
+            admission = await self._operation(
+                lambda: self.store.load_latest_work_attempt_admission(retained.claim.id),
+                name="Preparation handoff admission reconciliation",
+            )
+            if admission is not None:
+                # A failed admission acknowledgement is not non-dispatch proof.
+                # The admission's durable recovery owner must settle that work.
+                def require_admission(value=admission):
+                    recorded = require_work_attempt_admission_result(
+                        value, operation_name="Preparation ownership transfer"
+                    )
+                    if (
+                        recorded.task_id != retained.claim.id
+                        or recorded.contract != retained.claim.work_contract
+                    ):
+                        raise WorkAttemptAdmissionConflict(
+                            "Preparation admission changed authority."
+                        )
+                    if retained.admission is not None:
+                        self._require_preparation_admission(recorded, retained.admission)
+
+                try:
+                    self._validate(require_admission, "Preparation ownership transfer")
+                finally:
+                    del admission, require_admission
+                raise _PreparationOwnershipTransferred(
+                    "Preparation acquired admission ownership; recover the admitted attempt."
+                )
+            if admitted is not None:
+                raise WorkAttemptAdmissionConflict("Acknowledged preparation admission is missing.")
+            if retained.hold is not None:
+                return await self._publish_preparation_hold(retained.hold)
+        if retained.started is not None:
+            # Settlement may itself commit before acknowledgement loss. Keep
+            # the original execution tuple, not the terminal task's cleared lease.
+            await self._settle_preparation_execution(retained.started)
+            return
+        claim = retained.claim
+        value = await self._operation(
+            lambda: self.store.load_task(claim.id),
+            name="Undispatched preparation readback",
+        )
+
+        def require_exact(value=value):
+            if type(value) is not Task:
+                raise WorkCompletionConflict("Preparation readback lost its exact claim.")
+            recorded = copy_task(value)
+            # Election or an external cancellation may have changed stop
+            # diagnostics, but must not replace the claim or attach execution.
+            if (
+                claim.started_at is not None
+                or recorded.model_copy(
+                    update={
+                        "started_at": claim.started_at,
+                        "updated_at": claim.updated_at,
+                        "status_reason": claim.status_reason,
+                        "status_payload": claim.status_payload,
+                        "error": claim.error,
+                    }
+                )
+                != claim
+            ):
+                raise WorkCompletionConflict("Preparation readback changed its exact claim.")
+            return recorded
+
+        try:
+            recorded = self._validate(require_exact, "Undispatched preparation authority")
+        finally:
+            del value, require_exact
+        if recorded.started_at is not None:
+            retained.started = recorded
+            await self._settle_preparation_execution(recorded)
+
+    async def _consume_preparation_settlement(self, timeout_s: float) -> Task | None:
+        retained = self._preparation_settlement
+        if retained is None:
+            return
+        if retained.settlement is None:
+            retained.settlement = asyncio.create_task(
+                _capture_owned_task_outcome(lambda: self._reconcile_preparation_entry(retained)),
+                name="cayu-undispatched-preparation-settlement",
+            )
+        settlement = retained.settlement
+        outcome = await await_shielded_task_outcome(
+            settlement, timeout_s=timeout_s, timeout_after_cancellation_s=0
+        )
+        captured = outcome.result
+        failure = outcome.error or (None if captured is None else captured.error)
+        if self._preparation_settlement is not retained or retained.settlement is not settlement:
+            failure = None
+        elif settlement.done():
+            if (captured is not None and failure is None) or type(
+                failure
+            ) is _PreparationOwnershipTransferred:
+                self._preparation_settlement = None
+            else:
+                retained.settlement = None
+        if outcome.timed_out:
+            failure = _merge_worker_failures(
+                failure, VerifiedTaskWorkerDraining("Preparation entry settlement is draining.")
+            )
+        if outcome.cancellation is not None:
+            failure = _merge_worker_failures(failure, outcome.cancellation)
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+            )
+        if failure is not None:
+            raise failure from exception_cause(failure)
+        return None if captured is None else captured.result
+
+    def _require_preparation_admission(
+        self, value: object, expected: _PreparationAdmission
+    ) -> WorkAttemptAdmission:
+        admission = require_work_attempt_admission_result(
+            value, operation_name="Preparation admission acknowledgement"
+        )
+        request = expected.request
+        assert request.task_id is not None
+        # Authenticate the immutable initial intent. A recovery owner may
+        # already have replaced the mutable execution claim; that is not a
+        # conflicting admission and does not restore preparation ownership.
+        prepare = WorkAttemptAdmissionPrepare(
+            admission_id=request.admission_id,
+            claim_id=request.claim_id,
+            attempt_id=request.attempt_id,
+            task_id=request.task_id,
+            session_id=expected.session_id,
+            interaction_id=request.interaction_id,
+            worker_id=request.worker_id,
+            task_lease_expires_at=request.task_lease_expires_at,
+            execution_owner_id=expected.execution_owner_id,
+            generation=request.generation,
+            lease_seconds=request.lease_seconds,
+            kind="initial",
+            source_request_sha256=expected.source_request_sha256,
+            contract=expected.contract,
+            session_invocation=admission.session_invocation,
+            source_execution_profile_fingerprint=admission.source_execution_profile_fingerprint,
+            run_semantics=admission.run_semantics,
+            source_request=admission.source_request,
+        )
+        if (
+            admission.admission_id != request.admission_id
+            or admission.task_id != request.task_id
+            or admission.session_id != expected.session_id
+            or admission.attempt_id != request.attempt_id
+            or admission.interaction_id != request.interaction_id
+            or admission.kind != "initial"
+            or admission.contract != expected.contract
+            or admission.source_request_sha256 != expected.source_request_sha256
+            or admission.prepare_request_sha256 != work_attempt_admission_prepare_sha256(prepare)
+        ):
+            raise WorkAttemptAdmissionConflict("Preparation admission changed its exact request.")
+        return admission
+
+    async def _admit_prepared(
+        self, request: RunRequest, execution: WorkAttemptExecutionRequest
+    ) -> WorkAttemptAdmission:
+        retained = self._preparation_settlement
+        if retained is None:
+            return await self.app.admit_work_attempt(request, execution=execution)
+        request = self.app._with_application_run_defaults(request)
+        assert request.session_id is not None
+        assert retained.claim.work_contract is not None
+        source = self._validate(
+            lambda: self.app._session_engine.work_attempt_source_request_sha256(
+                request, kind="initial"
+            ),
+            "Preparation admission source authority",
+        )
+        expected = _PreparationAdmission(
+            request=execution.model_copy(deep=True),
+            contract=retained.claim.work_contract.model_copy(deep=True),
+            session_id=request.session_id,
+            source_request_sha256=source,
+            execution_owner_id=self.app._current_work_attempt_execution_owner_id(),
+            operation=asyncio.create_task(
+                _capture_owned_task_outcome(
+                    lambda: self.app.admit_work_attempt(request, execution=execution)
+                ),
+                name="cayu-preparation-admission",
+            ),
+        )
+        retained.admission = expected
+        outcome = await asyncio.shield(expected.operation)
+        if outcome.error is not None:
+            if isinstance(outcome.error, asyncio.CancelledError):
+                raise unexpected_child_cancellation_error(
+                    outcome.error, operation="Preparation admission"
+                )
+            raise outcome.error from exception_cause(outcome.error)
+        admission = self._validate(
+            lambda: self._require_preparation_admission(outcome.result, expected),
+            "Preparation admission acknowledgement",
+        )
+        self._preparation_settlement = None
+        return admission
 
     async def _with_heartbeat(self, owner: _LeaseOwner, action: Callable[[], Awaitable[_T]]) -> _T:
         stop = asyncio.Event()
@@ -488,6 +821,16 @@ class VerifiedTaskWorker:
             raise VerifiedTaskWorkerDraining("The prior worker run must settle before another run.")
         if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 0):
             raise ValueError("max_tasks must be a nonnegative integer.")
+        if self._pre_entry_settlement is not None:
+            await self._consume_pre_entry_settlement(self.callback_timeout_seconds)
+            if self._closed or self._running is not None:
+                raise VerifiedTaskWorkerDraining("Worker ownership changed during settlement.")
+        if self._preparation_settlement is not None:
+            await self._consume_preparation_settlement(self.callback_timeout_seconds)
+            if self._closed:
+                raise RuntimeError("VerifiedTaskWorker is closed.")
+            if self._running is not None:
+                raise VerifiedTaskWorkerDraining("Another worker run acquired ownership.")
         if self._verification is not None:
             await self._consume_verifier_settlement(self.callback_timeout_seconds)
             if self._closed:
@@ -550,6 +893,18 @@ class VerifiedTaskWorker:
             raise
         except BaseException as error:
             failure = error
+        try:
+            await self._consume_preparation_settlement(
+                max(0.0, deadline - asyncio.get_running_loop().time())
+            )
+        except BaseException as error:
+            failure = _merge_worker_failures(failure, error)
+        try:
+            await self._consume_pre_entry_settlement(
+                max(0.0, deadline - asyncio.get_running_loop().time())
+            )
+        except BaseException as error:
+            failure = _merge_worker_failures(failure, error)
         try:
             await self._consume_verifier_settlement(
                 max(0.0, deadline - asyncio.get_running_loop().time())
@@ -657,6 +1012,7 @@ class VerifiedTaskWorker:
             raise failure from exception_cause(failure)
 
     async def _step(self, _now: float, _handled: int) -> DurableWorkerStep:
+        await self._group_maintenance.step(self.store, self.app._secret_redactor, now=_now)
         recovered = await self._discover_unfinished_attempt()
         if recovered is not None:
             return recovered
@@ -778,6 +1134,30 @@ class VerifiedTaskWorker:
     ) -> DurableWorkerStep | None:
         if admission.claim.lease_expires_at > datetime.now(UTC):
             return None
+        if await self._group_cancellation_requested(admission.task_id):
+            if (
+                admission.state is WorkAttemptAdmissionState.ACTIVE
+                and admission.execution_entry is None
+                and admission.execution_stop is None
+            ):
+                if not await self.app._session_engine.settle_work_attempt_admission_handoff(
+                    admission
+                ):
+                    return None
+                # Admission positively proves preparation returned. The store's
+                # permanent group fence excludes execution entry, including a
+                # delayed original worker. Close the admitted session before
+                # publishing the receipt that removes it from discovery.
+                self._retain_pre_entry_settlement(admission)
+                await self._consume_pre_entry_settlement(self.callback_timeout_seconds)
+                return DurableWorkerStep(handled=1, activity=True)
+            # An ACTIVE admission may already have released its session while
+            # its preparation/proposal callback still owns external work.
+            # A replacement execution claim is not cleanup acknowledgement.
+            # Keep that historical obligation fenced; exact RELEASED proposals
+            # are reconciled separately by _finish_proposal. Maintenance turns
+            # unresolved owner loss into attention, never fresh execution.
+            return None
         release = await self.app._session_engine.load_work_attempt_released_recovery_evidence(
             admission
         )
@@ -860,6 +1240,32 @@ class VerifiedTaskWorker:
                 return DurableWorkerStep(handled=1, activity=True)
             if type(admission) is not WorkAttemptAdmission:
                 raise WorkCompletionConflict("Verified worker lost its admitted successor.")
+            if await self._group_cancellation_requested(admission.task_id):
+                # A peer may still own the verifier, including an opaque read
+                # that outlived its lease. The group fence prevents a new
+                # verifier claim; only an exact committed decision proves the
+                # existing verification finished. Merely discovering this
+                # admission must neither settle it nor fail the worker loop.
+                _, decision = await self._verification_request(proposal.proposal_id, contract)
+                if (
+                    decision is None
+                    and await self._load_verifier_claim(proposal.proposal_id, contract) is not None
+                ):
+                    return DurableWorkerStep(idle=True)
+                if decision is not None:
+                    await self.app._reconcile_completion_result_group_settlement(
+                        admission.task_id, decision.decision_id
+                    )
+                try:
+                    await self._settle_runtime_stop(
+                        owner,
+                        "work_contract_group_cancelled",
+                        proposal=proposal,
+                        decision_id=None if decision is None else decision.decision_id,
+                    )
+                except TaskGroupResultResolutionPending:
+                    return DurableWorkerStep(idle=True)
+                return DurableWorkerStep(handled=1, activity=True)
             verification, decision = await self._verification_request(
                 proposal.proposal_id, contract
             )
@@ -886,6 +1292,19 @@ class VerifiedTaskWorker:
                 )
                 self._verification = _RetainedVerifier(started.verification)
                 result = await started.result()
+            except _GroupVerificationAdmissionRefused:
+                if not await self._group_cancellation_requested(admission.task_id):
+                    raise
+                # Admission runs inside the owned verification operation. Drain
+                # that refused operation before re-entering cancellation handling,
+                # which independently checks existing verifier/resolver ownership.
+                await self._consume_verifier_settlement(self.callback_timeout_seconds)
+                continue
+            except TaskGroupResultResolutionPending:
+                # The election may win after the preliminary cancellation read.
+                # A peer's live resolver remains authoritative in either path.
+                await self._consume_verifier_settlement(self.callback_timeout_seconds)
+                return DurableWorkerStep(idle=True)
             except Exception as failure:
                 if isinstance(failure, (CompletionVerificationClaimLost, WorkCompletionConflict)):
                     # A peer may win between discovery and verifier admission.
@@ -1000,12 +1419,65 @@ class VerifiedTaskWorker:
         deadline = ExecutionDeadline.after(
             self.max_elapsed_seconds, source="verified-task-worker", scope="task"
         )
+        retain_callback = await self._group_owns_callback(task)
+        if retain_callback:
+            async with owner.lock:
+                current = owner.state
+                assert type(current) is Task and current.lease_expires_at is not None
+                claim_task_id, claim_lease = current.id, current.lease_expires_at
+                try:
+                    started = await self._operation(
+                        lambda: self.store.mark_claimed_task_execution_started(
+                            claim_task_id, self.worker_id, claim_lease
+                        ),
+                        name="Verified preparation execution entry",
+                        mutation="mark_claimed_task_execution_started",
+                    )
+
+                    def require_started(value=started, expected=current):
+                        recorded = copy_task(value)
+                        if (
+                            recorded.started_at is None
+                            or recorded.model_copy(
+                                update={
+                                    "started_at": expected.started_at,
+                                    "updated_at": expected.updated_at,
+                                }
+                            )
+                            != expected
+                        ):
+                            raise WorkCompletionConflict(
+                                "Preparation entry changed its claim authority."
+                            )
+                        return recorded
+
+                    try:
+                        task = owner.state = self._validate(
+                            require_started, "Verified preparation execution entry"
+                        )
+                    finally:
+                        del started, require_started
+                except BaseException as entry_failure:
+                    # The store call has settled, but its acknowledgement may
+                    # have been lost. No callback has been dispatched here.
+                    retained = _RetainedPreparationSettlement(copy_task(current))
+                    self._preparation_settlement = retained
+                    owner.state = retained
+                    try:
+                        await self._consume_preparation_settlement(self.callback_timeout_seconds)
+                    except BaseException as settlement_failure:
+                        combined = _merge_worker_failures(entry_failure, settlement_failure)
+                        assert combined is not None
+                        raise combined from exception_cause(combined)
+                    raise
         context = VerifiedTaskPreparationContext(
             copy_task(task), copy_work_contract(contract), session_id
         )
         try:
             raw = await self._callback(
-                lambda: self.handler.prepare(context), "Verified task preparation callback"
+                lambda: self.handler.prepare(context),
+                "Verified task preparation callback",
+                retain_until_settled=retain_callback,
             )
 
             def prepare(raw=raw):
@@ -1029,6 +1501,10 @@ class VerifiedTaskWorker:
                 request = self._validate(prepare, "Verified task preparation result")
             finally:
                 del raw, prepare
+        except asyncio.CancelledError as cancellation:
+            if retain_callback:
+                await self._settle_cancelled_group_callback(owner, contract, cancellation)
+            raise
         except Exception as failure:
             reason = (
                 "work_contract_preparation_timed_out"
@@ -1036,12 +1512,44 @@ class VerifiedTaskWorker:
                 else "work_contract_preparation_failed"
             )
             del failure
-            async with owner.lock:
-                await self._hold_preparation_locked(owner, contract, reason)
+            try:
+                async with owner.lock:
+                    if await self._group_cancellation_requested(task.id):
+                        reason = "work_contract_group_cancelled"
+                    await self._hold_preparation_locked(owner, contract, reason)
+            except BaseException as hold_failure:
+                if retain_callback and self._preparation_settlement is None:
+                    try:
+                        async with owner.lock:
+                            state = self._retain_drained_preparation(owner)
+                            await self._consume_preparation_settlement(
+                                self.callback_timeout_seconds
+                            )
+                            owner.state = state
+                    except BaseException as settlement_failure:
+                        combined = _merge_worker_failures(hold_failure, settlement_failure)
+                        assert combined is not None
+                        raise combined from exception_cause(combined)
+                raise
             return None
+        if retain_callback:
+            # Preparation has returned, but even acquiring the lease lock or
+            # reading the election can fail before admission starts. Retain its
+            # exact execution proof now. Heartbeats may still renew the claim;
+            # settlement binds the copied execution marker, not that lease.
+            # run/aclose cannot consume this owner until this run has drained.
+            assert self._preparation_settlement is None
+            self._preparation_settlement = _RetainedPreparationSettlement(
+                claim=copy_task(task), started=copy_task(task)
+            )
         async with owner.lock:
             current = owner.state
             assert type(current) is Task
+            if await self._group_cancellation_requested(task.id):
+                await self._hold_preparation_locked(
+                    owner, contract, "work_contract_group_cancelled"
+                )
+                return None
             request = request.model_copy(
                 update={
                     "task_id": task.id,
@@ -1063,20 +1571,54 @@ class VerifiedTaskWorker:
                 lease_seconds=self.lease_seconds,
             )
             try:
-                owner.state = await self.app.admit_work_attempt(request, execution=execution)
+                owner.state = await self._admit_prepared(request, execution)
+            except WorkAttemptAdmissionConflict:
+                if not retain_callback:
+                    raise
+                # The callback returned, but admission may have lost a race
+                # with election. Retain the exact hold before any readback/write.
+                # Its atomic store validation rejects transferred ownership.
+                await self._hold_preparation_locked(
+                    owner, contract, "work_contract_group_cancelled"
+                )
+                return None
             except ExecutionDeadlineExceeded:
                 await self._hold_preparation_locked(
                     owner, contract, "work_contract_elapsed_limit", request.execution_deadline
                 )
                 return None
+            except BaseException:
+                if self._preparation_settlement is not None:
+                    owner.state = self._preparation_settlement
+                raise
         return await self._run_and_propose(owner, contract)
 
     async def _hold_preparation_locked(self, owner, contract, reason, deadline=None):
         """Publish through the existing hold owner while the lease lock is held."""
         current = owner.state
+        hold = self._preparation_hold_request(current, contract, reason, deadline)
+        if reason == "work_contract_group_cancelled" or self._preparation_settlement is not None:
+            # Election may be observed before admission, during admission, or
+            # while draining cancellation. Every path retains the exact hold
+            # before readback/publication, so a transient failure has the same
+            # retry owner even when no admission was ever attempted.
+            retained = self._preparation_settlement or _RetainedPreparationSettlement(
+                claim=copy_task(current)
+            )
+            retained.hold = hold
+            self._preparation_settlement = retained
+            owner.state = retained
+            held = await self._consume_preparation_settlement(self.callback_timeout_seconds)
+            if held is None:
+                raise WorkCompletionConflict("Preparation hold returned no settled task.")
+            owner.state = held
+        else:
+            owner.state = await self._publish_preparation_hold(hold)
+
+    def _preparation_hold_request(self, current, contract, reason, deadline=None):
         assert type(current) is Task and current.lease_expires_at is not None
         lease = current.lease_expires_at
-        hold = WorkAttemptPreparationHold(
+        return WorkAttemptPreparationHold(
             hold_id=verified_task_operation_id(
                 "preparation-hold", current.id, self.worker_id, lease.isoformat()
             ),
@@ -1087,6 +1629,8 @@ class VerifiedTaskWorker:
             reason=reason,
             deadline_expires_at=None if deadline is None else deadline.expires_at,
         )
+
+    async def _publish_preparation_hold(self, hold: WorkAttemptPreparationHold) -> Task:
         receipt = await self._operation(
             lambda: self.store.hold_work_attempt_preparation(hold),
             name="Verified task preparation hold",
@@ -1104,7 +1648,7 @@ class VerifiedTaskWorker:
             return copied.task
 
         try:
-            owner.state = self._validate(require_hold, "Verified preparation hold receipt")
+            return self._validate(require_hold, "Verified preparation hold receipt")
         finally:
             del receipt, require_hold
 
@@ -1138,6 +1682,8 @@ class VerifiedTaskWorker:
         admission = owner.state
         assert type(admission) is WorkAttemptAdmission
         await self.app._session_engine.load_work_attempt_release_evidence(admission)
+        if await self._group_cancellation_requested(admission.task_id):
+            return await self._settle_runtime_stop(owner, "work_contract_group_cancelled")
         recorded_reason = runtime_stop_reason_for_execution_stop(admission)
         if recorded_reason is not None:
             return await self._settle_runtime_stop(owner, recorded_reason)
@@ -1154,8 +1700,15 @@ class VerifiedTaskWorker:
         if session.status is not SessionStatus.COMPLETED:
             raise WorkAttemptRecoveryRequired("Verified attempt still requires recovery.")
         context = await self._proposal_context(admission, contract)
+        retain_callback = await self._group_owns_callback(context.task)
         try:
-            proposal = await self._prepare_proposal(context, session.execution_deadline)
+            proposal = await self._prepare_proposal(
+                context, session.execution_deadline, retain_callback=retain_callback
+            )
+        except asyncio.CancelledError as cancellation:
+            if retain_callback:
+                await self._settle_cancelled_group_callback(owner, contract, cancellation)
+            raise
         except Exception as failure:
             reason = (
                 "work_contract_elapsed_limit"
@@ -1163,6 +1716,10 @@ class VerifiedTaskWorker:
                 else "work_contract_handler_failed"
             )
             return await self._stop_after_failure(owner, reason, failure)
+        if await self._group_cancellation_requested(admission.task_id):
+            # The read-only handler has returned, but its proposal is not yet
+            # admitted. Do not create verifier work after the group decided.
+            return await self._settle_runtime_stop(owner, "work_contract_group_cancelled")
         try:
             async with owner.lock:
                 session.execution_deadline.require_admission("completion_proposal")
@@ -1188,10 +1745,20 @@ class VerifiedTaskWorker:
                 owner.state = updated
         except ExecutionDeadlineExceeded as failure:
             return await self._stop_after_failure(owner, "work_contract_elapsed_limit", failure)
+        except WorkAttemptAdmissionConflict:
+            if await self._group_cancellation_requested(admission.task_id):
+                return await self._settle_runtime_stop(owner, "work_contract_group_cancelled")
+            raise
         return proposal
 
     async def _stop_after_failure(self, owner, reason: WorkAttemptStopReason, failure: Exception):
         try:
+            if isinstance(failure, _GroupExecutionEntryRefused):
+                admission = owner.state
+                if type(admission) is not WorkAttemptAdmission:
+                    raise WorkAttemptRecoveryRequired("Pre-entry refusal lost its admission owner.")
+                # Retain the store-confirmed refusal before any fallible await.
+                self._retain_pre_entry_settlement(admission)
             return await self._settle_runtime_stop(owner, reason)
         except asyncio.CancelledError as cancellation:
             combined = _merge_worker_failures(failure, cancellation)
@@ -1210,6 +1777,21 @@ class VerifiedTaskWorker:
         proposal: CompletionProposal | CompletionProposalCreate | None = None,
         decision_id: str | None = None,
     ) -> WorkAttemptLifecycleReceipt:
+        prior = owner.state
+        if self._pre_entry_settlement is not None:
+            if type(prior) is not WorkAttemptAdmission:
+                raise WorkAttemptRecoveryRequired("Pre-entry settlement lost its admission owner.")
+            # Returning from the owned invocation is positive local evidence.
+            # Retain it before any lookup, renewal, or lock acquisition can
+            # fail. Store readback/settlement still decides whether entry or a
+            # replacement owner won; this does not authorize cancellation.
+            async with owner.lock:
+                receipt = await self._consume_pre_entry_settlement(self.callback_timeout_seconds)
+                if receipt is not None:
+                    owner.state = prior.model_copy(
+                        update={"state": WorkAttemptAdmissionState.RELEASED}
+                    )
+                    return receipt
         await owner.heartbeat()
         async with owner.lock:
             admission = owner.state
@@ -1218,6 +1800,16 @@ class VerifiedTaskWorker:
                     "Runtime stop requires exact admission authority."
                 )
             reason = runtime_stop_reason_for_execution_stop(admission) or reason
+            if proposal is None and await self._group_cancellation_requested(admission.task_id):
+                reason = "work_contract_group_cancelled"
+            if reason == "work_contract_group_cancelled" and admission.execution_entry is None:
+                self._retain_pre_entry_settlement(admission)
+                receipt = await self._consume_pre_entry_settlement(self.callback_timeout_seconds)
+                assert receipt is not None
+                owner.state = admission.model_copy(
+                    update={"state": WorkAttemptAdmissionState.RELEASED}
+                )
+                return receipt
             proposal_digest = (
                 None
                 if proposal is None
@@ -1238,7 +1830,9 @@ class VerifiedTaskWorker:
                 expected_admission_sha256=work_attempt_admission_authority_sha256(admission),
                 release_evidence=release,
                 kind=(
-                    "continuation_deadline_stop"
+                    "group_cancellation"
+                    if reason == "work_contract_group_cancelled"
+                    else "continuation_deadline_stop"
                     if decision_id is not None
                     else "runtime_stop"
                     if proposal is None
@@ -1247,7 +1841,7 @@ class VerifiedTaskWorker:
                 decision_id=decision_id,
                 application_idempotency_key=(
                     None
-                    if decision_id is None
+                    if decision_id is None or reason == "work_contract_group_cancelled"
                     else verified_task_operation_id(
                         "application", admission.admission_id, decision_id
                     )
@@ -1291,7 +1885,30 @@ class VerifiedTaskWorker:
                     assert combined is not None
                     raise combined from exception_cause(combined)
                 if raw is None:
-                    raise
+                    if (
+                        isinstance(publication_failure, WorkAttemptAdmissionConflict)
+                        and request.kind != "group_cancellation"
+                        and proposal is None
+                        and await self._group_cancellation_requested(admission.task_id)
+                    ):
+                        # Only a typed precommit conflict without a receipt may
+                        # select the now-authoritative group stop. Ack-loss
+                        # replay above keeps its original complete tuple.
+                        request = WorkAttemptLifecycleSettlement.model_validate(
+                            request.model_copy(
+                                update={
+                                    "kind": "group_cancellation",
+                                    "stop_reason": "work_contract_group_cancelled",
+                                }
+                            ).model_dump(mode="python", warnings=False)
+                        )
+                        raw = await self._operation(
+                            lambda: self.store.settle_work_attempt_lifecycle(request),
+                            name="Verified group stop after decision race",
+                            mutation="settle_work_attempt_lifecycle",
+                        )
+                    else:
+                        raise
                 if proposal is not None and isinstance(
                     publication_failure, WorkAttemptAdmissionConflict
                 ):
@@ -1323,6 +1940,121 @@ class VerifiedTaskWorker:
             # transition. This is a local heartbeat projection, not dispatch.
             owner.state = admission.model_copy(update={"state": WorkAttemptAdmissionState.RELEASED})
             return receipt
+
+    def _retain_pre_entry_settlement(self, admission: WorkAttemptAdmission) -> None:
+        request = WorkAttemptLifecycleSettlement(
+            settlement_id=verified_task_operation_id("settlement", admission.admission_id),
+            task_id=admission.task_id,
+            admission_id=admission.admission_id,
+            expected_admission_sha256=pre_entry_settlement_authority(admission),
+            release_evidence=WorkAttemptPreEntrySettlementEvidence(
+                session_id=admission.session_id,
+                session_instance_id=admission.session_invocation.session_instance_id,
+                interaction_id=admission.interaction_id,
+                profile_fingerprint=admission.source_execution_profile_fingerprint,
+            ),
+            kind="group_cancellation",
+            stop_reason="work_contract_group_cancelled",
+        )
+        if self._pre_entry_settlement not in (None, request):
+            raise WorkAttemptAdmissionConflict("Another pre-entry settlement is retained.")
+        self._pre_entry_settlement = request
+
+    async def _consume_pre_entry_settlement(
+        self, timeout_s: float
+    ) -> WorkAttemptLifecycleReceipt | None:
+        request = self._pre_entry_settlement
+        if request is None:
+            return None
+
+        async def publish():
+            existing = await self._operation(
+                lambda: self.store.load_work_attempt_lifecycle_receipt(request.admission_id),
+                name="Verified pre-entry receipt lookup",
+            )
+            if existing is None:
+                raw_admission = await self._operation(
+                    lambda: self.store.load_work_attempt_admission(request.admission_id),
+                    name="Verified pre-entry admission lookup",
+                )
+                admission = self._validate(
+                    lambda: require_work_attempt_admission_result(
+                        raw_admission, operation_name="Pre-entry settlement readback"
+                    ),
+                    "Verified pre-entry admission validation",
+                )
+                if admission.execution_entry is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Retained pre-entry refusal conflicts with entered execution."
+                    )
+                if not await self._group_cancellation_requested(request.task_id):
+                    raise WorkAttemptAdmissionConflict(
+                        "Retained pre-entry refusal has no matching group cancellation."
+                    )
+                if pre_entry_settlement_authority(admission) != request.expected_admission_sha256:
+                    raise WorkAttemptAdmissionConflict("Pre-entry cleanup authority changed.")
+                await self.app._session_engine.close_unentered_work_attempt_invocation(admission)
+            try:
+                raw = (
+                    existing
+                    if existing is not None
+                    else await self._operation(
+                        lambda: self.store.settle_work_attempt_lifecycle(request),
+                        name="Verified pre-entry group settlement",
+                        mutation="settle_work_attempt_lifecycle",
+                    )
+                )
+            except Exception as publication_failure:
+                try:
+                    raw = await self._operation(
+                        lambda: self.store.load_work_attempt_lifecycle_receipt(
+                            request.admission_id
+                        ),
+                        name="Verified pre-entry settlement readback",
+                    )
+                except BaseException as readback_failure:
+                    failure = _merge_worker_failures(publication_failure, readback_failure)
+                    assert failure is not None
+                    raise failure from exception_cause(failure)
+                if raw is None:
+                    raise
+
+            def validate():
+                if type(raw) is not WorkAttemptLifecycleReceipt:
+                    raise WorkCompletionConflict("Pre-entry settlement returned no receipt.")
+                receipt = WorkAttemptLifecycleReceipt.model_validate(
+                    raw.model_dump(mode="python", warnings=False)
+                )
+                if receipt.request != request:
+                    raise WorkCompletionConflict("Pre-entry settlement receipt conflicts.")
+                return receipt
+
+            return self._validate(validate, "Verified pre-entry settlement receipt")
+
+        if self._pre_entry_publication is None:
+            self._pre_entry_publication = asyncio.create_task(_capture_owned_task_outcome(publish))
+        publication = self._pre_entry_publication
+        outcome = await await_shielded_task_outcome(
+            publication, timeout_s=timeout_s, timeout_after_cancellation_s=0
+        )
+        captured = outcome.result
+        failure = outcome.error or (None if captured is None else captured.error)
+        receipt = None if captured is None else captured.result
+        if publication is self._pre_entry_publication and publication.done():
+            self._pre_entry_publication = None
+            if captured is not None and failure is None:
+                self._pre_entry_settlement = None
+        if outcome.timed_out:
+            failure = _merge_worker_failures(
+                failure, VerifiedTaskWorkerDraining("Pre-entry settlement is still draining.")
+            )
+        failure = _merge_worker_failures(failure, outcome.cancellation)
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+        )
+        if failure is not None:
+            raise failure from exception_cause(failure)
+        return receipt
 
     async def _proposal_context(
         self, admission: WorkAttemptAdmission, contract: WorkContract
@@ -1357,12 +2089,18 @@ class VerifiedTaskWorker:
         )
 
     async def _prepare_proposal(
-        self, context: VerifiedTaskProposalContext, deadline: ExecutionDeadline
+        self,
+        context: VerifiedTaskProposalContext,
+        deadline: ExecutionDeadline,
+        *,
+        retain_callback: bool,
     ) -> CompletionProposalCreate:
         proposal_id, attempt_id = context.proposal_id, context.attempt.attempt_id
         deadline.require_admission("completion_proposal")
         report = await self._callback(
-            lambda: self.handler.propose(context), "Verified task proposal callback"
+            lambda: self.handler.propose(context),
+            "Verified task proposal callback",
+            retain_until_settled=retain_callback,
         )
 
         def prepare_report(report=report):

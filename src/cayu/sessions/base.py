@@ -7422,6 +7422,43 @@ class PersistedEventSideEffectDelivery(BaseModel):
         return value.astimezone(UTC)
 
 
+def _copy_pending_first_event_delivery(
+    expected: PersistedEventSideEffectDelivery,
+) -> PersistedEventSideEffectDelivery:
+    if type(expected) is not PersistedEventSideEffectDelivery:
+        raise TypeError("Expected a persisted event delivery.")
+    copied = PersistedEventSideEffectDelivery.model_validate(
+        expected.model_dump(mode="python", warnings=False)
+    )
+    if (
+        copied.status is not PersistedEventSideEffectStatus.PENDING
+        or copied.attempts != 0
+        or copied.claim_id is not None
+        or copied.lease_expires_at is not None
+    ):
+        raise ValueError("First delivery requires an unclaimed pending event.")
+    return copied
+
+
+def _copy_failed_first_delivery_retirement(
+    expected: PersistedEventSideEffectDelivery,
+) -> PersistedEventSideEffectDelivery:
+    """Only an exact returned first callback may be retired without dispatch."""
+    if type(expected) is not PersistedEventSideEffectDelivery:
+        raise TypeError("Expected a persisted event delivery.")
+    copied = PersistedEventSideEffectDelivery.model_validate(
+        expected.model_dump(mode="python", warnings=False)
+    )
+    if (
+        copied.status is not PersistedEventSideEffectStatus.FAILED
+        or copied.attempts != 1
+        or copied.claim_id is not None
+        or copied.lease_expires_at is not None
+    ):
+        raise ValueError("Retirement requires an unclaimed failed first delivery.")
+    return copied
+
+
 class PendingActionQuery(BaseModel):
     """Bounded query for durable control-plane actions blocking a session."""
 
@@ -11190,6 +11227,29 @@ class SessionStore(ABC):
         event_id: str,
     ) -> PersistedEventSideEffectDelivery | None:
         """Load one persisted event side-effect handoff by event identity."""
+
+    async def claim_first_persisted_event_side_effect(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectClaim | None:
+        """Claim only the exact unattempted snapshot under the ordinary claim lock.
+
+        Never take over a lease or retry a failed delivery. Return None when
+        unsupported or when any expected field changed; callers must reread.
+        """
+        _copy_pending_first_event_delivery(expected)
+        return None
+
+    async def retire_failed_first_event_delivery(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectDelivery | None:
+        """Atomically dead-letter an exact failed first delivery, preserving its error.
+
+        Compare the complete snapshot under the claim lock. A competing retry
+        wins or retirement wins, never both. Return None on conflict or when
+        unsupported; that absence is not proof of callback settlement.
+        """
+        _copy_failed_first_delivery_retirement(expected)
+        return None
 
     @abstractmethod
     async def mark_persisted_event_side_effect_delivered(
@@ -17758,12 +17818,32 @@ class InMemorySessionStore(SessionStore):
                 },
             )
 
+    async def claim_first_persisted_event_side_effect(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectClaim | None:
+        expected = _copy_pending_first_event_delivery(expected)
+        return await self._claim_persisted_event_side_effect(
+            session_id=expected.session_id, event_id=expected.event_id, expected=expected
+        )
+
     async def claim_persisted_event_side_effect(
         self,
         *,
         session_id: str | None = None,
         event_id: str | None = None,
         lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        return await self._claim_persisted_event_side_effect(
+            session_id=session_id, event_id=event_id, lease_seconds=lease_seconds
+        )
+
+    async def _claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+        expected: PersistedEventSideEffectDelivery | None = None,
     ) -> PersistedEventSideEffectClaim | None:
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
@@ -17785,6 +17865,8 @@ class InMemorySessionStore(SessionStore):
                 for target in _closure_progress_targets(owner)
             }
             for delivery in deliveries:
+                if expected is not None and delivery != expected:
+                    continue
                 if delivery.session_id in closure_targets:
                     continue
                 if session_id is not None and (
@@ -17847,6 +17929,24 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             delivery = self._persisted_event_side_effect_deliveries.get((session_id, event_id))
             return None if delivery is None else delivery.model_copy(deep=True)
+
+    async def retire_failed_first_event_delivery(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectDelivery | None:
+        expected = _copy_failed_first_delivery_retirement(expected)
+        key = (expected.session_id, expected.event_id)
+        async with self._lock:
+            if self._persisted_event_side_effect_deliveries.get(key) != expected:
+                return None
+            retired = expected.model_copy(
+                update={
+                    "status": PersistedEventSideEffectStatus.DEAD_LETTERED,
+                    "next_attempt_at": None,
+                    "updated_at": self._ownership_clock(),
+                }
+            )
+            self._persisted_event_side_effect_deliveries[key] = retired
+            return retired.model_copy(deep=True)
 
     async def mark_persisted_event_side_effect_delivered(
         self,

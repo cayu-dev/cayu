@@ -85,6 +85,13 @@ class WorkCompletionConflict(ValueError):
     """A stable work-completion identity is already bound to another operation."""
 
 
+class _GroupVerificationAdmissionRefused(WorkCompletionConflict):
+    """The store refused verifier admission for a durably cancelled group member.
+
+    This refuses this admission, not any verifier or resolver already in flight.
+    """
+
+
 class CompletionVerificationClaimLost(ValueError):
     """A verifier no longer owns the live claim for a completion proposal."""
 

@@ -51,6 +51,8 @@ if TYPE_CHECKING:
         TaskGroupCreate,
         TaskGroupCreationReceipt,
         TaskGroupEvent,
+        TaskGroupInvocationObligation,
+        TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
 
@@ -321,6 +323,7 @@ from cayu.sessions.base import (
     _classify_terminal_session_evidence_records,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
+    _copy_failed_first_delivery_retirement,
     _copy_historical_queued_interaction_profile_handoff,
     _copy_mcp_manifest_publication,
     _copy_optional_event_id,
@@ -328,6 +331,7 @@ from cayu.sessions.base import (
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
     _copy_optional_tool_capability_ceiling,
+    _copy_pending_first_event_delivery,
     _copy_profiled_fork_authority,
     _copy_queued_interaction_profile_handoff,
     _copy_queued_interaction_started_event,
@@ -696,6 +700,7 @@ from cayu.tasks.contracts import (
     WorkContract,
     WorkContractConflict,
     WorkContractRef,
+    _GroupVerificationAdmissionRefused,
     completion_decision_application_request_sha256,
     completion_decision_request_sha256,
     completion_gap_fingerprint,
@@ -768,7 +773,7 @@ from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 88
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 92
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 96
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -7821,12 +7826,32 @@ class SQLiteSessionStore(SessionStore):
 
         return await self._run_write(statement)
 
+    async def claim_first_persisted_event_side_effect(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectClaim | None:
+        expected = _copy_pending_first_event_delivery(expected)
+        return await self._claim_persisted_event_side_effect(
+            session_id=expected.session_id, event_id=expected.event_id, expected=expected
+        )
+
     async def claim_persisted_event_side_effect(
         self,
         *,
         session_id: str | None = None,
         event_id: str | None = None,
         lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        return await self._claim_persisted_event_side_effect(
+            session_id=session_id, event_id=event_id, lease_seconds=lease_seconds
+        )
+
+    async def _claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+        expected: PersistedEventSideEffectDelivery | None = None,
     ) -> PersistedEventSideEffectClaim | None:
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
@@ -7866,6 +7891,12 @@ class SQLiteSessionStore(SessionStore):
                 ).fetchone()
                 if delivery_row is None:
                     connection.commit()
+                    return None
+                if (
+                    expected is not None
+                    and _persisted_event_side_effect_delivery_from_row(delivery_row) != expected
+                ):
+                    connection.rollback()
                     return None
                 claim_id = str(uuid4())
                 attempt = int(delivery_row["attempts"]) + 1
@@ -7925,6 +7956,45 @@ class SQLiteSessionStore(SessionStore):
             return None if row is None else _persisted_event_side_effect_delivery_from_row(row)
 
         return await self._run_read(query)
+
+    async def retire_failed_first_event_delivery(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectDelivery | None:
+        expected = _copy_failed_first_delivery_retirement(expected)
+
+        def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectDelivery | None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM cayu_persisted_event_side_effects WHERE session_id = ? AND event_id = ?",
+                    (expected.session_id, expected.event_id),
+                ).fetchone()
+                if row is None or _persisted_event_side_effect_delivery_from_row(row) != expected:
+                    connection.rollback()
+                    return None
+                retired = expected.model_copy(
+                    update={
+                        "status": PersistedEventSideEffectStatus.DEAD_LETTERED,
+                        "next_attempt_at": None,
+                        "updated_at": self._ownership_clock(),
+                    }
+                )
+                connection.execute(
+                    "UPDATE cayu_persisted_event_side_effects SET status = 'dead_lettered', "
+                    "next_attempt_at = NULL, updated_at = ? WHERE session_id = ? AND event_id = ?",
+                    (
+                        sqlite_support.format_datetime(retired.updated_at),
+                        expected.session_id,
+                        expected.event_id,
+                    ),
+                )
+                connection.commit()
+                return retired
+            except Exception:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
 
     async def mark_persisted_event_side_effect_delivered(
         self,
@@ -16121,6 +16191,59 @@ class SQLiteTaskStore(TaskStore):
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
     supports_task_groups: ClassVar[bool] = True
+    supports_task_group_quiescence: ClassVar[bool] = True
+
+    async def list_task_group_reconciliation_candidates(
+        self,
+        *,
+        after_group_id: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        from cayu.storage._sqlite_task_groups import reconciliation_candidates
+
+        return await reconciliation_candidates(self, after_group_id=after_group_id, limit=limit)
+
+    async def _settle_task_group_execution(self, task: Task) -> None:
+        from cayu.storage._sqlite_task_groups import settle_execution
+
+        await settle_execution(self, task)
+
+    async def _task_group_cancellation_requested(self, task_id: str) -> bool:
+        from cayu.storage._sqlite_task_groups import cancellation_requested
+
+        return await cancellation_requested(self, task_id)
+
+    async def _task_group_retains_execution(self, task_id: str) -> bool:
+        from cayu.storage._sqlite_task_groups import retains_execution
+
+        return await retains_execution(self, task_id)
+
+    async def _observe_task_group_invocation(
+        self, invocation: TaskGroupInvocationObligation
+    ) -> None:
+        from cayu.storage._sqlite_task_groups import observe_invocation
+
+        await observe_invocation(self, invocation)
+
+    async def _observe_task_group_result_resolution(
+        self, task_id: str, decision_id: str, owner_id: str, *, settled: bool
+    ) -> None:
+        from cayu.storage._sqlite_task_groups import observe_result_resolution
+
+        await observe_result_resolution(self, task_id, decision_id, owner_id, settled=settled)
+
+    async def reconcile_task_group(self, group_id: str) -> TaskGroupSnapshot:
+        from cayu.storage._sqlite_task_groups import reconcile
+
+        return await reconcile(self, group_id)
+
+    async def resolve_task_group_quiescence(
+        self,
+        request: TaskGroupQuiescenceResolution,
+    ) -> TaskGroupSnapshot:
+        from cayu.storage._sqlite_task_groups import reconcile
+
+        return await reconcile(self, request.group_id, resolution=request)
 
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         from cayu.storage._sqlite_task_groups import create_group
@@ -17168,6 +17291,8 @@ class SQLiteTaskStore(TaskStore):
         self,
         request: WorkAttemptAdmissionPrepare,
     ) -> WorkAttemptAdmission:
+        from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
         request = copy_work_attempt_admission_prepare(request)
         if request.generation != 1:
             raise WorkAttemptAdmissionConflict(
@@ -17238,6 +17363,10 @@ class SQLiteTaskStore(TaskStore):
                 contract = self._require_task_contract_unlocked(task, request.contract)
                 lease_now = self._ownership_clock()
                 availability_now = self._clock()
+                if cancellation_requested_unlocked(self, task.id):
+                    raise WorkAttemptAdmissionConflict(
+                        "A decided group loser cannot admit another execution."
+                    )
                 continuation = self._work_attempt_continuation_context_unlocked(
                     task,
                     contract,
@@ -17573,6 +17702,8 @@ class SQLiteTaskStore(TaskStore):
     async def enter_work_attempt_execution(
         self, request: WorkAttemptExecutionEntryRequest
     ) -> WorkAttemptExecutionEntryResult:
+        from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
         request = copy_work_attempt_execution_entry_request(request)
         async with self._lock:
             with self._verified_transaction_unlocked():
@@ -17584,6 +17715,7 @@ class SQLiteTaskStore(TaskStore):
                     admission=admission,
                     task=self._require_task_unlocked(admission.task_id),
                     now=self._ownership_clock(),
+                    group_cancelled=cancellation_requested_unlocked(self, admission.task_id),
                 )
                 if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED:
                     self._update_work_attempt_admission_unlocked(result.admission)
@@ -17639,6 +17771,8 @@ class SQLiteTaskStore(TaskStore):
     async def hold_work_attempt_preparation(
         self, request: WorkAttemptPreparationHold
     ) -> WorkAttemptPreparationHoldReceipt:
+        from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
         request = copy_work_attempt_preparation_hold(request)
         digest = work_attempt_preparation_hold_sha256(request)
         async with self._lock:
@@ -17657,10 +17791,17 @@ class SQLiteTaskStore(TaskStore):
                     task=task,
                     has_attempt=self._latest_work_attempt_id_unlocked(task.id) is not None,
                     now=self._ownership_clock(),
+                    group_cancelled=cancellation_requested_unlocked(self, task.id),
                 )
                 encoded = receipt.model_dump_json(warnings=False)
                 self._update_task_snapshot_unlocked(updated)
-                self._record_task_transition_unlocked(task, updated)
+                self._record_task_transition_unlocked(
+                    task,
+                    updated,
+                    settled_execution=(task.id, request.worker_id, task.started_at)
+                    if task.started_at is not None
+                    else None,
+                )
                 self._connection.execute(
                     "INSERT INTO cayu_work_attempt_preparation_holds "
                     "(hold_id, task_id, request_sha256, receipt_json) VALUES (?, ?, ?, ?)",
@@ -17760,6 +17901,8 @@ class SQLiteTaskStore(TaskStore):
                 application = self._load_decision_application_receipt_unlocked(
                     task.id, request.application_idempotency_key or ""
                 )
+                from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
                 updated, settled_admission, receipt = plan_work_attempt_lifecycle_settlement(
                     request,
                     task=task,
@@ -17769,10 +17912,20 @@ class SQLiteTaskStore(TaskStore):
                     decision=decision,
                     application=application,
                     now=self._ownership_clock(),
+                    group_cancelled=cancellation_requested_unlocked(self, task.id),
+                    verification_claim=None
+                    if proposal is None
+                    else self._load_completion_claim_unlocked(proposal.proposal_id),
                 )
                 encoded = receipt.model_dump_json(warnings=False)
                 self._update_task_snapshot_unlocked(updated)
-                self._record_task_transition_unlocked(task, updated)
+                self._record_task_transition_unlocked(
+                    task,
+                    updated,
+                    settled_execution=(task.id, admission.claim.worker_id, task.started_at)
+                    if task.started_at is not None
+                    else None,
+                )
                 self._update_work_attempt_admission_unlocked(settled_admission)
                 self._connection.execute(
                     "INSERT INTO cayu_work_attempt_lifecycle_receipts "
@@ -17945,6 +18098,14 @@ class SQLiteTaskStore(TaskStore):
                 if request.generation != current.generation + 1:
                     raise WorkAttemptAdmissionConflict(
                         "Recovery must advance the execution generation exactly once."
+                    )
+                from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
+                # Exact live replay above does not acquire new authority. A losing
+                # execution must retain its original owner until positive settlement.
+                if cancellation_requested_unlocked(self, admission.task_id):
+                    raise WorkAttemptAdmissionConflict(
+                        "Task-group cancellation forbids replacement execution authority."
                     )
                 if (
                     self._connection.execute(
@@ -18247,6 +18408,8 @@ class SQLiteTaskStore(TaskStore):
         self,
         request: AdmittedCompletionProposalRequest,
     ) -> CompletionProposal:
+        from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
         request = copy_admitted_completion_proposal_request(request)
         proposal_request = request.proposal
         proposal_sha256 = completion_proposal_request_sha256(proposal_request)
@@ -18309,6 +18472,10 @@ class SQLiteTaskStore(TaskStore):
                     )
                 task = self._require_task_unlocked(admission.task_id)
                 contract = self._load_work_contract_unlocked(admission.contract)
+                if cancellation_requested_unlocked(self, task.id):
+                    raise WorkAttemptAdmissionConflict(
+                        "A decided group loser cannot submit a new proposal."
+                    )
                 verified_work_support.require_attempt_state_current(
                     task,
                     admission.attempt,
@@ -18508,6 +18675,8 @@ class SQLiteTaskStore(TaskStore):
         self,
         request: CompletionVerificationClaimRequest,
     ) -> CompletionVerificationClaim:
+        from cayu.storage._sqlite_task_groups import cancellation_requested_unlocked
+
         request = copy_completion_verification_claim_request(request)
         request_sha256 = completion_verification_claim_request_sha256(request)
         async with self._lock:
@@ -18543,6 +18712,10 @@ class SQLiteTaskStore(TaskStore):
                 now = self._ownership_clock()
                 current = self._load_completion_claim_unlocked(request.proposal_id)
                 decision = self._load_completion_decision_for_proposal_unlocked(request.proposal_id)
+                if decision is None and cancellation_requested_unlocked(self, proposal.task_id):
+                    raise _GroupVerificationAdmissionRefused(
+                        "A decided group loser cannot dispatch verification."
+                    )
                 if (
                     current is not None
                     and current.claim_id == request.claim_id
@@ -18952,11 +19125,16 @@ class SQLiteTaskStore(TaskStore):
         return created
 
     def _record_task_transition_unlocked(
-        self, prior: Task | None, current: Task, *, operation_id: str | None = None
+        self,
+        prior: Task | None,
+        current: Task,
+        *,
+        operation_id: str | None = None,
+        settled_execution: tuple[str, str, datetime] | None = None,
     ) -> None:
         from cayu.storage._sqlite_task_graphs import record_transition
 
-        record_transition(self, prior, current)
+        record_transition(self, prior, current, settled_execution=settled_execution)
         self._record_schedule_transition_unlocked(prior, current, operation_id=operation_id)
 
     def _record_schedule_transition_unlocked(
@@ -20779,7 +20957,13 @@ class SQLiteTaskStore(TaskStore):
                         "Task cancellation reconciliation lost its fenced transition.",
                     )
                 durable_task = self._require_task_unlocked(request.task_id)
-                self._record_task_transition_unlocked(task, durable_task)
+                self._record_task_transition_unlocked(
+                    task,
+                    durable_task,
+                    settled_execution=(task.id, task.worker_id, task.started_at)
+                    if task.worker_id is not None and task.started_at is not None
+                    else None,
+                )
                 receipt = result.terminalization_receipt.model_copy(
                     update={"task": durable_task},
                     deep=True,
@@ -20921,9 +21105,15 @@ class SQLiteTaskStore(TaskStore):
                     events=_task_retry_events(settled, occurred_at=now),
                     committed_at=now,
                 )
+                if successor is not None:
+                    from cayu.storage._sqlite_task_graphs import register_retry_successor
+
+                    register_retry_successor(self, settled, successor)
                 self._record_task_transition_unlocked(task, settled)
                 if successor is not None:
-                    self._record_task_transition_unlocked(None, successor)
+                    self._record_task_transition_unlocked(
+                        successor, self._require_task_unlocked(successor.id)
+                    )
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -21086,7 +21276,13 @@ class SQLiteTaskStore(TaskStore):
                         request,
                         "Task retry cancellation reconciliation lost its fenced transition.",
                     )
-                self._record_task_transition_unlocked(task, settled)
+                self._record_task_transition_unlocked(
+                    task,
+                    settled,
+                    settled_execution=(task.id, task.worker_id, task.started_at)
+                    if task.worker_id is not None and task.started_at is not None
+                    else None,
+                )
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -21316,7 +21512,7 @@ class SQLiteTaskStore(TaskStore):
                 started = current.model_copy(update={"started_at": now, "updated_at": now})
                 self._update_task_snapshot_unlocked(started)
                 self._record_task_transition_unlocked(current, started)
-                return started.model_copy(deep=True)
+                return self._require_task_unlocked(task_id).model_copy(deep=True)
 
     async def pause_task(
         self,
@@ -21654,7 +21850,7 @@ class SQLiteTaskStore(TaskStore):
         stamp = sqlite_support.format_datetime(as_of)
         rows = self._connection.execute(
             f"SELECT id FROM cayu_tasks WHERE {scope} "
-            "AND status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies') "
+            "AND status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group') "
             "AND schedule_json IS NOT NULL AND json_extract(schedule_json, '$.admitted_at') IS NULL "
             "AND (replace(json_extract(schedule_json, '$.policy.expires_at'), 'Z', '+00:00') <= ? OR "
             "(json_extract(schedule_json, '$.policy.misfire_policy') = 'skip' AND "
@@ -21674,6 +21870,7 @@ class SQLiteTaskStore(TaskStore):
                 TaskStatus.BLOCKED,
                 TaskStatus.NEEDS_ATTENTION,
                 TaskStatus.WAITING_DEPENDENCIES,
+                TaskStatus.WAITING_GROUP,
             }:
                 continue
             assert task.schedule is not None and task.available_at is not None
@@ -22359,7 +22556,7 @@ class SQLiteTaskStore(TaskStore):
                     WHERE id = ?
                       AND (
                         status = ?
-                        OR status = 'waiting_dependencies'
+                        OR status IN ('waiting_dependencies', 'waiting_group')
                         OR status = ?
                         OR status = ?
                         OR status = ?

@@ -53,6 +53,7 @@ const PAGE_LIMIT = 100
 const TASK_STATUSES: TaskStatusFilter[] = [
   "pending",
   "waiting_dependencies",
+  "waiting_group",
   "claimed",
   "running",
   "paused",

@@ -647,6 +647,7 @@ from cayu.sessions.base import (
     ModelCompletionStageSettlementRequest,
     ModelFailoverPolicy,
     ModelTarget,
+    PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
@@ -11502,6 +11503,344 @@ class SessionEngine:
             else pointer.transcript_end_cursor
         )
 
+    async def settle_work_attempt_admission_handoff(self, admission: WorkAttemptAdmission) -> bool:
+        return await self._settle_pre_entry_event_handoff(
+            admission, event_type=EventType.INTERACTION_STARTED
+        )
+
+    async def _settle_pre_entry_event_handoff(
+        self,
+        admission: WorkAttemptAdmission,
+        *,
+        event_type: EventType,
+        event_id: str | None = None,
+        dispatch_pending: bool = False,
+    ) -> bool:
+        """Require positive callback return, not expiry of its admission lease.
+
+        A terminal first attempt cannot have an older delivery still running.
+        Retire an exact failed first attempt atomically before permitting cleanup,
+        so a future delivery retry cannot begin after finalizer release.
+        After takeover/retry, delivery state alone cannot prove that every prior
+        callback returned. Keep that uncertainty fenced rather than redelivering.
+        """
+        records = await read_work_attempt_session_store(
+            lambda: self.session_store.query_events(
+                EventQuery(
+                    session_id=admission.session_id,
+                    interaction_id=admission.interaction_id if event_id is None else None,
+                    event_id=event_id,
+                    event_type=event_type,
+                    limit=2,
+                )
+            ),
+            operation_name="Pre-entry event handoff events",
+            redactor=self._secret_redactor,
+        )
+        validation = capture_work_attempt_event_records_result(
+            records,
+            operation_name="Pre-entry event handoff evidence",
+            redactor=self._secret_redactor,
+        )
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        records = validation.result
+        if records is None or len(records) != 1:
+            return False
+        record = records[0]
+        if (
+            record.event.session_id != admission.session_id
+            or (event_id is None and record.event.interaction_id != admission.interaction_id)
+            or (event_id is not None and record.event.id != event_id)
+            or record.event.type is not event_type
+        ):
+            return False
+        delivery = await read_work_attempt_session_store(
+            lambda: self.session_store.get_persisted_event_side_effect_delivery(
+                session_id=admission.session_id, event_id=record.event.id
+            ),
+            operation_name="Pre-entry event handoff delivery",
+            redactor=self._secret_redactor,
+        )
+        if (
+            dispatch_pending
+            and type(delivery) is PersistedEventSideEffectDelivery
+            and delivery.status is PersistedEventSideEffectStatus.PENDING
+            and type(delivery.attempts) is int
+            and delivery.attempts == 0
+            and delivery.session_id == admission.session_id
+            and delivery.event_id == record.event.id
+            and type(delivery.event_sequence) is int
+            and delivery.event_sequence == record.sequence
+            and delivery.claim_id is None
+            and delivery.lease_expires_at is None
+        ):
+            # Compare-and-claim the entire pending snapshot. A publisher that
+            # advanced it wins; this recovery must not dispatch a retry instead.
+            await self._event_writer.fan_out_first_persisted(delivery)
+            return await self._settle_pre_entry_event_handoff(
+                admission, event_type=event_type, event_id=event_id
+            )
+        if not (
+            type(delivery) is PersistedEventSideEffectDelivery
+            and delivery.session_id == admission.session_id
+            and delivery.event_id == record.event.id
+            and type(delivery.event_sequence) is int
+            and delivery.event_sequence == record.sequence
+            and type(delivery.attempts) is int
+            and delivery.attempts == 1
+            and delivery.claim_id is None
+            and delivery.lease_expires_at is None
+        ):
+            return False
+        if delivery.status is PersistedEventSideEffectStatus.FAILED:
+            retired = await read_work_attempt_session_store(
+                lambda: self.session_store.retire_failed_first_event_delivery(delivery),
+                operation_name="Pre-entry event handoff retirement",
+                redactor=self._secret_redactor,
+            )
+            if retired is None:
+                return False
+            if type(
+                retired
+            ) is not PersistedEventSideEffectDelivery or retired != delivery.model_copy(
+                update={
+                    "status": PersistedEventSideEffectStatus.DEAD_LETTERED,
+                    "next_attempt_at": None,
+                    "updated_at": retired.updated_at,
+                }
+            ):
+                raise WorkAttemptRecoveryRequired("Pre-entry event handoff retirement conflicts.")
+            delivery = retired
+        return delivery.status in {
+            PersistedEventSideEffectStatus.DELIVERED,
+            PersistedEventSideEffectStatus.DEAD_LETTERED,
+        }
+
+    async def close_unentered_work_attempt_invocation(
+        self, admission: WorkAttemptAdmission
+    ) -> InvocationReleaseEvidence:
+        """Close the exact admitted interaction without entering its execution.
+
+        The caller owns a group-cancelled, content-validated admission. Keep
+        that admission discoverable until this cleanup and release have both
+        committed; the TaskStore lifecycle receipt is published afterwards.
+        """
+        if admission.execution_entry is not None or admission.execution_stop is not None:
+            raise WorkAttemptRecoveryRequired("Pre-entry cleanup cannot close entered work.")
+        session, checkpoint = await self._load_work_attempt_execution_snapshot(admission)
+        if not await self.settle_work_attempt_admission_handoff(admission):
+            raise WorkAttemptRecoveryRequired("Pre-entry admission handoff is not settled.")
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            active is None
+            or active.session_id != session.id
+            or active.interaction_id != admission.interaction_id
+            or active.profile.fingerprint != admission.source_execution_profile_fingerprint
+        ):
+            raise WorkAttemptRecoveryRequired("Pre-entry cleanup lost its invocation profile.")
+        if active_invocation_execution_profile_is_released(
+            active, session_id=session.id, run_epoch=session.run_epoch
+        ):
+            return released_invocation_evidence(
+                session,
+                checkpoint,
+                session_id=admission.session_id,
+                session_instance_id=admission.session_invocation.session_instance_id,
+                active_profile=active,
+            )
+        if active.run_epoch != session.run_epoch:
+            raise WorkAttemptRecoveryRequired("Pre-entry cleanup lost its invocation epoch.")
+        if session.status not in {
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+            SessionStatus.INTERRUPTED,
+        }:
+            raise WorkAttemptRecoveryRequired(
+                "Pre-entry cleanup has a conflicting session outcome."
+            )
+        stop_id = "pre-entry:" + hashlib.sha256(admission.admission_id.encode()).hexdigest()
+        if session.status is not SessionStatus.RUNNING:
+            decision = invocation_terminal_decision_from_checkpoint(
+                checkpoint
+            ) or settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+            marker = (checkpoint or {}).get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            retained_stop_id = (
+                decision.interruption_request_id
+                if decision is not None
+                else marker.get("interruption_request_id")
+                if type(marker) is dict
+                else None
+            )
+            if retained_stop_id != stop_id:
+                # Another interruption owner may still be running terminal
+                # hooks. Its terminal status is not proof of owner return.
+                raise WorkAttemptRecoveryRequired("Pre-entry cleanup belongs to another stop.")
+        context = await self._resolve_work_attempt_invocation_context(
+            admission, session=session, checkpoint=checkpoint, require_open_interaction=False
+        )
+        _activate_session_run_fence(session)
+        _activate_session_interaction(session.id, admission.interaction_id)
+        try:
+            if admission.kind == "initial":
+                deferred = await read_work_attempt_session_store(
+                    lambda: self.session_store.load_deferred_interaction_input(session.id),
+                    operation_name="Pre-entry initial transcript lookup",
+                    redactor=self._secret_redactor,
+                )
+                if deferred is not None:
+                    validated = capture_work_attempt_execution_input_result(
+                        [], deferred, admission=admission, redactor=self._secret_redactor
+                    )
+                    if validated.failure is not None:
+                        raise_task_store_operation_failure(validated.failure)
+                    prepared = validated.result
+                    assert prepared is not None
+                    await self.session_store.replace_initial_transcript_messages(
+                        session.id,
+                        list(prepared.messages_to_append),
+                        list(prepared.messages),
+                    )
+                elif _initial_transcript_pending_interaction_id(checkpoint) is not None:
+                    raise WorkAttemptRecoveryRequired("Pre-entry initial transcript is incomplete.")
+            else:
+                await self.session_store.materialize_deferred_interaction_input(session.id)
+            if session.status is SessionStatus.RUNNING:
+                payload = {
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "interruption_request_id": stop_id,
+                }
+
+                def retain_stop(current, current_checkpoint):
+                    if (
+                        current.instance_id != session.instance_id
+                        or current.run_epoch != active.run_epoch
+                        or active_invocation_execution_profile_from_checkpoint(current_checkpoint)
+                        != active
+                        or (current_checkpoint or {}).get(
+                            _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, payload
+                        )
+                        != payload
+                    ):
+                        raise SessionRunFenced("Pre-entry interruption authority changed.")
+                    return {
+                        **(current_checkpoint or {}),
+                        _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY: payload,
+                    }
+
+                # Enter the existing durable terminal-election protocol. Its
+                # exact event identities arbitrate overlapping cleanup owners
+                # and survive failure between interaction and session writes.
+                with _invocation_lifecycle_authority_read_scope():
+                    session = await self.session_store.transition_status_and_checkpoint(
+                        session.id,
+                        from_statuses={SessionStatus.RUNNING},
+                        to_status=SessionStatus.INTERRUPTING,
+                        checkpoint_transform=retain_stop,
+                        require_no_active_model_completion_dispatch=True,
+                    )
+            if (
+                session.status is not SessionStatus.INTERRUPTED
+                or settled_invocation_terminal_decision_from_checkpoint(checkpoint) is None
+            ):
+                async for _event in self._handle_session_interrupted(
+                    session=session,
+                    registered_agent=context.registered_agent,
+                    registered_environment=context.registered_environment,
+                    environment_name=session.environment_name,
+                    execution_profile=context.profile,
+                    invocation_context=context,
+                    run_terminal_hooks=False,
+                ):
+                    pass
+
+            terminal_checkpoint = await self.session_store.load_checkpoint(session.id)
+            terminal_decision = settled_invocation_terminal_decision_from_checkpoint(
+                terminal_checkpoint
+            )
+            if (
+                terminal_decision is None
+                or terminal_decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+                or terminal_decision.interruption_request_id != stop_id
+                or terminal_decision.interaction_event_id is None
+                or not invocation_terminal_decision_matches_active_profile(
+                    terminal_decision,
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    run_epoch=active.run_epoch,
+                    interaction_id=admission.interaction_id,
+                    execution_profile_fingerprint=active.profile.fingerprint,
+                )
+            ):
+                raise WorkAttemptRecoveryRequired("Pre-entry terminal handoff lost its authority.")
+            for event_type, event_id in (
+                (EventType.INTERACTION_INTERRUPTED, terminal_decision.interaction_event_id),
+                (EventType.SESSION_INTERRUPTED, terminal_decision.terminal_event_id),
+            ):
+                if not await self._settle_pre_entry_event_handoff(
+                    admission, event_type=event_type, event_id=event_id, dispatch_pending=True
+                ):
+                    raise WorkAttemptRecoveryRequired("Pre-entry terminal handoff is not settled.")
+
+            # Paired terminal publication precedes clearing its stop marker.
+            # Reconcile that tail even when a previous attempt already closed
+            # the interaction. A release receipt must not strand an unfinished
+            # marker, and terminal status never authorizes clearing another stop.
+            def reconcile_stop(current, current_checkpoint):
+                decision = settled_invocation_terminal_decision_from_checkpoint(current_checkpoint)
+                if (
+                    current.instance_id != session.instance_id
+                    or current.run_epoch != active.run_epoch
+                    or active_invocation_execution_profile_from_checkpoint(current_checkpoint)
+                    != active
+                    or decision is None
+                    or decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+                    or decision.interruption_request_id != stop_id
+                    or not invocation_terminal_decision_matches_active_profile(
+                        decision,
+                        session_id=session.id,
+                        session_instance_id=session.instance_id,
+                        run_epoch=active.run_epoch,
+                        interaction_id=admission.interaction_id,
+                        execution_profile_fingerprint=active.profile.fingerprint,
+                    )
+                ):
+                    raise SessionRunFenced("Pre-entry marker cleanup lost its terminal authority.")
+                updated = dict(current_checkpoint or {})
+                marker = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+                if _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in updated and marker != {
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "interruption_request_id": stop_id,
+                }:
+                    raise SessionRunFenced("Pre-entry marker belongs to another interruption.")
+                updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, None)
+                return updated
+
+            with _invocation_lifecycle_authority_read_scope():
+                await self.session_store.publish_checkpoint_and_events(
+                    session.id,
+                    checkpoint_transform=reconcile_stop,
+                    events=[],
+                    expected_statuses={SessionStatus.INTERRUPTED},
+                    expected_run_epoch=active.run_epoch,
+                )
+            await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                session_id=session.id,
+                execution_profile=context.profile,
+                invocation_context=context,
+            )
+        finally:
+            _deactivate_session_interaction(session.id)
+            _deactivate_session_run_fence(session.id)
+        session, checkpoint = await self._load_work_attempt_execution_snapshot(admission)
+        return released_invocation_evidence(
+            session,
+            checkpoint,
+            session_id=admission.session_id,
+            session_instance_id=admission.session_invocation.session_instance_id,
+            active_profile=context.active_profile,
+        )
+
     async def load_work_attempt_release_evidence(
         self, admission: WorkAttemptAdmission
     ) -> InvocationReleaseEvidence:
@@ -11857,6 +12196,7 @@ class SessionEngine:
         *,
         session: Session,
         checkpoint: dict[str, Any] | None,
+        require_open_interaction: bool = True,
     ) -> InvocationContext:
         """Resolve durable source settings through the existing profile owner.
 
@@ -11894,6 +12234,7 @@ class SessionEngine:
             retry_policy=semantics.retry_policy,
             invocation_semantics_available=True,
             record_rejection=False,
+            require_open_interaction=require_open_interaction,
         )
         return _authenticated_invocation_context(
             active_profile=active,
@@ -23532,6 +23873,19 @@ class SessionEngine:
         stream = self._run_session_with_deadline(session=session, **kwargs)
         context = kwargs.get("invocation_context")
         work_attempt = context.work_attempt if isinstance(context, InvocationContext) else None
+        task_id = kwargs.get("task_id")
+        if (
+            task_id is not None
+            and isinstance(context, InvocationContext)
+            and work_attempt is None
+            and self.task_store is not None
+            and self.task_store.supports_task_group_quiescence
+        ):
+            stream = self._run_session_with_group_observation(
+                stream,
+                task_id=task_id,
+                invocation_context=context,
+            )
         stopped = work_attempt.admission.execution_stop if work_attempt is not None else None
         if work_attempt is not None and (
             boundary.expired or (stopped is not None and stopped.request.reason == "elapsed_limit")
@@ -23541,6 +23895,50 @@ class SessionEngine:
             # and cleanup, rather than stop any execution (none can be admitted).
             return stream
         return stream if boundary.expires_at is None else deadline_stream(stream, boundary)
+
+    async def _run_session_with_group_observation(
+        self,
+        stream: AsyncGenerator[Event, None],
+        *,
+        task_id: str,
+        invocation_context: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        from cayu.runtime._task_group_invocation import (
+            observe_owner_return,
+            prepare_invocation_obligation,
+        )
+
+        observation = None
+        failure: BaseException | None = None
+        try:
+            async with _close_delegated_event_stream(stream) as owned:
+                observation = await prepare_invocation_obligation(
+                    self.task_store,
+                    task_id=task_id,
+                    context=invocation_context,
+                    redactor=self._secret_redactor,
+                )
+                async for event in owned:
+                    yield event
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            # Only natural stream return acknowledges this execution owner.
+            # A release receipt from a concurrent interruption/recovery owner
+            # does not prove that this stream or provider cleanup returned.
+            if failure is None and observation is not None:
+                store = self.task_store
+                assert store is not None
+                # This acknowledgement owns its bounded observation and retry
+                # handle. Do not put admission of that owner behind the general
+                # cleanup supervisor, which may itself have exhausted capacity.
+                await observe_owner_return(
+                    store,
+                    self.session_store,
+                    observation,
+                    redactor=self._secret_redactor,
+                )
 
     async def _run_session_with_deadline(
         self,
@@ -24122,6 +24520,14 @@ class SessionEngine:
             task_started = True
             if active_run is not None:
                 active_run.task_started = True
+            from cayu.runtime._task_group_invocation import bind_invocation
+
+            await bind_invocation(
+                self.task_store,
+                task_id=task_id,
+                context=invocation_context,
+                redactor=self._secret_redactor,
+            )
             return await self._event_writer.emit(
                 _task_event(
                     event_type=EventType.TASK_STARTED,
@@ -24163,6 +24569,15 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                 )
             await turn_usage_tracker.mark_current_position()
+            if task_started and task_id is not None:
+                from cayu.runtime._task_group_invocation import bind_invocation
+
+                await bind_invocation(
+                    self.task_store,
+                    task_id=task_id,
+                    context=invocation_context,
+                    redactor=self._secret_redactor,
+                )
             if limits.scope == "run" and has_run_limits(limits) and run_limit_accounting is None:
                 run_baseline = await self._run_limit_controller.session_usage_summary(session.id)
 

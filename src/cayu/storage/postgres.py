@@ -68,6 +68,8 @@ if TYPE_CHECKING:
         TaskGroupCreate,
         TaskGroupCreationReceipt,
         TaskGroupEvent,
+        TaskGroupInvocationObligation,
+        TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
 
@@ -393,6 +395,7 @@ from cayu.sessions.base import (
     _classify_terminal_session_evidence_records,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
+    _copy_failed_first_delivery_retirement,
     _copy_historical_queued_interaction_profile_handoff,
     _copy_mcp_manifest_publication,
     _copy_optional_event_id,
@@ -400,6 +403,7 @@ from cayu.sessions.base import (
     _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
     _copy_optional_tool_capability_ceiling,
+    _copy_pending_first_event_delivery,
     _copy_profiled_fork_authority,
     _copy_queued_interaction_profile_handoff,
     _copy_queued_interaction_started_event,
@@ -617,7 +621,10 @@ from cayu.storage._postgres_verified_work import (
 )
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._task_graph_schema import POSTGRES_TASK_GRAPH_DDL
-from cayu.storage._task_group_schema import POSTGRES_TASK_GROUP_DDL
+from cayu.storage._task_group_schema import (
+    POSTGRES_TASK_GROUP_DDL,
+    POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
+)
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
@@ -1086,7 +1093,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 88
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 92
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 96
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
 
@@ -1423,6 +1430,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     93: POSTGRES_COLLABORATION_DDL,
     94: POSTGRES_COLLABORATION_LIFECYCLE_DDL,
     95: POSTGRES_COLLABORATION_REQUEST_DDL,
+    96: POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
     91: POSTGRES_TASK_GRAPH_DDL,
     88: (
         """
@@ -5611,8 +5619,8 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
         ),
     ),
     # This pending-action index change is not registered in REVISIONS yet.
-    # Keep it beyond the registered collaboration request revision.
-    96: (
+    # Keep it beyond the registered task-group quiescence revision.
+    97: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
             table_name="cayu_events",
@@ -31311,12 +31319,32 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             (session_id, event_ids),
         )
 
+    async def claim_first_persisted_event_side_effect(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectClaim | None:
+        expected = _copy_pending_first_event_delivery(expected)
+        return await self._claim_persisted_event_side_effect(
+            session_id=expected.session_id, event_id=expected.event_id, expected=expected
+        )
+
     async def claim_persisted_event_side_effect(
         self,
         *,
         session_id: str | None = None,
         event_id: str | None = None,
         lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        return await self._claim_persisted_event_side_effect(
+            session_id=session_id, event_id=event_id, lease_seconds=lease_seconds
+        )
+
+    async def _claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+        expected: PersistedEventSideEffectDelivery | None = None,
     ) -> PersistedEventSideEffectClaim | None:
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
@@ -31337,6 +31365,22 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     # Exclude closed targets in selection, so one retained target
                     # cannot starve unrelated event deliveries.
                     await self._lock_closure_lineage(cur)
+                    if expected is not None:
+                        await cur.execute(
+                            "SELECT session_id, event_id, event_sequence, status, attempts, claim_id, "
+                            "lease_expires_at, next_attempt_at, last_error, updated_at "
+                            "FROM cayu_persisted_event_side_effects "
+                            "WHERE session_id = %s AND event_id = %s FOR UPDATE",
+                            (expected.session_id, expected.event_id),
+                        )
+                        expected_row = await cur.fetchone()
+                        if (
+                            expected_row is None
+                            or _persisted_event_side_effect_delivery_from_row(expected_row)
+                            != expected
+                        ):
+                            await conn.rollback()
+                            return None
                     if session_id is not None and event_id is not None:
                         exact_filter = (
                             "AND candidate_delivery.session_id = %s "
@@ -31438,6 +31482,35 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             )
             row = await cur.fetchone()
         return None if row is None else _persisted_event_side_effect_delivery_from_row(row)
+
+    async def retire_failed_first_event_delivery(
+        self, expected: PersistedEventSideEffectDelivery
+    ) -> PersistedEventSideEffectDelivery | None:
+        expected = _copy_failed_first_delivery_retirement(expected)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.transaction(), conn.cursor() as cur:
+            await cur.execute(
+                "SELECT session_id, event_id, event_sequence, status, attempts, claim_id, "
+                "lease_expires_at, next_attempt_at, last_error, updated_at "
+                "FROM cayu_persisted_event_side_effects WHERE session_id = %s AND event_id = %s FOR UPDATE",
+                (expected.session_id, expected.event_id),
+            )
+            row = await cur.fetchone()
+            if row is None or _persisted_event_side_effect_delivery_from_row(row) != expected:
+                return None
+            retired = expected.model_copy(
+                update={
+                    "status": PersistedEventSideEffectStatus.DEAD_LETTERED,
+                    "next_attempt_at": None,
+                    "updated_at": await self._session_store_now(cur),
+                }
+            )
+            await cur.execute(
+                "UPDATE cayu_persisted_event_side_effects SET status = 'dead_lettered', "
+                "next_attempt_at = NULL, updated_at = %s WHERE session_id = %s AND event_id = %s",
+                (retired.updated_at, expected.session_id, expected.event_id),
+            )
+            return retired
 
     async def mark_persisted_event_side_effect_delivered(
         self,
@@ -39420,6 +39493,59 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
     supports_task_groups: ClassVar[bool] = True
+    supports_task_group_quiescence: ClassVar[bool] = True
+
+    async def list_task_group_reconciliation_candidates(
+        self,
+        *,
+        after_group_id: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        from cayu.storage._postgres_task_groups import reconciliation_candidates
+
+        return await reconciliation_candidates(self, after_group_id=after_group_id, limit=limit)
+
+    async def _settle_task_group_execution(self, task: Task) -> None:
+        from cayu.storage._postgres_task_groups import settle_execution
+
+        await settle_execution(self, task)
+
+    async def _task_group_cancellation_requested(self, task_id: str) -> bool:
+        from cayu.storage._postgres_task_groups import cancellation_requested
+
+        return await cancellation_requested(self, task_id)
+
+    async def _task_group_retains_execution(self, task_id: str) -> bool:
+        from cayu.storage._postgres_task_groups import retains_execution
+
+        return await retains_execution(self, task_id)
+
+    async def _observe_task_group_invocation(
+        self, invocation: TaskGroupInvocationObligation
+    ) -> None:
+        from cayu.storage._postgres_task_groups import observe_invocation
+
+        await observe_invocation(self, invocation)
+
+    async def _observe_task_group_result_resolution(
+        self, task_id: str, decision_id: str, owner_id: str, *, settled: bool
+    ) -> None:
+        from cayu.storage._postgres_task_groups import observe_result_resolution
+
+        await observe_result_resolution(self, task_id, decision_id, owner_id, settled=settled)
+
+    async def reconcile_task_group(self, group_id: str) -> TaskGroupSnapshot:
+        from cayu.storage._postgres_task_groups import reconcile
+
+        return await reconcile(self, group_id)
+
+    async def resolve_task_group_quiescence(
+        self,
+        request: TaskGroupQuiescenceResolution,
+    ) -> TaskGroupSnapshot:
+        from cayu.storage._postgres_task_groups import reconcile
+
+        return await reconcile(self, request.group_id, resolution=request)
 
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         from cayu.storage._postgres_task_groups import create_group
@@ -40212,11 +40338,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         return task
 
     async def _record_task_transition(
-        self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None
+        self,
+        cur: Any,
+        prior: Task | None,
+        current: Task,
+        *,
+        operation_id: str | None = None,
+        settled_execution: tuple[str, str, datetime] | None = None,
     ) -> None:
         from cayu.storage._postgres_task_graphs import record_transition
 
-        await record_transition(self, cur, prior, current)
+        await record_transition(self, cur, prior, current, settled_execution=settled_execution)
         await self._record_schedule_transition(cur, prior, current, operation_id=operation_id)
 
     async def _record_schedule_transition(
@@ -42242,7 +42374,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         reconciliation=result.reconciliation,
                         committed_at=now,
                     )
-                    await self._record_task_transition(cur, task, durable_task)
+                    await self._record_task_transition(
+                        cur,
+                        task,
+                        durable_task,
+                        settled_execution=(task.id, task.worker_id, task.started_at)
+                        if task.worker_id is not None and task.started_at is not None
+                        else None,
+                    )
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "
                         "(task_id, idempotency_key, request_sha256, worker_id, "
@@ -42353,7 +42492,6 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         )
                     assert settled_row is not None
                     durable_task = pg_support.task_from_row(settled_row)
-                    await self._record_task_transition(cur, task, durable_task)
                     if successor is not None:
                         await cur.execute(
                             f"""
@@ -42367,7 +42505,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             """,
                             pg_support.task_insert_values(successor),
                         )
-                        await self._record_task_transition(cur, None, successor)
+                        from cayu.storage._postgres_task_graphs import register_retry_successor
+
+                        await register_retry_successor(cur, durable_task, successor)
                         if successor.available_at is None or successor.available_at <= series_now:
                             notification_sender_connection = conn
                             notification_sender_pid = (
@@ -42377,6 +42517,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                                 "SELECT pg_notify(%s, %s)",
                                 (_TASK_ADMISSION_NOTIFY_CHANNEL, ""),
                             )
+                    await self._record_task_transition(cur, task, durable_task)
+                    if successor is not None:
+                        current_successor = await self._load_task(cur, successor.id)
+                        assert current_successor is not None
+                        await self._record_task_transition(cur, successor, current_successor)
                     receipt = TaskRetrySettlementResult(
                         task_id=request.task_id,
                         idempotency_key=request.idempotency_key,
@@ -42582,7 +42727,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         events=_task_retry_events(durable_task, occurred_at=now),
                         committed_at=now,
                     )
-                    await self._record_task_transition(cur, task, durable_task)
+                    await self._record_task_transition(
+                        cur,
+                        task,
+                        durable_task,
+                        settled_execution=(task.id, task.worker_id, task.started_at)
+                        if task.worker_id is not None and task.started_at is not None
+                        else None,
+                    )
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "
                         "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -42822,7 +42974,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             started = current.model_copy(update={"started_at": now, "updated_at": now})
             await self._update_task_snapshot(cur, started)
             await self._record_task_transition(cur, current, started)
-            return started.model_copy(deep=True)
+            return (await self._require_task(cur, task_id)).model_copy(deep=True)
 
         return await self._run_verified_work_mutation(operation)
 
@@ -42971,7 +43123,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         clauses, params = self._task_filter_clauses(query.model_copy(update={"status": None}))
         scope = " AND ".join(
             [
-                "status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies')",
+                "status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group')",
                 "session_id IS NULL",
                 "worker_id IS NULL",
                 "schedule IS NOT NULL AND schedule->>'admitted_at' IS NULL",
@@ -43012,6 +43164,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 TaskStatus.BLOCKED,
                 TaskStatus.NEEDS_ATTENTION,
                 TaskStatus.WAITING_DEPENDENCIES,
+                TaskStatus.WAITING_GROUP,
             }:
                 continue
             if await self._local_execution_attempt_fences_task(cur, task):
@@ -43221,9 +43374,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                                    lease_expires_at AS prior_lease, updated_at AS prior_updated_at
                             FROM cayu_tasks
                             WHERE {where_sql} AND (
-                                graph_id IS NULL OR graph_id IN (
+                                (graph_id IS NULL AND NOT EXISTS (
+                                    SELECT 1 FROM cayu_task_group_retry_lineage lineage
+                                    WHERE lineage.task_id = cayu_tasks.id
+                                )) OR COALESCE(graph_id, (
+                                    SELECT lineage.graph_id FROM cayu_task_group_retry_lineage lineage
+                                    WHERE lineage.task_id = cayu_tasks.id
+                                )) IN (
                                     SELECT member.graph_id FROM cayu_task_graph_members AS member
                                     WHERE member.task_id = ANY(%s)
+                                    UNION SELECT lineage.graph_id FROM cayu_task_group_retry_lineage lineage
+                                    WHERE lineage.task_id = ANY(%s)
                                 )
                             )
                             ORDER BY {order_sql}, id ASC
@@ -43247,6 +43408,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         *availability_params,
                         *retry_deadline_params,
                         *params,
+                        list(pending_ids),
                         list(pending_ids),
                         str(TaskStatus.CLAIMED),
                         worker_id,
@@ -43804,7 +43966,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         OR status = %s
                         OR status = %s
                         OR (status = %s AND session_id IS NULL)
-                        OR status = 'waiting_dependencies'
+                        OR status IN ('waiting_dependencies', 'waiting_group')
                       )
                       AND status_reason IS DISTINCT FROM %s
                       AND status_reason IS DISTINCT FROM %s

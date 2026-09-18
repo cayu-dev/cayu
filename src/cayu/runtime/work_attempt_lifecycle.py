@@ -25,6 +25,7 @@ WorkAttemptStopReason = Literal[
     "work_contract_handler_failed",
     "work_contract_execution_failed",
     "work_contract_execution_interrupted",
+    "work_contract_group_cancelled",
 ]
 
 
@@ -60,6 +61,7 @@ class WorkAttemptPreparationHold(BaseModel):
         "work_contract_preparation_failed",
         "work_contract_preparation_timed_out",
         "work_contract_elapsed_limit",
+        "work_contract_group_cancelled",
     ]
     deadline_expires_at: datetime | None = None
 
@@ -114,6 +116,48 @@ def work_attempt_preparation_hold_sha256(value: WorkAttemptPreparationHold) -> s
     ).hexdigest()
 
 
+class WorkAttemptPreEntrySettlementEvidence(BaseModel):
+    """Exact drained preparation owner; never evidence of invocation release.
+
+    The lifecycle transaction must still exclude execution entry and replacement
+    ownership. The original worker or cleanup-only discovery of an admitted,
+    never-entered loser emits this after closing its exact session invocation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    record_type: Literal["cayu.work-attempt-pre-entry-settlement"] = (
+        "cayu.work-attempt-pre-entry-settlement"
+    )
+    session_id: str
+    session_instance_id: str
+    interaction_id: str
+    profile_fingerprint: str
+
+    @field_validator("session_id", "session_instance_id", "interaction_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return validate_work_completion_linked_id(value, info.field_name)
+
+    @field_validator("profile_fingerprint")
+    @classmethod
+    def validate_fingerprint(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("Profile identity must be lowercase SHA-256.")
+        return value
+
+
+def pre_entry_settlement_authority(value: WorkAttemptAdmission) -> str:
+    """Cleanup identity survives renewal, but never a new owner or dispatch."""
+    copied = WorkAttemptAdmission.model_validate(
+        revalidate_model_input(value, WorkAttemptAdmission)
+    )
+    result = copied.model_dump(mode="json", warnings=False)
+    result["claim"].pop("lease_expires_at")
+    result["claim"].pop("renewal")
+    return sha256(canonical_durable_json_bytes(result, "pre_entry_settlement")).hexdigest()
+
+
 class WorkAttemptLifecycleSettlement(BaseModel):
     """Bind final task settlement to exact admission and invocation readback.
 
@@ -121,6 +165,8 @@ class WorkAttemptLifecycleSettlement(BaseModel):
     request is not a public replacement for that owner's cleanup protocol.
     The expected admission digest binds its entire canonical authority tuple,
     including execution generation, source settings and predecessor decision.
+    Cleanup-only pre-entry proof excludes renewable lease timestamps and renewal
+    receipts, but retains the original claim identity and all execution content.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -129,12 +175,13 @@ class WorkAttemptLifecycleSettlement(BaseModel):
     task_id: str
     admission_id: str
     expected_admission_sha256: str
-    release_evidence: InvocationReleaseEvidence
+    release_evidence: InvocationReleaseEvidence | WorkAttemptPreEntrySettlementEvidence
     kind: Literal[
         "decision_application",
         "runtime_stop",
         "proposal_deadline_stop",
         "continuation_deadline_stop",
+        "group_cancellation",
     ]
     proposal_id: str | None = None
     proposal_request_sha256: str | None = None
@@ -167,10 +214,34 @@ class WorkAttemptLifecycleSettlement(BaseModel):
     @field_validator("release_evidence", mode="before")
     @classmethod
     def copy_release_evidence(cls, value: object) -> object:
+        if type(value) is WorkAttemptPreEntrySettlementEvidence or (
+            isinstance(value, dict)
+            and cast("dict[str, object]", value).get("record_type")
+            == "cayu.work-attempt-pre-entry-settlement"
+        ):
+            return revalidate_model_input(value, WorkAttemptPreEntrySettlementEvidence)
         return revalidate_model_input(value, InvocationReleaseEvidence)
 
     @model_validator(mode="after")
     def validate_kind(self) -> WorkAttemptLifecycleSettlement:
+        if isinstance(self.release_evidence, WorkAttemptPreEntrySettlementEvidence) and (
+            self.kind != "group_cancellation"
+            or self.proposal_id is not None
+            or self.decision_id is not None
+        ):
+            raise ValueError("Pre-entry proof only permits unproposed group cancellation.")
+        if (self.kind == "group_cancellation") != (
+            self.stop_reason == "work_contract_group_cancelled"
+        ):
+            raise ValueError("Group cancellation requires its distinct settlement kind.")
+        if self.kind == "group_cancellation" and (
+            (self.proposal_id is None) != (self.proposal_request_sha256 is None)
+            or (self.decision_id is not None and self.proposal_id is None)
+            or self.application_idempotency_key is not None
+        ):
+            raise ValueError(
+                "Group cancellation must bind its exact proposal/decision without an application."
+            )
         if self.kind in {"proposal_deadline_stop", "continuation_deadline_stop"}:
             if (
                 self.proposal_id is None
@@ -178,7 +249,9 @@ class WorkAttemptLifecycleSettlement(BaseModel):
                 or self.stop_reason != "work_contract_elapsed_limit"
             ):
                 raise ValueError("Proposal expiry requires exact proposal and elapsed authority.")
-        elif self.proposal_id is not None or self.proposal_request_sha256 is not None:
+        elif self.kind != "group_cancellation" and (
+            self.proposal_id is not None or self.proposal_request_sha256 is not None
+        ):
             raise ValueError("Only proposal expiry accepts proposal identity fields.")
         if self.kind in {"decision_application", "continuation_deadline_stop"}:
             if (
@@ -187,7 +260,7 @@ class WorkAttemptLifecycleSettlement(BaseModel):
                 or (self.kind == "decision_application" and self.stop_reason is not None)
             ):
                 raise ValueError("Decision settlement requires only exact application authority.")
-        elif (
+        elif self.kind != "group_cancellation" and (
             self.stop_reason is None
             or self.decision_id is not None
             or self.application_idempotency_key is not None

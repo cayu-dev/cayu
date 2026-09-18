@@ -989,6 +989,7 @@ def require_local_execution_task_authority(
         or task.created_at != authority.task_created_at
         or task.worker_id != authority.worker_id
         or getattr(task.status, "value", str(task.status)) not in {"claimed", "running"}
+        or task.status_reason in {"cancellation_requested", "retry_cancellation_requested"}
         or task.lease_expires_at is None
         or task.lease_expires_at <= now
         or task.session_id != authority.session_id

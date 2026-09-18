@@ -99,6 +99,10 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     copy_session_invocation_binding,
 )
+from cayu.tasks._execution_settlement import (
+    TaskExecutionSettlement,
+    has_task_execution_settlement_pending,
+)
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     Task,
@@ -119,6 +123,7 @@ from cayu.tasks.base import (
     _task_cancellation_requested,
     _task_cancellation_terminalization_request,
     _terminalize_claimed_task_or_detect_peer_winner,
+    copy_task,
     task_create_with_runtime_invocation,
 )
 from cayu.tools.exposure import ToolCapabilityCeiling, copy_tool_capability_ceiling
@@ -825,6 +830,9 @@ class TaskStoreDispatcher(Dispatcher):
         self._terminal_receipt_reconciliation_generation = 0
         self._terminal_receipt_reconciliation_settled_count = 0
         self._startup_terminal_receipt_reconciliation_pending = True
+        from cayu.tasks._group_maintenance import TaskGroupMaintenance
+
+        self._group_maintenance = TaskGroupMaintenance()
 
     @property
     def task_type(self) -> str:
@@ -1123,8 +1131,30 @@ class TaskStoreDispatcher(Dispatcher):
         duplicate entrance in its task-local context because its independently elected
         periodic role owns that cadence.
         """
+        execution_settlement = TaskExecutionSettlement(self._tasks)
+        primary: BaseException | None = None
+        try:
+            return await self._process_next_owned(
+                runtime,
+                worker_id=worker_id,
+                execution_settlement=execution_settlement,
+            )
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            execution_settlement.finish(primary)
+
+    async def _process_next_owned(
+        self,
+        runtime: DispatchRuntime,
+        *,
+        worker_id: str,
+        execution_settlement: TaskExecutionSettlement,
+    ) -> DispatchHandle | None:
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        await self._group_maintenance.advance(self._tasks, now=asyncio.get_running_loop().time())
         if not task_store_cancellation_reconciliation_capability_is_complete(self._tasks):
             raise NotImplementedError(
                 "Queued dispatch workers require complete idempotent ordinary-task "
@@ -1371,12 +1401,10 @@ class TaskStoreDispatcher(Dispatcher):
             return await self._reclaimed_dispatch_handle(task, envelope)
         if task.lease_expires_at is None:  # pragma: no cover - claim contract
             raise TaskClaimLost("Queued dispatch claim has no worker lease.")
-        task = await self._tasks.mark_claimed_task_execution_started(
-            task.id,
-            worker_id,
-            task.lease_expires_at,
-        )
+        task = await execution_settlement.enter(task, DispatchStatus.CANCELLED)
         if loop.time() >= claim_deadline_monotonic:
+            execution_settlement.observe(task, DispatchStatus.CANCELLED)
+            await execution_settlement.attempt()
             requested = await self._request_dispatch_cancellation_fence(
                 task,
                 worker_id,
@@ -1401,16 +1429,44 @@ class TaskStoreDispatcher(Dispatcher):
             claim_deadline_monotonic=claim_deadline_monotonic,
             lease_authority=lease_authority,
         )
+        returned_settlement: _QueuedDispatchSettlement | None = None
+
+        async def verify_dispatch_return() -> bool:
+            nonlocal returned_settlement
+            observed = await durable_runtime._queued_dispatch_settlement_state(envelope)
+            if type(observed) is not _QueuedDispatchSettlement:
+                raise _QueuedDispatchAuthorityRejected(
+                    "Queued dispatch settlement returned an invalid record."
+                )
+            returned_settlement = observed
+            if observed.state in {
+                _QueuedDispatchSettlementState.NOT_ADMITTED,
+                _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE,
+            }:
+                # The owned stream has returned. Exact non-admission or released
+                # terminal ownership completes its proof; admission alone does not.
+                return True
+            if self._tasks.supports_task_group_quiescence:
+                retained = await self._tasks._task_group_retains_execution(task.id)
+                if type(retained) is not bool:
+                    raise TypeError("Task group membership requires boolean authority.")
+                if retained:
+                    raise RuntimeError("Admitted group execution still awaits exact release.")
+            return False
+
         try:
             try:
 
                 async def dispatch_owned() -> DispatchStatus:
+                    settlement_authority = copy_task(task)
                     owned_status = status
                     async for event in durable_runtime._dispatch_queued(envelope):
                         owned_status = _dispatch_status_after_event(
                             event,
                             fallback=owned_status,
                         )
+                    execution_settlement.observe(settlement_authority, owned_status)
+                    await execution_settlement.attempt()
                     return owned_status
 
                 status = await self._await_with_task_lease(
@@ -1424,6 +1480,41 @@ class TaskStoreDispatcher(Dispatcher):
             except TaskClaimLost:
                 return await self._reclaimed_dispatch_handle(task, envelope)
             except (SessionRunFenced, SessionStatusConflict):
+                # The exception alone is not proof that this invocation never
+                # entered. Authenticate the exact queued operation before
+                # acknowledging its execution and relinquishing the claim.
+                await execution_settlement.verify_returned_execution(
+                    task, verify_dispatch_return, DispatchStatus.SUBMITTED
+                )
+                if returned_settlement is None:
+                    raise
+                if returned_settlement.state is not _QueuedDispatchSettlementState.NOT_ADMITTED:
+                    try:
+                        handle = await self._await_with_task_lease(
+                            self._terminalize(
+                                durable_runtime,
+                                task,
+                                worker_id,
+                                request,
+                                DispatchStatus.SUBMITTED,
+                                {
+                                    "status": DispatchStatus.SUBMITTED.value,
+                                    **_queued_dispatch_evidence(envelope),
+                                },
+                                envelope=envelope,
+                                lease_authority=lease_authority,
+                                settlement=returned_settlement,
+                            ),
+                            heartbeat,
+                            task=task,
+                            worker_id=worker_id,
+                            dispatcher=self,
+                            lease_authority=lease_authority,
+                        )
+                    except TaskClaimLost:
+                        return await self._reclaimed_dispatch_handle(task, envelope)
+                    await execution_settlement.attempt()
+                    return handle
                 # The session is already being run by another worker — requeue rather than
                 # fail, so it runs once that session frees up (per-session serialization).
                 # The same rule applies while terminal hooks or trailing cleanup retain the
@@ -1494,34 +1585,17 @@ class TaskStoreDispatcher(Dispatcher):
                     diagnostic.payload_fields(),
                 )
                 diagnostic = None
-                try:
-                    settlement = await durable_runtime._queued_dispatch_settlement_state(envelope)
-                    if type(settlement) is not _QueuedDispatchSettlement:
-                        raise _QueuedDispatchAuthorityRejected(
-                            "Queued dispatch settlement returned an invalid record."
-                        )
-                except _QueuedDispatchAuthorityRejected as authority_error:
-                    return await self._reject_claimed_dispatch(
-                        durable_runtime,
-                        task=task,
-                        worker_id=worker_id,
-                        lease_authority=lease_authority,
-                        error=authority_error,
-                        envelope=envelope,
-                    )
-                except Exception as settlement_error:
-                    combined_failure = ExceptionGroup(
-                        "Queued dispatch failed before settlement could be classified.",
-                        [exc, settlement_error],
-                    )
-                    await self._release_claimed_dispatch_after_failure(
-                        task=task,
-                        worker_id=worker_id,
-                        failure=combined_failure,
-                        lease_authority=lease_authority,
-                    )
-                    raise combined_failure from None
+                await execution_settlement.verify_returned_execution(
+                    task, verify_dispatch_return, DispatchStatus.SUBMITTED
+                )
+                settlement = returned_settlement
+                if settlement is None:
+                    # Keep the original failure and the exact retained lookup.
+                    # No disposition is safe until its classification is known.
+                    raise
                 if settlement.state is _QueuedDispatchSettlementState.NOT_ADMITTED:
+                    # Includes prepared-subagent worker incompatibility: it can
+                    # requeue only after the same positive nondispatch proof.
                     if is_durable_subagent_authority_rejected(exc):
                         return await self._reject_claimed_dispatch(
                             durable_runtime,
@@ -1586,7 +1660,7 @@ class TaskStoreDispatcher(Dispatcher):
                     )
                     raise
                 try:
-                    return await self._await_with_task_lease(
+                    handle = await self._await_with_task_lease(
                         self._terminalize(
                             durable_runtime,
                             task,
@@ -1608,6 +1682,8 @@ class TaskStoreDispatcher(Dispatcher):
                         dispatcher=self,
                         lease_authority=lease_authority,
                     )
+                    await execution_settlement.attempt()
+                    return handle
                 except TaskClaimLost:
                     return await self._reclaimed_dispatch_handle(task, envelope)
             # A run can fail in-band (a SESSION_FAILED event, not an exception); record that as
@@ -2031,6 +2107,10 @@ class TaskStoreDispatcher(Dispatcher):
                     raise TaskClaimLost(
                         "Dispatch task heartbeat acknowledgement consumed the renewed lease."
                     )
+                if _task_cancellation_requested(renewed):
+                    # Use the existing owned natural-drain path. Interrupting
+                    # an opaque dispatch waiter is not proof its effects ended.
+                    raise TaskClaimLost("Queued dispatch has durable cancellation intent.")
                 return renewed
 
         async def reconcile_heartbeat_failure(exc: Exception) -> None:
@@ -2673,6 +2753,10 @@ class TaskStoreDispatcher(Dispatcher):
                     handle = override_turn.value
             except Exception as exc:
                 # A transient store error on one task must not kill the durable worker loop.
+                # An exception carrying a settlement owner is not disposable:
+                # transfer it to the caller instead of orphaning exact proof.
+                if has_task_execution_settlement_pending(exc):
+                    raise
                 logger.error(
                     "dispatch worker failed while processing a task: error_type=%s error=%s",
                     type(exc).__name__,

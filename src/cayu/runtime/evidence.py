@@ -644,6 +644,7 @@ class RuntimeEvidenceTask(BaseModel):
     status: Literal[
         "pending",
         "waiting_dependencies",
+        "waiting_group",
         "dependency_skipped",
         "claimed",
         "running",

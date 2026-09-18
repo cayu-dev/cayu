@@ -99,6 +99,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
+from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     InterruptedTaskContinuationClaimPage,
@@ -435,6 +436,9 @@ async def run_task_worker(
     if metrics is not None:
         poller.set_metrics(metrics)
     reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
+    from cayu.tasks._group_maintenance import TaskGroupMaintenance
+
+    group_maintenance = TaskGroupMaintenance()
 
     async def reclaim_expired_tasks() -> bool:
         if materialized_work_contract_queue_supported:
@@ -466,6 +470,7 @@ async def run_task_worker(
 
         loop = asyncio.get_running_loop()
         meaningful_activity = False
+        await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
         if (
             recover_interrupted_handoffs
             and interrupted_handoff_supported
@@ -702,6 +707,37 @@ async def _handle_with_heartbeat(
     *,
     recover_interrupted_authority_loss: bool = False,
 ) -> None:
+    settlement = TaskExecutionSettlement(task_store, app._secret_redactor)
+    primary: BaseException | None = None
+    try:
+        await _handle_with_heartbeat_owned(
+            app,
+            task_store,
+            task,
+            handler,
+            worker_id,
+            lease_seconds,
+            settlement=settlement,
+            recover_interrupted_authority_loss=recover_interrupted_authority_loss,
+        )
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        settlement.finish(primary)
+
+
+async def _handle_with_heartbeat_owned(
+    app: CayuApp,
+    task_store: TaskStore,
+    task: Task,
+    handler: TaskHandler,
+    worker_id: str,
+    lease_seconds: int,
+    *,
+    settlement: TaskExecutionSettlement,
+    recover_interrupted_authority_loss: bool,
+) -> None:
     (
         task,
         claim_deadline_monotonic,
@@ -712,6 +748,7 @@ async def _handle_with_heartbeat(
         task,
         worker_id,
         lease_seconds,
+        settlement=settlement,
     )
     owner_task = asyncio.current_task()
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
@@ -766,6 +803,7 @@ async def _handle_with_heartbeat(
                     heartbeat_task=heartbeat_task,
                     stop_heartbeat=stop_heartbeat,
                     lease_authority=lease_authority,
+                    settlement=settlement,
                 )
             except _TaskRetryElapsed as exc:
                 retry_elapsed = True
@@ -1007,6 +1045,8 @@ async def _renew_task_claim_before_dispatch(
     task: Task,
     worker_id: str,
     lease_seconds: int,
+    *,
+    settlement: TaskExecutionSettlement,
 ) -> tuple[Task, float, bool, bool]:
     """Prove that an acknowledged lease can still authorize handler dispatch."""
 
@@ -1070,12 +1110,12 @@ async def _renew_task_claim_before_dispatch(
         if renewed.lease_expires_at is None:  # pragma: no cover - heartbeat contract
             raise TaskClaimLost("Task heartbeat returned no worker lease before dispatch.")
         execution_lease_expires_at = renewed.lease_expires_at
-        renewed = await task_store.mark_claimed_task_execution_started(
-            renewed.id,
-            worker_id,
-            execution_lease_expires_at,
-        )
+        renewed = await settlement.enter(renewed)
         if monotonic() >= claim_deadline_monotonic:
+            # No callback has been dispatched. Retain the exact start receipt
+            # before cancellation mutates or clears its worker authority.
+            settlement.observe(renewed)
+            await settlement.attempt()
             renewed = await task_store.request_claimed_task_cancellation(
                 renewed.id,
                 worker_id,
@@ -1115,9 +1155,23 @@ async def _await_task_handler(
     heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
     stop_heartbeat: asyncio.Event,
     lease_authority: _TaskLeaseAuthority,
+    settlement: TaskExecutionSettlement,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+    # The callback may mutate its view. Settlement must remain bound to the
+    # exact execution entered by this worker, not callback-authored authority.
+    handler_view = copy_task(task)
+    settlement_authority = copy_task(task)
+
+    async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+        result = await handler(app, handler_view, worker_id)
+        settlement.observe(settlement_authority, result)
+        # Storage acknowledgement is not part of the callback outcome. Ordinary
+        # settlement failures stay owned until after result disposition.
+        await settlement.attempt()
+        return result
+
     with bind_task_lease_authority(lease_authority):
-        handler_task = asyncio.ensure_future(handler(app, task, worker_id))
+        handler_task = asyncio.ensure_future(owned_handler())
     try:
         completed, _pending = await asyncio.wait(
             (handler_task, heartbeat_task),

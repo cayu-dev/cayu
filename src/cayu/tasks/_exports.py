@@ -1,7 +1,22 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskGroupInvocationSettlementPending": (
+        "cayu.runtime._task_group_invocation",
+        "TaskGroupInvocationSettlementPending",
+    ),
+    "TaskExecutionSettlementPending": (
+        "cayu.tasks._execution_settlement",
+        "TaskExecutionSettlementPending",
+    ),
     "TaskGroupCreate": ("cayu.tasks.groups", "TaskGroupCreate"),
+    "TaskGroupQuiescencePolicy": ("cayu.tasks.groups", "TaskGroupQuiescencePolicy"),
+    "TaskGroupQuiescenceStatus": ("cayu.tasks.groups", "TaskGroupQuiescenceStatus"),
+    "TaskGroupQuiescence": ("cayu.tasks.groups", "TaskGroupQuiescence"),
+    "TaskGroupFinalizerStatus": ("cayu.tasks.groups", "TaskGroupFinalizerStatus"),
+    "TaskGroupExecutionObligation": ("cayu.tasks.groups", "TaskGroupExecutionObligation"),
+    "TaskGroupInvocationObligation": ("cayu.tasks.groups", "TaskGroupInvocationObligation"),
+    "TaskGroupQuiescenceResolution": ("cayu.tasks.groups", "TaskGroupQuiescenceResolution"),
     "TaskGroupPolicy": ("cayu.tasks.groups", "TaskGroupPolicy"),
     "TaskGroupCreationReceipt": ("cayu.tasks.groups", "TaskGroupCreationReceipt"),
     "TaskGroupSnapshot": ("cayu.tasks.groups", "TaskGroupSnapshot"),
@@ -238,6 +253,13 @@ EXPORTS: dict[str, tuple[str, str]] = {
 
 PUBLIC_NAMES = [
     "TaskGroupCreate",
+    "TaskGroupQuiescencePolicy",
+    "TaskGroupQuiescenceStatus",
+    "TaskGroupQuiescence",
+    "TaskGroupFinalizerStatus",
+    "TaskGroupExecutionObligation",
+    "TaskGroupInvocationObligation",
+    "TaskGroupQuiescenceResolution",
     "TaskGroupPolicy",
     "TaskGroupCreationReceipt",
     "TaskGroupSnapshot",
@@ -246,6 +268,8 @@ PUBLIC_NAMES = [
     "TaskGroupEvent",
     "TaskGroupEventType",
     "TaskGroupConflict",
+    "TaskExecutionSettlementPending",
+    "TaskGroupInvocationSettlementPending",
     "TaskGroupUnavailable",
     "TaskGraphCreate",
     "TaskGraphNode",

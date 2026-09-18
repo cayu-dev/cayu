@@ -12,6 +12,7 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
+    task_store_group_quiescence_capability_is_complete,
 )
 from cayu.tasks._groups import validate_group_cursor
 from cayu.tasks.base import TaskStore
@@ -21,6 +22,7 @@ from cayu.tasks.groups import (
     TaskGroupCreate,
     TaskGroupCreationReceipt,
     TaskGroupEvent,
+    TaskGroupQuiescenceResolution,
     TaskGroupSnapshot,
     copy_task_group_create,
     task_group_request_sha256,
@@ -69,11 +71,17 @@ async def create_task_group(app: CayuApp, request: TaskGroupCreate) -> TaskGroup
     store = _store(app)
     graph = validate_graph_request(app, copied.graph)
     _safe_graph_id(app, copied.group_id)
+    if copied.quiescence is not None and not task_store_group_quiescence_capability_is_complete(
+        store
+    ):
+        raise NotImplementedError("Task group quiescence requires an explicitly capable store.")
     copied = TaskGroupCreate(
         group_id=copied.group_id,
         graph=graph,
         member_task_ids=copied.member_task_ids,
         policy=copied.policy,
+        quiescence=copied.quiescence,
+        finalizer_task_id=copied.finalizer_task_id,
     )
     submitted = task_group_request_sha256(copied)
     existing = await load_task_group(app, copied.group_id)
@@ -84,6 +92,8 @@ async def create_task_group(app: CayuApp, request: TaskGroupCreate) -> TaskGroup
             or receipt.graph.graph_id != graph.graph_id
             or receipt.member_task_ids != copied.member_task_ids
             or receipt.policy != copied.policy
+            or receipt.quiescence != copied.quiescence
+            or receipt.finalizer_task_id != copied.finalizer_task_id
             or receipt.graph.task_ids != tuple(node.task.task_id for node in graph.nodes)
             or receipt.graph.submitted_request_sha256 != task_graph_request_sha256(graph)
         ):
@@ -95,6 +105,8 @@ async def create_task_group(app: CayuApp, request: TaskGroupCreate) -> TaskGroup
         graph=graph,
         member_task_ids=copied.member_task_ids,
         policy=copied.policy,
+        quiescence=copied.quiescence,
+        finalizer_task_id=copied.finalizer_task_id,
     )
     prepared._submitted_request_sha256 = submitted
     expected = task_group_request_sha256(prepared)
@@ -116,6 +128,8 @@ async def create_task_group(app: CayuApp, request: TaskGroupCreate) -> TaskGroup
         or receipt.submitted_request_sha256 != submitted
         or receipt.member_task_ids != prepared.member_task_ids
         or receipt.policy != prepared.policy
+        or receipt.quiescence != prepared.quiescence
+        or receipt.finalizer_task_id != prepared.finalizer_task_id
     ):
         raise TaskGroupConflict("Task store did not preserve exact group admission authority.")
     return receipt
@@ -173,3 +187,75 @@ async def list_task_group_events(
             ):
                 _safe_graph_id(app, identity)
     return events
+
+
+async def reconcile_task_group(app: CayuApp, group_id: str) -> TaskGroupSnapshot:
+    group_id = _safe_graph_id(app, group_id)
+    store = _store(app)
+    if not store.supports_task_group_quiescence:
+        raise NotImplementedError("Task group quiescence is unavailable.")
+    before = await load_task_group(app, group_id)
+    if before is not None:
+        from cayu.runtime._task_group_invocation import observe_release
+
+        for execution in before.quiescence.executions:
+            if (
+                execution.worker_id is None
+                and execution.settled_at is None
+                and execution.invocation is not None
+            ):
+                await observe_release(
+                    store,
+                    app.session_store,
+                    execution.invocation,
+                    redactor=app._secret_redactor,
+                )
+    outcome = await capture_task_store_operation(
+        partial(store.reconcile_task_group, group_id),
+        operation_name="Task group quiescence reconciliation",
+        redactor=app._secret_redactor,
+    )
+    if outcome.failure is not None:
+        raise_task_store_operation_failure(outcome.failure)
+    result = _validated(app, outcome.result, TaskGroupSnapshot)
+    if result.receipt.group_id != group_id:
+        raise TaskGroupConflict("Task store reconciled a different group.")
+    return result
+
+
+async def resolve_task_group_quiescence(
+    app: CayuApp,
+    request: TaskGroupQuiescenceResolution,
+) -> TaskGroupSnapshot:
+    from cayu.tasks._group_quiescence import prepare_resolution
+
+    prepared = capture_sensitive_validation(
+        lambda: prepare_resolution(request)[0],
+        operation_name="Task group resolution validation",
+        redactor=app._secret_redactor,
+    )
+    if prepared.failure is not None:
+        raise_task_store_operation_failure(prepared.failure)
+    copied = prepared.result
+    if copied is None:
+        raise TaskGroupConflict("Task group resolution has no authority.")
+    _safe_graph_id(app, copied.group_id)
+    _safe_graph_id(app, copied.idempotency_key)
+    store = _store(app)
+    if not store.supports_task_group_quiescence:
+        raise NotImplementedError("Task group quiescence is unavailable.")
+    outcome = await capture_task_store_operation(
+        partial(store.resolve_task_group_quiescence, copied),
+        operation_name="Task group quiescence resolution",
+        redactor=app._secret_redactor,
+    )
+    if outcome.failure is not None:
+        raise_task_store_operation_failure(outcome.failure)
+    result = _validated(app, outcome.result, TaskGroupSnapshot)
+    if (
+        result.receipt.group_id != copied.group_id
+        or result.receipt.request_sha256 != copied.request_sha256
+        or result.quiescence.status.value != "quiescent"
+    ):
+        raise TaskGroupConflict("Task store did not preserve exact group resolution.")
+    return result

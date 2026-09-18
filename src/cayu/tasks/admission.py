@@ -112,6 +112,10 @@ class WorkAttemptExecutionClaimLost(ValueError):
     """The caller no longer owns the exact active work-attempt generation."""
 
 
+class _GroupExecutionEntryRefused(WorkAttemptExecutionClaimLost):
+    """The exact admission was refused before its first execution entry."""
+
+
 class WorkAttemptRecoveryRequired(RuntimeError):
     """Durable admission remains fenced pending exact session reconciliation."""
 

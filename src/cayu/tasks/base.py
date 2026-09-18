@@ -29,6 +29,8 @@ if TYPE_CHECKING:
         TaskGroupCreate,
         TaskGroupCreationReceipt,
         TaskGroupEvent,
+        TaskGroupInvocationObligation,
+        TaskGroupQuiescenceResolution,
         TaskGroupSnapshot,
     )
 
@@ -197,6 +199,7 @@ from cayu.tasks.contracts import (
     WorkContract,
     WorkContractConflict,
     WorkContractRef,
+    _GroupVerificationAdmissionRefused,
     completion_decision_application_request_sha256,
     completion_decision_request_sha256,
     completion_gap_fingerprint,
@@ -269,6 +272,7 @@ def _bounded_task_retry_decimal(
 class TaskStatus(StrEnum):
     PENDING = "pending"
     WAITING_DEPENDENCIES = "waiting_dependencies"
+    WAITING_GROUP = "waiting_group"
     DEPENDENCY_SKIPPED = "dependency_skipped"
     CLAIMED = "claimed"
     RUNNING = "running"
@@ -1559,6 +1563,7 @@ class Task(BaseModel):
         if self.graph_id is None:
             if self.prerequisite_task_ids or self.status in {
                 TaskStatus.WAITING_DEPENDENCIES,
+                TaskStatus.WAITING_GROUP,
                 TaskStatus.DEPENDENCY_SKIPPED,
             }:
                 raise ValueError("Dependency state requires graph membership.")
@@ -2608,7 +2613,12 @@ class WorkAttemptPreparationHoldReceipt(BaseModel):
             self.request_sha256 != work_attempt_preparation_hold_sha256(self.request)
             or self.task.id != self.request.task_id
             or self.task.work_contract != self.request.contract
-            or self.task.status is not TaskStatus.NEEDS_ATTENTION
+            or self.task.status
+            is not (
+                TaskStatus.CANCELLED
+                if self.request.reason == "work_contract_group_cancelled"
+                else TaskStatus.NEEDS_ATTENTION
+            )
             or self.task.status_reason != self.request.reason
             or self.task.worker_id is not None
             or self.task.lease_expires_at is not None
@@ -2665,9 +2675,15 @@ class WorkAttemptLifecycleReceipt(BaseModel):
             self.task.session_instance_id != self.request.release_evidence.session_instance_id
         ):
             raise ValueError("Work-attempt receipt conflicts with its released invocation.")
-        if self.retired_contract_binding != (self.task.status is TaskStatus.COMPLETED):
+        if self.retired_contract_binding != (
+            self.task.status is TaskStatus.COMPLETED
+            or (
+                self.request.kind == "group_cancellation"
+                and self.task.status is TaskStatus.CANCELLED
+            )
+        ):
             raise ValueError(
-                "Only successful work-attempt settlement retires its contract binding."
+                "Only accepted or quiescent group-cancelled work retires its contract binding."
             )
         if self.request.kind in {
             "runtime_stop",
@@ -2678,6 +2694,11 @@ class WorkAttemptLifecycleReceipt(BaseModel):
             or self.task.status_reason != self.request.stop_reason
         ):
             raise ValueError("Runtime-stop receipt requires its typed non-success result.")
+        if self.request.kind == "group_cancellation" and (
+            self.task.status is not TaskStatus.CANCELLED
+            or self.task.status_reason != self.request.stop_reason
+        ):
+            raise ValueError("Group-stop receipt requires its typed cancellation result.")
         require_bounded_work_completion_document(
             self.model_dump(mode="json", warnings=False),
             "Work-attempt lifecycle receipt",
@@ -2811,6 +2832,7 @@ class TaskStatusCounts(BaseModel):
 
     pending: AggregateCount = Field(ge=0)
     waiting_dependencies: AggregateCount = Field(default=0, ge=0)
+    waiting_group: AggregateCount = Field(default=0, ge=0)
     dependency_skipped: AggregateCount = Field(default=0, ge=0)
     claimed: AggregateCount = Field(ge=0)
     running: AggregateCount = Field(ge=0)
@@ -3458,6 +3480,58 @@ class TaskStore(ABC):
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_graphs: ClassVar[bool] = False
     supports_task_groups: ClassVar[bool] = False
+    supports_task_group_quiescence: ClassVar[bool] = False
+
+    async def list_task_group_reconciliation_candidates(
+        self,
+        *,
+        after_group_id: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        """Read an ordered bounded page of draining groups, without changing them."""
+        raise NotImplementedError("This TaskStore does not support group quiescence.")
+
+    async def reconcile_task_group(self, group_id: str) -> TaskGroupSnapshot:
+        raise NotImplementedError("This TaskStore does not support group quiescence.")
+
+    async def _settle_task_group_execution(self, task: Task) -> None:
+        """Internal execution-owner boundary; terminal task status is not this proof."""
+        if self.supports_task_group_quiescence:
+            raise NotImplementedError("Group-capable stores must settle execution ownership.")
+
+    async def _task_group_cancellation_requested(self, task_id: str) -> bool:
+        """Internal store-owned stop observation, including exact retry descendants."""
+        if self.supports_task_group_quiescence:
+            raise NotImplementedError("Group-capable stores must expose cancellation intent.")
+        return False
+
+    async def _task_group_retains_execution(self, task_id: str) -> bool:
+        """Resolve selected membership or exact retry lineage from store authority."""
+        if self.supports_task_group_quiescence:
+            raise NotImplementedError("Group-capable stores must resolve execution ownership.")
+        return False
+
+    async def _observe_task_group_invocation(
+        self, invocation: TaskGroupInvocationObligation
+    ) -> None:
+        """Internal runtime binding/release, never a public quiescence assertion."""
+        if self.supports_task_group_quiescence:
+            raise NotImplementedError(
+                "Group-capable stores must observe exact invocation ownership."
+            )
+
+    async def _observe_task_group_result_resolution(
+        self, task_id: str, decision_id: str, owner_id: str, *, settled: bool
+    ) -> None:
+        """Internal retained resolver dispatch/settlement; not caller proof."""
+        if self.supports_task_group_quiescence:
+            raise NotImplementedError("Group-capable stores must own result resolution.")
+
+    async def resolve_task_group_quiescence(
+        self,
+        request: TaskGroupQuiescenceResolution,
+    ) -> TaskGroupSnapshot:
+        raise NotImplementedError("This TaskStore does not support group quiescence.")
 
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         """Atomically admit a new graph and immutable group, or replay its receipt."""
@@ -4548,6 +4622,59 @@ class InMemoryTaskStore(TaskStore):
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
     supports_task_groups: ClassVar[bool] = True
+    supports_task_group_quiescence: ClassVar[bool] = True
+
+    async def list_task_group_reconciliation_candidates(
+        self,
+        *,
+        after_group_id: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        from cayu.tasks._memory_groups import reconciliation_candidates
+
+        return await reconciliation_candidates(self, after_group_id=after_group_id, limit=limit)
+
+    async def _settle_task_group_execution(self, task: Task) -> None:
+        from cayu.tasks._memory_groups import settle_execution
+
+        await settle_execution(self, task)
+
+    async def _task_group_cancellation_requested(self, task_id: str) -> bool:
+        from cayu.tasks._memory_groups import cancellation_requested
+
+        return await cancellation_requested(self, task_id)
+
+    async def _task_group_retains_execution(self, task_id: str) -> bool:
+        from cayu.tasks._memory_groups import retains_execution
+
+        return await retains_execution(self, task_id)
+
+    async def _observe_task_group_invocation(
+        self, invocation: TaskGroupInvocationObligation
+    ) -> None:
+        from cayu.tasks._memory_groups import observe_invocation
+
+        await observe_invocation(self, invocation)
+
+    async def _observe_task_group_result_resolution(
+        self, task_id: str, decision_id: str, owner_id: str, *, settled: bool
+    ) -> None:
+        from cayu.tasks._memory_groups import observe_result_resolution
+
+        await observe_result_resolution(self, task_id, decision_id, owner_id, settled=settled)
+
+    async def reconcile_task_group(self, group_id: str) -> TaskGroupSnapshot:
+        from cayu.tasks._memory_groups import reconcile
+
+        return await reconcile(self, group_id)
+
+    async def resolve_task_group_quiescence(
+        self,
+        request: TaskGroupQuiescenceResolution,
+    ) -> TaskGroupSnapshot:
+        from cayu.tasks._memory_groups import reconcile
+
+        return await reconcile(self, request.group_id, resolution=request)
 
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         from cayu.tasks._memory_groups import create_group
@@ -4597,10 +4724,12 @@ class InMemoryTaskStore(TaskStore):
         self._task_groups: dict[str, TaskGroupSnapshot] = {}
         self._task_group_by_graph: dict[str, str] = {}
         self._task_group_events: dict[str, list[TaskGroupEvent]] = {}
+        self._task_group_resolutions: dict[tuple[str, str], tuple[str, TaskGroupSnapshot]] = {}
         self._task_graph_receipts: dict[str, TaskGraphCreationReceipt] = {}
         self._task_graph_members: dict[str, dict[str, tuple[str, ...]]] = {}
         self._task_graph_events: dict[str, list[TaskGraphEvent]] = {}
         self._task_graph_by_task: dict[str, str] = {}
+        self._task_group_retry_lineage: dict[str, tuple[str, str]] = {}
         self._task_graph_terminal_members: dict[str, TaskGraphMember] = {}
         self._schedule_receipts: dict[tuple[str, str], TaskScheduleReceipt] = {}
         self._schedule_events: dict[str, list[TaskScheduleEvent]] = {}
@@ -4842,6 +4971,8 @@ class InMemoryTaskStore(TaskStore):
         self,
         request: WorkAttemptAdmissionPrepare,
     ) -> WorkAttemptAdmission:
+        from cayu.tasks._memory_groups import cancellation_requested_unlocked
+
         request = copy_work_attempt_admission_prepare(request)
         if request.generation != 1:
             raise WorkAttemptAdmissionConflict(
@@ -4895,6 +5026,10 @@ class InMemoryTaskStore(TaskStore):
             contract = self._ensure_task_contract_matches(task, request.contract)
             lease_now = self._ownership_clock()
             availability_now = self._clock()
+            if cancellation_requested_unlocked(self, task.id):
+                raise WorkAttemptAdmissionConflict(
+                    "A decided group loser cannot admit another execution."
+                )
             continuation = self._work_attempt_continuation_context(task, contract, request)
             if continuation is None:
                 if request.kind != "initial":
@@ -5179,6 +5314,7 @@ class InMemoryTaskStore(TaskStore):
         self, request: WorkAttemptExecutionEntryRequest
     ) -> WorkAttemptExecutionEntryResult:
         from cayu.runtime._work_attempt_lifecycle_policy import plan_work_attempt_execution_entry
+        from cayu.tasks._memory_groups import cancellation_requested_unlocked
 
         request = copy_work_attempt_execution_entry_request(request)
         async with self._lock:
@@ -5188,6 +5324,7 @@ class InMemoryTaskStore(TaskStore):
                 admission=admission,
                 task=self._require_task(admission.task_id),
                 now=self._ownership_clock(),
+                group_cancelled=cancellation_requested_unlocked(self, admission.task_id),
             )
             if result.disposition is WorkAttemptExecutionEntryDisposition.ENTERED:
                 self._work_attempt_admissions[admission.admission_id] = (
@@ -5227,6 +5364,7 @@ class InMemoryTaskStore(TaskStore):
         self, request: WorkAttemptPreparationHold
     ) -> WorkAttemptPreparationHoldReceipt:
         from cayu.runtime._work_attempt_lifecycle_policy import plan_work_attempt_preparation_hold
+        from cayu.tasks._memory_groups import cancellation_requested_unlocked
 
         request = copy_work_attempt_preparation_hold(request)
         digest = work_attempt_preparation_hold_sha256(request)
@@ -5245,8 +5383,14 @@ class InMemoryTaskStore(TaskStore):
                 task=task,
                 has_attempt=bool(self._attempt_ids_by_task.get(task.id)),
                 now=self._ownership_clock(),
+                group_cancelled=cancellation_requested_unlocked(self, task.id),
             )
-            self._store_task(updated)
+            self._store_task(
+                updated,
+                settled_execution=(task.id, request.worker_id, task.started_at)
+                if task.started_at is not None
+                else None,
+            )
             self._work_attempt_preparation_holds[request.hold_id] = receipt
             return receipt.model_copy(deep=True)
 
@@ -5282,6 +5426,8 @@ class InMemoryTaskStore(TaskStore):
             application = self._decision_application_receipts.get(
                 (task.id, request.application_idempotency_key or "")
             )
+            from cayu.tasks._memory_groups import cancellation_requested_unlocked
+
             updated, settled_admission, receipt = plan_work_attempt_lifecycle_settlement(
                 request,
                 task=task,
@@ -5291,9 +5437,18 @@ class InMemoryTaskStore(TaskStore):
                 decision=decision,
                 application=application,
                 now=self._ownership_clock(),
+                group_cancelled=cancellation_requested_unlocked(self, task.id),
+                verification_claim=None
+                if proposal_id is None
+                else self._completion_verification_claims.get(proposal_id),
             )
             settled_admission = self._copy_work_attempt_admission(settled_admission)
-            self._store_task(updated)
+            self._store_task(
+                updated,
+                settled_execution=(task.id, admission.claim.worker_id, task.started_at)
+                if task.started_at is not None
+                else None,
+            )
             if receipt.retired_contract_binding:
                 self._remove_contracted_session_index_entry(updated)
             self._work_attempt_admissions[admission.admission_id] = settled_admission
@@ -5447,6 +5602,14 @@ class InMemoryTaskStore(TaskStore):
             if request.generation != current.generation + 1:
                 raise WorkAttemptAdmissionConflict(
                     "Recovery must advance the execution generation exactly once."
+                )
+            from cayu.tasks._memory_groups import cancellation_requested_unlocked
+
+            # Exact live replay above does not acquire new authority. A losing
+            # execution must retain its original owner until positive settlement.
+            if cancellation_requested_unlocked(self, admission.task_id):
+                raise WorkAttemptAdmissionConflict(
+                    "Task-group cancellation forbids replacement execution authority."
                 )
             if admission.attempt_id in self._proposal_id_by_attempt:
                 raise WorkAttemptAdmissionConflict(
@@ -5602,6 +5765,8 @@ class InMemoryTaskStore(TaskStore):
         self,
         request: AdmittedCompletionProposalRequest,
     ) -> CompletionProposal:
+        from cayu.tasks._memory_groups import cancellation_requested_unlocked
+
         request = copy_admitted_completion_proposal_request(request)
         proposal_request = request.proposal
         proposal_sha256 = completion_proposal_request_sha256(proposal_request)
@@ -5651,6 +5816,10 @@ class InMemoryTaskStore(TaskStore):
                     "Work attempt already has a different completion proposal."
                 )
             task = self._require_task(admission.task_id)
+            if cancellation_requested_unlocked(self, task.id):
+                raise WorkAttemptAdmissionConflict(
+                    "A decided group loser cannot submit a new proposal."
+                )
             self._ensure_attempt_state_is_current(task, admission.attempt)
             if (
                 task.session_instance_id != admission.session_invocation.session_instance_id
@@ -5673,14 +5842,6 @@ class InMemoryTaskStore(TaskStore):
             released = self._copy_work_attempt_admission(
                 admission.model_copy(update={"state": WorkAttemptAdmissionState.RELEASED})
             )
-            self._completion_proposals[proposal.proposal_id] = proposal
-            self._proposal_id_by_attempt[admission.attempt_id] = proposal.proposal_id
-            self._work_attempt_admissions[released.admission_id] = released
-            if (
-                self._unreleased_admission_id_by_session.get(released.session_id)
-                == released.admission_id
-            ):
-                del self._unreleased_admission_id_by_session[released.session_id]
             self._store_task(
                 task.model_copy(
                     update={
@@ -5690,6 +5851,14 @@ class InMemoryTaskStore(TaskStore):
                     }
                 )
             )
+            self._completion_proposals[proposal.proposal_id] = proposal
+            self._proposal_id_by_attempt[admission.attempt_id] = proposal.proposal_id
+            self._work_attempt_admissions[released.admission_id] = released
+            if (
+                self._unreleased_admission_id_by_session.get(released.session_id)
+                == released.admission_id
+            ):
+                del self._unreleased_admission_id_by_session[released.session_id]
             return proposal.model_copy(deep=True)
 
     async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
@@ -5826,6 +5995,8 @@ class InMemoryTaskStore(TaskStore):
         self,
         request: CompletionVerificationClaimRequest,
     ) -> CompletionVerificationClaim:
+        from cayu.tasks._memory_groups import cancellation_requested_unlocked
+
         request = copy_completion_verification_claim_request(request)
         request_sha256 = completion_verification_claim_request_sha256(request)
         async with self._lock:
@@ -5853,6 +6024,13 @@ class InMemoryTaskStore(TaskStore):
                 )
             now = self._ownership_clock()
             current = self._completion_verification_claims.get(request.proposal_id)
+            if (
+                proposal.proposal_id not in self._decision_id_by_proposal
+                and cancellation_requested_unlocked(self, proposal.task_id)
+            ):
+                raise _GroupVerificationAdmissionRefused(
+                    "A decided group loser cannot dispatch verification."
+                )
             if (
                 current is not None
                 and current.claim_id == request.claim_id
@@ -7406,7 +7584,12 @@ class InMemoryTaskStore(TaskStore):
                 request_sha256=request_sha256,
                 committed_at=now,
             )
-            self._store_task(result.task)
+            self._store_task(
+                result.task,
+                settled_execution=(task.id, task.worker_id, task.started_at)
+                if task.worker_id is not None and task.started_at is not None
+                else None,
+            )
             self._terminalization_receipts[receipt_key] = result.terminalization_receipt
             return _copy_task_cancellation_reconciliation_result(result)
 
@@ -7445,14 +7628,13 @@ class InMemoryTaskStore(TaskStore):
                 series_now=series_now,
             )
             if successor is not None and (
-                successor.id in self._tasks or successor.id in self._task_graph_by_task
+                successor.id in self._tasks
+                or successor.id in self._task_graph_by_task
+                or successor.id in self._task_group_retry_lineage
             ):
                 raise TaskTerminalizationConflict(
                     "Task retry successor identity is already occupied."
                 )
-            self._store_task(settled)
-            if successor is not None:
-                self._store_task(successor)
             receipt = TaskRetrySettlementResult(
                 task_id=request.task_id,
                 idempotency_key=request.idempotency_key,
@@ -7462,6 +7644,18 @@ class InMemoryTaskStore(TaskStore):
                 events=_task_retry_events(settled, occurred_at=now),
                 committed_at=now,
             )
+            from cayu.tasks._memory_graphs import store_graph_task
+
+            if not store_graph_task(
+                self, settled, schedule_operation_id=None, retry_successor=successor
+            ):
+                writes = tuple(
+                    self._prepare_task_write(item)
+                    for item in (settled, successor)
+                    if item is not None
+                )
+                for write in writes:
+                    self._publish_prepared_task_write(write)
             self._retry_settlements[receipt_key] = receipt
             committed = receipt.model_copy(deep=True)
         if successor is not None:
@@ -7589,7 +7783,12 @@ class InMemoryTaskStore(TaskStore):
                 request_sha256=request_sha256,
                 committed_at=now,
             )
-            self._store_task(receipt.task)
+            self._store_task(
+                receipt.task,
+                settled_execution=(task.id, task.worker_id, task.started_at)
+                if task.worker_id is not None and task.started_at is not None
+                else None,
+            )
             self._retry_settlements[receipt_key] = receipt
             return receipt.model_copy(deep=True)
 
@@ -7678,7 +7877,7 @@ class InMemoryTaskStore(TaskStore):
                 return current.model_copy(deep=True)
             started = current.model_copy(update={"started_at": now, "updated_at": now})
             self._store_task(started)
-            return started.model_copy(deep=True)
+            return self._require_task(task_id).model_copy(deep=True)
 
     async def pause_task(
         self,
@@ -7787,6 +7986,7 @@ class InMemoryTaskStore(TaskStore):
                     not in {
                         TaskStatus.PENDING,
                         TaskStatus.WAITING_DEPENDENCIES,
+                        TaskStatus.WAITING_GROUP,
                         TaskStatus.PAUSED,
                         TaskStatus.BLOCKED,
                         TaskStatus.NEEDS_ATTENTION,
@@ -8632,10 +8832,21 @@ class InMemoryTaskStore(TaskStore):
             candidates.append(task)
         return candidates
 
-    def _store_task(self, task: Task, *, schedule_operation_id: str | None = None) -> None:
+    def _store_task(
+        self,
+        task: Task,
+        *,
+        schedule_operation_id: str | None = None,
+        settled_execution: tuple[str, str, datetime] | None = None,
+    ) -> None:
         from cayu.tasks._memory_graphs import store_graph_task
 
-        if store_graph_task(self, task, schedule_operation_id=schedule_operation_id):
+        if store_graph_task(
+            self,
+            task,
+            schedule_operation_id=schedule_operation_id,
+            settled_execution=settled_execution,
+        ):
             return
         self._store_task_without_graph(task, schedule_operation_id=schedule_operation_id)
 
@@ -12579,6 +12790,7 @@ def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
     if task.status not in {
         TaskStatus.PENDING,
         TaskStatus.WAITING_DEPENDENCIES,
+        TaskStatus.WAITING_GROUP,
         TaskStatus.CLAIMED,
         TaskStatus.RUNNING,
         *_HELD_TASK_STATUSES,

@@ -62,6 +62,7 @@ from cayu.tasks.contracts import (
     copy_completion_proposal,
     validate_work_completion_linked_id,
 )
+from cayu.tasks.groups import TaskGroupConflict
 from cayu.vaults.redaction import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")
@@ -94,7 +95,7 @@ class VerifiedTaskDecisionResult:
     """Receipt-backed phase outcome; no receipt means an explicit continuation."""
 
     decision: CompletionDecision
-    application: CompletionDecisionApplicationReceipt
+    application: CompletionDecisionApplicationReceipt | None
     settlement: WorkAttemptLifecycleReceipt | None
 
 
@@ -481,6 +482,8 @@ class VerifiedTaskDecisionCoordinator:
             if prior is not None
             else await dependencies.release(admission)
         )
+        if not isinstance(release, InvocationReleaseEvidence):
+            raise WorkCompletionConflict("A pre-entry cancellation cannot settle a decision.")
         settlement_request = WorkAttemptLifecycleSettlement(
             settlement_id=settlement_key,
             task_id=admission.task_id,
@@ -491,6 +494,16 @@ class VerifiedTaskDecisionCoordinator:
             decision_id=verification.decision_id,
             application_idempotency_key=application_key,
         )
+        if prior is not None and prior.request.kind == "group_cancellation":
+            settlement_request = settlement_request.model_copy(
+                update={
+                    "kind": "group_cancellation",
+                    "stop_reason": "work_contract_group_cancelled",
+                    "proposal_id": proposal.proposal_id,
+                    "proposal_request_sha256": proposal.request_sha256,
+                    "application_idempotency_key": None,
+                }
+            )
         if prior is not None and prior.request != settlement_request:
             raise WorkCompletionConflict(
                 "Verified worker settlement conflicts with its exact request."
@@ -513,8 +526,9 @@ class VerifiedTaskDecisionCoordinator:
         proposal = prepared.proposal
         prior = prepared.prior
         settlement_request = prepared.settlement_request
-        application_key = settlement_request.application_idempotency_key
-        assert application_key is not None
+        application_key = verified_task_operation_id(
+            "application", admission.admission_id, verification.decision_id
+        )
         decision_validation = capture_sensitive_result_validation(
             lambda value=raw_decision: copy_completion_decision(value),
             operation_name="Verified worker decision result validation",
@@ -534,22 +548,31 @@ class VerifiedTaskDecisionCoordinator:
             or decision.contract != admission.contract
         ):
             raise WorkCompletionConflict("Verified worker decision returned conflicting authority.")
-        if decision.verdict is CompletionVerdict.ACCEPTED:
-            raw_task = await dependencies.resolve(
-                CompletionResultResolutionRequest(
-                    task_id=admission.task_id,
-                    decision_id=decision.decision_id,
-                    idempotency_key=application_key,
+        cancelled = await self._cancel_decided_loser(prepared, decision)
+        if cancelled is not None:
+            return VerifiedTaskDecisionResult(decision, None, cancelled)
+        try:
+            if decision.verdict is CompletionVerdict.ACCEPTED:
+                raw_task = await dependencies.resolve(
+                    CompletionResultResolutionRequest(
+                        task_id=admission.task_id,
+                        decision_id=decision.decision_id,
+                        idempotency_key=application_key,
+                    )
                 )
-            )
-        else:
-            raw_task = await dependencies.apply(
-                CompletionDecisionApplicationRequest(
-                    task_id=admission.task_id,
-                    decision_id=decision.decision_id,
-                    idempotency_key=application_key,
+            else:
+                raw_task = await dependencies.apply(
+                    CompletionDecisionApplicationRequest(
+                        task_id=admission.task_id,
+                        decision_id=decision.decision_id,
+                        idempotency_key=application_key,
+                    )
                 )
-            )
+        except TaskGroupConflict:
+            cancelled = await self._cancel_decided_loser(prepared, decision)
+            if cancelled is None:
+                raise
+            return VerifiedTaskDecisionResult(decision, None, cancelled)
         task_validation = capture_sensitive_result_validation(
             lambda value=raw_task: copy_task(value),
             operation_name="Verified worker application result validation",
@@ -637,3 +660,74 @@ class VerifiedTaskDecisionCoordinator:
         if validation.result is None:
             raise RuntimeError("Verified worker lifecycle returned no receipt.")
         return VerifiedTaskDecisionResult(decision, application, validation.result)
+
+    async def _cancel_decided_loser(
+        self, prepared: _PreparedDecision, decision: CompletionDecision
+    ) -> WorkAttemptLifecycleReceipt | None:
+        """Keep a completed verifier's evidence without applying a losing result."""
+        store = self._dependencies.store
+        admission = prepared.admission
+
+        def require_boolean(value):
+            if type(value) is not bool:
+                raise WorkCompletionConflict("Group stop observation has invalid authority.")
+            return value
+
+        if not await self._read(
+            lambda: store._task_group_cancellation_requested(admission.task_id),
+            require_boolean,
+            "Verified decision group cancellation",
+        ):
+            return None
+        # An application committed before the group election retains its exact
+        # receipt. Cancellation may not reinterpret that acknowledged success.
+        application = await self._read(
+            lambda: store.load_completion_decision_application_receipt(
+                admission.task_id,
+                verified_task_operation_id(
+                    "application", admission.admission_id, decision.decision_id
+                ),
+            ),
+            lambda value: value is not None,
+            "Verified group stop prior application",
+        )
+        if application:
+            return None  # The normal path below authenticates the full receipt.
+        request = WorkAttemptLifecycleSettlement.model_validate(
+            prepared.settlement_request.model_copy(
+                update={
+                    "kind": "group_cancellation",
+                    "stop_reason": "work_contract_group_cancelled",
+                    "proposal_id": prepared.proposal.proposal_id,
+                    "proposal_request_sha256": prepared.proposal.request_sha256,
+                    "decision_id": decision.decision_id,
+                    "application_idempotency_key": None,
+                }
+            ).model_dump(mode="python", warnings=False)
+        )
+        outcome = await capture_task_store_operation(
+            lambda: store.settle_work_attempt_lifecycle(request),
+            operation_name="Verified loser lifecycle cancellation",
+            redactor=self._dependencies.redactor,
+            mutation_store=store,
+            mutation_method_name="settle_work_attempt_lifecycle",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+
+        def require_receipt(value):
+            receipt = _copy_settlement(value)
+            if receipt is None or receipt.request != request:
+                raise WorkCompletionConflict("Verified group cancellation receipt conflicts.")
+            return receipt
+
+        checked = capture_sensitive_result_validation(
+            lambda: require_receipt(outcome.result),
+            operation_name="Verified group cancellation receipt",
+            redactor=self._dependencies.redactor,
+        )
+        if checked.failure is not None:
+            raise_task_store_operation_failure(checked.failure)
+        if checked.result is None:
+            raise WorkCompletionConflict("Verified group cancellation returned no receipt.")
+        return checked.result

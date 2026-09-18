@@ -2909,6 +2909,9 @@ from cayu.runtime._policy_evidence import ToolPolicyEvidence as ToolPolicyEviden
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
+from cayu.runtime._task_group_invocation import (
+    TaskGroupInvocationSettlementPending as TaskGroupInvocationSettlementPending,
+)
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot as UsageAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageIdentitySummary as UsageIdentitySummary
 from cayu.runtime.authority import SessionRunFenced as SessionRunFenced
@@ -4081,6 +4084,9 @@ from cayu.storage.sqlite import SQLiteTaskStore as SQLiteTaskStore
 from cayu.storage.work_context_sqlite import (
     SQLiteAgentWorkContextStore as SQLiteAgentWorkContextStore,
 )
+from cayu.tasks._execution_settlement import (
+    TaskExecutionSettlementPending as TaskExecutionSettlementPending,
+)
 from cayu.tasks.admission import WorkAttemptAdmission as WorkAttemptAdmission
 from cayu.tasks.admission import WorkAttemptAdmissionActivate as WorkAttemptAdmissionActivate
 from cayu.tasks.admission import WorkAttemptAdmissionConflict as WorkAttemptAdmissionConflict
@@ -4287,7 +4293,14 @@ from cayu.tasks.groups import TaskGroupCreationReceipt as TaskGroupCreationRecei
 from cayu.tasks.groups import TaskGroupDecision as TaskGroupDecision
 from cayu.tasks.groups import TaskGroupEvent as TaskGroupEvent
 from cayu.tasks.groups import TaskGroupEventType as TaskGroupEventType
+from cayu.tasks.groups import TaskGroupExecutionObligation as TaskGroupExecutionObligation
+from cayu.tasks.groups import TaskGroupFinalizerStatus as TaskGroupFinalizerStatus
+from cayu.tasks.groups import TaskGroupInvocationObligation as TaskGroupInvocationObligation
 from cayu.tasks.groups import TaskGroupPolicy as TaskGroupPolicy
+from cayu.tasks.groups import TaskGroupQuiescence as TaskGroupQuiescence
+from cayu.tasks.groups import TaskGroupQuiescencePolicy as TaskGroupQuiescencePolicy
+from cayu.tasks.groups import TaskGroupQuiescenceResolution as TaskGroupQuiescenceResolution
+from cayu.tasks.groups import TaskGroupQuiescenceStatus as TaskGroupQuiescenceStatus
 from cayu.tasks.groups import TaskGroupSnapshot as TaskGroupSnapshot
 from cayu.tasks.groups import TaskGroupStatus as TaskGroupStatus
 from cayu.tasks.groups import TaskGroupUnavailable as TaskGroupUnavailable

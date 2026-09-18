@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, LiteralString
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
@@ -13,12 +14,13 @@ from cayu.storage import _postgres_task_groups as groups
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._graphs import (
     GRAPH_TERMINAL_STATUSES,
+    GraphTransition,
     member_from_task,
     plan_graph_transition,
     require_graph_membership,
     require_member_authority,
 )
-from cayu.tasks._groups import plan_group_transition, prepare_group_admission
+from cayu.tasks._groups import prepare_group_admission
 from cayu.tasks.base import Task, TaskInvocationSnapshot
 from cayu.tasks.graphs import (
     TASK_GRAPH_MAX_NODES,
@@ -34,7 +36,7 @@ from cayu.tasks.graphs import (
     graph_identifier,
     task_graph_request_sha256,
 )
-from cayu.tasks.groups import TaskGroupCreate
+from cayu.tasks.groups import TaskGroupCreate, TaskGroupInvocationObligation
 
 if TYPE_CHECKING:
     from cayu.storage.postgres import PostgresTaskStore
@@ -77,9 +79,9 @@ async def lock_task_graphs(cur: Any, task_ids: tuple[str, ...]) -> None:
     if not task_ids:
         return
     await cur.execute(
-        "SELECT DISTINCT graph_id FROM cayu_task_graph_members "
-        "WHERE task_id = ANY(%s) ORDER BY graph_id",
-        (list(task_ids),),
+        "SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ANY(%s) "
+        "UNION SELECT graph_id FROM cayu_task_group_retry_lineage WHERE task_id = ANY(%s) ORDER BY graph_id",
+        (list(task_ids), list(task_ids)),
     )
     graph_ids = [row[0] for row in await cur.fetchall()]
     for graph_id in graph_ids:
@@ -100,9 +102,39 @@ async def require_graph_lock(cur: Any, graph_id: str) -> None:
 
 
 async def require_unreserved_identity(cur: Any, task_id: str) -> None:
-    await cur.execute("SELECT 1 FROM cayu_task_graph_members WHERE task_id = %s", (task_id,))
+    await cur.execute(
+        "SELECT 1 FROM cayu_task_graph_members WHERE task_id = %s "
+        "UNION ALL SELECT 1 FROM cayu_task_group_retry_lineage WHERE task_id = %s",
+        (task_id, task_id),
+    )
     if await cur.fetchone() is not None:
         raise TaskGraphConflict("Retained graph member identity cannot be reused.")
+
+
+async def register_retry_successor(cur: Any, source: Task, successor: Task) -> None:
+    """Automatic retry settlement owns the graph before either task row."""
+    await cur.execute(
+        "SELECT graph_id, task_id FROM cayu_task_graph_members WHERE task_id = %s "
+        "UNION ALL SELECT graph_id, root_task_id FROM cayu_task_group_retry_lineage WHERE task_id = %s",
+        (source.id, source.id),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return
+    await require_graph_lock(cur, row[0])
+    await cur.execute("SELECT group_id FROM cayu_task_groups WHERE graph_id = %s", (row[0],))
+    group = await cur.fetchone()
+    snapshot = None if group is None else await groups.read_group(cur, group[0])
+    if (
+        snapshot is None
+        or snapshot.receipt.quiescence is None
+        or row[1] not in snapshot.receipt.member_task_ids
+    ):
+        return
+    await cur.execute(
+        "INSERT INTO cayu_task_group_retry_lineage (task_id, graph_id, root_task_id) VALUES (%s, %s, %s)",
+        (successor.id, row[0], row[1]),
+    )
 
 
 async def _receipt(cur: Any, graph_id: str) -> TaskGraphCreationReceipt | None:
@@ -238,6 +270,7 @@ async def create_graph(
             now=await store._verified_evidence_now(cur),
             parents=parents,
             validate_task=lambda _request: None,
+            finalizer_task_id=None if group is None else group.finalizer_task_id,
         )
         group_publication = (
             None if group is None else prepare_group_admission(group, admission, submitted_digest)
@@ -266,10 +299,25 @@ async def create_graph(
 
 
 async def record_transition(
-    store: PostgresTaskStore, cur: Any, prior: Task | None, current: Task
+    store: PostgresTaskStore,
+    cur: Any,
+    prior: Task | None,
+    current: Task,
+    *,
+    settled_execution: tuple[str, str, datetime] | None = None,
+    invocation: TaskGroupInvocationObligation | None = None,
+    resolve_attention: bool = False,
 ) -> None:
+    from cayu.tasks._group_quiescence import (
+        plan_group_graph_transition,
+        require_group_mutation,
+        waiting_finalizer,
+    )
+
     await cur.execute(
-        "SELECT graph_id FROM cayu_task_graph_members WHERE task_id = %s", (current.id,)
+        "SELECT graph_id, task_id FROM cayu_task_graph_members WHERE task_id = %s "
+        "UNION ALL SELECT graph_id, root_task_id FROM cayu_task_group_retry_lineage WHERE task_id = %s",
+        (current.id, current.id),
     )
     row = await cur.fetchone()
     if row is None:
@@ -279,6 +327,7 @@ async def record_transition(
     if prior is None:
         raise TaskGraphConflict("Retained graph member identity cannot be reused.")
     graph_id = row[0]
+    root_id = row[1]
     await require_graph_lock(cur, graph_id)
     receipt = await _receipt(cur, graph_id)
     if receipt is None:
@@ -299,29 +348,76 @@ async def record_transition(
         (str(TaskGraphEventType.READY), current.id, graph_id),
     )
     sequence, readiness_recorded = await cur.fetchone()
-    transition = plan_graph_transition(
-        graph_id=graph_id,
-        prerequisites=prerequisites,
-        current=tasks,
-        proposed=current,
-        proposed_readiness_recorded=readiness_recorded,
-        first_sequence=sequence,
-        now=await store._verified_evidence_now(cur),
-    )
     await cur.execute("SELECT group_id FROM cayu_task_groups WHERE graph_id = %s", (graph_id,))
     group_row = await cur.fetchone()
-    group_publication = None
-    if group_row is not None:
-        snapshot = await groups.read_group(cur, group_row[0])
-        assert snapshot is not None
-        group_publication = plan_group_transition(
-            snapshot, transition, now=await store._verified_evidence_now(cur)
+    snapshot = None if group_row is None else await groups.read_group(cur, group_row[0])
+    if snapshot is not None:
+        require_group_mutation(snapshot, prior, current, root_task_id=root_id)
+    transition_now = (
+        await store._database_now(cur)
+        if snapshot is not None and snapshot.receipt.quiescence is not None
+        else await store._verified_evidence_now(cur)
+    )
+    transition = (
+        GraphTransition(tasks=(current,), events=(), retry_settlements=())
+        if current.id not in prerequisites
+        else plan_graph_transition(
+            graph_id=graph_id,
+            prerequisites=prerequisites,
+            current=tasks,
+            proposed=current,
+            proposed_readiness_recorded=readiness_recorded,
+            first_sequence=sequence,
+            now=transition_now,
+            group_waiting_task_id=None if snapshot is None else waiting_finalizer(snapshot),
         )
+    )
+    group_publication = None
+    if snapshot is not None:
+        await cur.execute(
+            "SELECT task_id, root_task_id FROM cayu_task_group_retry_lineage WHERE graph_id = %s ORDER BY task_id",
+            (graph_id,),
+        )
+        lineage_roots = dict(await cur.fetchall())
+        if lineage_roots:
+            await cur.execute(
+                f"SELECT {pg.TASK_COLUMNS} FROM cayu_tasks WHERE id = ANY(%s)",
+                (list(lineage_roots),),
+            )
+            descendants = {task.id: task for task in map(pg.task_from_row, await cur.fetchall())}
+            if descendants.keys() != lineage_roots.keys():
+                raise TaskGraphUnavailable("Retry descendant evidence is missing.")
+            tasks.update(descendants)
+        tasks[prior.id] = prior
+        await cur.execute(
+            "SELECT DISTINCT member.task_id FROM cayu_task_graph_members member "
+            "JOIN cayu_tasks task ON task.id = member.task_id "
+            "JOIN cayu_local_execution_attempts effect ON "
+            "(effect.task_id = task.id OR effect.retry_series_id = "
+            "task.retry_series->>'series_id') "
+            "WHERE member.graph_id = %s AND NOT effect.retry_admissible",
+            (graph_id,),
+        )
+        unsettled_effects = frozenset(row[0] for row in await cur.fetchall())
+        planned = plan_group_graph_transition(
+            snapshot,
+            transition,
+            current=tasks,
+            prerequisites=prerequisites,
+            first_sequence=sequence,
+            now=transition_now,
+            settled_execution=settled_execution,
+            invocation=invocation,
+            resolve_attention=resolve_attention,
+            unsettled_effects=unsettled_effects,
+            lineage_roots=lineage_roots,
+        )
+        transition, group_publication = planned.transition, planned.group
     for task in transition.tasks:
         await store._update_task_snapshot(cur, task)
         if task.id != current.id:
             await store._record_schedule_transition(cur, tasks[task.id], task)
-        if task.status in GRAPH_TERMINAL_STATUSES:
+        if task.status in GRAPH_TERMINAL_STATUSES and task.id in prerequisites:
             await cur.execute(
                 "UPDATE cayu_task_graph_members SET terminal_json = %s WHERE task_id = %s AND graph_id = %s",
                 (member_from_task(task).model_dump_json(), task.id, graph_id),
@@ -414,11 +510,24 @@ async def list_events(
 
 
 async def require_deletion_ready(cur: Any, task_ids: tuple[str, ...]) -> None:
+    from cayu.tasks._group_quiescence import require_group_deletion_ready
+
+    await cur.execute(
+        "SELECT group_id FROM cayu_task_groups WHERE graph_id IN "
+        "(SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ANY(%s) "
+        "UNION SELECT graph_id FROM cayu_task_group_retry_lineage WHERE task_id = ANY(%s))",
+        (list(task_ids), list(task_ids)),
+    )
+    for row in await cur.fetchall():
+        snapshot = await groups.read_group(cur, row[0])
+        assert snapshot is not None
+        require_group_deletion_ready(snapshot)
     await cur.execute(
         "SELECT 1 FROM cayu_task_graph_members WHERE graph_id IN "
-        "(SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ANY(%s)) "
+        "(SELECT graph_id FROM cayu_task_graph_members WHERE task_id = ANY(%s) "
+        "UNION SELECT graph_id FROM cayu_task_group_retry_lineage WHERE task_id = ANY(%s)) "
         "AND terminal_json IS NULL LIMIT 1",
-        (list(task_ids),),
+        (list(task_ids), list(task_ids)),
     )
     if await cur.fetchone() is not None:
         raise TaskGraphConflict("Nonterminal graph retains its member tasks.")

@@ -40,6 +40,7 @@ from cayu.runtime._diagnostics import (
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
+    capture_task_store_operation,
     raise_task_store_operation_failure,
 )
 from cayu.runtime.completion_result_resolvers import (
@@ -59,7 +60,7 @@ from cayu.sessions.base import (
     _renew_completion_result_event_publication,
     _reserve_completion_result_event_publication,
 )
-from cayu.tasks.base import CompletionDecisionApplicationReceipt, Task
+from cayu.tasks.base import CompletionDecisionApplicationReceipt, Task, TaskStore
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
@@ -70,6 +71,7 @@ from cayu.tasks.contracts import (
     WorkContract,
     completion_decision_application_request_sha256,
 )
+from cayu.tasks.groups import TaskGroupConflict
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
@@ -81,6 +83,10 @@ _PUBLICATION_OWNER_ID_PREFIX = "completion-result-owner:v1:"
 _PUBLICATION_OWNER_LEASE_SECONDS = 360.0
 _PUBLICATION_OWNER_HEARTBEAT_SECONDS = 30.0
 _PUBLICATION_RELEASE_SETTLEMENT_SECONDS = 5.0
+
+
+class _GroupResultResolutionNotDispatched(Exception):
+    """Runtime gate refusal, never supplied by the resolver callback."""
 
 
 @dataclass(slots=True)
@@ -132,6 +138,13 @@ class _ApplicationSettlementEvidence:
     not_committed: bool = False
 
 
+@dataclass(slots=True)
+class _GroupResolutionSettlement:
+    task_id: str
+    owner_id: str
+    callback_settled: bool = False
+
+
 def _resolver_key(reference: CompletionResultResolverRef) -> tuple[str, str, str]:
     return (
         reference.resolver_id,
@@ -147,6 +160,7 @@ class CompletionResultResolverCoordinator:
         self,
         *,
         application_coordinator: CompletionDecisionApplicationCoordinator,
+        task_store: TaskStore | None,
         session_store: SessionStore,
         event_writer: RuntimeEventWriter,
         secret_redactor: SecretRedactor,
@@ -165,6 +179,7 @@ class CompletionResultResolverCoordinator:
         if not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("Result resolution requires a SecretRedactor.")
         self._application_coordinator = application_coordinator
+        self._task_store = task_store
         self._session_store = session_store
         self._event_writer = event_writer
         self._secret_redactor = secret_redactor
@@ -173,6 +188,7 @@ class CompletionResultResolverCoordinator:
         self._locks: dict[str, _SingleFlightLock] = {}
         self._adapter_tasks: set[asyncio.Task[CapturedAwaitableOutcome[dict[str, object]]]] = set()
         self._resolution_capacity_reservations: set[object] = set()
+        self._group_resolution_settlements: dict[str, _GroupResolutionSettlement] = {}
         self._draining_adapter_tasks: dict[
             str,
             asyncio.Task[CapturedAwaitableOutcome[None]],
@@ -187,6 +203,7 @@ class CompletionResultResolverCoordinator:
             or self._adapter_tasks
             or self._resolution_capacity_reservations
             or self._draining_adapter_tasks
+            or self._group_resolution_settlements
         ):
             raise self._safe_execution_error(
                 "Result resolver coordinator inherited active execution state across a "
@@ -731,7 +748,9 @@ class CompletionResultResolverCoordinator:
     ) -> dict[str, object]:
         task = asyncio.create_task(
             capture_awaitable_outcome(
-                lambda adapter=resolver, value=request: adapter.resolve(value)
+                lambda adapter=resolver, value=request: self._resolve_with_group_ownership(
+                    adapter, value
+                )
             ),
             name="cayu-completion-result-resolver",
         )
@@ -804,6 +823,11 @@ class CompletionResultResolverCoordinator:
             ) from None
         if captured.error is not None:
             failure = captured.error
+            if type(failure) is _GroupResultResolutionNotDispatched:
+                del captured, failure
+                raise TaskGroupConflict(
+                    "Group ownership refused result resolver dispatch."
+                ) from None
             if exception_tree_contains(failure, _PROCESS_CONTROL_SIGNALS):
                 safe_failure = self._detached_process_control_failure(failure)
                 del captured, failure
@@ -834,6 +858,80 @@ class CompletionResultResolverCoordinator:
                 "Completion result resolver must return a JSON object."
             ) from None
         return captured.result
+
+    async def _resolve_with_group_ownership(
+        self, resolver: CompletionResultResolver, request: CompletionResultResolverRequest
+    ) -> dict[str, object]:
+        # This whole coroutine is retained by _invoke_resolver, including on
+        # timeout/cancellation. Never acknowledge the group from the observer.
+        store = self._task_store
+        if store is None or not store.supports_task_group_quiescence:
+            return await resolver.resolve(request)
+        retained = await store._task_group_retains_execution(request.decision.task_id)
+        if type(retained) is not bool:
+            raise WorkCompletionConflict("Group resolver ownership is invalid.")
+        if not retained:
+            return await resolver.resolve(request)
+        if (
+            request.decision.decision_id in self._group_resolution_settlements
+            or len(self._group_resolution_settlements) >= _MAX_ACTIVE_RESULT_RESOLVERS
+        ):
+            raise _GroupResultResolutionNotDispatched()
+        owner_id = uuid4().hex
+        task_id, decision_id = request.decision.task_id, request.decision.decision_id
+        acknowledgement = _GroupResolutionSettlement(task_id, owner_id)
+        self._group_resolution_settlements[decision_id] = acknowledgement
+        entry = await capture_awaitable_outcome(
+            lambda: store._observe_task_group_result_resolution(
+                task_id, decision_id, owner_id, settled=False
+            )
+        )
+        if isinstance(entry.error, TaskGroupConflict):
+            self._group_resolution_settlements.pop(decision_id, None)
+            raise _GroupResultResolutionNotDispatched() from None
+        if entry.error is not None:
+            # No callback was dispatched, but entry may have committed before
+            # acknowledgement loss. Retain its exact owner for reconciliation.
+            acknowledgement.callback_settled = True
+            raise entry.error
+        outcome = await capture_awaitable_outcome(lambda: resolver.resolve(request))
+        acknowledgement.callback_settled = True
+        settlement = await capture_awaitable_outcome(
+            lambda: self.reconcile_group_settlement(task_id, decision_id)
+        )
+        if outcome.error is not None and settlement.error is not None:
+            raise BaseExceptionGroup(
+                "Result resolution and group settlement failed.",
+                [outcome.error, settlement.error],
+            )
+        if settlement.error is not None:
+            raise settlement.error
+        if outcome.error is not None:
+            raise outcome.error
+        return cast("dict[str, object]", outcome.result)
+
+    async def reconcile_group_settlement(self, task_id: str, decision_id: str) -> None:
+        """Retry only this process's positive, naturally returned callback proof."""
+        self._ensure_process_local_generation()
+        acknowledgement = self._group_resolution_settlements.get(decision_id)
+        if acknowledgement is None or not acknowledgement.callback_settled:
+            return
+        if acknowledgement.task_id != task_id or self._task_store is None:
+            raise WorkCompletionConflict("Result settlement conflicts with its task.")
+        store = self._task_store
+        outcome = await capture_task_store_operation(
+            lambda: store._observe_task_group_result_resolution(
+                task_id, decision_id, acknowledgement.owner_id, settled=True
+            ),
+            operation_name="Completion result group settlement",
+            redactor=self._secret_redactor,
+            mutation_store=store,
+            mutation_method_name="_observe_task_group_result_resolution",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        if self._group_resolution_settlements.get(decision_id) is acknowledgement:
+            self._group_resolution_settlements.pop(decision_id)
 
     async def _apply_with_publication_ownership(
         self,
@@ -938,6 +1036,9 @@ class CompletionResultResolverCoordinator:
         return application_task.result()
 
     async def _require_resolver_not_draining(self, decision_id: str) -> None:
+        acknowledgement = self._group_resolution_settlements.get(decision_id)
+        if acknowledgement is not None and acknowledgement.callback_settled:
+            await self.reconcile_group_settlement(acknowledgement.task_id, decision_id)
         settlement = self._draining_adapter_tasks.get(decision_id)
         if settlement is not None and not settlement.done():
             raise self._safe_execution_error(

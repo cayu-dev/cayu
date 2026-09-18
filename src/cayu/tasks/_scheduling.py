@@ -99,6 +99,7 @@ def rescheduled_task(task: Task, request: TaskRescheduleRequest, *, now: datetim
     if task.status not in {
         "pending",
         "waiting_dependencies",
+        "waiting_group",
         "paused",
         "blocked",
         "needs_attention",
@@ -217,7 +218,7 @@ def schedule_transition_events(
             kinds.append(TaskScheduleEventType.EXPIRED)
         elif current.status_reason == "schedule_skipped":
             kinds.append(TaskScheduleEventType.SKIPPED)
-        elif current.status == "waiting_dependencies" and prior.status in {
+        elif current.status in {"waiting_dependencies", "waiting_group"} and prior.status in {
             "paused",
             "blocked",
             "needs_attention",

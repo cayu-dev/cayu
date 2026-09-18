@@ -8674,7 +8674,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "45",
+          "default": "46",
           "title": "Contract Version",
           "type": "string"
         },
@@ -10721,6 +10721,7 @@
       "enum": [
         "pending",
         "waiting_dependencies",
+        "waiting_group",
         "dependency_skipped",
         "claimed",
         "running",
@@ -10793,6 +10794,12 @@
           "default": "0",
           "pattern": "^(0|[1-9]\\d*)$",
           "title": "Waiting Dependencies",
+          "type": "string"
+        },
+        "waiting_group": {
+          "default": "0",
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Waiting Group",
           "type": "string"
         }
       },
@@ -13305,7 +13312,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "45",
+          "default": "46",
           "title": "Contract Version",
           "type": "string"
         }

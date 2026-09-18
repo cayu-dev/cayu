@@ -39,6 +39,7 @@ def prepare_graph_admission(
     now: datetime,
     parents: Mapping[str, Task | TaskInvocationSnapshot],
     validate_task: Callable[[TaskCreate], None],
+    finalizer_task_id: str | None = None,
 ) -> GraphAdmission:
     if request._submitted_request_sha256 is not None:
         member_ids = {node.task.task_id for node in request.nodes}
@@ -87,7 +88,9 @@ def prepare_graph_admission(
                     update={
                         "graph_id": request.graph_id,
                         "prerequisite_task_ids": node.prerequisite_task_ids,
-                        "status": TaskStatus.WAITING_DEPENDENCIES
+                        "status": TaskStatus.WAITING_GROUP
+                        if req.task_id == finalizer_task_id
+                        else TaskStatus.WAITING_DEPENDENCIES
                         if node.prerequisite_task_ids
                         else TaskStatus.PENDING,
                     }
@@ -129,7 +132,9 @@ def prepare_graph_admission(
             TaskGraphEvent(
                 graph_id=request.graph_id,
                 sequence=len(events) + 1,
-                type=TaskGraphEventType.WAITING
+                type=TaskGraphEventType.WAITING_GROUP
+                if task.status is TaskStatus.WAITING_GROUP
+                else TaskGraphEventType.WAITING
                 if task.prerequisite_task_ids
                 else TaskGraphEventType.READY,
                 occurred_at=now,

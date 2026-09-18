@@ -97,6 +97,7 @@ def plan_graph_transition(
     proposed_readiness_recorded: bool,
     first_sequence: int,
     now: datetime,
+    group_waiting_task_id: str | None = None,
 ) -> GraphTransition:
     """Validate a direct change and compute every resulting release/skip.
 
@@ -108,6 +109,11 @@ def plan_graph_transition(
     if any(not set(dependencies) <= current.keys() for dependencies in prerequisites.values()):
         raise TaskGraphUnavailable("Graph prerequisite evidence is missing.")
     prior = current[proposed.id]
+    if proposed.id == group_waiting_task_id:
+        if proposed.status in _EXECUTING_STATUSES:
+            raise TaskGraphConflict("Task group has not released its finalizer.")
+        if proposed.status is TaskStatus.PENDING:
+            proposed = proposed.model_copy(update={"status": TaskStatus.WAITING_GROUP})
     if prior.status in GRAPH_TERMINAL_STATUSES and proposed != prior:
         raise TaskGraphConflict("Terminal graph member cannot be changed.")
     for task_id, task in current.items():
@@ -148,15 +154,21 @@ def plan_graph_transition(
     if prior.status not in GRAPH_TERMINAL_STATUSES and proposed.status in GRAPH_TERMINAL_STATUSES:
         event(proposed, TaskGraphEventType.TERMINAL)
     if (
-        prior.status in {TaskStatus.PAUSED, TaskStatus.BLOCKED, TaskStatus.NEEDS_ATTENTION}
+        prior.status
+        in {
+            TaskStatus.PAUSED,
+            TaskStatus.BLOCKED,
+            TaskStatus.NEEDS_ATTENTION,
+            TaskStatus.WAITING_GROUP,
+        }
         and proposed.status is TaskStatus.PENDING
         and ready
-        and prerequisites[proposed.id]
         and not proposed_readiness_recorded
     ):
-        # A hold can outlive prerequisite completion. Resume supplies PENDING
-        # directly, so the waiting-to-pending propagation below cannot emit it.
-        # The store reads prior readiness under the same mutation ownership.
+        # A hold can outlive prerequisite completion or group release. Resume
+        # supplies PENDING directly, including for a finalizer without prerequisites.
+        # The store's recorded-readiness check also keeps already-ready roots
+        # from publishing a duplicate event after an ordinary hold/resume cycle.
         event(proposed, TaskGraphEventType.READY, prerequisites[proposed.id])
     changed = True
     while changed:
@@ -222,9 +234,22 @@ def plan_graph_transition(
             elif task.status is TaskStatus.WAITING_DEPENDENCIES and all(
                 tasks[identity].status is TaskStatus.COMPLETED for identity in deps
             ):
-                task = task.model_copy(update={"status": TaskStatus.PENDING, "updated_at": now})
+                task = task.model_copy(
+                    update={
+                        "status": TaskStatus.WAITING_GROUP
+                        if task_id == group_waiting_task_id
+                        else TaskStatus.PENDING,
+                        "updated_at": now,
+                    }
+                )
                 tasks[task_id] = copy_task(task)
-                event(task, TaskGraphEventType.READY, deps)
+                event(
+                    task,
+                    TaskGraphEventType.WAITING_GROUP
+                    if task_id == group_waiting_task_id
+                    else TaskGraphEventType.READY,
+                    deps,
+                )
                 changed = True
     return GraphTransition(
         tasks=tuple(
