@@ -24216,7 +24216,8 @@
     "tests/evals/test_workflow_exception_diagnostics.py::test_oversized_projected_metadata_cannot_hide_original_exception": 0.0003124579961877316,
     "tests/evals/test_workflow_exception_diagnostics.py::test_parallel_failure_keeps_each_child_without_selecting_a_root_cause": 0.000344249012414366,
     "tests/evals/test_workflow_exception_diagnostics.py::test_projection_failure_keeps_original_type_and_durable_details": 0.00018979102605953813,
-    "tests/evals/test_workflow_exception_diagnostics.py::test_root_hash_bound_survives_saved_report_and_cli": 0.313356251019286,
+    "tests/evals/test_workflow_exception_diagnostics.py::test_root_frame_bound_survives_saved_report_and_cli[workflow event record]": 0.08095887501258403,
+    "tests/evals/test_workflow_exception_diagnostics.py::test_root_frame_bound_survives_saved_report_and_cli[workflow session]": 0.666956625005696,
     "tests/evals/test_workflow_exception_diagnostics.py::test_typed_child_reference_survives": 0.0002219999732915312,
     "tests/evals/test_workflow_failure_projection.py::test_before_start_failure_has_no_invented_record_identity": 0.0592850421089679,
     "tests/evals/test_workflow_failure_projection.py::test_before_work_failure_keeps_usage_unknown": 0.06530741672031581,
@@ -35221,5 +35222,17 @@
     "tests/evals/test_workflow_root_hash.py::test_invalid_individual_document_is_still_rejected[payload1]": 0.09400054198340513,
     "tests/evals/test_workflow_root_hash.py::test_large_history_changed_during_scoring_cannot_publish": 3.302835625014268,
     "tests/evals/test_workflow_root_hash.py::test_root_retains_canonical_numeric_semantics": 0.0892833749530837,
-    "tests/evals/test_workflow_root_hash.py::test_unversioned_saved_anchor_keeps_legacy_digest": 0.11446099999011494
+    "tests/evals/test_workflow_root_hash.py::test_unversioned_saved_anchor_keeps_legacy_digest": 0.11446099999011494,
+    "tests/core/test_staged_terminal_transform_cost.py::test_native_round_delivers_all_results_with_bounded_parse_work[1-memory]": 1.7889926679781638,
+    "tests/core/test_staged_terminal_transform_cost.py::test_native_round_delivers_all_results_with_bounded_parse_work[1-sqlite]": 1.6047578340221662,
+    "tests/core/test_staged_terminal_transform_cost.py::test_native_round_delivers_all_results_with_bounded_parse_work[10-memory]": 5.915979709010571,
+    "tests/core/test_staged_terminal_transform_cost.py::test_native_round_delivers_all_results_with_bounded_parse_work[10-sqlite]": 5.031874166015768,
+    "tests/core/test_staged_terminal_transform_cost.py::test_owned_json_parse_skips_second_stage_validation_but_never_caches": 0.0021069590002298355,
+    "tests/core/test_staged_terminal_transform_cost.py::test_public_model_constructed_stage_is_not_trusted": 0.0008986250322777778,
+    "tests/core/test_staged_terminal_transform_cost.py::test_terminal_transition_parses_owner_once_and_detaches[completion]": 0.004583456990076229,
+    "tests/core/test_staged_terminal_transform_cost.py::test_terminal_transition_parses_owner_once_and_detaches[projection]": 0.01660629198886454,
+    "tests/core/test_staged_terminal_transform_cost.py::test_terminal_transition_parses_owner_once_and_detaches[timing]": 0.004558918008115143,
+    "tests/core/test_staged_terminal_transform_cost.py::test_transition_retains_complete_document_and_identity_checks[foreign_call]": 0.0014944169961381704,
+    "tests/core/test_staged_terminal_transform_cost.py::test_transition_retains_complete_document_and_identity_checks[foreign_round]": 0.0015315420168917626,
+    "tests/core/test_staged_terminal_transform_cost.py::test_transition_retains_complete_document_and_identity_checks[unrelated_invalid]": 0.0011062080156989396
 }

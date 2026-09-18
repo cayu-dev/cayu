@@ -4,7 +4,15 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -68,6 +76,10 @@ if TYPE_CHECKING:
     from cayu.approvals.user_input import PendingUserInput
 
 PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
+# Only the parser below supplies this marker, after owning a complete durable
+# JSON document. Nested models then originate in plain JSON, not caller-owned
+# instances, and need no second dump/validate cycle merely to detach them.
+_OWNED_ROUND_JSON_CONTEXT = object()
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_COMPLETED,
@@ -198,7 +210,15 @@ class PendingToolRound(BaseModel):
     def copy_tool_calls(
         cls,
         value: list[PendingToolCallApproval],
+        info: ValidationInfo,
     ) -> list[PendingToolCallApproval]:
+        if info.context is _OWNED_ROUND_JSON_CONTEXT:
+            if not value:
+                raise ValueError("Pending tool round must include tool calls.")
+            ids = [call.tool_call_id for call in value]
+            if len(ids) != len(set(ids)):
+                raise ValueError("Pending tool round contains duplicate tool-call identities.")
+            return value
         return copy_distinct_pending_tool_call_approvals(
             value,
             owner="Pending tool round",
@@ -227,10 +247,16 @@ class PendingToolRound(BaseModel):
     def copy_staged_terminals(
         cls,
         value: list[StagedToolCallTerminal],
+        info: ValidationInfo,
     ) -> list[StagedToolCallTerminal]:
-        copied = [
-            StagedToolCallTerminal.model_validate(item.model_dump(mode="json")) for item in value
-        ]
+        copied = (
+            value
+            if info.context is _OWNED_ROUND_JSON_CONTEXT
+            else [
+                StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
+                for item in value
+            ]
+        )
         ids = [item.tool_call_id for item in copied]
         if len(ids) != len(set(ids)):
             raise ValueError("Pending tool round cannot repeat staged terminal calls.")
@@ -798,7 +824,7 @@ def _pending_tool_round_from_owned_checkpoint(
         raise ValueError("Pending tool round checkpoint must be an object.")
     validation_rejected = False
     try:
-        pending_round = PendingToolRound(**value)
+        pending_round = PendingToolRound.model_validate(value, context=_OWNED_ROUND_JSON_CONTEXT)
     except Exception:
         if redactor is None:
             raise
@@ -1188,10 +1214,20 @@ def checkpoint_with_staged_terminals(
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     if type(copied) is not dict:
         raise AssertionError("Checkpoint copied as a non-object.")
-    owner_key, owner = _checkpoint_staged_terminal_owner(
+    owner_key, owner = _staged_terminal_owner_from_owned_checkpoint(
         copied,
         tool_round_identity=tool_round_identity,
     )
+    return _replace_owned_staged_terminals(copied, owner_key, owner, staged_terminals)
+
+
+def _replace_owned_staged_terminals(
+    copied: dict[str, Any],
+    owner_key: str,
+    owner: PendingToolRound | PendingUserInput,
+    staged_terminals: list[StagedToolCallTerminal],
+) -> dict[str, Any]:
+    """Replace stages on a call-local owned checkpoint and revalidate its owner."""
     copied_stages = [
         StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
         for item in staged_terminals
@@ -1207,14 +1243,28 @@ def _checkpoint_staged_terminal_owner(
     *,
     tool_round_identity: ToolRoundIdentity,
 ) -> tuple[str, PendingToolRound | PendingUserInput]:
-    identity = copy_tool_round_identity(tool_round_identity)
-    pending_round = pending_tool_round_from_checkpoint(checkpoint)
-    from cayu.approvals.user_input import (
-        PENDING_USER_INPUT_CHECKPOINT_KEY,
-        user_input_lifecycle_authority_from_checkpoint,
+    copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    if type(copied) is not dict:
+        raise AssertionError("Checkpoint copied as a non-object.")
+    return _staged_terminal_owner_from_owned_checkpoint(
+        copied, tool_round_identity=tool_round_identity
     )
 
-    pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
+
+def _staged_terminal_owner_from_owned_checkpoint(
+    copied: dict[str, Any],
+    *,
+    tool_round_identity: ToolRoundIdentity,
+) -> tuple[str, PendingToolRound | PendingUserInput]:
+    """Use only an immediately validated, detached document; never cache it."""
+    identity = copy_tool_round_identity(tool_round_identity)
+    pending_round = _pending_tool_round_from_owned_checkpoint(copied, copied)
+    from cayu.approvals.user_input import (
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+        _user_input_lifecycle_authority_from_owned_checkpoint,
+    )
+
+    pending_input, _ = _user_input_lifecycle_authority_from_owned_checkpoint(copied, copied)
     if pending_round is not None and pending_input is not None:
         raise RuntimeError("Checkpoint has multiple staged-terminal owners.")
     if pending_round is not None:
@@ -1293,7 +1343,10 @@ def started_staged_terminal_publication_transform(
         # workspace-bound stage until observation recovery has consumed it.
         if copied.get(WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY):
             raise RuntimeError("Cannot publish tool stages before workspace settlement.")
-        existing = checkpoint_staged_terminals(copied, tool_round_identity=identity)
+        owner_key, owner = _staged_terminal_owner_from_owned_checkpoint(
+            copied, tool_round_identity=identity
+        )
+        existing = owner.staged_terminals
         updated: list[StagedToolCallTerminal] = []
         found = False
         for item in existing:
@@ -1325,11 +1378,7 @@ def started_staged_terminal_publication_transform(
                 )
         if not found:
             raise RuntimeError("Publication timing has no staged terminal owner.")
-        return checkpoint_with_staged_terminals(
-            copied,
-            tool_round_identity=identity,
-            staged_terminals=updated,
-        )
+        return _replace_owned_staged_terminals(copied, owner_key, owner, updated)
 
     return transform
 
@@ -1356,10 +1405,11 @@ def _updated_staged_terminal_transform(
         copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
         if type(copied) is not dict:
             raise AssertionError("Checkpoint copied as a non-object.")
-        existing_stages = checkpoint_staged_terminals(
+        owner_key, owner = _staged_terminal_owner_from_owned_checkpoint(
             copied,
             tool_round_identity=identity,
         )
+        existing_stages = owner.staged_terminals
         tool_call_id = copied_event.payload.get("tool_call_id")
         if type(tool_call_id) is not str:
             raise ValueError(f"{operation} staged terminal lost its tool-call identity.")
@@ -1386,11 +1436,7 @@ def _updated_staged_terminal_transform(
             )
         if not found:
             raise RuntimeError(f"{operation} has no staged terminal owner.")
-        return checkpoint_with_staged_terminals(
-            copied,
-            tool_round_identity=identity,
-            staged_terminals=staged,
-        )
+        return _replace_owned_staged_terminals(copied, owner_key, owner, staged)
 
     return transform
 

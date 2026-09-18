@@ -113,13 +113,14 @@ def test_execution_projection_failure_does_not_become_preparation_failure():
     assert "secret" not in trial.error
 
 
-def test_root_hash_bound_survives_saved_report_and_cli(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("frame", ["workflow session", "workflow event record"])
+def test_root_frame_bound_survives_saved_report_and_cli(tmp_path, monkeypatch, capsys, frame):
     from cayu import _validation
 
     canonical = _validation.canonical_durable_json_bytes
 
     def bounded(value, field_name, **kwargs):
-        if field_name == "workflow attempt root":
+        if field_name == frame:
             kwargs["max_bytes"] = 128
         return canonical(value, field_name, **kwargs)
 
