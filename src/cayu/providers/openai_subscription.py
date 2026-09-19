@@ -114,6 +114,14 @@ DEFAULT_OPENAI_SUBSCRIPTION_REFRESH_SKEW_SECONDS = 120.0
 DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_OPENAI_SUBSCRIPTION_OAUTH_ISSUER = "https://auth.openai.com"
 OPENAI_SUBSCRIPTION_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+
+def _subscription_request_url(base_url: str, endpoint: str) -> str:
+    """Build a Codex backend URL with its required client-version parameter."""
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}/{endpoint}{separator}{urlencode({'client_version': package_version()})}"
+
+
 _PROTECTED_SUBSCRIPTION_HEADERS = {
     "authorization",
     "chatgpt-account-id",
@@ -782,7 +790,7 @@ class OpenAISubscriptionProvider(ModelProvider):
             payload = build_openai_payload(request, stream=True, reasoning_state="inline")
             credentials = await self.auth.credentials()
             raw_events = self.transport.stream_response_events(
-                url=f"{self.base_url}/responses",
+                url=_subscription_request_url(self.base_url, "responses"),
                 headers=self._headers(credentials),
                 payload=payload,
                 timeout_s=self.timeout_s,

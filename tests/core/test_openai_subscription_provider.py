@@ -224,7 +224,7 @@ def test_subscription_provider_uses_codex_endpoint_with_honest_cayu_identity() -
         ModelStreamEventType.COMPLETED,
     ]
     call = transport.calls[0]
-    assert call["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert call["url"] == "https://chatgpt.com/backend-api/codex/responses?client_version=0.6.0"
     assert call["headers"]["authorization"] == "Bearer subscription-access"
     assert call["headers"]["ChatGPT-Account-ID"] == "acct-cayu"
     assert call["headers"]["originator"] == "cayu"
