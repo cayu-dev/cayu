@@ -36217,6 +36217,26 @@
     "tests/core/test_event_side_effect_health.py::test_first_event_claim_never_retries_a_changed_snapshot[sqlite-leased]": 0.46639470898662694,
     "tests/core/test_task_group_quiescence.py::test_unentered_loser_session_cleanup_is_discoverable_after_restart[memory-pending_claim_race]": 6.47482662499533,
     "tests/core/test_task_group_quiescence.py::test_unentered_loser_session_cleanup_is_discoverable_after_restart[postgres-pending_claim_race]": 7.211492417001864,
-    "tests/core/test_task_group_quiescence.py::test_unentered_loser_session_cleanup_is_discoverable_after_restart[sqlite-pending_claim_race]": 6.600576833006926
-
+    "tests/core/test_task_group_quiescence.py::test_unentered_loser_session_cleanup_is_discoverable_after_restart[sqlite-pending_claim_race]": 6.600576833006926,
+    "tests/test_typesafe_provider.py::test_decision_is_persisted_by_cayu": 1.3409104160382412,
+    "tests/test_typesafe_provider.py::test_error_does_not_expose_credentials_or_body": 0.0058373750653117895,
+    "tests/test_typesafe_provider.py::test_invalid_configuration_fails_before_dispatch[None]": 0.002545792085584253,
+    "tests/test_typesafe_provider.py::test_invalid_configuration_fails_before_dispatch[native1]": 0.003299374075140804,
+    "tests/test_typesafe_provider.py::test_invalid_configuration_fails_before_dispatch[native3]": 0.0022302090073935688,
+    "tests/test_typesafe_provider.py::test_invalid_configuration_fails_before_dispatch[native4]": 0.0026519999955780804,
+    "tests/test_typesafe_provider.py::test_invalid_configuration_fails_before_dispatch[questions]": 0.0018009159830398858,
+    "tests/test_typesafe_provider.py::test_native_batch_and_governed_stream": 0.00810787599766627,
+    "tests/test_typesafe_provider.py::test_rejects_invalid_probabilities[-1]": 0.00018995796563103795,
+    "tests/test_typesafe_provider.py::test_rejects_invalid_probabilities[0.5]": 0.00020658300491049886,
+    "tests/test_typesafe_provider.py::test_rejects_invalid_probabilities[1.1]": 0.00017845799447968602,
+    "tests/test_typesafe_provider.py::test_rejects_invalid_probabilities[True]": 0.00032033398747444153,
+    "tests/test_typesafe_provider.py::test_rejects_invalid_probabilities[inf]": 0.00017387501429766417,
+    "tests/test_typesafe_provider.py::test_rejects_invalid_probabilities[nan]": 0.00017495901556685567,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[200-None]": 0.0058337090304121375,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[401-None]": 0.004509209014941007,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[429-http_status]": 0.004319457977544516,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[529-http_status]": 0.0032632910297252238,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[ConnectError-connection]": 0.0019199999514967203,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[ReadTimeout-timeout]": 0.003815040981862694,
+    "tests/test_typesafe_provider.py::test_sanitized_failures_preserve_retry_classification[RemoteProtocolError-connection]": 0.006872917001601309
 }

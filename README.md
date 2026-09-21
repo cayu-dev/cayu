@@ -472,6 +472,10 @@ use that generic adapter directly. Run `cayu guide providers#openrouter` or use
 the [package guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md#openrouter)
 for exact setup.
 
+For native Choice, Score, and Noul decisions, explicitly register the experimental
+[`TypeSafeProvider`](https://github.com/cayu-tech/cayu/blob/main/docs/typesafe.md). It uses TypeSafe's System One API through
+Cayu sessions and events; it does not support chat tools or multimodal inputs.
+
 For local development without separate OpenAI API billing, users can sign in
 with their own ChatGPT subscription:
 
