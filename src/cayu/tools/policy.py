@@ -195,6 +195,43 @@ class StaticToolPolicy(ToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class EnvironmentScopedToolPolicy(ToolPolicy):
+    """Pre-authorize explicit tools in named execution environments.
+
+    ``allow`` maps tool names to exact environment names (no wildcards).
+    Unlisted tools, empty scopes, and missing or unmatched environments deny.
+    Only trusted request context is checked, never model-provided arguments.
+    Names are public application identifiers, not credentials. Authorization
+    does not establish containment or bypass environment execution admission.
+    """
+
+    def __init__(self, *, allow: Mapping[str, Iterable[str]]) -> None:
+        if not isinstance(allow, Mapping):
+            raise TypeError("allow must be a mapping of tool names to environment names.")
+        scopes = {}
+        for tool_name, environments in allow.items():
+            name = require_clean_nonblank(tool_name, "tool_name")
+            scopes[name] = _copy_tool_name_set(environments, "environments")
+        self._allow: Mapping[str, frozenset[str]] = MappingProxyType(scopes)
+
+    @property
+    def allow(self) -> Mapping[str, frozenset[str]]:
+        return self._allow
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {"allow": {name: sorted(scopes) for name, scopes in sorted(self.allow.items())}}
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        if request.environment_name is not None and request.environment_name in self.allow.get(
+            request.tool_name, ()
+        ):
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+        return ToolPolicyResult(
+            decision=ToolPolicyDecision.DENY,
+            reason="Tool is not authorized in this execution environment.",
+        )
+
+
 class AlwaysRequireApprovalToolPolicy(ToolPolicy):
     """Require caller approval for specific tools (or for every tool).
 

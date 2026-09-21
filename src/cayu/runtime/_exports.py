@@ -402,6 +402,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DeferredInteractionInput": ("cayu.sessions.base", "DeferredInteractionInput"),
     "DelegatedActionReference": ("cayu.sessions.base", "DelegatedActionReference"),
     "DenyPatternRule": ("cayu.tools.policy", "DenyPatternRule"),
+    "EnvironmentScopedToolPolicy": ("cayu.tools.policy", "EnvironmentScopedToolPolicy"),
     "DeterministicCompletionVerifier": (
         "cayu.runtime.completion_verifiers",
         "DeterministicCompletionVerifier",
@@ -2135,6 +2136,7 @@ PUBLIC_NAMES = [
     "DeferredInteractionInput",
     "DelegatedActionReference",
     "DenyPatternRule",
+    "EnvironmentScopedToolPolicy",
     "DeterministicCompletionVerifier",
     "DiagnosticSeverity",
     "DispatchHandle",

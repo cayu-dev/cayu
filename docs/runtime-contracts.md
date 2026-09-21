@@ -1290,6 +1290,45 @@ Tool policy is Cayu's first scoped-authority primitive. It is separate from prov
 
 `AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include `RequiredFieldRule`, `AllowlistRule`, `RequiredAllowlistRule`, and `DenyPatternRule`; they cover required fields, optional string allowlists, required string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Use `RequiredAllowlistRule` for a security-sensitive field that must be present and allowed; it rejects missing, empty, non-string, and disallowed values atomically. `AllowlistRule` preserves the optional-field contract and does not reject a missing path. Violations return either `DENY` or `REQUIRE_APPROVAL`; they never silently rewrite tool arguments, and required-allowlist denials identify the failure as `missing`, `empty`, `wrong_type`, or `disallowed_value` in policy metadata. `TaintAwareToolPolicy` protects sensitive tools after configured untrusted source tools have produced output in the same session. It is origin-based, not a prompt-injection scanner: apps label source tools such as `read_email`, `fetch_url`, or `read_pdf` with taint labels, then protect outbound tools such as `send_email`, `make_payment`, or `execute_sql` from those labels. Cayu derives prior taint from durable terminal tool events and also applies taint within one model tool-call round before any tool implementation runs. A generic `ForkSessionRequest` derives the source session's active labels before creating the child, unions them with any explicitly supplied child labels, and persists the effective set in child metadata. The `session.forked` event reports only the source-derived set as `inherited_taint_labels`; a fork cannot clear source taint merely by omitting request metadata or changing agents. Resume and tool execution seed policy state from that durable session metadata, so the boundary remains enforced after restart. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
 
+For unattended, pre-authorized execution, use `EnvironmentScopedToolPolicy` with
+explicit tool-to-environment scopes:
+
+```python
+from cayu import EnvironmentScopedToolPolicy
+
+policy = EnvironmentScopedToolPolicy(allow={
+    "read_file": ("local", "research"),
+    "write_file": ("local", "research"),
+    "list_files": ("local", "research"),
+    "list_artifacts": ("local", "research"),
+    "inspect_document": ("local", "research"),
+    "exec_command": ("research",),
+    "browser_session": ("research",),
+})
+# Pass tool_policy=policy when registering the agent.
+```
+
+The policy compares exact names against Runtime's trusted
+`ToolPolicyRequest.environment_name`. Model arguments cannot select or spoof this
+scope. Missing environments, unmatched names, unlisted tools, and empty scopes
+are denied; there are no wildcard rules. Successful matches execute without a
+human approval checkpoint. Use `AlwaysRequireApprovalToolPolicy` when each call
+needs an operator decision instead.
+
+Scopes authorize operations in application-configured environments; naming an
+environment does not certify sandboxing, select a different runner, or grant host
+execution. Native execution admission, workload identity and binding, command
+policy, brokered egress, and workspace confinement still apply independently.
+`app.describe()` reports each tool's `policy_environment_names` and conditional
+(or denied) coverage, allowing `cayu check --fail-on warning --json` to accept
+this maintained authorization boundary. Custom subclasses remain unknown and
+ordinary allow-all policies remain unguarded. Scope names are public application
+identifiers: do not put credentials or private configuration in them. Inspection
+uses the normal secret-redaction path. The exact maintained implementation and
+its canonical scope configuration participate in execution-profile identity;
+changing scopes is an authority change subject to normal profile admission and
+adoption checks.
+
 Denied tool calls are recoverable by default. The runtime emits one terminal `tool.call.blocked`, does not run the protected operation, appends an error `tool_result` to the provider-neutral transcript, and lets the model continue. A direct `ToolPolicy` refusal discovered while planning a paused multi-call round has no `tool.call.started`; direct refusals checked at the per-call execution boundary and the nested `CommandPolicy` used by `ExecCommandTool` occur after `tool.call.started`. The terminal event is canonical for both refusal paths: its payload carries `denied_by` (`tool_policy` or `command_policy`), `decision`, a safe `reason`, `metadata`, `tool_name`, `tool_call_id`, the complete `model_step_id` / `model_attempt_id` / `tool_round_id` execution identity, `idempotency_key`, and the redacted model-facing `result`. `metadata` contains the `ToolPolicyResult` metadata for a tool-policy refusal and is an empty object for a command-policy refusal, whose result type has no metadata surface. Policy-denial reasons and model-facing refusal text are bounded to 4 KiB of UTF-8; longer values end with `[policy denial reason truncated]` without splitting a Unicode scalar. A command refusal never also emits `tool.call.failed`, so event queries, SSE replay, logging, tracing, and recovery count one terminal outcome. The denial payload does not copy command arguments, environment values, stdin, credentials, or hook-modified effective arguments; policy authors must likewise keep reasons and `ToolPolicy.metadata` free of secrets. Configured secret redaction still applies, but bounding is not semantic sanitization. Tools whose registered contract disables argument publication apply a stronger rule: policy reasons and metadata plus before/after-hook outputs, diagnostics, and actions are replaced with fixed operational classifications because an extension can derive them from withheld input even when no configured secret matches it. A before-tool hook block still uses `tool.call.blocked` with `blocked_by=before_tool_call_hook`, but it is not a policy refusal and therefore has no `denied_by`. If a before-tool hook modifies arguments and policy reauthorization refuses them, the event remains a policy denial with `denied_by=tool_policy` and also carries `blocked_by=tool_policy_reauthorization` to identify the second gate. Tool policy implementation errors are not policy refusals and retain their existing failure behavior. Existing stored events and checkpoints are not rewritten.
 
 Policies may also return `ToolPolicyDecision.REQUIRE_APPROVAL`. This is a durable interrupt, not an in-memory UI callback. The runtime authorizes the model's whole tool-call round before execution and durably replaces the unplanned round with its policy-evaluated call records. Each call records explicit policy evidence: `authoritative` for a durable policy decision, `unregistered` when no registered tool existed at planning time, and `ambiguous` when recovery cannot prove the result of an interrupted evaluation. If any authoritative call requires approval, the same checkpoint transaction retains that planned `pending_tool_round` and adds its matching `pending_tool_approval`; there is no state in which the policy-required round has been removed but its approval has not been published. The runtime then emits `session.checkpointed`, emits `tool.call.approval_requested`, marks the session `interrupted`, and emits `session.interrupted` with `interruption_type="tool_approval_required"`. No tool implementation in that round runs before approval. If a process stops before policy publication, recovery does not replay `authorize()`: stateful or time-sensitive policy evaluation is not guaranteed to reproduce the lost result. Instead, every registered call without a complete recognized durable decision is recorded as non-authoritative `ambiguous`, and the claimed recovery atomically publishes a manual gate before it may close the round. Approving that gate acknowledges recovery but records each ambiguous call as `tool.call.blocked`; it never emits `tool.call.approved` or `tool.call.started` and never dispatches the tool. A call recorded as `unregistered` also remains non-executable if a later deployment registers that name. Recovery validates transcript integrity and routes structured-output rounds before publishing the gate, so malformed or runtime-owned rounds cannot expose an executable approval surface. The same rule applies to unversioned legacy rounds, while recognized legacy decisions remain authoritative: recovery cannot downgrade a lost or recorded `DENY`, a policy exception, or missing evidence into executable approval. A versioned round marked `planned` is rejected if its evidence and decision conflict; the marker or absence of a decision is never authorization.

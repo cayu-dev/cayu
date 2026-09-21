@@ -4532,6 +4532,7 @@ from cayu.tools.policy import AllowAllToolPolicy as AllowAllToolPolicy
 from cayu.tools.policy import AllowlistRule as AllowlistRule
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy as AlwaysRequireApprovalToolPolicy
 from cayu.tools.policy import DenyPatternRule as DenyPatternRule
+from cayu.tools.policy import EnvironmentScopedToolPolicy as EnvironmentScopedToolPolicy
 from cayu.tools.policy import ParameterConstrainedToolPolicy as ParameterConstrainedToolPolicy
 from cayu.tools.policy import ParameterRule as ParameterRule
 from cayu.tools.policy import RequiredAllowlistRule as RequiredAllowlistRule

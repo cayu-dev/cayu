@@ -409,7 +409,8 @@ def check_manifest(
                         "this tool; custom policy behavior remains fail-closed."
                         if coverage_unknown
                         else "Register an enforcing ToolPolicy, such as "
-                        "AlwaysRequireApprovalToolPolicy scoped to this tool."
+                        "EnvironmentScopedToolPolicy for pre-authorized environment scopes or "
+                        "AlwaysRequireApprovalToolPolicy for per-call approval."
                     ),
                     tags=("deploy", "security"),
                     parameters={

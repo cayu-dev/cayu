@@ -40,6 +40,7 @@ from cayu.tools.policy import (
     AllowlistRule,
     AlwaysRequireApprovalToolPolicy,
     DenyPatternRule,
+    EnvironmentScopedToolPolicy,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
     RequiredFieldRule,
@@ -252,6 +253,8 @@ class ToolManifest(_ManifestModel):
     hard_deadline_seconds: float | None = Field(default=None, gt=0, le=24 * 60 * 60)
     input_schema: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
     policy_coverage: Literal["allowed", "denied", "approval_required", "conditional", "unknown"]
+    # Exact trusted-context scopes; None means this policy has no maintained scope declaration.
+    policy_environment_names: tuple[str, ...] | None = None
     # Static configured decision, not a claim that every argument violates a rule.
     parameter_policy_decision: Literal["deny", "require_approval"] | None = None
     command_policy: str | None = None
@@ -731,6 +734,11 @@ def _describe_tool(
         hard_deadline_seconds=execution_contract.hard_deadline_seconds,
         input_schema=app.redact_json(tool.schema),
         policy_coverage=_tool_policy_coverage(tool_policy, tool_name, tool.schema),
+        policy_environment_names=(
+            tuple(sorted(tool_policy.allow.get(tool_name, ())))
+            if type(tool_policy) is EnvironmentScopedToolPolicy
+            else None
+        ),
         parameter_policy_decision=_parameter_policy_decision(tool_policy, tool_name),
         command_policy=_command_policy_name(tool.tool),
         named_checks=_named_check_manifests(tool.tool),
@@ -933,6 +941,8 @@ def _tool_policy_coverage(
         return (
             "approval_required" if policy.tools is None or tool_name in policy.tools else "allowed"
         )
+    if type(policy) is EnvironmentScopedToolPolicy:
+        return "conditional" if policy.allow.get(tool_name) else "denied"
     if type(policy) is StaticToolPolicy:
         if tool_name in policy.deny or (policy.allow is not None and tool_name not in policy.allow):
             return "denied"

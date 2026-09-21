@@ -1152,6 +1152,7 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
     from cayu.tools.policy import (
         AllowAllToolPolicy,
         AlwaysRequireApprovalToolPolicy,
+        EnvironmentScopedToolPolicy,
         ParameterConstrainedToolPolicy,
         StaticToolPolicy,
         TaintAwareToolPolicy,
@@ -1161,6 +1162,7 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
     policy_types = (
         AllowAllToolPolicy,
         AlwaysRequireApprovalToolPolicy,
+        EnvironmentScopedToolPolicy,
         ParameterConstrainedToolPolicy,
         StaticToolPolicy,
         TaintAwareToolPolicy,
