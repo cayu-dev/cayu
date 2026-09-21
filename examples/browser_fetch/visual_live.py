@@ -134,9 +134,7 @@ async def exercise(args: Any, endpoint: ShopServer, output: Path):
             )
         },
         approved_destinations=(ApprovedEgressDestination(destination=HOST, policy_name="visual"),),
-        adapter=DockerEgressAdapter(
-            seccomp_profile=str(args.repo / "examples/browser_fetch/seccomp_profile.json")
-        ),
+        adapter=DockerEgressAdapter(),
         upstream=HttpxUpstream(
             routes={HOST: f"http://{endpoint.server_address[0]}:{endpoint.server_port}"}
         ),

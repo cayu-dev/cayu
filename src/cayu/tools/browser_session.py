@@ -242,6 +242,9 @@ _BACKEND_FAILURE_CODES = VISUAL_FAILURE_CODES | frozenset(
         "artifact_write_failed",
         "browser_crash",
         "browser_unavailable",
+        "browser_sandbox_unavailable",
+        "browser_dependencies_unavailable",
+        "browser_startup_failed",
         "capability_refused",
         "cleanup_failed",
         "destination_denied",
@@ -291,6 +294,14 @@ _ERROR_MESSAGES = {
     "artifact_write_failed": "The browser artifact could not be stored safely.",
     "browser_crash": "The interactive browser stopped unexpectedly.",
     "browser_unavailable": "The selected runner does not provide the interactive browser.",
+    "browser_sandbox_unavailable": (
+        "Chromium sandbox startup was denied. Use Cayu's packaged browser_seccomp_profile() "
+        "with DockerEgressAdapter(seccomp_profile=...) and a host supporting sandbox namespaces."
+    ),
+    "browser_dependencies_unavailable": (
+        "Chromium or its dependencies are missing. Build and select the pinned Cayu browser image."
+    ),
+    "browser_startup_failed": "Chromium failed to start. Verify the pinned browser image and host prerequisites.",
     "capability_refused": "The selected runner did not prove the required browser isolation.",
     "cleanup_failed": "The interactive browser could not be cleaned up safely.",
     "destination_denied": "The destination was denied by the browser egress policy.",
@@ -627,7 +638,7 @@ class BrowserBackendIdentity(BaseModel):
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
     worker_protocol: Literal["cayu.browser-session.v4"]
-    worker_version: Literal["14"]
+    worker_version: Literal["15"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod

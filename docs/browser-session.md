@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:14-playwright-1.62.0` image, the
-`cayu.browser-session.v4` protocol and worker version 14, brokered deny-by-default egress,
+`cayu-browser-fetch:15-playwright-1.62.0` image, the
+`cayu.browser-session.v4` protocol and worker version 15, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -855,3 +855,44 @@ No paid model or external website is required:
 CAYU_RUN_BROWSER_OPERATIONS_ACCEPTANCE=1 uv run pytest \
   tests/egress/test_browser_operations_docker_e2e.py -k rendered-text
 ```
+
+
+### Docker sandbox prerequisites and startup failures
+
+`VirtualEgressEnvironmentFactory(runner_kind="docker", image=DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE, ...)`
+selects Cayu's installed `browser-seccomp-v1.json` automatically. The same default
+applies to `DockerEgressAdapter()` for the exact pinned browser images, including
+reconnectable allocations. Other Docker images keep their default seccomp policy.
+Chromium still runs with its sandbox enabled, without privileged mode or extra capabilities.
+The effective profile content digest participates in reconnect configuration identity;
+changing it requires a fresh allocation.
+
+For an explicitly configured compatible image or an operator-managed override:
+
+```python
+from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.runners.browser_sandbox import browser_seccomp_profile
+
+adapter = DockerEgressAdapter(seccomp_profile=browser_seccomp_profile())
+# Or supply an absolute host path to an operator-maintained compatible profile.
+```
+
+The packaged prerequisite does not require a Runtime source checkout. Custom
+profiles take precedence over automatic selection. The Docker host must support
+Chromium sandbox namespaces; the profile cannot enable kernel features absent on
+the host. Rebuild/select the pinned image when upgrading the browser worker.
+
+Startup failures retain only bounded, fixed reason codes through the guest
+process boundary, never raw Playwright stderr, launch arguments, or environment:
+
+- `browser_sandbox_unavailable`: namespace/sandbox permission failure. Select the
+  packaged profile above and verify host namespace support.
+- `browser_dependencies_unavailable`: missing Chromium, Playwright, or native
+  libraries. Build and select the pinned browser image.
+- `browser_startup_failed`: other Chromium startup failure. Verify the pinned
+  image and host prerequisites.
+
+These codes appear in the normal tool failure evidence with concise remediation.
+A startup failure reports a retired allocation only after daemon cleanup succeeds.
+`browser_unavailable` remains the fallback for an absent/unreachable worker or
+startup loss without a known safe diagnostic.

@@ -114,7 +114,7 @@ def test_app_allocates_and_bootstraps_native_browser(
                     ("https://app-native.test",)
                 ),
                 browser_protocol="cayu.browser-session.v4",
-                browser_worker_version="14",
+                browser_worker_version="15",
                 store=profile_store,
                 key_authority=AESGCMBrowserProfileKeyAuthority(
                     authority_id="operator-test-key", key=b"p" * 32

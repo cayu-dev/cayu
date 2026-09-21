@@ -124,7 +124,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "14"
+INTERACTIVE_WORKER_VERSION = "15"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -4208,6 +4208,71 @@ def _interactive_retirement_token(session_id: str) -> str:
     )
 
 
+_STARTUP_FAILURE_CODES = frozenset(
+    {
+        "browser_sandbox_unavailable",
+        "browser_dependencies_unavailable",
+        "browser_startup_failed",
+    }
+)
+
+
+def _browser_startup_failure(exc: Exception) -> str:
+    # Never retain launch arguments, environment, paths, or raw Playwright stderr.
+    # Only a fixed diagnostic classification crosses the process boundary.
+    detail = str(exc).lower()
+    if (
+        "failed to move to new namespace" in detail
+        or "no usable sandbox" in detail
+        or ("operation not permitted" in detail and "sandbox" in detail)
+    ):
+        return "browser_sandbox_unavailable"
+    if any(
+        marker in detail
+        for marker in (
+            "executable doesn't exist",
+            "error while loading shared libraries",
+            "host system is missing dependencies",
+        )
+    ):
+        return "browser_dependencies_unavailable"
+    return "browser_startup_failed"
+
+
+def _record_startup_failure(session_id: str, code: str) -> None:
+    if code not in _STARTUP_FAILURE_CODES:
+        return
+    path = _interactive_retired_path(session_id).with_suffix(".startup-failure")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, code.encode("ascii"))
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _retired_startup_failure(session_id: str) -> str:
+    path = _interactive_retired_path(session_id).with_suffix(".startup-failure")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64:
+                return "browser_unavailable"
+            code = os.read(descriptor, 65).decode("ascii")
+        finally:
+            os.close(descriptor)
+    except (OSError, UnicodeError):
+        return "browser_unavailable"
+    return code if code in _STARTUP_FAILURE_CODES else "browser_unavailable"
+
+
 def _interactive_retirement_is_recorded(session_id: str) -> bool:
     retired_path = _interactive_retired_path(session_id)
     descriptor: int | None = None
@@ -4340,7 +4405,7 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
         )
     if _interactive_retirement_is_recorded(request.session_id):
         raise _GuestFailure(
-            "browser_unavailable",
+            _retired_startup_failure(request.session_id),
             allocation_disposition="retired",
         )
     await _start_interactive_daemon(request.session_id, socket_path)
@@ -4366,13 +4431,13 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
             return response
         if _interactive_retirement_is_recorded(request.session_id):
             raise _GuestFailure(
-                "browser_unavailable",
+                _retired_startup_failure(request.session_id),
                 allocation_disposition="retired",
             )
         await asyncio.sleep(0.025)
     if _interactive_retirement_is_recorded(request.session_id):
         raise _GuestFailure(
-            "browser_unavailable",
+            _retired_startup_failure(request.session_id),
             allocation_disposition="retired",
         )
     raise _GuestFailure("browser_unavailable")
@@ -4549,7 +4614,7 @@ class _InteractiveDaemon:
         try:
             from playwright.async_api import async_playwright
         except (ImportError, OSError) as exc:
-            raise _GuestFailure("browser_unavailable") from exc
+            raise _GuestFailure("browser_dependencies_unavailable") from exc
         proxy, ca_path = _proxy_and_ca()
         try:
             await self._start_profile_home()
@@ -4590,7 +4655,7 @@ class _InteractiveDaemon:
             raise
         except Exception as exc:
             await self.close()
-            raise _GuestFailure("browser_unavailable") from exc
+            raise _GuestFailure(_browser_startup_failure(exc)) from None
 
     async def _start_profile_home(self) -> None:
         """Allocate a profile home owned by an independent process-loss guardian."""
@@ -9212,7 +9277,7 @@ def _interactive_error_payload(
     page_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stable = error.code
-    if stable not in VISUAL_FAILURE_CODES | {
+    if stable not in VISUAL_FAILURE_CODES | _STARTUP_FAILURE_CODES | {
         "access_blocked",
         "actionability_failed",
         "allocation_lost",
@@ -9369,7 +9434,11 @@ async def _interactive_daemon_main(session_id: str) -> int:
     daemon = _InteractiveDaemon(session_id)
     server: asyncio.AbstractServer | None = None
     try:
-        await daemon.start()
+        try:
+            await daemon.start()
+        except _GuestFailure as exc:
+            _record_startup_failure(session_id, exc.code)
+            return 1
 
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:

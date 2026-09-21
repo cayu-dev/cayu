@@ -834,6 +834,7 @@ class DockerReconnect:
             if state_root.is_relative_to(workspace) or workspace.is_relative_to(state_root):
                 raise DockerEgressReconnectError("configuration_mismatch")
         identity = claim.journal.get("identity")
+        seccomp_profile = self.adapter._seccomp_profile_for_image(request.image)
         runner_configuration = _digest(
             [
                 request.runner_kind,
@@ -841,6 +842,20 @@ class DockerReconnect:
                 request.setup_commands,
                 request.host_workspace_path,
                 request.guest_ca_path,
+                *(
+                    []
+                    # Explicit profiles already participate in adapter.configuration.
+                    # Bind the automatically selected profile without changing the
+                    # identity of unrelated or explicitly configured allocations.
+                    if seccomp_profile is None or self.adapter._seccomp_profile is not None
+                    else [
+                        {
+                            "seccomp_sha256": hashlib.sha256(
+                                Path(seccomp_profile).read_bytes()
+                            ).hexdigest()
+                        }
+                    ]
+                ),
             ]
         )
         if identity is not None and identity["runner_configuration"] != runner_configuration:
@@ -856,7 +871,7 @@ class DockerReconnect:
                 env_overlay=dict(request.env_overlay),
                 _env_overlay_secret_values_present=request.env_overlay_secret_values_present,
                 ca_mount=(str(claim.ca_path), request.guest_ca_path),
-                seccomp_profile=self.adapter._seccomp_profile,
+                seccomp_profile=seccomp_profile,
                 setup_commands=request.setup_commands,
                 docker_cli_env_allowlist=self.adapter._docker_cli_env_allowlist,
             )

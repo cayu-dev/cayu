@@ -51,7 +51,7 @@ Build from the repository root:
 ```bash
 docker build \
   --file examples/browser_fetch/Dockerfile \
-  --tag cayu-browser-fetch:14-playwright-1.62.0 \
+  --tag cayu-browser-fetch:15-playwright-1.62.0 \
   .
 ```
 
@@ -103,7 +103,7 @@ Pass `policies={"product-docs": browser_policy}`,
 `approved_destinations=approved_destinations`, `credentials=[]`, an adapter
 constructed with
 `DockerEgressAdapter(seccomp_profile="/absolute/path/to/examples/browser_fetch/seccomp_profile.json")`,
-and `image="cayu-browser-fetch:14-playwright-1.62.0"` to
+and `image="cayu-browser-fetch:15-playwright-1.62.0"` to
 `VirtualEgressEnvironmentFactory`. Plain Docker proves the enforced networking
 path for trusted development and CI; it is not Cayu's untrusted-code isolation
 boundary. Applications that require a stronger boundary use the same adapter
@@ -147,3 +147,12 @@ Docker's normal syscall allowlist plus `clone`, `setns`, and `unshare`, which
 Chromium needs to create its own sandbox namespaces. The adapter requires an
 absolute existing host path and passes it to Docker explicitly. It never uses
 an unconfined profile, `SYS_ADMIN`, or privileged mode.
+
+
+The high-level virtual-egress Docker factory and `DockerEgressAdapter()` now select
+an installed, versioned Chromium seccomp profile for the pinned browser image.
+Applications do not need to copy this example's JSON file. For an explicit override,
+use `DockerEgressAdapter(seccomp_profile=browser_seccomp_profile())` with
+`browser_seccomp_profile` imported from `cayu.runners.browser_sandbox`, or pass an
+absolute path to an operator-maintained profile. See
+[Docker prerequisites and startup diagnostics](../../docs/browser-session.md#docker-sandbox-prerequisites-and-startup-failures).

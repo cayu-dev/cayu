@@ -726,6 +726,19 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             ),
         )
 
+    def _seccomp_profile_for_image(self, image: str) -> str | None:
+        from cayu.runners.browser_sandbox import browser_seccomp_profile
+        from cayu.runners.workloads import (
+            PINNED_BROWSER_FETCH_IMAGE,
+            PINNED_BROWSER_SESSION_IMAGE,
+        )
+
+        if self._seccomp_profile is not None:
+            return self._seccomp_profile
+        if image in {PINNED_BROWSER_FETCH_IMAGE, PINNED_BROWSER_SESSION_IMAGE}:
+            return validate_docker_seccomp_profile(browser_seccomp_profile())
+        return None
+
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
         if self._reconnect is not None:
             return await self._reconnect.create_runner(request)
@@ -749,7 +762,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             env_overlay=dict(request.env_overlay),
             _env_overlay_secret_values_present=(request.env_overlay_secret_values_present),
             ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
-            seccomp_profile=self._seccomp_profile,
+            seccomp_profile=self._seccomp_profile_for_image(request.image),
             setup_commands=request.setup_commands,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )

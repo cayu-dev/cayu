@@ -580,3 +580,54 @@ def test_disposal_proof_fails_closed(tmp_path, fault):
             claim.close()
 
     asyncio.run(scenario())
+
+
+def test_effective_browser_seccomp_change_refuses_reconnect(tmp_path, monkeypatch):
+    import hashlib
+
+    from cayu.egress import EgressBinding, VirtualEgressRunnerRequest, _docker_reconnect
+    from cayu.runners.workloads import PINNED_BROWSER_SESSION_IMAGE
+
+    async def scenario():
+        docker, adapter, manager, identity = setup(tmp_path / "ownership")
+        profile = tmp_path / "browser-seccomp.json"
+        profile.write_text('{"defaultAction":"SCMP_ACT_ERRNO"}')
+        monkeypatch.setattr(adapter, "_seccomp_profile_for_image", lambda _: str(profile))
+        claim = manager.claim(TOKEN)
+        claim.read()
+        binding = EgressBinding(network=NID)
+        request = VirtualEgressRunnerRequest(
+            name="fixture",
+            runner_kind="docker",
+            image=PINNED_BROWSER_SESSION_IMAGE,
+            binding=binding,
+            env_overlay={},
+            ca_cert_host_path="/fixture",
+            guest_ca_path="/ca.pem",
+            setup_commands=(),
+            egress_destinations=(),
+            session_id="session",
+            environment_name="environment",
+        )
+        identity["runner_configuration"] = _docker_reconnect._digest(
+            [
+                "docker",
+                PINNED_BROWSER_SESSION_IMAGE,
+                (),
+                None,
+                "/ca.pem",
+                {"seccomp_sha256": hashlib.sha256(profile.read_bytes()).hexdigest()},
+            ]
+        )
+        claim.write(identity=identity, image=PINNED_BROWSER_SESSION_IMAGE, state="recovering")
+        manager.bindings[id(binding)] = claim
+        profile.write_text('{"defaultAction":"SCMP_ACT_KILL"}')
+        commands = list(docker.commands)
+        try:
+            with pytest.raises(DockerEgressReconnectError, match="configuration_mismatch"):
+                await manager.create_runner(request)
+            assert docker.commands == commands
+        finally:
+            claim.close()
+
+    asyncio.run(scenario())

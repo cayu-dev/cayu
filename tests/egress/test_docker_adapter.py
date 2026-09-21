@@ -188,7 +188,10 @@ def test_create_runner_forwards_runtime_owned_overlay_secret_authority(
     )
 
 
-def test_create_runner_forwards_explicit_seccomp_profile(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("pinned", [False, True])
+def test_create_runner_forwards_explicit_seccomp_profile(monkeypatch, tmp_path, pinned) -> None:
+    from cayu.runners.workloads import PINNED_BROWSER_SESSION_IMAGE
+
     observed: dict[str, object] = {}
     expected_runner = object()
     profile = tmp_path / "chromium-seccomp.json"
@@ -209,7 +212,7 @@ def test_create_runner_forwards_explicit_seccomp_profile(monkeypatch, tmp_path) 
     request = VirtualEgressRunnerRequest(
         name="browser-worker",
         runner_kind="docker",
-        image="cayu-browser-fetch:2",
+        image=PINNED_BROWSER_SESSION_IMAGE if pinned else "cayu-browser-fetch:2",
         binding=EgressBinding(runner_kind="docker", network="internal"),
         env_overlay={},
         ca_cert_host_path="/tmp/ca.pem",
@@ -717,3 +720,47 @@ def test_prepare_rolls_back_when_authenticated_sidecar_never_becomes_ready() -> 
     assert all(not Path(source).exists() for source in mounted_sources)
     assert any(argv[0:2] == ["rm", "-f"] for argv in docker.calls)
     assert any(argv[0:2] == ["network", "rm"] for argv in docker.calls)
+
+
+@pytest.mark.parametrize("browser", [True, False])
+def test_default_seccomp_is_scoped_to_pinned_browser(monkeypatch, browser):
+    from cayu.runners.browser_sandbox import browser_seccomp_profile
+    from cayu.runners.workloads import PINNED_BROWSER_SESSION_IMAGE
+
+    observed = {}
+
+    class FakeDockerRunner:
+        @classmethod
+        async def create(cls, name, **kwargs):
+            observed.update(kwargs)
+            return object()
+
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", FakeDockerRunner)
+    adapter = DockerEgressAdapter(docker_exec=_FakeDocker(), proxy_host="127.0.0.1")
+    request = VirtualEgressRunnerRequest(
+        name="worker",
+        runner_kind="docker",
+        image=PINNED_BROWSER_SESSION_IMAGE if browser else "python:3.12-slim",
+        binding=EgressBinding(runner_kind="docker", network="internal"),
+        env_overlay={},
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path=GUEST_CA_PATH,
+        setup_commands=(),
+        egress_destinations=(),
+    )
+    asyncio.run(adapter.create_runner(request))
+    assert observed["seccomp_profile"] == (browser_seccomp_profile() if browser else None)
+
+
+def test_packaged_browser_seccomp_matches_maintained_profile():
+    from pathlib import Path
+
+    from cayu.runners.browser_sandbox import browser_seccomp_profile
+
+    packaged = Path(browser_seccomp_profile()).read_bytes()
+    assert (
+        packaged
+        == (
+            Path(__file__).resolve().parents[2] / "examples/browser_fetch/seccomp_profile.json"
+        ).read_bytes()
+    )
