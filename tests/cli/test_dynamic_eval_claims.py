@@ -235,3 +235,193 @@ def build_eval():
     assert inspection.phase == "completed"
     assert inspection.counts["error"] == len(errors)
     assert all(case.claim_state == "completed" for case in inspection.cases)
+
+
+@pytest.mark.parametrize("concurrency", [1, 4])
+@pytest.mark.parametrize("failure", ["task_group", "plain", "timeout", "none"])
+def test_workflow_failure_does_not_cancel_later_claims(tmp_path, concurrency, failure):
+    _project(
+        tmp_path,
+        f"""
+from cayu import WorkflowEvalTarget,WorkflowEvalExecution,WorkflowEvalResult,WorkflowSpec,EvaluationEvidencePolicySpec
+from cayu.workflows import WorkflowBase
+class Workflow(WorkflowBase):
+    spec=WorkflowSpec(name='process-workflow')
+    async def run(self,session_id):
+        ctx=self.context(session_id)
+        yield await ctx.start()
+        if int(self.case_id.split('-')[1]) < 4:
+            async def fail():
+                await asyncio.sleep(.01)
+                raise ValueError('synthetic ordinary workflow failure')
+            if {failure!r} == 'task_group':
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(fail())
+            elif {failure!r} == 'plain':
+                await fail()
+            elif {failure!r} == 'timeout':
+                await asyncio.sleep(60)
+        yield await ctx.completed({{'answer':'done'}})
+
+def build_eval():
+    app=build_app()
+    def execution(invocation):
+        child=build_app()
+        workflow=Workflow(child)
+        workflow.case_id=invocation.case_id
+        return WorkflowEvalExecution(app=child,workflow=workflow)
+    revision='sha256:'+'1'*64
+    target=WorkflowEvalTarget(key='process-proof',app=app,
+        request_base=RunRequest(agent_name='agent',messages=[]),application_release_id='test',
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),workflow_spec=Workflow.spec,
+        implementation_revision=revision,result_projector_revision=revision,execution_scope_revision=revision,
+        workflow_factory=execution,result_projector=lambda e:WorkflowEvalResult(final_output=e.completion_event.payload['answer']))
+    return EvalPlan(workflow_target=target,suite=EvalSuite(id='workflow-process-proof',cases=[
+        EvalCase(id=f'case-{{i}}',request=RunRequest(agent_name='agent',messages=[Message.text('user','synthetic')]),assertions=[FinalOutputContains('done')])
+        for i in range(8)]))
+""",
+    )
+    process = _start(
+        tmp_path,
+        "eval",
+        "run",
+        "--processes",
+        "2",
+        "--max-concurrency",
+        str(concurrency),
+        "--case-timeout-seconds",
+        "1",
+        "--process-directory",
+        "workers",
+        "--output",
+        "result.json",
+    )
+    stdout, stderr = _finished(process, 60)
+    logs = [(p.name, p.read_text()) for p in (tmp_path / "workers").glob("*.log")]
+    assert process.returncode == (0 if failure == "none" else 2), (stdout, stderr, logs)
+    assert (tmp_path / "result.json").exists(), (stdout, stderr, logs)
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert [case["case_id"] for case in result["cases"]] == [f"case-{i}" for i in range(8)]
+    for i, case in enumerate(result["cases"]):
+        assert case["status"] == ("error" if i < 4 and failure != "none" else "passed")
+        if i < 4 and failure in {"task_group", "plain"}:
+            evidence = case["trials"][0]["failure_evidence"]
+            assert "ValueError" in evidence["exception_types"]
+            if failure == "task_group":
+                assert "ExceptionGroup" in evidence["exception_types"]
+    claims = json.loads((tmp_path / "workers/claims.json").read_text())["cases"]
+    assert all(row["state"] == "completed" for row in claims)
+    assert (tmp_path / "workers/completed.json").exists()
+    # Inspection verifies immutable per-case hashes against the complete report.
+    from cayu.evals.process_inspection import inspect_process_eval_run
+
+    snapshot = asyncio.run(inspect_process_eval_run(tmp_path / "workers"))
+    assert snapshot.phase == "completed"
+    assert snapshot.counts["passed"] == (8 if failure == "none" else 4)
+
+
+@pytest.mark.parametrize("stop", ["caller", "deadline", "case", "slot", "unsettled"])
+@pytest.mark.parametrize("suppress", [False, True])
+def test_dynamic_slot_stop_retains_claim_and_settles_case(
+    tmp_path, monkeypatch, capsys, stop, suppress
+):
+    from types import SimpleNamespace
+
+    from cayu import EvalCase, EvalSuite, Message, RunRequest
+    from cayu.cli import _eval_processes
+    from cayu.evals._process_claims import initialize_claims
+
+    launch = {
+        "launch_id": "test",
+        "processes": 1,
+        "max_concurrency": 1,
+        "case_timeout_seconds": None,
+    }
+    identity = {"fingerprint": "1" * 64, "case_ids": ["case-0", "case-1"]}
+    initialize_claims(tmp_path, launch, identity)
+    plan = SimpleNamespace(
+        workflow_target=None,
+        app=object(),
+        suite=EvalSuite(
+            id="test",
+            cases=[
+                EvalCase(
+                    id=key,
+                    request=RunRequest(agent_name="agent", messages=[Message.text("user", key)]),
+                )
+                for key in identity["case_ids"]
+            ],
+        ),
+    )
+
+    async def scenario():
+        entered = asyncio.Event()
+        cleaning = asyncio.Event()
+        release = asyncio.Event()
+        settled = asyncio.Event()
+        calls = []
+        slot_tasks = []
+
+        from cayu.evals._process_claims import ProcessClaims
+
+        dispatch = ProcessClaims.dispatch
+
+        async def remember_slot(self, case_id, slot):
+            slot_tasks.append(asyncio.current_task())
+            return await dispatch(self, case_id, slot)
+
+        monkeypatch.setattr(ProcessClaims, "dispatch", remember_slot)
+
+        async def execute(app, suite, **kwargs):
+            calls.append(suite.cases[0].id)
+            entered.set()
+            try:
+                if stop == "case":
+                    raise asyncio.CancelledError
+                if stop == "unsettled":
+                    raise RuntimeError("unsettled cleanup")
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                if not suppress or stop == "case":
+                    raise
+                return object()
+            finally:
+                settled.set()
+
+        monkeypatch.setattr(_eval_processes, "run_eval_suite", execute)
+
+        async def run():
+            async with asyncio.timeout(None) as deadline:
+                deadlines.append(deadline)
+                await _eval_processes._dynamic_worker(tmp_path, 0, launch, identity, plan)
+
+        deadlines = []
+        worker = asyncio.create_task(run())
+        await asyncio.wait_for(entered.wait(), 5)
+        if stop == "caller":
+            worker.cancel()
+        elif stop == "deadline":
+            deadlines[0].reschedule(asyncio.get_running_loop().time())
+        elif stop == "slot":
+            slot_tasks[0].cancel()
+        if stop != "unsettled":
+            await asyncio.wait_for(cleaning.wait(), 5)
+            assert not worker.done(), "owner returned before case cleanup settled"
+        release.set()
+        expected = {"caller": asyncio.CancelledError, "deadline": TimeoutError}.get(
+            stop, ExceptionGroup
+        )
+        with pytest.raises(expected):
+            await asyncio.wait_for(worker, 5)
+        assert settled.is_set()
+        assert calls == ["case-0"]
+
+    asyncio.run(scenario())
+    rows = json.loads((tmp_path / "claims.json").read_text())["cases"]
+    assert [row["state"] for row in rows] == ["dispatching", "queued"]
+    assert not list(tmp_path.glob("case-result-*.json"))
+    assert not (tmp_path / "result-0.json").exists()
+    if stop != "unsettled":
+        assert "worker=0, slot=0, outstanding_claim='case-0'" in capsys.readouterr().err

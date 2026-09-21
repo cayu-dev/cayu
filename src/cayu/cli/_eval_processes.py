@@ -464,33 +464,71 @@ async def _dynamic_worker(directory, index, launch, identity, plan):
         else _WorkflowInstanceTracker(plan.workflow_target.instance_scope.value)
     )
 
-    async def slot_loop(slot):
-        while (case_id := await claims.claim(slot)) is not None:
-            suite = EvalSuite(
-                id=plan.suite.id, cases=[by_id[case_id]], metadata=plan.suite.metadata
+    async def run_case(suite):
+        if plan.workflow_target is not None:
+            return await _run_workflow_eval_suite(
+                plan.workflow_target,
+                suite,
+                workflow_instance_tracker=workflow_instance_tracker,
+                max_concurrency=1,
+                case_timeout_seconds=launch["case_timeout_seconds"],
+                trial_policy=policy,
             )
-            await claims.dispatch(case_id, slot)
-            if plan.workflow_target is not None:
-                result = await _run_workflow_eval_suite(
-                    plan.workflow_target,
-                    suite,
-                    workflow_instance_tracker=workflow_instance_tracker,
-                    max_concurrency=1,
-                    case_timeout_seconds=launch["case_timeout_seconds"],
-                    trial_policy=policy,
+        assert plan.app is not None
+        return await run_eval_suite(
+            plan.app,
+            suite,
+            max_concurrency=1,
+            case_timeout_seconds=launch["case_timeout_seconds"],
+            trial_policy=policy,
+        )
+
+    worker_task = asyncio.current_task()
+    assert worker_task is not None
+
+    async def slot_loop(slot):
+        slot_task = asyncio.current_task()
+        assert slot_task is not None
+        case_id = None
+
+        def check_cancelled():
+            # An awaited case may suppress cancellation during settlement. The
+            # long-lived owners still retain the request and must stop dispatch.
+            if slot_task.cancelling() or worker_task.cancelling():
+                raise asyncio.CancelledError
+
+        try:
+            while True:
+                check_cancelled()
+                case_id = await claims.claim(slot)
+                if case_id is None:
+                    return
+                suite = EvalSuite(
+                    id=plan.suite.id, cases=[by_id[case_id]], metadata=plan.suite.metadata
                 )
-            else:
-                assert plan.app is not None
-                result = await run_eval_suite(
-                    plan.app,
-                    suite,
-                    max_concurrency=1,
-                    case_timeout_seconds=launch["case_timeout_seconds"],
-                    trial_policy=policy,
-                )
-            if await _plan_identity(plan) != identity:
-                raise RuntimeError("Process eval target changed during execution")
-            await claims.complete(case_id, slot, result)
+                check_cancelled()
+                await claims.dispatch(case_id, slot)
+                check_cancelled()
+                # TaskGroup failures can leave cancellation counts on Python
+                # 3.11/3.12. Keep those counts local to this case, while ordinary
+                # await propagation still cancels and settles it with its owner.
+                result = await asyncio.create_task(run_case(suite))
+                check_cancelled()
+                if await _plan_identity(plan) != identity:
+                    raise RuntimeError("Process eval target changed during execution")
+                await claims.complete(case_id, slot, result)
+                case_id = None
+        except asyncio.CancelledError as error:
+            diagnostic = (
+                f"Process eval slot cancelled: worker={index}, slot={slot}, "
+                f"outstanding_claim={case_id!r}; no automatic replay."
+            )
+            print(diagnostic, file=sys.stderr, flush=True)
+            # TaskGroup otherwise accepts a cancelled slot as normal completion.
+            # Preserve caller/sibling shutdown, but surface independent slot loss.
+            if not worker_task.cancelling():
+                raise RuntimeError(diagnostic) from error
+            raise
 
     with progress.activate(), admission_scope(pacing):
         async with asyncio.TaskGroup() as group:
