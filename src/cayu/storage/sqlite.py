@@ -2007,6 +2007,7 @@ class SQLiteSessionStore(SessionStore):
     model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
     session_export_version: ClassVar[int] = 1
+    session_continuation_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -5198,17 +5199,20 @@ class SQLiteSessionStore(SessionStore):
         """Shared admission for closure and final deletion; no mutations."""
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
         from cayu.collaboration import _session_export_store as session_exports
+        from cayu.runtime import _session_continuation_store as continuations
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
 
         session_id = session.id
         export_records: dict[str, dict[str, Any]] = {}
+        continuation_records: dict[str, dict[str, Any]] = {}
         # Allow JSON escaping/whitespace overhead; the shared validator applies
         # the durable document limit before model reconstruction.
         rows = self._connection.execute(
             "SELECT idempotency_key, CASE WHEN length(CAST(record_json AS BLOB)) <= ? "
             "THEN record_json END FROM cayu_session_operations "
             "WHERE session_id = ? AND (idempotency_key GLOB 'tool-effect:*' "
-            "OR idempotency_key GLOB 'session-export:*')",
+            "OR idempotency_key GLOB 'session-export:*' "
+            "OR idempotency_key GLOB 'session-continuation:*')",
             (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id),
         )
         try:
@@ -5219,7 +5223,14 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(
                         "Session closure requires settled protected tool effects."
                     ) from None
-                if key.startswith(session_exports.OPERATION_PREFIX):
+                if key.startswith(continuations.CONTINUATION_OPERATION_PREFIX):
+                    if (
+                        type(value) is not dict
+                        or len(continuation_records) >= continuations.MAX_RETAINED_TICKETS + 1
+                    ):
+                        raise ValueError("Continuation retention evidence is malformed.")
+                    continuation_records[key] = value
+                elif key.startswith(session_exports.OPERATION_PREFIX):
                     if type(value) is not dict:
                         raise ValueError("Session export retention evidence is malformed.")
                     export_records[key] = value
@@ -5240,6 +5251,9 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = self._load_checkpoint_unlocked(session_id)
         deletion_now = self._ownership_clock()
+        continuations.require_erasure_quiescence(
+            session=session, checkpoint=checkpoint, records=continuation_records
+        )
         session_exports.require_erasure_quiescence(
             session=session, checkpoint=checkpoint, export_records=export_records
         )

@@ -47,6 +47,9 @@ from cayu.collaboration._session_export_store import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message
+from cayu.runtime._session_continuation_store import (
+    import_history_checkpoint as import_continuation_history_checkpoint,
+)
 from cayu.sessions.base import (
     DeferredInteractionInput,
     Session,
@@ -359,6 +362,7 @@ def import_sessions(
                 boundary=boundary,
             )
         checkpoint = import_history_checkpoint(checkpoint, session=session)
+        checkpoint = import_continuation_history_checkpoint(checkpoint, session=session)
         records_by_interaction: dict[str, list] = {}
         for record in targeted_tool_grant_state.records:
             records_by_interaction.setdefault(record.interaction_id, []).append(record)

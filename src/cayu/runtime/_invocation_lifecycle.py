@@ -421,6 +421,10 @@ class InvocationContext:
 
         return "InvocationContext(<authenticated>)"
 
+    def require_runtime_authority(self) -> None:
+        """Revalidate the runtime seal without granting authority to copied fields."""
+        self._validate()
+
     @property
     def profile(self) -> ExecutionProfileIdentity:
         """Return the sole validated profile object owned by this context."""
@@ -1995,6 +1999,13 @@ def _invocation_lifecycle_command_sha256(command: InvocationLifecycleCommand) ->
     ).hexdigest()
 
 
+def invocation_admission_command_sha256(command: AdmitInvocationCommand) -> str:
+    """Use the receiving owner's complete receipt identity for admission handoffs."""
+    if type(command) is not AdmitInvocationCommand:
+        raise TypeError("Admission identity requires a typed AdmitInvocationCommand.")
+    return _invocation_lifecycle_command_sha256(command)
+
+
 def _invocation_lifecycle_command_receipt(
     command: CreateInvocationCommand
     | AdmitInvocationCommand
@@ -2129,10 +2140,11 @@ def _compact_invocation_lifecycle_receipts(
     release_capacity_command_identity: str | None,
     result_session: Session,
     enforce_encoded_limit: bool = False,
+    pending_admission_identities: frozenset[str] = frozenset(),
 ) -> tuple[_InvocationLifecycleCommandReceipt, ...]:
     """Retain the newest replay epochs while reserving the active release."""
 
-    protected_identities = {retained_command_identity}
+    protected_identities = {retained_command_identity, *pending_admission_identities}
     if release_capacity_command_identity is not None:
         protected_identities.add(release_capacity_command_identity)
     item_limit = INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS
@@ -2248,11 +2260,15 @@ def checkpoint_with_invocation_lifecycle_receipt(
                     "Invocation release conflicts with its retained receipt capacity."
                 )
         release_capacity_command_identity = None
+    from cayu.runtime._session_continuation_store import pending_admission_receipt_identities
+
+    pending_admissions = pending_admission_receipt_identities(result_session, updated)
     compacted_receipts = _compact_invocation_lifecycle_receipts(
         retained,
         retained_command_identity=receipt.command_identity,
         release_capacity_command_identity=release_capacity_command_identity,
         result_session=result_session,
+        pending_admission_identities=pending_admissions,
     )
     try:
         next_ledger = _InvocationLifecycleReceiptLedger(
@@ -2268,6 +2284,7 @@ def checkpoint_with_invocation_lifecycle_receipt(
             release_capacity_command_identity=release_capacity_command_identity,
             result_session=result_session,
             enforce_encoded_limit=True,
+            pending_admission_identities=pending_admissions,
         )
         next_ledger = _InvocationLifecycleReceiptLedger(
             receipts=compacted_receipts,
@@ -2740,6 +2757,19 @@ async def _replay_invocation_lifecycle_command(
     if session is None:
         return None
     checkpoint = await store.load_checkpoint(replay_command.session_id)
+    return replay_invocation_lifecycle_command_from_state(session, checkpoint, replay_command)
+
+
+def replay_invocation_lifecycle_command_from_state(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    replay_command: CreateInvocationCommand
+    | AdmitInvocationCommand
+    | RebindInvocationCommand
+    | ReleaseInvocationCommand,
+) -> InvocationMutationResult | InvocationReleaseResult | None:
+    """Authenticate an exact command receipt against transaction-owned state."""
+
     identity = _invocation_lifecycle_command_identity(replay_command)
     receipt = _invocation_lifecycle_receipt_from_checkpoint(
         checkpoint,
@@ -2788,6 +2818,88 @@ async def _replay_invocation_lifecycle_command(
     )
 
 
+def reconcile_invocation_admission_from_state(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    expected_run_epoch: int,
+    command_sha256: str,
+    profile_sha256: str,
+) -> InvocationMutationResult | None:
+    """Read exact positive admission evidence without constructing a new command.
+
+    The source owner retains the expected command digest before dispatch. An
+    absent receipt is not exclusion and never authorizes another dispatch.
+    """
+    if session.id != session_id or session.instance_id != session_instance_id:
+        raise SessionRunFenced("Admission readback belongs to another session incarnation.")
+    target_epoch = expected_run_epoch + 1
+    identity = (
+        f"{InvocationLifecycleCommandKind.ADMIT.value}:"
+        f"{session_id}:{session_instance_id}:{target_epoch}"
+    )
+    receipt = _invocation_lifecycle_receipt_from_checkpoint(checkpoint, command_identity=identity)
+    if receipt is None:
+        return None
+    if (
+        receipt.command_sha256 != command_sha256
+        or receipt.kind is not InvocationLifecycleCommandKind.ADMIT
+        or receipt.session_id != session_id
+        or receipt.session_instance_id != session_instance_id
+        or receipt.active_profile.session_id != session_id
+        or receipt.active_profile.run_epoch != target_epoch
+        or receipt.active_profile.profile.fingerprint != profile_sha256
+        or receipt.result_session.id != session_id
+        or receipt.result_session.instance_id != session_instance_id
+        or receipt.result_session.run_epoch != target_epoch
+        or session.run_epoch < target_epoch
+    ):
+        raise InvocationLifecycleCommandConflict(
+            "Admission receipt conflicts with retained authority."
+        )
+    return InvocationMutationResult(
+        session=receipt.result_session,
+        active_profile=receipt.active_profile,
+        replayed=True,
+    )
+
+
+def superseding_invocation_admission_digest_from_state(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    expected_run_epoch: int,
+    command_sha256: str,
+) -> str | None:
+    """Return positive evidence that a different admission won this exact epoch.
+
+    A conflicting/malformed receipt is not exclusion evidence. Authenticate the
+    winning receipt against its own complete authority before returning its digest.
+    """
+    identity = (
+        f"{InvocationLifecycleCommandKind.ADMIT.value}:"
+        f"{session_id}:{session_instance_id}:{expected_run_epoch + 1}"
+    )
+    receipt = _invocation_lifecycle_receipt_from_checkpoint(checkpoint, command_identity=identity)
+    if receipt is None or receipt.command_sha256 == command_sha256:
+        return None
+    result = reconcile_invocation_admission_from_state(
+        session,
+        checkpoint,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        expected_run_epoch=expected_run_epoch,
+        command_sha256=receipt.command_sha256,
+        profile_sha256=receipt.active_profile.profile.fingerprint,
+    )
+    assert result is not None
+    return receipt.command_sha256
+
+
 def _apply_checkpoint_patch(
     patch: InvocationCheckpointPatch,
     checkpoint: dict[str, Any] | None,
@@ -2807,6 +2919,15 @@ def _invocation_session_state_sha256(session: Session) -> str:
 def invocation_checkpoint_state_sha256(
     checkpoint: dict[str, Any] | None,
 ) -> str:
+    # Continuation ownership has its own atomic index and receipt. Its event
+    # sequence may advance immediately before admission; it is not invocation
+    # lifecycle source authority and must not make an otherwise exact command
+    # stale.
+    if checkpoint is not None:
+        checkpoint = copy_durable_json_object(checkpoint, "invocation lifecycle checkpoint")
+        from cayu.runtime._session_continuation_store import ROOT_KEY
+
+        checkpoint.pop(ROOT_KEY, None)
     return sha256(
         canonical_durable_json_bytes(
             checkpoint,
@@ -3018,6 +3139,9 @@ async def apply_invocation_lifecycle_command(
     if type(copied) is AdmitInvocationCommand:
 
         def admit_checkpoint(session: Session, checkpoint: dict[str, Any] | None):
+            from cayu.runtime._session_continuation_store import require_admission_claim
+
+            require_admission_claim(session, checkpoint, copied)
             require_invocation_admission_source_authority(
                 session,
                 checkpoint,

@@ -19,8 +19,11 @@ from decimal import Decimal
 from enum import StrEnum
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Literal, NoReturn, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
 
 from pydantic import (
     BaseModel,
@@ -6072,6 +6075,7 @@ class SessionEngine:
         source_model: str | None = None,
         force_authority_review: bool = False,
         tool_capability_ceiling_narrowed: bool = False,
+        decision_clock: Callable[[], datetime] | None = None,
     ) -> ExecutionProfileDecision:
         event_session = session if decision_session is None else decision_session
         egress_authority_change = execution_profile_egress_authority_change(
@@ -6093,7 +6097,7 @@ class SessionEngine:
                 adoption_request_fingerprint=adoption_request_fingerprint,
                 fallback_actor=None,
                 fallback_reason="The execution profile is exactly equal.",
-                clock=self._clock,
+                clock=self._clock if decision_clock is None else decision_clock,
             )
 
         changed_component_set = frozenset(changed_component_classes)
@@ -6337,7 +6341,7 @@ class SessionEngine:
             adoption_request_fingerprint=adoption_request_fingerprint,
             fallback_actor=fallback_actor,
             fallback_reason=fallback_reason,
-            clock=self._clock,
+            clock=self._clock if decision_clock is None else decision_clock,
         )
 
     async def _replay_execution_profile_decision(
@@ -7997,12 +8001,16 @@ class SessionEngine:
         interaction_id: str,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
         queued_profile_handoff: QueuedInteractionProfileHandoff | None = None,
+        event_id: str | None = None,
+        started_at: datetime | None = None,
     ) -> Event:
         return self._interaction_started_event_from_identity(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             interaction_id=interaction_id,
+            event_id=event_id,
+            started_at=started_at,
             targeted_tool_grants=targeted_tool_grants,
             queued_profile_handoff=queued_profile_handoff,
         )
@@ -8015,13 +8023,14 @@ class SessionEngine:
         environment_name: str | None,
         interaction_id: str,
         event_id: str | None = None,
+        started_at: datetime | None = None,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
         queued_profile_handoff: QueuedInteractionProfileHandoff | None = None,
     ) -> Event:
         event_id = (
             str(uuid4()) if event_id is None else require_clean_nonblank(event_id, "event_id")
         )
-        started_at = self._clock()
+        started_at = self._clock() if started_at is None else started_at
         evidence = InteractionSummaryEvidence(
             status=InteractionStatus.ACTIVE,
             start_event_id=event_id,
@@ -14229,6 +14238,7 @@ class SessionEngine:
         request: ResumeRequest,
         *,
         store_resolved_session_id: str | None = None,
+        continuation_handoff: _ContinuationResumeHandoff | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_resume_request(
             request,
@@ -14252,6 +14262,7 @@ class SessionEngine:
             required_task_session_instance_id=task_session_instance_id,
             start_event_payload_extra={},
             start_task_on_enter=False,
+            continuation_handoff=continuation_handoff,
         )
         session_id = request.session_id
         del request
@@ -20023,6 +20034,7 @@ class SessionEngine:
         required_foreground_terminal: ForegroundChildTerminal | None = None,
         required_foreground_continuation: ForegroundParentContinuation | None = None,
         foreground_before_mutation: Callable[[], Awaitable[None]] | None = None,
+        continuation_handoff: _ContinuationResumeHandoff | None = None,
     ) -> AsyncGenerator[Event, None]:
         if request.failover is not None:
             self.session_store._require_model_failover_stage_protocol()
@@ -20377,7 +20389,11 @@ class SessionEngine:
                 del preflight_snapshot
 
         run_operation_id = (
-            str(uuid4())
+            (
+                str(uuid4())
+                if continuation_handoff is None
+                else continuation_handoff.run_operation_id
+            )
             if run_operation_id is None
             else require_clean_nonblank(run_operation_id, "run_operation_id")
         )
@@ -20904,7 +20920,11 @@ class SessionEngine:
                     adoption_request_fingerprint=None,
                     fallback_actor=_fork_initial_profile_actor(),
                     fallback_reason=("Apply the exact invocation admitted with the session fork."),
-                    clock=self._clock,
+                    clock=(
+                        self._clock
+                        if continuation_handoff is None
+                        else lambda: continuation_handoff.interaction_started_at
+                    ),
                 )
             else:
                 execution_profile_decision = await self._classify_execution_profile(
@@ -20923,6 +20943,11 @@ class SessionEngine:
                     ),
                     built_in_model_target_transition=(built_in_model_target_transition),
                     tool_capability_ceiling_narrowed=(tool_capability_ceiling_narrowed),
+                    decision_clock=(
+                        None
+                        if continuation_handoff is None
+                        else lambda: continuation_handoff.interaction_started_at
+                    ),
                 )
             # The decision is both admission authority and durable audit evidence.
             # Require the normal publication boundary to preserve it exactly before
@@ -21118,13 +21143,27 @@ class SessionEngine:
                 raise SessionRunFenced("Foreground continuation cannot replace its interaction.")
             interaction_started_event = None
         else:
-            interaction_id = str(uuid4())
+            interaction_id = (
+                continuation_handoff.interaction_id
+                if continuation_handoff is not None
+                else str(uuid4())
+            )
             interaction_started_event = self._interaction_started_event(
                 session=loaded_session,
                 registered_agent=registered_agent,
                 environment_name=_environment_name(registered_environment),
                 interaction_id=interaction_id,
                 targeted_tool_grants=prepared_targeted_tool_grants,
+                event_id=(
+                    None
+                    if continuation_handoff is None
+                    else continuation_handoff.interaction_started_event_id
+                ),
+                started_at=(
+                    None
+                    if continuation_handoff is None
+                    else continuation_handoff.interaction_started_at
+                ),
             )
         model_transition = None
         model_transition_event = None
@@ -21139,7 +21178,11 @@ class SessionEngine:
                 event_with_runtime_envelope_authority(
                     event_with_runtime_generated_id(
                         Event(
-                            id=str(uuid4()),
+                            id=(
+                                str(uuid4())
+                                if continuation_handoff is None
+                                else continuation_handoff.model_transition_event_id
+                            ),
                             type=EventType.SESSION_MODEL_SWITCHED,
                             session_id=loaded_session.id,
                             interaction_id=interaction_id,
@@ -21350,35 +21393,40 @@ class SessionEngine:
         try:
             if foreground_before_mutation is not None:
                 await foreground_before_mutation()
-            admission_result = await self.session_store.apply_invocation_lifecycle_command(
-                AdmitInvocationCommand(
-                    session_id=loaded_session.id,
-                    expected_session_instance_id=loaded_session.instance_id,
-                    expected_statuses=tuple(_RESUMABLE_SESSION_STATUSES),
-                    expected_run_epoch=loaded_session.run_epoch,
-                    expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
-                    target_active_profile=target_active_profile,
-                    checkpoint_patch=InvocationCheckpointPatch(
-                        mutation=runtime_publication_checkpoint_mutation(
-                            checkpoint,
-                            claimed_checkpoint,
-                        )
-                    ),
-                    tool_capability_ceiling=effective_tool_capability_ceiling,
-                    interaction_started_event=interaction_started_event,
-                    continued_interaction_id=(
-                        interaction_id if continuing_recovery_boundary else None
-                    ),
-                    interaction_source_messages=tuple(interaction_source_messages),
-                    defer_interaction_source=continuing_recovery_boundary,
-                    model_transition=model_transition,
-                    execution_profile_decision=execution_profile_decision,
-                    adopted_runtime_identity=adopted_runtime_identity,
-                    expected_active_profile=admission_source_active_profile,
-                )
+            admission_command = AdmitInvocationCommand(
+                session_id=loaded_session.id,
+                expected_session_instance_id=loaded_session.instance_id,
+                expected_statuses=tuple(_RESUMABLE_SESSION_STATUSES),
+                expected_run_epoch=loaded_session.run_epoch,
+                expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
+                target_active_profile=target_active_profile,
+                checkpoint_patch=InvocationCheckpointPatch(
+                    mutation=runtime_publication_checkpoint_mutation(checkpoint, claimed_checkpoint)
+                ),
+                tool_capability_ceiling=effective_tool_capability_ceiling,
+                interaction_started_event=interaction_started_event,
+                continued_interaction_id=(interaction_id if continuing_recovery_boundary else None),
+                interaction_source_messages=tuple(interaction_source_messages),
+                defer_interaction_source=continuing_recovery_boundary,
+                model_transition=model_transition,
+                execution_profile_decision=execution_profile_decision,
+                adopted_runtime_identity=adopted_runtime_identity,
+                expected_active_profile=admission_source_active_profile,
             )
+            if continuation_handoff is None:
+                admission_result = await self.session_store.apply_invocation_lifecycle_command(
+                    admission_command
+                )
+            else:
+                admission_result = await continuation_handoff.admit(
+                    admission_command, prepared_invocation_context
+                )
             if type(admission_result) is not InvocationMutationResult:
                 raise RuntimeError("Invocation admission returned an invalid result.")
+            if continuation_handoff is not None and admission_result.replayed:
+                if continuing_recovery_boundary:
+                    _deactivate_session_interaction(loaded_session.id)
+                return
             session = admission_result.session
         except (SessionRunFenced, SessionStatusConflict, ValueError) as admission_error:
             if egress_profile_activation is not None:

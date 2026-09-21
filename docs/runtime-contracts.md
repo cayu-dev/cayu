@@ -16404,3 +16404,117 @@ share the caller's record and byte bounds. Invalid pagination, duplicate record
 identities, and foreign-session evidence prevent a complete closure claim.
 Inspection and export use the same enumeration path; export repeats enumeration
 and refuses newly observed truncation rather than trusting an earlier inspection.
+
+## Durable session continuation tickets
+
+Session-owned waits use a durable continuation ticket rather than a process-local
+future. A ticket is created in `ARMING` before the session releases its writer,
+then may become `WAITING` through `SessionContinuationOwner.park(...)`, authenticated
+by its originating runtime invocation. Readiness is a separate immutable latch, so a result
+published before parking, during parking, or after a worker restart is retained
+exactly once. The ticket lifecycle is `ARMING`, `WAITING`, `SERVICING`,
+`CONSUMED`, or `RETIRED`; this slice reserves `SERVICING` for a later bounded
+clarification service and does not execute it.
+
+Readiness is accepted only through a qualified receiving owner implementing the
+typed continuation-latch receiver contract. A structurally valid latch or a
+matching digest supplied directly by a caller is not authentication.
+
+The ticket identity includes the session incarnation, owner, interaction and
+writer generation, registration key, complete target set and predicate tuple,
+deadline, failure/service policy, wait-edge revision, and continuation purpose.
+Changing any of those fields at a fixed registration key is a conflict. The
+session-owned namespace binds the application owner and exact session incarnation.
+Its bootstrap is retained under one fixed session key; concurrent initialization
+replays that binding, while a changed owner conflicts. Ticket, latch, consumption, and retirement evidence
+are committed as one bounded operation record, so acknowledgement loss replays
+the same aggregate rather than creating another continuation.
+
+`SessionContinuationOwner.prepare(intent, invocation=...)` takes a
+`ContinuationWait` and a sealed admitted runtime invocation. It derives session,
+namespace and initiating authority rather than accepting those identities from
+the wait caller. Its internal `ContinuationPreparation` uses the shared `ExpectedOperation`
+envelope binds the original initiator, source/destination owner, operation key,
+kind, version, mode and stage to the ticket. It also retains the exact
+`HandoffIntent` for wait registration before writer release. The child key derives
+from the parent operation and fixed registration slot, not a worker identity.
+`lookup_continuation_ticket(expected)` compares that original preparation and
+returns `ExactMatch`, `ExactNotFound`, `ExactConflict`, or `ExactUnavailable`;
+ordinary dependency-read failure is not interpreted as absence. Permission
+denial and caller cancellation remain separate from those lookup outcomes.
+
+Consumption atomically validates the originating ticket writer before retaining
+one exact inline-or-queued responsibility: only that writer or its documented
+released successor is eligible,
+even when the result was latched before another invocation advanced the session.
+Already-prepared handoffs retain their separate exact-reconciliation rules.
+The continuation must then enter the existing typed `AdmitInvocationCommand` boundary through
+`SessionStore.apply_invocation_lifecycle_command`; the lower-level guarded
+admission method is not an independent continuation entrance. A failed or
+cancelled admission leaves the prepared responsibility pending. Only a successful
+destination admission changes the ticket to `CONSUMED`. The retained consumption
+also includes a digest of the complete typed admission command, so changing its
+session, incarnation, status/epoch fence, interaction evidence, checkpoint
+mutation, execution profile, tool ceiling, or policy decision is a conflict.
+Retirement has its own
+exact control identity and races consumption under the same store transaction.
+
+Observer cancellation and timeout do not cancel the durable wait. Missing or
+unavailable foreign readback remains uncertain; it is never interpreted as proof
+that no result exists. Finite wait election, subscriptions, participant binding,
+and collaboration-worker scheduling are separate owner responsibilities.
+
+A session owner uses this boundary in order: call
+`SessionContinuationOwner.prepare(intent, invocation=...)` before releasing the writer, then
+accept a qualified receiver's latch through `SessionContinuationOwner.latch(...)`.
+The receiving service holds its callback and capability descriptor from trusted
+configuration, not from each request. Its callback cannot enter private publication
+scopes. Raw calls to the store's latch method—including identical already-retained
+values—do not authenticate a receipt. Generic operation publication cannot replace
+continuation evidence. An explicitly invoked host uses
+`SessionContinuationOwner.service(app, request, service)` to enter the application's
+existing resume path. Human-input, profile, whole-turn and execution admission
+checks still belong to that path. Only its final typed admission boundary calls
+`SessionContinuationOwner.admit(...)`, which receives the sealed prepared runtime context
+and checks input, profile and budget attribution against that exact command.
+Raw store consumption does not grant admission authority. The selected mode records
+whether the host is servicing an inline or queued continuation; this API does not
+create a queue or automatically schedule work. It streams through the existing
+session loop without accumulating a second copy of the event history.
+After acknowledgement loss, `reconcile_admission(...)` can authenticate the retained
+invocation receipt and finalize without reconstructing or dispatching a command.
+If a different, authenticated invocation receipt won the same session incarnation
+and target epoch, admission recovery atomically excludes the losing continuation
+as `superseded`. Its retirement identity binds the winning command digest; the
+winner remains unchanged and the losing ticket no longer blocks session closure.
+This also applies when a known pre-commit failure already released the losing
+admission claim; an unclaimed preparation still retains settlement responsibility.
+An arbitrary receipt conflict or malformed readback is not supersession evidence.
+Pending prepared responsibilities protect their target admission receipts from
+lifecycle-ledger compaction, including a competing winner's receipt. Consumption
+or exclusion releases that protection. Ledger limits remain enforced: new
+lifecycle work must refuse before mutation if protected evidence and required
+release capacity cannot fit, rather than discard pending settlement evidence.
+Missing receipt evidence preserves pending responsibility; it is not exclusion.
+An exact service retry binds the original resume request (including otherwise
+excluded loop-policy authority) and returns the retained receipt without another
+provider invocation. Changing the request or inline/queued selection conflicts.
+Cancellation or timeout may abandon the caller while these records remain pending, and
+the next worker reloads the exact operation key and retries it. A refusal is excluded
+through `SessionContinuationOwner.exclude(control, invocation=...)` with a separate
+exact refusal identity, while explicit operator cleanup uses
+`SessionContinuationOwner.retire(control, invocation=...)`. Its retained
+publication continues if the observer cancels or times out; exact retries join
+that work. Raw store retirement calls do not grant control authority. These are
+owner-level storage/reconciliation primitives; finite predicate election and automatic
+worker scheduling remain outside this slice.
+
+An unconsumed wait overtaken by a later writer can be excluded after restart
+through the registered owner's `retire(control)` with `reason="superseded"`,
+without the original in-process invocation. The atomic store boundary requires
+the exact session incarnation, ticket identity and revision, no consumption
+handoff, and an epoch beyond the original writer's single release increment.
+This cleanup never admits execution, revives the wait, or settles uncertain
+consumption. Other retirement reasons still require the original invocation.
+Checkpoint-copying forks exclude the source continuation index and tickets,
+including settled history; ordinary checkpoint transformations preserve them.

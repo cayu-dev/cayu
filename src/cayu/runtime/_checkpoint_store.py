@@ -42,6 +42,7 @@ from cayu.sessions.base import (
     _invocation_lifecycle_authority_read_scope,
     _replace_checkpoint_preserving_completion_result_event_publications,
     _runtime_publication_checkpoint_codec_scope,
+    _session_continuation_methods_owned,
     _session_export_methods_owned,
     runtime_publication_checkpoint_value_digest,
 )
@@ -79,6 +80,7 @@ def _versioned_checkpoint_transform(
     stamp_empty: bool = False,
     preserve_completion_result_publications: bool = False,
     preserve_session_exports: bool = True,
+    preserve_session_continuations: bool = True,
 ) -> CheckpointTransform:
     if checkpoint_transform is None:
         raise TypeError("checkpoint_transform is required.")
@@ -113,6 +115,7 @@ def _versioned_checkpoint_transform(
                 {} if result is None else result,
                 preserve_completion_result_publications=(preserve_completion_result_publications),
                 preserve_session_exports=preserve_session_exports,
+                preserve_session_continuations=preserve_session_continuations,
                 session_id=session_id,
             )
         except BaseException:
@@ -133,11 +136,15 @@ def _optional_versioned_checkpoint_transform(
     checkpoint_transform: CheckpointTransform | None,
     *,
     preserve_session_exports: bool = True,
+    preserve_session_continuations: bool = True,
 ) -> CheckpointTransform | None:
     if checkpoint_transform is None:
         return None
     return _versioned_checkpoint_transform(
-        session_id, checkpoint_transform, preserve_session_exports=preserve_session_exports
+        session_id,
+        checkpoint_transform,
+        preserve_session_exports=preserve_session_exports,
+        preserve_session_continuations=preserve_session_continuations,
     )
 
 
@@ -286,6 +293,14 @@ class _RuntimeCheckpointSessionStore:
     def _supports_session_export_protocol(self) -> bool:
         checker = getattr(self._store, "_supports_session_export_protocol", None)
         return _session_export_methods_owned(self) and callable(checker) and checker() is True
+
+    @property
+    def session_continuation_version(self) -> int:
+        return 1 if self._supports_session_continuation_protocol() else 0
+
+    def _supports_session_continuation_protocol(self) -> bool:
+        checker = getattr(self._store, "_supports_session_continuation_protocol", None)
+        return _session_continuation_methods_owned(self) and callable(checker) and checker() is True
 
     async def append_tool_effect_conflict(self, request: object) -> Any:
         """Evidence-only append has no checkpoint to decode, project, or stamp."""
@@ -692,6 +707,7 @@ class _RuntimeCheckpointSessionStore:
                 source_session_id,
                 checkpoint_transform,
                 preserve_session_exports=False,
+                preserve_session_continuations=False,
             ),
             **kwargs,
         )
@@ -711,6 +727,7 @@ class _RuntimeCheckpointSessionStore:
                 source_session_id,
                 checkpoint_transform,
                 preserve_session_exports=False,
+                preserve_session_continuations=False,
             ),
             **kwargs,
         )
@@ -734,7 +751,10 @@ class _RuntimeCheckpointSessionStore:
             )
 
         versioned_transform = _optional_versioned_checkpoint_transform(
-            source_session_id, checkpoint_transform, preserve_session_exports=False
+            source_session_id,
+            checkpoint_transform,
+            preserve_session_exports=False,
+            preserve_session_continuations=False,
         )
 
         def validate_fork_source(

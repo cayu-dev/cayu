@@ -412,6 +412,25 @@ from cayu.runtime._policy_evidence import ToolPolicyEvidence as ToolPolicyEviden
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
+from cayu.runtime._session_continuation import ContinuationConflict as ContinuationConflict
+from cayu.runtime._session_continuation import ContinuationConsumption as ContinuationConsumption
+from cayu.runtime._session_continuation import ContinuationLatch as ContinuationLatch
+from cayu.runtime._session_continuation import (
+    ContinuationLatchReceiver as ContinuationLatchReceiver,
+)
+from cayu.runtime._session_continuation import ContinuationNamespace as ContinuationNamespace
+from cayu.runtime._session_continuation import ContinuationPreparation as ContinuationPreparation
+from cayu.runtime._session_continuation import ContinuationRecord as ContinuationRecord
+from cayu.runtime._session_continuation import ContinuationRetirement as ContinuationRetirement
+from cayu.runtime._session_continuation import ContinuationService as ContinuationService
+from cayu.runtime._session_continuation import ContinuationTicket as ContinuationTicket
+from cayu.runtime._session_continuation import (
+    ContinuationUnavailable as ContinuationUnavailable,
+)
+from cayu.runtime._session_continuation import ContinuationWait as ContinuationWait
+from cayu.runtime._session_continuation_owner import (
+    SessionContinuationOwner as SessionContinuationOwner,
+)
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot as UsageAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageIdentitySummary as UsageIdentitySummary
 from cayu.runtime.authority import SessionRunFenced as SessionRunFenced

@@ -25167,6 +25167,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     model_completion_recovery_fence_version: ClassVar[int] = 1
     session_steering_version: ClassVar[int | None] = 1
     session_export_version: ClassVar[int] = 1
+    session_continuation_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -28396,10 +28397,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         """Shared admission for closure and final deletion; no mutations."""
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
         from cayu.collaboration import _session_export_store as session_exports
+        from cayu.runtime import _session_continuation_store as continuations
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
 
         session_id = session.id
         export_records: dict[str, dict[str, Any]] = {}
+        continuation_records: dict[str, dict[str, Any]] = {}
         after_key = ""
         while True:
             # Read one bounded document at a time, allowing JSON text overhead.
@@ -28408,13 +28411,21 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 "SELECT idempotency_key, CASE WHEN octet_length(record::text) <= %s "
                 "THEN record END FROM cayu_session_operations "
                 "WHERE session_id = %s AND (idempotency_key LIKE 'tool-effect:%%' "
-                "OR idempotency_key LIKE 'session-export:%%') "
+                "OR idempotency_key LIKE 'session-export:%%' "
+                "OR idempotency_key LIKE 'session-continuation:%%') "
                 "AND idempotency_key > %s ORDER BY idempotency_key LIMIT 1",
                 (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id, after_key),
             )
             effects = await cur.fetchall()
             for key, raw in effects:
-                if key.startswith(session_exports.OPERATION_PREFIX):
+                if key.startswith(continuations.CONTINUATION_OPERATION_PREFIX):
+                    if (
+                        type(raw) is not dict
+                        or len(continuation_records) >= continuations.MAX_RETAINED_TICKETS + 1
+                    ):
+                        raise ValueError("Continuation retention evidence is malformed.")
+                    continuation_records[key] = raw
+                elif key.startswith(session_exports.OPERATION_PREFIX):
                     if type(raw) is not dict:
                         raise ValueError("Session export retention evidence is malformed.")
                     export_records[key] = raw
@@ -28434,6 +28445,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = await self._load_checkpoint(cur, session_id)
         deletion_now = await self._session_store_now(cur)
+        continuations.require_erasure_quiescence(
+            session=session, checkpoint=checkpoint, records=continuation_records
+        )
         session_exports.require_erasure_quiescence(
             session=session, checkpoint=checkpoint, export_records=export_records
         )

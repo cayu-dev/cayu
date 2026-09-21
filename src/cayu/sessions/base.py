@@ -49,6 +49,7 @@ from cayu.runtime.event_side_effect_health import (
 )
 
 if TYPE_CHECKING:
+    from cayu.collaboration._contracts import ExactLookup
     from cayu.runtime._invocation_lifecycle import (
         AdmitInvocationCommand,
         CreateInvocationCommand,
@@ -61,6 +62,15 @@ if TYPE_CHECKING:
         SettleInvocationCommand,
     )
     from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
+    from cayu.runtime._session_continuation import (
+        ContinuationConsumption,
+        ContinuationLatch,
+        ContinuationNamespace,
+        ContinuationPreparation,
+        ContinuationRecord,
+        ContinuationRetirement,
+        ContinuationTicket,
+    )
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -4915,6 +4925,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     *,
     preserve_completion_result_publications: bool = True,
     preserve_session_exports: bool = True,
+    preserve_session_continuations: bool = True,
     session_id: str,
 ) -> dict[str, Any]:
     """Replace caller state while retaining decoded runtime-owned checkpoint authority."""
@@ -4922,6 +4933,13 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     from cayu.collaboration import _session_export_store as session_exports
 
     # Validate before decoding can normalize caller-controlled authority.
+    from cayu.runtime import _session_continuation_store as continuations
+
+    continuation_root = (
+        continuations.project_checkpoint_root(current, replacement, session_id=session_id)
+        if preserve_session_continuations
+        else None
+    )
     export_root = (
         session_exports.project_checkpoint_root(current, replacement, session_id=session_id)
         if preserve_session_exports
@@ -5028,6 +5046,9 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     updated.pop(session_exports.ROOT_KEY, None)
     if export_root is not None:
         updated[session_exports.ROOT_KEY] = export_root
+    updated.pop(continuations.ROOT_KEY, None)
+    if continuation_root is not None:
+        updated[continuations.ROOT_KEY] = continuation_root
     # Restored private authority counts toward the same complete document
     # ceiling as the callback's ordinary state, before either side is written.
     return copy_durable_json_object(updated, "checkpoint")
@@ -5041,6 +5062,7 @@ def _copy_checkpoint_for_transform(
     """Validate and detach callback-visible state from store-owned authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
+    from cayu.runtime import _session_continuation_store as continuations
 
     if checkpoint is None:
         return None
@@ -5067,6 +5089,11 @@ def _copy_checkpoint_for_transform(
         copied.pop(MODEL_FAILOVER_CHECKPOINT_KEY, None)
     if not session_exports.checkpoint_visible(session_id=session_id):
         copied.pop(session_exports.ROOT_KEY, None)
+    # Typed lifecycle callbacks must retain receipts needed by pending
+    # continuations. Read visibility does not grant index mutation authority;
+    # project_checkpoint_root still requires the continuation owner's scope.
+    if not continuations.checkpoint_visible() and not lifecycle_authority_allowed:
+        copied.pop(continuations.ROOT_KEY, None)
     return copied
 
 
@@ -5470,6 +5497,7 @@ def transform_fork_checkpoint(
             None,
             transformed,
             preserve_session_exports=False,
+            preserve_session_continuations=False,
             session_id=source_session.id,
         )
     except BaseException:
@@ -10035,17 +10063,49 @@ _SESSION_EXPORT_OWNER_METHODS = (
 
 def _session_export_methods_owned(store: object) -> bool:
     """An override must explicitly re-attest the complete export owner boundary."""
+    return _session_owner_methods_owned(
+        store, "session_export_version", _SESSION_EXPORT_OWNER_METHODS
+    )
+
+
+def _session_continuation_methods_owned(store: object) -> bool:
+    return _session_owner_methods_owned(
+        store,
+        "session_continuation_version",
+        (
+            *_SESSION_EXPORT_OWNER_METHODS,
+            "_publish_continuation_operation",
+            "_initialize_continuation_namespace",
+            "prepare_continuation_ticket",
+            "load_continuation_ticket",
+            "lookup_continuation_ticket",
+            "mark_continuation_waiting",
+            "latch_continuation",
+            "consume_continuation",
+            "_consume_continuation",
+            "_claim_continuation_admission",
+            "_release_continuation_admission_claim",
+            "_finalize_continuation_admission",
+            "retire_continuation",
+            "apply_invocation_lifecycle_command",
+        ),
+    )
+
+
+def _session_owner_methods_owned(
+    store: object, version_field: str, methods: tuple[str, ...]
+) -> bool:
     mro = type(store).__mro__
     capability_owner = next(
-        (index for index, owner in enumerate(mro) if "session_export_version" in vars(owner)),
+        (index for index, owner in enumerate(mro) if version_field in vars(owner)),
         len(mro),
     )
     if capability_owner == len(mro):
         return False
     instance_fields = vars(store)
-    if "session_export_version" in instance_fields:
+    if version_field in instance_fields:
         return False
-    for method in _SESSION_EXPORT_OWNER_METHODS:
+    for method in methods:
         method_owner = next(
             (index for index, owner in enumerate(mro) if method in vars(owner)), len(mro)
         )
@@ -10056,6 +10116,20 @@ def _session_export_methods_owned(store: object) -> bool:
         if method_owner < capability_owner:
             return False
     return True
+
+
+def _continuation_writer_was_released(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+) -> bool:
+    """Allow exactly one post-release epoch without accepting a new writer."""
+
+    active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    return active is not None and active_invocation_execution_profile_is_released(
+        active,
+        session_id=session.id,
+        run_epoch=session.run_epoch,
+    )
 
 
 class SessionStore(ABC):
@@ -10076,6 +10150,7 @@ class SessionStore(ABC):
     # Custom stores must opt into optional capabilities explicitly. Conservative
     # defaults keep discovery truthful for inherited methods that fail closed.
     session_export_version: ClassVar[int] = 0
+    session_continuation_version: ClassVar[int] = 0
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False
@@ -11520,6 +11595,13 @@ class SessionStore(ABC):
             and _session_export_methods_owned(self)
         )
 
+    def _supports_session_continuation_protocol(self) -> bool:
+        return (
+            type(self.session_continuation_version) is int
+            and self.session_continuation_version == 1
+            and _session_continuation_methods_owned(self)
+        )
+
     def _supports_owned_off_thread_session_commit_guard_protocol(self) -> bool:
         """Return whether this exact guarded-publication override owns its capability."""
 
@@ -11653,6 +11735,982 @@ class SessionStore(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} must implement store-time guarded operation publication."
         )
+
+    async def _publish_continuation_operation(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        events: list[Event],
+    ) -> Session:
+        """Enclose only a session-owned transform, never a receiving callback."""
+        from cayu.runtime._session_continuation_scope import publication_scope
+        from cayu.runtime._session_continuation_store import index_publication
+
+        def indexed_transform(session, checkpoint, current):
+            publication = operation_transform(session, checkpoint, current)
+            return index_publication(session, checkpoint, current, publication, key=idempotency_key)
+
+        with publication_scope(idempotency_key), _invocation_lifecycle_authority_read_scope():
+            return await self.publish_session_operation(
+                session_id,
+                idempotency_key=idempotency_key,
+                operation_transform=indexed_transform,
+                events=events,
+            )
+
+    async def _initialize_continuation_namespace(
+        self, namespace: ContinuationNamespace
+    ) -> ContinuationNamespace:
+        """Retain one immutable application/session owner at the fixed bootstrap key."""
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            CONTINUATION_NAMESPACE_KEY,
+            ContinuationConflict,
+            ContinuationNamespace,
+            ContinuationUnavailable,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        namespace = prepare_contract(ContinuationNamespace, namespace, redactor=SecretRedactor())
+        from cayu.runtime._session_continuation_scope import (
+            require_namespace_preparation,
+            require_preparation_writer,
+        )
+
+        require_namespace_preparation(namespace)
+
+        def transform(session, checkpoint, current):
+            if (
+                session.id != namespace.session_id
+                or session.instance_id != namespace.session_instance_id
+            ):
+                raise SessionRunFenced(
+                    "Continuation namespace belongs to another session instance."
+                )
+            if current is not None and ContinuationNamespace.model_validate(current) != namespace:
+                raise ContinuationConflict("Session continuation owner binding already exists.")
+            if current is None:
+                require_preparation_writer(session, checkpoint)
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={CONTINUATION_NAMESPACE_KEY: namespace.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            namespace.session_id,
+            idempotency_key=CONTINUATION_NAMESPACE_KEY,
+            operation_transform=transform,
+            events=[],
+        )
+        retained = await self.load_session_operation(
+            namespace.session_id, CONTINUATION_NAMESPACE_KEY
+        )
+        if retained is None or ContinuationNamespace.model_validate(retained) != namespace:
+            raise ContinuationUnavailable("Continuation namespace is not durably readable.")
+        return namespace
+
+    async def prepare_continuation_ticket(
+        self, command: ContinuationPreparation
+    ) -> ContinuationRecord:
+        """Atomically retain one exact continuation ticket in ``ARMING`` state."""
+
+        from cayu.collaboration._contracts import CollaborationConflict
+        from cayu.collaboration._preparation import prepare_contract, require_exact_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationPreparation,
+            ContinuationRecord,
+            ContinuationUnavailable,
+            continuation_namespace_id,
+            continuation_operation_key,
+            require_writer_generation,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        command = prepare_contract(ContinuationPreparation, command, redactor=SecretRedactor())
+        from cayu.runtime._session_continuation_scope import (
+            require_preparation,
+            require_preparation_writer,
+        )
+
+        require_preparation(command)
+        from cayu.runtime._session_continuation_store import require_reserved_capacity
+
+        require_reserved_capacity(command)
+        ticket = command.intent
+        session = await self.load(ticket.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {ticket.session_id}")
+        if (
+            session.instance_id != ticket.session_instance_id
+            or ticket.namespace.session_id != session.id
+            or ticket.namespace.session_instance_id != session.instance_id
+            or ticket.namespace.namespace_id
+            != continuation_namespace_id(session.id, session.instance_id, ticket.owner)
+            or ticket.state != "ARMING"
+            or ticket.revision != 1
+        ):
+            raise SessionRunFenced("Continuation ticket lacks the current session authority.")
+        await self._initialize_continuation_namespace(ticket.namespace)
+        key = continuation_operation_key(ticket)
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced("Continuation ticket belongs to a retired session instance.")
+            if current is None:
+                require_preparation_writer(current_session, checkpoint)
+                if current_session.run_epoch != ticket.writer_generation:
+                    raise SessionRunFenced(
+                        "Continuation ticket lacks the current writer generation."
+                    )
+                require_writer_generation(ticket, current_session.run_epoch)
+                record = ContinuationRecord(
+                    namespace=ticket.namespace, preparation=command, ticket=ticket
+                )
+            else:
+                record = ContinuationRecord.model_validate(current)
+                try:
+                    require_exact_contract(command, record.preparation, redactor=SecretRedactor())
+                except CollaborationConflict:
+                    raise ContinuationConflict("Continuation preparation conflicts.") from None
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: record.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None:
+            raise ContinuationUnavailable("Continuation preparation was not durably readable.")
+        return record
+
+    async def lookup_continuation_ticket(
+        self, expected: ContinuationPreparation
+    ) -> ExactLookup[ContinuationRecord]:
+        """Return exact retained preparation evidence, never infer an outcome."""
+
+        from cayu.collaboration._contracts import (
+            CollaborationConflict,
+            ExactConflict,
+            ExactMatch,
+            ExactNotFound,
+            ExactUnavailable,
+        )
+        from cayu.collaboration._preparation import prepare_contract, require_exact_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationPreparation,
+            ContinuationRecord,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        expected = prepare_contract(ContinuationPreparation, expected, redactor=SecretRedactor())
+        try:
+            record = await self.load_continuation_ticket(
+                expected.intent.session_id,
+                registration_key=expected.operation.caller_key,
+                session_instance_id=expected.intent.session_instance_id,
+            )
+        except (PermissionError, SessionRunFenced):
+            raise
+        except Exception:
+            # A failed/malformed authoritative read is an explicit lookup
+            # outcome, never proof of absence. Cancellation/fatal signals are
+            # deliberately outside this ordinary-dependency boundary.
+            return ExactUnavailable()
+        if record is None:
+            return ExactNotFound()
+        try:
+            require_exact_contract(expected, record.preparation, redactor=SecretRedactor())
+        except CollaborationConflict:
+            return ExactConflict()
+        return ExactMatch[ContinuationRecord](receipt=record)
+
+    async def load_continuation_ticket(
+        self,
+        session_id: str,
+        *,
+        registration_key: str,
+        session_instance_id: str,
+    ) -> ContinuationRecord | None:
+        """Read one continuation aggregate without treating absence as proof."""
+
+        from cayu.runtime._session_continuation import (
+            CONTINUATION_NAMESPACE_KEY,
+            ContinuationNamespace,
+            ContinuationRecord,
+            continuation_operation_key_for_registration,
+        )
+
+        session = await self.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        if session.instance_id != session_instance_id:
+            raise SessionRunFenced("Continuation readback belongs to a retired session instance.")
+        raw_namespace = await self.load_session_operation(session_id, CONTINUATION_NAMESPACE_KEY)
+        if raw_namespace is None:
+            return None
+        namespace = ContinuationNamespace.model_validate(raw_namespace)
+        if (
+            namespace.session_id != session.id
+            or namespace.session_instance_id != session_instance_id
+        ):
+            raise SessionRunFenced("Continuation namespace belongs to another session instance.")
+        key = continuation_operation_key_for_registration(
+            session_id=session.id,
+            session_instance_id=session_instance_id,
+            namespace_id=namespace.namespace_id,
+            registration_key=registration_key,
+        )
+        raw = await self.load_session_operation(session.id, key)
+        if raw is None:
+            return None
+        record = ContinuationRecord.model_validate(raw)
+        from cayu.runtime._session_continuation_store import require_history
+
+        require_history(record)
+        if (
+            record.namespace != namespace
+            or record.ticket.session_id != session.id
+            or record.ticket.session_instance_id != session_instance_id
+            or record.ticket.registration_key != registration_key
+        ):
+            raise SessionRunFenced("Continuation readback belongs to another session authority.")
+        return record
+
+    async def mark_continuation_waiting(self, ticket: ContinuationTicket) -> ContinuationRecord:
+        """Publish the ARMING-to-WAITING transition under the ticket's CAS."""
+
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationRecord,
+            ContinuationTicket,
+            ContinuationUnavailable,
+            continuation_operation_key,
+            require_ticket_identity,
+            require_writer_generation,
+        )
+        from cayu.runtime._session_continuation_scope import require_park
+        from cayu.vaults.redaction import SecretRedactor
+
+        ticket = prepare_contract(ContinuationTicket, ticket, redactor=SecretRedactor())
+        require_park(ticket)
+        key = continuation_operation_key(ticket)
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced("Continuation ticket belongs to a retired session instance.")
+            require_writer_generation(
+                ticket,
+                current_session.run_epoch,
+                allow_released_next_generation=_continuation_writer_was_released(
+                    current_session, checkpoint
+                ),
+            )
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is not durably armed.")
+            record = ContinuationRecord.model_validate(current)
+            require_ticket_identity(ticket, record.ticket)
+            if record.ticket.state == "WAITING":
+                updated = record
+            elif record.ticket.state == "ARMING" and record.ticket.revision == ticket.revision:
+                updated_ticket = record.ticket.model_copy(
+                    update={"state": "WAITING", "revision": record.ticket.revision + 1}
+                )
+                updated = record.model_copy(update={"ticket": updated_ticket})
+            else:
+                raise ContinuationConflict("Continuation ticket cannot enter WAITING state.")
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None:
+            raise ContinuationUnavailable("Continuation wait transition was not durably readable.")
+        return record
+
+    async def latch_continuation(
+        self,
+        latch: ContinuationLatch,
+    ) -> ContinuationRecord:
+        """Publish one immutable readiness latch, including an ARMING latch."""
+
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationRecord,
+            ContinuationUnavailable,
+            continuation_operation_key,
+            require_latch_identity,
+            require_ticket_identity,
+            require_writer_generation,
+        )
+        from cayu.runtime._session_continuation_scope import require_authenticated_latch
+
+        require_authenticated_latch(latch)
+
+        ticket = latch.ticket
+        key = continuation_operation_key(ticket)
+
+        # Reconcile an already committed latch before re-entering the receiving
+        # owner.  A lost acknowledgement must not turn an exact durable replay
+        # into a fresh foreign read (or make replay depend on a source that has
+        # since expired).  A missing latch still requires positive receiver
+        # authentication below.
+        existing = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if existing is not None and existing.latch is not None:
+            require_ticket_identity(existing.latch.ticket, ticket)
+            require_latch_identity(existing.latch, latch)
+            return existing
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced("Continuation latch belongs to a retired session instance.")
+            require_writer_generation(
+                ticket,
+                current_session.run_epoch,
+                allow_released_next_generation=_continuation_writer_was_released(
+                    current_session, checkpoint
+                ),
+            )
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is not durably armed.")
+            record = ContinuationRecord.model_validate(current)
+            require_ticket_identity(ticket, record.ticket)
+            if record.latch is not None:
+                require_latch_identity(record.latch, latch)
+                updated = record
+            elif record.ticket.state in {"CONSUMED", "RETIRED"}:
+                raise ContinuationConflict("A terminal continuation cannot accept a latch.")
+            else:
+                updated = record.model_copy(update={"latch": latch})
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None:
+            raise ContinuationUnavailable("Continuation latch was not durably readable.")
+        return record
+
+    async def consume_continuation(
+        self,
+        consumption: ContinuationConsumption,
+    ) -> ContinuationRecord:
+        """Atomically elect one inline or queued continuation and replay it."""
+
+        from cayu.runtime._session_continuation_scope import require_consumption
+
+        require_consumption(consumption)
+
+        return await self._consume_continuation(consumption, admission_boundary=False)
+
+    async def _claim_continuation_admission(
+        self, consumption: ContinuationConsumption
+    ) -> tuple[ContinuationRecord, bool]:
+        """Fence retirement before dispatching the typed admission mutation."""
+
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationConsumption,
+            ContinuationRecord,
+            ContinuationUnavailable,
+            continuation_operation_key,
+            require_latch_identity,
+            require_ticket_identity,
+        )
+        from cayu.runtime._session_continuation_scope import require_consumption
+        from cayu.vaults.redaction import SecretRedactor
+
+        consumption = prepare_contract(
+            ContinuationConsumption, consumption, redactor=SecretRedactor()
+        )
+        require_consumption(consumption)
+        if consumption.receipt_stage != "prepared":
+            raise ContinuationConflict(
+                "Admission claims require a prepared responsibility receipt."
+            )
+        ticket = consumption.ticket
+        key = continuation_operation_key(ticket)
+        acquired = False
+        claim_id = uuid4().hex
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            nonlocal acquired
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced(
+                    "Continuation admission claim belongs to a retired session instance."
+                )
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is unavailable.")
+            record = ContinuationRecord.model_validate(current)
+            if record.consumption is None:
+                raise ContinuationConflict("Continuation responsibility is not prepared.")
+            existing = record.consumption
+            require_ticket_identity(existing.ticket, ticket)
+            require_latch_identity(existing.latch, consumption.latch)
+            if existing.receipt_stage != "prepared":
+                raise ContinuationConflict("Continuation responsibility is no longer prepared.")
+            base_update = {
+                "admission_claimed": False,
+                "admission_claim_id": None,
+            }
+            comparable_existing = existing.model_copy(update=base_update)
+            comparable_consumption = consumption.model_copy(update=base_update)
+            if comparable_existing.model_dump(mode="json") != comparable_consumption.model_dump(
+                mode="json"
+            ):
+                raise ContinuationConflict("Continuation admission differs from its receipt.")
+            if existing.admission_claimed:
+                updated = record
+            else:
+                acquired = True
+                updated = record.model_copy(
+                    update={
+                        "consumption": existing.model_copy(
+                            update={
+                                "admission_claimed": True,
+                                "admission_claim_id": claim_id,
+                            }
+                        )
+                    }
+                )
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None or record.consumption is None:
+            raise ContinuationUnavailable("Continuation admission claim was not durably readable.")
+        return record, acquired
+
+    async def _release_continuation_admission_claim(
+        self, consumption: ContinuationConsumption
+    ) -> ContinuationRecord:
+        """Fence an uncommitted claim, or exclude it from positive supersession evidence."""
+
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationConsumption,
+            ContinuationRecord,
+            ContinuationUnavailable,
+            continuation_operation_key,
+            require_latch_identity,
+            require_ticket_identity,
+        )
+        from cayu.runtime._session_continuation_scope import require_consumption
+        from cayu.vaults.redaction import SecretRedactor
+
+        consumption = prepare_contract(
+            ContinuationConsumption, consumption, redactor=SecretRedactor()
+        )
+        require_consumption(consumption)
+        if consumption.receipt_stage != "prepared":
+            raise ContinuationConflict("Admission claim release requires a prepared receipt.")
+        ticket = consumption.ticket
+        key = continuation_operation_key(ticket)
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced(
+                    "Continuation admission claim belongs to a retired session instance."
+                )
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is unavailable.")
+            record = ContinuationRecord.model_validate(current)
+            if record.consumption is None:
+                raise ContinuationConflict("Continuation responsibility is not claimed.")
+            existing = record.consumption
+            require_ticket_identity(existing.ticket, ticket)
+            require_latch_identity(existing.latch, consumption.latch)
+            if (
+                existing.receipt_stage != "prepared"
+                or existing.admission_claimed != consumption.admission_claimed
+                or existing.admission_claim_id != consumption.admission_claim_id
+                or existing.model_copy(
+                    update={
+                        "admission_claimed": False,
+                        "admission_claim_id": None,
+                    }
+                ).model_dump(mode="json")
+                != consumption.model_copy(
+                    update={
+                        "admission_claimed": False,
+                        "admission_claim_id": None,
+                    }
+                ).model_dump(mode="json")
+            ):
+                raise ContinuationConflict("Continuation admission claim differs from its receipt.")
+            from cayu.runtime._invocation_lifecycle import (
+                reconcile_invocation_admission_from_state,
+                superseding_invocation_admission_digest_from_state,
+            )
+
+            superseding_digest = superseding_invocation_admission_digest_from_state(
+                current_session,
+                checkpoint,
+                session_id=ticket.session_id,
+                session_instance_id=ticket.session_instance_id,
+                expected_run_epoch=consumption.admission_expected_run_epoch,
+                command_sha256=consumption.admission_command_digest,
+            )
+            if superseding_digest is not None:
+                from cayu.runtime._session_continuation import ContinuationRetirement
+
+                retired_ticket = record.ticket.model_copy(
+                    update={
+                        "state": "RETIRED",
+                        "revision": record.ticket.revision + 1,
+                    }
+                )
+                updated = record.model_copy(
+                    update={
+                        "ticket": retired_ticket,
+                        "consumption": existing.model_copy(
+                            update={
+                                "ticket": retired_ticket,
+                                "receipt_stage": "excluded",
+                                "admission_claimed": False,
+                                "admission_claim_id": None,
+                            }
+                        ),
+                        "retirement": ContinuationRetirement(
+                            ticket=retired_ticket,
+                            control_id="admission-superseded:" + superseding_digest,
+                            reason="superseded",
+                            retired_at=current_session.updated_at.isoformat(),
+                        ),
+                    }
+                )
+                return SessionOperationPublication(
+                    checkpoint={} if checkpoint is None else checkpoint,
+                    operation_records={key: updated.model_dump(mode="json")},
+                )
+
+            if not existing.admission_claimed:
+                raise ContinuationConflict(
+                    "Unclaimed continuation exclusion requires positive supersession evidence."
+                )
+            if (
+                reconcile_invocation_admission_from_state(
+                    current_session,
+                    checkpoint,
+                    session_id=ticket.session_id,
+                    session_instance_id=ticket.session_instance_id,
+                    expected_run_epoch=consumption.admission_expected_run_epoch,
+                    command_sha256=consumption.admission_command_digest,
+                    profile_sha256=consumption.profile_digest,
+                )
+                is not None
+            ):
+                raise ContinuationConflict("Committed continuation admission cannot be released.")
+            updated = record.model_copy(
+                update={
+                    "consumption": existing.model_copy(
+                        update={
+                            "admission_claimed": False,
+                            "admission_claim_id": None,
+                        }
+                    )
+                }
+            )
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None or record.consumption is None:
+            raise ContinuationUnavailable("Continuation claim release was not durably readable.")
+        return record
+
+    async def _finalize_continuation_admission(
+        self,
+        consumption: ContinuationConsumption,
+        command: AdmitInvocationCommand | None = None,
+    ) -> ContinuationRecord:
+        """Commit the admitted stage only from the typed lifecycle boundary."""
+
+        from cayu.runtime._session_continuation_scope import require_consumption
+
+        require_consumption(consumption)
+
+        return await self._consume_continuation(
+            consumption, admission_boundary=True, admission_command=command
+        )
+
+    async def _consume_continuation(
+        self,
+        consumption: ContinuationConsumption,
+        *,
+        admission_boundary: bool,
+        admission_command: AdmitInvocationCommand | None = None,
+    ) -> ContinuationRecord:
+        """Apply the store-side CAS for public preparation or typed admission."""
+
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationRecord,
+            ContinuationUnavailable,
+            continuation_admission_digest,
+            continuation_operation_key,
+            require_latch_identity,
+            require_ticket_identity,
+            require_writer_generation,
+        )
+
+        ticket = consumption.ticket
+        key = continuation_operation_key(ticket)
+        if consumption.receipt_stage == "admitted" and not admission_boundary:
+            raise ContinuationConflict(
+                "Admitted continuation receipts require the typed lifecycle boundary."
+            )
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced(
+                    "Continuation consumption belongs to a retired session instance."
+                )
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is unavailable.")
+            if admission_boundary:
+                from cayu.runtime._invocation_lifecycle import (
+                    AdmitInvocationCommand,
+                    reconcile_invocation_admission_from_state,
+                    replay_invocation_lifecycle_command_from_state,
+                )
+
+                if admission_command is not None and (
+                    type(admission_command) is not AdmitInvocationCommand
+                    or continuation_admission_digest(admission_command)
+                    != consumption.admission_command_digest
+                    or admission_command.session_id != ticket.session_id
+                    or admission_command.expected_session_instance_id != ticket.session_instance_id
+                    or replay_invocation_lifecycle_command_from_state(
+                        current_session, checkpoint, admission_command
+                    )
+                    is None
+                ):
+                    raise ContinuationConflict(
+                        "Continuation lacks exact durable admission evidence."
+                    )
+                if (
+                    reconcile_invocation_admission_from_state(
+                        current_session,
+                        checkpoint,
+                        session_id=ticket.session_id,
+                        session_instance_id=ticket.session_instance_id,
+                        expected_run_epoch=consumption.admission_expected_run_epoch,
+                        command_sha256=consumption.admission_command_digest,
+                        profile_sha256=consumption.profile_digest,
+                    )
+                    is None
+                ):
+                    raise ContinuationConflict(
+                        "Continuation lacks exact durable admission evidence."
+                    )
+            record = ContinuationRecord.model_validate(current)
+            if record.consumption is not None:
+                existing = record.consumption
+                require_ticket_identity(existing.ticket, consumption.ticket)
+                require_latch_identity(existing.latch, consumption.latch)
+                replay = existing.model_copy(
+                    update={"ticket": consumption.ticket, "latch": consumption.latch}
+                )
+                if replay == consumption or (
+                    existing.receipt_stage in {"prepared", "admitted"}
+                    and consumption.receipt_stage == "prepared"
+                    and replay.model_copy(
+                        update={
+                            "receipt_stage": "prepared",
+                            "admission_claimed": False,
+                            "admission_claim_id": None,
+                        }
+                    )
+                    == consumption.model_copy(
+                        update={
+                            "admission_claimed": False,
+                            "admission_claim_id": None,
+                        }
+                    )
+                ):
+                    updated = record
+                elif (
+                    existing.receipt_stage == "prepared"
+                    and consumption.receipt_stage == "admitted"
+                    and existing.admission_claimed
+                    and existing.admission_claim_id == consumption.admission_claim_id
+                    and existing.model_copy(
+                        update={
+                            "ticket": consumption.ticket,
+                            "latch": consumption.latch,
+                            "receipt_stage": "admitted",
+                            "admission_claimed": True,
+                        }
+                    ).model_dump(mode="json")
+                    == consumption.model_dump(mode="json")
+                ):
+                    consumed_ticket = record.ticket.model_copy(
+                        update={"state": "CONSUMED", "revision": record.ticket.revision + 1}
+                    )
+                    updated_consumption = consumption.model_copy(
+                        update={
+                            "ticket": consumed_ticket,
+                            "latch": record.latch,
+                            "admission_claimed": True,
+                            "admission_claim_id": consumption.admission_claim_id,
+                        }
+                    )
+                    updated = record.model_copy(
+                        update={"ticket": consumed_ticket, "consumption": updated_consumption}
+                    )
+                else:
+                    raise ContinuationConflict("Continuation was consumed differently.")
+            else:
+                if current_session.run_epoch != consumption.admission_expected_run_epoch:
+                    raise ContinuationConflict(
+                        "Continuation admission belongs to a stale writer generation."
+                    )
+                require_ticket_identity(ticket, record.ticket)
+                # The new admission command describes the current writer, not
+                # the wait's originating authority. A previously latched result
+                # must not let an overtaken wait start a fresh consumption.
+                # Existing preparations above reconcile their exact handoff.
+                require_writer_generation(
+                    record.ticket,
+                    current_session.run_epoch,
+                    allow_released_next_generation=_continuation_writer_was_released(
+                        current_session, checkpoint
+                    ),
+                )
+                if record.latch is None or record.ticket.state not in {"WAITING", "SERVICING"}:
+                    raise ContinuationConflict("Continuation is not ready for consumption.")
+                if consumption.receipt_stage != "prepared":
+                    raise ContinuationConflict(
+                        "Continuation admission requires a prepared responsibility receipt."
+                    )
+                if record.ticket.revision != ticket.revision:
+                    raise ContinuationConflict("Continuation ticket revision is stale.")
+                require_ticket_identity(record.latch.ticket, record.ticket)
+                require_latch_identity(record.latch, consumption.latch)
+                updated = record.model_copy(
+                    update={"consumption": consumption.model_copy(update={"latch": record.latch})}
+                )
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None:
+            raise ContinuationUnavailable("Continuation consumption was not durably readable.")
+        return record
+
+    async def retire_continuation(self, retirement: ContinuationRetirement) -> ContinuationRecord:
+        """Atomically retire a ticket, losing only to an already committed consume."""
+
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationRecord,
+            ContinuationRetirement,
+            ContinuationUnavailable,
+            continuation_operation_key,
+            require_ticket_identity,
+            require_writer_generation,
+        )
+        from cayu.runtime._session_continuation_scope import require_retirement
+        from cayu.vaults.redaction import SecretRedactor
+
+        retirement = prepare_contract(ContinuationRetirement, retirement, redactor=SecretRedactor())
+        supersession_only = require_retirement(retirement)
+        ticket = retirement.ticket
+        key = continuation_operation_key(ticket)
+
+        def transform(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            current: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            if current_session.instance_id != ticket.session_instance_id:
+                raise SessionRunFenced(
+                    "Continuation retirement belongs to a retired session instance."
+                )
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is unavailable.")
+            record = ContinuationRecord.model_validate(current)
+            if record.retirement is not None:
+                existing = record.retirement
+                require_ticket_identity(existing.ticket, retirement.ticket)
+                replay = existing.model_copy(update={"ticket": retirement.ticket})
+                if replay == retirement:
+                    updated = record
+                else:
+                    raise ContinuationConflict("Continuation was retired differently.")
+            else:
+                if supersession_only:
+                    # A release alone advances by one. A later epoch in this
+                    # exact incarnation proves the old wait has been overtaken.
+                    # Never settle prepared/claimed receiving work by inference.
+                    if (
+                        retirement.reason != "superseded"
+                        or current_session.run_epoch <= ticket.writer_generation + 1
+                        or record.consumption is not None
+                    ):
+                        raise ContinuationConflict(
+                            "Supersession requires an overtaken, unconsumed continuation."
+                        )
+                else:
+                    require_writer_generation(
+                        ticket,
+                        current_session.run_epoch,
+                        allow_released_next_generation=_continuation_writer_was_released(
+                            current_session, checkpoint
+                        ),
+                    )
+                require_ticket_identity(ticket, record.ticket)
+                if record.ticket.revision != ticket.revision:
+                    raise ContinuationConflict("Continuation ticket revision is stale.")
+                if record.ticket.state in {"CONSUMED", "RETIRED"}:
+                    raise ContinuationConflict("Continuation is already terminal.")
+                retired_ticket = record.ticket.model_copy(
+                    update={"state": "RETIRED", "revision": record.ticket.revision + 1}
+                )
+                updated_retirement = retirement.model_copy(update={"ticket": retired_ticket})
+                if record.consumption is not None:
+                    if (
+                        record.consumption.receipt_stage != "prepared"
+                        or record.consumption.admission_claimed
+                    ):
+                        raise ContinuationConflict(
+                            "Continuation admission is in progress and must settle before retirement."
+                        )
+                    excluded_consumption = record.consumption.model_copy(
+                        update={"ticket": retired_ticket, "receipt_stage": "excluded"}
+                    )
+                    updated = record.model_copy(
+                        update={
+                            "ticket": retired_ticket,
+                            "consumption": excluded_consumption,
+                            "retirement": updated_retirement,
+                        }
+                    )
+                else:
+                    updated = record.model_copy(
+                        update={"ticket": retired_ticket, "retirement": updated_retirement}
+                    )
+            return SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+
+        await self._publish_continuation_operation(
+            ticket.session_id,
+            idempotency_key=key,
+            operation_transform=transform,
+            events=[],
+        )
+        record = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if record is None:
+            raise ContinuationUnavailable("Continuation retirement was not durably readable.")
+        return record
 
     async def load_runtime_publication_receipt(
         self,
@@ -13293,6 +14351,7 @@ class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
     session_export_version: ClassVar[int] = 1
+    session_continuation_version: ClassVar[int] = 1
     supports_session_closure_receipts: ClassVar[bool] = True
     supports_session_closure_detachment: ClassVar[bool] = True
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
@@ -15708,9 +16767,15 @@ class InMemorySessionStore(SessionStore):
     def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
         from cayu.collaboration import _session_export_store as session_exports
+        from cayu.runtime import _session_continuation_store as continuations
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
 
         session_id = session.id
+        continuations.require_erasure_quiescence(
+            session=session,
+            checkpoint=self._checkpoints.get(session_id),
+            records=self._session_operation_records.get(session_id, {}),
+        )
         session_exports.require_erasure_quiescence(
             session=session,
             checkpoint=self._checkpoints.get(session_id),
@@ -19415,6 +20480,7 @@ class InMemorySessionStore(SessionStore):
                 idempotency_key
             )
             from cayu.collaboration import _session_export_store as session_exports
+            from cayu.runtime import _session_continuation_store as continuations
 
             callback_session = session.model_copy(deep=True)
             callback_checkpoint = (
@@ -19426,6 +20492,8 @@ class InMemorySessionStore(SessionStore):
                 session_id=session_id
             ):
                 callback_checkpoint.pop(session_exports.ROOT_KEY, None)
+            if callback_checkpoint is not None and not continuations.checkpoint_visible():
+                callback_checkpoint.pop(continuations.ROOT_KEY, None)
             callback_record = (
                 None
                 if current_record is None
@@ -25564,9 +26632,13 @@ def _reject_reserved_runtime_publication_key(
     from cayu.collaboration._session_export_store import require_operation_key_access
     from cayu.runtime._argument_continuity import require_private_key_access
     from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.runtime._session_continuation_scope import (
+        require_operation_key_access as require_continuation_key_access,
+    )
 
     value = require_clean_nonblank(value, field_name)
     require_operation_key_access(value, read=browser_control_read)
+    require_continuation_key_access(value, read=browser_control_read)
     require_private_key_access(value, read=browser_control_read)
     if not browser_control_read:
         require_browser_control_operation_owner(value)
@@ -26137,11 +27209,15 @@ def _validate_invocation_release_settlement_receipt_authority(
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
     from cayu.collaboration._session_export_store import require_operation_record_owner
     from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.runtime._session_continuation import (
+        require_operation_record_owner as require_continuation_record_owner,
+    )
 
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")
         require_browser_control_operation_owner(key, records[key])
         require_operation_record_owner(key, records[key])
+        require_continuation_record_owner(key, records[key])
 
 
 def _prepare_initial_session_operation_records(

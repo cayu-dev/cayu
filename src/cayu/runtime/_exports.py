@@ -355,6 +355,37 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CostQualityPairExclusion": ("cayu.budgets.quality", "CostQualityPairExclusion"),
     "CostSessionTotals": ("cayu.budgets.quality", "CostSessionTotals"),
     "CreateInvocationCommand": ("cayu.runtime._invocation_lifecycle", "CreateInvocationCommand"),
+    "ContinuationConflict": ("cayu.runtime._session_continuation", "ContinuationConflict"),
+    "ContinuationConsumption": (
+        "cayu.runtime._session_continuation",
+        "ContinuationConsumption",
+    ),
+    "ContinuationLatch": ("cayu.runtime._session_continuation", "ContinuationLatch"),
+    "ContinuationLatchReceiver": (
+        "cayu.runtime._session_continuation",
+        "ContinuationLatchReceiver",
+    ),
+    "ContinuationNamespace": (
+        "cayu.runtime._session_continuation",
+        "ContinuationNamespace",
+    ),
+    "ContinuationPreparation": ("cayu.runtime._session_continuation", "ContinuationPreparation"),
+    "ContinuationRecord": ("cayu.runtime._session_continuation", "ContinuationRecord"),
+    "ContinuationRetirement": (
+        "cayu.runtime._session_continuation",
+        "ContinuationRetirement",
+    ),
+    "ContinuationTicket": ("cayu.runtime._session_continuation", "ContinuationTicket"),
+    "ContinuationService": ("cayu.runtime._session_continuation", "ContinuationService"),
+    "ContinuationWait": ("cayu.runtime._session_continuation", "ContinuationWait"),
+    "ContinuationUnavailable": (
+        "cayu.runtime._session_continuation",
+        "ContinuationUnavailable",
+    ),
+    "SessionContinuationOwner": (
+        "cayu.runtime._session_continuation_owner",
+        "SessionContinuationOwner",
+    ),
     "CriterionOutcomeStatus": ("cayu.tasks.contracts", "CriterionOutcomeStatus"),
     "DEFAULT_CHILD_SESSION_RESULT_MAX_CHARS": (
         "cayu.sessions.child_results",

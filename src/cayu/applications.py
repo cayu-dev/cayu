@@ -759,6 +759,7 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 if TYPE_CHECKING:
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
+    from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
     from cayu.tasks.groups import (
         TaskGroupCreate,
         TaskGroupCreationReceipt,
@@ -5463,6 +5464,7 @@ class CayuApp:
         request: ResumeRequest,
         *,
         store_resolved_session_id: str | None = None,
+        continuation_handoff: _ContinuationResumeHandoff | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
@@ -5476,6 +5478,7 @@ class CayuApp:
         stream = self._session_engine.resume(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
+            continuation_handoff=continuation_handoff,
         )
         del request
         if boundary.expires_at is not None:
