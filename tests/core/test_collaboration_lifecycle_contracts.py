@@ -232,3 +232,15 @@ def test_permit_settlement_is_exact_and_quiescence_is_positive():
     )
     with pytest.raises(ValueError, match="another permit"):
         PermitSnapshot(expected=changed, position=1, state="settled", settlement=receipt)
+
+
+@pytest.mark.parametrize("invalid", [1, 0, "true", None])
+def test_permit_exclusion_proof_requires_a_boolean(invalid):
+    with pytest.raises(ValueError):
+        ReceivingSettlementReceipt(
+            expected=permit_command(),
+            receiving_owner=authority().owner,
+            receipt_id="receipt",
+            outcome="quiescent",
+            admission_excluded=invalid,
+        )

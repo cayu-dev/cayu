@@ -99,21 +99,17 @@ def prepare_permit(
         {"expected": expected, "receiving_receipt": maximum, "event": event},
         redactor=probe_redactor,
     )
-    if expected.intent.request.required_settlement == "exclusion":
-        prepare_contract(
-            PermitExclusion,
-            {
-                "expected": expected,
-                "receiving_receipt": maximum.model_copy(update={"outcome": "excluded"}),
-                "event": event.model_copy(
-                    update={
-                        "operation": expected.operation,
-                        "type": "permit_excluded",
-                    }
-                ),
-            },
-            redactor=probe_redactor,
-        )
+    prepare_contract(
+        PermitExclusion,
+        {
+            "expected": expected,
+            "receiving_receipt": maximum.model_copy(update={"admission_excluded": True}),
+            "event": event.model_copy(
+                update={"operation": expected.operation, "type": "permit_excluded"}
+            ),
+        },
+        redactor=probe_redactor,
+    )
     prepare_contract(
         _ReceivingReadback,
         {"result": {"status": "match", "receipt": maximum}},
@@ -347,7 +343,7 @@ async def exclude_permit(
     found = prepare_contract(
         _ReceivingReadback, {"result": await reader.lookup(expected)}, redactor=redactor
     ).result
-    if not isinstance(found, ExactMatch) or found.receipt.outcome != "excluded":
+    if not isinstance(found, ExactMatch) or not found.receipt.proves_exclusion:
         raise CollaborationUnavailable("Positive receiving exclusion is unavailable.")
     require_exact_contract(expected, found.receipt.expected, redactor=redactor)
     async with store._transaction(initialized.binding.application_scope, write=True) as tx:

@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import StrictBool, model_validator
 
 from cayu.collaboration._contracts import (
     Code,
@@ -93,6 +93,13 @@ class ReceivingSettlementReceipt(ContractValue):
     receiving_owner: OwnerRef
     receipt_id: Identifier
     outcome: Literal["excluded", "quiescent"]
+    # Quiescence alone does not fence future admission. A receiving owner may
+    # additionally attest its permanent exact-operation admission tombstone.
+    admission_excluded: StrictBool = False
+
+    @property
+    def proves_exclusion(self) -> bool:
+        return self.outcome == "excluded" or self.admission_excluded
 
     @model_validator(mode="after")
     def matches_receiving_responsibility(self) -> ReceivingSettlementReceipt:
@@ -191,7 +198,7 @@ class PermitExclusion(ContractValue):
     def exact_exclusion(self) -> PermitExclusion:
         if (
             self.receiving_receipt.expected != self.expected
-            or self.receiving_receipt.outcome != "excluded"
+            or not self.receiving_receipt.proves_exclusion
             or self.event.operation != self.expected.operation
             or self.event.type != "permit_excluded"
             or self.event.participants != (self.expected.intent.request.participant,)
@@ -212,7 +219,7 @@ class RetiredPermitExclusion(ContractValue):
         namespace = self.retirement.namespace
         if (
             self.receiving_receipt.expected != self.expected
-            or self.receiving_receipt.outcome != "excluded"
+            or not self.receiving_receipt.proves_exclusion
             or namespace.owner != self.expected.source
             or namespace.namespace_incarnation != self.expected.operation.namespace_incarnation
             or namespace.generation != self.expected.operation.generation

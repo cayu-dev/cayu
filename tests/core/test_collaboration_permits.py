@@ -73,6 +73,7 @@ class Receiver(PermitSettlementReader):
         self.entered = asyncio.Event()
         self.release = None
         self.outcome = "quiescent"
+        self.admission_excluded = False
 
     @property
     def owner(self):
@@ -92,13 +93,15 @@ class Receiver(PermitSettlementReader):
                 receiving_owner=self.owner,
                 receipt_id="receiver-receipt",
                 outcome=self.outcome,
+                admission_excluded=self.admission_excluded,
             )
         )
 
 
 @pytest.mark.parametrize("registration_wins", [False, True])
+@pytest.mark.parametrize("required_settlement", ["exclusion", "quiescence"])
 async def test_receiving_exclusion_fences_or_settles_concurrent_registration(
-    stores, registration_wins
+    stores, registration_wins, required_settlement
 ):
     from cayu.collaboration._permits import (
         PermitExclusion,
@@ -119,14 +122,22 @@ async def test_receiving_exclusion_fences_or_settles_concurrent_registration(
             "intent": original.intent.model_copy(
                 update={
                     "request": original.intent.request.model_copy(
-                        update={"required_settlement": "exclusion"}
+                        update={"required_settlement": required_settlement}
                     )
                 }
             )
         }
     )
     reader = Receiver(expected)
-    reader.outcome = "excluded"
+    if required_settlement == "quiescence":
+        # Quiescence without permanent admission exclusion cannot create a
+        # negative-admission tombstone, even from an authenticated receiver.
+        with pytest.raises(CollaborationUnavailable, match="exclusion"):
+            await store._exclude_permit(initialized, expected, reader=reader, redactor=REDACTOR)
+        reader.admission_excluded = True
+        reader.entered.clear()
+    else:
+        reader.outcome = "excluded"
     reader.release = asyncio.Event()
     exclusion = asyncio.create_task(
         store._exclude_permit(initialized, expected, reader=reader, redactor=REDACTOR)
@@ -137,7 +148,7 @@ async def test_receiving_exclusion_fences_or_settles_concurrent_registration(
     reader.release.set()
     result = await exclusion
     assert isinstance(result, PermitSettlement if registration_wins else PermitExclusion)
-    assert result.receiving_receipt.outcome == "excluded"
+    assert result.receiving_receipt.outcome == reader.outcome
     inspected = await application.inspect_participant(ref, context=CONTEXT)
     assert inspected.outstanding_obligations == 0
     assert inspected.issued_permit_frontier == int(registration_wins)

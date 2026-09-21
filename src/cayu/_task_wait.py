@@ -114,7 +114,7 @@ def restore_task_cancellation_requests(
 
 
 async def await_shielded_task_outcome(
-    task: asyncio.Task[_ResultT],
+    task: asyncio.Future[_ResultT],
     *,
     cancellation: asyncio.CancelledError | None = None,
     timeout_s: float | None = None,

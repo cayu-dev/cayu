@@ -13,8 +13,9 @@ import shutil
 import stat
 import sys
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
+from contextvars import copy_context
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._filesystem_lock import cooperative_path_lock
+from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu._validation import (
     copy_durable_metadata,
     require_clean_nonblank,
@@ -345,6 +347,59 @@ class LocalArtifactStore(ArtifactStore):
         await asyncio.to_thread(
             _change_artifact_pin, self.root, self._root_identity, artifact_id, owner, False
         )
+
+    def _resource_metadata(self, artifact_id: str) -> ArtifactMetadata:
+        target = _artifact_dir(self.root, artifact_id)
+        with (
+            _artifact_ownership_lock(self.root, target.name),
+            _open_store_root(self.root, self._root_identity) as root_fd,
+        ):
+            return _load_metadata(target, parent_fd=root_fd)
+
+    async def _pin_resource(
+        self,
+        artifact_id: str,
+        *,
+        owner: str,
+        dispatch: Callable[[Callable[[], asyncio.Future[None]]], Awaitable[None]],
+    ) -> None:
+        # The resource receiver validates under its revocation guard and invokes
+        # start before releasing it. Thread settlement does not hold that guard.
+        def start() -> asyncio.Future[None]:
+            return asyncio.get_running_loop().run_in_executor(
+                None,
+                copy_context().run,
+                _change_resource_pin,
+                self.root,
+                self._root_identity,
+                artifact_id,
+                owner,
+                True,
+            )
+
+        await dispatch(start)
+
+    async def _release_resource_pin(self, artifact_id: str, *, owner: str) -> None:
+        pending = asyncio.get_running_loop().run_in_executor(
+            None,
+            copy_context().run,
+            _change_resource_pin,
+            self.root,
+            self._root_identity,
+            artifact_id,
+            owner,
+            False,
+        )
+        # Shutdown cancels retained owner tasks too. Do not relinquish their
+        # fence while an unpin thread can still mutate the physical store.
+        outcome = await await_shielded_task_outcome(pending)
+        if outcome.cancellation is not None:
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+            )
+            raise outcome.cancellation from outcome.error
+        if outcome.error is not None:
+            raise outcome.error
 
     async def delete(self, artifact_id: str) -> None:
         try:
@@ -1634,12 +1689,32 @@ def _change_artifact_pin(
     owner: str,
     acquire: bool,
 ) -> None:
+    _change_pin(root, root_identity, artifact_id, owner, acquire, namespace="pin_")
+
+
+def _change_resource_pin(
+    root: Path, root_identity: tuple[int, int], artifact_id: str, owner: str, acquire: bool
+) -> None:
+    # Generic public pin/release cannot address this retention namespace, even
+    # when the exact operation identity is known. Both use the deletion fence.
+    _change_pin(root, root_identity, artifact_id, owner, acquire, namespace="pin_resource_")
+
+
+def _change_pin(
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact_id: str,
+    owner: str,
+    acquire: bool,
+    *,
+    namespace: str,
+) -> None:
     owner = require_unicode_scalar_text(require_clean_nonblank(owner, "pin.owner"), "pin.owner")
     if len(owner.encode("utf-8")) > 1024:
         raise ValueError("Artifact pin owner is too long.")
     if not _supports_durable_publication():
         raise ArtifactStoreUnavailableError("Artifact pins require durable publication support.")
-    name = "pin_" + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+    name = namespace + hashlib.sha256(owner.encode("utf-8")).hexdigest()
     target = _artifact_dir(root, artifact_id)
     with (
         _artifact_ownership_lock(root, target.name),

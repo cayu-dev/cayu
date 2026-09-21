@@ -3,6 +3,9 @@
 from cayu.artifacts._closure import ArtifactClosureClaim as ArtifactClosureClaim
 from cayu.artifacts._closure import ArtifactClosureItem as ArtifactClosureItem
 from cayu.artifacts._closure import copy_artifact_closure_claim as copy_artifact_closure_claim
+from cayu.artifacts._input_manifest import ArtifactInputMember as ArtifactInputMember
+from cayu.artifacts._input_manifest import FolderInputEntry as FolderInputEntry
+from cayu.artifacts._input_manifest import FolderInputManifest as FolderInputManifest
 from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES as DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
 )
@@ -47,6 +50,27 @@ from cayu.artifacts.base import ArtifactStoreUnavailableError as ArtifactStoreUn
 from cayu.artifacts.base import InvalidArtifactIdError as InvalidArtifactIdError
 from cayu.artifacts.base import copy_artifact_read_result as copy_artifact_read_result
 from cayu.artifacts.local import LocalArtifactStore as LocalArtifactStore
+from cayu.artifacts.resources import LocalArtifactResourceOwner as LocalArtifactResourceOwner
+from cayu.artifacts.resources import (
+    MandateResourcePreparationReader as MandateResourcePreparationReader,
+)
+from cayu.artifacts.resources import ResourceAcquisitionCommand as ResourceAcquisitionCommand
+from cayu.artifacts.resources import ResourceAcquisitionIntent as ResourceAcquisitionIntent
+from cayu.artifacts.resources import ResourceAcquisitionReceipt as ResourceAcquisitionReceipt
+from cayu.artifacts.resources import ResourceOwnerConflict as ResourceOwnerConflict
+from cayu.artifacts.resources import ResourceOwnerError as ResourceOwnerError
+from cayu.artifacts.resources import ResourceOwnerUnavailable as ResourceOwnerUnavailable
+from cayu.artifacts.resources import ResourceOwnerUnsupported as ResourceOwnerUnsupported
+from cayu.artifacts.resources import (
+    ResourcePreparationAuthorization as ResourcePreparationAuthorization,
+)
+from cayu.artifacts.resources import ResourcePreparationLease as ResourcePreparationLease
+from cayu.artifacts.resources import ResourcePreparationReader as ResourcePreparationReader
+from cayu.artifacts.resources import ResourcePreparationReceipt as ResourcePreparationReceipt
+from cayu.artifacts.resources import ResourceTransferCommand as ResourceTransferCommand
+from cayu.artifacts.resources import ResourceTransferIntent as ResourceTransferIntent
+from cayu.artifacts.resources import ResourceTransferReceipt as ResourceTransferReceipt
+from cayu.artifacts.resources import resource_operation_digest as resource_operation_digest
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementEvidence as ArtifactWriteSettlementEvidence,
 )
