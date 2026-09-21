@@ -1,6 +1,63 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ContextViewProjectionSource": ("cayu.sessions.context_views", "ContextViewProjectionSource"),
+    "ContextViewExtensionProjection": (
+        "cayu.sessions.context_views",
+        "ContextViewExtensionProjection",
+    ),
+    "CONTEXT_VIEW_CONTRACT_VERSION": (
+        "cayu.sessions.context_views",
+        "CONTEXT_VIEW_CONTRACT_VERSION",
+    ),
+    "CONTEXT_VIEW_STORE_VERSION": (
+        "cayu.sessions.context_views",
+        "CONTEXT_VIEW_STORE_VERSION",
+    ),
+    "ContextViewExtensionRecord": ("cayu.sessions.context_views", "ContextViewExtensionRecord"),
+    "ContextViewExtensionRegistration": (
+        "cayu.sessions.context_views",
+        "ContextViewExtensionRegistration",
+    ),
+    "ContextViewLimits": ("cayu.sessions.context_views", "ContextViewLimits"),
+    "ContextViewLifecycleEvent": (
+        "cayu.sessions.context_views",
+        "ContextViewLifecycleEvent",
+    ),
+    "ContextViewManifest": ("cayu.sessions.context_views", "ContextViewManifest"),
+    "ContextViewOwnershipRequest": (
+        "cayu.sessions.context_views",
+        "ContextViewOwnershipRequest",
+    ),
+    "ContextViewPublicationRequest": (
+        "cayu.sessions.context_views",
+        "ContextViewPublicationRequest",
+    ),
+    "ContextViewReadback": ("cayu.sessions.context_views", "ContextViewReadback"),
+    "ContextViewSelectionReceipt": (
+        "cayu.sessions.context_views",
+        "ContextViewSelectionReceipt",
+    ),
+    "ContextViewSelectionRequest": (
+        "cayu.sessions.context_views",
+        "ContextViewSelectionRequest",
+    ),
+    "ParticipantSessionBinding": (
+        "cayu.sessions.context_views",
+        "ParticipantSessionBinding",
+    ),
+    "ParticipantSessionCreationReceipt": (
+        "cayu.sessions.context_views",
+        "ParticipantSessionCreationReceipt",
+    ),
+    "ParticipantSessionCreationRequest": (
+        "cayu.sessions.context_views",
+        "ParticipantSessionCreationRequest",
+    ),
+    "ParticipantSessionExecutionRequest": (
+        "cayu.sessions.context_views",
+        "ParticipantSessionExecutionRequest",
+    ),
     "ActiveModelCompletionStage": ("cayu.sessions.base", "ActiveModelCompletionStage"),
     "CHECKPOINT_SCHEMA_VERSION_KEY": ("cayu.sessions.checkpoints", "CHECKPOINT_SCHEMA_VERSION_KEY"),
     "CHILD_SESSION_CONTEXT_PROJECTION_VERSION": (
@@ -430,6 +487,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
 
 PUBLIC_NAMES = [
     "ActiveModelCompletionStage",
+    "CONTEXT_VIEW_CONTRACT_VERSION",
+    "CONTEXT_VIEW_STORE_VERSION",
     "CHECKPOINT_SCHEMA_VERSION_KEY",
     "CHILD_SESSION_CONTEXT_PROJECTION_VERSION",
     "CHILD_SESSION_PUBLIC_ALIAS_MAX_CHARS",
@@ -453,6 +512,18 @@ PUBLIC_NAMES = [
     "ChildSessionResultReference",
     "ChildSessionResultUnavailable",
     "CompactSessionRequest",
+    "ContextViewExtensionRecord",
+    "ContextViewExtensionRegistration",
+    "ContextViewProjectionSource",
+    "ContextViewExtensionProjection",
+    "ContextViewLimits",
+    "ContextViewLifecycleEvent",
+    "ContextViewManifest",
+    "ContextViewOwnershipRequest",
+    "ContextViewPublicationRequest",
+    "ContextViewReadback",
+    "ContextViewSelectionReceipt",
+    "ContextViewSelectionRequest",
     "DEFAULT_CHILD_SESSION_RESULT_MAX_CHARS",
     "DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES",
     "DEFAULT_RECOVERY_CLEANUP_MAX_SUPERVISED_TASKS",
@@ -522,6 +593,9 @@ PUBLIC_NAMES = [
     "PendingActionQuery",
     "PendingActionRecord",
     "PendingActionResultTooLarge",
+    "ParticipantSessionBinding",
+    "ParticipantSessionCreationReceipt",
+    "ParticipantSessionCreationRequest",
     "PendingActionSession",
     "PersistedEventSideEffectClaim",
     "PersistedEventSideEffectClaimLost",

@@ -3148,8 +3148,10 @@ def test_auxiliary_accounting_migration_preserves_pending_action_index(postgres_
             await creator.close()
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
-            # Reconstruct revision88's accounting definitions. The new revision
-            # must not activate main's unrelated, unregistered index migration.
+            # Reconstruct the pre-accounting-migration definitions. The pending
+            # action index is owned by the current baseline (including
+            # delegated-action events); the accounting migration must preserve
+            # that definition rather than replacing it.
             await conn.execute("DROP INDEX idx_cayu_events_cost_attempt")
             await conn.execute("DROP INDEX idx_cayu_events_cost_sequence")
             for statement in POSTGRES_ACCOUNTING_DDL:
@@ -3161,7 +3163,7 @@ def test_auxiliary_accounting_migration_preserves_pending_action_index(postgres_
                 "SELECT pg_get_indexdef('idx_cayu_events_pending_action_lookup'::regclass)"
             )
             pending_index = (await cursor.fetchone())[0]
-            assert "session.delegated_action.updated" not in pending_index
+            assert "session.delegated_action.updated" in pending_index
 
         for mode in (SchemaMode.MIGRATE, SchemaMode.VALIDATE):
             store = PostgresSessionStore(postgres_dsn, schema_mode=mode)

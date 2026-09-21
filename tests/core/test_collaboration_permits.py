@@ -569,6 +569,7 @@ async def test_admission_covers_complete_escaped_settlement_envelopes(stores, bo
             "receiving_owner": command["intent"]["request"]["target"]["owner"],
             "receipt_id": receipt_id,
             "outcome": "quiescent",
+            "admission_excluded": False,
         }
         snapshot = {
             "expected": command,

@@ -641,10 +641,16 @@ class ParticipantCoordinator:
             self._receipt(expected, result.receipt)
         return result
 
-    async def inspect(self, participant: ParticipantRef, *, context: CollaborationAccessContext):
+    async def inspect(
+        self,
+        participant: ParticipantRef,
+        *,
+        context: CollaborationAccessContext,
+        action: ParticipantAction = "inspect",
+    ):
         store, initialized = self._ready()
         participant = self._prepare(ParticipantRef, participant)
-        _, grant = self._authorize(context, "inspect")
+        _, grant = self._authorize(context, action)
         self._require_refs(grant, (participant,))
         self._capability(store, initialized, mutation=False)
         result = self._prepare(

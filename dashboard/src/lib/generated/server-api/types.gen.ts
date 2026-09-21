@@ -17387,6 +17387,10 @@ export type ToolManifest = {
      * Policy Coverage
      */
     policy_coverage: 'allowed' | 'denied' | 'approval_required' | 'conditional' | 'unknown';
+    /**
+     * Policy Environment Names
+     */
+    policy_environment_names?: Array<string> | null;
     registration_provenance: RegistrationProvenance;
     /**
      * Sandboxed

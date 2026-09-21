@@ -113,6 +113,7 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.pricing import SessionCostTotals
 from cayu.budgets.usage import SessionUsageSummary, session_usage_summary
+from cayu.collaboration.access import CollaborationAccessContext
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
@@ -1313,6 +1314,7 @@ class RecoverySessionRunRequest:
     initial_model_step_tool_exposure: ResolvedToolExposureAuthority | None = None
     previous_tool_exposure_profile_id: str | None = None
     preserve_failure_until_initial_provider_dispatch: bool = False
+    participant_context: CollaborationAccessContext | None = None
 
     def __post_init__(self) -> None:
         if type(self.invocation_context) is not InvocationContext:
@@ -1495,6 +1497,10 @@ class RecoveryAbandonedSessionRequest:
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
     run_terminal_hooks: bool = True
+    # Some admission boundaries have already settled their predecessor and
+    # therefore cannot rely on the outer cancellation handler to retry. Keep a
+    # durable repair marker if terminal-event publication fails.
+    retain_terminal_publication_repair: bool = False
 
 
 class _IncompleteRecoveryClaimAuthority:
@@ -1963,6 +1969,9 @@ class RecoveryCoordinator:
         self,
         *,
         session_store: SessionStore,
+        require_participant_execution: Callable[
+            [Session, CollaborationAccessContext | None], Awaitable[None]
+        ],
         task_store: TaskStore | None,
         event_writer: RuntimeEventWriter,
         session_control: SessionControl[SessionUsageTracker],
@@ -1999,6 +2008,7 @@ class RecoveryCoordinator:
     ) -> None:
         self._human_review_policy = human_review_policy
         self._session_store = session_store
+        self._require_participant_execution = require_participant_execution
         self._foreground_gate_policy_owner = ForegroundGatePolicyOwner()
         self._task_store = task_store
         self._event_writer = event_writer
@@ -5900,11 +5910,13 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         with self._session_control.active_control_ownership(response.session_id):
             async with _close_delegated_event_stream(
                 self._resolve_user_input_owned(
                     response,
+                    participant_context=participant_context,
                     before_mutation=before_mutation,
                     after_admission=after_admission,
                     effect_reconciliation=effect_reconciliation,
@@ -5921,6 +5933,7 @@ class RecoveryCoordinator:
         after_admission: RecoveryMutationHook | None = None,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         foreground_gate: GateReplay | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -6196,6 +6209,7 @@ class RecoveryCoordinator:
 
         continuation_stream = self.continue_user_input_resolution(
             response=response,
+            participant_context=participant_context,
             session=session,
             pending=pending,
             resolution_intent=claimed_intent,
@@ -6238,6 +6252,7 @@ class RecoveryCoordinator:
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a user-input round stuck on `manual_recovery_required`.
 
@@ -6495,6 +6510,7 @@ class RecoveryCoordinator:
         )
         recovery_stream = self.recover_user_input(
             request=request,
+            participant_context=participant_context,
             loaded_session=loaded_session,
             session=session,
             pending=pending,
@@ -6535,11 +6551,13 @@ class RecoveryCoordinator:
         task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         with self._session_control.active_control_ownership(request.session_id):
             async with _close_delegated_event_stream(
                 self._resolve_tool_approval_owned(
                     request,
+                    participant_context=participant_context,
                     task_id=task_id,
                     before_mutation=before_mutation,
                     after_admission=after_admission,
@@ -6556,6 +6574,7 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
         foreground_gate: GateReplay | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -6915,6 +6934,7 @@ class RecoveryCoordinator:
         )
         continuation_stream = self.continue_tool_approval_resolution(
             request=request,
+            participant_context=participant_context,
             session=session,
             pending_approval=pending_approval,
             registered_agent=registered_agent,
@@ -6957,6 +6977,7 @@ class RecoveryCoordinator:
         task_handoff_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Accept one disposition and drive its durable effect to a recovery boundary."""
 
@@ -7043,6 +7064,7 @@ class RecoveryCoordinator:
                 provider_disposition_task_worker_id=request.task_worker_id,
                 provider_disposition_task_handoff_id=task_handoff_id,
                 provider_disposition_after_admission=after_admission,
+                participant_context=participant_context,
             )
             for recovered_event in recovered.events:
                 yield recovered_event
@@ -7057,6 +7079,7 @@ class RecoveryCoordinator:
                 return
         disposition_stream = self._finish_pending_provider_operation_disposition(
             pending=pending,
+            participant_context=participant_context,
             result=durable_result,
             task_id=task_id,
             task_worker_id=request.task_worker_id,
@@ -7479,12 +7502,14 @@ class RecoveryCoordinator:
         task_worker_id: str | None = None,
         task_handoff_id: str | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Finish one accepted disposition without replaying its old provider request."""
 
         loaded_session = await self._session_store.load(pending.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {pending.session_id}")
+        await self._require_participant_execution(loaded_session, participant_context)
         if invocation_context is None:
             registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
             registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
@@ -7708,6 +7733,7 @@ class RecoveryCoordinator:
 
             fallback_stream = self._run_pending_provider_operation_fallback(
                 pending=pending,
+                participant_context=participant_context,
                 result=result,
                 session=session,
                 registered_agent=registered_agent,
@@ -7842,6 +7868,7 @@ class RecoveryCoordinator:
         task_worker_id: str | None = None,
         task_handoff_id: str | None = None,
         invocation_context: InvocationContext | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Run the accepted fallback from an already fenced running session."""
 
@@ -7882,6 +7909,7 @@ class RecoveryCoordinator:
         session_stream = self._run_session(
             RecoverySessionRunRequest(
                 session=session,
+                participant_context=participant_context,
                 messages=transcript,
                 messages_to_append=[],
                 max_steps=recovery_context.max_steps,
@@ -8019,6 +8047,7 @@ class RecoveryCoordinator:
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -8199,6 +8228,7 @@ class RecoveryCoordinator:
         )
         recovery_stream = self.recover_tool_approval(
             request=request,
+            participant_context=participant_context,
             loaded_session=loaded_session,
             session=session,
             pending_approval=pending_approval,
@@ -8404,6 +8434,7 @@ class RecoveryCoordinator:
         *,
         before_mutation: RecoveryMutationHook | None = None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a crashed ordinary tool round with an operator-verified outcome.
 
@@ -8443,7 +8474,10 @@ class RecoveryCoordinator:
             if effect is not None and effect.intent.approval_id is not None:
                 async with _close_delegated_event_stream(
                     self.recover_tool_approval_request(
-                        request, before_mutation=before_mutation, after_admission=after_admission
+                        request,
+                        before_mutation=before_mutation,
+                        after_admission=after_admission,
+                        participant_context=participant_context,
                     )
                 ) as approval_stream:
                     async for event in approval_stream:
@@ -8481,6 +8515,7 @@ class RecoveryCoordinator:
                 async with _close_delegated_event_stream(
                     self.resolve_user_input(
                         response,
+                        participant_context=participant_context,
                         before_mutation=before_mutation,
                         after_admission=after_admission,
                         effect_reconciliation=request,
@@ -8684,6 +8719,7 @@ class RecoveryCoordinator:
                 )
             recovery_stream = self.recover_tool_round(
                 request=request,
+                participant_context=participant_context,
                 loaded_session=loaded_session,
                 pending_round=pending_round,
                 pending_tool_call=pending_tool_call,
@@ -8940,7 +8976,9 @@ class RecoveryCoordinator:
         emit_resume_event: bool = True,
         effect_reconciliation: ToolEffectReconciliationRequest | None = None,
         foreground_gate: GateReplay | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
+        await self._require_participant_execution(session, participant_context)
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
@@ -9905,6 +9943,7 @@ class RecoveryCoordinator:
                     structured_output=invocation_semantics.structured_output,
                     thinking=invocation_semantics.thinking,
                     request_metadata=response.metadata,
+                    participant_context=participant_context,
                     task_id=pending.task_id,
                     task_worker_id=response.task_worker_id,
                     task_handoff_id=response.task_handoff_id,
@@ -10456,7 +10495,11 @@ class RecoveryCoordinator:
         recovery_closure_only: bool = False,
         invocation_context: InvocationContext | None = None,
         foreground_gate: GateReplay | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
+        # Even closure-only approval recovery reconnects its environment before
+        # publishing the round, so it must not borrow historical participant authority.
+        await self._require_participant_execution(session, participant_context)
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
@@ -11593,6 +11636,7 @@ class RecoveryCoordinator:
                     structured_output=invocation_semantics.structured_output,
                     thinking=invocation_semantics.thinking,
                     request_metadata=request.metadata,
+                    participant_context=participant_context,
                     task_id=pending_approval.task_id,
                     task_worker_id=request.task_worker_id,
                     task_handoff_id=request.task_handoff_id,
@@ -12311,6 +12355,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
         invocation_context: InvocationContext | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -12689,6 +12734,7 @@ class RecoveryCoordinator:
             response = gate_input_response_from_recovery(request)
             continuation_stream = self.continue_user_input_resolution(
                 response=response,
+                participant_context=participant_context,
                 session=session,
                 pending=pending,
                 resolution_intent=resolution_intent,
@@ -12743,6 +12789,7 @@ class RecoveryCoordinator:
         deferred_messages: list[Message],
         claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None,
         invocation_context: InvocationContext | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -13158,6 +13205,7 @@ class RecoveryCoordinator:
                 )
             continuation_stream = self.continue_tool_approval_resolution(
                 request=approval_request,
+                participant_context=participant_context,
                 session=session,
                 pending_approval=pending_approval,
                 registered_agent=registered_agent,
@@ -13879,6 +13927,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
         after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Claim one manual recovery durably and stream its owned continuation."""
         caller_runtime_task = asyncio.current_task()
@@ -13983,6 +14032,7 @@ class RecoveryCoordinator:
         )
         recovery_stream = recover_claimed(
             request=request,
+            participant_context=participant_context,
             loaded_session=claim.session_before_fence,
             session=claim.session,
             run_operation=claim.run_operation,
@@ -14303,6 +14353,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
         invocation_context: InvocationContext | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Persist one operator-verified ordinary tool outcome and continue safely."""
         if type(request) is not ToolRoundRecoveryRequest:
@@ -14755,6 +14806,7 @@ class RecoveryCoordinator:
         try:
             continuation = await self._prepare_recovered_tool_round_continuation(
                 session=session,
+                participant_context=participant_context,
                 pending_round=pending_round,
                 invocation_semantics=invocation_semantics,
                 invocation_context=(
@@ -15085,6 +15137,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
         invocation_context: InvocationContext | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Validate and settle a receipt under the existing recovery supervisor."""
         if type(request) is not ToolEffectReconciliationRequest:
@@ -15204,6 +15257,7 @@ class RecoveryCoordinator:
                 yield event
             continuation = await self._prepare_recovered_tool_round_continuation(
                 session=session,
+                participant_context=participant_context,
                 pending_round=pending_round,
                 invocation_semantics=invocation_semantics,
                 invocation_context=invocation_context,
@@ -15243,6 +15297,7 @@ class RecoveryCoordinator:
         task_worker_id: str | None,
         task_handoff_id: str | None,
         completed_model_step: int | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> RecoverySessionRunRequest:
         """Restore a claimed round without deciding its outcome or acquiring a new owner.
 
@@ -15275,6 +15330,7 @@ class RecoveryCoordinator:
             )
         return RecoverySessionRunRequest(
             session=session,
+            participant_context=participant_context,
             invocation_context=invocation_context,
             messages=transcript,
             messages_to_append=[],
@@ -17476,6 +17532,26 @@ class RecoveryCoordinator:
             "reason": _ABANDONED_RUN_REASON,
             "abandoned": True,
         }
+        terminal_repair = request.retain_terminal_publication_repair
+        retained_repair_payload: dict[str, Any] | None = None
+        if not terminal_repair:
+            checkpoint = await self._session_store.load_checkpoint(request.session.id)
+            marker = (
+                None
+                if checkpoint is None
+                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            )
+            terminal_repair = (
+                isinstance(marker, dict) and marker.get("terminal_publication_repair") is True
+            )
+            if terminal_repair:
+                if not isinstance(marker, dict):
+                    raise ValueError("Terminal publication repair marker must be an object.")
+                retained_repair_payload = copy_durable_record(
+                    marker, "terminal publication repair marker"
+                )
+        if terminal_repair:
+            payload["terminal_publication_repair"] = True
         deadline = effective_deadline(
             current_execution_deadline(), request.session.execution_deadline
         )
@@ -17506,14 +17582,21 @@ class RecoveryCoordinator:
             if type(copied_failures) is not list:
                 raise TypeError("Interaction transition cancellation diagnostics must be a list.")
             payload["interaction_transition_failures"] = copied_failures
-        if request.provider_cancellation_failures:
-            copied_provider_failures = copy_provider_cancellation_failures(
-                request.provider_cancellation_failures
-            )
-            payload["provider_cancellation_failures"] = [
-                dict(item) for item in copied_provider_failures
-            ]
-            payload["interruption_request_id"] = str(uuid4())
+        if request.provider_cancellation_failures or terminal_repair:
+            if terminal_repair:
+                payload["terminal_publication_repair"] = True
+            if not request.provider_cancellation_failures:
+                payload["interruption_request_id"] = str(uuid4())
+            else:
+                copied_provider_failures = copy_provider_cancellation_failures(
+                    request.provider_cancellation_failures
+                )
+                payload["provider_cancellation_failures"] = [
+                    dict(item) for item in copied_provider_failures
+                ]
+                payload["interruption_request_id"] = str(uuid4())
+            if retained_repair_payload is not None:
+                payload = retained_repair_payload
             # The status transition and terminal-event publication are
             # separate durable operations. Persist exact repair authority
             # before either operation so a publication failure or process loss
@@ -17533,7 +17616,7 @@ class RecoveryCoordinator:
             *,
             require_interrupted: bool,
         ) -> None:
-            if not request.provider_cancellation_failures:
+            if not request.provider_cancellation_failures and not terminal_repair:
                 return
 
             def clear_published_interrupt(
@@ -17643,7 +17726,11 @@ class RecoveryCoordinator:
                 ):
                     terminal_event = copy_event(emitted)
 
-        if request.interaction_transition_failures or request.provider_cancellation_failures:
+        if (
+            request.interaction_transition_failures
+            or request.provider_cancellation_failures
+            or terminal_repair
+        ):
             # These failures are the only durable explanation for an ambiguous
             # transition that exact readback proved absent. Let the owned
             # cancellation cleanup preserve a publication failure instead of
@@ -18507,6 +18594,7 @@ class RecoveryCoordinator:
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
@@ -18541,6 +18629,7 @@ class RecoveryCoordinator:
             provider_disposition_task_worker_id=provider_disposition_task_worker_id,
             provider_disposition_task_handoff_id=provider_disposition_task_handoff_id,
             provider_disposition_after_admission=provider_disposition_after_admission,
+            participant_context=participant_context,
             interrupt_for_manual_tool_recovery=interrupt_for_manual_tool_recovery,
         )
 
@@ -18560,6 +18649,7 @@ class RecoveryCoordinator:
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
         provider_disposition_after_admission: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
@@ -18641,6 +18731,9 @@ class RecoveryCoordinator:
         )
         pending_provider_disposition_effect_is_durable = False
         if pending_provider_disposition is not None:
+            # A durable disposition records intent, not current permission to
+            # execute its fallback or terminal hooks after reconstruction.
+            await self._require_participant_execution(session, participant_context)
             (
                 pending_disposition_record,
                 pending_disposition_result,
@@ -19225,6 +19318,7 @@ class RecoveryCoordinator:
                 )
                 recovered = await self._recover_incomplete_session(
                     preserve_interaction_id=preserve_interaction_id,
+                    participant_context=participant_context,
                     session=claim.session,
                     session_before_fence=claim.session_before_fence,
                     previous_status=previous_status,
@@ -19567,6 +19661,7 @@ class RecoveryCoordinator:
         existing_event = None if not terminal_events else terminal_events[0].model_copy(deep=True)
         exact_interrupt_marker_retained = pending_interrupt_payload is not None and (
             "provider_cancellation_failures" in pending_interrupt_payload
+            or pending_interrupt_payload.get("terminal_publication_repair") is True
             or USER_INPUT_SUPERSESSION_INTENT_KEY in pending_interrupt_payload
             or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in pending_interrupt_payload
         )
@@ -20266,8 +20361,8 @@ class RecoveryCoordinator:
         *,
         session: Session,
         expected_payload: dict[str, Any],
-    ) -> _TerminalFinalizationClaimAcquisition | None:
-        """Claim an unowned pending terminal publication without fencing its session."""
+    ) -> _TerminalFinalizationClaimAcquisition | Event | None:
+        """Claim pending publication, or return its exact already-settled event."""
 
         expected_payload = copy_json_value(
             expected_payload,
@@ -20352,6 +20447,26 @@ class RecoveryCoordinator:
         if isinstance(error, SessionRuntimePublicationConflict):
             if cancellation is not None:
                 raise cancellation from error
+            # The live owner can finish between the caller's pending-state
+            # read and this atomic claim. Never relax the mutation comparison:
+            # only exact, already-published evidence permits joining instead.
+            # Finalization may advance the epoch; this result grants no claim
+            # and must be returned without attempting another repair mutation.
+            current = await self._session_store.load(session.id)
+            request_id = interruption_request_id_from_payload(expected_payload)
+            if (
+                current is not None
+                and current.instance_id == session.instance_id
+                and current.run_epoch >= session.run_epoch
+                and current.status is SessionStatus.INTERRUPTED
+                and request_id is not None
+            ):
+                event = await self._session_control.latest_interrupted_event(
+                    session.id, interruption_request_id=request_id
+                )
+                if event is not None:
+                    require_interruption_event_matches_pending_marker(event, expected_payload)
+                    return event
             raise error
 
         async def reconcile_claim() -> bool:
@@ -23003,6 +23118,7 @@ class RecoveryCoordinator:
         provider_disposition_task_id: str | None = None,
         provider_disposition_task_worker_id: str | None = None,
         provider_disposition_task_handoff_id: str | None = None,
+        participant_context: CollaborationAccessContext | None = None,
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
@@ -23366,6 +23482,7 @@ class RecoveryCoordinator:
                     )
                 async for event in self._run_pending_provider_operation_fallback(
                     pending=pending_disposition,
+                    participant_context=participant_context,
                     result=resolution_result,
                     session=session,
                     registered_agent=registered_agent,

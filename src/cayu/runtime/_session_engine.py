@@ -20,7 +20,7 @@ from enum import StrEnum
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 if TYPE_CHECKING:
     from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
@@ -122,6 +122,7 @@ from cayu.budgets.usage import (
     combine_session_usage_summaries,
     session_usage_summary_payload,
 )
+from cayu.collaboration.access import CollaborationAccessContext
 from cayu.configuration import RunDefaults
 from cayu.context.base import (
     _COMPACTION_ATTEMPT_ID_KEY,
@@ -5182,6 +5183,9 @@ class SessionEngine:
         self,
         *,
         session_store: SessionStore,
+        require_participant_execution: Callable[
+            [Session, CollaborationAccessContext | None], Awaitable[None]
+        ],
         task_store: TaskStore | None,
         get_budget_policy: Callable[[], BudgetPolicy | None],
         event_writer: RuntimeEventWriter,
@@ -5221,6 +5225,7 @@ class SessionEngine:
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
     ) -> None:
         self.session_store = session_store
+        self._require_participant_execution = require_participant_execution
         self.task_store = task_store
         self._get_budget_policy = get_budget_policy
         self._event_writer = event_writer
@@ -10153,6 +10158,7 @@ class SessionEngine:
         expected_context_policy: object | None = None,
         allow_work_attempt_admission: bool = False,
         prepared_work_attempt: WorkAttemptAdmission | None = None,
+        allow_existing_session_id: bool = False,
     ) -> _PreparedInitialRun | None:
         """Resolve one new-session request, optionally without ordinary admission."""
 
@@ -10423,8 +10429,10 @@ class SessionEngine:
             raise AssertionError("Run request session identity was not assigned.")
         if runtime_prepared_session_authority(request) is None:
             existing_session = await self.session_store.load(prepared_session_id)
-            if existing_session is not None and (
-                store_resolved_existing_session_id != prepared_session_id
+            if (
+                existing_session is not None
+                and not allow_existing_session_id
+                and (store_resolved_existing_session_id != prepared_session_id)
             ):
                 del existing_session
                 raise ValueError(f"Session already exists: {prepared_session_id}")
@@ -13098,14 +13106,31 @@ class SessionEngine:
         expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
         expected_context_policy: object | None = None,
         pause_after_initial_transcript: bool = False,
+        participant_execution_key: str | None = None,
+        participant_session_instance_id: str | None = None,
+        participant_context: CollaborationAccessContext | None = None,
+        participant_permit_operation: str | None = None,
+        participant_permit_commitment: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(pause_after_initial_transcript) is not bool:
             raise TypeError("pause_after_initial_transcript must be a bool.")
+        if (participant_execution_key is None) != (participant_session_instance_id is None):
+            raise ValueError(
+                "Participant execution requires both an execution key and session incarnation."
+            )
+        if participant_execution_key is not None:
+            if type(participant_execution_key) is not str or not participant_execution_key.strip():
+                raise ValueError("Participant execution key must be non-blank.")
+            if type(participant_session_instance_id) is not str:
+                raise ValueError("Participant execution requires a session incarnation.")
+            if participant_permit_operation is None or participant_permit_commitment is None:
+                raise ValueError("Participant execution requires a durable permit.")
         preparation = self._prepare_initial_run(
             request,
             expected_execution_profile=expected_execution_profile,
             expected_registered_environment=expected_registered_environment,
             expected_context_policy=expected_context_policy,
+            allow_existing_session_id=participant_execution_key is not None,
         )
         del request
         prepared = await preparation
@@ -13142,9 +13167,18 @@ class SessionEngine:
             raise AssertionError("Run request session identity was not assigned.")
         prepared_session_authority = runtime_prepared_session_authority(request)
         interaction_id = (
-            str(uuid4())
-            if prepared_session_authority is None
-            else prepared_session_authority.interaction_id
+            str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"cayu-participant-session:{session_id}:{participant_execution_key}",
+                )
+            )
+            if participant_execution_key is not None
+            else (
+                str(uuid4())
+                if prepared_session_authority is None
+                else prepared_session_authority.interaction_id
+            )
         )
         interaction_started_event = self._interaction_started_event_from_identity(
             session_id=session_id,
@@ -13152,14 +13186,142 @@ class SessionEngine:
             environment_name=_environment_name(registered_environment),
             interaction_id=interaction_id,
             event_id=(
-                None
-                if prepared_session_authority is None
-                else prepared_session_authority.interaction_started_event_id
+                str(
+                    uuid5(
+                        NAMESPACE_URL,
+                        f"cayu-participant-session-event:{session_id}:{participant_execution_key}",
+                    )
+                )
+                if participant_execution_key is not None
+                else (
+                    None
+                    if prepared_session_authority is None
+                    else prepared_session_authority.interaction_started_event_id
+                )
             ),
             targeted_tool_grants=targeted_tool_grants,
         )
         invocation_context: InvocationContext | None = None
-        if prepared_session_authority is None:
+        if participant_execution_key is not None:
+            participant_session = await self.session_store.load(session_id)
+            if (
+                participant_session is None
+                or participant_session.instance_id != participant_session_instance_id
+            ):
+                raise SessionStatusConflict("Participant session incarnation is unavailable.")
+            participant_checkpoint = await self.session_store.load_checkpoint(session_id)
+            if participant_session.status is SessionStatus.PENDING:
+                if participant_checkpoint is not None:
+                    raise SessionRunFenced(
+                        "Participant session has unexpected checkpoint authority."
+                    )
+                participant_active_profile = ActiveInvocationExecutionProfile(
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                    run_epoch=participant_session.run_epoch + 1,
+                    profile=execution_profile,
+                )
+                execution_profile = participant_active_profile.profile
+                participant_invocation_context = _authenticated_invocation_context(
+                    active_profile=participant_active_profile,
+                    binding=PreparedInvocationBinding(
+                        session_id=participant_session.id,
+                        session_instance_id=participant_session.instance_id,
+                        interaction_id=interaction_id,
+                        run_epoch=participant_session.run_epoch + 1,
+                        agent_name=participant_session.agent_name,
+                        provider_name=participant_session.provider_name,
+                        model=participant_session.model,
+                        runtime_name=participant_session.runtime_name,
+                        runtime_version=participant_session.runtime_version,
+                        runtime_build_provenance=participant_session.runtime_build_provenance,
+                        environment_name=participant_session.environment_name,
+                    ),
+                    validated_profile=execution_profile,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                    runtime_hooks=self._runtime_hooks,
+                    loop_policies=self._loop_policies,
+                    request_loop_policies=request.loop_policies,
+                    budget_policy=budget_policy,
+                    tool_capability_ceiling=tool_capability_ceiling,
+                    targeted_tool_grants=targeted_tool_grants,
+                )
+                admission_command = AdmitInvocationCommand(
+                    session_id=session_id,
+                    expected_session_instance_id=participant_session.instance_id,
+                    expected_statuses=(SessionStatus.PENDING,),
+                    expected_run_epoch=participant_session.run_epoch,
+                    expected_checkpoint_sha256=invocation_checkpoint_state_sha256(
+                        participant_checkpoint
+                    ),
+                    target_active_profile=participant_active_profile,
+                    checkpoint_patch=InvocationCheckpointPatch(
+                        mutation=runtime_publication_checkpoint_mutation(None, None)
+                    ),
+                    tool_capability_ceiling=tool_capability_ceiling,
+                    interaction_source_messages=tuple(request.messages),
+                    interaction_started_event=interaction_started_event,
+                    defer_interaction_source=True,
+                    allow_pending_initial_interaction=True,
+                    participant_permit_operation=participant_permit_operation,
+                    participant_permit_commitment=participant_permit_commitment,
+                )
+                admission_result = await self.session_store.apply_invocation_lifecycle_command(
+                    admission_command
+                )
+                if type(admission_result) is not InvocationMutationResult:
+                    raise RuntimeError(
+                        "Participant invocation admission returned an invalid result."
+                    )
+                if admission_result.replayed:
+                    return
+                session = admission_result.session
+                invocation_context = participant_invocation_context.with_admitted_session(session)
+            elif participant_session.status is SessionStatus.RUNNING:
+                active = active_invocation_execution_profile_from_checkpoint(participant_checkpoint)
+                if (
+                    active is None
+                    or active.session_id != session_id
+                    or active.interaction_id != interaction_id
+                    or active.run_epoch != participant_session.run_epoch
+                    or active.profile != execution_profile
+                ):
+                    raise SessionStatusConflict(
+                        "Participant session has another active invocation."
+                    )
+                execution_profile = active.profile
+                invocation_context = _authenticated_invocation_context(
+                    active_profile=active,
+                    binding=AdmittedInvocationBinding(
+                        session_id=participant_session.id,
+                        session_instance_id=participant_session.instance_id,
+                        interaction_id=active.interaction_id,
+                        run_epoch=participant_session.run_epoch,
+                        agent_name=participant_session.agent_name,
+                        provider_name=participant_session.provider_name,
+                        model=participant_session.model,
+                        runtime_name=participant_session.runtime_name,
+                        runtime_version=participant_session.runtime_version,
+                        runtime_build_provenance=participant_session.runtime_build_provenance,
+                        environment_name=participant_session.environment_name,
+                    ),
+                    validated_profile=execution_profile,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                    runtime_hooks=self._runtime_hooks,
+                    loop_policies=self._loop_policies,
+                    request_loop_policies=request.loop_policies,
+                    budget_policy=budget_policy,
+                    tool_capability_ceiling=tool_capability_ceiling,
+                    targeted_tool_grants=targeted_tool_grants,
+                )
+                session = participant_session
+            else:
+                raise SessionStatusConflict("Participant session is no longer executable.")
+        elif prepared_session_authority is None:
             request = run_request_with_runtime_session_instance_authority(
                 request,
                 session_instance_id=str(uuid4()),
@@ -13854,6 +14016,7 @@ class SessionEngine:
                 raise RuntimeError("Initial transcript was not finalized during setup.")
             session_stream = self._run_session(
                 session=session,
+                participant_context=participant_context,
                 invocation_context=invocation_context,
                 model_failover=model_failover,
                 messages=messages,
@@ -14239,12 +14402,16 @@ class SessionEngine:
         *,
         store_resolved_session_id: str | None = None,
         continuation_handoff: _ContinuationResumeHandoff | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_resume_request(
             request,
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
         )
+        session = await self.session_store.load(request.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         task_id, task_session_instance_id = await self._linked_resume_task_id(request)
         replayed_failure, replay_events = await self._replay_runtime_task_failure_if_needed(
             session_id=request.session_id,
@@ -14258,6 +14425,7 @@ class SessionEngine:
             return
         session_stream = self._resume_session(
             request=request,
+            participant_context=participant_context,
             task_id=task_id,
             required_task_session_instance_id=task_session_instance_id,
             start_event_payload_extra={},
@@ -14303,12 +14471,16 @@ class SessionEngine:
         request: CompactSessionRequest,
         *,
         store_resolved_session_id: str | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_compact_session_request(
             request,
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
         )
+        session = await self.session_store.load(request.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         (
             requires_completion_decision,
             admission_failure,
@@ -14402,6 +14574,7 @@ class SessionEngine:
         reject_only: bool = False,
         invocation_context: InvocationContext | None = None,
         predecessor_settlement_event: Event | None = None,
+        before_successor_admission: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[list[Event], InvocationContext | None]:
         if invocation_context is not None and invocation_context.work_attempt is not None:
             # Acceptance may have come from another app without this TaskStore.
@@ -14495,6 +14668,13 @@ class SessionEngine:
                 if delivery_batch_index == 0
                 else f"{delivery_interaction_id}:batch:{delivery_batch_index}"
             )
+            if not continue_active_interaction and not interaction_started and not reject_only:
+                # A settled predecessor/profile is not permission for a new
+                # participant interaction. Recheck immediately before admission,
+                # including a first delivery after a rejection-only batch.
+                if before_successor_admission is None:
+                    raise RuntimeError("Queued successor lacks its execution admission owner.")
+                await before_successor_admission()
             try:
                 try:
                     batch: SessionMessageDeliveryBatch = (
@@ -16660,6 +16840,7 @@ class SessionEngine:
                     expected_statuses=_RESUMABLE_SESSION_STATUSES,
                     expected_run_epoch=request.expected_run_epoch,
                     expected_transcript_cursor=request.expected_transcript_cursor,
+                    context_view_compaction_cursor=request.expected_transcript_cursor,
                 )
 
             terminal_publication_task = asyncio.create_task(publish_terminal_success())
@@ -17431,7 +17612,40 @@ class SessionEngine:
         invocation_context: InvocationContext | None = None,
         predecessor_settlement_event: Event | None = None,
         task_id: str | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event | _QueuedCompletionResult, None]:
+        async def admit_successor() -> None:
+            try:
+                await self._require_participant_execution(session, participant_context)
+            except asyncio.CancelledError as cancellation:
+                # This read cannot dispatch a successor. The predecessor has
+                # already settled, so the outer cancellation path deliberately
+                # will not rewrite it. Settle only the abandoned session through
+                # the existing supervised owner before propagating cancellation.
+                async def finalize_admission() -> None:
+                    terminal = await self._recovery_coordinator.finalize_abandoned_session_run(
+                        RecoveryAbandonedSessionRequest(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                            execution_profile=execution_profile,
+                            invocation_context=invocation_context,
+                            retain_terminal_publication_repair=True,
+                        )
+                    )
+                    if terminal is not None:
+                        _mark_session_invocation_terminal_event(terminal)
+
+                await self._run_cleanup_steps(
+                    authoritative_failure=cancellation,
+                    steps=(("queued successor admission cancellation", finalize_admission),),
+                )
+                raise
+
         events: list[Event] = []
         delivery_method = self.session_store.deliver_queued_session_messages
         store_type = type(delivery_method.__self__)
@@ -17471,6 +17685,7 @@ class SessionEngine:
                 include_on_idle=True,
                 invocation_context=invocation_context,
                 predecessor_settlement_event=predecessor_settlement_event,
+                before_successor_admission=admit_successor,
                 reject_only=step >= max_steps,
             )
             events.extend(drained_events)
@@ -19279,16 +19494,21 @@ class SessionEngine:
                         expected_payload=interrupt_payload,
                     )
                 )
-                if transferred_claim is None:
-                    await self._recovery_coordinator._repair_terminal_evidence_owned(
-                        session=session,
-                        inactive_for_seconds=None,
-                        previous_status=session.status,
-                    )
-                    repaired_event = await self._wait_for_user_input_supersession_interrupt_repair(
-                        session=session,
-                        expected_payload=interrupt_payload,
-                    )
+                if transferred_claim is None or isinstance(transferred_claim, Event):
+                    if isinstance(transferred_claim, Event):
+                        repaired_event = transferred_claim
+                    else:
+                        await self._recovery_coordinator._repair_terminal_evidence_owned(
+                            session=session,
+                            inactive_for_seconds=None,
+                            previous_status=session.status,
+                        )
+                        repaired_event = (
+                            await self._wait_for_user_input_supersession_interrupt_repair(
+                                session=session,
+                                expected_payload=interrupt_payload,
+                            )
+                        )
                     if repaired_event is None:
                         raise TimeoutError(
                             f"Session interruption is still finalizing: {session.id}"
@@ -19853,6 +20073,9 @@ class SessionEngine:
                             expected_payload=payload,
                         )
                     )
+                    if isinstance(transferred_claim, Event):
+                        yield transferred_claim
+                        return
                     if transferred_claim is not None:
                         terminal_finalization_claim_id = transferred_claim.claim_id
                         terminal_finalization_claim_expires_at = transferred_claim.claim_expires_at
@@ -20035,6 +20258,7 @@ class SessionEngine:
         required_foreground_continuation: ForegroundParentContinuation | None = None,
         foreground_before_mutation: Callable[[], Awaitable[None]] | None = None,
         continuation_handoff: _ContinuationResumeHandoff | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if request.failover is not None:
             self.session_store._require_model_failover_stage_protocol()
@@ -20156,6 +20380,7 @@ class SessionEngine:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        await self._require_participant_execution(loaded_session, participant_context)
         if (
             required_task_session_instance_id is not None
             and loaded_session.instance_id != required_task_session_instance_id
@@ -21830,6 +22055,7 @@ class SessionEngine:
         )
         session_stream = self._run_session(
             session=session,
+            participant_context=participant_context,
             invocation_context=invocation_context,
             model_failover=model_failover,
             messages=messages,
@@ -23758,6 +23984,7 @@ class SessionEngine:
         )
         stream = self._run_recovered_session(
             session=request.session,
+            participant_context=request.participant_context,
             invocation_context=invocation_context,
             messages=request.messages,
             messages_to_append=request.messages_to_append,
@@ -23820,6 +24047,7 @@ class SessionEngine:
         previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
         messages_deferred: bool = False,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -23872,6 +24100,7 @@ class SessionEngine:
             )
         stream = self._run_session(
             session=session,
+            participant_context=participant_context,
             invocation_context=invocation_context,
             model_failover=model_failover,
             messages=messages,
@@ -24028,6 +24257,7 @@ class SessionEngine:
         new_terminal_invocation: bool = False,
         foreground_wait: ForegroundChildWait | None = None,
         model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -25074,6 +25304,7 @@ class SessionEngine:
                     queued_completion = None
                     async with contextlib.aclosing(
                         self._handle_queued_messages_before_completion(
+                            participant_context=participant_context,
                             finish_completion=complete_session,
                             session=session,
                             registered_agent=registered_agent,
@@ -25951,6 +26182,7 @@ class SessionEngine:
                             queued_completion = None
                             async with contextlib.aclosing(
                                 self._handle_queued_messages_before_completion(
+                                    participant_context=participant_context,
                                     finish_completion=complete_session,
                                     session=session,
                                     registered_agent=registered_agent,
@@ -26071,6 +26303,7 @@ class SessionEngine:
                                     queued_completion = None
                                     async with contextlib.aclosing(
                                         self._handle_queued_messages_before_completion(
+                                            participant_context=participant_context,
                                             finish_completion=complete_session,
                                             session=session,
                                             registered_agent=registered_agent,
@@ -26315,6 +26548,7 @@ class SessionEngine:
                         queued_completion = None
                         async with contextlib.aclosing(
                             self._handle_queued_messages_before_completion(
+                                participant_context=participant_context,
                                 finish_completion=complete_session,
                                 session=session,
                                 registered_agent=registered_agent,

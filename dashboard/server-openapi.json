@@ -34437,6 +34437,20 @@
             "title": "Policy Coverage",
             "type": "string"
           },
+          "policy_environment_names": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Environment Names"
+          },
           "registration_provenance": {
             "$ref": "#/components/schemas/RegistrationProvenance"
           },

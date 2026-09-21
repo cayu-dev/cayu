@@ -980,11 +980,98 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    99: """
+        CREATE TABLE IF NOT EXISTS cayu_context_view_lifecycle_events (
+            event_id TEXT PRIMARY KEY,
+            operation_key TEXT NOT NULL UNIQUE,
+            selection_key TEXT NOT NULL,
+            view_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('adopted', 'transferred', 'released', 'expired')),
+            owner_scope TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            owner_incarnation TEXT NOT NULL,
+            pin_commitment TEXT NOT NULL,
+            ownership_revision INTEGER NOT NULL CHECK (ownership_revision >= 1),
+            event_json TEXT NOT NULL CHECK (json_valid(event_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_context_view_lifecycle_events_view
+            ON cayu_context_view_lifecycle_events(view_id, ownership_revision, event_id);
+    """,
+    98: """
+        CREATE TABLE IF NOT EXISTS cayu_context_view_ownership_operations (
+            operation_key TEXT PRIMARY KEY,
+            selection_key TEXT NOT NULL,
+            request_commitment TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_context_view_ownership_operations_selection
+            ON cayu_context_view_ownership_operations(selection_key);
+    """,
+    97: """
+        CREATE TABLE IF NOT EXISTS cayu_context_views (
+            view_id TEXT PRIMARY KEY,
+            publication_key TEXT NOT NULL UNIQUE,
+            source_owner_scope TEXT NOT NULL,
+            source_owner_id TEXT NOT NULL,
+            source_owner_incarnation TEXT NOT NULL,
+            source_session_id TEXT NOT NULL,
+            source_session_instance_id TEXT NOT NULL,
+            transcript_cursor INTEGER NOT NULL CHECK (transcript_cursor >= 0),
+            projection_schema TEXT NOT NULL,
+            extension_set_commitment TEXT NOT NULL,
+            manifest_json TEXT NOT NULL CHECK (json_valid(manifest_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_context_views_source
+            ON cayu_context_views(
+                source_owner_scope, source_owner_id, source_owner_incarnation,
+                source_session_id, source_session_instance_id, transcript_cursor, view_id
+            );
+        CREATE TABLE IF NOT EXISTS cayu_context_view_selections (
+            selection_key TEXT PRIMARY KEY,
+            request_commitment TEXT NOT NULL,
+            view_id TEXT NOT NULL,
+            owner_scope TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            owner_incarnation TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('selected', 'adopted', 'transferred', 'released', 'expired')),
+            pin_commitment TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+            receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_context_view_selections_view
+            ON cayu_context_view_selections(view_id, state);
+    """,
+    96: SQLITE_TASK_GROUP_QUIESCENCE_DDL
+    + """
+        CREATE TABLE IF NOT EXISTS cayu_participant_session_bindings (
+            creation_key TEXT PRIMARY KEY,
+            request_commitment TEXT NOT NULL,
+            session_id TEXT NOT NULL UNIQUE REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            session_instance_id TEXT NOT NULL,
+            application_scope TEXT NOT NULL,
+            participant_owner_id TEXT NOT NULL,
+            participant_owner_incarnation TEXT NOT NULL,
+            participant_id TEXT NOT NULL,
+            participant_incarnation TEXT NOT NULL,
+            lifecycle_revision INTEGER NOT NULL,
+            configuration_revision INTEGER NOT NULL,
+            admission_generation INTEGER NOT NULL,
+            creator_commitment TEXT NOT NULL,
+            authorization_commitment TEXT NOT NULL,
+            initial_input_commitment TEXT NOT NULL,
+            execution_profile_commitment TEXT NOT NULL,
+            binding_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            CHECK (length(creation_key) BETWEEN 1 AND 256),
+            CHECK (length(request_commitment) BETWEEN 1 AND 256)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_participant_session_bindings_participant
+            ON cayu_participant_session_bindings(participant_owner_id, participant_id);
+    """,
     92: SQLITE_TASK_GROUP_DDL,
     93: SQLITE_COLLABORATION_DDL,
     94: SQLITE_COLLABORATION_LIFECYCLE_DDL,
     95: SQLITE_COLLABORATION_REQUEST_DDL,
-    96: SQLITE_TASK_GROUP_QUIESCENCE_DDL,
     91: SQLITE_TASK_GRAPH_DDL,
     90: SQLITE_SCHEDULING_DDL,
     81: """
@@ -4511,6 +4598,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ("cayu_task_groups", "barrier_status", "TEXT NOT NULL DEFAULT 'not_requested'"),
         ("cayu_task_groups", "barrier_deadline", "TEXT"),
     ),
+    98: (("cayu_context_view_selections", "ownership_revision", "INTEGER NOT NULL DEFAULT 1"),),
     91: (
         ("cayu_tasks", "graph_id", "TEXT"),
         ("cayu_tasks", "prerequisite_task_ids_json", "TEXT NOT NULL DEFAULT '[]'"),

@@ -1665,7 +1665,14 @@ def test_incomplete_recovery_renewal_preserves_owner_cancellation(
         await asyncio.wait_for(store.renewal_dispatched.wait(), timeout=10)
 
         assert heartbeat.cancel("stop recovery") is True
-        await asyncio.sleep(0)
+
+        # Cancellation crosses wait_for/shield callbacks on Python 3.11;
+        # one event-loop tick does not prove delivery to the owner.
+        async def wait_for_owned_cancellation() -> None:
+            while heartbeat.cancelling() != 0 and not heartbeat.done():
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_owned_cancellation(), timeout=5)
         assert not heartbeat.done()
         assert heartbeat.cancelling() == 0
 

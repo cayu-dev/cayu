@@ -470,7 +470,6 @@ async def run_task_worker(
 
         loop = asyncio.get_running_loop()
         meaningful_activity = False
-        await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
         if (
             recover_interrupted_handoffs
             and interrupted_handoff_supported
@@ -561,6 +560,11 @@ async def run_task_worker(
                 poller.metrics.maintenance(reclaim=True)
             meaningful_activity = meaningful_activity or bool(reclaimed)
 
+        async def prepare_claim() -> None:
+            # Maintenance is a database poll too. Only the admitted worker may
+            # scan; otherwise an idle cohort fans out before claim admission.
+            await group_maintenance.step(task_store, app._secret_redactor, now=loop.time())
+
         async def claim_next_task() -> Task | None:
             if materialized_work_contract_queue_supported:
                 claim_outcome = await capture_task_store_operation(
@@ -589,6 +593,7 @@ async def run_task_worker(
 
         claim = await poller.claim(
             claim_next_task,
+            before_claim=prepare_claim,
             maximum_active_s=lease_seconds,
         )
         task = claim.value

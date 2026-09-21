@@ -318,6 +318,38 @@ from cayu.sessions.cleanup import (
 )
 from cayu.sessions.cleanup import RecoveryCleanupTaskSnapshot as RecoveryCleanupTaskSnapshot
 from cayu.sessions.cleanup import copy_recovery_cleanup_policy as copy_recovery_cleanup_policy
+from cayu.sessions.context_views import (
+    CONTEXT_VIEW_CONTRACT_VERSION as CONTEXT_VIEW_CONTRACT_VERSION,
+)
+from cayu.sessions.context_views import CONTEXT_VIEW_STORE_VERSION as CONTEXT_VIEW_STORE_VERSION
+from cayu.sessions.context_views import (
+    ContextViewExtensionProjection as ContextViewExtensionProjection,
+)
+from cayu.sessions.context_views import ContextViewExtensionRecord as ContextViewExtensionRecord
+from cayu.sessions.context_views import (
+    ContextViewExtensionRegistration as ContextViewExtensionRegistration,
+)
+from cayu.sessions.context_views import ContextViewLifecycleEvent as ContextViewLifecycleEvent
+from cayu.sessions.context_views import ContextViewLimits as ContextViewLimits
+from cayu.sessions.context_views import ContextViewManifest as ContextViewManifest
+from cayu.sessions.context_views import ContextViewOwnershipRequest as ContextViewOwnershipRequest
+from cayu.sessions.context_views import ContextViewProjectionSource as ContextViewProjectionSource
+from cayu.sessions.context_views import (
+    ContextViewPublicationRequest as ContextViewPublicationRequest,
+)
+from cayu.sessions.context_views import ContextViewReadback as ContextViewReadback
+from cayu.sessions.context_views import ContextViewSelectionReceipt as ContextViewSelectionReceipt
+from cayu.sessions.context_views import ContextViewSelectionRequest as ContextViewSelectionRequest
+from cayu.sessions.context_views import ParticipantSessionBinding as ParticipantSessionBinding
+from cayu.sessions.context_views import (
+    ParticipantSessionCreationReceipt as ParticipantSessionCreationReceipt,
+)
+from cayu.sessions.context_views import (
+    ParticipantSessionCreationRequest as ParticipantSessionCreationRequest,
+)
+from cayu.sessions.context_views import (
+    ParticipantSessionExecutionRequest as ParticipantSessionExecutionRequest,
+)
 from cayu.sessions.exports import SessionExportBoundary as SessionExportBoundary
 from cayu.sessions.exports import SessionExportLimits as SessionExportLimits
 from cayu.sessions.exports import SessionExportSnapshot as SessionExportSnapshot

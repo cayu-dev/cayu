@@ -8,6 +8,7 @@ import mimetypes
 import os
 import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from uuid import uuid4
 
 from cayu._validation import (
+    canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
     copy_durable_metadata,
     copy_json_value,
@@ -77,8 +79,25 @@ from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
 )
-from cayu.collaboration._contracts import ExactLookup, ExpectedOperation
+from cayu.collaboration._contracts import (
+    CollaborationConflict,
+    ExactLookup,
+    ExactMatch,
+    ExactUnavailable,
+    ExpectedOperation,
+    InitiatorBinding,
+    ObjectRef,
+)
 from cayu.collaboration._coordinator import ParticipantCoordinator
+from cayu.collaboration._permit_store import prepare_permit
+from cayu.collaboration._permits import (
+    PermitCommand,
+    PermitIntent,
+    PermitReceipt,
+    PermitRegistration,
+    PermitSettlementReader,
+    ReceivingSettlementReceipt,
+)
 from cayu.collaboration._request_coordinator import RequestCoordinator
 from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
@@ -525,6 +544,7 @@ from cayu.sessions.base import (
     SessionQuery,
     SessionRunFenced,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
     TranscriptSnapshot,
     _activate_session_interaction,
@@ -555,6 +575,21 @@ from cayu.sessions.cleanup import (
     RecoveryCleanupSupervisor,
     RecoveryCleanupSupervisorSnapshot,
     copy_recovery_cleanup_policy,
+)
+from cayu.sessions.context_views import (
+    ContextViewExtensionRegistration,
+    ContextViewManifest,
+    ContextViewOwnershipRequest,
+    ContextViewProjectionSource,
+    ContextViewPublicationRequest,
+    ContextViewReadback,
+    ContextViewSelectionRequest,
+    ParticipantSessionBinding,
+    ParticipantSessionCreationReceipt,
+    ParticipantSessionCreationRequest,
+    ParticipantSessionExecutionRequest,
+    json_commitment,
+    project_context_view_extensions,
 )
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -926,6 +961,45 @@ def _resolve_cayu_app_config(
     return resolved, sources
 
 
+class _ParticipantExecutionSettlementReader(PermitSettlementReader):
+    def __init__(self, app: CayuApp, expected: PermitCommand, commitment: str) -> None:
+        self.app, self.expected, self.commitment = app, expected, commitment
+
+    @property
+    def owner(self):
+        return self.expected.intent.request.target.owner
+
+    async def lookup(self, expected: PermitCommand):
+        if expected != self.expected:
+            raise RuntimeError("Participant execution settlement identity conflicts.")
+        target = self.expected.intent.request.target
+        session = await self.app.session_store.load(target.object_id)
+        if session is None or session.instance_id != target.incarnation:
+            return ExactUnavailable()
+        checkpoint = await self.app.session_store.load_checkpoint(session.id)
+        ledger = None if checkpoint is None else checkpoint.get("invocation_lifecycle_receipt")
+        consumed = any(
+            isinstance(item, dict)
+            and item.get("participant_permit_operation") == expected.operation.caller_key
+            and item.get("participant_permit_commitment") == self.commitment
+            for item in (() if not isinstance(ledger, dict) else ledger.get("receipts", ()))
+        )
+        if consumed and session.status.value in {"completed", "failed", "interrupted"}:
+            outcome = "quiescent"
+        elif not consumed and session.status.value == "pending":
+            outcome = "excluded"
+        else:
+            return ExactUnavailable()
+        return ExactMatch[ReceivingSettlementReceipt](
+            receipt=ReceivingSettlementReceipt(
+                expected=expected,
+                receiving_owner=self.owner,
+                receipt_id=f"session:{session.id}:{session.instance_id}",
+                outcome=outcome,
+            )
+        )
+
+
 class CayuApp:
     """Application runtime for registered agents, providers, and session state."""
 
@@ -953,6 +1027,7 @@ class CayuApp:
         collaboration: CollaborationRegistration | None = None,
         collaboration_requests: RequestRegistration | None = None,
         session_exports: SessionExportRegistration | None = None,
+        context_view_extensions: Iterable[ContextViewExtensionRegistration] | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
         completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
@@ -1328,6 +1403,7 @@ class CayuApp:
             ),
         )
         self._recovery_coordinator = RecoveryCoordinator(
+            require_participant_execution=self._require_participant_execution,
             human_review_policy=human_review_policy,
             session_store=self._runtime_session_store,
             task_store=self.task_store,
@@ -1393,6 +1469,7 @@ class CayuApp:
 
         self._session_engine = SessionEngine(
             session_store=self._runtime_session_store,
+            require_participant_execution=self._require_participant_execution,
             task_store=self.task_store,
             get_budget_policy=lambda: self.budget_policy,
             event_writer=self._event_writer,
@@ -1479,6 +1556,29 @@ class CayuApp:
             registration=collaboration,
             redactor=self._secret_redactor,
         )
+        # Participant lifecycle admission and inert-session creation share one
+        # application-level fence.  This keeps an active snapshot authoritative
+        # through the session-store commit; direct coordinator calls remain an
+        # internal escape hatch and are not public application operations.
+        self._participant_session_authority_lock = asyncio.Lock()
+        self._participant_session_execution_lock_guard = asyncio.Lock()
+        self._participant_session_execution_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        if context_view_extensions is None:
+            self._context_view_extensions = ()
+        else:
+            raw_extensions = tuple(context_view_extensions)
+            if any(type(item) is not ContextViewExtensionRegistration for item in raw_extensions):
+                raise TypeError(
+                    "context_view_extensions must contain ContextViewExtensionRegistration values."
+                )
+            names = tuple(item.extension for item in raw_extensions)
+            if len(set(names)) != len(names):
+                raise ValueError("context_view_extensions cannot register duplicate names.")
+            if raw_extensions and self.session_store.context_view_version is None:
+                raise RuntimeError(
+                    "The configured SessionStore does not yet support context-view extensions."
+                )
+            self._context_view_extensions = raw_extensions
         self._request_coordinator = RequestCoordinator(
             participants=self._participant_coordinator,
             registration=collaboration_requests,
@@ -1682,9 +1782,10 @@ class CayuApp:
     async def change_participant_lifecycle(
         self, request: ParticipantLifecycleChange, *, context: CollaborationAccessContext
     ) -> LifecycleReceipt:
-        return await self._participant_coordinator.mutate_lifecycle(
-            ParticipantLifecycleChange, request, context=context
-        )
+        async with self._participant_session_authority_lock:
+            return await self._participant_coordinator.mutate_lifecycle(
+                ParticipantLifecycleChange, request, context=context
+            )
 
     async def list_participant_obligations(
         self,
@@ -1710,12 +1811,458 @@ class CayuApp:
             ParticipantCreate, request, context=context
         )
 
+    async def create_participant_session(
+        self,
+        creation: ParticipantSessionCreationRequest,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+    ) -> tuple[Session, ParticipantSessionCreationReceipt]:
+        async with self._participant_session_authority_lock:
+            return await self._create_participant_session_unserialized(
+                creation,
+                participant=participant,
+                context=context,
+            )
+
+    async def _create_participant_session_unserialized(
+        self,
+        creation: ParticipantSessionCreationRequest,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+    ) -> tuple[Session, ParticipantSessionCreationReceipt]:
+        """Create one inert session bound to an active participant.
+
+        Participant authorization is resolved before the SessionStore call. The
+        store then mints the session incarnation and commits its binding and
+        receipt atomically; no provider, tool, or environment work is started.
+        """
+
+        if type(creation) is not ParticipantSessionCreationRequest:
+            raise TypeError("Participant session creation requires a typed creation request.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Participant session creation requires a ParticipantRef.")
+        if self.session_store.participant_session_binding_version != 1:
+            raise RuntimeError(
+                "The configured SessionStore does not support participant-owned sessions."
+            )
+        inspection = await self._participant_coordinator.inspect(
+            participant,
+            context=context,
+            action="administration",
+        )
+        snapshot = inspection.participant
+        if snapshot.reference != participant:
+            raise RuntimeError("Participant inspection returned another identity.")
+        existing = await self.session_store.lookup_participant_session_creation(creation)
+        if existing is not None:
+            existing_session, existing_receipt = existing
+            if existing_receipt.binding.participant != participant:
+                raise ValueError("Participant creation key belongs to another participant.")
+            expected_creator_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_durable_json_bytes(
+                        {
+                            "application_scope": participant.owner.application_scope,
+                            "principal": context.principal,
+                        },
+                        "creator_authority",
+                    )
+                ).hexdigest()
+            )
+            if existing_receipt.binding.creator_commitment != expected_creator_commitment:
+                raise ValueError("Participant creation key belongs to another creator.")
+            if snapshot.lifecycle != "active":
+                return existing_session, existing_receipt
+        if snapshot.lifecycle != "active":
+            raise PermissionError("Only active participants can own a new session.")
+        requested_session_id = creation.request.session_id
+        prepared = await self._session_engine._prepare_initial_run(
+            self._with_application_run_defaults(creation.request),
+            admit_session=False,
+        )
+        if prepared is None:
+            raise RuntimeError("Participant session preparation did not produce a profile.")
+        prepared_request = prepared.request
+        profile_json = canonical_bounded_durable_json_bytes(
+            prepared.execution_profile.model_dump(mode="json"),
+            "execution_profile",
+            max_bytes=256 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        initial_input_json = canonical_bounded_durable_json_bytes(
+            [message.model_dump(mode="json") for message in prepared_request.messages],
+            "initial_input",
+            max_bytes=8 * 1024 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        creator_material = {
+            "application_scope": participant.owner.application_scope,
+            "principal": context.principal,
+        }
+        authorization_material = {
+            "participant": participant.model_dump(mode="json"),
+            "lifecycle_revision": snapshot.lifecycle_revision,
+            "configuration_revision": snapshot.configuration_revision,
+            "admission_generation": snapshot.admission_generation,
+            "configuration": snapshot.configuration.model_dump(mode="json"),
+        }
+        creator_commitment = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(creator_material, "creator_authority")
+            ).hexdigest()
+        )
+        authorization_commitment = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(authorization_material, "participant_authority")
+            ).hexdigest()
+        )
+        initial_input_commitment = json_commitment(initial_input_json, "initial_input")
+        execution_profile_commitment = json_commitment(profile_json, "execution_profile")
+        # Retain data from the resolved preflight, never reconstruct it later
+        # from a potentially replaced registration. Arbitrary metadata/options
+        # remain excluded; the profile commits their execution identity.
+        # Literal secret matching must precede JSON escaping (quotes, slashes,
+        # and newlines are meaningful parts of a registered secret).
+        for field_name, value in (
+            ("agent_name", prepared.registered_agent.spec.name),
+            ("agent_system_prompt", prepared.registered_agent.spec.system_prompt),
+            ("rendered_system_prompt", prepared.rendered_system_prompt),
+        ):
+            session_request_boundary.require_secret_free_session_authority(
+                value,
+                field_name=field_name,
+                redactor=self._secret_redactor,
+            )
+        historical_definition_json = canonical_bounded_durable_json_bytes(
+            {
+                "historical_only": True,
+                "agent_name": prepared.registered_agent.spec.name,
+                "agent_system_prompt": prepared.registered_agent.spec.system_prompt,
+                "rendered_system_prompt": prepared.rendered_system_prompt,
+                "agent_definition_commitment": json_commitment(
+                    canonical_bounded_durable_json_bytes(
+                        prepared.registered_agent.spec.model_dump(mode="json"),
+                        "resolved agent definition",
+                        max_bytes=256 * 1024,
+                        max_nodes=8192,
+                        max_nesting=64,
+                    ).decode("utf-8")
+                ),
+                "execution_profile_commitment": execution_profile_commitment,
+            },
+            "historical definition",
+            max_bytes=256 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        session_request_boundary.require_secret_free_session_authority(
+            historical_definition_json,
+            field_name="historical_definition",
+            redactor=self._secret_redactor,
+        )
+
+        def binding_factory(
+            session: Session,
+        ) -> tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]:
+            binding = ParticipantSessionBinding(
+                application_scope=participant.owner.application_scope,
+                participant=participant,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                lifecycle_revision=snapshot.lifecycle_revision,
+                configuration_revision=snapshot.configuration_revision,
+                admission_generation=snapshot.admission_generation,
+                creator_commitment=creator_commitment,
+                authorization_commitment=authorization_commitment,
+                initial_input_commitment=initial_input_commitment,
+                request_commitment=creation.request_commitment,
+                execution_profile_commitment=execution_profile_commitment,
+                historical_definition_json=historical_definition_json,
+                creation_key=creation.creation_key,
+            )
+            material = {
+                "binding": binding.model_dump(mode="json"),
+                "requested_session_id": requested_session_id,
+                "initial_input_commitment": initial_input_commitment,
+                "execution_profile_json": profile_json,
+                "schema_version": 1,
+            }
+            receipt_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_durable_json_bytes(
+                        material,
+                        "participant_session_receipt",
+                        max_bytes=512 * 1024,
+                        max_nodes=8192,
+                    )
+                ).hexdigest()
+            )
+            receipt = ParticipantSessionCreationReceipt(
+                binding=binding,
+                requested_session_id=requested_session_id,
+                initial_input_commitment=initial_input_commitment,
+                execution_profile_json=profile_json,
+                receipt_commitment=receipt_commitment,
+            )
+            return binding, receipt
+
+        session, receipt = await self.session_store.create_participant_owned_session(
+            creation,
+            resolved_request=prepared_request,
+            identity=prepared.session_identity,
+            binding_factory=binding_factory,
+        )
+        return session, receipt
+
+    async def execute_participant_session(
+        self,
+        execution: ParticipantSessionExecutionRequest,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+    ) -> AsyncIterator[Event]:
+        """Activate one inert participant-owned root session exactly once.
+
+        This is the sole execution entrance for sessions created by
+        ``create_participant_session``.  It authenticates the current
+        participant before handing the request to the ordinary session engine;
+        it does not create children or publish context views implicitly.
+        """
+
+        if type(execution) is not ParticipantSessionExecutionRequest:
+            raise TypeError("Participant session execution requires a typed request.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Participant session execution requires a ParticipantRef.")
+        async with self._participant_session_authority_lock:
+            inspection = await self._participant_coordinator.inspect(
+                participant,
+                context=context,
+                action="administration",
+            )
+            request = execution.request
+            if request.session_id is None:
+                raise ValueError("Participant session execution requires a session_id.")
+            session = await self.session_store.load(request.session_id)
+            if session is None or session.instance_id != execution.session_instance_id:
+                raise LookupError("The participant session incarnation is unavailable.")
+            binding = await self.session_store.load_participant_session_binding(session.id)
+            if binding is None or binding.participant != participant:
+                raise PermissionError("The session is not bound to this participant.")
+            creation_receipt = await self.session_store.load_participant_session_creation_receipt(
+                session.id
+            )
+            if creation_receipt is None or creation_receipt.binding != binding:
+                raise RuntimeError("Participant session receipt is inconsistent with its binding.")
+            expected_request_commitment = (
+                execution.request_commitment
+                if creation_receipt.requested_session_id is not None
+                else execution.creation_request_commitment
+            )
+            if binding.request_commitment != expected_request_commitment:
+                raise ValueError(
+                    "Participant session execution conflicts with its creation request."
+                )
+            operation_key = (
+                "participant-execution:"
+                + sha256(
+                    f"{session.id}:{session.instance_id}:{execution.execution_key}".encode()
+                ).hexdigest()
+            )
+            initialized = self._participant_coordinator._ready()[1]
+            operation = initialized.operation(operation_key)
+            expected_profile = execution_profile_from_session_metadata(session.metadata)
+            admission_commitment = sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "request": execution.request.model_dump(mode="json"),
+                        "binding": binding.model_dump(mode="json"),
+                        "session_instance_id": session.instance_id,
+                        "execution_key": execution.execution_key,
+                        "execution_profile_fingerprint": expected_profile.fingerprint,
+                    },
+                    "participant_execution_admission",
+                )
+            ).hexdigest()
+            permit_receipt = await self._participant_coordinator._ready()[
+                0
+            ]._lookup_registered_permit(initialized, operation, redactor=self._secret_redactor)
+            if permit_receipt is not None:
+                permit = prepare_permit(initialized, permit_receipt.expected, self._secret_redactor)
+                if permit.intent.request.admission_commitment != admission_commitment:
+                    raise ValueError("Participant execution conflicts with its retained permit.")
+            else:
+                if inspection.participant.lifecycle != "active":
+                    raise PermissionError("Only active participants can execute a session.")
+                permit_request = PermitRegistration(
+                    operation=operation,
+                    participant=participant,
+                    expected_lifecycle_revision=inspection.participant.lifecycle_revision,
+                    expected_configuration_revision=inspection.participant.configuration_revision,
+                    admission_commitment=admission_commitment,
+                    admission_generation=inspection.participant.admission_generation,
+                    source_operation=initialized.operation(operation_key + ":source"),
+                    target=ObjectRef(
+                        owner=participant.owner,
+                        kind="participant_session",
+                        object_id=session.id,
+                        incarnation=session.instance_id,
+                    ),
+                    target_state="future",
+                    effect_scope="participant_session_execution",
+                    required_settlement="exclusion",
+                    settlement_operation=initialized.operation(operation_key + ":settled"),
+                )
+                permit = prepare_permit(
+                    initialized,
+                    PermitCommand(
+                        operation=operation,
+                        source=initialized.owner,
+                        destination=initialized.owner,
+                        initiator=InitiatorBinding(
+                            issuer=initialized.owner,
+                            principal=context.principal,
+                            participant=ObjectRef(
+                                owner=participant.owner,
+                                kind="participant",
+                                object_id=participant.participant_id,
+                                incarnation=participant.incarnation,
+                            ),
+                            mandate=None,
+                            invocation_id=execution.execution_key,
+                            interaction_id=None,
+                        ),
+                        intent=PermitIntent(
+                            request=permit_request, limits=initialized.binding.limits
+                        ),
+                    ),
+                    self._secret_redactor,
+                )
+                permit_receipt = await self._participant_coordinator._store_result(
+                    self._participant_coordinator._ready()[0]._register_permit(
+                        initialized, permit, redactor=self._secret_redactor
+                    )
+                )
+                if not isinstance(permit_receipt, PermitReceipt):
+                    raise RuntimeError("Participant execution permit receipt is unavailable.")
+            permit_commitment = sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "permit": permit_receipt.model_dump(mode="json"),
+                        "request": execution.request.model_dump(mode="json"),
+                        "binding": binding.model_dump(mode="json"),
+                        "session_instance_id": session.instance_id,
+                        "execution_key": execution.execution_key,
+                        "execution_profile_fingerprint": expected_profile.fingerprint,
+                    },
+                    "participant_execution_admission",
+                )
+            ).hexdigest()
+            stream = self._run_private(
+                request,
+                expected_execution_profile=expected_profile,
+                participant_execution_key=execution.execution_key,
+                participant_session_instance_id=execution.session_instance_id,
+                participant_context=context,
+                participant_permit_operation=operation.caller_key,
+                participant_permit_commitment=permit_commitment,
+            )
+            async with self._participant_session_execution_lock_guard:
+                lock, users = self._participant_session_execution_locks.get(
+                    session.id, (asyncio.Lock(), 0)
+                )
+                self._participant_session_execution_locks[session.id] = (lock, users + 1)
+
+        async def guarded_events() -> AsyncIterator[Event]:
+            # Serialize only this session's delegated stream. Two identical
+            # callers may both pass the read-only preflight, but only one may
+            # consume the pending root-session activation. Unrelated sessions
+            # must not be blocked by a slow provider or tool stream.
+            lock = self._participant_session_execution_locks[session.id][0]
+            try:
+                async with lock, _close_delegated_event_stream(stream) as owned_stream:
+                    async for event in owned_stream:
+                        yield await self._project_emitted_event_for_public_api(event)
+                await self._participant_coordinator._store_result(
+                    self._participant_coordinator._ready()[0]._settle_permit(
+                        initialized,
+                        permit,
+                        reader=_ParticipantExecutionSettlementReader(
+                            self, permit, permit_commitment
+                        ),
+                        redactor=self._secret_redactor,
+                    )
+                )
+            except (
+                PermissionError,
+                LookupError,
+                ValueError,
+                SessionStatusConflict,
+                CollaborationConflict,
+            ):
+                # Only a typed pre-admission rejection proves that no external
+                # effect could have started. Cancellation, timeout, provider
+                # failure and stream abandonment retain the pending permit for
+                # exact later reconciliation.
+                with suppress(Exception):
+                    await self._participant_coordinator._store_result(
+                        self._participant_coordinator._ready()[0]._exclude_permit(
+                            initialized,
+                            permit,
+                            reader=_ParticipantExecutionSettlementReader(
+                                self, permit, permit_commitment
+                            ),
+                            redactor=self._secret_redactor,
+                        )
+                    )
+                raise
+            except Exception:
+                # A non-cancellation failure may have been durably recorded by
+                # the receiving session store before its acknowledgement was
+                # lost.  Reconcile that terminal evidence, but leave a pending
+                # permit fenced when the reader cannot prove quiescence.
+                with suppress(Exception):
+                    await self._participant_coordinator._store_result(
+                        self._participant_coordinator._ready()[0]._settle_permit(
+                            initialized,
+                            permit,
+                            reader=_ParticipantExecutionSettlementReader(
+                                self, permit, permit_commitment
+                            ),
+                            redactor=self._secret_redactor,
+                        )
+                    )
+                raise
+            finally:
+                async with self._participant_session_execution_lock_guard:
+                    current = self._participant_session_execution_locks.get(session.id)
+                    if current is not None and current[0] is lock:
+                        remaining = current[1] - 1
+                        if remaining:
+                            self._participant_session_execution_locks[session.id] = (
+                                lock,
+                                remaining,
+                            )
+                        else:
+                            del self._participant_session_execution_locks[session.id]
+
+        async for event in guarded_events():
+            yield event
+
     async def configure_participant(
         self, request: ParticipantConfigure, *, context: CollaborationAccessContext
     ) -> ParticipantReceipt:
-        return await self._participant_coordinator.mutate(
-            ParticipantConfigure, request, context=context
-        )
+        async with self._participant_session_authority_lock:
+            return await self._participant_coordinator.mutate(
+                ParticipantConfigure, request, context=context
+            )
 
     async def change_participant_alias(
         self, request: ParticipantAliasChange, *, context: CollaborationAccessContext
@@ -1760,6 +2307,409 @@ class CayuApp:
         self, expected: ExpectedOperation[ParticipantIntent], *, context: CollaborationAccessContext
     ) -> ExactLookup[ParticipantReceipt]:
         return await self._participant_coordinator.lookup(expected, context=context)
+
+    @property
+    def context_view_extensions(self) -> tuple[ContextViewExtensionRegistration, ...]:
+        """Return detached application registrations for historical projections."""
+
+        return tuple(self._context_view_extensions)
+
+    def project_context_view_extensions(self, source: ContextViewProjectionSource):
+        """Return the all-or-nothing detached extension projection for a view."""
+
+        return project_context_view_extensions(self._context_view_extensions, source)
+
+    async def publish_completed_context_view(
+        self,
+        request: ContextViewPublicationRequest,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+    ) -> ContextViewManifest:
+        """Publish an immutable view from authoritative completed-turn evidence."""
+
+        if type(request) is not ContextViewPublicationRequest:
+            raise TypeError("Context-view publication requires a typed request.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Context-view publication requires a ParticipantRef.")
+        if self.session_store.context_view_version is None:
+            raise RuntimeError("The configured SessionStore does not support context views.")
+        source_session_id, _ = await self._resolve_public_session_authority(
+            request.source_session_id
+        )
+        request = request.model_copy(update={"source_session_id": source_session_id}, deep=True)
+        inspection = await self._participant_coordinator.inspect(
+            participant,
+            context=context,
+            action="administration",
+        )
+        if inspection.participant.lifecycle != "active":
+            raise PermissionError("Only active participants can publish context views.")
+        lookup_publication = getattr(self.session_store, "lookup_context_view_publication", None)
+        if lookup_publication is None:
+            raise RuntimeError(
+                "The configured SessionStore cannot reconcile context-view publication."
+            )
+        existing_manifest = await lookup_publication(request.publication_key)
+        if existing_manifest is not None:
+            stored_extension_schema = tuple(
+                (extension.extension, extension.schema_version)
+                for extension in existing_manifest.extensions
+            )
+            current_extension_schema = tuple(
+                (extension.extension, extension.schema_version)
+                for extension in self._context_view_extensions
+            )
+            if (
+                existing_manifest.participant != participant
+                or existing_manifest.source_session_id != request.source_session_id
+                or existing_manifest.source_session_instance_id
+                != request.source_session_instance_id
+                or existing_manifest.view_id != request.view_id
+                or existing_manifest.interaction_id != request.interaction_id
+                or existing_manifest.boundary_id != request.boundary_id
+                or existing_manifest.projection_schema != request.projection_schema
+                or stored_extension_schema != current_extension_schema
+            ):
+                raise ValueError("Context-view publication key conflicts with its request.")
+            return existing_manifest
+        source = await self.session_store.capture_context_view_publication_source(
+            request.source_session_id
+        )
+        session = source.session
+        if session.instance_id != request.source_session_instance_id:
+            raise LookupError("The source session incarnation is unavailable.")
+        binding = source.binding
+        if binding.participant != participant:
+            raise PermissionError("The source session is not bound to this participant.")
+        for field_name in ("agent_name", "provider_name", "model", "environment_name"):
+            session_request_boundary.require_secret_free_session_authority(
+                getattr(session, field_name),
+                field_name=field_name,
+                redactor=self._secret_redactor,
+            )
+        pointer = source.pointer
+        completion_event = source.completion_event
+        assert completion_event.interaction_id is not None
+        if request.interaction_id != completion_event.interaction_id:
+            raise ValueError(
+                "The publication interaction identity conflicts with completion evidence."
+            )
+        if request.boundary_id != pointer.logical_step_id:
+            raise ValueError(
+                "The publication boundary identity conflicts with completion evidence."
+            )
+        records = source.records
+
+        def contains_resource_reference(value: object) -> bool:
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    if (
+                        key
+                        in {
+                            "attachment",
+                            "attachments",
+                            "resource_reference",
+                            "resource_references",
+                        }
+                        and child is not None
+                    ):
+                        return True
+                    if contains_resource_reference(child):
+                        return True
+                return False
+            if isinstance(value, (list, tuple)):
+                return any(contains_resource_reference(child) for child in value)
+            return False
+
+        if any(
+            contains_resource_reference(record.message.model_dump(mode="json"))
+            for record in records
+        ):
+            raise ValueError(
+                "Context-view publication requires independently qualified resource references."
+            )
+        messages_json = canonical_bounded_durable_json_bytes(
+            [record.message.model_dump(mode="json") for record in records],
+            "context view messages",
+            max_bytes=8 * 1024 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        # Extensions receive only the bounded historical projection source.
+        # Passing the executable Session model would expose invocation,
+        # metadata, leases, and other private authority to a producer even
+        # though none of it is eligible for a historical manifest.
+        # No application-owned executable context is published by this baseline
+        # projection.  ``null`` is explicit and committed rather than a mutable
+        # placeholder that could be mistaken for retained configuration.
+        application_context_json = None
+        historical_profile = source.execution_profile
+        historical_ancestry_json = canonical_bounded_durable_json_bytes(
+            {
+                "source_session_instance_id": session.instance_id,
+                "provider_name": session.provider_name,
+                "model": session.model,
+                "agent_name": session.agent_name,
+                "execution_profile": historical_profile.model_dump(mode="json"),
+                "runtime_build_fingerprint": session.runtime_build_fingerprint,
+                "creation_definition_json": binding.historical_definition_json,
+                "creation_definition_commitment": json_commitment(
+                    binding.historical_definition_json
+                ),
+            },
+            "historical ancestry",
+            max_bytes=256 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        causal_budget_ancestry_json = canonical_bounded_durable_json_bytes(
+            {"causal_budget_id": session.causal_budget_id},
+            "causal budget ancestry",
+            max_bytes=256 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        compaction_json = canonical_bounded_durable_json_bytes(
+            {
+                "state": "uncompacted",
+                "input_frontier": pointer.source_transcript_cursor,
+                "retained_output_frontier": source.transcript_end_cursor,
+                "retained_suffix_frontier": source.transcript_end_cursor,
+            },
+            "context view compaction relationship",
+            max_bytes=256 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode("utf-8")
+        extension_source = ContextViewProjectionSource(
+            source_session_id=session.id,
+            source_session_instance_id=session.instance_id,
+            participant_json=canonical_bounded_durable_json_bytes(
+                participant.model_dump(mode="json"), "participant", max_bytes=8192, max_nodes=64
+            ).decode("utf-8"),
+            interaction_id=completion_event.interaction_id,
+            boundary_id=pointer.logical_step_id,
+            completion_event_id=pointer.completion_event_id,
+            source_transcript_cursor=pointer.source_transcript_cursor,
+            transcript_cursor=source.transcript_end_cursor,
+            messages_json=messages_json,
+            compaction_json=compaction_json,
+            historical_ancestry_json=historical_ancestry_json,
+        )
+        extension_records, extension_set_commitment = self.project_context_view_extensions(
+            extension_source
+        )
+        material = {
+            "schema_version": 1,
+            "source_owner": participant.owner.model_dump(mode="json"),
+            "participant": participant.model_dump(mode="json"),
+            "source_session_id": session.id,
+            "source_session_instance_id": session.instance_id,
+            "view_id": request.view_id,
+            "interaction_id": request.interaction_id,
+            "boundary_id": request.boundary_id,
+            "completion_event_id": pointer.completion_event_id,
+            "transcript_cursor": source.transcript_end_cursor,
+            "projection_schema": request.projection_schema,
+            "extension_set_commitment": extension_set_commitment,
+            "messages_json": messages_json,
+            "application_context_json": application_context_json,
+            "extensions": [record.model_dump(mode="json") for record in extension_records],
+            "historical_ancestry_json": historical_ancestry_json,
+            "causal_budget_ancestry_json": causal_budget_ancestry_json,
+            "resource_references_json": None,
+            "compaction_json": compaction_json,
+            "messages_commitment": json_commitment(messages_json, "messages"),
+            "application_context_commitment": json_commitment(
+                application_context_json or "null", "application context"
+            ),
+        }
+        material["manifest_commitment"] = (
+            "sha256:"
+            + sha256(
+                canonical_bounded_durable_json_bytes(
+                    material,
+                    "context view manifest",
+                    max_bytes=8 * 1024 * 1024,
+                    max_nodes=8192,
+                    max_nesting=64,
+                )
+            ).hexdigest()
+        )
+        manifest = ContextViewManifest.model_validate(material)
+        return await self.session_store.publish_context_view(
+            manifest,
+            publication_key=request.publication_key,
+        )
+
+    async def transition_context_view_ownership(
+        self,
+        request: ContextViewOwnershipRequest,
+        *,
+        participant: ParticipantRef,
+        destination_participant: ParticipantRef | None = None,
+        context: CollaborationAccessContext,
+    ):
+        """Apply one authenticated, replay-safe context-view ownership transition."""
+
+        if type(request) is not ContextViewOwnershipRequest:
+            raise TypeError("Context-view ownership requires a typed request.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Context-view ownership requires a ParticipantRef.")
+        if self.session_store.context_view_version is None:
+            raise RuntimeError("The configured SessionStore does not support context views.")
+        inspection = await self._participant_coordinator.inspect(
+            participant,
+            context=context,
+            action="administration",
+        )
+        if inspection.participant.lifecycle != "active" and request.operation != "release":
+            raise PermissionError("Only active participants can change context-view ownership.")
+        if request.current_owner != participant.owner:
+            raise PermissionError("The authenticated participant is not the current owner.")
+        request = request.model_copy(update={"current_participant": participant}, deep=True)
+        if request.destination_owner is not None:
+            if (
+                destination_participant is None
+                or destination_participant.owner != request.destination_owner
+            ):
+                raise PermissionError(
+                    "The destination participant does not match the transfer owner."
+                )
+            destination_inspection = await self._participant_coordinator.inspect(
+                destination_participant,
+                context=context,
+                action="administration",
+            )
+            if destination_inspection.participant.lifecycle != "active":
+                raise PermissionError("Ownership cannot be transferred to an inactive participant.")
+            request = request.model_copy(
+                update={"destination_participant": destination_participant}, deep=True
+            )
+        return await self.session_store.transition_context_view_ownership(request)
+
+    async def select_context_view(
+        self,
+        request: ContextViewSelectionRequest,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+    ):
+        if type(request) is not ContextViewSelectionRequest:
+            raise TypeError("Context-view selection requires a typed request.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Context-view selection requires a ParticipantRef.")
+        if self.session_store.context_view_version is None:
+            raise RuntimeError("The configured SessionStore does not support context views.")
+        source_session_id, _ = await self._resolve_public_session_authority(
+            request.source_session_id
+        )
+        request = request.model_copy(update={"source_session_id": source_session_id}, deep=True)
+        inspection = await self._participant_coordinator.inspect(
+            participant,
+            context=context,
+            action="administration",
+        )
+        if inspection.participant.lifecycle != "active":
+            raise PermissionError("Only active participants can select context views.")
+        if request.source_owner != participant.owner:
+            raise PermissionError("The authenticated participant does not own the source view.")
+        binding = await self.session_store.load_participant_session_binding(
+            request.source_session_id
+        )
+        if (
+            binding is None
+            or binding.participant != participant
+            or binding.session_id != request.source_session_id
+            or binding.session_instance_id != request.source_session_instance_id
+        ):
+            raise PermissionError(
+                "The source session is not bound to this participant incarnation."
+            )
+        return await self.session_store.select_context_view(request)
+
+    async def read_context_view(
+        self,
+        view_id: str,
+        *,
+        source_session_id: str,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+    ) -> ContextViewReadback:
+        if type(view_id) is not str or type(source_session_id) is not str:
+            raise TypeError("Context-view readback requires string identifiers.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Context-view readback requires a ParticipantRef.")
+        if self.session_store.context_view_version is None:
+            raise RuntimeError("The configured SessionStore does not support context views.")
+        source_session_id, _ = await self._resolve_public_session_authority(source_session_id)
+        await self._participant_coordinator.inspect(
+            participant,
+            context=context,
+            action="readback",
+        )
+        readback = await self.session_store.read_context_view(
+            view_id,
+            source_session_id=source_session_id,
+        )
+        # A collaboration OwnerRef is shared by many participants. Historical
+        # owner events cannot authenticate a different participant incarnation.
+        events = await self.session_store.read_context_view_lifecycle_events(
+            view_id, limit=1, owner_participant=participant
+        )
+        authorized_participants = {
+            readback.view.participant,
+            *(event.owner_participant for event in events if event.owner_participant is not None),
+        }
+        if participant not in authorized_participants:
+            raise PermissionError("The authenticated participant does not own the source view.")
+        return readback
+
+    async def read_context_view_lifecycle_events(
+        self,
+        view_id: str,
+        *,
+        source_session_id: str,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+        limit: int = 256,
+    ):
+        if type(limit) is not int or not 1 <= limit <= 256:
+            raise ValueError("Context-view public event limits must be between 1 and 256.")
+        if type(view_id) is not str or type(source_session_id) is not str:
+            raise TypeError("Context-view event readback requires string identifiers.")
+        if type(participant) is not ParticipantRef:
+            raise TypeError("Context-view event readback requires a ParticipantRef.")
+        if self.session_store.context_view_version is None:
+            raise RuntimeError("The configured SessionStore does not support context views.")
+        source_session_id, _ = await self._resolve_public_session_authority(source_session_id)
+        await self._participant_coordinator.inspect(
+            participant,
+            context=context,
+            action="readback",
+        )
+        readback = await self.session_store.read_context_view(
+            view_id,
+            source_session_id=source_session_id,
+        )
+        authority_events = await self.session_store.read_context_view_lifecycle_events(
+            view_id, limit=1, owner_participant=participant
+        )
+        authorized_participants = {
+            readback.view.participant,
+            *(
+                event.owner_participant
+                for event in authority_events
+                if event.owner_participant is not None
+            ),
+        }
+        if participant not in authorized_participants:
+            raise PermissionError("The authenticated participant does not own the view events.")
+        events = await self.session_store.read_context_view_lifecycle_events(view_id, limit=limit)
+        if not events:
+            raise LookupError("Context-view lifecycle evidence is unavailable.")
+        return events
 
     @property
     def budget_policy(self) -> BudgetPolicy | None:
@@ -5411,6 +6361,11 @@ class CayuApp:
         expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
         expected_context_policy: object | None = None,
         pause_after_initial_transcript: bool = False,
+        participant_execution_key: str | None = None,
+        participant_session_instance_id: str | None = None,
+        participant_context: CollaborationAccessContext | None = None,
+        participant_permit_operation: str | None = None,
+        participant_permit_commitment: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
@@ -5434,6 +6389,11 @@ class CayuApp:
             expected_registered_environment=expected_registered_environment,
             expected_context_policy=expected_context_policy,
             pause_after_initial_transcript=pause_after_initial_transcript,
+            participant_execution_key=participant_execution_key,
+            participant_session_instance_id=participant_session_instance_id,
+            participant_context=participant_context,
+            participant_permit_operation=participant_permit_operation,
+            participant_permit_commitment=participant_permit_commitment,
         )
         del request
         if boundary.expires_at is not None:
@@ -5442,7 +6402,29 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
-    async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
+    async def _require_participant_execution(
+        self, session: Session, context: CollaborationAccessContext | None
+    ) -> None:
+        if self.session_store.participant_session_binding_version is None:
+            return
+        binding = await self.session_store.load_participant_session_binding(session.id)
+        if binding is None:
+            return
+        if binding.session_instance_id != session.instance_id:
+            raise PermissionError("Participant session incarnation changed.")
+        if context is None:
+            raise PermissionError(
+                "Participant session continuation requires administration access."
+            )
+        inspection = await self._participant_coordinator.inspect(
+            binding.participant, context=context, action="administration"
+        )
+        if inspection.participant.lifecycle != "active":
+            raise PermissionError("Only active participants can execute a session.")
+
+    async def resume(
+        self, request: ResumeRequest, *, context: CollaborationAccessContext | None = None
+    ) -> AsyncIterator[Event]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
         request = copy_resume_request(request)
@@ -5453,6 +6435,7 @@ class CayuApp:
         stream = self._resume_private(
             request,
             store_resolved_session_id=store_resolved_session_id,
+            participant_context=context,
         )
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -5465,6 +6448,7 @@ class CayuApp:
         *,
         store_resolved_session_id: str | None = None,
         continuation_handoff: _ContinuationResumeHandoff | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
@@ -5479,6 +6463,7 @@ class CayuApp:
             request=request,
             store_resolved_session_id=store_resolved_session_id,
             continuation_handoff=continuation_handoff,
+            participant_context=participant_context,
         )
         del request
         if boundary.expires_at is not None:
@@ -5490,6 +6475,8 @@ class CayuApp:
     async def compact_session(
         self,
         request: CompactSessionRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         if type(request) is not CompactSessionRequest:
             raise TypeError("Runtime compaction requires a CompactSessionRequest.")
@@ -5500,6 +6487,7 @@ class CayuApp:
         stream = self._compact_session_private(
             request,
             store_resolved_session_id=store_resolved_session_id,
+            participant_context=context,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -5510,10 +6498,23 @@ class CayuApp:
         request: CompactSessionRequest,
         *,
         store_resolved_session_id: str | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not CompactSessionRequest:
             raise TypeError("Runtime compaction requires a CompactSessionRequest.")
         stored = await self.session_store.load(request.session_id)
+        if stored is not None:
+            await self._require_participant_execution(stored, participant_context)
+        if getattr(self.session_store, "context_view_version", None) is not None:
+            try:
+                await self.session_store.validate_context_view_compaction(
+                    request.session_id,
+                    request.expected_transcript_cursor,
+                )
+            except NotImplementedError as exc:
+                raise RuntimeError(
+                    "The configured SessionStore cannot prove context-view compaction safety."
+                ) from exc
         boundary = resumed_execution_deadline(
             stored.execution_deadline if stored is not None else ExecutionDeadline()
         )
@@ -5521,6 +6522,7 @@ class CayuApp:
         stream = self._session_engine.compact_session(
             request=request,
             store_resolved_session_id=store_resolved_session_id,
+            participant_context=participant_context,
         )
         if boundary.expires_at is not None:
             stream = deadline_stream(stream, boundary)
@@ -7977,7 +8979,11 @@ class CayuApp:
         enforce_task_handoff_identity: bool = False,
         allow_terminal_failure_replay: bool = False,
         approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> None:
+        session = await self.session_store.load(session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         await self._require_continuation_task_authority(
             session_id=session_id,
             session_instance_id=session_instance_id,
@@ -7997,6 +9003,7 @@ class CayuApp:
         self,
         request: RecoverySessionRunRequest,
     ) -> AsyncGenerator[Event, None]:
+        await self._require_participant_execution(request.session, request.participant_context)
         await self._require_continuation_task_authority(
             session_id=request.session.id,
             session_instance_id=(
@@ -8217,6 +9224,8 @@ class CayuApp:
     async def resolve_user_input(
         self,
         response: UserInputResponse,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         if type(response) is not UserInputResponse:
             raise TypeError("Runtime user input resolution requires a UserInputResponse.")
@@ -8235,7 +9244,7 @@ class CayuApp:
                 ),
             },
         )
-        stream = self._resolve_user_input_private(response)
+        stream = self._resolve_user_input_private(response, participant_context=context)
         del response
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -8244,6 +9253,8 @@ class CayuApp:
     async def _resolve_user_input_private(
         self,
         response: UserInputResponse,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -8253,6 +9264,9 @@ class CayuApp:
         if type(response) is not UserInputResponse:
             raise TypeError("Runtime user input resolution requires a UserInputResponse.")
         response = copy_user_input_response(response)
+        session = await self.session_store.load(response.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         (
             task_id,
             task_session_instance_id,
@@ -8271,7 +9285,9 @@ class CayuApp:
         task_handoff_id = response.task_handoff_id
         stream = self._recovery_coordinator.resolve_user_input(
             response=response,
+            participant_context=participant_context,
             before_mutation=lambda: self._require_continuation_recovery_execution(
+                participant_context=participant_context,
                 session_id=session_id,
                 session_instance_id=task_session_instance_id,
                 task_id=task_id,
@@ -8300,6 +9316,8 @@ class CayuApp:
     async def recover_user_input(
         self,
         request: UserInputRecoveryRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         if type(request) is not UserInputRecoveryRequest:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
@@ -8322,7 +9340,7 @@ class CayuApp:
                 ),
             },
         )
-        stream = self._recover_user_input_private(request)
+        stream = self._recover_user_input_private(request, participant_context=context)
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -8331,6 +9349,8 @@ class CayuApp:
     async def _recover_user_input_private(
         self,
         request: UserInputRecoveryRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a user-input round stuck on `manual_recovery_required`.
 
@@ -8343,6 +9363,9 @@ class CayuApp:
         if type(request) is not UserInputRecoveryRequest:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
         request = copy_user_input_recovery_request(request)
+        session = await self.session_store.load(request.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         (
             task_id,
             task_session_instance_id,
@@ -8361,7 +9384,9 @@ class CayuApp:
         task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.recover_user_input_request(
             request=request,
+            participant_context=participant_context,
             before_mutation=lambda: self._require_continuation_recovery_execution(
+                participant_context=participant_context,
                 session_id=session_id,
                 session_instance_id=task_session_instance_id,
                 task_id=task_id,
@@ -8389,6 +9414,8 @@ class CayuApp:
     async def resolve_tool_approval(
         self,
         request: ToolApprovalRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
@@ -8417,7 +9444,7 @@ class CayuApp:
                 ),
             },
         )
-        stream = self._resolve_tool_approval_private(request)
+        stream = self._resolve_tool_approval_private(request, participant_context=context)
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -8426,6 +9453,8 @@ class CayuApp:
     async def resolve_provider_operation(
         self,
         request: ProviderOperationResolutionRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         """Resolve unavailable provider work by explicit fallback retry or failure."""
 
@@ -8439,6 +9468,9 @@ class CayuApp:
             request,
             session_id=session_id,
         )
+        session = await self.session_store.load(session_id)
+        if session is not None:
+            await self._require_participant_execution(session, context)
         allow_terminal_failure_replay = request.action is ProviderOperationResolutionAction.FAIL
         (
             task_id,
@@ -8459,10 +9491,12 @@ class CayuApp:
         task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.resolve_provider_operation(
             request,
+            participant_context=context,
             task_id=task_id,
             task_handoff_id=task_handoff_id,
             before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                participant_context=context,
                 session_instance_id=task_session_instance_id,
                 task_id=task_id,
                 task_worker_id=task_worker_id,
@@ -8491,10 +9525,15 @@ class CayuApp:
     async def _resolve_tool_approval_private(
         self,
         request: ToolApprovalRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
         request = _validate_tool_approval_request(request)
+        session = await self.session_store.load(request.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         approval_failure_identity = ApprovalTaskFailureIdentity(
             approval_id=request.approval_id,
             tool_round_id=request.tool_round_id,
@@ -8522,8 +9561,10 @@ class CayuApp:
         task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.resolve_tool_approval(
             request=request,
+            participant_context=participant_context,
             task_id=task_id,
             before_mutation=lambda: self._require_continuation_recovery_execution(
+                participant_context=participant_context,
                 session_id=session_id,
                 session_instance_id=task_session_instance_id,
                 task_id=task_id,
@@ -8554,6 +9595,8 @@ class CayuApp:
     async def recover_tool_approval(
         self,
         request: ToolApprovalRecoveryRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
@@ -8581,7 +9624,7 @@ class CayuApp:
                 ),
             },
         )
-        stream = self._recover_tool_approval_private(request)
+        stream = self._recover_tool_approval_private(request, participant_context=context)
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -8590,10 +9633,15 @@ class CayuApp:
     async def _recover_tool_approval_private(
         self,
         request: ToolApprovalRecoveryRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         request = _validate_tool_approval_recovery_request(request)
+        session = await self.session_store.load(request.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         (
             task_id,
             task_session_instance_id,
@@ -8612,7 +9660,9 @@ class CayuApp:
         task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.recover_tool_approval_request(
             request=request,
+            participant_context=participant_context,
             before_mutation=lambda: self._require_continuation_recovery_execution(
+                participant_context=participant_context,
                 session_id=session_id,
                 session_instance_id=task_session_instance_id,
                 task_id=task_id,
@@ -8681,6 +9731,8 @@ class CayuApp:
     async def reconcile_tool_effect(
         self,
         request: ToolEffectReconciliationRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         """Validate external evidence and continue an existing uncertain tool call."""
         if type(request) is not ToolEffectReconciliationRequest:
@@ -8759,7 +9811,7 @@ class CayuApp:
                 "user_input_response": response,
             }
         )
-        stream = self._recover_tool_round_private(request)
+        stream = self._recover_tool_round_private(request, participant_context=context)
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -8768,6 +9820,8 @@ class CayuApp:
     async def recover_tool_round(
         self,
         request: ToolRoundRecoveryRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> AsyncIterator[Event]:
         if type(request) is not ToolRoundRecoveryRequest:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
@@ -8787,7 +9841,7 @@ class CayuApp:
                 ),
             },
         )
-        stream = self._recover_tool_round_private(request)
+        stream = self._recover_tool_round_private(request, participant_context=context)
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -8796,6 +9850,8 @@ class CayuApp:
     async def _recover_tool_round_private(
         self,
         request: ToolRoundRecoveryRequest | ToolEffectReconciliationRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a crashed ordinary tool round with an operator-verified outcome.
 
@@ -8829,6 +9885,9 @@ class CayuApp:
             request = copy_tool_round_recovery_request(request)
         else:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
+        session = await self.session_store.load(request.session_id)
+        if session is not None:
+            await self._require_participant_execution(session, participant_context)
         if type(request) is ToolEffectReconciliationRequest:
             replay = await self._recovery_coordinator.replay_consumed_tool_effect(request)
             if replay is not None:
@@ -8852,7 +9911,9 @@ class CayuApp:
         task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.recover_tool_round_request(
             request=request,
+            participant_context=participant_context,
             before_mutation=lambda: self._require_continuation_recovery_execution(
+                participant_context=participant_context,
                 session_id=session_id,
                 session_instance_id=task_session_instance_id,
                 task_id=task_id,

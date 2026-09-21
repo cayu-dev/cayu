@@ -2019,10 +2019,36 @@ class EnvironmentLifecycle:
                     expected_active_invocation_profile=active_profile,
                 )
             except SessionRunFenced:
-                # A receipt from an older invocation is not settlement proof
-                # for this run. Retain the current fence and preserve the
-                # process-control or primary failure that initiated cleanup.
+                # Another invocation's receipt cannot authorize this cleanup.
                 return
+        if (
+            terminal_event is None
+            and invocation_context is not None
+            and transition is not None
+            and transition.only_if_no_queued_messages
+            and transition.to_status is not session.status
+            and session.status in {SessionStatus.FAILED, SessionStatus.INTERRUPTED}
+        ):
+            # A successor admission can fail after conditional predecessor
+            # settlement. Nested execution may already have cleared its run
+            # operation before the outer recovery owner performs cleanup.
+            # Locate a candidate, not authority: release_session_invocation
+            # authenticates its native terminal receipt, exact incarnation,
+            # epoch and active profile atomically before releasing anything.
+            records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(
+                        EventType.SESSION_FAILED
+                        if session.status is SessionStatus.FAILED
+                        else EventType.SESSION_INTERRUPTED,
+                    ),
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if records:
+                terminal_event = records[0].event
         if (
             terminal_event is None
             and transition is not None

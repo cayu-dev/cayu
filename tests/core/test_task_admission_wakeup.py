@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import process_time
@@ -237,12 +238,95 @@ async def test_matching_admission_wakes_idle_task_worker_before_long_poll() -> N
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_group_maintenance_failure_releases_worker_poll_turn(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    store = _ObservedInMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    recovered = asyncio.Event()
+    stop = asyncio.Event()
+    metrics = DurableWorkerMetrics(configured_handler_capacity=2)
+    scans = 0
+    original_scan = store.list_task_group_reconciliation_candidates
+
+    async def scan(**kwargs):
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            entered.set()
+            await release.wait()
+            raise RuntimeError("maintenance unavailable")
+        result = await original_scan(**kwargs)
+        recovered.set()
+        return result
+
+    monkeypatch.setattr(store, "list_task_group_reconciliation_candidates", scan)
+
+    async def handler(*args):
+        pytest.fail("An empty queue must not dispatch work.")
+
+    def start(worker_id):
+        return asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id=worker_id,
+                poll_interval_s=0.01,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                metrics=metrics,
+                stop=stop,
+            )
+        )
+
+    first = start("first")
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        second = start("second")
+        await _wait_for_subscribers(store, 2)
+        assert scans == 1
+        assert store.claim_calls == 0
+        if cancel:
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert first.cancelling() == 1
+            assert first.cancelled()
+        else:
+            release.set()
+            with pytest.raises(RuntimeError, match="maintenance unavailable"):
+                await first
+        await asyncio.wait_for(recovered.wait(), 5)
+        await asyncio.wait_for(store.empty_claim.wait(), 5)
+        assert scans == 2
+    finally:
+        stop.set()
+        release.set()
+        await asyncio.gather(first, *(() if second is None else (second,)), return_exceptions=True)
+    snapshot = metrics.snapshot()
+    assert snapshot.claim_attempts == store.claim_calls
+    assert snapshot.failed_claims == snapshot.cancelled_claims == 0
+    assert snapshot.store_failures == int(not cancel)
+    assert store._task_admission_wakeup_broker.subscriber_count == 0
+    assert store._durable_worker_poller_groups == {}
+
+
+@pytest.mark.anyio
 @pytest.mark.qualification
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 async def test_hundred_idle_task_workers_meet_economics_budget(
     store_kind: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Collection of unrelated earlier tests/fixtures is not worker idle cost.
+    # Keep GC enabled throughout pool startup and the actual measured window.
+    gc.collect()
     database = tmp_path / "hundred-worker-economics.sqlite"
     store = (
         _ObservedInMemoryTaskStore()
@@ -254,6 +338,17 @@ async def test_hundred_idle_task_workers_meet_economics_budget(
     stop = asyncio.Event()
     handled = asyncio.Event()
     metrics = DurableWorkerMetrics(configured_handler_capacity=100)
+    group_scans = 0
+    original_group_scan = store.list_task_group_reconciliation_candidates
+
+    async def observe_group_scan(**kwargs):
+        nonlocal group_scans
+        assert metrics.snapshot().active_pollers == 1
+        group_scans += 1
+        await asyncio.sleep(0)
+        return await original_group_scan(**kwargs)
+
+    monkeypatch.setattr(store, "list_task_group_reconciliation_candidates", observe_group_scan)
 
     async def handler(app: CayuApp, task: Task, worker_id: str) -> None:
         await _complete_handler(app, task, worker_id)
@@ -288,6 +383,10 @@ async def test_hundred_idle_task_workers_meet_economics_budget(
         idle_cpu_s = process_time() - cpu_started
 
         assert 2 <= store.claim_calls <= 10
+        # A scan precedes its claim inside the active turn. Completed attempts
+        # and the one in-flight poller are disjoint ownership evidence.
+        idle_snapshot = metrics.snapshot()
+        assert 0 < group_scans <= idle_snapshot.claim_attempts + idle_snapshot.active_pollers
         assert idle_cpu_s <= 0.10
 
         # Publish while the active poller owns a proven empty result. This makes
@@ -298,6 +397,13 @@ async def test_hundred_idle_task_workers_meet_economics_budget(
         try:
             await asyncio.wait_for(empty_poll.wait(), timeout=10)
             await producer.create_task(TaskCreate(task_id="pooled-job", type="job"))
+            if store_kind == "memory":
+                # Keep the empty poll gated until a waiter actually consumes
+                # the hint; publication alone does not order its delivery
+                # before a competing fallback poll can claim the new task.
+                async with asyncio.timeout(5):
+                    while metrics.snapshot().wake_hints_received == 0:
+                        await asyncio.sleep(0)
         finally:
             release_poll.set()
         await asyncio.wait_for(handled.wait(), timeout=0.5)
@@ -316,14 +422,22 @@ async def test_hundred_idle_task_workers_meet_economics_budget(
     assert snapshot.maximum_active_pollers == 1
     assert snapshot.maximum_active_handlers == 1
     assert snapshot.claim_attempts == store.claim_calls
+    assert group_scans <= snapshot.claim_attempts
     assert snapshot.successful_claims == 1
     assert snapshot.admission_to_claim_latency_samples == 1
     assert snapshot.admission_to_claim_latency_max_s <= 0.5
     if store_kind == "memory":
         assert snapshot.wake_hints_received == 1
-        assert snapshot.wake_hints_accepted == 1
-        assert snapshot.wake_hints_ignored == 0
-        assert snapshot.wake_hints_followed_by_successful_claims == 1
+        # With 100 workers a fallback claimant can win before the hinted
+        # worker obtains admission. Hints are lossy optimizations, not claim
+        # authority. The delivered hint may remain unaccepted at shutdown;
+        # every accepted hint must have exactly one classified outcome.
+        assert 0 <= snapshot.wake_hints_accepted <= 1
+        assert snapshot.wake_hints_followed_by_successful_claims <= snapshot.wake_hints_accepted
+        assert (
+            snapshot.wake_hints_ignored + snapshot.wake_hints_followed_by_successful_claims
+            == snapshot.wake_hints_accepted
+        )
     else:
         assert snapshot.wake_hints_received == 0
         assert snapshot.fallback_poll_activations >= 1

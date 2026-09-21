@@ -1132,6 +1132,8 @@ class AdmitInvocationCommand(_InvocationCommandModel):
     adopted_runtime_identity: SessionRuntimeIdentity | None = None
     expected_active_profile: ActiveInvocationExecutionProfile | None = None
     allow_pending_initial_interaction: StrictBool = False
+    participant_permit_operation: str | None = None
+    participant_permit_commitment: str | None = None
 
     @field_validator("expected_statuses", mode="before")
     @classmethod
@@ -1195,6 +1197,21 @@ class AdmitInvocationCommand(_InvocationCommandModel):
 
     @model_validator(mode="after")
     def validate_admission_authority(self) -> AdmitInvocationCommand:
+        if (self.participant_permit_operation is None) != (
+            self.participant_permit_commitment is None
+        ):
+            raise ValueError("Participant permit identity must be supplied as a pair.")
+        if self.participant_permit_operation is not None:
+            require_durable_clean_nonblank(
+                self.participant_permit_operation, "participant_permit_operation"
+            )
+            if not isinstance(self.participant_permit_commitment, str):
+                raise ValueError("participant_permit_commitment must be text.")
+            commitment = require_durable_clean_nonblank(
+                self.participant_permit_commitment, "participant_permit_commitment"
+            )
+            if len(commitment) != 64 or any(c not in "0123456789abcdef" for c in commitment):
+                raise ValueError("participant_permit_commitment must be lowercase SHA-256.")
         target = self.target_active_profile
         if target.session_id != self.session_id:
             raise ValueError("Admission target belongs to another session.")
@@ -1532,6 +1549,8 @@ class _InvocationLifecycleCommandReceipt(BaseModel):
     session_instance_id: str
     result_session: Session
     active_profile: ActiveInvocationExecutionProfile
+    participant_permit_operation: str | None = None
+    participant_permit_commitment: str | None = None
     record_sha256: str = ""
 
     @field_validator(
@@ -2023,6 +2042,8 @@ def _invocation_lifecycle_command_receipt(
         session_instance_id=command.expected_session_instance_id,
         result_session=result_session,
         active_profile=active_profile,
+        participant_permit_operation=getattr(command, "participant_permit_operation", None),
+        participant_permit_commitment=getattr(command, "participant_permit_commitment", None),
     )
 
 

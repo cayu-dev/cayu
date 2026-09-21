@@ -9310,8 +9310,77 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                     AgentSpec(name="assistant", model="fake-model"),
                     tools=[UserInputTool()],
                 )
+                claim_entered = asyncio.Event()
+                original_transfer = (
+                    peer_app._recovery_coordinator._claim_pending_terminal_evidence_finalization
+                )
+
+                async def transfer_after_live_settlement(**kwargs):
+                    # Force the real owner to finish after the peer has resolved
+                    # pending authority, but before its atomic claim comparison.
+                    claim_entered.set()
+                    await asyncio.gather(running, interrupting)
+                    settled_session = await peer_store.load(session_id)
+                    settled_checkpoint = await peer_store.load_checkpoint(session_id)
+                    for changed in (
+                        {
+                            **kwargs,
+                            "session": kwargs["session"].model_copy(
+                                update={"instance_id": "different-incarnation"}
+                            ),
+                        },
+                        {
+                            **kwargs,
+                            "session": kwargs["session"].model_copy(
+                                update={"run_epoch": settled_session.run_epoch + 1}
+                            ),
+                        },
+                        {
+                            **kwargs,
+                            "expected_payload": {
+                                **kwargs["expected_payload"],
+                                "interruption_request_id": "other-request",
+                            },
+                        },
+                        {
+                            **kwargs,
+                            "expected_payload": {
+                                **kwargs["expected_payload"],
+                                "reason": "different-reason",
+                            },
+                        },
+                    ):
+                        with pytest.raises((SessionRuntimePublicationConflict, RuntimeError)):
+                            await original_transfer(**changed)
+                    result = await original_transfer(**kwargs)
+                    assert isinstance(result, Event)
+                    readback_entered = asyncio.Event()
+
+                    async def hold_readback(*args, **read_kwargs):
+                        readback_entered.set()
+                        await asyncio.Event().wait()
+
+                    with monkeypatch.context() as cancellation_patch:
+                        cancellation_patch.setattr(
+                            peer_app._session_control, "latest_interrupted_event", hold_readback
+                        )
+                        cancelled = asyncio.create_task(original_transfer(**kwargs))
+                        await asyncio.wait_for(readback_entered.wait(), timeout=10)
+                        cancelled.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await cancelled
+                        assert cancelled.cancelled() and cancelled.cancelling() == 1
+                    assert await peer_store.load(session_id) == settled_session
+                    assert await peer_store.load_checkpoint(session_id) == settled_checkpoint
+                    return result
+
+                monkeypatch.setattr(
+                    peer_app._recovery_coordinator,
+                    "_claim_pending_terminal_evidence_finalization",
+                    transfer_after_live_settlement,
+                )
                 retrying = asyncio.create_task(_collect_events(peer_app.interrupt_session(request)))
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(claim_entered.wait(), timeout=10)
                 assert not retrying.done()
                 release_handler.set()
                 run_events, interrupt_events, retry_events = await asyncio.wait_for(

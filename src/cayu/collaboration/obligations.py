@@ -22,6 +22,8 @@ class ParticipantObligation(ContractValue):
     source_operation: OperationRef
     settlement_operation: OperationRef
     admission_generation: Generation
+    expected_configuration_revision: Generation | None = None
+    admission_commitment: str | None = None
     target: ObjectRef
     target_state: Literal["existing", "future"]
     effect_scope: Code

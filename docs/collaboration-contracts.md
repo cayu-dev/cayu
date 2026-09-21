@@ -9,7 +9,10 @@ infrastructure, not a public agent API. Importing the package starts no work and
 registers no owner. The [participant identity API](participant-identity.md) builds
 on this foundation with a production CollaborationStore for scoped identities,
 lifecycle admission, permit responsibility and namespace retention. It does not
-dispatch collaboration requests or create participant-bound sessions.
+dispatch collaboration requests. Participant-owned inert-session creation and
+historical context-view retention are documented separately in
+[`context-views.md`](context-views.md); those APIs remain capability-gated by
+the configured native SessionStore.
 
 Existing SessionStore, TaskStore, execution/resource owners and BudgetLedger keep
 their current authority. Colocating them in one database does not make separate

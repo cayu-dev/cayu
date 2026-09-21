@@ -36,6 +36,8 @@ class PermitRegistration(ContractValue):
     operation: OperationRef
     participant: ParticipantRef
     expected_lifecycle_revision: Generation
+    expected_configuration_revision: Generation | None = None
+    admission_commitment: str | None = None
     admission_generation: Generation
     source_operation: OperationRef
     target: ObjectRef
@@ -48,6 +50,11 @@ class PermitRegistration(ContractValue):
     @model_validator(mode="after")
     def bound_source_and_reserved_key(self) -> PermitRegistration:
         scope = self.participant.owner.application_scope
+        if self.admission_commitment is not None and (
+            len(self.admission_commitment) != 64
+            or any(character not in "0123456789abcdef" for character in self.admission_commitment)
+        ):
+            raise ValueError("admission_commitment must be lowercase SHA-256.")
         if any(
             operation.application_scope != scope
             for operation in (self.operation, self.source_operation, self.settlement_operation)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -66,6 +67,15 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
         record["failure"] = failure[:16384]
         record["failure_truncated"] = len(failure) > 16384
     _append_ci_report(record)
+    if report.failed:
+        # A job deadline can prevent pytest's final summary, and artifact
+        # storage can be unavailable. Emit the same bounded evidence now on the
+        # controller (workers have no _CI_REPORT_PATH), exactly once per phase.
+        print(
+            f"\nCI failure: {report.nodeid} [{report.when}]\n{record['failure']}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class ProviderCredentialCanaries:

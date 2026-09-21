@@ -1154,7 +1154,6 @@ class TaskStoreDispatcher(Dispatcher):
     ) -> DispatchHandle | None:
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        await self._group_maintenance.advance(self._tasks, now=asyncio.get_running_loop().time())
         if not task_store_cancellation_reconciliation_capability_is_complete(self._tasks):
             raise NotImplementedError(
                 "Queued dispatch workers require complete idempotent ordinary-task "
@@ -1189,6 +1188,11 @@ class TaskStoreDispatcher(Dispatcher):
         claim_type_limit = (
             len(claim_task_types) if demand_poller is None or demand_poller.has_pending_hint else 1
         )
+
+        async def prepare_claim() -> None:
+            # Pooled workers must not scan before shared poller admission.
+            # Direct process_next callers still execute this same maintenance.
+            await self._group_maintenance.advance(self._tasks, now=loop.time())
 
         async def claim_next_task() -> tuple[Task, str, _DispatchLeaseAuthority, float] | None:
             claim_start_index = (
@@ -1246,10 +1250,12 @@ class TaskStoreDispatcher(Dispatcher):
         if demand_poller is not None:
             claim = await demand_poller.claim(
                 claim_next_task,
+                before_claim=prepare_claim,
                 maximum_active_s=self._lease_seconds,
             )
             claimed = claim.value
         else:
+            await prepare_claim()
             claimed = await claim_next_task()
         if claimed is None:
             return None

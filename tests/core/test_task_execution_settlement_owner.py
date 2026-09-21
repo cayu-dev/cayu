@@ -93,6 +93,18 @@ async def assert_settled(app, identity):
     assert execution.settled_at is not None
 
 
+async def retry_until_settled(settlement):
+    # Observation timeout is not a database completion deadline. Join the same
+    # owner until storage finishes, with a finite outer test/cleanup deadline.
+    async with asyncio.timeout(10):
+        while True:
+            try:
+                return await settlement.retry()
+            except TaskExecutionSettlementPending as pending:
+                assert pending.settlement is settlement
+                await asyncio.sleep(0.01)
+
+
 @pytest.mark.parametrize("commit", [False, True])
 async def test_exact_settlement_retry_survives_permitted_task_deletion(store, monkeypatch, commit):
     from tests.core.task_invocation_fixtures import task_backed_session_invocation
@@ -786,7 +798,7 @@ async def test_failed_execution_entry_keeps_exact_nondispatch_owner(
             if failure != "settlement":
                 assert not settlements
         repaired = True
-        await pending.settlement.retry()
+        await retry_until_settled(pending.settlement)
         if failure == "precommit":
             assert not settlements and not runtime.calls
             await store.complete_task("winner", {})
@@ -815,7 +827,7 @@ async def test_failed_execution_entry_keeps_exact_nondispatch_owner(
             owner.cancel()
         await asyncio.gather(owner, return_exceptions=True)
         if pending is not None:
-            await pending.settlement.retry()
+            await retry_until_settled(pending.settlement)
 
 
 @pytest.mark.parametrize("nondispatch", [False, True])
@@ -1070,7 +1082,7 @@ async def test_timed_out_write_and_cancelled_retries_join_the_same_late_commit(
         assert raised.value.settlement is pending.settlement
         assert len(calls) == 1 and not write_cancellations
         release.set()
-        result = await pending.settlement.retry()
+        result = await retry_until_settled(pending.settlement)
         assert result is (DispatchStatus.COMPLETED if dispatch else None)
         assert completed.is_set() and len(calls) == 1 and not write_cancellations
         assert pending.settlement._operation is None

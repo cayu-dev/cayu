@@ -3987,6 +3987,11 @@ when store authority is actually obtained. Thus coalesced, stale, and
 productive hints are distinguishable without making any hint authoritative.
 Caught dispatcher reclaim and terminal-receipt reconciliation failures each
 advance `store_failures`; the maintenance attempt remains separately visible.
+Task-group maintenance shares poller admission but precedes the authoritative
+claim. If it fails or is cancelled, it releases the poll turn without recording
+a claim outcome or accepting a pending hint. An ordinary maintenance store error
+still increments `store_failures`; a pending hint remains available for a later
+claim while its worker remains subscribed.
 
 Admission latency starts at the claimed task's durable `created_at` timestamp
 and ends immediately after the store-atomic claim returns. This backend-aware

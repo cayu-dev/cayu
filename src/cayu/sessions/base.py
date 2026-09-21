@@ -50,6 +50,7 @@ from cayu.runtime.event_side_effect_health import (
 
 if TYPE_CHECKING:
     from cayu.collaboration._contracts import ExactLookup
+    from cayu.collaboration.participants import ParticipantRef as _ParticipantRef
     from cayu.runtime._invocation_lifecycle import (
         AdmitInvocationCommand,
         CreateInvocationCommand,
@@ -76,6 +77,30 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.runtime.evidence_spool import EvidenceSpool
+    from cayu.sessions._context_view_source import ContextViewPublicationSource
+    from cayu.sessions.context_views import (
+        ContextViewLifecycleEvent as _ContextViewLifecycleEvent,
+    )
+    from cayu.sessions.context_views import (
+        ContextViewManifest as _ContextViewManifest,
+    )
+    from cayu.sessions.context_views import (
+        ContextViewOwnershipRequest as _ContextViewOwnershipRequest,
+    )
+    from cayu.sessions.context_views import (
+        ContextViewReadback as _ContextViewReadback,
+    )
+    from cayu.sessions.context_views import (
+        ContextViewSelectionReceipt as _ContextViewSelectionReceipt,
+    )
+    from cayu.sessions.context_views import (
+        ContextViewSelectionRequest as _ContextViewSelectionRequest,
+    )
+    from cayu.sessions.context_views import (
+        ParticipantSessionBinding,
+        ParticipantSessionCreationReceipt,
+        ParticipantSessionCreationRequest,
+    )
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
 
 from pydantic import (
@@ -99,6 +124,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     FrozenJsonDict,
     JsonUtf8SizeCounter,
+    canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
@@ -10193,6 +10219,97 @@ class SessionStore(ABC):
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
+    participant_session_binding_version: ClassVar[int | None] = None
+    context_view_version: ClassVar[int | None] = None
+
+    async def create_participant_owned_session(
+        self,
+        creation_request: ParticipantSessionCreationRequest,
+        *,
+        resolved_request: RunRequest,
+        identity: SessionIdentity,
+        binding_factory: Callable[
+            [Session], tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]
+        ],
+    ) -> tuple[Session, ParticipantSessionCreationReceipt]:
+        raise NotImplementedError(
+            "This SessionStore does not support participant-owned session creation."
+        )
+
+    async def load_participant_session_binding(
+        self, session_id: str
+    ) -> ParticipantSessionBinding | None:
+        raise NotImplementedError("This SessionStore does not support participant bindings.")
+
+    async def load_participant_session_creation_receipt(
+        self, session_id: str
+    ) -> ParticipantSessionCreationReceipt | None:
+        raise NotImplementedError("This SessionStore does not support participant receipts.")
+
+    async def lookup_participant_session_creation(
+        self, creation_request: ParticipantSessionCreationRequest
+    ) -> tuple[Session, ParticipantSessionCreationReceipt] | None:
+        raise NotImplementedError("This SessionStore does not support creation-key lookup.")
+
+    async def capture_context_view_publication_source(
+        self, session_id: str
+    ) -> ContextViewPublicationSource:
+        """Capture a bounded completed-turn snapshot under one native read boundary."""
+        raise NotImplementedError("This SessionStore cannot capture context-view publication.")
+
+    async def publish_context_view(
+        self, manifest: _ContextViewManifest, *, publication_key: str
+    ) -> _ContextViewManifest:
+        raise NotImplementedError("This SessionStore does not support context-view publication.")
+
+    async def lookup_context_view_publication(
+        self, publication_key: str
+    ) -> _ContextViewManifest | None:
+        raise NotImplementedError(
+            "This SessionStore does not support context-view publication lookup."
+        )
+
+    async def select_context_view(
+        self, request: _ContextViewSelectionRequest
+    ) -> _ContextViewSelectionReceipt:
+        raise NotImplementedError("This SessionStore does not support context-view selection.")
+
+    async def read_context_view(
+        self, view_id: str, *, source_session_id: str
+    ) -> _ContextViewReadback:
+        raise NotImplementedError("This SessionStore does not support context-view readback.")
+
+    async def transition_context_view_ownership(
+        self, request: _ContextViewOwnershipRequest
+    ) -> _ContextViewSelectionReceipt:
+        raise NotImplementedError(
+            "This SessionStore does not support context-view ownership transitions."
+        )
+
+    async def validate_context_view_source_closure(self, session_id: str) -> None:
+        """Refuse source deletion while an active context-view pin needs it."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support context-view closure admission."
+        )
+
+    async def validate_context_view_compaction(
+        self, session_id: str, expected_transcript_cursor: int
+    ) -> None:
+        """Prove retained view material survives a source-session compaction."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support context-view compaction admission."
+        )
+
+    async def read_context_view_lifecycle_events(
+        self, view_id: str, *, limit: int = 256, owner_participant: _ParticipantRef | None = None
+    ) -> tuple[_ContextViewLifecycleEvent, ...]:
+        """Read bounded evidence; apply an exact participant filter before limiting."""
+        raise NotImplementedError(
+            "This SessionStore does not support context-view lifecycle events."
+        )
+
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return local files that own this store's durable state.
 
@@ -11729,6 +11846,7 @@ class SessionStore(ABC):
         expected_statuses: set[SessionStatus] | None = None,
         expected_run_epoch: int | None = None,
         expected_transcript_cursor: int | None = None,
+        context_view_compaction_cursor: int | None = None,
     ) -> Session:
         """Publish an operation using time sampled at the commit transaction."""
 
@@ -14347,6 +14465,33 @@ def _validate_closure_progress_update(existing: dict[str, Any], proposed: dict[s
         raise ValueError("Closure progress cannot forget completed descendants.")
 
 
+class _InMemoryContextViewSelectionTransaction:
+    """Rollback selection-side expiry evidence when validation rejects a request."""
+
+    def __init__(self, store: InMemorySessionStore) -> None:
+        self._store = store
+        self._receipts: dict[str, Any] | None = None
+        self._commitments: dict[str, str] | None = None
+        self._events: dict[str, Any] | None = None
+
+    async def __aenter__(self) -> _InMemoryContextViewSelectionTransaction:
+        await self._store._lock.acquire()
+        self._receipts = self._store._context_selection_receipts.copy()
+        self._commitments = self._store._context_selection_request_commitments.copy()
+        self._events = self._store._context_lifecycle_events.copy()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        if exc_type is not None:
+            assert self._receipts is not None
+            assert self._commitments is not None
+            assert self._events is not None
+            self._store._context_selection_receipts = self._receipts
+            self._store._context_selection_request_commitments = self._commitments
+            self._store._context_lifecycle_events = self._events
+        self._store._lock.release()
+
+
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
@@ -14684,6 +14829,8 @@ class InMemorySessionStore(SessionStore):
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
+    participant_session_binding_version: ClassVar[int | None] = 1
+    context_view_version: ClassVar[int | None] = 1
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -14717,7 +14864,19 @@ class InMemorySessionStore(SessionStore):
         self._public_authority_alias_codec = public_authority_alias_codec
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
+        self._participant_creation_lock = asyncio.Lock()
         self._sessions: dict[str, Session] = {}
+        self._participant_session_bindings: dict[str, ParticipantSessionBinding] = {}
+        self._participant_session_receipts: dict[str, ParticipantSessionCreationReceipt] = {}
+        self._participant_session_ids_by_key: dict[str, str] = {}
+        self._participant_session_request_commitments: dict[str, str | None] = {}
+        self._context_views: dict[str, Any] = {}
+        self._context_publication_keys: dict[str, str] = {}
+        self._context_selection_receipts: dict[str, Any] = {}
+        self._context_selection_request_commitments: dict[str, str] = {}
+        self._context_ownership_operation_commitments: dict[str, str] = {}
+        self._context_ownership_operation_receipts: dict[str, Any] = {}
+        self._context_lifecycle_events: dict[str, Any] = {}
         self._session_closure_receipts: dict[tuple[str, str], dict[str, Any]] = {}
         self._session_closure_progress: dict[tuple[str, str], dict[str, Any]] = {}
         self._session_closure_tombstones: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -16214,9 +16373,21 @@ class InMemorySessionStore(SessionStore):
         checkpoint_transform: CheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         operation_initializer: SessionOperationInitializer | None = None,
+        participant_binding_factory: Callable[
+            [Session], tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]
+        ]
+        | None = None,
+        participant_request_commitment: str | None = None,
     ) -> Session:
         if type(request) is not RunRequest:
             raise TypeError("Session creation requires a RunRequest.")
+        if participant_binding_factory is not None and not callable(participant_binding_factory):
+            raise TypeError("participant_binding_factory must be callable.")
+        if participant_binding_factory is not None:
+            from cayu.sessions.context_views import (
+                ParticipantSessionBinding,
+                ParticipantSessionCreationReceipt,
+            )
         request = copy_run_request(request)
         identity = copy_session_identity(identity)
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
@@ -16353,6 +16524,27 @@ class InMemorySessionStore(SessionStore):
             elif pending_checkpoint is not None:
                 prepared_checkpoint = pending_checkpoint
 
+            participant_binding = None
+            participant_receipt = None
+            if participant_binding_factory is not None:
+                participant_binding, participant_receipt = participant_binding_factory(
+                    session.model_copy(deep=True)
+                )
+                if type(participant_binding) is not ParticipantSessionBinding:
+                    raise TypeError("Participant binding factory returned an invalid binding.")
+                if type(participant_receipt) is not ParticipantSessionCreationReceipt:
+                    raise TypeError("Participant binding factory returned an invalid receipt.")
+                if participant_binding.session_id != session.id:
+                    raise ValueError("Participant binding session identity conflicts.")
+                if participant_binding.session_instance_id != session.instance_id:
+                    raise ValueError("Participant binding incarnation conflicts.")
+                if participant_receipt.binding != participant_binding:
+                    raise ValueError("Participant receipt binding conflicts.")
+                if participant_binding.creation_key in self._participant_session_ids_by_key:
+                    raise ValueError("Participant creation key was concurrently claimed.")
+                if type(participant_request_commitment) is not str:
+                    raise ValueError("Participant request commitment is required.")
+
             # Every caller-controlled transform and validation step is complete.
             # Publish the prepared state while retaining the in-memory store lock.
             self._register_private_authority_alias_unlocked(
@@ -16370,6 +16562,18 @@ class InMemorySessionStore(SessionStore):
             self._latest_interaction_event_records_by_sequence[session.id] = []
             self._pending_action_event_records[session.id] = {}
             self._session_operation_records[session.id] = initial_operation_records
+            if participant_binding is not None:
+                self._participant_session_bindings[session.id] = participant_binding.model_copy(
+                    deep=True
+                )
+                assert participant_receipt is not None
+                self._participant_session_receipts[session.id] = participant_receipt.model_copy(
+                    deep=True
+                )
+                self._participant_session_ids_by_key[participant_binding.creation_key] = session.id
+                self._participant_session_request_commitments[participant_binding.creation_key] = (
+                    participant_request_commitment
+                )
             self._transcripts[session.id] = []
             self._transcript_interaction_ids[session.id] = []
             self._latest_transcript_indexes_by_role[session.id] = {}
@@ -16399,6 +16603,607 @@ class InMemorySessionStore(SessionStore):
             if admission is not None:
                 _activate_session_run_fence(session)
             return session.model_copy(deep=True)
+
+    async def create_participant_owned_session(
+        self,
+        creation_request: ParticipantSessionCreationRequest,
+        *,
+        resolved_request: RunRequest,
+        identity: SessionIdentity,
+        binding_factory: Callable[
+            [Session], tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]
+        ],
+    ) -> tuple[Session, ParticipantSessionCreationReceipt]:
+        from cayu.sessions.context_views import (
+            ParticipantSessionCreationRequest,
+        )
+
+        if type(creation_request) is not ParticipantSessionCreationRequest:
+            raise TypeError("Participant creation requires a typed creation request.")
+        if type(resolved_request) is not RunRequest:
+            raise TypeError("Participant creation requires a resolved RunRequest.")
+        if not callable(binding_factory):
+            raise TypeError("binding_factory must be callable.")
+        async with self._participant_creation_lock:
+            existing_id = self._participant_session_ids_by_key.get(creation_request.creation_key)
+            if existing_id is not None:
+                session = self._sessions.get(existing_id)
+                receipt = self._participant_session_receipts.get(existing_id)
+                if session is None or receipt is None:
+                    raise RuntimeError("Participant creation index is inconsistent.")
+                if (
+                    self._participant_session_request_commitments.get(creation_request.creation_key)
+                    != creation_request.request_commitment
+                ):
+                    raise ValueError("Participant creation key conflicts with the request.")
+                if (session.provider_name, session.model) != (
+                    identity.provider_name,
+                    identity.model,
+                ):
+                    raise ValueError(
+                        "Participant creation key conflicts with the execution target."
+                    )
+                expected_binding, expected_receipt = binding_factory(session.model_copy(deep=True))
+                if expected_binding != self._participant_session_bindings.get(existing_id):
+                    raise ValueError("Participant creation key conflicts with its binding.")
+                if expected_receipt != receipt:
+                    raise ValueError("Participant creation key conflicts with its receipt.")
+                return session.model_copy(deep=True), receipt.model_copy(deep=True)
+            session = await self.create(
+                resolved_request,
+                identity=identity,
+                participant_binding_factory=binding_factory,
+                participant_request_commitment=creation_request.request_commitment,
+            )
+            receipt = self._participant_session_receipts.get(session.id)
+            if receipt is None:
+                raise RuntimeError("Participant creation did not persist its receipt.")
+            return session, receipt.model_copy(deep=True)
+
+    async def lookup_participant_session_creation(
+        self, creation_request: ParticipantSessionCreationRequest
+    ) -> tuple[Session, ParticipantSessionCreationReceipt] | None:
+        from cayu.sessions.context_views import ParticipantSessionCreationRequest
+
+        if type(creation_request) is not ParticipantSessionCreationRequest:
+            raise TypeError("Participant creation requires a typed creation request.")
+        async with self._participant_creation_lock:
+            session_id = self._participant_session_ids_by_key.get(creation_request.creation_key)
+            if session_id is None:
+                return None
+            session = self._sessions.get(session_id)
+            receipt = self._participant_session_receipts.get(session_id)
+            if session is None or receipt is None:
+                raise RuntimeError("Participant creation index is inconsistent.")
+            if self._participant_session_request_commitments.get(creation_request.creation_key) != (
+                creation_request.request_commitment
+            ):
+                raise ValueError("Participant creation key conflicts with the request.")
+            return session.model_copy(deep=True), receipt.model_copy(deep=True)
+
+    async def load_participant_session_binding(
+        self, session_id: str
+    ) -> ParticipantSessionBinding | None:
+        async with self._lock:
+            binding = self._participant_session_bindings.get(session_id)
+            return None if binding is None else binding.model_copy(deep=True)
+
+    async def load_participant_session_creation_receipt(
+        self, session_id: str
+    ) -> ParticipantSessionCreationReceipt | None:
+        async with self._lock:
+            receipt = self._participant_session_receipts.get(session_id)
+            return None if receipt is None else receipt.model_copy(deep=True)
+
+    async def capture_context_view_publication_source(
+        self, session_id: str
+    ) -> ContextViewPublicationSource:
+        from cayu.sessions._context_view_source import (
+            capture_source,
+            closed_round_publication_id,
+            completed_boundary,
+            publication_frontier,
+        )
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            binding = self._participant_session_bindings.get(session_id)
+            checkpoint = self._checkpoints.get(session_id)
+            pointer = completed_boundary(session, binding, checkpoint)
+            assert session is not None and binding is not None
+            tool_receipt = None
+            if pointer.tool_round_id is not None:
+                publication_id = f"tool-round:{pointer.tool_round_id}"
+                key = _runtime_publication_storage_key(publication_id)
+                record = self._session_operation_records.get(session_id, {}).get(key)
+                if record is None:
+                    from itertools import islice
+
+                    closures = tuple(
+                        islice(
+                            (
+                                item.event
+                                for item in reversed(
+                                    self._session_event_records.get(session_id, ())
+                                )
+                                if item.event.type is EventType.SESSION_CHECKPOINTED
+                                and item.event.payload.get("tool_round_id") == pointer.tool_round_id
+                                and (
+                                    item.event.payload.get("cleared") is True
+                                    or item.event.payload.get("transition") == "answered"
+                                )
+                            ),
+                            2,
+                        )
+                    )
+                    publication_id = closed_round_publication_id(pointer, closures)
+                    key = _runtime_publication_storage_key(publication_id)
+                    record = self._session_operation_records.get(session_id, {}).get(key)
+                if record is not None:
+                    tool_receipt = _reconstruct_runtime_publication_receipt(
+                        record,
+                        storage_key=key,
+                        session_id=session_id,
+                        publication_id=publication_id,
+                    )
+                publication_frontier(pointer, tool_receipt)
+                assert tool_receipt is not None
+                self._validate_runtime_publication_material_unlocked(tool_receipt)
+            end = publication_frontier(pointer, tool_receipt)
+            event = self._event_records_by_id.get((session_id, pointer.completion_event_id))
+            messages = self._transcripts.get(session_id, [])
+            interactions = self._transcript_interaction_ids.get(session_id, [])
+            records = tuple(
+                TranscriptRecord(
+                    index=index,
+                    interaction_id=interactions[index],
+                    message=detach_message(messages[index]),
+                )
+                for index in range(
+                    pointer.source_transcript_cursor,
+                    min(end, len(messages)),
+                )
+            )
+            return capture_source(
+                session,
+                binding,
+                checkpoint,
+                pointer,
+                None if event is None else event.event,
+                records,
+                tool_receipt,
+            )
+
+    async def publish_context_view(
+        self, manifest: _ContextViewManifest, *, publication_key: str
+    ) -> _ContextViewManifest:
+        from cayu.sessions.context_views import (
+            CONTEXT_VIEW_MAX_PUBLICATIONS_PER_OWNER,
+        )
+        from cayu.sessions.context_views import (
+            ContextViewManifest as ContextViewManifestType,
+        )
+
+        if type(manifest) is not ContextViewManifestType or type(publication_key) is not str:
+            raise TypeError("Context-view publication requires typed manifest and key.")
+        if len(publication_key.encode("utf-8")) > 512:
+            raise ValueError("publication_key must be at most 512 UTF-8 bytes.")
+        publication_key = require_clean_nonblank(publication_key, "publication_key")
+        async with self._lock:
+            existing_id = self._context_publication_keys.get(publication_key)
+            if existing_id is not None:
+                existing = self._context_views[existing_id]
+                if existing != manifest:
+                    raise ValueError("Context-view publication key conflicts with its manifest.")
+                return existing.model_copy(deep=True)
+            if manifest.view_id in self._context_views:
+                raise ValueError("Context-view ID is already bound to another manifest.")
+            source = self._sessions.get(manifest.source_session_id)
+            if source is None or source.instance_id != manifest.source_session_instance_id:
+                raise LookupError("The source session incarnation is unavailable.")
+            publication_count = sum(
+                view.source_owner == manifest.source_owner for view in self._context_views.values()
+            )
+            if publication_count >= CONTEXT_VIEW_MAX_PUBLICATIONS_PER_OWNER:
+                raise OverflowError("Context-view publication quota exceeded for the owner.")
+            self._context_views[manifest.view_id] = manifest.model_copy(deep=True)
+            self._context_publication_keys[publication_key] = manifest.view_id
+            return manifest.model_copy(deep=True)
+
+    async def lookup_context_view_publication(
+        self, publication_key: str
+    ) -> _ContextViewManifest | None:
+        from cayu.sessions.context_views import ContextViewManifest as ContextViewManifestType
+
+        if type(publication_key) is not str or not publication_key.strip():
+            raise ValueError("Context-view publication keys must be non-blank strings.")
+        if len(publication_key.encode("utf-8")) > 512:
+            raise ValueError("publication_key must be at most 512 UTF-8 bytes.")
+        async with self._lock:
+            view_id = self._context_publication_keys.get(publication_key)
+            if view_id is None:
+                return None
+            manifest = self._context_views.get(view_id)
+            if manifest is None or type(manifest) is not ContextViewManifestType:
+                raise RuntimeError("Context-view publication index is inconsistent.")
+            return manifest.model_copy(deep=True)
+
+    def _require_context_view_lifecycle_capacity(
+        self, view_id: str, *, additional_slots: int = 0
+    ) -> None:
+        from cayu.sessions.context_views import validate_context_view_lifecycle_capacity
+
+        events = sum(event.view_id == view_id for event in self._context_lifecycle_events.values())
+        unsettled = sum(
+            receipt.view.view_id == view_id
+            and receipt.state in {"selected", "adopted", "transferred"}
+            for receipt in self._context_selection_receipts.values()
+        )
+        validate_context_view_lifecycle_capacity(
+            events, unsettled, additional_slots=additional_slots
+        )
+
+    async def select_context_view(
+        self, request: _ContextViewSelectionRequest
+    ) -> _ContextViewSelectionReceipt:
+        from cayu.sessions.context_views import (
+            CONTEXT_VIEW_EXPIRY_BATCH_SIZE,
+            CONTEXT_VIEW_MAX_SELECTIONS_PER_OWNER,
+            context_view_manifest_bytes,
+        )
+        from cayu.sessions.context_views import (
+            ContextViewSelectionReceipt as ContextViewSelectionReceiptType,
+        )
+        from cayu.sessions.context_views import (
+            ContextViewSelectionRequest as ContextViewSelectionRequestType,
+        )
+
+        if type(request) is not ContextViewSelectionRequestType:
+            raise TypeError("Context-view selection requires a typed request.")
+        request = ContextViewSelectionRequestType.model_validate(request)
+        from cayu.sessions.context_views import json_commitment
+
+        request_commitment = json_commitment(
+            canonical_bounded_durable_json_bytes(
+                request.model_dump(mode="json"),
+                "context view selection request",
+                max_bytes=256 * 1024,
+                max_nodes=8192,
+                max_nesting=64,
+            ).decode("utf-8"),
+            "context view selection request",
+        )
+        async with _InMemoryContextViewSelectionTransaction(self):
+            now_ms = int(self._ownership_clock().timestamp() * 1000)
+            expired_count = 0
+            for selection_key, receipt in sorted(
+                self._context_selection_receipts.items(),
+                key=lambda item: item[0] != request.selection_key,
+            ):
+                if expired_count >= CONTEXT_VIEW_EXPIRY_BATCH_SIZE:
+                    break
+                if (
+                    receipt.owner == request.source_owner
+                    and receipt.state == "selected"
+                    and receipt.expires_at_ms <= now_ms
+                ):
+                    self._require_context_view_lifecycle_capacity(receipt.view.view_id)
+                    expired = receipt.model_copy(update={"state": "expired"}, deep=True)
+                    self._context_selection_receipts[selection_key] = expired
+                    from cayu.sessions.context_views import ContextViewLifecycleEvent
+
+                    operation_key = f"expiry:{selection_key}:{receipt.ownership_revision}"
+                    event = ContextViewLifecycleEvent(
+                        event_id="sha256:"
+                        + sha256(f"context-view-event:{operation_key}".encode()).hexdigest(),
+                        operation_key=operation_key,
+                        selection_key=selection_key,
+                        view_id=receipt.view.view_id,
+                        state="expired",
+                        owner=expired.owner,
+                        owner_participant=expired.owner_participant,
+                        pin_commitment=expired.pin_commitment,
+                        ownership_revision=expired.ownership_revision,
+                    )
+                    self._context_lifecycle_events[event.event_id] = event
+                    expired_count += 1
+            existing = self._context_selection_receipts.get(request.selection_key)
+            if existing is not None:
+                if self._context_selection_request_commitments.get(request.selection_key) != (
+                    request_commitment
+                ):
+                    raise ValueError("Context-view selection key conflicts with its request.")
+                if existing.state == "selected" and existing.expires_at_ms <= now_ms:
+                    self._require_context_view_lifecycle_capacity(existing.view.view_id)
+                    existing = existing.model_copy(update={"state": "expired"}, deep=True)
+                    self._context_selection_receipts[request.selection_key] = existing
+                    from cayu.sessions.context_views import ContextViewLifecycleEvent
+
+                    operation_key = f"expiry:{request.selection_key}:{existing.ownership_revision}"
+                    event = ContextViewLifecycleEvent(
+                        event_id="sha256:"
+                        + sha256(f"context-view-event:{operation_key}".encode()).hexdigest(),
+                        operation_key=operation_key,
+                        selection_key=request.selection_key,
+                        view_id=existing.view.view_id,
+                        state="expired",
+                        owner=existing.owner,
+                        owner_participant=existing.owner_participant,
+                        pin_commitment=existing.pin_commitment,
+                        ownership_revision=existing.ownership_revision,
+                    )
+                    self._context_lifecycle_events[event.event_id] = event
+                return existing.model_copy(deep=True)
+            source = self._sessions.get(request.source_session_id)
+            if source is None or source.instance_id != request.source_session_instance_id:
+                raise LookupError("Context-view source session incarnation is unavailable.")
+            candidates = [
+                view
+                for view in self._context_views.values()
+                if view.source_owner == request.source_owner
+                and view.source_session_id == request.source_session_id
+                and view.source_session_instance_id == request.source_session_instance_id
+                and view.projection_schema == request.projection_schema
+                and view.extension_set_commitment == request.extension_set_commitment
+                and (request.selector != "exact" or view.view_id == request.exact_view_id)
+                and (
+                    request.minimum_transcript_cursor is None
+                    or view.transcript_cursor >= request.minimum_transcript_cursor
+                )
+            ]
+            if not candidates:
+                raise LookupError("No eligible context view is available.")
+            if len(candidates) > request.limits.max_views:
+                raise OverflowError("Context-view count exceeds the requested limit.")
+            selection_count = sum(
+                receipt.owner == request.source_owner
+                for receipt in self._context_selection_receipts.values()
+            )
+            if selection_count >= CONTEXT_VIEW_MAX_SELECTIONS_PER_OWNER:
+                raise OverflowError("Context-view selection quota exceeded for the owner.")
+            active_pins = sum(
+                1
+                for receipt in self._context_selection_receipts.values()
+                if receipt.owner == request.source_owner
+                and receipt.state in {"selected", "adopted", "transferred"}
+                and (receipt.state != "selected" or receipt.expires_at_ms > now_ms)
+            )
+            if active_pins >= request.limits.max_pins:
+                raise OverflowError("Context-view pin count exceeds the requested limit.")
+            selected = max(candidates, key=lambda view: (view.transcript_cursor, view.view_id))
+            self._require_context_view_lifecycle_capacity(selected.view_id, additional_slots=1)
+            selected_bytes = context_view_manifest_bytes(selected)
+            if selected_bytes > request.limits.max_view_bytes:
+                raise OverflowError("Context-view manifest exceeds the requested byte limit.")
+            retained_views = {
+                receipt.view.view_id: receipt.view
+                for receipt in self._context_selection_receipts.values()
+                if receipt.owner == request.source_owner
+                and receipt.state in {"selected", "adopted", "transferred"}
+                and (receipt.state != "selected" or receipt.expires_at_ms > now_ms)
+            }
+            retained_views[selected.view_id] = selected
+            retained_bytes = sum(
+                context_view_manifest_bytes(view) for view in retained_views.values()
+            )
+            if retained_bytes > request.limits.max_retained_bytes:
+                raise OverflowError("Context-view retained bytes exceed the requested limit.")
+            pin_commitment = (
+                "sha256:"
+                + sha256(
+                    f"context-pin:{request.selection_key}:{selected.view_id}".encode()
+                ).hexdigest()
+            )
+            receipt = ContextViewSelectionReceiptType(
+                selection_key=request.selection_key,
+                view=selected,
+                owner=request.source_owner,
+                state="selected",
+                pin_commitment=pin_commitment,
+                owner_participant=selected.participant,
+                expires_at_ms=int(
+                    self._ownership_clock().timestamp() * 1000
+                    + request.limits.max_lifetime_seconds * 1000
+                ),
+            )
+            self._context_selection_receipts[request.selection_key] = receipt
+            self._context_selection_request_commitments[request.selection_key] = request_commitment
+            return receipt.model_copy(deep=True)
+
+    async def transition_context_view_ownership(
+        self, request: _ContextViewOwnershipRequest
+    ) -> _ContextViewSelectionReceipt:
+        from cayu.sessions.context_views import (
+            ContextViewOwnershipRequest as ContextViewOwnershipRequestType,
+        )
+        from cayu.sessions.context_views import (
+            json_commitment,
+        )
+
+        if type(request) is not ContextViewOwnershipRequestType:
+            raise TypeError("Context-view ownership requires a typed request.")
+        request = ContextViewOwnershipRequestType.model_validate(request)
+        request_commitment = json_commitment(
+            canonical_bounded_durable_json_bytes(
+                request.model_dump(mode="json"),
+                "context view ownership request",
+                max_bytes=256 * 1024,
+                max_nodes=8192,
+                max_nesting=64,
+            ).decode("utf-8"),
+            "context view ownership request",
+        )
+        async with self._lock:
+            prior_commitment = self._context_ownership_operation_commitments.get(
+                request.operation_key
+            )
+            if prior_commitment is not None:
+                if prior_commitment != request_commitment:
+                    raise ValueError("Ownership operation key conflicts with its request.")
+                receipt = self._context_ownership_operation_receipts[request.operation_key]
+                return receipt.model_copy(deep=True)
+            receipt = self._context_selection_receipts.get(request.selection_key)
+            if receipt is None or receipt.view.view_id != request.view_id:
+                raise LookupError("Context-view selection is unavailable.")
+            if receipt.pin_commitment != request.pin_commitment:
+                raise ValueError("Context-view pin commitment conflicts with the request.")
+            if receipt.state != request.expected_state:
+                raise ValueError("Context-view ownership state is stale or already settled.")
+            if receipt.ownership_revision != request.expected_revision:
+                raise ValueError("Context-view ownership revision is stale.")
+            if receipt.owner != request.current_owner:
+                raise PermissionError("The current owner does not control this context-view pin.")
+            if (
+                request.current_participant is not None
+                and receipt.owner_participant is not None
+                and receipt.owner_participant != request.current_participant
+            ):
+                raise PermissionError(
+                    "The current participant does not control this context-view pin."
+                )
+            now_ms = int(self._ownership_clock().timestamp() * 1000)
+            self._require_context_view_lifecycle_capacity(receipt.view.view_id)
+            if receipt.state == "selected" and receipt.expires_at_ms <= now_ms:
+                expired = receipt.model_copy(update={"state": "expired"}, deep=True)
+                self._context_selection_receipts[request.selection_key] = expired
+                from cayu.sessions.context_views import ContextViewLifecycleEvent
+
+                operation_key = f"expiry:{request.selection_key}:{receipt.ownership_revision}"
+                self._context_lifecycle_events[
+                    "sha256:" + sha256(f"context-view-event:{operation_key}".encode()).hexdigest()
+                ] = ContextViewLifecycleEvent(
+                    event_id="sha256:"
+                    + sha256(f"context-view-event:{operation_key}".encode()).hexdigest(),
+                    operation_key=operation_key,
+                    selection_key=request.selection_key,
+                    view_id=receipt.view.view_id,
+                    state="expired",
+                    owner=expired.owner,
+                    owner_participant=expired.owner_participant,
+                    pin_commitment=expired.pin_commitment,
+                    ownership_revision=expired.ownership_revision,
+                )
+                raise LookupError("Context-view selection has expired.")
+            if request.operation == "adopt":
+                assert request.destination_owner is not None
+                next_state = "adopted"
+                next_owner = request.destination_owner
+            elif request.operation == "transfer":
+                assert request.destination_owner is not None
+                next_state = "transferred"
+                next_owner = request.destination_owner
+            else:
+                next_state = "released"
+                next_owner = receipt.owner
+            next_participant = receipt.owner_participant
+            if request.operation != "release":
+                if request.destination_participant is None:
+                    if request.destination_owner != receipt.owner:
+                        raise PermissionError(
+                            "A transfer to another owner requires destination participant evidence."
+                        )
+                else:
+                    next_participant = request.destination_participant
+            updated = receipt.model_copy(
+                update={
+                    "owner": next_owner,
+                    "state": next_state,
+                    "ownership_revision": receipt.ownership_revision + 1,
+                    "owner_participant": next_participant,
+                },
+                deep=True,
+            )
+            self._require_context_view_lifecycle_capacity(
+                updated.view.view_id, additional_slots=int(next_state != "released")
+            )
+            self._context_selection_receipts[request.selection_key] = updated
+            self._context_ownership_operation_commitments[request.operation_key] = (
+                request_commitment
+            )
+            self._context_ownership_operation_receipts[request.operation_key] = updated
+            from cayu.sessions.context_views import ContextViewLifecycleEvent
+
+            event = ContextViewLifecycleEvent(
+                event_id="sha256:"
+                + sha256(f"context-view-event:{request.operation_key}".encode()).hexdigest(),
+                operation_key=request.operation_key,
+                selection_key=request.selection_key,
+                view_id=request.view_id,
+                state=next_state,
+                owner=updated.owner,
+                owner_participant=updated.owner_participant,
+                pin_commitment=updated.pin_commitment,
+                ownership_revision=updated.ownership_revision,
+            )
+            self._context_lifecycle_events[event.event_id] = event
+            return updated.model_copy(deep=True)
+
+    async def validate_context_view_source_closure(self, session_id: str) -> None:
+        async with self._lock:
+            now_ms = int(self._ownership_clock().timestamp() * 1000)
+            for receipt in self._context_selection_receipts.values():
+                if (
+                    receipt.view.source_session_id == session_id
+                    and receipt.state in {"selected", "adopted", "transferred"}
+                    and (receipt.state != "selected" or receipt.expires_at_ms > now_ms)
+                ):
+                    raise ValueError("Session has an active context-view retention pin.")
+
+    async def validate_context_view_compaction(
+        self, session_id: str, expected_transcript_cursor: int
+    ) -> None:
+        if type(expected_transcript_cursor) is not int or expected_transcript_cursor < 0:
+            raise ValueError("Context-view compaction requires a non-negative transcript cursor.")
+        async with self._lock:
+            self._validate_context_view_compaction_unlocked(session_id, expected_transcript_cursor)
+
+    def _validate_context_view_compaction_unlocked(
+        self, session_id: str, expected_transcript_cursor: int
+    ) -> None:
+        from cayu.sessions.context_views import require_independent_context_view_material
+
+        now_ms = int(self._ownership_clock().timestamp() * 1000)
+        for receipt in self._context_selection_receipts.values():
+            if (
+                receipt.view.source_session_id == session_id
+                and receipt.state in {"selected", "adopted", "transferred"}
+                and (receipt.state != "selected" or receipt.expires_at_ms > now_ms)
+                and receipt.view.transcript_cursor <= expected_transcript_cursor
+            ):
+                manifest = self._context_views.get(receipt.view.view_id)
+                if manifest is None or manifest != receipt.view:
+                    raise ValueError("Pinned context-view material is unavailable for compaction.")
+                require_independent_context_view_material(manifest)
+
+    async def read_context_view_lifecycle_events(
+        self, view_id: str, *, limit: int = 256, owner_participant: _ParticipantRef | None = None
+    ) -> tuple[_ContextViewLifecycleEvent, ...]:
+        if type(limit) is not int or not 1 <= limit <= 256:
+            raise ValueError("Context-view lifecycle event limits must be between 1 and 256.")
+        if owner_participant is not None:
+            from cayu.collaboration.participants import ParticipantRef
+
+            owner_participant = ParticipantRef.model_validate(owner_participant)
+        async with self._lock:
+            events = [
+                event
+                for event in self._context_lifecycle_events.values()
+                if event.view_id == view_id
+                and (owner_participant is None or event.owner_participant == owner_participant)
+            ]
+            events.sort(key=lambda event: (event.ownership_revision, event.event_id))
+            return tuple(event.model_copy(deep=True) for event in events[:limit])
+
+    async def read_context_view(
+        self, view_id: str, *, source_session_id: str
+    ) -> _ContextViewReadback:
+        from cayu.sessions.context_views import ContextViewReadback as ContextViewReadbackType
+
+        async with self._lock:
+            view = self._context_views.get(view_id)
+            if view is None or view.source_session_id != source_session_id:
+                raise LookupError("Context view is unavailable.")
+            return ContextViewReadbackType(view=view.model_copy(deep=True))
 
     async def create_fork(
         self,
@@ -16903,6 +17708,24 @@ class InMemorySessionStore(SessionStore):
         *,
         closure_receipt: dict[str, Any] | None = None,
     ) -> None:
+        # Participant creation/replay acquires this lock before the store lock.
+        # Deletion follows the same order so a committed session cannot lose
+        # its receipt between the atomic create and readback.
+        await self._participant_creation_lock.acquire()
+        try:
+            await self._delete_session_unserialized(
+                session_id,
+                closure_receipt=closure_receipt,
+            )
+        finally:
+            self._participant_creation_lock.release()
+
+    async def _delete_session_unserialized(
+        self,
+        session_id: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+    ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -16919,6 +17742,15 @@ class InMemorySessionStore(SessionStore):
                     f"Cannot delete a session while it is {session.status}; "
                     f"interrupt it first: {session_id}"
                 )
+            if self.context_view_version is not None:
+                now_ms = int(self._ownership_clock().timestamp() * 1000)
+                for receipt in self._context_selection_receipts.values():
+                    if (
+                        receipt.view.source_session_id == session_id
+                        and receipt.state in {"selected", "adopted", "transferred"}
+                        and (receipt.state != "selected" or receipt.expires_at_ms > now_ms)
+                    ):
+                        raise ValueError("Session has an active context-view retention pin.")
             for _, child_id in self._child_session_keys_by_parent.get(session_id, []):
                 child = self._sessions.get(child_id)
                 if child is None or child.parent_session_id != session_id:
@@ -16975,6 +17807,11 @@ class InMemorySessionStore(SessionStore):
                 if key[0] != session_id and binding.grant_id not in targeted_grant_ids
             }
             self._sessions.pop(session_id, None)
+            binding = self._participant_session_bindings.pop(session_id, None)
+            self._participant_session_receipts.pop(session_id, None)
+            if binding is not None:
+                self._participant_session_ids_by_key.pop(binding.creation_key, None)
+                self._participant_session_request_commitments.pop(binding.creation_key, None)
             self._events.pop(session_id, None)
             self._event_ids.pop(session_id, None)
             self._persisted_event_side_effect_deliveries = {
@@ -20408,6 +21245,7 @@ class InMemorySessionStore(SessionStore):
         expected_statuses: set[SessionStatus] | None = None,
         expected_run_epoch: int | None = None,
         expected_transcript_cursor: int | None = None,
+        context_view_compaction_cursor: int | None = None,
     ) -> Session:
         return await self._publish_session_operation(
             session_id,
@@ -20420,6 +21258,7 @@ class InMemorySessionStore(SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            context_view_compaction_cursor=context_view_compaction_cursor,
         )
 
     async def _publish_session_operation(
@@ -20435,6 +21274,7 @@ class InMemorySessionStore(SessionStore):
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
         expected_transcript_cursor: int | None,
+        context_view_compaction_cursor: int | None = None,
     ) -> Session:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
         idempotency_key = _reject_reserved_runtime_publication_key(
@@ -20467,6 +21307,10 @@ class InMemorySessionStore(SessionStore):
                     f"current {session.run_epoch}."
                 )
             current_cursor = len(self._transcripts.get(session_id, []))
+            if context_view_compaction_cursor is not None:
+                self._validate_context_view_compaction_unlocked(
+                    session_id, context_view_compaction_cursor
+                )
             if (
                 expected_transcript_cursor is not None
                 and current_cursor != expected_transcript_cursor

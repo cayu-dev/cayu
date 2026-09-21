@@ -640,18 +640,19 @@ class DurableWorkerPoller:
         self,
         action: Callable[[], Awaitable[_ClaimT | None]],
         *,
+        before_claim: Callable[[], Awaitable[None]] | None = None,
         maximum_active_s: float | None = None,
         store_failure_on_exception: bool = True,
     ) -> DurableWorkerClaim[_ClaimT]:
         if not callable(action):
             raise TypeError("Durable worker claim action must be callable.")
+        if before_claim is not None and not callable(before_claim):
+            raise TypeError("Durable worker preparation must be callable.")
         if maximum_active_s is not None:
             validate_worker_interval(maximum_active_s, "maximum_active_s")
         if type(store_failure_on_exception) is not bool:
             raise TypeError("store_failure_on_exception must be a bool.")
         now = self._clock()
-        accepted_hint = self._pending_hint
-        hint_received_at = self._pending_hint_received_at
         if not self._group._begin(
             self._token,
             now=now,
@@ -660,6 +661,24 @@ class DurableWorkerPoller:
         ):
             return DurableWorkerClaim(attempted=False)
         self._forced = False
+        # Preparation shares admission, but is not an authoritative claim.
+        # In particular, failure must not consume a pending admission hint or
+        # manufacture a failed/cancelled claim that never reached the store.
+        try:
+            if before_claim is not None:
+                await before_claim()
+        except BaseException as exc:
+            if store_failure_on_exception and isinstance(exc, Exception):
+                self._group.metrics.store_failure()
+            self._group._finish(
+                self._token,
+                now=self._clock(),
+                claimed=False,
+                random_source=self._random_source,
+            )
+            raise
+        accepted_hint = self._pending_hint
+        hint_received_at = self._pending_hint_received_at
         if accepted_hint:
             self._pending_hint = False
             self._pending_hint_received_at = None

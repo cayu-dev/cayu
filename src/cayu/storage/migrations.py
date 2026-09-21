@@ -465,7 +465,18 @@ REVISIONS: tuple[Revision, ...] = (
     # Collaboration writers must preserve mandatory request-control reservations.
     Revision(revision=95, kind=RevisionKind.BREAKING, compatible_from=95),
     # Group writers must preserve execution obligations until quiescence.
+    # Participant-owned inert sessions require a native creation-key index and
+    # immutable binding/receipt records in every durable session backend.
     Revision(revision=96, kind=RevisionKind.BREAKING, compatible_from=96),
+    # Context-view manifests and selection pins require native durable records
+    # so publication/readback and exact selection survive restart.
+    Revision(revision=97, kind=RevisionKind.BREAKING, compatible_from=97),
+    # Context-view ownership transitions and replay receipts require a native
+    # fenced operation namespace in every durable session backend.
+    Revision(revision=98, kind=RevisionKind.BREAKING, compatible_from=98),
+    # Ownership transitions require durable lifecycle evidence independent of
+    # the mutable selection receipt.
+    Revision(revision=99, kind=RevisionKind.BREAKING, compatible_from=99),
 )
 
 #: The revision an empty database is initialized to.

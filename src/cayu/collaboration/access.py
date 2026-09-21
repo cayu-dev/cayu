@@ -18,6 +18,7 @@ from cayu.collaboration.participants import (
 ParticipantAction = Literal[
     "discover",
     "inspect",
+    "administration",
     "readback",
     "create",
     "configure",

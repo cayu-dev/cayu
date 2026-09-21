@@ -109,6 +109,7 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
 
     assert "github.event_name == 'pull_request'" not in shards
     assert "timeout-minutes: 45" in shards
+    assert "sudo apt-get install --yes --no-install-recommends ffmpeg" in shards
     assert (
         "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]"
         in shards
@@ -123,7 +124,7 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     assert "name: ci-durations-general-${{ matrix.shard }}" in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
-    assert "timeout-minutes: 15" in specialists
+    assert "timeout-minutes: 30" in specialists
     assert "stress-process" not in specialists
     assert "postgres-conformance-8" in specialists
     assert "scripts/run_ci.py --lane specialist" in specialists

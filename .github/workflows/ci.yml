@@ -101,7 +101,7 @@ jobs:
         run: |
           if ! command -v ffmpeg >/dev/null; then
             sudo apt-get update
-            sudo apt-get install --yes ffmpeg
+            sudo apt-get install --yes --no-install-recommends ffmpeg
           fi
       - name: Test duration-balanced shard
         run: python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"
@@ -119,7 +119,8 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    # Loaded runners need collection/setup headroom beyond measured test calls.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

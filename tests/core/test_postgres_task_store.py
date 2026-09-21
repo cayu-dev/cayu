@@ -6036,6 +6036,18 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
         handled = asyncio.Event()
         metrics = DurableWorkerMetrics(configured_handler_capacity=100)
         schedule_reads = 0
+        group_scans = 0
+        original_group_scan = consumer.list_task_group_reconciliation_candidates
+
+        async def observe_group_scan(**kwargs):
+            nonlocal group_scans
+            assert metrics.snapshot().active_pollers == 1
+            group_scans += 1
+            return await original_group_scan(**kwargs)
+
+        monkeypatch.setattr(
+            consumer, "list_task_group_reconciliation_candidates", observe_group_scan
+        )
         original_schedule_wakeup = consumer.next_task_schedule_wakeup
 
         async def observe_schedule(query=None):
@@ -6099,6 +6111,7 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
             idle_cpu_s = process_time() - cpu_started
             idle_snapshot = metrics.snapshot()
             assert 2 <= idle_snapshot.claim_attempts <= 10
+            assert 0 < group_scans <= idle_snapshot.claim_attempts + idle_snapshot.active_pollers
             assert 0 < schedule_reads <= idle_snapshot.claim_attempts
             assert idle_cpu_s <= 0.10
 
@@ -6118,6 +6131,7 @@ def test_postgres_hundred_worker_pool_meets_disconnected_listener_budget(postgre
         assert sum(handled_counts) == 1
         snapshot = metrics.snapshot()
         assert snapshot.configured_handler_capacity == 100
+        assert group_scans <= snapshot.claim_attempts
         assert snapshot.maximum_active_pollers == 1
         assert snapshot.maximum_active_handlers == 1
         assert snapshot.successful_claims == 1

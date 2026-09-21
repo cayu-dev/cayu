@@ -21,6 +21,7 @@ from cayu.collaboration._contracts import (
     ExactUnavailable,
     ExpectedOperation,
     Generation,
+    OperationRef,
     OwnerRef,
 )
 from cayu.collaboration._history_references import HistoryKey
@@ -816,6 +817,39 @@ class CollaborationStore(ABC):
             redactor=redactor,
         )
 
+    async def _lookup_registered_permit(
+        self,
+        initialized: CollaborationInitialization,
+        operation: OperationRef,
+        *,
+        redactor: SecretRedactor,
+    ) -> PermitReceipt | None:
+        """Read one retained registration for acknowledgement-loss recovery."""
+        from cayu.collaboration._permit_store import prepare_permit_record, registered_receipt
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        operation = prepare_contract(OperationRef, operation, redactor=redactor)
+        async with self._transaction(initialized.binding.application_scope, write=False) as tx:
+            anchor = await self._anchor(tx, initialized, redactor)
+            raw = await tx.get(
+                "operations",
+                (operation.namespace_incarnation, operation.generation, operation.caller_key),
+            )
+            if raw is None:
+                return None
+            from cayu.collaboration.base import _stored_mode
+
+            if _stored_mode(raw) != "permit":
+                raise CollaborationConflict("Operation key already has different intent.")
+            record = prepare_permit_record(raw, redactor)
+            if not isinstance(record, PermitReceipt):
+                return None
+            result = await registered_receipt(tx, record.expected, redactor)
+            if result is None or result.expected.operation != operation:
+                raise CollaborationUnavailable("Retained permit identity conflicts.")
+            del anchor
+            return result
+
     async def scan_obligations(
         self,
         initialized: CollaborationInitialization,
@@ -874,6 +908,8 @@ class CollaborationStore(ABC):
                             source_operation=request.source_operation,
                             settlement_operation=request.settlement_operation,
                             admission_generation=request.admission_generation,
+                            expected_configuration_revision=request.expected_configuration_revision,
+                            admission_commitment=request.admission_commitment,
                             target=request.target,
                             target_state=request.target_state,
                             effect_scope=request.effect_scope,

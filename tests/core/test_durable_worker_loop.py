@@ -371,6 +371,84 @@ def test_worker_metrics_record_persisted_admission_to_claim_latency() -> None:
     assert snapshot.admission_to_claim_latency_max_s == pytest.approx(0.75)
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("count_store_failure", [False, True])
+def test_preclaim_failure_preserves_hint_without_recording_claim(
+    cancel: bool, count_store_failure: bool
+) -> None:
+    now = 0.0
+    poller = DurableWorkerPollerGroup().subscribe(
+        DurableWorkerDemandPolicy(dispatch_latency_s=1.0, jitter_ratio=0.0),
+        clock=lambda: now,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    failure = RuntimeError("preparation failed")
+    claim_calls = 0
+
+    async def prepare() -> None:
+        entered.set()
+        await release.wait()
+        raise failure
+
+    async def claim() -> str:
+        nonlocal claim_calls
+        claim_calls += 1
+        return "task"
+
+    async def scenario() -> None:
+        nonlocal now
+        poller.note_hint()
+        poller.begin_step()
+        attempt = asyncio.create_task(
+            poller.claim(
+                claim, before_claim=prepare, store_failure_on_exception=count_store_failure
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert poller.metrics_snapshot().active_pollers == 1
+            if cancel:
+                attempt.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await attempt
+                assert attempt.cancelling() == 1
+                assert attempt.cancelled()
+            else:
+                release.set()
+                with pytest.raises(RuntimeError) as caught:
+                    await attempt
+                assert caught.value is failure
+            snapshot = poller.metrics_snapshot()
+            assert snapshot.active_pollers == 0
+            assert snapshot.claim_attempts == claim_calls == 0
+            assert snapshot.failed_claims == snapshot.cancelled_claims == 0
+            assert snapshot.store_failures == int(count_store_failure and not cancel)
+            assert snapshot.wake_hints_received == 1
+            assert snapshot.wake_hints_accepted == snapshot.wake_hints_ignored == 0
+            assert poller.has_pending_hint
+            assert not poller.last_attempted
+
+            now = 1.0
+            poller.begin_step()
+            result = await poller.claim(claim)
+            assert result.attempted and result.value == "task"
+            snapshot = poller.metrics_snapshot()
+            assert snapshot.claim_attempts == snapshot.successful_claims == claim_calls == 1
+            assert snapshot.wake_hints_accepted == 1
+            assert snapshot.wake_hints_followed_by_successful_claims == 1
+            assert snapshot.wake_hints_ignored == 0
+            assert not poller.has_pending_hint
+        finally:
+            release.set()
+            await asyncio.gather(attempt, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        poller.close()
+
+
 def test_worker_metrics_keep_failed_and_cancelled_claims_out_of_empty_claims() -> None:
     now = 0.0
     metrics = DurableWorkerMetrics()

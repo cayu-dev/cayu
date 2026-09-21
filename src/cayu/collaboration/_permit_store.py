@@ -219,6 +219,10 @@ async def register_permit_in_transaction(
         participant.lifecycle != "active"
         or participant.lifecycle_revision != request.expected_lifecycle_revision
         or participant.admission_generation != request.admission_generation
+        or (
+            request.expected_configuration_revision is not None
+            and participant.configuration_revision != request.expected_configuration_revision
+        )
     ):
         raise CollaborationConflict("Participant no longer admits this permit authority.")
     settlement_key = (

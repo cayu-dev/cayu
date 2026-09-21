@@ -6465,6 +6465,18 @@ def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
     metrics = DurableWorkerMetrics(configured_handler_capacity=100)
     original_claim = h.tasks.claim_task
     schedule_reads = 0
+    group_scans = 0
+    original_group_scan = h.tasks.list_task_group_reconciliation_candidates
+
+    async def observe_group_scan(**kwargs):
+        nonlocal group_scans
+        assert metrics.snapshot().active_pollers == 1
+        group_scans += 1
+        # A real persistent-store await allows the other workers to enter.
+        await asyncio.sleep(0)
+        return await original_group_scan(**kwargs)
+
+    monkeypatch.setattr(h.tasks, "list_task_group_reconciliation_candidates", observe_group_scan)
     original_schedule_wakeup = h.tasks.next_task_schedule_wakeup
 
     async def observe_schedule(query=None):
@@ -6514,6 +6526,8 @@ def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
             await asyncio.wait_for(empty_claim.wait(), timeout=1)
             await asyncio.sleep(0.15)
             assert 2 <= claim_calls <= 10
+            idle_snapshot = metrics.snapshot()
+            assert 0 < group_scans <= idle_snapshot.claim_attempts + idle_snapshot.active_pollers
             assert 0 < schedule_reads <= claim_calls * len(h.dispatcher._claim_task_types())
         finally:
             stop.set()
@@ -6528,6 +6542,7 @@ def test_hundred_idle_dispatch_workers_meet_claim_operation_budget(
     assert snapshot.configured_handler_capacity == 100
     assert snapshot.maximum_active_pollers == 1
     assert snapshot.claim_attempts == claim_calls
+    assert group_scans <= snapshot.claim_attempts
     assert snapshot.empty_claims == claim_calls
 
 
@@ -6601,6 +6616,79 @@ def test_dispatcher_instances_share_claim_namespace_rotation(
     assert snapshot.claim_attempts == len(claim_types)
     assert snapshot.empty_claims == len(claim_types) - 1
     assert snapshot.successful_claims == 1
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_run_worker_maintenance_failure_does_not_count_as_claim(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    h = _build([_batch("unused")])
+    metrics = DurableWorkerMetrics()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    stop = asyncio.Event()
+    claim_calls = 0
+    original_claim = h.tasks.claim_task
+    original_scan = h.tasks.list_task_group_reconciliation_candidates
+
+    async def fail_scan(**kwargs):
+        entered.set()
+        await release.wait()
+        stop.set()
+        raise RuntimeError("maintenance unavailable")
+
+    async def observe_claim(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        result = await original_claim(*args, **kwargs)
+        stop.set()
+        return result
+
+    monkeypatch.setattr(h.tasks, "list_task_group_reconciliation_candidates", fail_scan)
+    monkeypatch.setattr(h.tasks, "claim_task", observe_claim)
+
+    async def run_worker():
+        return await h.dispatcher.run_worker(
+            h.app,
+            worker_id="maintenance-metrics",
+            stop=stop,
+            poll_interval_s=0.01,
+            metrics=metrics,
+            reclaim_expired_leases=False,
+            reconcile_terminal_receipts=False,
+        )
+
+    async def scenario() -> None:
+        worker = asyncio.create_task(run_worker())
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert metrics.snapshot().active_pollers == 1
+            if cancel:
+                worker.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await worker
+                assert worker.cancelling() == 1
+                assert worker.cancelled()
+            else:
+                release.set()
+                assert await worker is None
+            snapshot = metrics.snapshot()
+            assert snapshot.active_pollers == 0
+            assert snapshot.claim_attempts == claim_calls == 0
+            assert snapshot.failed_claims == snapshot.cancelled_claims == 0
+            assert snapshot.store_failures == int(not cancel)
+
+            monkeypatch.setattr(h.tasks, "list_task_group_reconciliation_candidates", original_scan)
+            stop.clear()
+            assert await asyncio.wait_for(run_worker(), 5) is None
+            snapshot = metrics.snapshot()
+            assert snapshot.claim_attempts == snapshot.empty_claims == claim_calls == 1
+        finally:
+            stop.set()
+            release.set()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_run_worker_metrics_count_each_reclaim_store_failure(

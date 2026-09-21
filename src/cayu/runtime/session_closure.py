@@ -1600,6 +1600,18 @@ class SessionClosureCoordinator:
         session = await self._session_store.load(session_id)
         if session is None:
             return inspection
+        if getattr(self._session_store, "context_view_version", None) is not None:
+            validate_context_views = getattr(
+                self._session_store, "validate_context_view_source_closure", None
+            )
+            if validate_context_views is None:
+                raise ValueError("Session store cannot prove context-view retention safety.")
+            try:
+                await validate_context_views(session_id)
+            except NotImplementedError as exc:
+                raise ValueError(
+                    "Session store cannot prove context-view retention safety."
+                ) from exc
         await self._require_quiescent_session(session_id)
         await self._require_dependent_admission(session_id, policy)
         child_record = next(
@@ -1684,6 +1696,18 @@ class SessionClosureCoordinator:
                 error="The session is absent without a durable closure receipt.",
             )
         await self._require_quiescent_session(session_id)
+        if getattr(self._session_store, "context_view_version", None) is not None:
+            validate_context_views = getattr(
+                self._session_store, "validate_context_view_source_closure", None
+            )
+            if validate_context_views is None:
+                raise ValueError("Session store cannot prove context-view retention safety.")
+            try:
+                await validate_context_views(session_id)
+            except NotImplementedError as exc:
+                raise ValueError(
+                    "Session store cannot prove context-view retention safety."
+                ) from exc
         await self._require_dependent_admission(session_id, policy)
         saved_progress = (
             await self._load_progress(session_id, plan_id)
