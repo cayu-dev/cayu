@@ -197,3 +197,89 @@ def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch):
             thread.join(timeout=5)
 
     asyncio.run(scenario())
+
+
+def test_public_web_normal_run_navigates(tmp_path):
+    """Exercise public profile admission and inspect actual native tool output."""
+    from cayu import (
+        AgentSpec,
+        CayuApp,
+        EnvironmentSpec,
+        ExecutionProfileBehaviorIdentity,
+        InMemorySessionStore,
+        LocalArtifactStore,
+        Message,
+        ModelStreamEvent,
+        RunRequest,
+        ScriptedModelProvider,
+        WebBridge,
+        run_to_completion,
+    )
+
+    async def scenario():
+        repo = Path(__file__).resolve().parents[2]
+        artifacts = LocalArtifactStore(tmp_path / "artifacts", store_id="public-web-run")
+        factory = VirtualEgressEnvironmentFactory(
+            policies={"research": PublicWebEgressPolicy(name="research")},
+            public_web_policy="research",
+            adapter=DockerEgressAdapter(
+                seccomp_profile=str(repo / "examples/browser_fetch/seccomp_profile.json"),
+            ),
+            image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+            artifact_store=artifacts,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="public-web-test",
+                behavior_version="1",
+                implementation_version="1",
+            ),
+            egress_authority_source="public-web-test",
+            egress_policy_version="1",
+        )
+        bridge = WebBridge.sandboxed_browser(
+            environment=factory,
+            browser_image=PINNED_BROWSER_SESSION_WORKLOAD.image,
+            interactive=True,
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        name="browser_session",
+                        arguments={
+                            "operation": "navigate",
+                            "operation_id": "public-web-open",
+                            "url": "https://example.com",
+                        },
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(EnvironmentSpec(name="research"), factory, default=True)
+        app.register_agent(
+            AgentSpec(name="researcher", model="scripted"),
+            tools=bridge.tools,
+            execution_requirements=bridge.execution_requirements,
+        )
+        outcome = await run_to_completion(
+            app,
+            RunRequest(
+                agent_name="researcher",
+                messages=[Message.text("user", "Open example.com")],
+            ),
+        )
+        assert outcome.error is None, outcome.error
+        transcript = await store.load_transcript(outcome.session_id)
+        results = [p for m in transcript for p in m.content if p.type == "tool_result"]
+        assert len(results) == 1
+        assert not results[0].is_error, results[0].content
+        assert "Example Domain" in results[0].content
+
+    asyncio.run(scenario())

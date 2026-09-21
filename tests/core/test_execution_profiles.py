@@ -9667,3 +9667,139 @@ def test_profile_resolution_failure_does_not_admit_resume(monkeypatch) -> None:
         assert provider.requests == []
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"egress_authority_source": "other"},
+        {"egress_authority_scope": "other"},
+        {"egress_policy_version": "2"},
+        {"egress_authority_generation": 2},
+    ],
+)
+def test_public_web_identity_admits_normal_run_and_remains_conservative(change) -> None:
+    from cayu import PublicWebEgressPolicy, run_to_completion
+
+    async def exercise() -> None:
+        adapter = _AdoptionHandoffAdapter()
+
+        def factory(**overrides):
+            args = dict(egress_authority_source="research", egress_policy_version="1")
+            args.update(overrides)
+            return VirtualEgressEnvironmentFactory(
+                policies={"research": PublicWebEgressPolicy(name="research")},
+                public_web_policy="research",
+                adapter=adapter,
+                execution_profile_identity=_test_behavior_identity("research"),
+                **args,
+            )
+
+        original = factory()
+        authority = original.egress_authority_identity
+        store = InMemorySessionStore()
+        provider = _completed_provider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(EnvironmentSpec(name="research"), original, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        outcome = await run_to_completion(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "research")],
+            ),
+        )
+        assert outcome.error is None
+        assert provider.requests
+        session = await store.load(outcome.session_id)
+        profile = execution_profile_from_session_metadata(session.metadata)
+        assert profile.egress_authority == authority
+        component = profile.component(ExecutionProfileComponentClass.EGRESS_AUTHORITY)
+        assert component.availability is ExecutionProfileIdentityAvailability.AVAILABLE
+        assert component.fingerprint
+        assert not authority.comparison_available
+        candidate = factory(**change).egress_authority_identity
+        assert compare_egress_authority(authority, candidate) is (
+            EgressAuthorityChangeKind.INCOMPARABLE
+            if change
+            else EgressAuthorityChangeKind.UNCHANGED
+        )
+        from cayu.runtime.execution_profiles import _egress_authority_component
+
+        assert (_egress_authority_component(candidate) == component) is (not change)
+
+    asyncio.run(exercise())
+
+
+def test_custom_opaque_policy_identity_still_unavailable() -> None:
+    from cayu import ApprovedEgressDestination
+    from cayu.runtime.execution_profiles import _egress_authority_component
+
+    class CustomPolicy(HttpEgressPolicy):
+        pass
+
+    factory = VirtualEgressEnvironmentFactory(
+        policies={
+            "custom": CustomPolicy(
+                name="custom",
+                allowed_hosts=("example.com",),
+                allowed_endpoints=(("GET", "/"),),
+            )
+        },
+        approved_destinations=(
+            ApprovedEgressDestination(
+                destination="example.com",
+                policy_name="custom",
+            ),
+        ),
+        runner_kind="docker",
+    )
+    authority = factory.egress_authority_identity
+    assert authority.policies[0].kind == "opaque"
+    assert _egress_authority_component(authority).availability is (
+        ExecutionProfileIdentityAvailability.UNAVAILABLE
+    )
+
+
+def test_same_public_web_profile_resumes_without_adoption() -> None:
+    from cayu import PublicWebEgressPolicy, run_to_completion
+
+    async def exercise():
+        authority = VirtualEgressEnvironmentFactory(
+            policies={"research": PublicWebEgressPolicy(name="research")},
+            public_web_policy="research",
+            runner_kind="docker",
+        ).egress_authority_identity
+        factory = IdentityConfiguredEgressEnvironmentFactory(generation=1, allow_post=False)
+        factory._egress_authority = authority
+        store = InMemorySessionStore()
+        provider = _completed_provider(batches=2)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(EnvironmentSpec(name="research"), factory, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        outcome = await run_to_completion(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "research")],
+            ),
+        )
+        assert outcome.error is None
+        await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id=outcome.session_id,
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        )
+        assert len(provider.requests) == 2
+        retained = await store.load(outcome.session_id)
+        assert (
+            execution_profile_from_session_metadata(retained.metadata).egress_authority == authority
+        )
+
+    asyncio.run(exercise())

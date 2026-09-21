@@ -1925,7 +1925,10 @@ def _egress_authority_component(
             ExecutionProfileIdentityStrength.STRUCTURAL,
             {"kind": "none", "version": 1},
         )
-    if not authority.comparison_available:
+    # Public-web policies have a canonical identity even though changed policies
+    # cannot be ordered by finite permission-set comparison. Opaque extensions
+    # still lack the authority contract needed for profile admission.
+    if any(policy.kind == "opaque" for policy in authority.policies):
         return _unavailable_component(ExecutionProfileComponentClass.EGRESS_AUTHORITY)
     return _available_component(
         ExecutionProfileComponentClass.EGRESS_AUTHORITY,
