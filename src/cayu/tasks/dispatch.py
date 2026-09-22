@@ -832,7 +832,7 @@ class TaskStoreDispatcher(Dispatcher):
         self._startup_terminal_receipt_reconciliation_pending = True
         from cayu.tasks._group_maintenance import TaskGroupMaintenance
 
-        self._group_maintenance = TaskGroupMaintenance()
+        self._group_maintenance = TaskGroupMaintenance.for_store(self._tasks)
 
     @property
     def task_type(self) -> str:

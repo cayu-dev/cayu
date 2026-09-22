@@ -438,7 +438,7 @@ async def run_task_worker(
     reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
     from cayu.tasks._group_maintenance import TaskGroupMaintenance
 
-    group_maintenance = TaskGroupMaintenance()
+    group_maintenance = TaskGroupMaintenance.for_store(task_store)
 
     async def reclaim_expired_tasks() -> bool:
         if materialized_work_contract_queue_supported:

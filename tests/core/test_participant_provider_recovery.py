@@ -14,6 +14,7 @@ from tests.core.test_provider_operation_offline_recovery import (
 )
 
 from cayu.agents import AgentSpec
+from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.events import EventType
@@ -291,12 +292,24 @@ def test_participant_provider_resolution_authority_and_replay(
                 )
             with pytest.raises(PermissionError, match="administration"):
                 await collect(value.resolve_provider_operation(intent))
+            # Cancellation retained the execution permit. Provider receipt replay
+            # does not prove that this separate obligation has been settled.
+            with pytest.raises(CollaborationConflict):
+                await value.change_participant_lifecycle(
+                    ParticipantLifecycleChange(
+                        operation=initialized.operation("retire"),
+                        participant=participant,
+                        expected_lifecycle_revision=3,
+                        state="retired",
+                    ),
+                    context=CONTEXT,
+                )
             await value.change_participant_lifecycle(
                 ParticipantLifecycleChange(
-                    operation=initialized.operation("retire"),
+                    operation=initialized.operation("disable-after-recovery"),
                     participant=participant,
                     expected_lifecycle_revision=3,
-                    state="retired",
+                    state="disabled",
                 ),
                 context=CONTEXT,
             )

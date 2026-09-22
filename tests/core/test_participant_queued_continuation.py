@@ -15,6 +15,7 @@ from cayu import (
     ToolApprovalRequest,
 )
 from cayu.agents import AgentSpec
+from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.collaboration.memory import InMemoryCollaborationStore
 from cayu.evals.testing import ScriptedModelProvider
@@ -184,12 +185,28 @@ def test_queued_successor_requires_current_participant_authority(
 
                     monkeypatch.setattr(value._event_writer, "emit", fail_terminal_publication)
             elif state != "active":
+                if entrance == "root" and state == "retired":
+                    # The root execution still owns a permit while its provider
+                    # is blocked. Retirement must not discard that obligation.
+                    with pytest.raises(CollaborationConflict):
+                        await value.change_participant_lifecycle(
+                            ParticipantLifecycleChange(
+                                operation=initialized.operation("retire-before-handoff"),
+                                participant=participant,
+                                expected_lifecycle_revision=1,
+                                state="retired",
+                            ),
+                            context=CONTEXT,
+                        )
                 await value.change_participant_lifecycle(
                     ParticipantLifecycleChange(
                         operation=initialized.operation("disable-before-handoff"),
                         participant=participant,
                         expected_lifecycle_revision=1,
-                        state="disabled" if state == "tampered_terminal" else state,
+                        state="disabled"
+                        if state == "tampered_terminal"
+                        or (entrance == "root" and state == "retired")
+                        else state,
                     ),
                     context=CONTEXT,
                 )

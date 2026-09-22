@@ -29,50 +29,23 @@ _REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR = "CAYU_REQUIRE_CURRENT_TEST_DURATIONS"
 _POSTGRES_CONTAINER_IMAGE = "pgvector/pgvector:pg16"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _MAX_UNKNOWN_DURATION_FRACTION = 0.05
-_CI_REPORT_PATH: Path | None = None
+_CI_FAILURE_LOGGING = False
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _CI_REPORT_PATH
+    global _CI_FAILURE_LOGGING
     if os.environ.get("GITHUB_ACTIONS") != "true" or not config.getoption("splits", None):
         return
     owner = os.environ.setdefault("CAYU_CI_REPORT_OWNER_PID", str(os.getpid()))
-    if owner != str(os.getpid()):
-        return
-    _CI_REPORT_PATH = Path(config.rootpath) / ".ci-test-reports.jsonl"
-    _CI_REPORT_PATH.write_text("", encoding="utf-8")
-
-
-def _append_ci_report(record: dict[str, object]) -> None:
-    if _CI_REPORT_PATH is not None:
-        with _CI_REPORT_PATH.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(record, ensure_ascii=True) + "\n")
-
-
-def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
-    _append_ci_report({"nodeid": nodeid, "phase": "start"})
+    _CI_FAILURE_LOGGING = owner == str(os.getpid())
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    if _CI_REPORT_PATH is None:
-        return
-    record: dict[str, object] = {
-        "nodeid": report.nodeid,
-        "phase": report.when,
-        "duration": report.duration,
-        "outcome": report.outcome,
-    }
-    if report.failed:
-        failure = report.longreprtext
-        record["failure"] = failure[:16384]
-        record["failure_truncated"] = len(failure) > 16384
-    _append_ci_report(record)
-    if report.failed:
-        # A job deadline can prevent pytest's final summary, and artifact
-        # storage can be unavailable. Emit the same bounded evidence now on the
-        # controller (workers have no _CI_REPORT_PATH), exactly once per phase.
+    if _CI_FAILURE_LOGGING and report.failed:
+        # Preserve failure evidence if a deadline prevents pytest's final summary.
+        # Only the controller emits it; no separate diagnostic archive is needed.
         print(
-            f"\nCI failure: {report.nodeid} [{report.when}]\n{record['failure']}",
+            f"\nCI failure: {report.nodeid} [{report.when}]\n{report.longreprtext[:16384]}",
             file=sys.stderr,
             flush=True,
         )

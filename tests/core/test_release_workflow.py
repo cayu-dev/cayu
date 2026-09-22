@@ -102,6 +102,14 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         (_REPOSITORY_ROOT / ".github/workflows/qualification.yml").read_text(), "qualification"
     )
 
+    mcp = _job_block(
+        (_REPOSITORY_ROOT / ".github/workflows/mcp-conformance.yml").read_text(),
+        "conformance-subset",
+    )
+    for job in (shards, specialists, qualification, mcp):
+        assert "actions/upload-artifact@" not in job
+        assert "continue-on-error" not in job
+
     for job in (shards, specialists, qualification):
         assert "command -v rg" in job
         assert "sudo apt-get install --yes ripgrep" in job
@@ -121,7 +129,6 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     assert "-n 2" not in runner
     assert "--cov" not in runner
     assert "COVERAGE_FILE" not in runner
-    assert "name: ci-durations-general-${{ matrix.shard }}" in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
     assert "timeout-minutes: 30" in specialists
@@ -133,7 +140,6 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     assert '"postgres and not (stress or qualification)", 8, group' in runner
     assert "--cov" not in specialists
     assert "COVERAGE_FILE" not in specialists
-    assert "name: ci-durations-${{ matrix.lane }}" in specialists
 
 
 def test_privileged_jobs_share_release_tag_verifier() -> None:
@@ -219,6 +225,8 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "if:" not in package[upload:]
     assert "name: release-dist" in package[upload:]
     assert "path: dist/first/" in package[upload:]
+    assert "continue-on-error" not in package[upload:]
+    assert "retention-days: 3" in package[upload:]
 
     assert "name: release-dist" in publish
     assert "path: dist/" in publish

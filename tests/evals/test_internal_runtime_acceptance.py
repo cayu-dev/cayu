@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import ExitStack
 from datetime import UTC, datetime
 
 import pytest
@@ -133,9 +134,27 @@ def test_acceptance_failure_reports_case_and_trial_evidence(status):
     assert "output-must-not-be-dumped" not in str(raised.value)
 
 
+@pytest.fixture
+def acceptance_directories(monkeypatch):
+    from cayu.evals.internal import runtime_acceptance
+
+    temporary_directory = runtime_acceptance.TemporaryDirectory
+    # A plan can remain reachable through retained runtime diagnostics. The
+    # test owns its scratch directories regardless of when the plan is collected.
+    with ExitStack() as cleanup:
+
+        def owned_directory(*args, **kwargs):
+            directory = temporary_directory(*args, **kwargs)
+            cleanup.enter_context(directory)
+            return directory
+
+        monkeypatch.setattr(runtime_acceptance, "TemporaryDirectory", owned_directory)
+        yield
+
+
 @pytest.mark.parametrize("max_concurrency", [1, 2])
 def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(
-    monkeypatch, max_concurrency
+    monkeypatch, max_concurrency, acceptance_directories
 ) -> None:
     from cayu.evals.internal.runtime_acceptance import build
 

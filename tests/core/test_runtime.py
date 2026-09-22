@@ -39043,9 +39043,19 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("publication_delay", [0, 0.05])
 def test_automatic_compaction_cancellation_does_not_wait_for_stalled_completion_sink(
     monkeypatch: pytest.MonkeyPatch,
+    publication_delay: float,
 ) -> None:
+    class CompletionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        async def complete_model_completion_stage(self, session_id: str, **kwargs):
+            # Exercise publication slower than the old 10 ms setup deadline.
+            await asyncio.sleep(publication_delay)
+            return await super().complete_model_completion_stage(session_id, **kwargs)
+
     class BlockingCompletionSink(InMemoryEventSink):
         def __init__(self) -> None:
             super().__init__()
@@ -39084,12 +39094,13 @@ def test_automatic_compaction_cancellation_does_not_wait_for_stalled_completion_
             )
 
     async def run() -> None:
+        # Shorten only cancellation draining, not ordinary durable publication.
         monkeypatch.setattr(
             model_step_executor_module,
-            "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+            "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
             0.01,
         )
-        store = InMemorySessionStore()
+        store = CompletionStore()
         sink = BlockingCompletionSink()
         app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
         app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
@@ -39119,49 +39130,59 @@ def test_automatic_compaction_cancellation_does_not_wait_for_stalled_completion_
                 ),
             )
         )
-        await asyncio.wait_for(sink.blocked.wait(), timeout=1)
-        durable = await store.load_events("sess_automatic_stalled_completion_sink")
-        completions = [
-            event
-            for event in durable
-            if event.type == EventType.MODEL_COMPLETED
-            and event.payload.get("purpose") == "context_compaction"
-        ]
-        assert len(completions) == 1
-
-        task.cancel("cancel automatic compaction with stalled completion sink")
-        assert task.cancelling() == 1
-        await asyncio.wait_for(sink.cancellation_observed.wait(), timeout=1)
-        done, _pending = await asyncio.wait({task}, timeout=1)
-        # Prove caller cancellation completes before the non-cancellable sink.
-        assert task in done
-        with pytest.raises(
-            asyncio.CancelledError,
-            match="cancel automatic compaction with stalled completion sink",
-        ):
-            await task
-        assert task.cancelled()
-
-        sink.release.set()
-        for _ in range(100):
-            delivered = [
+        try:
+            # Reach the cancellation boundary using the normal publication timeout.
+            # A 10 ms timeout during setup can abort compaction on a busy CI worker.
+            await asyncio.wait_for(sink.blocked.wait(), timeout=10)
+            durable = await store.load_events("sess_automatic_stalled_completion_sink")
+            completions = [
                 event
-                for event in sink.events
+                for event in durable
                 if event.type == EventType.MODEL_COMPLETED
                 and event.payload.get("purpose") == "context_compaction"
             ]
-            if delivered:
-                break
-            await asyncio.sleep(0.01)
-        completion_record = next(
-            record
-            for record in await store.query_events(
-                EventQuery(session_id="sess_automatic_stalled_completion_sink")
+            assert len(completions) == 1
+
+            task.cancel("cancel automatic compaction with stalled completion sink")
+            assert task.cancelling() == 1
+            await asyncio.wait_for(sink.cancellation_observed.wait(), timeout=1)
+            done, _pending = await asyncio.wait({task}, timeout=1)
+            # Prove caller cancellation completes before the non-cancellable sink.
+            assert task in done
+            with pytest.raises(
+                asyncio.CancelledError,
+                match="cancel automatic compaction with stalled completion sink",
+            ):
+                await task
+            assert task.cancelled()
+
+            sink.release.set()
+            for _ in range(100):
+                delivered = [
+                    event
+                    for event in sink.events
+                    if event.type == EventType.MODEL_COMPLETED
+                    and event.payload.get("purpose") == "context_compaction"
+                ]
+                if delivered:
+                    break
+                await asyncio.sleep(0.01)
+            completion_record = next(
+                record
+                for record in await store.query_events(
+                    EventQuery(session_id="sess_automatic_stalled_completion_sink")
+                )
+                if record.event.id == completions[0].id
             )
-            if record.event.id == completions[0].id
-        )
-        assert [event.id for event in delivered] == [public_event_id(completion_record.sequence)]
-        assert sink.completion_delivery_calls == 1
+            assert [event.id for event in delivered] == [
+                public_event_id(completion_record.sequence)
+            ]
+            assert sink.completion_delivery_calls == 1
+        finally:
+            sink.release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
 

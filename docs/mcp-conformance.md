@@ -88,7 +88,8 @@ or use `npm audit fix` to silently replace the referee's dependency baseline.
 evidence are written under `$evidence_dir/run`. An existing output directory is
 rejected to prevent stale checks from satisfying a new run. Each official run
 has a 30-second inner timeout and 45-second outer process-group deadline. SDK
-verification has a 180-second deadline. Failures retain evidence. A missing
+verification has a 180-second deadline. Local runs retain these evidence files;
+CI keeps job logs without uploading a separate evidence artifact. A missing
 required check, any failure/warning/skip, a nonzero exit, or skipped SDK test
 fails the gate. Each client must also emit a fresh run-specific completion
 receipt after session cleanup and event-loop shutdown. This prevents the

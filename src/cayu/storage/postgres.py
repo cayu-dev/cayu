@@ -5731,8 +5731,7 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             ),
         ),
     ),
-    # This pending-action index change is not registered in REVISIONS yet.
-    # Keep it beyond the registered task-group quiescence revision.
+    # Include delegated-action updates in the revision-97 pending-action index.
     97: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_pending_action_lookup",
@@ -6835,6 +6834,7 @@ class _PostgresStoreBase:
                     await self._ensure_concurrent_index(
                         conn,
                         index,
+                        pending_revision=concurrent_revision.revision,
                     )
 
             # Record the revision only after every non-transactional object is
@@ -12867,6 +12867,8 @@ class _PostgresStoreBase:
         self,
         conn: Any,
         index: _ConcurrentIndexMigration,
+        *,
+        pending_revision: int | None = None,
     ) -> None:
         await conn.set_autocommit(True)
         lock_acquired = False
@@ -12886,6 +12888,16 @@ class _PostgresStoreBase:
                     lock_acquired = row is not None and row[0] is True
                 if not lock_acquired:
                     await asyncio.sleep(_SCHEMA_ADVISORY_LOCK_POLL_SECONDS)
+
+            if pending_revision is not None:
+                async with conn.cursor() as cur:
+                    state = await self._read_schema_state(cur)
+                if state.revision >= pending_revision:
+                    # A peer may have finished this revision and replaced the
+                    # index again while we waited. Never apply a stale definition.
+                    # The migration loop re-reads progress and validates the final
+                    # required indexes before admitting the store.
+                    return
 
             while True:
                 async with conn.cursor() as cur:

@@ -9,6 +9,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
+from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -63,6 +64,22 @@ class _TemporarySQLiteSessionStore(SQLiteSessionStore):
     def __init__(self) -> None:
         self._temporary_directory = TemporaryDirectory(prefix="cayu-branch-tests-")
         super().__init__(Path(self._temporary_directory.name) / "sessions.sqlite3")
+
+
+@pytest.fixture(autouse=True)
+def temporary_session_stores(monkeypatch):
+    # Keep directories alive until test teardown and clean them explicitly;
+    # cyclic store references must not emit warnings in a later test's GC.
+    with ExitStack() as cleanup:
+        initialize = _TemporarySQLiteSessionStore.__init__
+
+        def initialize_owned(self):
+            initialize(self)
+            cleanup.callback(self._temporary_directory.cleanup)
+            cleanup.callback(lambda: asyncio.run(self.close()))
+
+        monkeypatch.setattr(_TemporarySQLiteSessionStore, "__init__", initialize_owned)
+        yield
 
 
 def _replace_owned_commit_guard(

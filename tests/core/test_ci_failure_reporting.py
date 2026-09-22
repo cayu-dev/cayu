@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -15,8 +14,7 @@ from tests import conftest as reporting
 
 @pytest.mark.parametrize("phase", ["setup", "call", "teardown"])
 def test_ci_failure_evidence_is_bounded_and_emitted_once(tmp_path, monkeypatch, capsys, phase):
-    target = tmp_path / "reports.jsonl"
-    monkeypatch.setattr(reporting, "_CI_REPORT_PATH", target)
+    monkeypatch.setattr(reporting, "_CI_FAILURE_LOGGING", True)
     report = SimpleNamespace(
         nodeid="test_example.py::test_failed",
         when=phase,
@@ -26,15 +24,12 @@ def test_ci_failure_evidence_is_bounded_and_emitted_once(tmp_path, monkeypatch, 
         longreprtext="x" * 20000,
     )
     reporting.pytest_runtest_logreport(report)
-    record = json.loads(target.read_text())
-    assert record["failure"] == "x" * 16384
-    assert record["failure_truncated"] is True
     assert capsys.readouterr().err == (f"\nCI failure: {report.nodeid} [{phase}]\n{'x' * 16384}\n")
     # Workers/non-CI runs neither emit duplicate diagnostics nor write reports.
-    monkeypatch.setattr(reporting, "_CI_REPORT_PATH", None)
+    monkeypatch.setattr(reporting, "_CI_FAILURE_LOGGING", False)
     reporting.pytest_runtest_logreport(report)
     assert not capsys.readouterr().err
-    assert len(target.read_text().splitlines()) == 1
+    assert not (tmp_path / ".ci-test-reports.jsonl").exists()
 
 
 def test_ci_controller_prints_failure_before_summary_with_xdist(tmp_path):
@@ -62,10 +57,5 @@ def test_ci_controller_prints_failure_before_summary_with_xdist(tmp_path):
     assert result.returncode == 1, result.stdout
     assert result.stdout.count("CI failure: test_sample.py::test_failure [call]") == 1
     assert result.stdout.index("CI failure:") < result.stdout.index("FAILURES")
-    records = [
-        json.loads(line) for line in (tmp_path / ".ci-test-reports.jsonl").read_text().splitlines()
-    ]
-    failures = [record for record in records if record.get("outcome") == "failed"]
-    assert len(failures) == 1
-    assert "ci-immediate-evidence" in failures[0]["failure"]
-    assert any(record.get("outcome") == "passed" for record in records)
+    assert "ci-immediate-evidence" in result.stdout
+    assert not (tmp_path / ".ci-test-reports.jsonl").exists()

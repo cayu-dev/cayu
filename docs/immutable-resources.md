@@ -1,7 +1,6 @@
 # Exact immutable input resources
 
-`LocalArtifactResourceOwner` is the qualified local implementation for issue
-#1800. It acquires an exact, revision-pinned artifact or a bounded
+`LocalArtifactResourceOwner` acquires an exact, revision-pinned artifact or a bounded
 `FolderInputManifest`, records the complete command before reading, and keeps
 the artifact-store pin until an owner-issued receipt is released. A receipt is
 not a capability by itself: readback, transfer, and release revalidate the
@@ -86,7 +85,7 @@ honor this namespace; only resource-owned cleanup removes its retention.
 
 The command must carry an exact `ResourceSelector`, a pinned policy, explicit
 material and byte bounds, and the cleanup owner. `authorize()` also records a
-validated #1758 `PermitCommand` in the owner journal; passing a matching digest
+validated `PermitCommand` in the owner journal; passing a matching digest
 or a caller-shaped receipt without that durable authorization is rejected.
 The concrete mandate receiver compares the complete command and permit against
 its trusted registration, including the participant, lifecycle/admission

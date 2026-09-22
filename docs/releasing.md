@@ -40,3 +40,8 @@ Never reuse a published version, move its tag, or edit its tagged release notes.
 If PyPI succeeds but GitHub release creation fails, rerun only the failed job.
 After release, give the development branch a distinct development version and one
 `## Unreleased` section.
+
+CI retains the shared wheel and source archives for three days so package checks,
+approval, and publication consume the same bytes. Complete approval within that
+window or rebuild and revalidate the release. Routine test and MCP diagnostics
+stay in job logs; CI does not upload separate diagnostic artifacts.

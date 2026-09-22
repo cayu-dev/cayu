@@ -51,11 +51,3 @@ jobs:
         run: >-
           python3 scripts/run_ci.py --lane specialist
           --specialist-lane "qualification-${{ matrix.shard }}"
-      - name: Upload completed qualification phases and failure evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-durations-qualification-${{ matrix.shard }}
-          path: .ci-test-reports.jsonl
-          include-hidden-files: true
-          if-no-files-found: error

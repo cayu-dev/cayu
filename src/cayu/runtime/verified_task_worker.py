@@ -363,7 +363,7 @@ class VerifiedTaskWorker:
         self._recovery_cursor: str | None = None
         from cayu.tasks._group_maintenance import TaskGroupMaintenance
 
-        self._group_maintenance = TaskGroupMaintenance()
+        self._group_maintenance = TaskGroupMaintenance.for_store(self.store)
 
     def _validate(self, factory: Callable[[], _T], name: str) -> _T:
         captured = capture_sensitive_result_validation(

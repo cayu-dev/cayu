@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
+    from cayu.tasks._group_maintenance import TaskGroupMaintenance
     from cayu.tasks.graphs import (
         TaskGraphCreate,
         TaskGraphCreationReceipt,
@@ -3476,6 +3477,8 @@ class TaskStore(ABC):
     ownership mutation; worker-provided timestamps or cutoffs are not lease
     authority.
     """
+
+    _task_group_maintenance: TaskGroupMaintenance
 
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_graphs: ClassVar[bool] = False

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
@@ -13,6 +14,8 @@ from cayu.tasks.graphs import graph_identifier
 from cayu.tasks.groups import TaskGroupUnavailable
 from cayu.vaults.redaction import SecretRedactor
 
+_REGISTRY_LOCK = Lock()
+
 
 @dataclass
 class TaskGroupMaintenance:
@@ -20,8 +23,27 @@ class TaskGroupMaintenance:
 
     after_group_id: str | None = None
     next_scan_at: float = 0.0
+    _lock: Lock = field(default_factory=Lock, repr=False)
+    _running: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def for_store(cls, store: TaskStore) -> TaskGroupMaintenance:
+        """Share one bounded scan cursor across a store's worker entrances."""
+        with _REGISTRY_LOCK:
+            maintenance = getattr(store, "_task_group_maintenance", None)
+            if maintenance is None:
+                maintenance = cls()
+                store._task_group_maintenance = maintenance
+            return maintenance
+
+    def _due(self, now: float) -> bool:
+        with self._lock:
+            return not self._running and now >= self.next_scan_at
 
     async def step(self, store: TaskStore, redactor: SecretRedactor, *, now: float) -> None:
+        # Avoid allocating a store-operation task for every idle worker turn.
+        if not self._due(now):
+            return
         outcome = await capture_task_store_operation(
             lambda: self.advance(store, now=now),
             operation_name="Task group maintenance",
@@ -36,7 +58,18 @@ class TaskGroupMaintenance:
         Dispatchers already own their TaskStore boundary and expose a separate
         diagnostic interface, not the application's private secret registry.
         """
-        if not store.supports_task_group_quiescence or now < self.next_scan_at:
+        with self._lock:
+            if self._running or now < self.next_scan_at:
+                return
+            self._running = True
+        try:
+            await self._advance(store, now=now)
+        finally:
+            with self._lock:
+                self._running = False
+
+    async def _advance(self, store: TaskStore, *, now: float) -> None:
+        if not store.supports_task_group_quiescence:
             return
         identities = await store.list_task_group_reconciliation_candidates(
             after_group_id=self.after_group_id,

@@ -2714,7 +2714,12 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
     asyncio.run(runner())
 
 
-def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn: str) -> None:
+@pytest.mark.parametrize("delay_historical_index", [False, True])
+def test_revision_fifteen_requires_session_sequence_index_migration(
+    postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    delay_historical_index: bool,
+) -> None:
     async def runner() -> None:
         import psycopg
 
@@ -2747,14 +2752,47 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         first_migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
         second_migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        paused = asyncio.Event()
+        resume = asyncio.Event()
+        ensure_index = first_migrator._ensure_concurrent_index
+
+        async def delayed_index(conn, index, **kwargs):
+            if index is next(
+                candidate
+                for candidate in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+                if candidate.index_name == "idx_cayu_events_pending_action_lookup"
+            ):
+                paused.set()
+                await resume.wait()
+            await ensure_index(conn, index, **kwargs)
+
+        if delay_historical_index:
+            monkeypatch.setattr(first_migrator, "_ensure_concurrent_index", delayed_index)
+        first = asyncio.create_task(first_migrator.ensure_schema())
         try:
-            await asyncio.gather(
-                first_migrator.ensure_schema(),
-                second_migrator.ensure_schema(),
-            )
+            async with asyncio.timeout(30):
+                if delay_historical_index:
+                    await paused.wait()
+                    # Finish the replacement index before the first migrator
+                    # gets its lock for the historical revision-17 definition.
+                    await second_migrator.ensure_schema()
+                    resume.set()
+                    await first
+                else:
+                    await asyncio.gather(first, second_migrator.ensure_schema())
         finally:
+            resume.set()
+            if not first.done():
+                first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
             await first_migrator.close()
             await second_migrator.close()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            await validator.ensure_schema()
+        finally:
+            await validator.close()
 
         async with (
             await psycopg.AsyncConnection.connect(postgres_dsn) as conn,

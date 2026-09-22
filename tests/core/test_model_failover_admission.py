@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import warnings
 
 import pytest
@@ -475,6 +476,9 @@ def test_invalid_mode_diagnostics_do_not_format_adapter_values(
         def __repr__(self):
             raise AssertionError(canary)
 
+    # Collect earlier tests' cyclic resources before observing this memory-only
+    # scenario. Their SQLite cleanup warnings are not adapter diagnostics.
+    gc.collect()
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
         test_public_run_rejects_invalid_candidate_mode_before_mutation(

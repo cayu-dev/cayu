@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v0.7.0
+
+- Add durable task dependency graphs and task groups with explicit completion
+  policies and retained execution obligations.
+- Add collaboration participant identities, namespaces, lifecycle controls, and
+  durable request acceptance, admission, and observation foundations.
+- Add authorized durable session exports with exact content-release controls.
+- Support governed credentialless browser research, revision-bound rendered-text
+  readback, and source-bound image region inspection.
+- Add experimental TypeSafe provider support and include the Codex client version
+  in subscription URLs. Preserve safe, actionable provider and command diagnostics.
+- Keep native eval workers busy with durable case claims, isolate process-case
+  cancellation, and retain safe workflow failure diagnostics and versioned history
+  anchors. Reduce repeated checkpoint validation and support explicit best-effort
+  retained compaction targets.
+- Remove routine CI diagnostic uploads, retain required release archives for
+  three days, and share task-group maintenance scans across workers on each store.
+
+### Upgrade from v0.6.1
+
+This release requires storage revision **96** (previously **90**) and server
+contract **46** (previously **44**). Manifest/generator schema **17** is unchanged.
+Inspect existing stores with `cayu storage status` and follow the storage migration
+guidance before upgrading. Upgrade all writers together, refresh generated clients,
+and validate the complete application before adoption.
+
 ## v0.6.1
 
 - OpenAI Responses HTTP streams drain trailing data for at most a 50 ms grace
