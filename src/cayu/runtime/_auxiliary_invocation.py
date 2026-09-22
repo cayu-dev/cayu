@@ -15,6 +15,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
+from cayu.budgets.binding import BudgetBinding, copy_budget_binding
 from cayu.providers import ModelRequest
 from cayu.providers.base import _copy_auxiliary_request
 from cayu.providers.response import ModelResponse
@@ -205,6 +206,7 @@ class AuxiliaryInvocationPolicy:
     _limits: RunLimits
     _retry_policy: RetryPolicy
     _accounting: RunLimitAccountingContext | None
+    _budget_binding: BudgetBinding | None
 
     def __init__(
         self,
@@ -212,12 +214,18 @@ class AuxiliaryInvocationPolicy:
         limits: RunLimits,
         retry_policy: RetryPolicy,
         accounting: RunLimitAccountingContext | None = None,
+        budget_binding: BudgetBinding | None = None,
     ) -> None:
         if type(limits) is not RunLimits or type(retry_policy) is not RetryPolicy:
             raise TypeError("Auxiliary invocation requires resolved limits and retry policy.")
         object.__setattr__(self, "_limits", copy_run_limits(limits))
         object.__setattr__(self, "_retry_policy", copy_retry_policy(retry_policy))
         object.__setattr__(self, "_accounting", _copy_accounting(accounting))
+        object.__setattr__(
+            self,
+            "_budget_binding",
+            None if budget_binding is None else copy_budget_binding(budget_binding),
+        )
 
     @property
     def limits(self) -> RunLimits:
@@ -230,6 +238,10 @@ class AuxiliaryInvocationPolicy:
     @property
     def accounting(self) -> RunLimitAccountingContext | None:
         return _copy_accounting(self._accounting)
+
+    @property
+    def budget_binding(self) -> BudgetBinding | None:
+        return None if self._budget_binding is None else copy_budget_binding(self._budget_binding)
 
 
 def _copy_accounting(value: RunLimitAccountingContext | None) -> RunLimitAccountingContext | None:

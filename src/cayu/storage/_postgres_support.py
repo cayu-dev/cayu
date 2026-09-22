@@ -105,6 +105,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_budget_bindings (
+        binding_id TEXT PRIMARY KEY,
+        authority_digest TEXT NOT NULL,
+        registered_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_budget_binding_consumptions (
+        binding_id TEXT NOT NULL,
+        consumption_id TEXT NOT NULL,
+        consumed_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (binding_id, consumption_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
         session_id TEXT NOT NULL,
         event_id TEXT NOT NULL,

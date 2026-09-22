@@ -323,6 +323,7 @@ from cayu.runtime._run_limit_accounting import (
     has_run_limit_accounting_authority,
 )
 from cayu.runtime._run_limits import (
+    _TRUSTED_BINDING_PROVENANCE,
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
     BudgetDispatchReservationFailed,
     BudgetedOperationFailed,
@@ -5878,7 +5879,7 @@ class ModelStepExecutor:
         record_model_completion: Callable[[Event], Event],
         prepare_provider_dispatch: Callable[
             [ModelAttemptIdentity],
-            Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]],
+            Awaitable[tuple[list[Event], BudgetReservationResult | None, BaseException | None]],
         ],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         validate_live_model_semantics: Callable[[], None],
@@ -6129,6 +6130,8 @@ class ModelStepExecutor:
             for reservation_event in reservation_events:
                 yield reservation_event, None
             if preparation_error is not None:
+                if not isinstance(preparation_error, Exception):
+                    raise preparation_error
                 if prior_retry_failure is None:
                     raise preparation_error
                 authoritative_failure = prior_retry_failure.cause
@@ -10362,6 +10365,14 @@ class ModelStepRun:
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
         self._validate_live_model_semantics()
+        resolved_budget_binding = await controller._binding_for_dispatch(
+            request={
+                "session_id": self._session.id,
+                "agent_name": self._registered_agent.spec.name,
+                "kind": "model",
+            },
+            binding=None,
+        )
         reservation_setup = await controller.reserve_for_model_step(
             session=self._session,
             agent_name=self._registered_agent.spec.name,
@@ -10376,6 +10387,8 @@ class ModelStepRun:
                 None if self._execution_profile is None else self._execution_profile.fingerprint
             ),
             reservation_identity_guard=self._reservation_identity_guard,
+            binding=resolved_budget_binding,
+            _binding_provenance=_TRUSTED_BINDING_PROVENANCE,
         )
         budget_reservations = list(reservation_setup.reservations)
         try:
@@ -10465,7 +10478,7 @@ class ModelStepRun:
         ) -> tuple[
             list[Event],
             BudgetReservationResult | None,
-            Exception | None,
+            BaseException | None,
         ]:
             if lifecycle.pending_reservations is not None:
                 if lifecycle.pending_model_attempt_identity != model_attempt_identity:
@@ -10491,6 +10504,8 @@ class ModelStepRun:
                 ),
                 existing_reservation_ids=lifecycle.observed_reservation_ids,
                 reservation_identity_guard=self._reservation_identity_guard,
+                binding=resolved_budget_binding,
+                _binding_provenance=_TRUSTED_BINDING_PROVENANCE,
             )
             if retry_setup.error is not None:
                 return settlement_events + list(retry_setup.events), None, retry_setup.error
@@ -11083,7 +11098,7 @@ class ModelStepRun:
         settle_provider_dispatch: Callable[[], Awaitable[tuple[list[Event], Exception | None]]],
         prepare_provider_dispatch: Callable[
             [ModelAttemptIdentity],
-            Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]],
+            Awaitable[tuple[list[Event], BudgetReservationResult | None, BaseException | None]],
         ],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,

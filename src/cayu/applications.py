@@ -69,6 +69,7 @@ from cayu.budgets.base import (
     SessionBudgetStore,
     copy_budget_policy,
 )
+from cayu.budgets.binding import BudgetBinding, BudgetBindingReceiver, copy_budget_binding
 from cayu.budgets.pricing import (
     CausalBudgetCostSummary,
     PriceBook,
@@ -1017,6 +1018,8 @@ class CayuApp:
         budget_policy: BudgetPolicy | None = None,
         budget_store: BudgetStore | None = None,
         budget_ledger: BudgetLedger | None = None,
+        budget_binding_receiver: BudgetBindingReceiver | None = None,
+        enable_common_root_budget_binding: bool = False,
         event_watcher_store: EventWatcherStore | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -1089,6 +1092,18 @@ class CayuApp:
             raise TypeError("budget_store must be a BudgetStore.")
         if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
             raise TypeError("budget_ledger must be a BudgetLedger.")
+        if (
+            budget_binding_receiver is not None
+            and not isinstance(budget_binding_receiver, BudgetBindingReceiver)
+            and not callable(getattr(budget_binding_receiver, "register", None))
+        ):
+            raise TypeError("budget_binding_receiver must implement BudgetBindingReceiver.")
+        if type(enable_common_root_budget_binding) is not bool:
+            raise TypeError("enable_common_root_budget_binding must be bool.")
+        if enable_common_root_budget_binding and budget_binding_receiver is None:
+            raise ValueError(
+                "A trusted budget binding receiver is required when common-root binding is enabled."
+            )
         if event_watcher_store is not None and not isinstance(
             event_watcher_store,
             EventWatcherStore,
@@ -1267,6 +1282,8 @@ class CayuApp:
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
         self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
+        self.budget_binding_receiver = budget_binding_receiver
+        self.enable_common_root_budget_binding = enable_common_root_budget_binding
         self._event_watcher_supervisor = EventWatcherSupervisor()
         self.event_watcher_store = (
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
@@ -1332,6 +1349,8 @@ class CayuApp:
             budget_ledger=self.budget_ledger,
             event_writer=self._event_writer,
             clock=self._clock,
+            budget_binding_receiver=self.budget_binding_receiver,
+            common_root_budget_binding_enabled=self.enable_common_root_budget_binding,
         )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._agent_thinking_sources: dict[str, CayuConfigSource] = {}
@@ -1401,6 +1420,7 @@ class CayuApp:
                 if self._browser_control_runtime is not None
                 else None
             ),
+            strict_common_budget_admission=self.enable_common_root_budget_binding,
         )
         self._recovery_coordinator = RecoveryCoordinator(
             require_participant_execution=self._require_participant_execution,
@@ -2716,6 +2736,26 @@ class CayuApp:
         """Return a defensive copy of the app-owned budget policy."""
 
         return copy_budget_policy(self._budget_policy)
+
+    async def resolve_budget_binding(self, *, request: object) -> BudgetBinding:
+        """Resolve a trusted common-root binding for a bound operation.
+
+        Public request values are never treated as authority. Applications
+        must register a receiver that resolves and authenticates the binding.
+        """
+
+        receiver = self.budget_binding_receiver
+        if receiver is None:
+            raise RuntimeError("No trusted common-root budget binding receiver is configured.")
+        resolver = getattr(receiver, "register", None) or getattr(
+            receiver, "resolve_budget_binding", None
+        )
+        if resolver is None:
+            raise RuntimeError("No trusted common-root budget binding receiver is configured.")
+        binding = await resolver(request=request)
+        if type(binding) is not BudgetBinding:
+            raise TypeError("Budget binding receivers must return BudgetBinding instances.")
+        return copy_budget_binding(binding)
 
     @budget_policy.setter
     def budget_policy(self, value: BudgetPolicy | None) -> None:

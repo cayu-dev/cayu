@@ -18,6 +18,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Console](console.md)
 - [Control plane](control-plane.md)
 - [Cost optimization](cost-optimization.md)
+- [Common-root budget bindings](common-root-budgets.md)
 - [Docker coding toolchains](docker-coding-toolchains.md)
 - [Environment factories](environment-factories.md)
 - Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)

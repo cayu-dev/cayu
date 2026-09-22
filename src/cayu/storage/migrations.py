@@ -477,6 +477,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Ownership transitions require durable lifecycle evidence independent of
     # the mutable selection receipt.
     Revision(revision=99, kind=RevisionKind.BREAKING, compatible_from=99),
+    # Common-root budget bindings are durably registered before admission.
+    Revision(revision=100, kind=RevisionKind.ADDITIVE, compatible_from=99),
+    Revision(revision=101, kind=RevisionKind.ADDITIVE, compatible_from=99),
 )
 
 #: The revision an empty database is initialized to.

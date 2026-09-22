@@ -16,8 +16,11 @@ from cayu._validation import (
 from cayu._validation import (
     require_nonblank,
 )
+from cayu.budgets._batch import BudgetBatchResult, batch_failure, prepare_batch, replay_batch
 from cayu.budgets.base import (
     DEFAULT_RESERVATION_TTL_SECONDS,
+    BudgetBindingAllowanceExhausted,
+    BudgetBindingRegistrationConflict,
     BudgetLedger,
     BudgetLimit,
     BudgetReconciliation,
@@ -105,6 +108,138 @@ class SQLiteBudgetLedger(BudgetLedger):
         if self.path == Path(":memory:"):
             return ()
         return (self.path.resolve(),)
+
+    async def register_budget_binding(
+        self,
+        *,
+        binding_id: str,
+        authority_digest: str,
+        allowance: int,
+    ) -> None:
+        binding_id = require_clean_nonblank(binding_id, "binding_id")
+        authority_digest = require_clean_nonblank(authority_digest, "authority_digest")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO cayu_budget_bindings
+                        (binding_id, authority_digest, allowance, registered_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (binding_id, authority_digest, allowance, self._clock().isoformat()),
+                )
+                row = self._connection.execute(
+                    "SELECT authority_digest, allowance "
+                    "FROM cayu_budget_bindings WHERE binding_id = ?",
+                    (binding_id,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("Budget binding registration disappeared during conflict.")
+                if (row[0], row[1]) != (authority_digest, allowance):
+                    raise BudgetBindingRegistrationConflict(
+                        "Budget binding id is already registered with different authority."
+                    )
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def reserve_batch(
+        self,
+        *,
+        members,
+        binding_id=None,
+        binding_authority_digest=None,
+        binding_allowance=None,
+        binding_consumption_id=None,
+    ) -> BudgetBatchResult:
+        """Reserve all ceilings in one SQLite write transaction."""
+        members = prepare_batch(members)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = tuple(
+                    self._load_record_unlocked(m.record.reservation_id)
+                    if self._record_exists_unlocked(m.record.reservation_id)
+                    else None
+                    for m in members
+                )
+                replay = replay_batch(members, existing)
+                if replay is not None:
+                    self._connection.commit()
+                    return replay
+                now = self._clock()
+                projected_usage: list[Decimal] = []
+                for member in members:
+                    self._reap_expired_unlocked(now, limit=member.limit)
+                    used = self._used_amount_unlocked(member.limit, now=now)
+                    failure = batch_failure(
+                        member,
+                        used,
+                    )
+                    if failure is not None:
+                        self._connection.commit()
+                        return BudgetBatchResult((), failure=failure)
+                    projected_usage.append(used + member.record.reserved_amount)
+                if binding_id is not None:
+                    if not all(
+                        v is not None
+                        for v in (
+                            binding_authority_digest,
+                            binding_allowance,
+                            binding_consumption_id,
+                        )
+                    ):
+                        raise ValueError("Complete binding consumption identity is required.")
+                    binding = self._connection.execute(
+                        "SELECT authority_digest, allowance "
+                        "FROM cayu_budget_bindings WHERE binding_id = ?",
+                        (binding_id,),
+                    ).fetchone()
+                    if binding is None or (binding[0], binding[1]) != (
+                        binding_authority_digest,
+                        binding_allowance,
+                    ):
+                        raise BudgetBindingRegistrationConflict(
+                            "Budget binding is not registered exactly."
+                        )
+                    inserted = self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO cayu_budget_binding_consumptions
+                            (binding_id, consumption_id, consumed_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (binding_id, binding_consumption_id, self._clock().isoformat()),
+                    ).rowcount
+                    if inserted:
+                        count = self._connection.execute(
+                            "SELECT COUNT(*) FROM cayu_budget_binding_consumptions WHERE binding_id = ?",
+                            (binding_id,),
+                        ).fetchone()[0]
+                        if count > binding_allowance:
+                            raise BudgetBindingAllowanceExhausted(
+                                "Budget binding allowance is exhausted."
+                            )
+                records = tuple(
+                    m.record.model_copy(update={"created_at": now, "updated_at": now}, deep=True)
+                    for m in members
+                )
+                for record in records:
+                    self._insert_record_unlocked(record)
+                self._connection.commit()
+                return BudgetBatchResult(records, tuple(projected_usage))
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    def _record_exists_unlocked(self, reservation_id: str) -> bool:
+        return (
+            self._connection.execute(
+                "SELECT 1 FROM cayu_budget_reservations WHERE reservation_id = ?", (reservation_id,)
+            ).fetchone()
+            is not None
+        )
 
     async def claim_reservation_identity(
         self,

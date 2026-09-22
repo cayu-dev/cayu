@@ -1128,8 +1128,8 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
             await creator.close()
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             await conn.execute(
-                "DELETE FROM cayu_schema_migrations WHERE revision IN (%s, %s)",
-                (latest_breaking, schema.LATEST_REVISION),
+                "DELETE FROM cayu_schema_migrations WHERE revision >= %s",
+                (latest_breaking,),
             )
             await conn.commit()
 

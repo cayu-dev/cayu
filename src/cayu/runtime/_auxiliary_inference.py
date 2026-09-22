@@ -24,6 +24,7 @@ from cayu.budgets.base import (
     budget_reservation_authority_sha256,
 )
 from cayu.budgets.billing import BillingIdentity, copy_billing_identity, resolved_billing_identity
+from cayu.budgets.binding import BudgetBinding, copy_budget_binding
 from cayu.budgets.usage import normalize_usage_metrics, usage_metrics_payload
 from cayu.deadlines import ExecutionDeadline, execution_deadline_scope, expired_execution_deadline
 from cayu.events import (
@@ -73,6 +74,7 @@ from cayu.runtime._run_limit_accounting import (
     restore_run_limit_accounting_context,
 )
 from cayu.runtime._run_limits import (
+    _TRUSTED_BINDING_PROVENANCE,
     BudgetStepReservation,
     LimitEvaluation,
     OperationReservationSetup,
@@ -152,6 +154,7 @@ class AuxiliaryInferenceOwner:
         tool_call_id: str,
         idempotency_key: str,
         budget_limits: tuple[BudgetLimit, ...],
+        budget_binding: BudgetBinding | None = None,
         redactor: Callable[[], SecretRedactor],
         refresh: Callable[[], Awaitable[None]],
         observe_event: Callable[[Event], None],
@@ -160,6 +163,7 @@ class AuxiliaryInferenceOwner:
 
         invocation._validate()
         session = session.model_copy(deep=True)
+        budget_binding = None if budget_binding is None else copy_budget_binding(budget_binding)
         parent = copy_tool_round_identity(parent)
 
         def validate_provider() -> None:
@@ -199,6 +203,14 @@ class AuxiliaryInferenceOwner:
             )
             # Scheduling only: the store remains the atomic dispatch authority.
             lock = self._session_locks.setdefault(session.id, asyncio.Lock())
+            effective_budget_binding = await self._run_limit_controller._binding_for_dispatch(
+                request={
+                    "session_id": session.id,
+                    "agent_name": invocation.binding.agent_name,
+                    "kind": "auxiliary",
+                },
+                binding=budget_binding,
+            )
 
             async def run_attempt(attempt: int) -> AuxiliaryAttemptResult:
                 await refresh_execution()
@@ -230,6 +242,7 @@ class AuxiliaryInferenceOwner:
                     invocation=invocation,
                     policy=policy,
                     budget_limits=budget_limits,
+                    budget_binding=effective_budget_binding,
                     request_limits=limits,
                 )
                 for event in evaluation.events:
@@ -254,6 +267,7 @@ class AuxiliaryInferenceOwner:
                         attempt=attempt,
                         billing_identity=billing_identity,
                         reservations=reservations,
+                        budget_binding=effective_budget_binding,
                     )
 
                 preliminary = make_stage()
@@ -263,6 +277,7 @@ class AuxiliaryInferenceOwner:
                     budget_limits=budget_limits,
                     request_limits=limits,
                     billing_identity=billing_identity,
+                    budget_binding=effective_budget_binding,
                     identity=ModelAttemptIdentity(
                         model_step_id=preliminary.intent["model_step_id"],
                         model_attempt_id=preliminary.intent["model_attempt_id"],
@@ -422,6 +437,7 @@ class AuxiliaryInferenceOwner:
         policy: AuxiliaryInvocationPolicy,
         budget_limits: tuple[BudgetLimit, ...],
         request_limits: InferenceLimits,
+        budget_binding: BudgetBinding | None = None,
     ) -> LimitEvaluation:
         """Use the normal bounded accounting owner, including original run scope.
 
@@ -436,6 +452,7 @@ class AuxiliaryInferenceOwner:
             raise TypeError("Auxiliary admission requires frozen runtime invocation inputs.")
         invocation._validate()
         binding = invocation.binding
+        common_binding = None if budget_binding is None else copy_budget_binding(budget_binding)
         if (
             session.id != binding.session_id
             or session.run_epoch != binding.run_epoch
@@ -454,6 +471,18 @@ class AuxiliaryInferenceOwner:
         elif has_run_limit_accounting_authority(limits, budget_limits):
             raise ValueError("Auxiliary admission lost the original run accounting authority.")
         provider = invocation.registered_provider.provider
+        if common_binding is not None and (
+            (
+                common_binding.provider_name is not None
+                and common_binding.provider_name != binding.provider_name
+            )
+            or (common_binding.model is not None and common_binding.model != binding.model)
+            or (
+                common_binding.environment_name is not None
+                and common_binding.environment_name != binding.environment_name
+            )
+        ):
+            raise ValueError("Budget binding conflicts with the auxiliary invocation.")
         return await self._run_limit_controller.evaluate_request_limits(
             session=session,
             agent_name=binding.agent_name,
@@ -478,6 +507,7 @@ class AuxiliaryInferenceOwner:
         request_limits: InferenceLimits,
         identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None,
+        budget_binding: BudgetBinding | None = None,
     ) -> OperationReservationSetup:
         """Reserve through the existing ledger, never silently skip a hard cap.
 
@@ -529,8 +559,10 @@ class AuxiliaryInferenceOwner:
             execution_profile_fingerprint=invocation.profile.fingerprint,
             settlement_event_payload={"interaction_id": binding.interaction_id},
             billing_identity=billing_identity,
+            binding=budget_binding,
             rejection_release_reason="Auxiliary inference admission was rejected before dispatch.",
             accepted_record_error="Auxiliary inference reservation lost its durable identity.",
+            _binding_provenance=_TRUSTED_BINDING_PROVENANCE,
         )
 
     def stage_request(
@@ -549,6 +581,7 @@ class AuxiliaryInferenceOwner:
         attempt: int,
         reservations: tuple[BudgetStepReservation, ...] = (),
         billing_identity: BillingIdentity | None = None,
+        budget_binding: BudgetBinding | None = None,
     ) -> ModelCompletionStageRequest:
         """Build the complete private preparation tuple, without persisting content.
 
@@ -654,6 +687,9 @@ class AuxiliaryInferenceOwner:
             if accounting is None
             else accounting.model_dump(mode="json"),
         }
+        if budget_binding is not None:
+            intent["budget_binding_id"] = budget_binding.binding_id
+            intent["budget_binding_authority_sha256"] = budget_binding.authority_digest
         return ModelCompletionStageRequest(
             stage_id=f"auxiliary:{attempt_digest}",
             logical_step_id=f"auxiliary:{attempt_digest}",

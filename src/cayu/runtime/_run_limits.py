@@ -49,6 +49,7 @@ from cayu.budgets.base import (
     _expired_reservation_reason,
     _is_expired_reservation_reason,
     _operation_budget_limits_for_session,
+    _reservation_result,
     budget_actual_cost_for_event,
     budget_check_from_events,
     budget_check_from_totals,
@@ -77,6 +78,7 @@ from cayu.budgets.billing import (
     copy_billing_identity,
     resolved_billing_identity,
 )
+from cayu.budgets.binding import BudgetBinding, BudgetBindingReceiver, copy_budget_binding
 from cayu.budgets.pricing import (
     SessionCostSummary,
     SessionCostTotals,
@@ -131,6 +133,8 @@ from cayu.sessions.base import (
     SessionStore,
 )
 from cayu.tools.inference import InferenceLimits
+
+_TRUSTED_BINDING_PROVENANCE = object()
 
 
 def _event_with_budget_authority(
@@ -320,6 +324,7 @@ def _execution_identity_payload(
 @dataclass(frozen=True)
 class _PublishableBudgetReservationAuthority:
     reservation_id: str
+    record: BudgetReservationRecord
     settlement_fallback: BudgetSettlementFallback
     billing_identity: BillingIdentity | None
 
@@ -339,6 +344,7 @@ def _new_publishable_budget_reservation_authority(
     reserved_amount: Decimal,
     fallback_settled_at: datetime,
     reservation_ttl_seconds: int | None,
+    binding: BudgetBinding | None = None,
 ) -> _PublishableBudgetReservationAuthority:
     """Allocate authority only after its terminal fallback is publishable."""
 
@@ -422,6 +428,7 @@ def _new_publishable_budget_reservation_authority(
         raise RuntimeError("Budget publication changed fallback billing authority.")
     return _PublishableBudgetReservationAuthority(
         reservation_id=reservation_id,
+        record=record,
         settlement_fallback=BudgetSettlementFallback(
             settled_at=conservative.settled_at,
             reconciliation_reason=conservative.reason or raw_fallback.reconciliation_reason,
@@ -1204,7 +1211,7 @@ class BudgetReservationSetup:
     reservations: tuple[BudgetStepReservation, ...]
     failure: BudgetReservationResult | None
     events: tuple[Event, ...]
-    error: Exception | None
+    error: BaseException | None
 
 
 @dataclass(frozen=True)
@@ -1393,18 +1400,71 @@ class RunLimitController:
         budget_ledger: BudgetLedger,
         event_writer: RuntimeEventWriter,
         clock: Callable[[], datetime],
+        budget_binding_receiver: BudgetBindingReceiver | None = None,
+        common_root_budget_binding_enabled: bool = False,
     ) -> None:
         self._session_store = session_store
         self._budget_store = budget_store
         self._budget_ledger = budget_ledger
         self._event_writer = event_writer
         self._clock = clock
+        self._budget_binding_receiver = budget_binding_receiver
+        self._common_root_budget_binding_enabled = common_root_budget_binding_enabled
         self._reservation_identity_guard = BudgetReservationIdentityGuard(
             session_store,
             budget_ledger,
         )
         self._global_settlement_recovery_lock = asyncio.Lock()
         self._global_settlement_recovery_after: BudgetSettlementCursor | None = None
+
+    async def resolve_budget_binding(self, *, request: object) -> BudgetBinding:
+        """Resolve a trusted binding or fail closed for bound dispatch."""
+
+        receiver = self._budget_binding_receiver
+        resolver = None if receiver is None else getattr(receiver, "register", None)
+        if resolver is None and receiver is not None:
+            resolver = getattr(receiver, "resolve_budget_binding", None)
+        if resolver is None:
+            raise RuntimeError("No trusted common-root budget binding receiver is configured.")
+        binding = await resolver(request=request)
+        if type(binding) is not BudgetBinding:
+            raise TypeError("Budget binding receivers must return BudgetBinding instances.")
+        binding = copy_budget_binding(binding)
+        await self._budget_ledger.register_budget_binding(
+            binding_id=binding.binding_id,
+            authority_digest=binding.authority_digest,
+            allowance=binding.allowance,
+        )
+        return binding
+
+    async def _binding_for_dispatch(
+        self,
+        *,
+        request: object,
+        binding: BudgetBinding | None,
+        trusted_binding: bool = False,
+    ) -> BudgetBinding | None:
+        """Resolve configured authority; never silently downgrade a bound app."""
+
+        if binding is not None:
+            if trusted_binding:
+                binding = copy_budget_binding(binding)
+                await self._budget_ledger.register_budget_binding(
+                    binding_id=binding.binding_id,
+                    authority_digest=binding.authority_digest,
+                    allowance=binding.allowance,
+                )
+                return binding
+            resolved = await self.resolve_budget_binding(request=request)
+            supplied = copy_budget_binding(binding)
+            if not supplied.exact_match(resolved):
+                raise ValueError(
+                    "Supplied budget binding conflicts with trusted receiver authority."
+                )
+            return resolved
+        if not self._common_root_budget_binding_enabled:
+            return None
+        return await self.resolve_budget_binding(request=request)
 
     def usage_tracker(self, session_id: str) -> SessionUsageTracker:
         return SessionUsageTracker(self._session_store, session_id=session_id)
@@ -2432,8 +2492,24 @@ class RunLimitController:
         existing_reservation_ids: Collection[str] = (),
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
         model: str | None = None,
+        binding: BudgetBinding | None = None,
+        _binding_provenance: object | None = None,
     ) -> BudgetReservationSetup:
         effective_model = require_clean_nonblank(session.model if model is None else model, "model")
+        binding = await self._binding_for_dispatch(
+            request={"session_id": session.id, "agent_name": agent_name, "kind": "model"},
+            binding=binding,
+            trusted_binding=_binding_provenance is _TRUSTED_BINDING_PROVENANCE,
+        )
+        if binding is not None and (
+            (binding.provider_name is not None and binding.provider_name != provider_name)
+            or (binding.model is not None and binding.model != effective_model)
+            or (
+                binding.environment_name is not None
+                and binding.environment_name != environment_name
+            )
+        ):
+            raise ValueError("Budget binding conflicts with the model dispatch identity.")
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         limits = self.provider_reservation_limits(
             session=session,
@@ -2441,8 +2517,103 @@ class RunLimitController:
             budget_policy=budget_policy,
             request_budget_limits=request_budget_limits,
         )
+        base_limits = limits
+        if binding is not None:
+            limits = (
+                *limits,
+                *(
+                    limit
+                    for limit in _effective_budget_limits(
+                        binding.limits,
+                        identity_namespace="model_binding",
+                    )
+                    if limit.reservation is not None
+                ),
+            )
         if not limits:
             return BudgetReservationSetup((), None, (), None)
+        if binding is not None:
+            operation = await self.reserve_operation_budgets(
+                budget_limits=tuple(base_limits),
+                session_id=session.id,
+                agent_name=agent_name,
+                provider_name=provider_name,
+                model=effective_model,
+                model_attempt_identity=model_attempt_identity,
+                environment_name=environment_name,
+                execution_profile_fingerprint=execution_profile_fingerprint,
+                rejection_release_reason="model reservation setup failed",
+                accepted_record_error="Atomic model reservation did not produce a record.",
+                billing_identity=billing_identity,
+                reservation_identity_guard=reservation_identity_guard,
+                binding=binding,
+                _binding_provenance=_TRUSTED_BINDING_PROVENANCE,
+            )
+            try:
+                emitted_events = tuple(
+                    [await self._event_writer.emit(event) for event in operation.events]
+                )
+                if operation.error is None:
+                    await self.recover_pending_budget_settlements()
+            except BaseException as publication_error:
+                cleanup_errors: list[BaseException] = []
+                remaining = list(operation.reservations)
+                try:
+                    async for _ in self.release_operation_reservations(
+                        remaining,
+                        reason="model reservation publication failed",
+                    ):
+                        pass
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if cleanup_errors:
+                    if isinstance(publication_error, asyncio.CancelledError):
+                        publication_error.add_note(
+                            f"model reservation cleanup failed: {cleanup_errors[0]!r}"
+                        )
+                        raise publication_error from cleanup_errors[0]
+                    raise BaseExceptionGroup(
+                        "Model reservation publication and cleanup failed",
+                        [publication_error, *cleanup_errors],
+                    ) from None
+                raise
+            if operation.error is not None and operation.reservations:
+                remaining = list(operation.reservations)
+                try:
+                    async for _ in self.release_operation_reservations(
+                        remaining,
+                        reason="model reservation setup failed",
+                    ):
+                        pass
+                except BaseException as cleanup_error:
+                    if isinstance(operation.error, asyncio.CancelledError):
+                        operation.error.add_note(f"reservation cleanup failed: {cleanup_error!r}")
+                    else:
+                        operation = OperationReservationSetup(
+                            reservations=tuple(remaining),
+                            results=operation.results,
+                            events=operation.events,
+                            releases=operation.releases,
+                            failure=operation.failure,
+                            error=BaseExceptionGroup(
+                                "Model reservation setup and cleanup failed",
+                                [operation.error, cleanup_error],
+                            ),
+                        )
+                operation = OperationReservationSetup(
+                    reservations=tuple(remaining),
+                    results=operation.results,
+                    events=operation.events,
+                    releases=operation.releases,
+                    failure=operation.failure,
+                    error=operation.error,
+                )
+            return BudgetReservationSetup(
+                reservations=operation.reservations,
+                failure=operation.failure,
+                events=emitted_events,
+                error=operation.error,
+            )
 
         reservations: list[BudgetStepReservation] = []
         reservation_ids = set(existing_reservation_ids)
@@ -2461,6 +2632,14 @@ class RunLimitController:
                 else {"execution_profile_fingerprint": execution_profile_fingerprint}
             ),
         )
+        if binding is not None:
+            settlement_event_payload.update(
+                {
+                    "budget_binding_id": binding.binding_id,
+                    "budget_binding_authority_sha256": binding.authority_digest,
+                    "budget_root_id": binding.root_budget_id,
+                }
+            )
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         try:
             for limit in limits:
@@ -2489,6 +2668,7 @@ class RunLimitController:
                     reserved_amount=expected_requested_amount,
                     fallback_settled_at=reservation_effective_at,
                     reservation_ttl_seconds=self.reservation_ttl_seconds,
+                    binding=binding,
                 )
                 ledger_billing_identity = copy_billing_identity(authority.billing_identity)
                 try:
@@ -4599,10 +4779,26 @@ class RunLimitController:
         reservation_event_factory: Callable[[BudgetReservationResult], Event] | None = None,
         billing_identity: BillingIdentity | None = None,
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
+        binding: BudgetBinding | None = None,
+        _binding_provenance: object | None = None,
     ) -> OperationReservationSetup:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        binding = await self._binding_for_dispatch(
+            request={"session_id": session_id, "agent_name": agent_name, "kind": "operation"},
+            binding=binding,
+            trusted_binding=_binding_provenance is _TRUSTED_BINDING_PROVENANCE,
+        )
+        if binding is not None and (
+            (binding.provider_name is not None and binding.provider_name != provider_name)
+            or (binding.model is not None and binding.model != model)
+            or (
+                binding.environment_name is not None
+                and binding.environment_name != environment_name
+            )
+        ):
+            raise ValueError("Budget binding conflicts with the operation identity.")
         effective_limits = _effective_budget_limits(
-            budget_limits,
+            (*budget_limits, *(() if binding is None else binding.limits)),
             identity_namespace="operation",
             preserve_effective=True,
         )
@@ -4627,6 +4823,14 @@ class RunLimitController:
             profile_settlement_payload["execution_profile_fingerprint"] = (
                 execution_profile_fingerprint
             )
+        if binding is not None:
+            profile_settlement_payload.update(
+                {
+                    "budget_binding_id": binding.binding_id,
+                    "budget_binding_authority_sha256": binding.authority_digest,
+                    "budget_root_id": binding.root_budget_id,
+                }
+            )
         expected_settlement_event_payload = _interaction_bound_settlement_event_payload(
             self._event_writer,
             session_id=session_id,
@@ -4637,9 +4841,7 @@ class RunLimitController:
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         if reservation_event_factory is None:
 
-            def default_reservation_event_factory(
-                result: BudgetReservationResult,
-            ) -> Event:
+            def event_factory(result: BudgetReservationResult) -> Event:
                 return Event(
                     type=(
                         EventType.BUDGET_RESERVED
@@ -4650,10 +4852,187 @@ class RunLimitController:
                     agent_name=agent_name,
                     payload=budget_reservation_payload(result),
                 )
-
-            event_factory = default_reservation_event_factory
         else:
             event_factory = reservation_event_factory
+        if binding is not None:
+            # Bound dispatches must cross the ledger as one transaction.  The
+            # individual reserve() loop below remains for legacy/unbound
+            # operations, whose compatibility semantics are intentionally
+            # unchanged.
+            from cayu.budgets._batch import BudgetBatchMember
+
+            authorities: list[
+                tuple[_EffectiveBudgetLimit, _PublishableBudgetReservationAuthority]
+            ] = []
+            for limit in limits:
+                expected_limit = _copy_effective_budget_limit(limit)
+                effective_at = self._clock()
+                requested = _budget_reservation_amount(
+                    limit=expected_limit,
+                    provider_name=provider_name,
+                    model=model,
+                    effective_at=effective_at,
+                    billing_identity=expected_billing_identity,
+                )
+                authority = _new_publishable_budget_reservation_authority(
+                    self._event_writer,
+                    limit=expected_limit,
+                    model_attempt_identity=model_attempt_identity,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    provider_name=provider_name,
+                    model=model,
+                    settlement_event_payload=expected_settlement_event_payload,
+                    billing_identity=expected_billing_identity,
+                    reserved_amount=requested,
+                    fallback_settled_at=effective_at,
+                    reservation_ttl_seconds=self.reservation_ttl_seconds,
+                    binding=binding,
+                )
+                authorities.append((expected_limit, authority))
+            members = tuple(
+                BudgetBatchMember(limit, authority.record) for limit, authority in authorities
+            )
+            batch = await self._budget_ledger.reserve_batch(
+                members=members,
+                binding_id=binding.binding_id,
+                binding_authority_digest=binding.authority_digest,
+                binding_allowance=binding.allowance,
+                binding_consumption_id=model_attempt_identity.model_attempt_id,
+            )
+            if batch.failure is not None:
+                failure = batch.failure
+                event = event_factory(failure)
+                if type(event) is not Event or event.type != EventType.BUDGET_RESERVATION_FAILED:
+                    raise ValueError("Reservation event factory returned an invalid batch failure.")
+                event = _event_with_budget_authority(
+                    event,
+                    execution_identity=model_attempt_identity,
+                    execution_profile_fingerprint=execution_profile_fingerprint,
+                    additional_fields=("budget_limit_id", "session_id"),
+                )
+                return OperationReservationSetup((), (failure,), (event,), (), failure, None)
+            if len(batch.records) != len(authorities):
+                raise RuntimeError("Budget ledger returned an incomplete atomic reservation batch.")
+            batch_reservations = [
+                BudgetStepReservation(
+                    limit=limit,
+                    record=record,
+                    request_billing_identity=copy_billing_identity(expected_billing_identity),
+                )
+                for (limit, authority), record in zip(authorities, batch.records, strict=True)
+            ]
+            reservations.extend(batch_reservations)
+            try:
+                for index, ((limit, authority), reservation) in enumerate(
+                    zip(authorities, batch_reservations, strict=True)
+                ):
+                    record = reservation.record
+                    if (
+                        record
+                        != authority.record.model_copy(
+                            update={
+                                "created_at": record.created_at,
+                                "updated_at": record.updated_at,
+                            },
+                            deep=True,
+                        )
+                        or record.status != "active"
+                    ):
+                        raise RuntimeError("Budget ledger changed atomic reservation identity.")
+                    result = _reservation_result(
+                        limit=limit,
+                        model_attempt_identity=model_attempt_identity,
+                        accepted=True,
+                        requested=record.reserved_amount,
+                        actual=(
+                            batch.projected_usage[index]
+                            if index < len(batch.projected_usage)
+                            else record.reserved_amount
+                        ),
+                        message="Budget reservation accepted atomically.",
+                        record=record,
+                    )
+                    event = event_factory(result)
+                    expected_payload = budget_reservation_payload(result)
+                    if type(event) is not Event or event.type != EventType.BUDGET_RESERVED:
+                        raise ValueError(
+                            "Reservation event factory returned an invalid batch event."
+                        )
+                    if any(event.payload.get(k) != v for k, v in expected_payload.items()):
+                        raise ValueError(
+                            "Reservation event factory changed atomic budget evidence."
+                        )
+                    event = _event_with_budget_authority(
+                        event,
+                        execution_identity=model_attempt_identity,
+                        execution_profile_fingerprint=execution_profile_fingerprint,
+                        additional_fields=("budget_limit_id", "reservation_id", "session_id"),
+                    )
+                    await identity_guard.claim(
+                        record.reservation_id,
+                        publication_session_id=event.session_id,
+                        publication_id=event.id,
+                    )
+                    results.append(result)
+                    events.append(event)
+            except BaseException as exc:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    async for reconciliation in self.release_operation_reservations(
+                        reservations,
+                        reason=rejection_release_reason,
+                    ):
+                        releases.append(reconciliation)
+                except BaseException as release_error:
+                    cleanup_errors.append(release_error)
+                    exc.add_note(f"atomic reservation cleanup failed: {release_error!r}")
+                if cleanup_errors and not isinstance(exc, asyncio.CancelledError):
+                    exc = BaseExceptionGroup(
+                        "Atomic reservation setup and cleanup failed",
+                        [exc, *cleanup_errors],
+                    )
+                return OperationReservationSetup(
+                    # Successful releases are removed from this mutable list;
+                    # any remaining entries retain an explicit cleanup owner.
+                    reservations=tuple(reservations),
+                    results=tuple(results),
+                    events=tuple(events),
+                    releases=tuple(releases),
+                    failure=None,
+                    error=exc,
+                )
+            reservations = batch_reservations
+            try:
+                await self.recover_pending_budget_settlements()
+            except BaseException as recovery_error:
+                cleanup_errors: list[BaseException] = []
+                remaining = list(batch_reservations)
+                try:
+                    async for _ in self.release_operation_reservations(
+                        remaining,
+                        reason="budget settlement recovery failed before dispatch",
+                    ):
+                        pass
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if cleanup_errors and not isinstance(recovery_error, asyncio.CancelledError):
+                    recovery_error = BaseExceptionGroup(
+                        "Budget settlement recovery and cleanup failed",
+                        [recovery_error, *cleanup_errors],
+                    )
+                return OperationReservationSetup(
+                    reservations=tuple(remaining),
+                    results=tuple(results),
+                    events=tuple(events),
+                    releases=(),
+                    failure=None,
+                    error=recovery_error,
+                )
+            return OperationReservationSetup(
+                tuple(reservations), tuple(results), tuple(events), (), None, None
+            )
         for limit in limits:
             try:
                 expected_limit = _copy_effective_budget_limit(limit)
@@ -4685,6 +5064,7 @@ class RunLimitController:
                     reserved_amount=expected_requested_amount,
                     fallback_settled_at=reservation_effective_at,
                     reservation_ttl_seconds=self.reservation_ttl_seconds,
+                    binding=binding,
                 )
                 ledger_billing_identity = copy_billing_identity(authority.billing_identity)
                 try:

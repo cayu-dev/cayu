@@ -9,7 +9,7 @@ from hashlib import sha256
 from itertools import chain
 from pathlib import Path
 from threading import Lock
-from typing import Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -75,6 +75,8 @@ from cayu.runtime.execution_units import (
 )
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
+if TYPE_CHECKING:
+    from cayu.budgets._batch import BudgetBatchMember, BudgetBatchResult
 BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
 BudgetCalendarPeriod = Literal["day", "week", "month"]
 BudgetAction = Literal["interrupt", "notify"]
@@ -133,12 +135,28 @@ class BudgetReservationIdentityConflict(RuntimeError):
     """A reservation identity was already linked to another durable event."""
 
 
+class BudgetBindingRegistrationConflict(RuntimeError):
+    """A binding id was already registered with different authority."""
+
+
+class BudgetBindingAllowanceExhausted(RuntimeError):
+    """A registered binding has no remaining dispatch allowance."""
+
+
 class _BudgetLedgerReservationIdentityState:
     """Process-local fallback ownership registry for one ledger instance."""
 
     def __init__(self) -> None:
         self.lock = Lock()
         self.claims: dict[str, tuple[str, str]] = {}
+
+
+class _BudgetLedgerBindingRegistrationState:
+    """Process-local fallback registry for an in-memory ledger."""
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.bindings: dict[str, tuple[str, int | None, set[str]]] = {}
 
 
 def _budget_ledger_reservation_identity_state(
@@ -154,6 +172,23 @@ def _budget_ledger_reservation_identity_state(
             attributes[_BUDGET_LEDGER_IDENTITY_STATE_ATTRIBUTE] = state
         elif type(state) is not _BudgetLedgerReservationIdentityState:
             raise RuntimeError("Budget ledger reservation identity state is invalid.")
+        return state
+
+
+def _budget_ledger_binding_registration_state(
+    ledger: BudgetLedger,
+) -> _BudgetLedgerBindingRegistrationState:
+    """Return the fallback binding registry attached to ``ledger``."""
+
+    attribute = "_cayu_runtime_budget_binding_registration_state_v1"
+    with _BUDGET_LEDGER_IDENTITY_STATE_INIT_LOCK:
+        attributes = object.__getattribute__(ledger, "__dict__")
+        state = attributes.get(attribute)
+        if state is None:
+            state = _BudgetLedgerBindingRegistrationState()
+            attributes[attribute] = state
+        elif type(state) is not _BudgetLedgerBindingRegistrationState:
+            raise RuntimeError("Budget ledger binding registration state is invalid.")
         return state
 
 
@@ -1896,6 +1931,52 @@ class BudgetLedger(ABC):
     a store-owned injectable clock.
     """
 
+    async def reserve_batch(
+        self,
+        *,
+        members: tuple[BudgetBatchMember, ...],
+        binding_id: str | None = None,
+        binding_authority_digest: str | None = None,
+        binding_allowance: int | None = None,
+        binding_consumption_id: str | None = None,
+    ) -> BudgetBatchResult:
+        """Reserve every ceiling atomically; unsupported ledger wrappers refuse.
+
+        Exact replay returns retained accounting evidence, never permission to
+        redispatch. The runtime's durable dispatch owner still grants execution.
+        """
+        raise NotImplementedError("This ledger does not qualify atomic batch reservation.")
+
+    async def register_budget_binding(
+        self,
+        *,
+        binding_id: str,
+        authority_digest: str,
+        allowance: int,
+    ) -> None:
+        """Durably claim a binding id for one exact trusted authority.
+
+        The ledger stores the exact authority digest and its bounded allowance;
+        it never mints or resolves authority.
+        Persistent backends override this with a transactional shared-store
+        implementation. The default is the qualified in-process fallback.
+        """
+
+        binding_id = require_clean_nonblank(binding_id, "binding_id")
+        authority_digest = require_clean_nonblank(authority_digest, "authority_digest")
+        if type(allowance) is not int or not 0 < allowance <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("allowance must be a positive durable integer.")
+        state = _budget_ledger_binding_registration_state(self)
+        with state.lock:
+            existing = state.bindings.get(binding_id)
+            if existing is None:
+                state.bindings[binding_id] = (authority_digest, allowance, set())
+                return
+            if existing[:2] != (authority_digest, allowance):
+                raise BudgetBindingRegistrationConflict(
+                    "Budget binding id is already registered with different authority."
+                )
+
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return local files that hold this ledger's durable state."""
 
@@ -2336,6 +2417,80 @@ class InMemoryBudgetLedger(BudgetLedger):
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
+
+    async def reserve_batch(
+        self,
+        *,
+        members: tuple[BudgetBatchMember, ...],
+        binding_id: str | None = None,
+        binding_authority_digest: str | None = None,
+        binding_allowance: int | None = None,
+        binding_consumption_id: str | None = None,
+    ) -> BudgetBatchResult:
+        from cayu.budgets._batch import (
+            BudgetBatchResult,
+            batch_failure,
+            prepare_batch,
+            replay_batch,
+            stamp_batch,
+        )
+
+        members = prepare_batch(members)
+        async with self._lock:
+            now = self._clock()
+            replay = replay_batch(
+                members, tuple(self._records.get(m.record.reservation_id) for m in members)
+            )
+            if replay is not None:
+                return replay
+            pending_binding_consumption: tuple[str, set[str]] | None = None
+            if binding_id is not None:
+                if not all(
+                    value is not None
+                    for value in (
+                        binding_authority_digest,
+                        binding_allowance,
+                        binding_consumption_id,
+                    )
+                ):
+                    raise ValueError("Complete binding consumption identity is required.")
+                assert type(binding_allowance) is int
+                registration = _budget_ledger_binding_registration_state(self).bindings.get(
+                    binding_id
+                )
+                if registration is None or registration[:2] != (
+                    binding_authority_digest,
+                    binding_allowance,
+                ):
+                    raise BudgetBindingRegistrationConflict(
+                        "Budget binding is not registered exactly."
+                    )
+                consumed = registration[2]
+                if binding_consumption_id not in consumed:
+                    if len(consumed) >= binding_allowance:
+                        raise BudgetBindingAllowanceExhausted(
+                            "Budget binding allowance is exhausted."
+                        )
+                    pending_binding_consumption = (cast("str", binding_consumption_id), consumed)
+            projected_usage: list[Decimal] = []
+            for member in members:
+                self._reap_expired_unlocked(now, limit=member.limit)
+                used = _ledger_used_amount(self._records.values(), limit=member.limit, now=now)
+                failure = batch_failure(
+                    member,
+                    used,
+                )
+                if failure is not None:
+                    return BudgetBatchResult((), failure=failure)
+                projected_usage.append(used + member.record.reserved_amount)
+            if pending_binding_consumption is not None:
+                consumption_id, consumed = pending_binding_consumption
+                consumed.add(consumption_id)
+            result = stamp_batch(members, now, tuple(projected_usage))
+            self._records.update(
+                {r.reservation_id: r.model_copy(deep=True) for r in result.records}
+            )
+            return result
 
     @property
     def reservation_ttl_seconds(self) -> int | None:

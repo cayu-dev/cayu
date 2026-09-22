@@ -1497,6 +1497,7 @@ class ToolRoundExecutor:
         close_interrupted_round: InterruptedRoundEventStream,
         browser_control_service: BrowserControlService | None = None,
         image_decode_policy: ImageDecodePolicy | None = None,
+        strict_common_budget_admission: bool = False,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -1516,6 +1517,7 @@ class ToolRoundExecutor:
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
         self._browser_control_service = browser_control_service
+        self._strict_common_budget_admission = strict_common_budget_admission
         self._workspace_capture_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS
         )
@@ -5532,12 +5534,18 @@ class ToolRoundExecutor:
                     tool_call_id=effective_tool_call.id,
                     idempotency_key=idempotency_key,
                     budget_limits=budget_limits,
+                    budget_binding=auxiliary_invocation_policy.budget_binding,
                     redactor=lambda: invocation_secret_scope.redactor,
                     refresh=require_live_environment_exposure,
                     observe_event=auxiliary_events.append,
                 )
                 tool_context._bind_runtime_inference(inference_scope)
             if registered_tool.effect is ToolEffect.EXTERNAL:
+                if self._strict_common_budget_admission:
+                    raise RuntimeError(
+                        "Opaque external tool adapters are not qualified for common-root "
+                        "budget admission and are refused before dispatch."
+                    )
                 if invocation_context is None or execution_profile is None:
                     raise RuntimeError(
                         "External tool dispatch requires frozen invocation authority."

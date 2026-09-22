@@ -110,9 +110,12 @@ from cayu.approvals.tools import (
     ResolutionActor,
     resolution_actor_payload,
 )
+from cayu.budgets._batch import BudgetBatchResult, batch_failure, prepare_batch, replay_batch
 from cayu.budgets.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.budgets.base import (
     DEFAULT_RESERVATION_TTL_SECONDS,
+    BudgetBindingAllowanceExhausted,
+    BudgetBindingRegistrationConflict,
     BudgetLedger,
     BudgetLimit,
     BudgetReconciliation,
@@ -1426,6 +1429,28 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    101: (
+        """
+        ALTER TABLE cayu_budget_bindings ADD COLUMN IF NOT EXISTS allowance BIGINT
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_budget_binding_consumptions (
+            binding_id TEXT NOT NULL,
+            consumption_id TEXT NOT NULL,
+            consumed_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (binding_id, consumption_id)
+        )
+        """,
+    ),
+    100: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_budget_bindings (
+            binding_id TEXT PRIMARY KEY,
+            authority_digest TEXT NOT NULL,
+            registered_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+    ),
     99: (
         """
         CREATE TABLE IF NOT EXISTS cayu_context_view_lifecycle_events (
@@ -13509,6 +13534,47 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     def reservation_ttl_seconds(self) -> int | None:
         return self._reservation_ttl_seconds
 
+    async def register_budget_binding(
+        self,
+        *,
+        binding_id: str,
+        authority_digest: str,
+        allowance: int,
+    ) -> None:
+        binding_id = require_clean_nonblank(binding_id, "binding_id")
+        authority_digest = require_clean_nonblank(authority_digest, "authority_digest")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_budget_bindings
+                            (binding_id, authority_digest, allowance, registered_at)
+                        VALUES (%s, %s, %s, clock_timestamp())
+                        ON CONFLICT (binding_id) DO NOTHING
+                        """,
+                        (binding_id, authority_digest, allowance),
+                    )
+                    await cur.execute(
+                        "SELECT authority_digest, allowance "
+                        "FROM cayu_budget_bindings WHERE binding_id = %s",
+                        (binding_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise RuntimeError(
+                            "Budget binding registration disappeared during conflict."
+                        )
+                    if (row[0], row[1]) != (authority_digest, allowance):
+                        raise BudgetBindingRegistrationConflict(
+                            "Budget binding id is already registered with different authority."
+                        )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
     @staticmethod
     async def _budget_database_now(cur: Any) -> datetime:
         await cur.execute("SELECT clock_timestamp()")
@@ -13571,6 +13637,110 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                                 "Budget ledger reused a reservation identity."
                             )
                 await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def reserve_batch(
+        self,
+        *,
+        members,
+        binding_id=None,
+        binding_authority_digest=None,
+        binding_allowance=None,
+        binding_consumption_id=None,
+    ) -> BudgetBatchResult:
+        """Reserve all ceilings in one PostgreSQL transaction."""
+        members = prepare_batch(members)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    for member in sorted(members, key=lambda item: item.limit.budget_limit_id):
+                        await cur.execute(
+                            "SELECT pg_advisory_xact_lock(%s)",
+                            (_budget_advisory_lock_key(member.limit),),
+                        )
+                    existing = []
+                    for member in members:
+                        try:
+                            existing.append(
+                                await self._load_record(cur, member.record.reservation_id)
+                            )
+                        except KeyError:
+                            existing.append(None)
+                    replay = replay_batch(members, tuple(existing))
+                    if replay is not None:
+                        await conn.commit()
+                        return replay
+                    now = await self._budget_database_now(cur)
+                    records = []
+                    projected_usage = []
+                    for member in members:
+                        await self._reap_expired(cur, now, limit=member.limit)
+                        used = await self._used_amount(cur, member.limit, now=now)
+                        failure = batch_failure(member, used)
+                        if failure is not None:
+                            await conn.commit()
+                            return BudgetBatchResult((), failure=failure)
+                        projected_usage.append(used + member.record.reserved_amount)
+                        records.append(
+                            member.record.model_copy(
+                                update={"created_at": now, "updated_at": now}, deep=True
+                            )
+                        )
+                    if binding_id is not None:
+                        if not all(
+                            v is not None
+                            for v in (
+                                binding_authority_digest,
+                                binding_allowance,
+                                binding_consumption_id,
+                            )
+                        ):
+                            raise ValueError("Complete binding consumption identity is required.")
+                        await cur.execute(
+                            "SELECT authority_digest, allowance "
+                            "FROM cayu_budget_bindings WHERE binding_id = %s FOR UPDATE",
+                            (binding_id,),
+                        )
+                        binding = await cur.fetchone()
+                        if binding is None:
+                            raise BudgetBindingRegistrationConflict(
+                                "Budget binding is not registered exactly."
+                            )
+                        if (binding[0], binding[1]) != (
+                            binding_authority_digest,
+                            binding_allowance,
+                        ):
+                            raise BudgetBindingRegistrationConflict(
+                                "Budget binding is not registered exactly."
+                            )
+                        await cur.execute(
+                            """
+                            INSERT INTO cayu_budget_binding_consumptions
+                                (binding_id, consumption_id, consumed_at)
+                            VALUES (%s, %s, clock_timestamp())
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (binding_id, binding_consumption_id),
+                        )
+                        await cur.execute(
+                            "SELECT COUNT(*) FROM cayu_budget_binding_consumptions "
+                            "WHERE binding_id = %s",
+                            (binding_id,),
+                        )
+                        count_row = await cur.fetchone()
+                        assert count_row is not None
+                        assert type(binding_allowance) is int
+                        if count_row[0] > binding_allowance:
+                            raise BudgetBindingAllowanceExhausted(
+                                "Budget binding allowance is exhausted."
+                            )
+                    for record in records:
+                        await self._insert_record(cur, record)
+                await conn.commit()
+                return BudgetBatchResult(tuple(records), tuple(projected_usage))
             except BaseException:
                 await conn.rollback()
                 raise
