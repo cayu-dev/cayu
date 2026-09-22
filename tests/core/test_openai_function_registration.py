@@ -35,11 +35,11 @@ async def test_active_nonfunction_index_has_exact_type_diagnostic(
         "done": function.arguments_done(),
     }[operation]
     raw = [function.created(), other_added(kind), incoming]
-    events, durable, calls = await run_ordering_attempts(tmp_path, adapter, [raw, raw])
+    events, durable, calls = await run_ordering_attempts(tmp_path, adapter, [raw] * 5)
     assert not calls
     assert not any(e.type == EventType.TOOL_CALL_STARTED for e in durable)
     errors = [e.payload for e in durable if e.type == EventType.MODEL_ERROR]
-    assert len(errors) == 2
+    assert len(errors) == 5
     for error in errors:
         assert error["provider_protocol_reason"] == "function_call_output_index_type_mismatch"
         types = json.loads(error["provider_protocol_stream_item_types"])
@@ -55,8 +55,8 @@ async def test_active_nonfunction_index_has_exact_type_diagnostic(
         assert "fixture-" not in repr(fields)
         assert "safe" not in repr(fields)
         assert "fc_0" not in repr(fields)
-    assert errors[-1]["retry_disposition"] == "unknown_provider_attempt_cap"
-    assert errors[-1]["effective_max_attempts"] == 2
+    assert errors[-1]["retry_disposition"] == "configured_attempt_exhaustion"
+    assert errors[-1]["effective_max_attempts"] == 5
     assert events[-1].type == EventType.SESSION_FAILED
 
 
@@ -154,7 +154,7 @@ async def test_mixed_native_retry_preserves_two_functions_and_searches(tmp_path,
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("adapter", ["api", "subscription"])
-async def test_shifted_function_identity_stays_visible_without_remapping(tmp_path, adapter):
+async def test_reconciled_function_identity_keeps_raw_diagnostics_on_truncation(tmp_path, adapter):
     shifted = {**function.arguments_done(1), "item_id": function.added()["item"]["id"]}
     raw = [function.created(), function.added(), shifted]
     _events, durable, calls = await run_ordering_attempts(tmp_path, adapter, [raw, raw])
@@ -164,7 +164,7 @@ async def test_shifted_function_identity_stays_visible_without_remapping(tmp_pat
             continue
         error = event.payload
         assert error["provider_protocol_reason"] == (
-            "function_call_arguments_done_arrived_before_output_item_added"
+            "streaming_response_ended_before_response_completed"
         )
         rows = json.loads(error["provider_protocol_native_structure"])
         assert rows == json.loads(error["provider_protocol_transport_structure"])

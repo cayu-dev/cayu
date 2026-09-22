@@ -396,14 +396,16 @@ async def test_native_sse_failures_cannot_execute_and_preserve_retry_receipts(
 
     from cayu import EventType
 
-    events, durable, executed = await run_sse(tmp_path, [raw, raw])
+    transient = OpenAIProtocolError("fixture", reason_code=reason).retryable is True
+    count = 5 if transient else 2
+    events, durable, executed = await run_sse(tmp_path, [raw] * count)
     assert executed == []
     assert not [
         e for e in durable if e.type in {EventType.TOOL_CALL_STARTED, EventType.MODEL_COMPLETED}
     ]
     errors = [e.payload for e in durable if e.type == EventType.MODEL_ERROR]
     public_errors = [e.payload for e in events if e.type == EventType.MODEL_ERROR]
-    assert len(errors) == len(public_errors) == 2
+    assert len(errors) == len(public_errors) == count
     for error, public in zip(errors, public_errors, strict=True):
         assert error["provider_error_type"] == "protocol_error"
         assert error["provider_protocol_reason"] == reason
@@ -415,14 +417,16 @@ async def test_native_sse_failures_cannot_execute_and_preserve_retry_receipts(
         assert "safe" not in repr(fields)
         assert "fc_0" not in repr(fields) and "call_0" not in repr(fields)
     started = [e.payload for e in durable if e.type == EventType.MODEL_STARTED]
-    assert len(started) == 2
-    assert len({e["model_attempt_id"] for e in started}) == 2
+    assert len(started) == count
+    assert len({e["model_attempt_id"] for e in started}) == count
     assert len({e["model_step_id"] for e in started}) == 1
     assert [e["model_attempt_id"] for e in errors] == [e["model_attempt_id"] for e in started]
     assert [e["model_step_id"] for e in errors] == [e["model_step_id"] for e in started]
-    assert [e["attempt"] for e in errors] == [1, 2]
-    assert errors[-1]["effective_max_attempts"] == 2
-    assert errors[-1]["retry_disposition"] == "unknown_provider_attempt_cap"
+    assert [e["attempt"] for e in errors] == list(range(1, count + 1))
+    assert errors[-1]["effective_max_attempts"] == count
+    assert errors[-1]["retry_disposition"] == (
+        "configured_attempt_exhaustion" if transient else "unknown_provider_attempt_cap"
+    )
     assert events[-1].type == EventType.SESSION_FAILED
 
 
@@ -479,7 +483,7 @@ async def test_function_trace_is_bounded_and_contains_no_content(tmp_path):
 
     canary = "synthetic-sensitive-" + "x" * 5000
     raw = [created(), added(), *[delta(value=canary) for _ in range(20)], arguments_done(1)]
-    _events, durable, executed = await run_sse(tmp_path, [raw, raw])
+    _events, durable, executed = await run_sse(tmp_path, [raw] * 5)
     assert executed == []
     for event in durable:
         if event.type != EventType.MODEL_ERROR:

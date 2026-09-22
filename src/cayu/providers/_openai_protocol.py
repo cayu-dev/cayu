@@ -240,6 +240,7 @@ _PROTOCOL_DIAGNOSTICS: dict[str, tuple[str, str | None]] = {
         None,
     ),
     "output_annotation_must_be_an_object": ("response", None),
+    "terminal_reconciled_item_conflicts_with_lifecycle_evidence": ("stream", None),
     "output_item_added_has_invalid_lifecycle_status": ("stream", None),
     "output_item_added_requires_item_object": ("stream", None),
     "output_item_added_requires_nonblank_id": ("stream", None),

@@ -8888,8 +8888,13 @@ stream that receives no bytes or decoded lines before its idle deadline is
 normalized to a typed retryable provider error. Every non-empty response chunk
 and received line resets that idle deadline, while one incomplete line/event
 has a separate retryable duration ceiling. Malformed
-SSE/JSON, provider protocol errors, and event size/line-limit failures remain
-terminal and are not converted into transport retries.
+SSE/JSON and event size/line-limit failures are not converted into transport
+retries. OpenAI protocol errors normally retain the unknown-provider cap. The
+function index-type collision and unregistered argument-completion
+classes explicitly carry `retryable=True` and use the configured transient
+budget after conservative identity reconciliation fails. Effect and completion
+suppression still prevent unsafe repetition; see
+[function-call event ordering](function-call-event-ordering.md).
 When retries are enabled, provider-derived `model.text.delta`, `model.error`,
 and `model.completed` events include `step`, `attempt`, and `max_attempts` so
 SSE consumers, dashboards, and replay tools can distinguish failed-attempt

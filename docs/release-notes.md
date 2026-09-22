@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Accept already-searching OpenAI web-search registrations and completed replay
+  registrations. Reconcile unoccupied completion indexes by exact item identity,
+  retain terminal integrity checks, and retry function index-type collisions and
+  unregistered argument completions under the caller's transient retry budget.
+
 ## v0.7.0
 
 - Add durable task dependency graphs and task groups with explicit completion

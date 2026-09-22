@@ -366,6 +366,19 @@ class OpenAIProtocolError(OpenAIError, OpenAIProtocolDiagnosticError):
     ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        # These malformed stream shapes may differ on a fresh response. Keep
+        # integrity validation strict, but use the caller's transient budget.
+        # Runtime still suppresses retries after effects or completion.
+        self.retryable = (
+            True
+            if type(reason_code) is str
+            and reason_code
+            in {
+                "function_call_output_index_type_mismatch",
+                "function_call_arguments_done_arrived_before_output_item_added",
+            }
+            else None
+        )
         self.source_diagnostic = source_diagnostic
         self.stream_diagnostic = stream_diagnostic
         self.citation_diagnostic = citation_diagnostic
@@ -1454,9 +1467,8 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     credential_values=credential_values,
                 )
             else:
-                # A parser/protocol failure is an unknown provider outcome, not
-                # an application exception. Preserve that typed identity so the
-                # runtime applies max_unknown_attempts rather than stopping at 1.
+                # Preserve typed protocol identity and explicit retryability.
+                # Unclassified shapes still use the stricter unknown cap.
                 protocol_event = credential_safe_error_event(
                     exc,
                     provider_label="OpenAI",
@@ -1467,8 +1479,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 protocol_payload = dict(protocol_event.payload)
                 # Preserve the public protocol-error type while marking the
                 # fixed, credential-free provider classification explicitly.
-                # The runtime can then apply its bounded unknown retry policy.
+                # The runtime retains effect suppression and caller attempt limits.
                 protocol_payload["provider_error_type"] = "protocol_error"
+                if exc.retryable is not None:
+                    protocol_payload["retryable"] = exc.retryable
                 if isinstance(exc, OpenAIUnsupportedSearchSourceError):
                     protocol_payload["provider_error_type"] = "unsupported_capability"
                     protocol_payload["retryable"] = False
@@ -3217,7 +3231,7 @@ async def openai_stream_events(
                             reason_code="hosted_search_event_requires_a_call_identity",
                         )
                     if status in {"in_progress", "searching"}:
-                        if status == "in_progress":
+                        if status == "in_progress" or call_id not in seen_call_ids:
                             if call_id in seen_call_ids:
                                 raise OpenAIProtocolError(
                                     "OpenAI web search call identity was reused.",
@@ -3367,6 +3381,7 @@ async def _openai_stream_events_impl(
     assembled_text_length = 0
     fallback_output_items: dict[int, dict[str, Any]] = {}
     pending_replay_items: dict[int, tuple[str, str]] = {}
+    reconciled_indexes: set[int] = set()
     lifecycle = StreamLifecycle(_OPENAI_STREAM_POLICY, error_factory=_openai_lifecycle_error)
     async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
@@ -3390,6 +3405,25 @@ async def _openai_stream_events_impl(
             fallback_output_items,
             lifecycle.response_id,
             nonfunction_registration=nonfunction_registration,
+        )
+        # Diagnostics above retain the original wire indexes. Only completion
+        # events with an exact, unique prior identity may be reconciled.
+        original_index = event.get("output_index")
+        event = _reconcile_stream_completion_index(
+            event,
+            pending_function_calls,
+            pending_replay_items,
+            pending_web_search_calls,
+            pending_tool_search_calls,
+            fallback_output_items,
+        )
+        if event.get("output_index") != original_index:
+            reconciled_indexes.add(_stream_output_index(event))
+        nonfunction_registration = _pending_nonfunction_item(
+            event.get("output_index"),
+            pending_replay_items,
+            pending_web_search_calls,
+            pending_tool_search_calls,
         )
         event_type = event.get("type")
         if event_type == "cayu.internal.transport_cancelled":
@@ -3499,7 +3533,7 @@ async def _openai_stream_events_impl(
                         stream_diagnostic=search_trace.snapshot(),
                     )
                 normalized = _normalized_web_search_call(item, item_index=output_index)
-                if normalized["status"] != "in_progress":
+                if normalized["status"] not in {"in_progress", "searching"}:
                     raise OpenAIProtocolError(
                         "OpenAI web_search_call output_item.added must be in progress.",
                         reason_code="web_search_call_output_item_added_must_be_in_progress",
@@ -3745,6 +3779,16 @@ async def _openai_stream_events_impl(
                     yield _web_search_outcome_unknown_event(call_id)
                 pending_web_search_calls.clear()
                 pending_tool_search_calls.clear()
+            terminal_output = _stream_response_object(event).get("output")
+            if isinstance(terminal_output, list) and terminal_output:
+                for index in reconciled_indexes - unfinished_output_indexes:
+                    if index >= len(terminal_output) or not _reconciled_completion_matches(
+                        terminal_output[index], fallback_output_items.get(index)
+                    ):
+                        raise OpenAIProtocolError(
+                            "OpenAI terminal item conflicts with reconciled lifecycle evidence.",
+                            reason_code="terminal_reconciled_item_conflicts_with_lifecycle_evidence",
+                        )
             terminal_events = _stream_terminal_events(
                 _openai_terminal_identity_projection(event, lifecycle),
                 fallback_output_items,
@@ -5037,7 +5081,7 @@ def _record_stream_replay_item_added(
             f"OpenAI {item_type} output_item.added requires nonblank id.",
             reason_code="output_item_added_requires_nonblank_id",
         )
-    if item.get("status") not in {None, "in_progress", "incomplete"}:
+    if item.get("status") not in {None, "in_progress", "incomplete", "completed"}:
         raise OpenAIProtocolError(
             f"OpenAI {item_type} output_item.added has invalid lifecycle status.",
             reason_code="output_item_added_has_invalid_lifecycle_status",
@@ -5237,6 +5281,66 @@ def _pending_nonfunction_item(
     if index in tool_searches:
         return "tool_search_call", tool_searches[index].get("id")
     return None
+
+
+def _reconciled_completion_matches(terminal: Any, completed: Mapping[str, Any] | None) -> bool:
+    """Compare completion evidence with the existing optional-status semantics."""
+    if not isinstance(terminal, Mapping) or completed is None:
+        return False
+    if terminal.get("status") not in {None, "completed"} or completed.get("status") not in {
+        None,
+        "completed",
+    }:
+        return False
+    return {**terminal, "status": "completed"} == {**completed, "status": "completed"}
+
+
+def _reconcile_stream_completion_index(
+    event: Mapping[str, Any],
+    functions: Mapping[int, _PendingFunctionCall],
+    replay: Mapping[int, tuple[str, str]],
+    searches: Mapping[int, tuple[str, str]],
+    tool_searches: Mapping[int, Mapping[str, Any]],
+    finished: Mapping[int, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Repair only an unoccupied completion index with one exact registered ID.
+
+    Never move registrations, deltas, hosted calls, or overwrite another item.
+    The normal parser still validates arguments, item type, and terminal output.
+    """
+    kind = event.get("type")
+    item = event.get("item")
+    if kind == "response.function_call_arguments.done":
+        identity = _mapping_optional_string(event, "item_id")
+        item_type = "function_call"
+    elif kind == "response.output_item.done" and isinstance(item, Mapping):
+        identity = _mapping_optional_string(item, "id")
+        item_type = item.get("type")
+        if item_type not in {"reasoning", "function_call"}:
+            return event
+    else:
+        return event
+    index = _stream_output_index(event)
+    if identity is None or any(
+        index in registry for registry in (functions, replay, searches, tool_searches, finished)
+    ):
+        return event
+    matches = (
+        [
+            i
+            for i, call in functions.items()
+            if item_type == "function_call" and call.item_id == identity
+        ]
+        + [i for i, registered in replay.items() if registered == (item_type, identity)]
+        + [
+            i
+            for i, completed in finished.items()
+            if completed.get("type") == item_type and completed.get("id") == identity
+        ]
+    )
+    if len(matches) != 1:
+        return event
+    return {**event, "output_index": matches[0]}
 
 
 def _validate_function_stream_boundary(

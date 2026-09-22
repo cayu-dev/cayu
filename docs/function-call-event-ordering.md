@@ -22,6 +22,29 @@ retains previously completed calls. Reconciliation treats omitted status as
 compatible with completed status only after the existing completion validator
 has accepted the item. Explicit nonterminal statuses remain invalid.
 
+## Completion-index compatibility
+
+Some upstream streams register reasoning/functions at one index but complete the
+same item ID at a different, unused index. The foreground API and subscription
+parsers reconcile only reasoning item completion, function argument completion,
+and function item completion to one exact registered identity. Registrations,
+deltas, hosted calls, occupied indexes, and ambiguous identities are not moved.
+Argument/name/call-ID validation remains in force. Nonempty terminal output must
+match every reconciled item at its registered index, treating omitted completion
+status as equivalent to `completed`; contradictory output fails.
+Raw structural diagnostics retain the received indexes before reconciliation.
+
+Unreconciled `function_call_output_index_type_mismatch` and
+`function_call_arguments_done_arrived_before_output_item_added` failures carry
+`retryable=True`. They use the configured transient retry policy and general
+attempt ceiling, including after an earlier overload, rather than the unknown
+provider ceiling. Effect/completion suppression and disabled retry policies still
+apply. Other unclassified protocol failures retain the unknown-provider cap.
+
+The same foreground parser accepts web-search registration at `searching` and
+replayable item registration at `completed`, while still requiring item completion
+and terminal reconciliation. Registration alone cannot authorize a final answer.
+
 ## Synthetic transitions
 
 `tests/core/test_openai_function_ordering.py` runs direct native-parser controls
@@ -35,12 +58,12 @@ arguments, `D(i)` complete the output item, and `T` complete the response.
 | A(0), d(0), G(0), D(0), T | Pending, accumulating, complete evidence, matching item, matching terminal; exactly one call executes |
 | Same sequence with omitted item status | Accepted; status omission cannot contradict synthesized completion |
 | A(0), A(1), d(1), d(0), G(1), G(0), D(1), D(0), T | Independent indices and identities; each call executes once |
-| G(0), or A(0), G(1) | Existing orphan reason; no complete call can execute |
+| G(0), or A(0), G(1) with no matching item ID | Existing orphan reason; no complete call can execute |
 | A(0), G(0), G(0) | `function_call_arguments_done_was_repeated` |
 | A(0), G(0), d(0) | `function_call_arguments_delta_arrived_after_arguments_done` |
 | A(0), G(0), A(0) | Repeated registration; completed evidence cannot be overwritten |
 | Changed item/response/call identity or name | Bounded identity diagnostic; no tool execution |
-| Same item/call identity at a different index | `function_call_identity_was_reused` |
+| Registration repeats the same item/call identity at a different index | `function_call_identity_was_reused` |
 | Function index reused by a message, or the reverse | `function_call_output_index_type_mismatch` |
 | G(0) disagrees with nonempty accumulated arguments | `function_call_arguments_done_conflicts_with_streamed_arguments` |
 | D(0) or T contradicts completed arguments/identity | Existing item/terminal conflict diagnostic; no tool execution |

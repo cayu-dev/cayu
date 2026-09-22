@@ -1197,10 +1197,12 @@ def _safe_subscription_error_event(
         if type(retry_after_s) in {int, float}:
             payload["retry_after_s"] = retry_after_s
     if isinstance(exc, OpenAIProtocolError):
-        # Match the API adapter's bounded unknown-provider retry classification.
+        # Match the API adapter's explicit or unknown retry classification.
         # Only the canonical projector may copy protocol evidence across this boundary.
         payload["provider"] = provider_name
         payload["provider_error_type"] = "protocol_error"
+        if exc.retryable is not None:
+            payload["retryable"] = exc.retryable
         if isinstance(exc, OpenAIUnsupportedSearchSourceError):
             payload["provider_error_type"] = "unsupported_capability"
             payload["retryable"] = False

@@ -45,7 +45,7 @@ async def test_completed_message_index_cannot_be_reused_by_function():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("terminal_output", [None, []])
-async def test_reasoning_index_shift_followed_by_reuse_cannot_drop_a_completed_item(
+async def test_reasoning_index_shift_preserves_both_registered_items(
     terminal_output,
 ):
     # Synthetic structural reproduction: one identity moves from 8 to 9, then
@@ -64,10 +64,8 @@ async def test_reasoning_index_shift_followed_by_reuse_cannot_drop_a_completed_i
         },
     ]
     seen = []
-    with pytest.raises(OpenAIProtocolError) as caught:
-        await parse(raw, seen)
-    assert caught.value.reason_code == "reasoning_output_item_added_was_repeated"
-    assert not seen
+    await parse(raw, seen)
+    assert [part["state"]["id"] for part in seen[-1].payload["provider_state"]] == ["rs_a", "rs_b"]
 
 
 @pytest.mark.anyio
@@ -105,10 +103,10 @@ async def test_sparse_reasoning_indexes_preserve_both_completed_items():
 
 @pytest.mark.anyio
 async def test_collision_retries_preserve_bounded_durable_diagnostics(tmp_path):
-    events, durable, executed = await run_sse(tmp_path, [collision(), collision()])
+    events, durable, executed = await run_sse(tmp_path, [collision()] * 5)
     assert not executed
     errors = [e.payload for e in durable if e.type == EventType.MODEL_ERROR]
-    assert len(errors) == 2
+    assert len(errors) == 5
     for error in errors:
         assert error["provider_protocol_reason"] == "function_call_output_index_type_mismatch"
         assert json.loads(error["provider_protocol_stream_item_types"])[-1] == [
