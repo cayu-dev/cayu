@@ -18,6 +18,7 @@ from typing import Any
 from cayu._exception_groups import add_exception_note_safely
 from cayu._task_wait import await_shielded_task_outcome
 from cayu.credentials import CredentialMode
+from cayu.egress._docker_diagnostics import docker_setup_failure
 from cayu.egress._docker_reconnect import (
     OWNER_LABEL,
     PROXY_ALIAS,
@@ -1108,11 +1109,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         if self._reconnect is not None:
             await self._reconnect.run(argv)
             return
-        exit_code, _stderr = await self._docker_exec(argv)
+        exit_code, stderr = await self._docker_exec(argv)
         if exit_code != 0:
-            raise UnsupportedEgressError(
-                f"docker {argv[0]} failed while preparing egress (exit_code={exit_code})."
-            )
+            raise UnsupportedEgressError(docker_setup_failure(argv, exit_code, stderr))
 
     async def _container_id(self, name: str) -> str:
         exit_code, stdout = await self._docker_run(

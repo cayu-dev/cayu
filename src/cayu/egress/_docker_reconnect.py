@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 from cayu.credentials import CredentialMode
+from cayu.egress._docker_diagnostics import docker_setup_failure
 from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.adapter import EgressBinding, RunnerFinalizationResult, VirtualEgressRunnerRequest
 from cayu.egress.errors import DockerEgressReconnectError, InvalidEgressReconnectMetadataError
@@ -454,7 +455,7 @@ class DockerReconnect:
             done, _pending = await asyncio.wait({task}, timeout=self.timeout_s)
             if not done:
                 raise DockerEgressReconnectError("ownership_uncertain")
-            code, _diagnostic = task.result()
+            code, diagnostic = task.result()
         except asyncio.CancelledError:
             raise
         except BaseException:
@@ -462,7 +463,9 @@ class DockerReconnect:
             raise DockerEgressReconnectError("ownership_uncertain") from None
         claim.write(pending_mutation=False)
         if code:
-            raise DockerEgressReconnectError("daemon_unavailable")
+            error = DockerEgressReconnectError("daemon_unavailable")
+            error.args = (f"{error} {docker_setup_failure(args, code, diagnostic)}",)
+            raise error
 
     async def freeze(self, claim: _Claim) -> None:
         claim.require_owned()

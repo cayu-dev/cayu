@@ -1327,6 +1327,16 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
+- Failed Docker setup commands include the operation (for example, `network create`
+  or `network connect`), exit code, and a sanitized stderr excerpt in the exception
+  and retained environment/session failure events. Reconnect setup uses the same
+  diagnostic format and preserves its existing failure classification. Only known
+  literal Docker diagnostic phrases are retained; names, paths, URLs, credentials,
+  and unrecognized text become `[REDACTED]`. Empty stderr is `[unavailable]`.
+  The excerpt is limited to 1,024 UTF-8 bytes with `...[truncated]` when the output
+  limit or the 65,536-character input scan limit is reached. An unfamiliar daemon
+  message may therefore be entirely redacted. These diagnostics report the failed
+  operation; they do not establish the underlying infrastructure root cause.
 - The broker proxy binds a host-reachable interface so the sidecar can reach it via
   `host.docker.internal` on both Docker Desktop and native Linux. A private
   sidecar-only outer CONNECT authenticates that hop independently of provider or

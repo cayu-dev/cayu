@@ -631,3 +631,29 @@ def test_effective_browser_seccomp_change_refuses_reconnect(tmp_path, monkeypatc
             claim.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["create", "connect"])
+def test_setup_failure_retains_safe_diagnostics_and_settles_mutation(tmp_path, operation):
+    async def scenario():
+        _, adapter, manager, _ = setup(tmp_path)
+        claim = manager.claim(TOKEN)
+        claim.read()
+
+        async def fail(args):
+            return 17, "Error response from daemon: permission denied TOKEN=private-canary"
+
+        adapter._docker_exec = fail
+        try:
+            with pytest.raises(DockerEgressReconnectError) as raised:
+                await adapter._run(["network", operation, NID])
+            assert raised.value.code == "daemon_unavailable"
+            assert f"network {operation}" in str(raised.value)
+            assert "exit_code=17" in str(raised.value)
+            assert "permission denied" in str(raised.value)
+            assert "private-canary" not in str(raised.value)
+            assert claim.journal["pending_mutation"] is False
+        finally:
+            claim.close()
+
+    asyncio.run(scenario())

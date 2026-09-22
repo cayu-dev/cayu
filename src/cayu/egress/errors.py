@@ -44,7 +44,7 @@ class EgressReconnectError(EgressError):
 
 
 class DockerEgressReconnectError(EgressReconnectError):
-    """Bounded Docker failure classification without backend diagnostic text."""
+    """Bounded Docker failure classification with optional safe setup diagnostics."""
 
     def __init__(self, code: str) -> None:
         if code not in {
