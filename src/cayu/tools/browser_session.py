@@ -832,15 +832,79 @@ class BrowserArtifactPayload:
             raise ValueError("Browser artifact content_type is too large.")
 
 
+_LIMIT_UNITS = {
+    "dom_nodes": "nodes",
+    "accessibility_source_bytes": "bytes",
+    "accessibility_scalar_bytes": "bytes",
+    "accessibility_materialization_upper_bound": "bytes",
+    "frame_documents": "frames",
+    "response_bytes": "bytes",
+    "response_declared_bytes": "bytes",
+    "snapshot_bytes": "bytes",
+    "snapshot_refs": "refs",
+}
+
+
+def _validated_limit_diagnostic(value: Any) -> dict[str, Any]:
+    """Accept only bounded numeric evidence, never guest/page-authored prose."""
+    if type(value) is not dict or set(value) != {
+        "identifier",
+        "bound",
+        "observed",
+        "measurement",
+        "units",
+    }:
+        raise ValueError("Invalid browser limit diagnostic.")
+    identifier = value["identifier"]
+    if (
+        type(identifier) is not str
+        or identifier not in _LIMIT_UNITS
+        or value["units"] != _LIMIT_UNITS[identifier]
+        or value["measurement"] not in ("exact", "lower_bound", "upper_bound", "unavailable")
+        or type(value["bound"]) is not int
+        or not 0 <= value["bound"] <= 2**63 - 1
+        or (
+            value["observed"] is not None
+            and (type(value["observed"]) is not int or not 0 <= value["observed"] <= 2**63 - 1)
+        )
+        or (value["observed"] is None) != (value["measurement"] == "unavailable")
+    ):
+        raise ValueError("Invalid browser limit diagnostic.")
+    return dict(value)
+
+
+_LIMIT_RECOVERY = {
+    "oversized_snapshot": (
+        "For JSON or bulk data, use an available authorized HTTP or code-execution tool to "
+        "download and process it. Otherwise, request fewer records or a smaller page."
+    ),
+    "oversized_response": (
+        "Request fewer records or a smaller response. For bulk data, use an available "
+        "authorized HTTP or code-execution tool with appropriate limits."
+    ),
+}
+_LEGACY_LIMIT_MESSAGES = {code: _ERROR_MESSAGES[code] for code in _LIMIT_RECOVERY}
+for _limit_code, _limit_recovery in _LIMIT_RECOVERY.items():
+    _ERROR_MESSAGES[_limit_code] += (
+        " " + _limit_recovery + " Existing destination and access restrictions still apply. "
+        "If the allocation is retired, start a new browser session for any browser retry."
+    )
+
+
 @dataclass(frozen=True)
 class BrowserBackendFailure:
     """Stable, bounded failure returned by a browser backend."""
 
     code: str
+    limit: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if type(self.code) is not str or self.code not in _BACKEND_FAILURE_CODES:
             raise ValueError("Browser backend failure code is unsupported.")
+        if self.limit is not None:
+            if self.code not in _LIMIT_RECOVERY:
+                raise ValueError("Unexpected browser limit diagnostic.")
+            object.__setattr__(self, "limit", _validated_limit_diagnostic(self.limit))
 
 
 @dataclass(frozen=True)
@@ -4702,6 +4766,7 @@ class BrowserSessionTool(Tool):
                 allocation_disposition=response.allocation_disposition,
                 page_set=page_set,
                 page_delta=response.page_delta,
+                limit=response.failure.limit,
             )
         if response.closed:
             session_id = request["session_id"]
@@ -4763,6 +4828,24 @@ class BrowserSessionTool(Tool):
                 request=request,
                 allocation_disposition=response.allocation_disposition,
             )
+        observation_limit = None
+        snapshot_bytes = len(observation.snapshot.encode("utf-8"))
+        if snapshot_bytes > self.max_snapshot_bytes:
+            observation_limit = {
+                "identifier": "snapshot_bytes",
+                "bound": self.max_snapshot_bytes,
+                "observed": snapshot_bytes,
+                "units": "bytes",
+                "measurement": "exact",
+            }
+        elif len(observation.refs) > self.max_refs:
+            observation_limit = {
+                "identifier": "snapshot_refs",
+                "bound": self.max_refs,
+                "observed": len(observation.refs),
+                "units": "refs",
+                "measurement": "exact",
+            }
         if (
             observation.session_id != request["session_id"]
             or observation.page_id != request["page_id"]
@@ -4776,6 +4859,7 @@ class BrowserSessionTool(Tool):
                 dispatch="completed",
                 request=request,
                 allocation_disposition=response.allocation_disposition,
+                limit=observation_limit,
             )
         if observation.visual is not None:
             policy = self.visual_policy
@@ -5856,6 +5940,7 @@ def _error_result(
     allocation_disposition: Literal["live", "retired", "uncertain"] | None = None,
     page_set: BrowserPageSetState | None = None,
     page_delta: BrowserPageSetDelta | None = None,
+    limit: dict[str, Any] | None = None,
 ) -> ToolResult:
     structured: dict[str, Any] = {
         "error": code,
@@ -5874,6 +5959,23 @@ def _error_result(
         structured["active_page_id"] = page_set.active_page_id
     if page_delta is not None:
         structured["page_delta"] = page_delta.model_dump(mode="json")
+    if code in _LIMIT_RECOVERY:
+        structured["recovery"] = [
+            _LIMIT_RECOVERY[code],
+            "Existing destination and access restrictions still apply.",
+            "If the allocation is retired, start a new browser session for any browser retry.",
+        ]
+        structured["limit"] = (
+            _validated_limit_diagnostic(limit)
+            if limit is not None
+            else {
+                "identifier": None,
+                "bound": None,
+                "observed": None,
+                "measurement": "unavailable",
+                "units": None,
+            }
+        )
     guidance = _ERROR_GUIDANCE.get(code)
     if guidance is not None:
         structured["guidance"] = guidance
@@ -6174,7 +6276,10 @@ def _validate_recovered_browser_tool_result(
         return None
     if len(result.content.encode("utf-8")) > terminal_limit:
         return None
-    if error is not None and (not result.is_error or result.content != _ERROR_MESSAGES[error]):
+    if error is not None and (
+        not result.is_error
+        or result.content not in (_ERROR_MESSAGES[error], _LEGACY_LIMIT_MESSAGES.get(error))
+    ):
         return None
     if raw_structured.get("closed") is True and (
         result.is_error or result.content != "The browser session was closed."
@@ -7368,7 +7473,7 @@ def _parse_runner_response(
             return BrowserBackendResponse(failure=BrowserBackendFailure("browser_crash"))
         try:
             return BrowserBackendResponse(
-                failure=BrowserBackendFailure(code),
+                failure=BrowserBackendFailure(code, limit=raw.get("limit")),
                 page_set=page_set,
                 page_delta=page_delta,
                 allocation_disposition=cast(

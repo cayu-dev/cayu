@@ -443,13 +443,34 @@ class _GuestFailure(RuntimeError):
         allocation_disposition: Literal["live", "retired", "uncertain"] = "uncertain",
         access: dict[str, Any] | None = None,
         effective_origin: str | None = None,
+        limit: dict[str, Any] | None = None,
     ) -> None:
         self.code = code
+        # Concurrent guards can replace a size failure with resource exhaustion
+        # while its numeric diagnostic remains on the page state. Only size
+        # failures admit that diagnostic in the host protocol.
+        self.limit = limit if code in {"oversized_response", "oversized_snapshot"} else None
         self.status_code = status_code
         self.allocation_disposition = allocation_disposition
         self.access = access
         self.effective_origin = effective_origin
         super().__init__(code)
+
+
+def _limit_diagnostic(
+    identifier: str,
+    bound: int,
+    observed: int | None,
+    units: str,
+    measurement: str = "lower_bound",
+) -> dict[str, Any]:
+    return {
+        "identifier": identifier,
+        "bound": bound,
+        "observed": observed,
+        "measurement": measurement,
+        "units": units,
+    }
 
 
 def _guest_http_access(
@@ -891,6 +912,7 @@ class _InteractivePage:
     response_bytes: int = 0
     navigation_epoch: int = 0
     limit_exceeded: bool = False
+    limit_diagnostic: dict[str, Any] | None = None
     limit_error_code: Literal["oversized_response", "oversized_snapshot", "resource_exhausted"] = (
         "oversized_response"
     )
@@ -930,7 +952,7 @@ def _interactive_page_failure(state: _InteractivePage) -> _GuestFailure | None:
     if state.access_evidence is not None:
         return _GuestFailure("access_blocked", access=state.access_evidence)
     if state.limit_exceeded:
-        return _GuestFailure(state.limit_error_code)
+        return _GuestFailure(state.limit_error_code, limit=state.limit_diagnostic)
     return None
 
 
@@ -2802,7 +2824,15 @@ async def _isolated_frame_projection(
     ):
         raise _GuestFailure("browser_crash")
     if extracted["node_limit_exceeded"]:
-        raise _GuestFailure("oversized_response")
+        raise _GuestFailure(
+            "oversized_response",
+            limit=_limit_diagnostic(
+                "dom_nodes",
+                max_dom_nodes,
+                extracted["node_count"],
+                "nodes",
+            ),
+        )
     if extracted["node_count"] > max_dom_nodes:
         raise _GuestFailure("browser_crash")
 
@@ -2936,7 +2966,15 @@ async def _frame_identities(cdp: Any) -> tuple[_FrameIdentity, ...]:
             )
         )
         if len(identities) > _MAX_FRAME_DOCUMENTS:
-            raise _GuestFailure("oversized_response")
+            raise _GuestFailure(
+                "oversized_response",
+                limit=_limit_diagnostic(
+                    "frame_documents",
+                    _MAX_FRAME_DOCUMENTS,
+                    len(identities),
+                    "frames",
+                ),
+            )
         raw_children = tree.get("childFrames", [])
         if type(raw_children) is not list:
             raise _GuestFailure("browser_crash")
@@ -5870,7 +5908,7 @@ class _InteractiveDaemon:
             if state.denied_code is not None:
                 failure = _GuestFailure(state.denied_code)
             elif state.limit_exceeded:
-                failure = _GuestFailure(state.limit_error_code)
+                failure = _GuestFailure(state.limit_error_code, limit=state.limit_diagnostic)
             else:
                 try:
                     browser_connected = bool(self.browser.is_connected())
@@ -6438,6 +6476,7 @@ class _InteractiveDaemon:
             if cleanup_ok and authoritative_failure is not None:
                 raise _GuestFailure(
                     authoritative_failure.code,
+                    limit=authoritative_failure.limit,
                     status_code=authoritative_failure.status_code,
                     effective_origin=authoritative_failure.effective_origin,
                     access=authoritative_failure.access,
@@ -6640,6 +6679,7 @@ class _InteractiveDaemon:
         return _interactive_error_payload(
             _GuestFailure(
                 failure.code,
+                limit=failure.limit,
                 status_code=failure.status_code,
                 access=failure.access,
                 effective_origin=failure.effective_origin,
@@ -7429,6 +7469,12 @@ class _InteractiveDaemon:
             if isinstance(length, (int, float)) and not isinstance(length, bool):
                 state.response_bytes += max(0, math.ceil(float(length)))
                 if state.response_bytes > limits.max_response_bytes:
+                    state.limit_diagnostic = _limit_diagnostic(
+                        "response_bytes",
+                        limits.max_response_bytes,
+                        state.response_bytes,
+                        "bytes",
+                    )
                     state.limit_exceeded = True
                     self._schedule_response_limit_abort(state)
 
@@ -7474,6 +7520,14 @@ class _InteractiveDaemon:
                 if length is not None and state.response_bytes + max(0, int(length)) > (
                     limits.max_response_bytes
                 ):
+                    # Content-Length is declared evidence, not measured transfer size.
+                    state.limit_diagnostic = _limit_diagnostic(
+                        "response_declared_bytes",
+                        limits.max_response_bytes,
+                        None,
+                        "bytes",
+                        "unavailable",
+                    )
                     state.limit_exceeded = True
                     self._schedule_response_limit_abort(state)
             except Exception:
@@ -8581,7 +8635,20 @@ async def _admit_interactive_snapshot_materialization(
             max_scalar_bytes=limits.max_snapshot_bytes,
         )
         if limit_exceeded or node_count > remaining_nodes or source_bytes > remaining_source_bytes:
-            raise _GuestFailure("oversized_snapshot")
+            if node_count > remaining_nodes:
+                diagnostic = _limit_diagnostic(
+                    "dom_nodes", limits.max_dom_nodes, total_nodes + node_count, "nodes"
+                )
+            elif source_bytes > remaining_source_bytes:
+                diagnostic = _limit_diagnostic(
+                    "accessibility_source_bytes",
+                    limits.max_snapshot_bytes * _INTERACTIVE_ACCESSIBILITY_SOURCE_MULTIPLIER,
+                    total_source_bytes + source_bytes,
+                    "bytes",
+                )
+            else:
+                diagnostic = None
+            raise _GuestFailure("oversized_snapshot", limit=diagnostic)
         total_nodes += node_count
         total_source_bytes += source_bytes
         # One accessibility node can reuse any source-derived accessible name
@@ -8594,7 +8661,16 @@ async def _admit_interactive_snapshot_materialization(
             + _INTERACTIVE_ACCESSIBILITY_NODE_ENVELOPE_BYTES
         )
         if materialization_upper_bound > _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES:
-            raise _GuestFailure("oversized_snapshot")
+            raise _GuestFailure(
+                "oversized_snapshot",
+                limit=_limit_diagnostic(
+                    "accessibility_materialization_upper_bound",
+                    _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES,
+                    materialization_upper_bound,
+                    "bytes",
+                    "upper_bound",
+                ),
+            )
         remaining_nodes -= node_count
         remaining_source_bytes -= source_bytes
 
@@ -8619,7 +8695,15 @@ async def _interactive_frame_ids(cdp: Any) -> tuple[str, ...]:
         seen.add(frame_id)
         frame_ids.append(frame_id)
         if len(frame_ids) > _MAX_FRAME_DOCUMENTS:
-            raise _GuestFailure("oversized_snapshot")
+            raise _GuestFailure(
+                "oversized_snapshot",
+                limit=_limit_diagnostic(
+                    "frame_documents",
+                    _MAX_FRAME_DOCUMENTS,
+                    len(frame_ids),
+                    "frames",
+                ),
+            )
         raw_children = tree.get("childFrames", [])
         if type(raw_children) is not list:
             raise _GuestFailure("browser_crash")
@@ -8654,6 +8738,7 @@ async def _interactive_frame_snapshot_census(
             const root = document.documentElement;
             let nodeCount = root ? 1 : 0;
             let sourceBytes = 0;
+            let scalarBytes = 0;
             let limitExceeded = nodeCount > nodeLimit;
             const consume = value => {
                 if (typeof value !== "string") return;
@@ -8674,6 +8759,7 @@ async def _interactive_frame_snapshot_census(
                     sourceBytes += encodedBytes;
                     valueBytes += encodedBytes;
                     if (sourceBytes > sourceLimit || valueBytes > scalarLimit) {
+                        scalarBytes = valueBytes;
                         limitExceeded = true;
                         return;
                     }
@@ -8744,6 +8830,7 @@ async def _interactive_frame_snapshot_census(
             return {
                 node_count: nodeCount,
                 source_bytes: sourceBytes,
+                scalar_bytes: scalarBytes,
                 limit_exceeded: limitExceeded,
             };
         })()""".replace("__CAYU_NODE_LIMIT__", str(max_nodes))
@@ -8764,7 +8851,11 @@ async def _interactive_frame_snapshot_census(
         raise _GuestFailure("browser_crash")
     extracted = projection["result"]["value"]
     if (
-        set(extracted) != {"limit_exceeded", "node_count", "source_bytes"}
+        set(extracted)
+        not in (
+            {"limit_exceeded", "node_count", "source_bytes"},
+            {"limit_exceeded", "node_count", "source_bytes", "scalar_bytes"},
+        )
         or type(extracted.get("node_count")) is not int
         or extracted["node_count"] < 0
         or type(extracted.get("source_bytes")) is not int
@@ -8772,6 +8863,19 @@ async def _interactive_frame_snapshot_census(
         or type(extracted.get("limit_exceeded")) is not bool
     ):
         raise _GuestFailure("browser_crash")
+    scalar_bytes = extracted.get("scalar_bytes", 0)
+    if type(scalar_bytes) is not int or scalar_bytes < 0:
+        raise _GuestFailure("browser_crash")
+    if scalar_bytes > max_scalar_bytes:
+        raise _GuestFailure(
+            "oversized_snapshot",
+            limit=_limit_diagnostic(
+                "accessibility_scalar_bytes",
+                max_scalar_bytes,
+                scalar_bytes,
+                "bytes",
+            ),
+        )
     return (
         extracted["node_count"],
         extracted["source_bytes"],
@@ -8986,7 +9090,8 @@ async def _interactive_observation(
         if exc.code in {"oversized_response", "oversized_snapshot"}:
             state.limit_exceeded = True
             state.limit_error_code = "oversized_snapshot"
-            raise _GuestFailure("oversized_snapshot") from exc
+            state.limit_diagnostic = exc.limit
+            raise _GuestFailure("oversized_snapshot", limit=exc.limit) from exc
         raise
     except BaseException as exc:
         primary_failure = exc
@@ -9322,6 +9427,7 @@ def _interactive_error_payload(
         "kind": "error",
         "allocation_disposition": error.allocation_disposition,
         "error": stable,
+        **({"limit": error.limit} if error.limit is not None else {}),
         **({"access": error.access} if error.access is not None else {}),
     }
     if page_set is not None:

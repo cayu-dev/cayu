@@ -258,6 +258,10 @@ href="https://docs.browser.test/interactive-popup-target">Open popup</a></body><
 <body><main>Admitted secondary page</main></body></html>"""
             self._send(200, "text/html; charset=utf-8", body)
             return
+        if self.path == "/interactive-oversized-json":
+            body = json.dumps({"records": "x" * 100_000}).encode()
+            self._send(200, "application/json", body)
+            return
         if self.path == "/interactive-accessibility-amplification":
             label = "x" * 100_000
             controls = '<button aria-labelledby="label"></button>' * 500
@@ -593,6 +597,14 @@ async def _drive_browser_fetch() -> dict[str, Any]:
                 "operation": "close",
                 "session_id": multi_page_root["session_id"],
                 "operation_id": "multi-page-close-1",
+            },
+        )
+        interactive_oversized_json = await browser_session_tool.run(
+            interactive_context,
+            {
+                "operation": "navigate",
+                "url": "https://docs.browser.test/interactive-oversized-json",
+                "operation_id": "interactive-oversized-json-1",
             },
         )
         interactive_accessibility_amplification = await browser_session_tool.run(
@@ -1068,6 +1080,7 @@ asyncio.run(main())
             "multi_page_switch": multi_page_switch,
             "multi_page_close_page": multi_page_close_page,
             "multi_page_close": multi_page_close,
+            "interactive_oversized_json": interactive_oversized_json,
             "interactive_accessibility_amplification": (interactive_accessibility_amplification),
             "interactive_accessibility_url_amplification": (
                 interactive_accessibility_url_amplification
@@ -1665,3 +1678,23 @@ print(
             await runner.close()
 
     asyncio.run(exercise())
+
+
+def test_interactive_oversized_json_reports_limit_and_recovery(
+    browser_fetch_results: dict[str, Any],
+) -> None:
+    result = browser_fetch_results["interactive_oversized_json"]
+    assert result.is_error
+    assert result.structured["error"] == "oversized_snapshot"
+    assert result.structured["allocation_disposition"] == "retired"
+    assert result.structured["execution"]["observation"] == "not_published"
+    assert result.structured["limit"] == {
+        "identifier": "accessibility_scalar_bytes",
+        "bound": 32 * 1024,
+        "observed": 32 * 1024 + 1,
+        "measurement": "lower_bound",
+        "units": "bytes",
+    }
+    assert "available authorized HTTP or code-execution tool" in result.content
+    assert "start a new browser session" in result.content
+    assert result.structured["recovery"]

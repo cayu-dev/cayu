@@ -7520,7 +7520,7 @@ def test_interactive_guest_snapshot_preserves_playwright_ref_suffixes() -> None:
     assert truncation == []
 
 
-def test_interactive_guest_retires_before_materializing_oversized_snapshot() -> None:
+def test_interactive_guest_retires_before_materializing_oversized_snapshot(tmp_path: Path) -> None:
     class _OversizedCdp(_BoundedSnapshotCdp):
         async def send(
             self,
@@ -7588,6 +7588,36 @@ def test_interactive_guest_retires_before_materializing_oversized_snapshot() -> 
         assert page.locator_owner.called is False
         assert context.closed is True
         assert daemon.pages == {}
+        assert result["limit"] == {
+            "identifier": "dom_nodes",
+            "bound": 100,
+            "observed": 101,
+            "measurement": "lower_bound",
+            "units": "nodes",
+        }
+        parsed = browser_session_module._parse_runner_response(
+            json.dumps(result),
+            max_artifact_bytes=1024,
+            max_page_records=10,
+            max_page_creations_per_operation=1,
+        )
+        backend = _FakeBrowserBackend(
+            failure=parsed.failure,
+            failure_disposition=parsed.allocation_disposition,
+        )
+        tool = BrowserSessionTool(_backend=backend)
+        args = {"operation": "navigate", "url": "https://example.test", "operation_id": "limit-1"}
+        ctx = _context(tmp_path)
+        failed = await tool.run(ctx, args)
+        assert failed.is_error
+        assert failed.structured["limit"] == result["limit"]
+        assert failed.structured["allocation_disposition"] == "retired"
+        assert failed.structured["execution"]["observation"] == "not_published"
+        assert "available authorized HTTP or code-execution tool" in failed.content
+        assert "start a new browser session" in failed.content
+        assert failed.structured["recovery"]
+        assert await tool.run(ctx, args) == failed
+        assert len(backend.calls) == 1
 
     asyncio.run(scenario())
 
@@ -9151,7 +9181,10 @@ def test_interactive_guest_allows_only_the_exact_authorized_download() -> None:
     assert state.denied_code is None
 
 
-def test_interactive_guest_closes_background_page_at_response_byte_limit() -> None:
+@pytest.mark.parametrize("navigation_limit_order", [None, "before", "after"])
+def test_interactive_guest_closes_background_page_at_response_byte_limit(
+    navigation_limit_order: str | None,
+) -> None:
     class _Cdp:
         def __init__(self) -> None:
             self.handlers: dict[str, Any] = {}
@@ -9225,13 +9258,45 @@ def test_interactive_guest_closes_background_page_at_response_byte_limit() -> No
         await _configure_interactive_daemon_for_test(daemon, request)
         await daemon._configure_page(state, limits)
 
+        def exceed_navigation_limit() -> None:
+            page.main_frame = object()
+            state.navigation_epoch = limits.max_requests
+            daemon._mark_page_navigated(state, page.main_frame)
+
+        if navigation_limit_order == "before":
+            exceed_navigation_limit()
         cdp.handlers["Network.dataReceived"]({"encodedDataLength": 5})
+        if navigation_limit_order == "after":
+            exceed_navigation_limit()
         await page.closed.wait()
 
         assert state.limit_exceeded is True
         result = await daemon.execute(request)
-        assert result["error"] == "oversized_response"
+        expected_code = (
+            "oversized_response" if navigation_limit_order is None else "resource_exhausted"
+        )
+        assert result["error"] == expected_code
         assert result["allocation_disposition"] == "retired"
+        if navigation_limit_order is None:
+            assert result["limit"] == {
+                "identifier": "response_bytes",
+                "bound": 4,
+                "observed": 5,
+                "measurement": "lower_bound",
+                "units": "bytes",
+            }
+        else:
+            assert "limit" not in result
+        parsed = browser_session_module._parse_runner_response(
+            json.dumps(result),
+            max_artifact_bytes=1024,
+            max_page_records=10,
+            max_page_creations_per_operation=1,
+        )
+        assert parsed.failure is not None
+        assert parsed.failure.code == expected_code
+        assert parsed.failure.limit == result.get("limit")
+        assert parsed.allocation_disposition == "retired"
         assert daemon.closing is True
         assert daemon.close_after_response is True
         assert context.closed is True
@@ -9327,6 +9392,13 @@ def test_interactive_guest_rechecks_response_limit_after_final_observation() -> 
 
         assert result["error"] == "oversized_response"
         assert result["allocation_disposition"] == "retired"
+        assert result["limit"] == {
+            "identifier": "response_bytes",
+            "bound": 4,
+            "observed": 5,
+            "measurement": "lower_bound",
+            "units": "bytes",
+        }
         assert state.limit_exceeded is True
         assert page.closed is True
         assert context.closed is True
@@ -13522,3 +13594,27 @@ def test_completed_allocation_generation_preserves_old_browser_receipts(tmp_path
             await scenario(stack)
 
     asyncio.run(run())
+
+
+def test_browser_limit_diagnostics_reject_untrusted_prose() -> None:
+    diagnostic = {
+        "identifier": "dom_nodes",
+        "bound": 100,
+        "observed": 101,
+        "measurement": "lower_bound",
+        "units": "nodes",
+    }
+    for diagnostic_field, value in (
+        ("identifier", "page secret"),
+        ("units", "page secret"),
+        ("observed", "page secret"),
+        ("bound", True),
+    ):
+        with pytest.raises(ValueError, match="Invalid browser limit"):
+            BrowserBackendFailure(
+                "oversized_snapshot", limit={**diagnostic, diagnostic_field: value}
+            )
+    unknown = browser_session_module._error_result("oversized_response", dispatch="completed")
+    assert unknown.structured["limit"]["measurement"] == "unavailable"
+    assert unknown.structured["limit"]["observed"] is None
+    assert "smaller response" in unknown.content

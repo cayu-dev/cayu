@@ -419,6 +419,25 @@ Downloads are admitted only for the exact active-page `download` operation;
 an automatic or popup-initiated download is cancelled and its page is
 quarantined through the same bounded cleanup owner.
 
+Browser limit failures remain failed tool results. `oversized_snapshot` means
+observation size or complexity exceeded admission limits; `oversized_response`
+means network response/evidence limits were exceeded. Both include host-authored
+recovery choices in model-facing content and structured `recovery`: request less
+data or use an available, authorized HTTP/code tool for bulk data. Existing
+destination and access restrictions apply, and a retired allocation requires a
+new browser session for a browser retry. No automatic fallback is performed.
+
+Structured `limit` identifies the guard when known, with `identifier`, `bound`,
+`observed`, `units`, and `measurement`. Measurements are `exact`, `lower_bound`
+(for an interrupted census or transfer), `upper_bound` (the conservative
+accessibility materialization estimate), or `unavailable` with a null observed
+value. A declared Content-Length guard is identified separately from measured
+transfer bytes. Unknown guards have null identifier, bound, observed, and units.
+DOM nodes, frame counts, accessible scalar/source bytes, materialization bounds,
+and final snapshot bytes/refs are distinct; none implies an exact response size.
+Diagnostics contain only validated identifiers and numeric evidence, never page
+text. Older workers can still return limit errors without measurement details.
+
 One action that creates pages is still one operation. Its terminal result
 contains a bounded `page_delta` and complete bounded `page_set`. An
 acknowledgement lost after popup creation is `outcome_ambiguous`; Cayu never
