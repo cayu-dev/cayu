@@ -117,6 +117,23 @@ async def prune_namespace(
         request.namespace.generation,
         limit=request.max_records,
     )
+    # A wait owns its source registrations until its elected result is
+    # durably released.  Scan the bounded operation index independently of the
+    # pruning batch: a small maintenance batch must not accidentally miss a
+    # pin that appears later in caller-key order.
+    from cayu.collaboration.waits import WaitSnapshot, source_key
+
+    pinned_sources: set[str] = set()
+    for generation in range(1, anchor.current_generation + 1):
+        all_records = await tx.scan_operations(
+            request.namespace.namespace_incarnation,
+            generation,
+            limit=anchor.initialization.binding.limits.operations,
+        )
+        for retained in all_records:
+            if _stored_mode(retained) == "collaboration_wait":
+                wait = prepare_contract(WaitSnapshot, retained, redactor=redactor)
+                pinned_sources.update(wait.source_pins)
     released = removed = events_removed = permits_removed = 0
     processed = set()
     processed_requests = set()
@@ -139,6 +156,10 @@ async def prune_namespace(
                     else request_item.expected.intent.expected
                 )
             assert command is not None
+            if source_key(command) in pinned_sources:
+                raise CollaborationUnavailable(
+                    "Wait source remains retained by an active collaboration wait."
+                )
             request_key = _key(command)
             if request_key in processed_requests:
                 continue
@@ -314,6 +335,24 @@ async def prune_namespace(
             permits_removed += 1
             processed.add(parent)
             bundle = (registered, settled)
+        elif mode == "collaboration_wait":
+            wait = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if wait.source_pins or wait.state not in {"cancelled", "expired", "elected"}:
+                raise CollaborationUnavailable(
+                    "Retired namespace retains an unsettled collaboration wait."
+                )
+            await tx.delete(
+                "operations",
+                (
+                    wait.registration.wait.operation.namespace_incarnation,
+                    wait.registration.wait.operation.generation,
+                    wait.registration.wait.operation.caller_key,
+                ),
+            )
+            released += len(contract_bytes(wait, redactor=redactor))
+            removed += 1
+            events_removed += len(wait.events)
+            continue
         else:
             raise CollaborationUnavailable("Unknown retained operation cannot be pruned.")
         references: list[HistoryKey] = []

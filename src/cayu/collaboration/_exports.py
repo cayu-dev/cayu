@@ -1,6 +1,16 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "CollaborationWait": ("cayu.collaboration.waits", "CollaborationWait"),
+    "WaitEvidence": ("cayu.collaboration.waits", "WaitEvidence"),
+    "WaitElection": ("cayu.collaboration.waits", "WaitElection"),
+    "WaitRegistration": ("cayu.collaboration.waits", "WaitRegistration"),
+    "WaitSnapshot": ("cayu.collaboration.waits", "WaitSnapshot"),
+    "WaitControl": ("cayu.collaboration.waits", "WaitControl"),
+    "CollaborationWaitLatchReceiver": (
+        "cayu.collaboration._wait_coordinator",
+        "CollaborationWaitLatchReceiver",
+    ),
     "RequestDueCursor": ("cayu.collaboration.requests", "RequestDueCursor"),
     "RequestDuePage": ("cayu.collaboration.requests", "RequestDuePage"),
     "RequestRegistration": ("cayu.collaboration.request_access", "RequestRegistration"),

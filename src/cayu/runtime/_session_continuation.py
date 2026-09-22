@@ -182,6 +182,11 @@ class ContinuationLatch(ContractValue):
     latch_key: StrictStr = Field(min_length=1, max_length=256)
     outcome_digest: StrictStr
     accepted_at: StrictStr
+    # Optional source identity used by registered collaboration receivers.
+    # Existing continuation producers leave it unset; a collaboration wait
+    # supplies it so the receiver can perform durable exact readback after a
+    # process restart instead of relying on an in-memory callback map.
+    wait_operation: OperationRef | None = None
 
     unordered_fields = frozenset({"selected_manifest"})
 

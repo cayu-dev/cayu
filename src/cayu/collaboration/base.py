@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from functools import partial
+from hashlib import sha256
 from typing import ClassVar, Literal, Protocol, cast
 from uuid import uuid4
 
@@ -75,6 +76,7 @@ from cayu.collaboration.requests import (
     RequestControlReceipt,
     RequestReceipt,
 )
+from cayu.collaboration.waits import wait_identity_digest
 from cayu.vaults.redaction import SecretRedactor
 
 Table = Literal[
@@ -151,6 +153,33 @@ class _Anchor(ContractValue):
     retained_bytes: Counter
     alias_revision: Counter
     reserved_operations: Counter = 0
+
+
+def _consume_wait_reservation(snapshot, updated, *, redactor):
+    """Charge materialized wait growth against its terminal reserve."""
+    from cayu.collaboration._preparation import contract_bytes
+
+    old_bytes = len(contract_bytes(snapshot, redactor=redactor))
+    new_bytes = len(contract_bytes(updated, redactor=redactor))
+    byte_growth = max(0, new_bytes - old_bytes)
+    event_growth = max(0, len(updated.events) - len(snapshot.events))
+    return updated.model_copy(
+        update={
+            "reserved_bytes": min(
+                updated.reserved_bytes,
+                max(0, snapshot.reserved_bytes - byte_growth),
+            ),
+            "reserved_events": min(
+                updated.reserved_events,
+                max(0, snapshot.reserved_events - event_growth),
+            ),
+        }
+    )
+
+
+def _wait_event_growth(snapshot, updated) -> int:
+    """Return newly retained wait events for aggregate capacity accounting."""
+    return len(updated.events) - len(snapshot.events)
 
 
 def _key(
@@ -320,6 +349,671 @@ class CollaborationStore(ABC):
         anchor = prepare_contract(_Anchor, raw, redactor=redactor)
         require_exact_contract(expected, anchor.initialization, redactor=redactor)
         return anchor
+
+    async def register_wait(self, initialized, wait, *, redactor: SecretRedactor):
+        return await self._owned_wait("register", self._register_wait, initialized, wait, redactor)
+
+    async def load_wait(self, initialized, wait, *, redactor: SecretRedactor):
+        return await self._owned_wait("load", self._load_wait, initialized, wait, redactor)
+
+    async def record_wait_evidence(self, initialized, wait, evidence, *, redactor: SecretRedactor):
+        from cayu.collaboration.waits import WaitEvidence
+
+        evidence = prepare_contract(WaitEvidence, evidence, redactor=redactor)
+        return await self._owned_wait(
+            "evidence", self._record_wait_evidence, initialized, wait, redactor, evidence=evidence
+        )
+
+    async def release_wait_sources(self, initialized, wait, *, redactor: SecretRedactor):
+        return await self._owned_wait(
+            "release", self._release_wait_sources, initialized, wait, redactor
+        )
+
+    async def record_wait_delivery(
+        self,
+        initialized,
+        wait,
+        *,
+        receipt_digest: str,
+        delivery: Literal["accepted", "excluded"] = "accepted",
+        redactor: SecretRedactor,
+    ):
+        return await self._owned_wait(
+            "delivery",
+            self._record_wait_delivery,
+            initialized,
+            wait,
+            redactor,
+            receipt_digest=receipt_digest,
+            delivery=delivery,
+        )
+
+    async def cancel_wait(self, initialized, wait, *, expired: bool, redactor: SecretRedactor):
+        return await self._owned_wait(
+            "cancel", self._cancel_wait, initialized, wait, redactor, expired=expired
+        )
+
+    async def _owned_wait(self, action, operation, initialized, wait, redactor, **kwargs):
+        from cayu._validation import canonical_durable_json_bytes
+        from cayu.collaboration._contracts import snapshot_input
+        from cayu.collaboration.waits import CollaborationWait, wait_operation_key
+
+        initialized = prepare_contract(CollaborationInitialization, initialized, redactor=redactor)
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        extra = canonical_durable_json_bytes(snapshot_input(kwargs), "wait operation")
+        expectation = sha256(
+            contract_bytes(initialized, redactor=redactor)
+            + b"\x00"
+            + contract_bytes(wait, redactor=redactor)
+            + b"\x00"
+            + extra
+        ).digest()
+        return await self._owners.run(
+            partial(operation, initialized, wait, redactor=redactor, **kwargs),
+            key=("wait", action, initialized.binding.application_scope, *wait_operation_key(wait)),
+            expectation=expectation,
+            redactor=redactor,
+        )
+
+    async def _register_wait(
+        self,
+        initialized: CollaborationInitialization,
+        wait,
+        *,
+        redactor: SecretRedactor,
+    ):
+        """Persist one exact wait registration without dispatching source work."""
+
+        from cayu.collaboration._namespace_store import require_open_namespace
+        from cayu.collaboration.waits import (
+            CollaborationWait,
+            WaitEvent,
+            WaitRegistration,
+            WaitSnapshot,
+            deadline_ms,
+            wait_identity_digest,
+            wait_operation_key,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        if (
+            wait.source_owner != initialized.owner
+            or wait.operation.application_scope != initialized.binding.application_scope
+            or wait.operation.namespace_incarnation != initialized.namespace_incarnation
+            or wait.initiator.issuer != initialized.owner
+        ):
+            raise CollaborationConflict("Wait registration conflicts with initialized authority.")
+        key = wait_operation_key(wait)
+        async with self._transaction(initialized.binding.application_scope, write=True) as tx:
+            anchor = await self._anchor(tx, initialized, redactor)
+            raw = await tx.get("operations", key)
+            if raw is not None:
+                if _stored_mode(raw) != "collaboration_wait":
+                    raise CollaborationConflict("Wait key already belongs to another operation.")
+                existing = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+                if wait_identity_digest(existing.registration.wait) != wait_identity_digest(wait):
+                    raise CollaborationConflict("Wait registration intent changed.")
+                return existing
+            await require_open_namespace(tx, anchor, wait.operation, redactor)
+            if await tx.now_ms() >= deadline_ms(wait.deadline):
+                raise CollaborationConflict("Wait deadline has already passed.")
+            registration = WaitRegistration(
+                wait=wait,
+                registration_digest=wait_identity_digest(wait),
+                registered_sequence=1,
+            )
+            event = WaitEvent(sequence=1, kind="registered")
+            snapshot = WaitSnapshot(
+                registration=registration,
+                state="pending",
+                revision=1,
+                source_pins=wait.source_keys,
+                events=(event,),
+            )
+            updated = prepare_contract(
+                _Anchor,
+                anchor.model_copy(
+                    update={
+                        "operation_count": anchor.operation_count + 1,
+                        "event_count": anchor.event_count + len(snapshot.events),
+                        "reserved_events": anchor.reserved_events + snapshot.reserved_events,
+                        "reserved_bytes": anchor.reserved_bytes + snapshot.reserved_bytes,
+                        "retained_bytes": anchor.retained_bytes
+                        + len(contract_bytes(snapshot, redactor=redactor)),
+                    }
+                ),
+                redactor=redactor,
+            )
+            require_capacity(updated, ordinary=True)
+            await tx.put("operations", key, snapshot, insert=True)
+            await tx.put("anchors", (), updated, insert=False)
+            return snapshot
+
+    async def _load_wait(
+        self,
+        initialized: CollaborationInitialization,
+        wait,
+        *,
+        redactor: SecretRedactor,
+    ):
+        from cayu.collaboration.waits import (
+            CollaborationWait,
+            WaitSnapshot,
+            wait_operation_key,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        async with self._transaction(initialized.binding.application_scope, write=False) as tx:
+            raw = await tx.get("operations", wait_operation_key(wait))
+            if raw is None:
+                return None
+            if _stored_mode(raw) != "collaboration_wait":
+                raise CollaborationConflict("Wait key belongs to another operation.")
+            snapshot = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if wait_identity_digest(snapshot.registration.wait) != wait_identity_digest(wait):
+                raise CollaborationConflict("Wait registration intent changed.")
+            return snapshot
+
+    async def _record_wait_evidence(
+        self,
+        initialized: CollaborationInitialization,
+        wait,
+        evidence,
+        *,
+        redactor: SecretRedactor,
+    ):
+        """Atomically append exact evidence and elect a result when possible."""
+
+        from cayu.collaboration.waits import (
+            CollaborationWait,
+            WaitElection,
+            WaitEvent,
+            WaitEvidence,
+            WaitSnapshot,
+            deadline_ms,
+            election_digest,
+            evaluate_wait,
+            ref_key,
+            source_key,
+            wait_operation_key,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        evidence = prepare_contract(WaitEvidence, evidence, redactor=redactor)
+        key = wait_operation_key(wait)
+        async with self._transaction(initialized.binding.application_scope, write=True) as tx:
+            raw = await tx.get("operations", key)
+            if raw is None:
+                raise CollaborationUnavailable("Wait registration is unavailable.")
+            snapshot = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if wait_identity_digest(snapshot.registration.wait) != wait_identity_digest(wait):
+                raise CollaborationConflict("Wait registration intent changed.")
+            if ref_key(evidence.target) not in wait.target_keys:
+                raise CollaborationConflict("Evidence belongs to another wait target.")
+            now = await tx.now_ms()
+            prior = next(
+                (
+                    item
+                    for item in snapshot.evidence
+                    if ref_key(item.target) == ref_key(evidence.target)
+                ),
+                None,
+            )
+            if prior is not None:
+                prior_without_ingestion = prior.model_copy(update={"ingestion_sequence": 0})
+                if prior_without_ingestion == evidence and not (
+                    snapshot.state == "pending" and now >= deadline_ms(wait.deadline)
+                ):
+                    return snapshot
+                if (
+                    prior.receipt_digest == evidence.receipt_digest
+                    and prior.status == evidence.status
+                    and prior.commitment == evidence.commitment
+                    and not (snapshot.state == "pending" and now >= deadline_ms(wait.deadline))
+                ):
+                    # The store owns ingestion and observation timestamps, so
+                    # the replayed source evidence will not compare equal
+                    # byte-for-byte.  Its authenticated receipt digest and
+                    # classification are the stable idempotency identity.
+                    return snapshot
+                if prior.receipt_digest == evidence.receipt_digest and not (
+                    snapshot.state == "pending" and now >= deadline_ms(wait.deadline)
+                ):
+                    raise CollaborationConflict("Evidence receipt changed for this target.")
+            if prior is not None and now < deadline_ms(wait.deadline):
+                if (
+                    prior.model_copy(
+                        update={
+                            "accepted_at_ms": evidence.accepted_at_ms,
+                            "observed_at_ms": evidence.observed_at_ms,
+                            "ingestion_sequence": evidence.ingestion_sequence,
+                        }
+                    )
+                    == evidence
+                ):
+                    return snapshot
+                if prior.status in {"success", "failure", "settled"}:
+                    if evidence.status in {"ambiguous", "unavailable"}:
+                        return snapshot
+                    raise CollaborationConflict("Wait target evidence changed.")
+                if evidence.status in {"ambiguous", "unavailable"}:
+                    return snapshot
+            if snapshot.state != "pending":
+                raise CollaborationConflict("A terminal wait cannot accept new evidence.")
+            if now >= deadline_ms(wait.deadline):
+                # A deadline is an election boundary, not proof that every
+                # unresolved target failed.  Close the wait with explicit
+                # unavailable evidence so consumers can distinguish an
+                # unknown source from a settled failure.
+                evidence_items = list(snapshot.evidence)
+                events = list(snapshot.events)
+                known = {ref_key(item.target) for item in evidence_items}
+                for target in wait.targets:
+                    target_key = ref_key(target.intent.selection.reference)
+                    if target_key in known:
+                        continue
+                    unavailable = WaitEvidence(
+                        target=target.intent.selection.reference,
+                        status="unavailable",
+                        ingestion_sequence=len(events) + 1,
+                        source_sequence=1,
+                        accepted_at_ms=now,
+                        observed_at_ms=now,
+                        receipt_digest=sha256(source_key(target).encode()).hexdigest(),
+                    )
+                    evidence_items.append(unavailable)
+                    events.append(
+                        WaitEvent(
+                            sequence=len(events) + 1,
+                            kind="evidence",
+                            target=unavailable.target,
+                            evidence_digest=unavailable.receipt_digest,
+                        )
+                    )
+                evidence_tuple = tuple(evidence_items)
+                election_sequence = len(events) + 1
+                election = WaitElection(
+                    result="unavailable",
+                    selected=(),
+                    evidence=evidence_tuple,
+                    sequence=election_sequence,
+                    elected_at_ms=now,
+                    outcome_digest=election_digest(
+                        "unavailable", (), evidence_tuple, election_sequence, now
+                    ),
+                )
+                events.append(WaitEvent(sequence=election_sequence, kind="elected"))
+                pending_delivery = wait.delivery_ticket is not None
+                expired = snapshot.model_copy(
+                    update={
+                        "state": "elected",
+                        "election": election,
+                        "evidence": evidence_tuple,
+                        "delivery": "pending" if pending_delivery else "none",
+                        "source_pins": snapshot.source_pins if pending_delivery else (),
+                        "reserved_bytes": snapshot.reserved_bytes if pending_delivery else 0,
+                        "reserved_events": snapshot.reserved_events if pending_delivery else 0,
+                        "revision": snapshot.revision + 1,
+                        "events": (
+                            *events,
+                            *(
+                                ()
+                                if pending_delivery
+                                else (WaitEvent(sequence=len(events) + 1, kind="released"),)
+                            ),
+                        ),
+                    }
+                )
+                expired = _consume_wait_reservation(snapshot, expired, redactor=redactor)
+                anchor = await self._anchor(tx, initialized, redactor)
+                updated_anchor = prepare_contract(
+                    _Anchor,
+                    anchor.model_copy(
+                        update={
+                            "event_count": anchor.event_count
+                            + _wait_event_growth(snapshot, expired),
+                            "retained_bytes": anchor.retained_bytes
+                            + len(contract_bytes(expired, redactor=redactor))
+                            - len(contract_bytes(snapshot, redactor=redactor)),
+                            "reserved_bytes": anchor.reserved_bytes
+                            + expired.reserved_bytes
+                            - snapshot.reserved_bytes,
+                            "reserved_events": anchor.reserved_events
+                            + expired.reserved_events
+                            - snapshot.reserved_events,
+                        }
+                    ),
+                    redactor=redactor,
+                )
+                require_capacity(updated_anchor, ordinary=True)
+                await tx.put("operations", key, expired, insert=False)
+                await tx.put("anchors", (), updated_anchor, insert=False)
+                return expired
+            # The source may carry a completion timestamp, but it cannot
+            # backdate admission into this wait.  Both admission and
+            # observation are owned by this store's physical clock.
+            evidence = evidence.model_copy(
+                update={
+                    "accepted_at_ms": now,
+                    "observed_at_ms": now,
+                    "ingestion_sequence": len(snapshot.events) + 1,
+                }
+            )
+            evidence_items = (
+                *(item for item in snapshot.evidence if item.target != evidence.target),
+                evidence,
+            )
+            events = (
+                *snapshot.events,
+                WaitEvent(
+                    sequence=len(snapshot.events) + 1,
+                    kind="evidence",
+                    target=evidence.target,
+                    evidence_digest=evidence.receipt_digest,
+                ),
+            )
+            result = evaluate_wait(wait, evidence_items)
+            election = None
+            state = "pending"
+            if result is not None:
+                selected = tuple(
+                    item.target
+                    for item in sorted(evidence_items, key=lambda item: item.ingestion_sequence)
+                    if item.status == "success"
+                )
+                sequence = len(events) + 1
+                elected_at_ms = evidence.observed_at_ms
+                digest = election_digest(result, selected, evidence_items, sequence, elected_at_ms)
+                election = WaitElection(
+                    result=result,
+                    selected=selected,
+                    evidence=evidence_items,
+                    sequence=sequence,
+                    elected_at_ms=elected_at_ms,
+                    outcome_digest=digest,
+                )
+                events = (*events, WaitEvent(sequence=sequence, kind="elected"))
+                state = "elected"
+            delivery = (
+                "pending" if state == "elected" and wait.delivery_ticket is not None else "none"
+            )
+            terminal_no_delivery = result is not None and wait.delivery_ticket is None
+            updated = snapshot.model_copy(
+                update={
+                    "state": state,
+                    "delivery": delivery,
+                    "evidence": evidence_items,
+                    "election": election,
+                    "source_pins": () if terminal_no_delivery else snapshot.source_pins,
+                    "reserved_bytes": 0 if terminal_no_delivery else snapshot.reserved_bytes,
+                    "reserved_events": 0 if terminal_no_delivery else snapshot.reserved_events,
+                    "revision": snapshot.revision + 1,
+                    "events": (
+                        (*events, WaitEvent(sequence=len(events) + 1, kind="released"))
+                        if terminal_no_delivery
+                        else events
+                    ),
+                }
+            )
+            updated = _consume_wait_reservation(snapshot, updated, redactor=redactor)
+            anchor = await self._anchor(tx, initialized, redactor)
+            updated = prepare_contract(updated.__class__, updated, redactor=redactor)
+            updated_anchor = prepare_contract(
+                _Anchor,
+                anchor.model_copy(
+                    update={
+                        "event_count": anchor.event_count + _wait_event_growth(snapshot, updated),
+                        "retained_bytes": anchor.retained_bytes
+                        + len(contract_bytes(updated, redactor=redactor))
+                        - len(contract_bytes(snapshot, redactor=redactor)),
+                        "reserved_bytes": anchor.reserved_bytes
+                        + updated.reserved_bytes
+                        - snapshot.reserved_bytes,
+                        "reserved_events": anchor.reserved_events
+                        + updated.reserved_events
+                        - snapshot.reserved_events,
+                    }
+                ),
+                redactor=redactor,
+            )
+            require_capacity(updated_anchor, ordinary=True)
+            await tx.put("operations", key, updated, insert=False)
+            await tx.put("anchors", (), updated_anchor, insert=False)
+            return updated
+
+    async def _release_wait_sources(
+        self,
+        initialized: CollaborationInitialization,
+        wait,
+        *,
+        redactor: SecretRedactor,
+    ):
+        """Release source-retention pins after an external election is readable."""
+
+        from cayu.collaboration.waits import (
+            CollaborationWait,
+            WaitEvent,
+            WaitSnapshot,
+            wait_operation_key,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        key = wait_operation_key(wait)
+        async with self._transaction(initialized.binding.application_scope, write=True) as tx:
+            raw = await tx.get("operations", key)
+            if raw is None:
+                raise CollaborationUnavailable("Wait registration is unavailable.")
+            snapshot = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if wait_identity_digest(snapshot.registration.wait) != wait_identity_digest(wait):
+                raise CollaborationConflict("Wait registration intent changed.")
+            if snapshot.state != "elected" or not snapshot.source_pins:
+                return snapshot
+            if snapshot.registration.wait.delivery_ticket is not None:
+                raise CollaborationConflict(
+                    "Session-bound source retention requires an acknowledged delivery receipt."
+                )
+            released = snapshot.model_copy(
+                update={
+                    "source_pins": (),
+                    "revision": snapshot.revision + 1,
+                    "events": (
+                        *snapshot.events,
+                        WaitEvent(sequence=len(snapshot.events) + 1, kind="released"),
+                    ),
+                }
+            )
+            released = _consume_wait_reservation(snapshot, released, redactor=redactor)
+            old_bytes = len(contract_bytes(snapshot, redactor=redactor))
+            new_bytes = len(contract_bytes(released, redactor=redactor))
+            anchor = await self._anchor(tx, initialized, redactor)
+            updated_anchor = prepare_contract(
+                _Anchor,
+                anchor.model_copy(
+                    update={
+                        "event_count": anchor.event_count + _wait_event_growth(snapshot, released),
+                        "retained_bytes": anchor.retained_bytes + new_bytes - old_bytes,
+                        "reserved_bytes": anchor.reserved_bytes
+                        + released.reserved_bytes
+                        - snapshot.reserved_bytes,
+                        "reserved_events": anchor.reserved_events
+                        + released.reserved_events
+                        - snapshot.reserved_events,
+                    }
+                ),
+                redactor=redactor,
+            )
+            require_capacity(updated_anchor, ordinary=True)
+            await tx.put("operations", key, released, insert=False)
+            await tx.put("anchors", (), updated_anchor, insert=False)
+            return released
+
+    async def _record_wait_delivery(
+        self,
+        initialized: CollaborationInitialization,
+        wait,
+        *,
+        receipt_digest: str,
+        delivery: Literal["accepted", "excluded"] = "accepted",
+        redactor: SecretRedactor,
+    ):
+        from cayu.collaboration.waits import (
+            CollaborationWait,
+            WaitEvent,
+            WaitSnapshot,
+            wait_operation_key,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        key = wait_operation_key(wait)
+        async with self._transaction(initialized.binding.application_scope, write=True) as tx:
+            raw = await tx.get("operations", key)
+            if raw is None:
+                raise CollaborationUnavailable("Wait registration is unavailable.")
+            snapshot = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if wait_identity_digest(snapshot.registration.wait) != wait_identity_digest(wait):
+                raise CollaborationConflict("Wait registration intent changed.")
+            if delivery == "accepted" and (
+                snapshot.state != "elected" or snapshot.election is None
+            ):
+                raise CollaborationConflict("Wait has no elected delivery.")
+            if delivery == "excluded" and snapshot.state not in {
+                "cancelled",
+                "expired",
+                "unavailable",
+            }:
+                raise CollaborationConflict("Wait is not eligible for exclusion.")
+            if snapshot.delivery in {"accepted", "excluded"}:
+                if (
+                    snapshot.delivery != delivery
+                    or snapshot.delivery_receipt_digest != receipt_digest
+                ):
+                    raise CollaborationConflict("Wait delivery receipt changed.")
+                return snapshot
+            if (
+                snapshot.registration.wait.delivery_ticket is not None
+                and snapshot.delivery != "pending"
+            ):
+                raise CollaborationConflict("Wait delivery has no pending handoff responsibility.")
+            if snapshot.delivery not in {"none", "pending"}:
+                raise CollaborationConflict("Wait delivery is already terminal.")
+            updated = snapshot.model_copy(
+                update={
+                    "delivery": delivery,
+                    "delivery_receipt_digest": receipt_digest,
+                    "source_pins": (),
+                    "reserved_bytes": 0,
+                    "reserved_events": 0,
+                    "revision": snapshot.revision + 1,
+                    "events": (
+                        *snapshot.events,
+                        WaitEvent(sequence=len(snapshot.events) + 1, kind="released"),
+                    ),
+                }
+            )
+            updated = _consume_wait_reservation(snapshot, updated, redactor=redactor)
+            anchor = await self._anchor(tx, initialized, redactor)
+            updated_anchor = prepare_contract(
+                _Anchor,
+                anchor.model_copy(
+                    update={
+                        "event_count": anchor.event_count + _wait_event_growth(snapshot, updated),
+                        "retained_bytes": anchor.retained_bytes
+                        + len(contract_bytes(updated, redactor=redactor))
+                        - len(contract_bytes(snapshot, redactor=redactor)),
+                        "reserved_bytes": anchor.reserved_bytes - snapshot.reserved_bytes,
+                        "reserved_events": anchor.reserved_events - snapshot.reserved_events,
+                    }
+                ),
+                redactor=redactor,
+            )
+            require_capacity(updated_anchor, ordinary=True)
+            await tx.put("operations", key, updated, insert=False)
+            await tx.put("anchors", (), updated_anchor, insert=False)
+            return updated
+
+    async def _cancel_wait(
+        self,
+        initialized: CollaborationInitialization,
+        wait,
+        *,
+        expired: bool,
+        redactor: SecretRedactor,
+    ):
+        from cayu.collaboration.waits import (
+            CollaborationWait,
+            WaitEvent,
+            WaitSnapshot,
+            deadline_ms,
+            wait_identity_digest,
+            wait_operation_key,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=redactor)
+        key = wait_operation_key(wait)
+        async with self._transaction(initialized.binding.application_scope, write=True) as tx:
+            raw = await tx.get("operations", key)
+            if raw is None:
+                raise CollaborationUnavailable("Wait registration is unavailable.")
+            snapshot = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if wait_identity_digest(snapshot.registration.wait) != wait_identity_digest(wait):
+                raise CollaborationConflict("Wait registration intent changed.")
+            if snapshot.state != "pending":
+                return snapshot
+            now = await tx.now_ms()
+            deadline_passed = now >= deadline_ms(wait.deadline)
+            if expired and not deadline_passed:
+                raise CollaborationConflict("Wait deadline has not passed.")
+            # Expiry is the authoritative classification at and after the
+            # owner deadline, even when a caller submits an ordinary cancel
+            # at the same boundary.  This keeps cancellation from racing the
+            # store-owned deadline into a different terminal result.
+            state = "expired" if expired or deadline_passed else "cancelled"
+            pending_delivery = wait.delivery_ticket is not None
+            updated_events = (
+                *snapshot.events,
+                WaitEvent(sequence=len(snapshot.events) + 1, kind=state),
+            )
+            if snapshot.source_pins and not pending_delivery:
+                updated_events = (
+                    *updated_events,
+                    WaitEvent(sequence=len(updated_events) + 1, kind="released"),
+                )
+            updated = snapshot.model_copy(
+                update={
+                    "state": state,
+                    "terminal_at_ms": now,
+                    "revision": snapshot.revision + 1,
+                    "delivery": "pending" if pending_delivery else "none",
+                    "source_pins": snapshot.source_pins if pending_delivery else (),
+                    "reserved_bytes": snapshot.reserved_bytes if pending_delivery else 0,
+                    "reserved_events": snapshot.reserved_events if pending_delivery else 0,
+                    "events": updated_events,
+                }
+            )
+            updated = _consume_wait_reservation(snapshot, updated, redactor=redactor)
+            anchor = await self._anchor(tx, initialized, redactor)
+            updated_anchor = prepare_contract(
+                _Anchor,
+                anchor.model_copy(
+                    update={
+                        "event_count": anchor.event_count + _wait_event_growth(snapshot, updated),
+                        "retained_bytes": anchor.retained_bytes
+                        + len(contract_bytes(updated, redactor=redactor))
+                        - len(contract_bytes(snapshot, redactor=redactor)),
+                        "reserved_bytes": anchor.reserved_bytes
+                        + updated.reserved_bytes
+                        - snapshot.reserved_bytes,
+                        "reserved_events": anchor.reserved_events
+                        + updated.reserved_events
+                        - snapshot.reserved_events,
+                    }
+                ),
+                redactor=redactor,
+            )
+            require_capacity(updated_anchor, ordinary=True)
+            await tx.put("operations", key, updated, insert=False)
+            await tx.put("anchors", (), updated_anchor, insert=False)
+            return updated
 
     def _command(
         self,

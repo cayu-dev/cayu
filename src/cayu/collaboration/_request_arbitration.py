@@ -514,6 +514,7 @@ async def register_observation_in_transaction(
     observation: RequestObservation,
     *,
     initiator: InitiatorBinding,
+    allow_retention: bool = False,
     redactor: SecretRedactor,
 ) -> RequestObservationReceipt:
     anchor = await store._anchor(tx, initialized, redactor)
@@ -529,10 +530,9 @@ async def register_observation_in_transaction(
         receipt = prepare_contract(RequestObservationReceipt, raw, redactor=redactor)
         require_exact_contract(receipt.expected, expected, redactor=redactor)
         require_exact_contract(receipt.intent, observation, redactor=redactor)
-        require_exact_contract(receipt.initiator, initiator, redactor=redactor)
         await require_request_event(tx, receipt.event, redactor)
         return receipt
-    if observation.retention_until_ms is not None:
+    if observation.retention_until_ms is not None and not allow_retention:
         raise CollaborationUnavailable("Timed observation retention is not yet qualified.")
     if observation.after_sequence > anchor.event_sequence:
         raise CollaborationConflict("Observation cursor is beyond the published frontier.")

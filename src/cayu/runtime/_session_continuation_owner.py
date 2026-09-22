@@ -376,7 +376,13 @@ class SessionContinuationOwner:
     ) -> ContinuationRecord:
         """Record an exact destination refusal without dispatching admission."""
         retirement = prepare_contract(ContinuationRetirement, candidate, redactor=self.redactor)
-        if retirement.reason not in {"failed", "expired", "unavailable", "superseded"}:
+        if retirement.reason not in {
+            "cancelled",
+            "failed",
+            "expired",
+            "unavailable",
+            "superseded",
+        }:
             raise ContinuationConflict("Continuation exclusion requires a refusal reason.")
         return await self.retire(retirement, invocation=invocation)
 

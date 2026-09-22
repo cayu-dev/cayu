@@ -101,6 +101,7 @@ from cayu.collaboration._permits import (
 )
 from cayu.collaboration._request_coordinator import RequestCoordinator
 from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
+from cayu.collaboration._wait_coordinator import WaitCoordinator
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
 from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.exports import (
@@ -163,6 +164,7 @@ from cayu.collaboration.requests import (
     RequestReceipt,
     RequestSnapshot,
 )
+from cayu.collaboration.waits import CollaborationWait, WaitRegistration, WaitSnapshot
 from cayu.configuration import (
     CayuConfig,
     CayuConfigSource,
@@ -1604,6 +1606,11 @@ class CayuApp:
             registration=collaboration_requests,
             redactor=self._secret_redactor,
         )
+        self._wait_coordinator = WaitCoordinator(
+            participants=self._participant_coordinator,
+            requests=self._request_coordinator,
+            redactor=self._secret_redactor,
+        )
         self._session_export_coordinator = SessionExportCoordinator(
             store=self.session_store,
             registration=session_exports,
@@ -1682,6 +1689,73 @@ class CayuApp:
         return await self._request_coordinator.read_observation(
             expected, observation, context=context
         )
+
+    async def register_collaboration_wait(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+    ) -> WaitSnapshot:
+        return await self._wait_coordinator.register(wait, context=context)
+
+    async def observe_collaboration_wait(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+    ) -> WaitSnapshot:
+        return await self._wait_coordinator.observe(wait, context=context)
+
+    async def inspect_collaboration_wait(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+    ) -> WaitSnapshot | None:
+        return await self._wait_coordinator.inspect(wait, context=context)
+
+    async def lookup_collaboration_wait(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+    ) -> ExactLookup[WaitRegistration]:
+        return await self._wait_coordinator.lookup(wait, context=context)
+
+    async def cancel_collaboration_wait(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+        expired: bool = False,
+    ) -> WaitSnapshot:
+        return await self._wait_coordinator.cancel(wait, context=context, expired=expired)
+
+    async def deliver_collaboration_wait(
+        self, wait: CollaborationWait, *, context: MandateAccessContext, continuation_owner
+    ) -> WaitSnapshot:
+        return await self._wait_coordinator.deliver(
+            wait, context=context, continuation_owner=continuation_owner
+        )
+
+    async def exclude_collaboration_wait(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+        continuation_owner,
+        invocation,
+    ) -> WaitSnapshot:
+        return await self._wait_coordinator.exclude(
+            wait,
+            context=context,
+            continuation_owner=continuation_owner,
+            invocation=invocation,
+        )
+
+    def collaboration_wait_latch_receiver(self):
+        """Return the durable receiver used by session-bound wait delivery."""
+        return self._wait_coordinator.latch_receiver()
 
     async def list_due_collaboration_requests(
         self,

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration.base import CollaborationStore
+from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.storage._collaboration_repository import _SQLRepository
 from cayu.storage.postgres import _PostgresStoreBase
 
@@ -21,6 +23,8 @@ class PostgresCollaborationStore(_PostgresStoreBase, CollaborationStore):
 
     @asynccontextmanager
     async def _transaction(self, scope: str, *, write: bool):
+        if self._owners.closed and asyncio.current_task() not in self._owners.pending:
+            raise CollaborationUnavailable("Collaboration store is closing.")
         await self._ensure_ready()
         async with self._connection() as connection:
             # Reads use the same scope lock: a receipt and its linkage must be

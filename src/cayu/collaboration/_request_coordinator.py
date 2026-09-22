@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from functools import partial
-from typing import Annotated, TypeVar
+from typing import Annotated, NamedTuple, TypeVar
 
 from pydantic import Field, StrictInt
 
@@ -154,6 +154,7 @@ class _Submission(ContractValue):
     request: CollaborationRequest | RequestCommand | RequestControl | RequestControlCommand
     context: MandateAccessContext
     observation: RequestObservation | None = None
+    allow_retention: bool = False
 
 
 class _DueQuery(ContractValue):
@@ -165,6 +166,18 @@ class _DueQuery(ContractValue):
 class _ReceivingSubmission(ContractValue):
     command: RequestAdmissionCommand | RequestProgressCommand | RequestOutcomeCommand
     context: MandateAccessContext
+
+
+class RequestObservationRead(NamedTuple):
+    """Source-owned observation and the snapshot read at its same frontier.
+
+    This is intentionally an internal result.  A consumer must not combine a
+    coverage page with a separately fetched snapshot: publication between
+    those reads could make evidence appear covered when it was not.
+    """
+
+    page: RequestObservationPage
+    snapshot: RequestSnapshot
 
 
 def _initiator(context: MandateAccessContext) -> InitiatorBinding:
@@ -496,6 +509,44 @@ class RequestCoordinator:
         *,
         context: MandateAccessContext,
     ) -> RequestObservationReceipt:
+        return await self._observe_source(
+            expected, observation, context=context, allow_retention=False
+        )
+
+    async def _observe_retained_source(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestObservationReceipt:
+        return await self._observe_source(
+            expected, observation, context=context, allow_retention=True
+        )
+
+    async def _authorize_retained_source(
+        self,
+        expected: RequestCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> None:
+        """Authorize a frozen source command without rereading its record."""
+        expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
+        value = prepare_contract(
+            _Submission,
+            {"request": expected, "context": context},
+            redactor=self._redactor,
+        )
+        await self._run(value, mode="authorize_retained")
+
+    async def _observe_source(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+        allow_retention: bool,
+    ) -> RequestObservationReceipt:
         expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
         observation = prepare_contract(RequestObservation, observation, redactor=self._redactor)
         value = prepare_contract(
@@ -503,6 +554,7 @@ class RequestCoordinator:
             {"request": expected, "context": context, "observation": observation},
             redactor=self._redactor,
         )
+        value = value.model_copy(update={"allow_retention": allow_retention})
         return await self._run(value, mode="register_observation")
 
     async def read_observation(
@@ -521,6 +573,26 @@ class RequestCoordinator:
         )
         result = await self._run(value, mode="read_observation")
         assert isinstance(result, RequestObservationPage)
+        return result
+
+    async def read_observation_source(
+        self,
+        expected: RequestCommand,
+        observation: RequestObservation,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestObservationRead:
+        """Read coverage and the authenticated source snapshot atomically."""
+        expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
+        observation = prepare_contract(RequestObservation, observation, redactor=self._redactor)
+        value = prepare_contract(
+            _Submission,
+            {"request": expected, "context": context, "observation": observation},
+            redactor=self._redactor,
+        )
+        result = await self._run(value, mode="read_observation_source")
+        if not isinstance(result, RequestObservationRead):
+            raise CollaborationUnavailable("Observation source read is unavailable.")
         return result
 
     async def _trusted_mutation(self, command, *, context, operation):
@@ -792,6 +864,8 @@ class RequestCoordinator:
                 )
 
             await validate(("readback",))
+            if mode == "authorize_retained":
+                return None
             original_initiator = _initiator(context) if command is None else command.initiator
             async with store._transaction(initialized.binding.application_scope, write=False) as tx:
                 await self._require_retained_read_grant(tx, request.operation, read_grant)
@@ -869,9 +943,10 @@ class RequestCoordinator:
                         command,
                         value.observation,
                         initiator=_initiator(context),
+                        allow_retention=value.allow_retention,
                         redactor=self._redactor,
                     )
-            if mode == "read_observation":
+            if mode in {"read_observation", "read_observation_source"}:
                 if found is None or command is None or value.observation is None:
                     raise CollaborationUnavailable(
                         "Observation requires retained request authority."
@@ -936,12 +1011,15 @@ class RequestCoordinator:
                         raise CollaborationAccessDenied(
                             "Observation authority expired during read."
                         )
-                    return RequestObservationPage(
+                    page = RequestObservationPage(
                         registration=registration,
                         events=events,
                         coverage_sequence=anchor.event_sequence,
                         complete=True,
                     )
+                    if mode == "read_observation_source":
+                        return RequestObservationRead(page=page, snapshot=current_request)
+                    return page
             if mode == "control":
                 assert isinstance(raw_request, RequestControl)
                 if found is None:

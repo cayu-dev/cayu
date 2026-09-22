@@ -8,6 +8,9 @@ from cayu.collaboration._contracts import CollaborationContractError as Collabor
 from cayu.collaboration._session_export_participant import (
     SessionExportRequestReceivingOwner as SessionExportRequestReceivingOwner,
 )
+from cayu.collaboration._wait_coordinator import (
+    CollaborationWaitLatchReceiver as CollaborationWaitLatchReceiver,
+)
 from cayu.collaboration.access import CollaborationAccessContext as CollaborationAccessContext
 from cayu.collaboration.access import CollaborationAccessDenied as CollaborationAccessDenied
 from cayu.collaboration.access import CollaborationAccessGrant as CollaborationAccessGrant
@@ -145,6 +148,12 @@ from cayu.collaboration.requests import RequestReceipt as RequestReceipt
 from cayu.collaboration.requests import RequestRef as RequestRef
 from cayu.collaboration.requests import RequestSelection as RequestSelection
 from cayu.collaboration.requests import RequestSnapshot as RequestSnapshot
+from cayu.collaboration.waits import CollaborationWait as CollaborationWait
+from cayu.collaboration.waits import WaitControl as WaitControl
+from cayu.collaboration.waits import WaitElection as WaitElection
+from cayu.collaboration.waits import WaitEvidence as WaitEvidence
+from cayu.collaboration.waits import WaitRegistration as WaitRegistration
+from cayu.collaboration.waits import WaitSnapshot as WaitSnapshot
 from cayu.storage.collaboration_postgres import (
     PostgresCollaborationStore as PostgresCollaborationStore,
 )

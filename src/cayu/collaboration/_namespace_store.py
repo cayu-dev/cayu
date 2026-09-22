@@ -139,6 +139,36 @@ async def inspect_retirement(
         )
 
 
+async def _has_wait_responsibility(
+    tx: _Repository,
+    namespace: NamespaceRef,
+    *,
+    current_generation: int,
+    limit: int,
+    redactor: SecretRedactor,
+) -> bool:
+    """Treat active wait source/delivery responsibility as namespace debt."""
+    from cayu.collaboration.waits import WaitSnapshot, source_key
+
+    for generation in range(1, current_generation + 1):
+        for raw in await tx.scan_operations(
+            namespace.namespace_incarnation,
+            generation,
+            limit=limit,
+        ):
+            if _stored_mode(raw) != "collaboration_wait":
+                continue
+            wait = prepare_contract(WaitSnapshot, raw, redactor=redactor)
+            if any(
+                target.operation.namespace_incarnation == namespace.namespace_incarnation
+                and target.operation.generation == namespace.generation
+                and source_key(target) in wait.source_pins
+                for target in wait.registration.wait.targets
+            ):
+                return True
+    return False
+
+
 async def lifecycle_replay(
     store: CollaborationStore, tx: _Repository, expected: LifecycleCommand, redactor: SecretRedactor
 ) -> LifecycleReceipt | None:
@@ -161,6 +191,11 @@ async def lifecycle_replay(
     if _stored_mode(raw) == "request_control":
         prepare_contract(RequestControlReceipt, raw, redactor=redactor)
         raise CollaborationConflict("Operation key already carries request control.")
+    if _stored_mode(raw) == "collaboration_wait":
+        from cayu.collaboration.waits import WaitSnapshot
+
+        prepare_contract(WaitSnapshot, raw, redactor=redactor)
+        raise CollaborationConflict("Operation key already carries a collaboration wait.")
     receipt = prepare_contract(LifecycleReceipt, raw, redactor=redactor)
     require_exact_contract(expected, receipt.expected, redactor=redactor)
     event = await tx.get("events", (receipt.event.sequence,))
@@ -215,6 +250,13 @@ async def apply_lifecycle(
                 request.expected_retired_through != anchor.retired_through
                 or namespace.state != "sealed"
                 or namespace.outstanding_obligations
+                or await _has_wait_responsibility(
+                    tx,
+                    request.namespace,
+                    current_generation=anchor.current_generation,
+                    limit=anchor.initialization.binding.limits.operations,
+                    redactor=redactor,
+                )
             ):
                 raise CollaborationConflict("Namespace retirement requires contiguous settlement.")
             retired_through = namespace.reference.generation

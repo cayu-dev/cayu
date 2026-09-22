@@ -153,3 +153,28 @@ registration, or after a previous read is returned at the next current
 frontier; the registration event itself is metadata and is not reported as
 request work. Missing frontier evidence returns unavailable rather than
 silently reporting a complete page.
+
+## Finite collaboration waits
+
+`CollaborationWait` registers a bounded, finite election over exact request
+commands. It supports `ALL_SUCCESS`, `ALL_SETTLED`, `ANY_SUCCESS`, and
+`QUORUM_SUCCESS`; registration stores the predicate, deadline, source pins,
+and retention responsibility without starting a model, tool, session, or
+background worker.
+
+Use `register_collaboration_wait()` once, then
+`observe_collaboration_wait()` to catch up the authenticated request-source
+frontiers and record evidence. The first qualifying evidence manifest is
+durable and replayable. `inspect_collaboration_wait()` is a read-only exact
+readback; `lookup_collaboration_wait()` returns the shared exact
+match/conflict/not-found/unavailable registration result. `cancel_collaboration_wait()` records cancellation or an
+owner-time expiry without changing the target requests.
+
+An external observer can use these operations without creating a session. A
+session-bound wait carries an exact continuation ticket. After election,
+`deliver_collaboration_wait()` passes the authenticated predicate/result
+binding to a `CollaborationWaitLatchReceiver` registered with the destination;
+cancellation and expiry keep
+their source responsibility pending until an explicit authenticated exclusion
+receipt is recorded. Acknowledgement loss is reconciled by repeating the same
+exact operation, never by rerunning a request producer.
