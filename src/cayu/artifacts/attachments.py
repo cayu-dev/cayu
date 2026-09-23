@@ -202,6 +202,14 @@ def file_attachment_from_payload(payload: object) -> FileAttachment | None:
     return FileAttachment.model_validate(dict(raw_payload))
 
 
+def same_file_attachment_reference(left: FileAttachment, right: FileAttachment) -> bool:
+    """Compare resolution identity, excluding only per-read source provenance."""
+    exclude = {"metadata": {"source_artifact_id"}}
+    return left.model_dump(mode="json", exclude=exclude) == right.model_dump(
+        mode="json", exclude=exclude
+    )
+
+
 def resolved_file_attachment(
     attachment: FileAttachment,
     result: ArtifactReadResult,

@@ -39,7 +39,9 @@ from cayu._filesystem_lock import cooperative_path_lock
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu._validation import DURABLE_DOCUMENT_LIMITS, canonical_durable_json_bytes
 from cayu.artifacts._input_manifest import FolderInputManifest
-from cayu.artifacts.base import ArtifactMetadata, ArtifactReadResult, ArtifactStore
+from cayu.artifacts._store_identity import local_artifact_store_identity
+from cayu.artifacts.attachments import FileAttachment
+from cayu.artifacts.base import ArtifactMetadata, ArtifactReadResult, ArtifactScope, ArtifactStore
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.collaboration._contracts import (
     ContractValue,
@@ -73,7 +75,7 @@ from cayu.collaboration.mandates import (
     ResourceSelector,
     ResourceSelectorOwner,
 )
-from cayu.collaboration.participants import CollaborationInitialization
+from cayu.collaboration.participants import CollaborationInitialization, ParticipantRef
 from cayu.vaults.redaction import SecretRedactor
 
 RESOURCE_KIND_ARTIFACT = "artifact"
@@ -141,11 +143,7 @@ def _registered_artifact_store(store: ArtifactStore) -> dict[str, object]:
         raise ResourceOwnerUnsupported(
             "Mandate receiver requires the qualified local artifact store."
         )
-    return {
-        "id": store.id,
-        "root": str(store.root),
-        "root_identity": [str(part) for part in store._root_identity],
-    }
+    return local_artifact_store_identity(store)
 
 
 def _reserved_bytes(journal: Mapping[str, object]) -> int:
@@ -2243,6 +2241,19 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
         command = prepare_contract(ResourceTransferCommand, command, redactor=self._redactor)
         return await self._owned(lambda: self._read_transfer(command))
 
+    async def read_preparation(
+        self, command: ResourceAcquisitionCommand | ResourceTransferCommand
+    ) -> ResourcePreparationReceipt:
+        """Read exact owner-issued preparation evidence under its fence."""
+        command = prepare_contract(type(command), command, redactor=self._redactor)
+
+        async def operation():
+            stored = await self._require_authorization(command, None)
+            async with self._preparation_reader.revalidation_guard(command, stored.lease):
+                return stored
+
+        return await self._owned(operation)
+
     async def _read_transfer(self, command):
         found = await self._read_transfer_for_cleanup(command)
         if not isinstance(found, ExactMatch):
@@ -2503,6 +2514,144 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
             )
 
         return await self._owned(admitted, destination_owner)
+
+    async def _release_transferred_source_internal(
+        self,
+        transfer: ResourceTransferReceipt,
+        *,
+        destination_owner: LocalArtifactResourceOwner,
+    ) -> ResourceAcquisitionReceipt:
+        """Owner-internal cleanup after authenticated destination acceptance.
+
+        This path deliberately does not reacquire the source mandate: the
+        destination's exact accepted receipt is the durable handoff evidence.
+        It is not exposed as acquisition authority and is only used by an
+        already authenticated recovery owner.
+        """
+        if not isinstance(destination_owner, LocalArtifactResourceOwner):
+            raise TypeError("destination_owner must be a registered local resource owner.")
+        transfer = prepare_contract(ResourceTransferReceipt, transfer, redactor=self._redactor)
+        return await self._owned(
+            lambda: self._release_transferred_source(transfer, destination_owner=destination_owner),
+            destination_owner,
+        )
+
+    async def _run_context_view_commit(
+        self,
+        receipts: tuple[ResourceAcquisitionReceipt, ...],
+        *,
+        participant: ParticipantRef,
+        attachments: tuple[FileAttachment, ...],
+        artifact_store: ArtifactStore | None,
+        environment_name: str,
+        session_id: str,
+        operation: Callable[[], Awaitable[_ResultT]],
+    ) -> _ResultT:
+        """Authenticate source retention and fence it through view publication."""
+        receipts = tuple(
+            prepare_contract(ResourceAcquisitionReceipt, item, redactor=self._redactor)
+            for item in receipts
+        )
+
+        async def admitted():
+            for receipt in receipts:
+                if receipt.command.destination != self.owner:
+                    raise ResourceOwnerConflict("Context-view resource belongs to another owner.")
+                found = await self._readback(receipt.command)
+                if not isinstance(found, ExactMatch) or found.receipt != receipt:
+                    raise ResourceOwnerUnavailable("Context-view resource is not retained.")
+                preparation = await self._require_authorization(receipt.command, None)
+                if preparation.permit.intent.request.participant != participant:
+                    raise ResourceOwnerConflict(
+                        "Context-view resource belongs to another participant."
+                    )
+            await self._validate_context_artifacts(
+                attachments,
+                artifact_store=artifact_store,
+                environment_name=environment_name,
+                session_id=session_id,
+            )
+            return await operation()
+
+        return await self._owned(admitted)
+
+    async def _validate_context_artifacts(
+        self,
+        attachments: tuple[FileAttachment, ...],
+        *,
+        artifact_store: ArtifactStore | None,
+        environment_name: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Validate resolution while publication/creation owns our retention fence.
+
+        A transfer retains bytes; it does not rewrite session/environment access
+        scope or copy material into another physical store. Only shared local
+        environment artifacts are qualified for inert recipient creation;
+        source publication may also authenticate that source's session scope.
+        """
+        if artifact_store is None or (
+            _registered_artifact_store(artifact_store) != _registered_artifact_store(self._store)
+        ):
+            raise ResourceOwnerUnsupported(
+                "Context artifact store does not match retained material."
+            )
+        for attachment in attachments:
+            metadata = await _resource_io(self._store._resource_metadata, attachment.artifact_id)
+            available = (
+                metadata.scope is ArtifactScope.ENVIRONMENT
+                and metadata.environment_name == environment_name
+            ) or (
+                session_id is not None
+                and metadata.scope is ArtifactScope.SESSION
+                and metadata.session_id == session_id
+            )
+            if not available:
+                raise ResourceOwnerUnsupported(
+                    "Retained artifact scope is unavailable to the recipient."
+                )
+            if (
+                metadata.size_bytes != attachment.size_bytes
+                or metadata.content_type != attachment.content_type
+            ):
+                raise ResourceOwnerConflict(
+                    "Attachment reference conflicts with retained material."
+                )
+
+    async def _run_recipient_commit(
+        self,
+        transfers: tuple[ResourceTransferReceipt, ...],
+        *,
+        recipient: ParticipantRef,
+        operation: Callable[[], Awaitable[_ResultT]],
+    ) -> _ResultT:
+        """Fence destination retention through an authenticated child commit."""
+        recipient = prepare_contract(ParticipantRef, recipient, redactor=self._redactor)
+        transfers = tuple(
+            prepare_contract(ResourceTransferReceipt, item, redactor=self._redactor)
+            for item in transfers
+        )
+
+        async def admitted():
+            for transfer in transfers:
+                if transfer.command.destination != recipient.owner:
+                    raise ResourceOwnerConflict("Recipient transfer destination conflicts.")
+                preparation = await self._require_authorization(transfer.command, None)
+                if preparation.permit.intent.request.participant != recipient:
+                    raise ResourceOwnerConflict(
+                        "Resource preparation belongs to another recipient."
+                    )
+                await self._revalidate_preparation(transfer.command, preparation)
+                found = await self._read_transfer_for_cleanup(transfer.command)
+                if (
+                    not isinstance(found, ExactMatch)
+                    or found.receipt != transfer
+                    or found.receipt.stage != "accepted"
+                ):
+                    raise ResourceOwnerUnavailable("Recipient transfer is not currently retained.")
+            return await operation()
+
+        return await self._owned(admitted)
 
     async def _release_transferred_source(
         self,

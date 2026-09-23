@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import warnings
 
 import pytest
 
 from cayu._validation import canonical_bounded_durable_json_bytes
 from cayu.applications import CayuApp
+from cayu.artifacts.attachments import file_attachment
 from cayu.collaboration._contracts import OwnerRef
 from cayu.collaboration.participants import ParticipantRef
 from cayu.events import Event, EventType
+from cayu.messages import ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.base import (
     CompactSessionRequest,
@@ -37,6 +40,8 @@ from cayu.sessions.context_views import (
     ParticipantSessionCreationReceipt,
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
+    RecipientSessionCreationReceipt,
+    RecipientSessionCreationRequest,
     project_context_view_extensions,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -45,7 +50,11 @@ from cayu.storage.sqlite import SQLiteSessionStore
 def _manifest() -> ContextViewManifest:
     owner = OwnerRef(application_scope="app", owner_id="session-owner", incarnation="owner-1")
     participant = ParticipantRef(owner=owner, participant_id="participant", incarnation="p-1")
-    messages_json = '[{"role":"assistant","text":"done"}]'
+    messages_json = json.dumps(
+        [Message.text("assistant", "done").model_dump(mode="json")],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     extension_set_commitment = "sha256:" + hashlib.sha256(b"[]").hexdigest()
     material = {
         "schema_version": 1,
@@ -120,7 +129,9 @@ def test_manifest_is_positive_schema_and_historical_only() -> None:
     manifest = _manifest()
     readback = ContextViewReadback(view=manifest)
     assert readback.historical_only is True
-    assert manifest.messages_json == '[{"role":"assistant","text":"done"}]'
+    assert [Message.model_validate(item) for item in json.loads(manifest.messages_json)] == [
+        Message.text("assistant", "done")
+    ]
     assert "provider" not in manifest.messages_json
 
 
@@ -538,6 +549,13 @@ def test_public_participant_context_view_witness_across_backends(
 async def _test_public_participant_context_view_witness(
     backend: str, tmp_path, postgres_dsn: str | None
 ) -> None:
+    from tests.artifacts.test_resources import (
+        LocalArtifactResourceOwner,
+        _transfer_command,
+        authorized,
+        command,
+        make_store,
+    )
     from tests.core.test_explicit_session_compaction import RecordingCompactor
     from tests.core.test_participant_identity import CONTEXT, app, create, registration
 
@@ -888,6 +906,195 @@ async def _test_public_participant_context_view_witness(
             destination_participant=participant,
             context=CONTEXT,
         )
+        provider_requests_before_recipient = len(provider.requests)
+        artifact_store, artifact = await asyncio.to_thread(make_store, tmp_path)
+        from tests.core.test_builtin_tools import TINY_PNG_BYTES
+
+        from cayu.artifacts import ArtifactScope
+        from cayu.environments import Environment, EnvironmentSpec
+
+        artifact = await artifact_store.put_bytes(
+            TINY_PNG_BYTES,
+            filename="image.png",
+            content_type="image/png",
+            scope=ArtifactScope.ENVIRONMENT,
+            environment_name="resource",
+        )
+        application.register_environment(
+            Environment(EnvironmentSpec(name="resource"), artifact_store=artifact_store)
+        )
+        source_owner_ref = OwnerRef(
+            application_scope=participant.owner.application_scope,
+            owner_id="fork-resource-source",
+            incarnation="source-1",
+        )
+        resource_source = LocalArtifactResourceOwner(
+            tmp_path / "fork-source", owner=source_owner_ref, artifact_store=artifact_store
+        )
+        resource_destination = LocalArtifactResourceOwner(
+            tmp_path / "fork-destination",
+            owner=participant.owner,
+            artifact_store=artifact_store,
+            participant=participant,
+        )
+        acquired = await authorized(
+            resource_source, command(source_owner_ref, artifact.id, store=artifact_store)
+        )
+        accepted = await resource_destination.accept_transfer(
+            _transfer_command(acquired, source_owner_ref, participant.owner),
+            source_owner=resource_source,
+        )
+        recipient_creation = RecipientSessionCreationRequest(
+            request=RunRequest(
+                agent_name="reviewer",
+                environment_name="resource",
+                messages=[
+                    Message.text("user", "recipient first input"),
+                    Message(
+                        role="tool",
+                        content=(
+                            ToolResultPart(
+                                tool_call_id="fork-call",
+                                tool_name="read_file",
+                                artifacts=[
+                                    file_attachment(
+                                        artifact_id=artifact.id,
+                                        kind="image",
+                                        filename=artifact.filename,
+                                        content_type="image/png",
+                                        size_bytes=artifact.size_bytes,
+                                    )
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+            creation_key=f"recipient-fork-{backend}",
+            recipient=participant,
+            mode="fork",
+            selected_view=adopted,
+            resource_transfers=(accepted,),
+            preparation_receipts=(await resource_destination.read_preparation(accepted.command),),
+        )
+        recipient_session, recipient_receipt = await application.create_recipient_session(
+            recipient_creation, context=CONTEXT, resource_owner=resource_destination
+        )
+        assert recipient_receipt.resource_transfer_commitments == (accepted.operation_digest,)
+        assert (await resource_source.readback(acquired.command)).receipt == acquired
+        forged_material = recipient_receipt.model_dump(mode="json", exclude={"receipt_commitment"})
+        forged_material["source_view_commitment"] = "sha256:" + "0" * 64
+        forged_material["receipt_commitment"] = (
+            "sha256:"
+            + hashlib.sha256(
+                canonical_bounded_durable_json_bytes(
+                    forged_material,
+                    "recipient receipt",
+                    max_bytes=512 * 1024,
+                    max_nodes=8192,
+                    max_nesting=64,
+                )
+            ).hexdigest()
+        )
+        forged_handoff = RecipientSessionCreationReceipt.model_validate(forged_material)
+        with pytest.raises(PermissionError, match="durable metadata"):
+            await application.settle_recipient_resource_handoff(
+                forged_handoff,
+                resource_owner=resource_destination,
+                source_owners=(resource_source,),
+                context=CONTEXT,
+            )
+        assert (await resource_source.readback(acquired.command)).receipt == acquired
+        assert recipient_receipt.mode == "fork"
+        assert recipient_session.id != session.id
+        assert len(provider.requests) == provider_requests_before_recipient
+        expected_input = [
+            *json.loads(manifest.messages_json),
+            Message.text("user", "recipient first input").model_dump(mode="json"),
+            Message(
+                role="tool",
+                content=(
+                    ToolResultPart(
+                        tool_call_id="fork-call",
+                        tool_name="read_file",
+                        artifacts=[
+                            file_attachment(
+                                artifact_id=artifact.id,
+                                kind="image",
+                                filename=artifact.filename,
+                                content_type="image/png",
+                                size_bytes=artifact.size_bytes,
+                            )
+                        ],
+                    ),
+                ),
+            ).model_dump(mode="json"),
+        ]
+        assert [
+            message.model_dump(mode="json")
+            for message in await session_store.load_transcript(recipient_session.id)
+        ] == expected_input
+        assert recipient_receipt.participant_receipt.initial_input_commitment == (
+            "sha256:"
+            + hashlib.sha256(
+                canonical_bounded_durable_json_bytes(
+                    expected_input,
+                    "expected recipient input",
+                    max_bytes=8 * 1024 * 1024,
+                    max_nodes=8192,
+                    max_nesting=64,
+                )
+            ).hexdigest()
+        )
+        forged_selection = adopted.model_copy(
+            update={"pin_commitment": "sha256:" + "0" * 64}, deep=True
+        )
+        with pytest.raises(PermissionError, match="ownership"):
+            await application.create_recipient_session(
+                RecipientSessionCreationRequest(
+                    request=recipient_creation.request,
+                    creation_key=f"forged-recipient-{backend}",
+                    recipient=participant,
+                    mode="fork",
+                    selected_view=forged_selection,
+                    resource_transfers=(accepted,),
+                    preparation_receipts=(
+                        await resource_destination.read_preparation(accepted.command),
+                    ),
+                ),
+                context=CONTEXT,
+                resource_owner=resource_destination,
+            )
+        # A frozen model can still be bypassed with model_copy(update=...).
+        # The public request boundary must reject that malformed nested value
+        # before metadata serialization can emit its contents in a warning.
+        malformed_selection = adopted.model_copy(
+            update={"owner_participant": "secret-canary"}, deep=True
+        )
+        with warnings.catch_warnings(record=True) as diagnostics:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="valid selected view receipt"):
+                RecipientSessionCreationRequest(
+                    request=recipient_creation.request,
+                    creation_key=f"malformed-recipient-{backend}",
+                    recipient=participant,
+                    mode="fork",
+                    selected_view=malformed_selection,
+                )
+        assert all("secret-canary" not in str(item.message) for item in diagnostics)
+        with pytest.raises(ValueError, match="conflicts"):
+            await application.create_recipient_session(
+                RecipientSessionCreationRequest(
+                    request=RunRequest(
+                        agent_name="reviewer", messages=[Message.text("user", "changed input")]
+                    ),
+                    creation_key=recipient_creation.creation_key,
+                    recipient=participant,
+                    mode="fork",
+                    selected_view=adopted,
+                ),
+                context=CONTEXT,
+            )
         # A later participant must be authorized even when their first evidence
         # is beyond the public 256-event page, and even for a one-event request.
         _, reader_receipt = await create(application, initialized, key=f"witness-reader-{backend}")
@@ -969,6 +1176,57 @@ async def _test_public_participant_context_view_witness(
                 session_store=session_store,
             )
             await readback_application.initialize_collaboration()
+        recovered_recipient = await readback_application.lookup_recipient_session(
+            recipient_creation, context=CONTEXT
+        )
+        assert recovered_recipient is not None
+        assert recovered_recipient[0].id == recipient_session.id
+        assert recovered_recipient[1] == recipient_receipt
+        # Reconstruct both journal owners and finish the handoff only from the
+        # durable child. SQL session/collaboration stores were reopened above.
+        resource_source = LocalArtifactResourceOwner(
+            tmp_path / "fork-source", owner=source_owner_ref, artifact_store=artifact_store
+        )
+        resource_destination = LocalArtifactResourceOwner(
+            tmp_path / "fork-destination",
+            owner=participant.owner,
+            artifact_store=artifact_store,
+            participant=participant,
+        )
+        assert (
+            await readback_application.reconcile_recipient_resource_handoff(
+                recipient_creation,
+                resource_owner=resource_destination,
+                source_owners=(resource_source,),
+                context=CONTEXT,
+            )
+            == recipient_receipt
+        )
+        assert (
+            await readback_application.reconcile_recipient_resource_handoff(
+                recipient_creation,
+                resource_owner=resource_destination,
+                source_owners=(resource_source,),
+                context=CONTEXT,
+            )
+            == recipient_receipt
+        )
+        assert (await resource_destination.read_transfer(accepted.command)).receipt == accepted
+        from cayu.collaboration._contracts import ExactUnavailable
+
+        assert isinstance(await resource_source.readback(acquired.command), ExactUnavailable)
+        with pytest.raises(ValueError):
+            await artifact_store.delete(artifact.id)
+        replayed_child, replayed_receipt = await readback_application.create_recipient_session(
+            recipient_creation, context=CONTEXT, resource_owner=resource_destination
+        )
+        assert replayed_child.id == recipient_session.id
+        assert replayed_receipt == recipient_receipt
+        assert len(provider.requests) == 3
+        assert [
+            message.model_dump(mode="json")
+            for message in await session_store.load_transcript(recipient_session.id)
+        ] == expected_input
         # The pin is still adopted across parent continuation and durable reopen.
         await session_store.validate_context_view_compaction(session.id, manifest.transcript_cursor)
         readback = await readback_application.read_context_view(

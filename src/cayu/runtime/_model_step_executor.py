@@ -15619,10 +15619,9 @@ def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bo
     # is not authority to resolve the source or part of the derived identity.
     # All other metadata stays strict, including page selections, content
     # digests, browser publication constraints, and unknown extension fields.
-    exclude = {"metadata": {"source_artifact_id"}}
-    return left.model_dump(mode="json", exclude=exclude) == right.model_dump(
-        mode="json", exclude=exclude
-    )
+    from cayu.artifacts.attachments import same_file_attachment_reference
+
+    return same_file_attachment_reference(left, right)
 
 
 def _validate_stream_event(

@@ -21,8 +21,20 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
+from cayu.artifacts.attachments import (
+    FileAttachment,
+    file_attachment_from_payload,
+    same_file_attachment_reference,
+)
+from cayu.artifacts.resources import (
+    ResourceAcquisitionReceipt,
+    ResourcePreparationReceipt,
+    ResourceTransferReceipt,
+    resource_operation_digest,
+)
 from cayu.collaboration._contracts import ContractValue, Generation, Identifier, OwnerRef
 from cayu.collaboration.participants import ParticipantRef
+from cayu.messages import FilePart, Message, ToolResultPart
 from cayu.sessions.base import RunRequest, copy_run_request
 
 CONTEXT_VIEW_CONTRACT_VERSION = 1
@@ -115,6 +127,7 @@ class ParticipantSessionCreationRequest:
 
     request: RunRequest
     creation_key: str
+    metadata_json: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.request) is not RunRequest:
@@ -125,10 +138,20 @@ class ParticipantSessionCreationRequest:
             raise ValueError("creation_key must be at most 256 UTF-8 bytes.")
         object.__setattr__(self, "request", copied)
         object.__setattr__(self, "creation_key", key)
+        if self.metadata_json is not None:
+            object.__setattr__(
+                self,
+                "metadata_json",
+                _canonical_json_text(
+                    self.metadata_json, "participant creation metadata", max_bytes=256 * 1024
+                ),
+            )
 
     @property
     def request_commitment(self) -> str:
         material = self.request.model_dump(mode="json")
+        if self.metadata_json is not None:
+            material = {"request": material, "metadata": json.loads(self.metadata_json)}
         return (
             "sha256:"
             + sha256(
@@ -141,6 +164,217 @@ class ParticipantSessionCreationRequest:
                 )
             ).hexdigest()
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RecipientSessionCreationRequest:
+    """Authenticated, inert recipient creation intent.
+
+    This is deliberately distinct from root participant-session creation.  A
+    FORK carries one exact, already selected historical view; it never carries
+    a live session or a fallback request.
+    """
+
+    request: RunRequest
+    creation_key: str
+    recipient: ParticipantRef
+    mode: Literal["fresh", "fork"] = "fresh"
+    selected_view: ContextViewSelectionReceipt | None = None
+    resource_transfers: tuple[ResourceTransferReceipt, ...] = ()
+    preparation_receipts: tuple[ResourcePreparationReceipt, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not RunRequest:
+            raise TypeError("Recipient creation requires a RunRequest.")
+        if type(self.recipient) is not ParticipantRef:
+            raise TypeError("Recipient creation requires a ParticipantRef.")
+        object.__setattr__(self, "recipient", ParticipantRef.model_validate(self.recipient))
+        key = require_durable_clean_nonblank(self.creation_key, "creation_key")
+        # Reserve the ten bytes used by participant_request's "recipient:" namespace.
+        if len(key.encode("utf-8")) > 246:
+            raise ValueError("creation_key must be at most 246 UTF-8 bytes.")
+        if self.mode not in {"fresh", "fork"}:
+            raise ValueError("Recipient creation mode must be fresh or fork.")
+        if self.mode == "fresh" and self.selected_view is not None:
+            raise ValueError("Fresh creation cannot include a selected view.")
+        if self.mode == "fork":
+            if type(self.selected_view) is not ContextViewSelectionReceipt:
+                raise ValueError("Fork creation requires an exact selected view receipt.")
+            try:
+                # model_copy(update=...) can bypass nested model validation.
+                # ContractValue snapshots known fields without invoking any
+                # serializer and revalidates even already-typed instances.
+                selected_view = ContextViewSelectionReceipt.model_validate(self.selected_view)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Fork creation requires a valid selected view receipt.") from exc
+            object.__setattr__(self, "selected_view", selected_view)
+            if self.selected_view.state not in {"adopted", "transferred"}:
+                raise ValueError("Fork creation requires an adopted or transferred view.")
+        transfers = tuple(self.resource_transfers)
+        if any(type(item) is not ResourceTransferReceipt for item in transfers):
+            raise TypeError("Recipient resource transfers require typed receipts.")
+        transfers = tuple(ResourceTransferReceipt.model_validate(item) for item in transfers)
+        transfer_ids = tuple(item.operation_digest for item in transfers)
+        if len(set(transfer_ids)) != len(transfer_ids):
+            raise ValueError("Resource transfer receipts must be unique.")
+        if any(item.stage != "accepted" for item in transfers):
+            raise ValueError("Only accepted resource transfers can be retained by a recipient.")
+        preparations = tuple(self.preparation_receipts)
+        if any(type(item) is not ResourcePreparationReceipt for item in preparations):
+            raise TypeError("Recipient preparation evidence requires typed receipts.")
+        preparations = tuple(
+            ResourcePreparationReceipt.model_validate(item) for item in preparations
+        )
+        expected_preparations = tuple(resource_operation_digest(item.command) for item in transfers)
+        if tuple(item.operation_digest for item in preparations) != expected_preparations:
+            raise ValueError("Recipient preparation evidence does not match transfers.")
+        object.__setattr__(self, "request", copy_run_request(self.request))
+        object.__setattr__(self, "creation_key", key)
+        object.__setattr__(self, "resource_transfers", transfers)
+        object.__setattr__(self, "preparation_receipts", preparations)
+
+    @property
+    def metadata_json(self) -> str:
+        material = {
+            "mode": self.mode,
+            "original_request_commitment": ParticipantSessionCreationRequest(
+                request=self.request, creation_key=self.creation_key
+            ).request_commitment,
+            "recipient": self.recipient.model_dump(mode="json"),
+            "selected_view": None
+            if self.selected_view is None
+            else self.selected_view.model_dump(mode="json"),
+            "resource_transfers": [
+                item.model_dump(mode="json") for item in self.resource_transfers
+            ],
+            "preparation_receipts": [
+                item.model_dump(mode="json") for item in self.preparation_receipts
+            ],
+        }
+        return canonical_bounded_durable_json_bytes(
+            material,
+            "recipient creation metadata",
+            max_bytes=512 * 1024,
+            max_nodes=8192,
+            max_nesting=64,
+        ).decode()
+
+    @property
+    def participant_request(self) -> ParticipantSessionCreationRequest:
+        request = self.request
+        if self.mode == "fork":
+            assert self.selected_view is not None
+            try:
+                messages = [
+                    Message.model_validate(item)
+                    for item in json.loads(self.selected_view.view.messages_json)
+                ]
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("Selected context-view messages are unavailable.") from exc
+            # Retained history precedes the new first input. Neither may erase
+            # the other, including in exact readback and lost-ACK replay.
+            request = request.model_copy(
+                update={"messages": [*messages, *request.messages]}, deep=True
+            )
+        return ParticipantSessionCreationRequest(
+            request=request,
+            creation_key="recipient:" + self.creation_key,
+            metadata_json=self.metadata_json,
+        )
+
+    @property
+    def input_artifact_ids(self) -> tuple[str, ...]:
+        """Return every artifact referenced by the complete child input."""
+        return tuple(sorted({item.artifact_id for item in self.input_attachments}))
+
+    @property
+    def input_attachments(self) -> tuple[FileAttachment, ...]:
+        """Keep full resolution identity until retained-material validation."""
+        messages = self.participant_request.request.messages
+        references: dict[str, FileAttachment] = {}
+        for message in messages:
+            for part in message.content:
+                if type(part) is FilePart:
+                    payloads = (part.attachment,)
+                elif type(part) is ToolResultPart:
+                    payloads = tuple(part.artifacts)
+                else:
+                    continue
+                for payload in payloads:
+                    attachment = file_attachment_from_payload(payload)
+                    if attachment is not None:
+                        previous = references.get(attachment.artifact_id)
+                        if previous is not None and not same_file_attachment_reference(
+                            previous, attachment
+                        ):
+                            raise ValueError("Recipient attachment references conflict.")
+                        references[attachment.artifact_id] = attachment
+                    elif type(part) is FilePart:
+                        raise ValueError("Recipient file attachment is unsupported.")
+        return tuple(references.values())
+
+
+class RecipientSessionCreationReceipt(ContractValue):
+    """Immutable receipt for one inert recipient-owned child."""
+
+    session_id: Identifier
+    session_instance_id: Identifier
+    recipient: ParticipantRef
+    mode: Literal["fresh", "fork"]
+    creation_key: StrictStr
+    request_commitment: StrictStr
+    source_view_commitment: StrictStr | None = None
+    resource_transfer_commitments: tuple[StrictStr, ...] = ()
+    resource_preparation_commitments: tuple[StrictStr, ...] = ()
+    participant_receipt: ParticipantSessionCreationReceipt
+    receipt_commitment: StrictStr
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> RecipientSessionCreationReceipt:
+        if self.participant_receipt.binding.participant != self.recipient:
+            raise ValueError("Recipient receipt ownership conflicts with its binding.")
+        if self.participant_receipt.binding.session_id != self.session_id:
+            raise ValueError("Recipient receipt session conflicts with its binding.")
+        metadata_text = self.participant_receipt.recipient_metadata_json
+        if metadata_text is None:
+            raise ValueError("Recipient receipt is missing durable creation metadata.")
+        try:
+            metadata = json.loads(metadata_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Recipient receipt metadata is invalid.") from exc
+        if (
+            metadata.get("mode") != self.mode
+            or metadata.get("recipient") != self.recipient.model_dump(mode="json")
+            or tuple(
+                item.get("operation_digest")
+                for item in metadata.get("resource_transfers", ())
+                if isinstance(item, dict)
+            )
+            != tuple(self.resource_transfer_commitments)
+            or tuple(
+                item.get("operation_digest")
+                for item in metadata.get("preparation_receipts", ())
+                if isinstance(item, dict)
+            )
+            != tuple(self.resource_preparation_commitments)
+        ):
+            raise ValueError("Recipient receipt metadata conflicts with its tuple.")
+        material = self.model_dump(mode="json", exclude={"receipt_commitment"})
+        expected = (
+            "sha256:"
+            + sha256(
+                canonical_bounded_durable_json_bytes(
+                    material,
+                    "recipient receipt",
+                    max_bytes=512 * 1024,
+                    max_nodes=8192,
+                    max_nesting=64,
+                )
+            ).hexdigest()
+        )
+        if self.receipt_commitment != expected:
+            raise ValueError("Recipient receipt commitment does not match its material.")
+        return self
 
 
 def _canonical_json_text(value: object, field_name: str, *, max_bytes: int) -> str:
@@ -474,6 +708,7 @@ class ParticipantSessionCreationReceipt(ContractValue):
     initial_input_commitment: StrictStr
     execution_profile_json: StrictStr
     receipt_commitment: StrictStr
+    recipient_metadata_json: str | None = None
     schema_version: Literal[1] = 1
 
     @field_validator("execution_profile_json")
@@ -486,6 +721,8 @@ class ParticipantSessionCreationReceipt(ContractValue):
         if self.initial_input_commitment != self.binding.initial_input_commitment:
             raise ValueError("Receipt initial-input commitment conflicts with its binding.")
         material = self.model_dump(mode="json", exclude={"receipt_commitment"})
+        if material.get("recipient_metadata_json") is None:
+            material.pop("recipient_metadata_json", None)
         expected = (
             "sha256:"
             + sha256(
@@ -565,6 +802,7 @@ class ContextViewPublicationRequest(ContractValue):
     boundary_id: Identifier
     projection_schema: Identifier
     publication_key: StrictStr
+    resource_receipts: tuple[ResourceAcquisitionReceipt, ...] = ()
 
     @field_validator("publication_key")
     @classmethod
@@ -686,7 +924,11 @@ class ContextViewManifest(ContractValue):
         return self
 
 
-def require_independent_context_view_material(manifest: ContextViewManifest) -> None:
+def require_independent_context_view_material(
+    manifest: ContextViewManifest,
+    *,
+    qualified_resources: tuple[ResourceAcquisitionReceipt, ...] | None = None,
+) -> None:
     """Prove this retained value needs no mutable source material for readback.
 
     Called under the source mutation owner, not merely by public preflight.
@@ -697,23 +939,22 @@ def require_independent_context_view_material(manifest: ContextViewManifest) -> 
     compaction = json.loads(manifest.compaction_json or "null")
     messages = json.loads(manifest.messages_json)
 
-    def has_resource(value: object) -> bool:
-        if isinstance(value, dict):
-            return any(
-                (
-                    key
-                    in {"attachment", "attachments", "resource_reference", "resource_references"}
-                    and child is not None
-                )
-                or has_resource(child)
-                for key, child in value.items()
-            )
-        return isinstance(value, list) and any(has_resource(child) for child in value)
-
+    references = json.loads(manifest.resource_references_json or "[]")
+    if type(references) is not list:
+        raise ValueError("Pinned context-view resource references are invalid.")
+    try:
+        receipts = tuple(ResourceAcquisitionReceipt.model_validate(item) for item in references)
+        required = context_view_artifact_ids([Message.model_validate(item) for item in messages])
+    except (TypeError, ValueError):
+        raise ValueError("Pinned context-view material is invalid.") from None
+    if not set(required) <= {item for receipt in receipts for item in receipt.material_ids}:
+        raise ValueError("Pinned context-view resources are not independently retained.")
+    if qualified_resources is not None and any(
+        receipt not in qualified_resources for receipt in receipts
+    ):
+        raise ValueError("Pinned context-view material resource references are not qualified.")
     if (
         manifest.projection_schema != "whole-turn.v1"
-        or manifest.resource_references_json is not None
-        or has_resource(messages)
         or type(compaction) is not dict
         or set(compaction)
         != {"state", "input_frontier", "retained_output_frontier", "retained_suffix_frontier"}
@@ -728,6 +969,57 @@ def require_independent_context_view_material(manifest: ContextViewManifest) -> 
         or len(messages) != manifest.transcript_cursor - compaction["input_frontier"]
     ):
         raise ValueError("Pinned context-view material is unavailable for compaction.")
+
+
+def context_view_artifact_ids(messages: list[Message]) -> tuple[str, ...]:
+    return tuple(sorted({item.artifact_id for item in context_view_attachments(messages)}))
+
+
+def context_view_attachments(messages: list[Message]) -> tuple[FileAttachment, ...]:
+    """Only typed local file attachments may cross the historical boundary.
+
+    Other resource-shaped payloads remain unsupported, including resource
+    markers embedded in arbitrary tool data. References carry data, not grants.
+    """
+    references: dict[str, FileAttachment] = {}
+
+    def has_resource(value):
+        if isinstance(value, dict):
+            return any(
+                (
+                    key
+                    in {"attachment", "attachments", "resource_reference", "resource_references"}
+                    and child is not None
+                )
+                or has_resource(child)
+                for key, child in value.items()
+            )
+        return isinstance(value, list) and any(has_resource(child) for child in value)
+
+    for message in messages:
+        for part in message.content:
+            value = part.model_dump(mode="json", warnings=False)
+            if type(part) is FilePart:
+                payloads = (value.pop("attachment"),)
+            elif type(part) is ToolResultPart:
+                payloads = tuple(value.pop("artifacts"))
+            else:
+                payloads = ()
+            if has_resource(value):
+                raise ValueError("Context-view material contains unsupported resource references.")
+            for payload in payloads:
+                attachment = file_attachment_from_payload(payload)
+                if attachment is None:
+                    raise ValueError(
+                        "Context-view material contains unsupported resource references."
+                    )
+                previous = references.get(attachment.artifact_id)
+                if previous is not None and not same_file_attachment_reference(
+                    previous, attachment
+                ):
+                    raise ValueError("Context-view attachment references conflict.")
+                references[attachment.artifact_id] = attachment
+    return tuple(references.values())
 
 
 class ContextViewSelectionRequest(ContractValue):

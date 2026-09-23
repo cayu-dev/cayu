@@ -36,6 +36,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
     session_message_rejection,
 )
+from cayu.sessions import creation_fence
 from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageInspection,
@@ -44,6 +45,8 @@ from cayu.sessions.base import (
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
 )
+from cayu.storage import _creation_fence
+from cayu.storage._creation_fence import PostgresCreationFenceMixin
 
 if TYPE_CHECKING:
     from cayu.knowledge.maintenance_governance import (
@@ -1434,6 +1437,17 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    103: (
+        """CREATE TABLE IF NOT EXISTS cayu_session_creation_decisions (
+            operation_key TEXT PRIMARY KEY,
+            owner_key TEXT NOT NULL,
+            state TEXT NOT NULL,
+            recovery_pending INTEGER NOT NULL,
+            decision_json TEXT NOT NULL
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_creation_decisions_pending
+            ON cayu_session_creation_decisions(owner_key, recovery_pending, operation_key)""",
+    ),
     101: (
         """
         ALTER TABLE cayu_budget_bindings ADD COLUMN IF NOT EXISTS allowance BIGINT
@@ -25415,7 +25429,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         return removed, len(stale_ids) > limit
 
 
-class PostgresSessionStore(_PostgresStoreBase, SessionStore):
+class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, SessionStore):
     """Postgres-backed session store for durable multi-tenant runtime state."""
 
     supports_usage_aggregates: ClassVar[bool] = True
@@ -27122,6 +27136,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         operation_initializer: SessionOperationInitializer | None = None,
         participant_binding_factory: Callable[[Session], tuple[Any, Any]] | None = None,
         participant_request_commitment: str | None = None,
+        participant_provenance=None,
+        recipient_selection=None,
+        creation_target=None,
+        recipient_receipt_validator=None,
     ) -> Session:
         from cayu.sessions.pending_actions import pending_action_event_storage_values
 
@@ -27145,6 +27163,24 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 async with conn.cursor() as cur:
                     await self._lock_closure_lineage(cur)
                     await self._require_available_closure_identity(cur, session_id)
+                    from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+
+                    if (
+                        participant_provenance is _RECIPIENT_PROVENANCE_CAPABILITY
+                        and creation_target is None
+                    ):
+                        raise PermissionError(
+                            "Recipient creation requires its exact durable target."
+                        )
+                    if creation_target is not None:
+                        creation_target = creation_fence.snapshot_target(creation_target)
+                        await _creation_fence.postgres_lock(cur, creation_target)
+                        creation_fence.require_pending(
+                            creation_target,
+                            await _creation_fence.postgres_read(cur, creation_target),
+                            request_commitment=participant_request_commitment,
+                            requested_session_id=request.session_id,
+                        )
                     parent_session = (
                         None
                         if request.parent_session_id is None
@@ -27261,6 +27297,62 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 Jsonb(receipt.model_dump(mode="json")),
                             ),
                         )
+                        if receipt.recipient_metadata_json is not None:
+                            from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+
+                            if participant_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY:
+                                raise PermissionError(
+                                    "Recipient provenance requires the trusted application boundary."
+                                )
+                            await cur.executemany(
+                                "INSERT INTO cayu_transcript_messages "
+                                "(session_id, interaction_id, message, transcript_search_document) "
+                                "VALUES (%s, %s, %s, %s)",
+                                [
+                                    (
+                                        session.id,
+                                        None,
+                                        _dumps(message.model_dump(mode="json")),
+                                        _postgres_transcript_index_document(session.id, message),
+                                    )
+                                    for message in request.messages
+                                ],
+                            )
+                        if recipient_selection is not None:
+                            from cayu.sessions.context_views import ContextViewSelectionReceipt
+
+                            await cur.execute(
+                                "SELECT receipt_json FROM cayu_context_view_selections "
+                                "WHERE selection_key = %s FOR UPDATE",
+                                (recipient_selection.selection_key,),
+                            )
+                            row = await cur.fetchone()
+                            stored_selection = (
+                                None
+                                if row is None
+                                else ContextViewSelectionReceipt.model_validate(row[0])
+                            )
+                            if (
+                                stored_selection is None
+                                or stored_selection != recipient_selection
+                                or stored_selection.state not in {"adopted", "transferred"}
+                            ):
+                                raise PermissionError(
+                                    "Recipient context-view ownership changed before child creation."
+                                )
+                        if recipient_receipt_validator is not None:
+                            recipient_receipt_validator(session, receipt)
+                        if creation_target is not None:
+                            creation_fence.validate_binding(
+                                creation_target,
+                                binding,
+                                requested_session_id=receipt.requested_session_id,
+                            )
+                            await _creation_fence.postgres_write(
+                                cur, creation_fence.created(creation_target, session, receipt)
+                            )
+                    elif creation_target is not None:
+                        raise PermissionError("Creation targets require participant ownership.")
                     if initial_operation_records:
                         await cur.executemany(
                             "INSERT INTO cayu_session_operations "
@@ -27430,23 +27522,43 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         resolved_request,
         identity,
         binding_factory,
+        recipient_provenance=None,
+        recipient_selection=None,
+        creation_target=None,
+        recipient_receipt_validator=None,
     ):
         from cayu.storage._participant_session_records import validate_replay
 
+        if creation_request.metadata_json is not None:
+            from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+
+            if recipient_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY:
+                raise PermissionError(
+                    "Recipient provenance requires the trusted application boundary."
+                )
+
         existing = await self.lookup_participant_session_creation(creation_request)
         if existing is not None:
+            if creation_target is not None:
+                await _creation_fence.validate_replay(self, creation_target, existing[0])
             return validate_replay(existing, identity, binding_factory)
         try:
             session = await self.create(
                 resolved_request,
                 identity=identity,
                 participant_binding_factory=binding_factory,
+                participant_provenance=recipient_provenance,
+                recipient_selection=recipient_selection,
+                creation_target=creation_target,
+                recipient_receipt_validator=recipient_receipt_validator,
                 participant_request_commitment=creation_request.request_commitment,
             )
-        except UniqueViolation:
+        except (UniqueViolation, creation_fence.SessionCreationConflict):
             existing = await self.lookup_participant_session_creation(creation_request)
             if existing is None:
                 raise
+            if creation_target is not None:
+                await _creation_fence.validate_replay(self, creation_target, existing[0])
             return validate_replay(existing, identity, binding_factory)
         receipt = await self.load_participant_session_creation_receipt(session.id)
         if receipt is None:
@@ -28076,6 +28188,25 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             )
             await conn.commit()
             return receipt.model_copy(deep=True)
+
+    async def lookup_context_view_selection(self, selection_key):
+        from cayu.sessions.context_views import ContextViewSelectionReceipt
+
+        if type(selection_key) is not str:
+            raise TypeError("Context-view selection key must be a string.")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT receipt_json FROM cayu_context_view_selections WHERE selection_key = %s",
+                (selection_key,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        value = row[0]
+        if isinstance(value, str):
+            return ContextViewSelectionReceipt.model_validate_json(value)
+        return ContextViewSelectionReceipt.model_validate(value)
 
     async def transition_context_view_ownership(self, request):
         from cayu.sessions.context_views import (

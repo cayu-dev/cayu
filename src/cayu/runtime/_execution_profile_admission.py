@@ -14,6 +14,8 @@ from weakref import ReferenceType, ref
 
 from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
+from cayu.artifacts._store_identity import local_artifact_store_identity
+from cayu.artifacts.local import LocalArtifactStore
 from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
 from cayu.providers.deadlines import _provider_deadline_material
 from cayu.providers.operations import ProviderOperationMode
@@ -2133,6 +2135,42 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
     return {"adapter": adapter, "version": version, **material}
 
 
+def require_historical_artifact_environment(
+    *,
+    profile: ExecutionProfileIdentity,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    registered_agent: runtime_records.RegisteredAgentState,
+    runtime_version: str | None,
+    process_identity: str,
+    redactor: SecretRedactor,
+) -> None:
+    """Authenticate static artifact resolution without launching the source."""
+    from cayu.runtime.execution_profiles import _aggregate_identity_strength, _available_component
+
+    if (
+        registered_environment is None
+        or registered_environment.factory_backed
+        or type(registered_environment.environment.artifact_store) is not LocalArtifactStore
+    ):
+        raise ValueError("Historical resources require a qualified static artifact environment.")
+    material, process_local, application_versioned = _environment_identity_material(
+        registered_environment=registered_environment,
+        execution_requirements=registered_agent.execution_requirements.model_dump(mode="json"),
+        runtime_version=runtime_version,
+        process_identity=process_identity,
+        redactor=redactor,
+    )
+    expected = _available_component(
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        _aggregate_identity_strength(
+            process_local=process_local, application_versioned=application_versioned
+        ),
+        material,
+    )
+    if profile.component(ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT) != expected:
+        raise ValueError("Historical artifact environment identity is unavailable.")
+
+
 def _environment_identity_material(
     *,
     registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -2195,6 +2233,15 @@ def _environment_identity_material(
         {
             "environment": {
                 "name": registered_environment.spec.name,
+                **(
+                    {
+                        "local_artifact_store": local_artifact_store_identity(
+                            environment.artifact_store
+                        )
+                    }
+                    if type(environment.artifact_store) is LocalArtifactStore
+                    else {}
+                ),
                 "behavior": environment_entry,
                 "factory_backed": registered_environment.factory_backed,
                 "factory": factory_entry,

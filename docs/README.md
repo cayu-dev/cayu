@@ -36,6 +36,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Model catalog](model-catalog.md)
 - [Operation outcomes](operation-outcomes.md)
 - [Participant identity administration](participant-identity.md)
+- [Recipient sessions](recipient-sessions.md)
 - [Named checks](named-checks.md)
 - [OpenAI subscription](openai-subscription.md)
 - [Project server](project-server.md)

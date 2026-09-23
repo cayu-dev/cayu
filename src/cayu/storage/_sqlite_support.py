@@ -984,6 +984,17 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    103: """
+        CREATE TABLE IF NOT EXISTS cayu_session_creation_decisions (
+            operation_key TEXT PRIMARY KEY,
+            owner_key TEXT NOT NULL,
+            state TEXT NOT NULL,
+            recovery_pending INTEGER NOT NULL,
+            decision_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_creation_decisions_pending
+            ON cayu_session_creation_decisions(owner_key, recovery_pending, operation_key);
+    """,
     102: SQLITE_PARTICIPANT_BINDINGS_DDL,
     101: """
         CREATE TABLE IF NOT EXISTS cayu_budget_binding_consumptions (

@@ -10,6 +10,7 @@ import threading
 import traceback
 import warnings
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -1321,28 +1322,6 @@ class _ReadTrackingArtifactStore(LocalArtifactStore):
     async def read_bytes(self, *args, **kwargs):
         self.reads += 1
         return await super().read_bytes(*args, **kwargs)
-
-
-class _ConflictingReadArtifactStore(LocalArtifactStore):
-    def __init__(self, root, *, store_id: str, metadata_update: dict) -> None:
-        super().__init__(root, store_id=store_id)
-        self._metadata_update = metadata_update
-
-    async def read_bytes(self, *args, **kwargs):
-        result = await super().read_bytes(*args, **kwargs)
-        return result.model_copy(
-            update={
-                "metadata": result.metadata.model_copy(
-                    update=self._metadata_update,
-                )
-            }
-        )
-
-
-class _NoneReadArtifactStore(LocalArtifactStore):
-    async def read_bytes(self, *args, **kwargs):
-        del args, kwargs
-        return None
 
 
 class _CancellingMutationTool(Tool):
@@ -8146,7 +8125,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
             False,
             "artifact-store",
             {"filename": "foreign.json"},
-            "failed",
+            "missing",
             False,
             False,
         ),
@@ -8155,7 +8134,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
             False,
             "artifact-store",
             {"session_id": "foreign-session"},
-            "failed",
+            "missing",
             False,
             False,
         ),
@@ -8164,7 +8143,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
             False,
             "artifact-store",
             {"scope": ArtifactScope.ENVIRONMENT},
-            "failed",
+            "missing",
             False,
             False,
         ),
@@ -8180,7 +8159,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
                     "window_id": "foreign-window",
                 }
             },
-            "failed",
+            "missing",
             False,
             False,
         ),
@@ -8188,6 +8167,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
 )
 def test_workspace_observation_recovery_reports_partial_artifact_state(
     tmp_path,
+    monkeypatch,
     crash_phase: str,
     delete_before_recovery: bool,
     recovery_store_id: str,
@@ -8201,11 +8181,17 @@ def test_workspace_observation_recovery_reports_partial_artifact_state(
         artifact_root = tmp_path / "artifacts"
         workspace_root = tmp_path / "workspace"
         workspace_root.mkdir()
-        artifact_store = (
-            _CommitThenRaiseArtifactStore(artifact_root, store_id="artifact-store")
-            if commit_then_raise
-            else LocalArtifactStore(artifact_root, store_id="artifact-store")
-        )
+        # Inject transport/readback faults without replacing the physical store's
+        # execution-profile identity between the original run and recovery.
+        artifact_store = LocalArtifactStore(artifact_root, store_id="artifact-store")
+        if commit_then_raise:
+            put_bytes = artifact_store.put_bytes
+
+            async def put_then_raise(*args, **kwargs):
+                await put_bytes(*args, **kwargs)
+                raise ConnectionError("artifact acknowledgement lost")
+
+            monkeypatch.setattr(artifact_store, "put_bytes", put_then_raise)
         first_provider = _BulkProvider()
         first_app = CayuApp(session_store=store, enable_logging=False)
         first_app.register_provider(first_provider, default=True)
@@ -8250,23 +8236,20 @@ def test_workspace_observation_recovery_reports_partial_artifact_state(
         recovery_provider = _BulkProvider()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(recovery_provider, default=True)
-        recovery_artifact_store = (
-            _NoneReadArtifactStore(
-                artifact_root,
-                store_id=recovery_store_id,
-            )
-            if malformed_read_result
-            else LocalArtifactStore(
-                artifact_root,
-                store_id=recovery_store_id,
-            )
-            if metadata_update is None
-            else _ConflictingReadArtifactStore(
-                artifact_root,
-                store_id=recovery_store_id,
-                metadata_update=metadata_update,
-            )
-        )
+        recovery_artifact_store = LocalArtifactStore(artifact_root, store_id=recovery_store_id)
+        read_bytes = recovery_artifact_store.read_bytes
+
+        async def read_with_fault(*args, **kwargs):
+            if malformed_read_result:
+                return None
+            result = await read_bytes(*args, **kwargs)
+            if metadata_update is not None:
+                # Valid readback of different material means the exact retained
+                # artifact is missing, rather than an exception during readback.
+                return replace(result, metadata=result.metadata.model_copy(update=metadata_update))
+            return result
+
+        monkeypatch.setattr(recovery_artifact_store, "read_bytes", read_with_fault)
         recovery_app.register_environment(
             Environment(
                 _portable_environment_spec("local"),
@@ -8844,7 +8827,7 @@ def test_workspace_observation_recovery_rejects_foreign_authority_before_artifac
             Environment(
                 _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
-                artifact_store=LocalArtifactStore(
+                artifact_store=_ReadTrackingArtifactStore(
                     artifact_root,
                     store_id="artifact-store",
                 ),
@@ -9046,7 +9029,7 @@ def test_workspace_observation_recovery_rejects_foreign_durable_tool_outcome(
             Environment(
                 _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
-                artifact_store=LocalArtifactStore(
+                artifact_store=_ReadTrackingArtifactStore(
                     artifact_root,
                     store_id="artifact-store",
                 ),
@@ -9277,7 +9260,7 @@ def test_workspace_observation_recovery_validates_delta_before_artifact_read(
             Environment(
                 _portable_environment_spec("local"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
-                artifact_store=LocalArtifactStore(
+                artifact_store=_ReadTrackingArtifactStore(
                     artifact_root,
                     store_id="artifact-store",
                 ),

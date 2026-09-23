@@ -58,6 +58,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.context_views",
         "ParticipantSessionExecutionRequest",
     ),
+    "RecipientSessionCreationRequest": (
+        "cayu.sessions.context_views",
+        "RecipientSessionCreationRequest",
+    ),
+    "RecipientSessionCreationReceipt": (
+        "cayu.sessions.context_views",
+        "RecipientSessionCreationReceipt",
+    ),
     "ActiveModelCompletionStage": ("cayu.sessions.base", "ActiveModelCompletionStage"),
     "CHECKPOINT_SCHEMA_VERSION_KEY": ("cayu.sessions.checkpoints", "CHECKPOINT_SCHEMA_VERSION_KEY"),
     "CHILD_SESSION_CONTEXT_PROJECTION_VERSION": (
@@ -596,6 +604,8 @@ PUBLIC_NAMES = [
     "ParticipantSessionBinding",
     "ParticipantSessionCreationReceipt",
     "ParticipantSessionCreationRequest",
+    "RecipientSessionCreationRequest",
+    "RecipientSessionCreationReceipt",
     "PendingActionSession",
     "PersistedEventSideEffectClaim",
     "PersistedEventSideEffectClaimLost",

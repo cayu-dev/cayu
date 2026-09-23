@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import mimetypes
 import os
 import traceback as traceback_module
@@ -54,12 +55,18 @@ from cayu.approvals.user_input import (
 )
 from cayu.artifacts._images import ImageDecodePolicy
 from cayu.artifacts.attachments import (
+    FileAttachment,
     FileAttachmentKind,
     file_attachment,
     validate_file_attachment_bytes,
     validate_file_attachment_content_type,
 )
 from cayu.artifacts.base import ArtifactScope, ArtifactStore
+from cayu.artifacts.resources import (
+    LocalArtifactResourceOwner,
+    ResourceOwnerUnavailable,
+    ResourceTransferReceipt,
+)
 from cayu.budgets.base import (
     BudgetLedger,
     BudgetLimit,
@@ -514,6 +521,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationTarget,
 )
 from cayu.sessions.base import (
+    _RECIPIENT_PROVENANCE_CAPABILITY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -591,8 +599,13 @@ from cayu.sessions.context_views import (
     ParticipantSessionCreationReceipt,
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
+    RecipientSessionCreationReceipt,
+    RecipientSessionCreationRequest,
+    context_view_artifact_ids,
+    context_view_attachments,
     json_commitment,
     project_context_view_extensions,
+    require_independent_context_view_material,
 )
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -1912,6 +1925,10 @@ class CayuApp:
         participant: ParticipantRef,
         context: CollaborationAccessContext,
     ) -> tuple[Session, ParticipantSessionCreationReceipt]:
+        if creation.metadata_json is not None:
+            raise TypeError(
+                "Recipient provenance may only be created through create_recipient_session()."
+            )
         async with self._participant_session_authority_lock:
             return await self._create_participant_session_unserialized(
                 creation,
@@ -1919,12 +1936,438 @@ class CayuApp:
                 context=context,
             )
 
+    async def create_recipient_session(
+        self,
+        creation: RecipientSessionCreationRequest,
+        *,
+        context: CollaborationAccessContext,
+        resource_owner: LocalArtifactResourceOwner | None = None,
+    ) -> tuple[Session, RecipientSessionCreationReceipt]:
+        """Create one inert recipient child from fresh or exact retained material.
+
+        The existing participant-session store remains the atomic identity and
+        transcript owner. This boundary only prepares authenticated historical
+        input and records recipient-specific provenance in its creation key.
+        It never executes the prepared request.
+        """
+        if type(creation) is not RecipientSessionCreationRequest:
+            raise TypeError("Recipient creation requires a typed request.")
+        # Revalidate and detach nested mutable input before any await. All
+        # admission checks and durable evidence must describe this one input.
+        creation = replace(creation)
+        participant = creation.recipient
+        # Replay is resolved from the durable child record before touching the
+        # source view. A committed child must remain recoverable even if the
+        # source has since compacted or become unavailable.
+        existing = await self.lookup_recipient_session(
+            creation, context=context, resource_owner=resource_owner
+        )
+        if existing is not None:
+            from cayu.sessions._recipient_admission import (
+                admit_recipient_creation,
+                settle_recipient_creation,
+            )
+
+            previous = existing[1].participant_receipt
+            target = await admit_recipient_creation(
+                self,
+                creation.participant_request,
+                participant,
+                context,
+                None,
+                previous.initial_input_commitment,
+                previous.binding.execution_profile_commitment,
+                recovery=True,
+            )
+            await settle_recipient_creation(self, target)
+            return existing
+        if creation.resource_transfers:
+            if not isinstance(resource_owner, LocalArtifactResourceOwner):
+                raise PermissionError("Accepted resource transfers require their qualified owner.")
+            for transfer in creation.resource_transfers:
+                if transfer.command.destination != participant.owner:
+                    raise PermissionError("Resource transfer destination conflicts with recipient.")
+                found = await resource_owner.read_transfer(transfer.command)
+                if not isinstance(found, ExactMatch) or found.receipt != transfer:
+                    raise PermissionError("Resource transfer is not authenticated by its owner.")
+            for transfer, preparation in zip(
+                creation.resource_transfers, creation.preparation_receipts, strict=True
+            ):
+                if await resource_owner.read_preparation(transfer.command) != preparation:
+                    raise PermissionError("Resource preparation authority is not authenticated.")
+                if preparation.permit.intent.request.participant != participant:
+                    raise PermissionError("Resource preparation belongs to another recipient.")
+        input_artifact_ids = set(creation.input_artifact_ids)
+        retained_artifact_ids = {
+            material_id
+            for transfer in creation.resource_transfers
+            for material_id in transfer.command.intent.receipt.material_ids
+        }
+        if not input_artifact_ids <= retained_artifact_ids:
+            raise PermissionError(
+                "Recipient input references artifacts without exact retained transfers."
+            )
+        source_commitment = None
+        if creation.mode == "fork":
+            view = creation.selected_view
+            assert view is not None
+            manifest = view.view
+            if view.owner_participant is not None and view.owner_participant != participant:
+                raise PermissionError("The selected view is not owned by the recipient.")
+            try:
+                durable_selection = await self.session_store.lookup_context_view_selection(
+                    view.selection_key
+                )
+            except NotImplementedError as exc:
+                raise RuntimeError(
+                    "The configured SessionStore cannot authenticate context-view selection."
+                ) from exc
+            if (
+                durable_selection is None
+                or durable_selection != view
+                or durable_selection.state not in {"adopted", "transferred"}
+                or durable_selection.owner_participant != participant
+                or durable_selection.owner != participant.owner
+            ):
+                raise PermissionError("The selected context-view ownership is not authenticated.")
+            # Never treat a caller-provided manifest as authority.  Read the
+            # selected pin through the authenticated context-view owner and
+            # require the exact receipt material to match that readback.
+            readback = await self.read_context_view(
+                manifest.view_id,
+                source_session_id=manifest.source_session_id,
+                participant=participant,
+                context=context,
+            )
+            if readback.view != manifest:
+                raise ValueError("Selected context-view receipt conflicts with durable readback.")
+            manifest = readback.view
+            require_independent_context_view_material(
+                manifest,
+                qualified_resources=tuple(
+                    item.command.intent.receipt for item in creation.resource_transfers
+                ),
+            )
+            source_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_bounded_durable_json_bytes(
+                        manifest.model_dump(mode="json"),
+                        "selected context-view manifest",
+                        max_bytes=8 * 1024 * 1024,
+                        max_nodes=8192,
+                        max_nesting=64,
+                    )
+                ).hexdigest()
+            )
+        participant_creation = creation.participant_request
+
+        def build_receipt(
+            session: Session, participant_receipt: ParticipantSessionCreationReceipt
+        ) -> RecipientSessionCreationReceipt:
+            material = {
+                "session_id": session.id,
+                "session_instance_id": session.instance_id,
+                "recipient": participant.model_dump(mode="json"),
+                "mode": creation.mode,
+                "creation_key": creation.creation_key,
+                "request_commitment": participant_creation.request_commitment,
+                "source_view_commitment": source_commitment,
+                "resource_transfer_commitments": [
+                    item.operation_digest for item in creation.resource_transfers
+                ],
+                "resource_preparation_commitments": [
+                    item.operation_digest for item in creation.preparation_receipts
+                ],
+                "participant_receipt": participant_receipt.model_dump(mode="json"),
+            }
+            receipt_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_bounded_durable_json_bytes(
+                        material,
+                        "recipient receipt",
+                        max_bytes=512 * 1024,
+                        max_nodes=8192,
+                        max_nesting=64,
+                    )
+                ).hexdigest()
+            )
+            return RecipientSessionCreationReceipt(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                recipient=participant,
+                mode=creation.mode,
+                creation_key=creation.creation_key,
+                request_commitment=participant_creation.request_commitment,
+                source_view_commitment=source_commitment,
+                resource_transfer_commitments=tuple(
+                    item.operation_digest for item in creation.resource_transfers
+                ),
+                resource_preparation_commitments=tuple(
+                    item.operation_digest for item in creation.preparation_receipts
+                ),
+                participant_receipt=participant_receipt,
+                receipt_commitment=receipt_commitment,
+            )
+
+        async def commit_child():
+            async with self._participant_session_authority_lock:
+                return await self._create_participant_session_unserialized(
+                    participant_creation,
+                    participant=participant,
+                    context=context,
+                    recipient_metadata_json=participant_creation.metadata_json,
+                    recipient_selection=creation.selected_view,
+                    recipient_receipt_validator=build_receipt,
+                    recipient_resource_owner=resource_owner,
+                    recipient_attachments=creation.input_attachments,
+                )
+
+        if creation.resource_transfers:
+            assert resource_owner is not None
+            session, participant_receipt = await resource_owner._run_recipient_commit(
+                creation.resource_transfers,
+                recipient=participant,
+                operation=commit_child,
+            )
+        else:
+            session, participant_receipt = await commit_child()
+        return session, build_receipt(session, participant_receipt)
+
+    async def settle_recipient_resource_handoff(
+        self,
+        receipt: RecipientSessionCreationReceipt,
+        *,
+        resource_owner: LocalArtifactResourceOwner,
+        source_owners: tuple[LocalArtifactResourceOwner, ...],
+        context: CollaborationAccessContext,
+    ) -> None:
+        """Release source pins only after durable recipient commitment."""
+        if type(receipt) is not RecipientSessionCreationReceipt:
+            raise TypeError("Recipient handoff requires its typed receipt.")
+        # Re-run validation after wrappers/model_copy so stale commitments
+        # cannot become trusted handoff evidence.
+        try:
+            receipt = RecipientSessionCreationReceipt.model_validate(receipt)
+        except ValueError as exc:
+            raise PermissionError("Recipient handoff receipt is invalid.") from exc
+        if not isinstance(resource_owner, LocalArtifactResourceOwner):
+            raise TypeError("Recipient handoff requires a qualified destination owner.")
+        if any(not isinstance(source, LocalArtifactResourceOwner) for source in source_owners):
+            raise TypeError("Recipient handoff requires qualified source owners.")
+        sources = {source.owner: source for source in source_owners}
+        if len(sources) != len(source_owners):
+            raise ValueError("Recipient source ownership is ambiguous.")
+        await self._participant_coordinator.inspect(
+            receipt.recipient, context=context, action="administration"
+        )
+        durable = await self.session_store.load_participant_session_creation_receipt(
+            receipt.session_id
+        )
+        session = await self.session_store.load(receipt.session_id)
+        if (
+            durable is None
+            or durable != receipt.participant_receipt
+            or session is None
+            or session.instance_id != receipt.session_instance_id
+            or durable.binding.participant != receipt.recipient
+            or durable.binding.request_commitment != receipt.request_commitment
+        ):
+            raise PermissionError("Recipient handoff lacks exact durable child evidence.")
+        if durable.recipient_metadata_json is None:
+            raise ResourceOwnerUnavailable("Recipient transfer evidence is unavailable.")
+        try:
+            metadata = json.loads(durable.recipient_metadata_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ResourceOwnerUnavailable("Recipient transfer evidence is malformed.") from exc
+        selected_view = metadata.get("selected_view")
+        source_view_commitment = None
+        if selected_view is not None:
+            if not isinstance(selected_view, dict) or not isinstance(
+                selected_view.get("view"), dict
+            ):
+                raise ResourceOwnerUnavailable("Recipient context-view evidence is malformed.")
+            source_view_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_bounded_durable_json_bytes(
+                        selected_view["view"],
+                        "selected context-view manifest",
+                        max_bytes=8 * 1024 * 1024,
+                        max_nodes=8192,
+                        max_nesting=64,
+                    )
+                ).hexdigest()
+            )
+        transfer_commitments = tuple(
+            item.get("operation_digest")
+            for item in metadata.get("resource_transfers", ())
+            if isinstance(item, dict)
+        )
+        preparation_commitments = tuple(
+            item.get("operation_digest")
+            for item in metadata.get("preparation_receipts", ())
+            if isinstance(item, dict)
+        )
+        if (
+            durable.binding.creation_key != "recipient:" + receipt.creation_key
+            or metadata.get("mode") != receipt.mode
+            or metadata.get("recipient") != receipt.recipient.model_dump(mode="json")
+            or source_view_commitment != receipt.source_view_commitment
+            or transfer_commitments != receipt.resource_transfer_commitments
+            or preparation_commitments != receipt.resource_preparation_commitments
+        ):
+            raise PermissionError("Recipient handoff receipt conflicts with durable metadata.")
+        transfers = tuple(
+            ResourceTransferReceipt.model_validate(value)
+            for value in metadata["resource_transfers"]
+        )
+        if any(
+            transfer.command.source not in sources
+            or transfer.command.destination != resource_owner.owner
+            for transfer in transfers
+        ):
+            raise ResourceOwnerUnavailable("Recipient transfer owners are unavailable.")
+        for transfer in transfers:
+            await sources[transfer.command.source]._release_transferred_source_internal(
+                transfer, destination_owner=resource_owner
+            )
+
+    async def reconcile_recipient_resource_handoff(
+        self,
+        creation: RecipientSessionCreationRequest,
+        *,
+        resource_owner: LocalArtifactResourceOwner,
+        source_owners: tuple[LocalArtifactResourceOwner, ...],
+        context: CollaborationAccessContext,
+    ) -> RecipientSessionCreationReceipt:
+        """Recover handoff ownership when the caller lost the child receipt."""
+        found = await self.lookup_recipient_session(
+            creation, context=context, resource_owner=resource_owner
+        )
+        if found is None:
+            raise LookupError("Recipient creation has not committed.")
+        _session, receipt = found
+        await self.settle_recipient_resource_handoff(
+            receipt,
+            resource_owner=resource_owner,
+            source_owners=source_owners,
+            context=context,
+        )
+        return receipt
+
+    async def lookup_recipient_session(
+        self,
+        creation: RecipientSessionCreationRequest,
+        *,
+        context: CollaborationAccessContext,
+        resource_owner: LocalArtifactResourceOwner | None = None,
+    ) -> tuple[Session, RecipientSessionCreationReceipt] | None:
+        """Recover an exact recipient creation without rereading source state."""
+        if type(creation) is not RecipientSessionCreationRequest:
+            raise TypeError("Recipient lookup requires a typed request.")
+        creation = replace(creation)
+        inspection = await self._participant_coordinator.inspect(
+            creation.recipient, context=context, action="readback"
+        )
+        if inspection.participant.reference != creation.recipient:
+            raise PermissionError("Recipient inspection returned another identity.")
+        found = await self.session_store.lookup_participant_session_creation(
+            creation.participant_request
+        )
+        if found is None:
+            return None
+        session, participant_receipt = found
+        if participant_receipt.binding.participant != creation.recipient:
+            raise PermissionError("Recipient creation belongs to another participant.")
+        expected_creator_commitment = (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "application_scope": creation.recipient.owner.application_scope,
+                        "principal": context.principal,
+                    },
+                    "creator_authority",
+                )
+            ).hexdigest()
+        )
+        if participant_receipt.binding.creator_commitment != expected_creator_commitment:
+            raise PermissionError("Recipient creation belongs to another initiator.")
+        if participant_receipt.recipient_metadata_json != creation.metadata_json:
+            raise ValueError("Recipient creation evidence conflicts with its receipt.")
+        source_commitment = None
+        if creation.selected_view is not None:
+            source_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_bounded_durable_json_bytes(
+                        creation.selected_view.view.model_dump(mode="json"),
+                        "selected context-view manifest",
+                        max_bytes=8 * 1024 * 1024,
+                        max_nodes=8192,
+                        max_nesting=64,
+                    )
+                ).hexdigest()
+            )
+        material = {
+            "session_id": session.id,
+            "session_instance_id": session.instance_id,
+            "recipient": creation.recipient.model_dump(mode="json"),
+            "mode": creation.mode,
+            "creation_key": creation.creation_key,
+            "request_commitment": creation.participant_request.request_commitment,
+            "source_view_commitment": source_commitment,
+            "resource_transfer_commitments": [
+                item.operation_digest for item in creation.resource_transfers
+            ],
+            "resource_preparation_commitments": [
+                item.operation_digest for item in creation.preparation_receipts
+            ],
+            "participant_receipt": participant_receipt.model_dump(mode="json"),
+        }
+        receipt_commitment = (
+            "sha256:"
+            + sha256(
+                canonical_bounded_durable_json_bytes(
+                    material,
+                    "recipient receipt",
+                    max_bytes=512 * 1024,
+                    max_nodes=8192,
+                    max_nesting=64,
+                )
+            ).hexdigest()
+        )
+        return session, RecipientSessionCreationReceipt(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            recipient=creation.recipient,
+            mode=creation.mode,
+            creation_key=creation.creation_key,
+            request_commitment=creation.participant_request.request_commitment,
+            source_view_commitment=source_commitment,
+            resource_transfer_commitments=tuple(
+                item.operation_digest for item in creation.resource_transfers
+            ),
+            resource_preparation_commitments=tuple(
+                item.operation_digest for item in creation.preparation_receipts
+            ),
+            participant_receipt=participant_receipt,
+            receipt_commitment=receipt_commitment,
+        )
+
     async def _create_participant_session_unserialized(
         self,
         creation: ParticipantSessionCreationRequest,
         *,
         participant: ParticipantRef,
         context: CollaborationAccessContext,
+        recipient_metadata_json: str | None = None,
+        recipient_selection=None,
+        recipient_receipt_validator=None,
+        recipient_resource_owner: LocalArtifactResourceOwner | None = None,
+        recipient_attachments: tuple[FileAttachment, ...] = (),
     ) -> tuple[Session, ParticipantSessionCreationReceipt]:
         """Create one inert session bound to an active participant.
 
@@ -1970,7 +2413,7 @@ class CayuApp:
                 raise ValueError("Participant creation key belongs to another creator.")
             if snapshot.lifecycle != "active":
                 return existing_session, existing_receipt
-        if snapshot.lifecycle != "active":
+        if snapshot.lifecycle != "active" and recipient_metadata_json is None:
             raise PermissionError("Only active participants can own a new session.")
         requested_session_id = creation.request.session_id
         prepared = await self._session_engine._prepare_initial_run(
@@ -1980,6 +2423,23 @@ class CayuApp:
         if prepared is None:
             raise RuntimeError("Participant session preparation did not produce a profile.")
         prepared_request = prepared.request
+        if recipient_attachments:
+            environment = prepared.registered_environment
+            if (
+                recipient_resource_owner is None
+                or environment is None
+                or environment.factory is not None
+            ):
+                raise PermissionError(
+                    "Recipient attachments require a qualified static artifact environment."
+                )
+            # The caller is inside _run_recipient_commit's retained owner fence.
+            # Check the resolved profile's environment, not a caller-selected store.
+            await recipient_resource_owner._validate_context_artifacts(
+                recipient_attachments,
+                artifact_store=environment.environment.artifact_store,
+                environment_name=environment.spec.name,
+            )
         profile_json = canonical_bounded_durable_json_bytes(
             prepared.execution_profile.model_dump(mode="json"),
             "execution_profile",
@@ -2019,6 +2479,7 @@ class CayuApp:
         )
         initial_input_commitment = json_commitment(initial_input_json, "initial_input")
         execution_profile_commitment = json_commitment(profile_json, "execution_profile")
+        creation_target = None
         # Retain data from the resolved preflight, never reconstruct it later
         # from a potentially replaced registration. Arbitrary metadata/options
         # remain excluded; the profile commits their execution identity.
@@ -2062,6 +2523,31 @@ class CayuApp:
             redactor=self._secret_redactor,
         )
 
+        if recipient_metadata_json is not None:
+            from cayu.sessions._recipient_admission import admit_recipient_creation
+
+            creation_target = await admit_recipient_creation(
+                self,
+                creation,
+                participant,
+                context,
+                snapshot,
+                initial_input_commitment,
+                execution_profile_commitment,
+            )
+            admitted = creation_target.permit.intent.request
+            authorization_material.update(
+                lifecycle_revision=admitted.expected_lifecycle_revision,
+                configuration_revision=admitted.expected_configuration_revision,
+                admission_generation=admitted.admission_generation,
+            )
+            authorization_commitment = (
+                "sha256:"
+                + sha256(
+                    canonical_durable_json_bytes(authorization_material, "participant_authority")
+                ).hexdigest()
+            )
+
         def binding_factory(
             session: Session,
         ) -> tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]:
@@ -2070,9 +2556,21 @@ class CayuApp:
                 participant=participant,
                 session_id=session.id,
                 session_instance_id=session.instance_id,
-                lifecycle_revision=snapshot.lifecycle_revision,
-                configuration_revision=snapshot.configuration_revision,
-                admission_generation=snapshot.admission_generation,
+                lifecycle_revision=(
+                    snapshot.lifecycle_revision
+                    if creation_target is None
+                    else creation_target.permit.intent.request.expected_lifecycle_revision
+                ),
+                configuration_revision=(
+                    snapshot.configuration_revision
+                    if creation_target is None
+                    else creation_target.permit.intent.request.expected_configuration_revision
+                ),
+                admission_generation=(
+                    snapshot.admission_generation
+                    if creation_target is None
+                    else creation_target.permit.intent.request.admission_generation
+                ),
                 creator_commitment=creator_commitment,
                 authorization_commitment=authorization_commitment,
                 initial_input_commitment=initial_input_commitment,
@@ -2086,8 +2584,11 @@ class CayuApp:
                 "requested_session_id": requested_session_id,
                 "initial_input_commitment": initial_input_commitment,
                 "execution_profile_json": profile_json,
+                "recipient_metadata_json": recipient_metadata_json,
                 "schema_version": 1,
             }
+            if material["recipient_metadata_json"] is None:
+                del material["recipient_metadata_json"]
             receipt_commitment = (
                 "sha256:"
                 + sha256(
@@ -2104,16 +2605,47 @@ class CayuApp:
                 requested_session_id=requested_session_id,
                 initial_input_commitment=initial_input_commitment,
                 execution_profile_json=profile_json,
+                recipient_metadata_json=recipient_metadata_json,
                 receipt_commitment=receipt_commitment,
             )
             return binding, receipt
 
-        session, receipt = await self.session_store.create_participant_owned_session(
-            creation,
-            resolved_request=prepared_request,
-            identity=prepared.session_identity,
-            binding_factory=binding_factory,
-        )
+        from cayu.sessions.creation_fence import SessionCreationExcluded
+
+        try:
+            session, receipt = await self.session_store.create_participant_owned_session(
+                creation,
+                resolved_request=prepared_request,
+                identity=prepared.session_identity,
+                binding_factory=binding_factory,
+                recipient_provenance=(
+                    _RECIPIENT_PROVENANCE_CAPABILITY
+                    if recipient_metadata_json is not None
+                    else None
+                ),
+                recipient_selection=recipient_selection,
+                recipient_receipt_validator=recipient_receipt_validator,
+                **({"creation_target": creation_target} if creation_target is not None else {}),
+            )
+        except SessionCreationExcluded as rejected:
+            if creation_target is not None:
+                from cayu.sessions._recipient_admission import settle_recipient_creation
+
+                try:
+                    await settle_recipient_creation(self, creation_target)
+                except BaseException as cleanup:
+                    if cleanup.__context__ is rejected:
+                        cleanup.__context__ = None
+                    if not isinstance(cleanup, Exception):
+                        raise cleanup from rejected
+                    raise BaseExceptionGroup(
+                        "Creation exclusion settlement failed.", [rejected, cleanup]
+                    ) from None
+            raise
+        if creation_target is not None:
+            from cayu.sessions._recipient_admission import settle_recipient_creation
+
+            await settle_recipient_creation(self, creation_target)
         return session, receipt
 
     async def execute_participant_session(
@@ -2419,11 +2951,30 @@ class CayuApp:
         *,
         participant: ParticipantRef,
         context: CollaborationAccessContext,
+        resource_owner: LocalArtifactResourceOwner | None = None,
     ) -> ContextViewManifest:
         """Publish an immutable view from authoritative completed-turn evidence."""
 
         if type(request) is not ContextViewPublicationRequest:
             raise TypeError("Context-view publication requires a typed request.")
+        from cayu.collaboration._preparation import prepare_contract
+
+        request = prepare_contract(
+            ContextViewPublicationRequest, request, redactor=self._secret_redactor
+        )
+        resource_references_json = (
+            None
+            if not request.resource_receipts
+            else canonical_bounded_durable_json_bytes(
+                [item.model_dump(mode="json") for item in request.resource_receipts],
+                "context view resources",
+                max_bytes=256 * 1024,
+                max_nodes=8192,
+                max_nesting=64,
+            ).decode()
+        )
+        if request.resource_receipts and not isinstance(resource_owner, LocalArtifactResourceOwner):
+            raise PermissionError("Context-view resources require their qualified source owner.")
         if type(participant) is not ParticipantRef:
             raise TypeError("Context-view publication requires a ParticipantRef.")
         if self.session_store.context_view_version is None:
@@ -2464,6 +3015,7 @@ class CayuApp:
                 or existing_manifest.boundary_id != request.boundary_id
                 or existing_manifest.projection_schema != request.projection_schema
                 or stored_extension_schema != current_extension_schema
+                or existing_manifest.resource_references_json != resource_references_json
             ):
                 raise ValueError("Context-view publication key conflicts with its request.")
             return existing_manifest
@@ -2495,31 +3047,10 @@ class CayuApp:
             )
         records = source.records
 
-        def contains_resource_reference(value: object) -> bool:
-            if isinstance(value, Mapping):
-                for key, child in value.items():
-                    if (
-                        key
-                        in {
-                            "attachment",
-                            "attachments",
-                            "resource_reference",
-                            "resource_references",
-                        }
-                        and child is not None
-                    ):
-                        return True
-                    if contains_resource_reference(child):
-                        return True
-                return False
-            if isinstance(value, (list, tuple)):
-                return any(contains_resource_reference(child) for child in value)
-            return False
-
-        if any(
-            contains_resource_reference(record.message.model_dump(mode="json"))
-            for record in records
-        ):
+        required_artifacts = context_view_artifact_ids([record.message for record in records])
+        if not set(required_artifacts) <= {
+            item for receipt in request.resource_receipts for item in receipt.material_ids
+        }:
             raise ValueError(
                 "Context-view publication requires independently qualified resource references."
             )
@@ -2612,7 +3143,7 @@ class CayuApp:
             "extensions": [record.model_dump(mode="json") for record in extension_records],
             "historical_ancestry_json": historical_ancestry_json,
             "causal_budget_ancestry_json": causal_budget_ancestry_json,
-            "resource_references_json": None,
+            "resource_references_json": resource_references_json,
             "compaction_json": compaction_json,
             "messages_commitment": json_commitment(messages_json, "messages"),
             "application_context_commitment": json_commitment(
@@ -2632,10 +3163,39 @@ class CayuApp:
             ).hexdigest()
         )
         manifest = ContextViewManifest.model_validate(material)
-        return await self.session_store.publish_context_view(
-            manifest,
-            publication_key=request.publication_key,
-        )
+
+        async def publish():
+            return await self.session_store.publish_context_view(
+                manifest,
+                publication_key=request.publication_key,
+            )
+
+        if request.resource_receipts:
+            assert resource_owner is not None
+            from cayu.runtime._execution_profile_admission import (
+                require_historical_artifact_environment,
+            )
+
+            environment = self._get_registered_environment_for_session(session.environment_name)
+            require_historical_artifact_environment(
+                profile=source.execution_profile,
+                registered_environment=environment,
+                registered_agent=self._get_registered_agent(session.agent_name),
+                runtime_version=session.runtime_version,
+                process_identity=self._execution_profile_process_identity,
+                redactor=self._secret_redactor,
+            )
+            assert environment is not None
+            return await resource_owner._run_context_view_commit(
+                request.resource_receipts,
+                participant=participant,
+                attachments=context_view_attachments([record.message for record in records]),
+                artifact_store=environment.environment.artifact_store,
+                environment_name=environment.spec.name,
+                session_id=session.id,
+                operation=publish,
+            )
+        return await publish()
 
     async def transition_context_view_ownership(
         self,

@@ -63,8 +63,9 @@ from cayu.vaults.redaction import SecretRedactor
 
 
 class _RegisteredTestPreparationReader(ResourcePreparationReader):
-    def __init__(self, owner_ref):
+    def __init__(self, owner_ref, participant=None):
         self._owner = owner_ref
+        self._participant = participant
 
     @property
     def owner(self):
@@ -106,7 +107,20 @@ class _RegisteredTestPreparationReader(ResourcePreparationReader):
         return
 
     def transfer_permit(self, command):
-        return preparation_permit(command)
+        permit = preparation_permit(command)
+        if self._participant is None:
+            return permit
+        return permit.model_copy(
+            update={
+                "intent": permit.intent.model_copy(
+                    update={
+                        "request": permit.intent.request.model_copy(
+                            update={"participant": self._participant}
+                        )
+                    }
+                )
+            }
+        )
 
     async def settle_responsibility(self, command, permit, reader):
         return
@@ -120,12 +134,13 @@ class _UnavailablePreparationReader(_RegisteredTestPreparationReader):
 
 
 class LocalArtifactResourceOwner(_LocalArtifactResourceOwner):
-    def __init__(self, root, *, owner, artifact_store, preparation_reader=None):
+    def __init__(self, root, *, owner, artifact_store, preparation_reader=None, participant=None):
         super().__init__(
             root,
             owner=owner,
             artifact_store=artifact_store,
-            preparation_reader=preparation_reader or _RegisteredTestPreparationReader(owner),
+            preparation_reader=preparation_reader
+            or _RegisteredTestPreparationReader(owner, participant),
         )
 
 

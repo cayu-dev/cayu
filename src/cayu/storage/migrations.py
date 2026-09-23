@@ -482,6 +482,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=101, kind=RevisionKind.ADDITIVE, compatible_from=99),
     # Repair databases that applied revision 96 before participant bindings were added.
     Revision(revision=102, kind=RevisionKind.ADDITIVE, compatible_from=99),
+    # Every recipient creator must honor durable future-target exclusion.
+    Revision(revision=103, kind=RevisionKind.BREAKING, compatible_from=103),
 )
 
 #: The revision an empty database is initialized to.

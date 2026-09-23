@@ -47,6 +47,8 @@ from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
 )
+from cayu.sessions import creation_fence
+from cayu.storage._creation_fence import MemoryCreationFenceMixin
 
 if TYPE_CHECKING:
     from cayu.collaboration._contracts import ExactLookup
@@ -446,6 +448,10 @@ from cayu.tools.grants import (
 )
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
+
+# Unexported capability used only by CayuApp's recipient boundary. Direct
+# store callers cannot manufacture recipient provenance by shaping a request.
+_RECIPIENT_PROVENANCE_CAPABILITY = object()
 
 
 class _SessionCommitGuardCancelled(RuntimeError):
@@ -10222,6 +10228,26 @@ class SessionStore(ABC):
     participant_session_binding_version: ClassVar[int | None] = None
     context_view_version: ClassVar[int | None] = None
 
+    async def _prepare_session_creation_target(self, target, *, authority):
+        raise NotImplementedError("This SessionStore does not support creation decisions.")
+
+    async def _register_session_creation_target(self, target, *, authority):
+        raise NotImplementedError("This SessionStore does not support creation decisions.")
+
+    async def _exclude_session_creation_target(self, target, *, authority):
+        raise NotImplementedError("This SessionStore does not support creation decisions.")
+
+    async def _acknowledge_session_creation_settlement(self, target, *, authority):
+        raise NotImplementedError("This SessionStore does not support creation settlement.")
+
+    async def read_session_creation_decision(self, target):
+        from cayu.collaboration._contracts import ExactUnavailable
+
+        return ExactUnavailable()
+
+    async def list_pending_session_creations(self, owner, *, cursor=None, limit=32):
+        raise NotImplementedError("This SessionStore does not support creation discovery.")
+
     async def create_participant_owned_session(
         self,
         creation_request: ParticipantSessionCreationRequest,
@@ -10231,6 +10257,11 @@ class SessionStore(ABC):
         binding_factory: Callable[
             [Session], tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]
         ],
+        recipient_provenance: object | None = None,
+        recipient_selection: _ContextViewSelectionReceipt | None = None,
+        creation_target=None,
+        recipient_receipt_validator: Callable[[Session, ParticipantSessionCreationReceipt], object]
+        | None = None,
     ) -> tuple[Session, ParticipantSessionCreationReceipt]:
         raise NotImplementedError(
             "This SessionStore does not support participant-owned session creation."
@@ -10261,6 +10292,13 @@ class SessionStore(ABC):
         self, manifest: _ContextViewManifest, *, publication_key: str
     ) -> _ContextViewManifest:
         raise NotImplementedError("This SessionStore does not support context-view publication.")
+
+    async def lookup_context_view_selection(
+        self, selection_key: str
+    ) -> _ContextViewSelectionReceipt | None:
+        raise NotImplementedError(
+            "This SessionStore does not support context-view selection lookup."
+        )
 
     async def lookup_context_view_publication(
         self, publication_key: str
@@ -10476,6 +10514,16 @@ class SessionStore(ABC):
         checkpoint_transform: CheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         operation_initializer: SessionOperationInitializer | None = None,
+        participant_binding_factory: Callable[
+            [Session], tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]
+        ]
+        | None = None,
+        participant_request_commitment: str | None = None,
+        participant_provenance: object | None = None,
+        recipient_selection: _ContextViewSelectionReceipt | None = None,
+        creation_target=None,
+        recipient_receipt_validator: Callable[[Session, ParticipantSessionCreationReceipt], object]
+        | None = None,
     ) -> Session:
         """Create a session, optionally admitting its first interaction atomically.
 
@@ -14492,7 +14540,7 @@ class _InMemoryContextViewSelectionTransaction:
         self._store._lock.release()
 
 
-class InMemorySessionStore(SessionStore):
+class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     """In-process session store for tests, local development, and examples."""
 
     session_export_version: ClassVar[int] = 1
@@ -14865,6 +14913,7 @@ class InMemorySessionStore(SessionStore):
         self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._participant_creation_lock = asyncio.Lock()
+        self._session_creation_decisions = {}
         self._sessions: dict[str, Session] = {}
         self._participant_session_bindings: dict[str, ParticipantSessionBinding] = {}
         self._participant_session_receipts: dict[str, ParticipantSessionCreationReceipt] = {}
@@ -16378,6 +16427,11 @@ class InMemorySessionStore(SessionStore):
         ]
         | None = None,
         participant_request_commitment: str | None = None,
+        participant_provenance: object | None = None,
+        recipient_selection: _ContextViewSelectionReceipt | None = None,
+        creation_target=None,
+        recipient_receipt_validator: Callable[[Session, ParticipantSessionCreationReceipt], object]
+        | None = None,
     ) -> Session:
         if type(request) is not RunRequest:
             raise TypeError("Session creation requires a RunRequest.")
@@ -16394,6 +16448,19 @@ class InMemorySessionStore(SessionStore):
             raise TypeError("result_checkpoint_transform must be callable.")
         async with self._lock:
             session_id = request.session_id or str(uuid4())
+            if (
+                participant_provenance is _RECIPIENT_PROVENANCE_CAPABILITY
+                and creation_target is None
+            ):
+                raise PermissionError("Recipient creation requires its exact durable target.")
+            if creation_target is not None:
+                creation_target = creation_fence.snapshot_target(creation_target)
+                creation_fence.require_pending(
+                    creation_target,
+                    self._session_creation_decisions.get(creation_target.key),
+                    request_commitment=participant_request_commitment,
+                    requested_session_id=request.session_id,
+                )
             self._require_available_closure_identity_unlocked(session_id)
             admission = _copy_optional_interaction_admission(
                 session_id,
@@ -16526,6 +16593,7 @@ class InMemorySessionStore(SessionStore):
 
             participant_binding = None
             participant_receipt = None
+            recipient_messages = []
             if participant_binding_factory is not None:
                 participant_binding, participant_receipt = participant_binding_factory(
                     session.model_copy(deep=True)
@@ -16544,6 +16612,43 @@ class InMemorySessionStore(SessionStore):
                     raise ValueError("Participant creation key was concurrently claimed.")
                 if type(participant_request_commitment) is not str:
                     raise ValueError("Participant request commitment is required.")
+                if (
+                    participant_receipt.recipient_metadata_json is not None
+                    and participant_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY
+                ):
+                    raise PermissionError(
+                        "Recipient provenance requires the trusted application boundary."
+                    )
+                if participant_receipt.recipient_metadata_json is not None:
+                    recipient_messages = copy_transcript_messages(request.messages)
+                if recipient_selection is not None:
+                    stored_selection = self._context_selection_receipts.get(
+                        recipient_selection.selection_key
+                    )
+                    if (
+                        stored_selection is None
+                        or stored_selection != recipient_selection
+                        or stored_selection.state not in {"adopted", "transferred"}
+                    ):
+                        raise PermissionError(
+                            "Recipient context-view ownership changed before child creation."
+                        )
+                if recipient_receipt_validator is not None:
+                    recipient_receipt_validator(session, participant_receipt)
+
+            creation_decision = None
+            if creation_target is not None:
+                if participant_binding is None:
+                    raise PermissionError("Creation targets require participant ownership.")
+                assert participant_receipt is not None
+                creation_fence.validate_binding(
+                    creation_target,
+                    participant_binding,
+                    requested_session_id=participant_receipt.requested_session_id,
+                )
+                creation_decision = creation_fence.created(
+                    creation_target, session, participant_receipt
+                )
 
             # Every caller-controlled transform and validation step is complete.
             # Publish the prepared state while retaining the in-memory store lock.
@@ -16552,6 +16657,8 @@ class InMemorySessionStore(SessionStore):
                 field_name="session_id",
             )
             self._sessions[session.id] = session
+            if creation_decision is not None:
+                self._session_creation_decisions[creation_decision.target.key] = creation_decision
             self._index_session_parent_unlocked(session)
             self._events[session.id] = []
             self._event_ids[session.id] = set()
@@ -16574,10 +16681,13 @@ class InMemorySessionStore(SessionStore):
                 self._participant_session_request_commitments[participant_binding.creation_key] = (
                     participant_request_commitment
                 )
-            self._transcripts[session.id] = []
-            self._transcript_interaction_ids[session.id] = []
+            self._transcripts[session.id] = recipient_messages
+            self._transcript_interaction_ids[session.id] = [None] * len(recipient_messages)
             self._latest_transcript_indexes_by_role[session.id] = {}
             self._transcript_search_documents[session.id] = []
+            if recipient_messages:
+                self._replace_latest_transcript_role_indexes_unlocked(session.id)
+                self._replace_transcript_search_session_unlocked(session.id, recipient_messages)
             self._refresh_child_lifecycle_candidate_unlocked(session)
             if prepared_admission_events is not None:
                 assert admission is not None
@@ -16613,6 +16723,10 @@ class InMemorySessionStore(SessionStore):
         binding_factory: Callable[
             [Session], tuple[ParticipantSessionBinding, ParticipantSessionCreationReceipt]
         ],
+        recipient_provenance: object | None = None,
+        recipient_selection: _ContextViewSelectionReceipt | None = None,
+        creation_target=None,
+        recipient_receipt_validator=None,
     ) -> tuple[Session, ParticipantSessionCreationReceipt]:
         from cayu.sessions.context_views import (
             ParticipantSessionCreationRequest,
@@ -16620,6 +16734,11 @@ class InMemorySessionStore(SessionStore):
 
         if type(creation_request) is not ParticipantSessionCreationRequest:
             raise TypeError("Participant creation requires a typed creation request.")
+        if (
+            creation_request.metadata_json is not None
+            and recipient_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY
+        ):
+            raise PermissionError("Recipient provenance requires the trusted application boundary.")
         if type(resolved_request) is not RunRequest:
             raise TypeError("Participant creation requires a resolved RunRequest.")
         if not callable(binding_factory):
@@ -16648,12 +16767,20 @@ class InMemorySessionStore(SessionStore):
                     raise ValueError("Participant creation key conflicts with its binding.")
                 if expected_receipt != receipt:
                     raise ValueError("Participant creation key conflicts with its receipt.")
+                if creation_target is not None:
+                    from cayu.storage._creation_fence import validate_replay
+
+                    await validate_replay(self, creation_target, session)
                 return session.model_copy(deep=True), receipt.model_copy(deep=True)
             session = await self.create(
                 resolved_request,
                 identity=identity,
                 participant_binding_factory=binding_factory,
                 participant_request_commitment=creation_request.request_commitment,
+                participant_provenance=recipient_provenance,
+                recipient_selection=recipient_selection,
+                creation_target=creation_target,
+                recipient_receipt_validator=recipient_receipt_validator,
             )
             receipt = self._participant_session_receipts.get(session.id)
             if receipt is None:
@@ -17009,6 +17136,15 @@ class InMemorySessionStore(SessionStore):
             self._context_selection_receipts[request.selection_key] = receipt
             self._context_selection_request_commitments[request.selection_key] = request_commitment
             return receipt.model_copy(deep=True)
+
+    async def lookup_context_view_selection(self, selection_key: str):
+        from cayu.sessions.context_views import ContextViewSelectionReceipt
+
+        async with self._lock:
+            receipt = self._context_selection_receipts.get(selection_key)
+            if receipt is None:
+                return None
+            return ContextViewSelectionReceipt.model_validate(receipt.model_dump(mode="json"))
 
     async def transition_context_view_ownership(
         self, request: _ContextViewOwnershipRequest

@@ -194,6 +194,9 @@ def test_doctor_reads_committed_live_wal_without_mutating_it(
     async def seed() -> SQLiteSessionStore:
         store = SQLiteSessionStore(database)
         store._connection.execute("PRAGMA wal_autocheckpoint = 0")
+        # Schema initialization may already have triggered an automatic checkpoint.
+        # Establish a deterministic main-file baseline before the WAL-only row.
+        store._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         await store.create(
             RunRequest(
                 session_id="live-wal-session",
@@ -212,8 +215,7 @@ def test_doctor_reads_committed_live_wal_without_mutating_it(
             uri=True,
         )
         try:
-            with pytest.raises(sqlite3.OperationalError, match="no such table"):
-                immutable.execute("SELECT COUNT(*) FROM cayu_sessions").fetchone()
+            assert immutable.execute("SELECT COUNT(*) FROM cayu_sessions").fetchone()[0] == 0
         finally:
             immutable.close()
         main_before = database.read_bytes()

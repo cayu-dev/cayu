@@ -34,6 +34,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
     session_message_rejection,
 )
+from cayu.sessions import creation_fence
 from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageInspection,
@@ -42,6 +43,8 @@ from cayu.sessions.base import (
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
 )
+from cayu.storage import _creation_fence
+from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 
 if TYPE_CHECKING:
     from cayu.runtime._zero_work_interruption import (
@@ -1981,7 +1984,7 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
     )
 
 
-class SQLiteSessionStore(SessionStore):
+class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
     """SQLite-backed session store for durable local runtime state."""
 
     supports_usage_aggregates: ClassVar[bool] = True
@@ -3661,6 +3664,10 @@ class SQLiteSessionStore(SessionStore):
         operation_initializer: SessionOperationInitializer | None = None,
         participant_binding_factory: Callable[[Session], tuple[Any, Any]] | None = None,
         participant_request_commitment: str | None = None,
+        participant_provenance=None,
+        recipient_selection=None,
+        creation_target=None,
+        recipient_receipt_validator=None,
     ) -> Session:
         from cayu.sessions.pending_actions import pending_action_event_storage_values
 
@@ -3683,6 +3690,23 @@ class SQLiteSessionStore(SessionStore):
                 self._connection.execute("BEGIN IMMEDIATE")
                 with self._connection:
                     created_at = self._ownership_clock()
+                    from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+
+                    if (
+                        participant_provenance is _RECIPIENT_PROVENANCE_CAPABILITY
+                        and creation_target is None
+                    ):
+                        raise PermissionError(
+                            "Recipient creation requires its exact durable target."
+                        )
+                    if creation_target is not None:
+                        creation_target = creation_fence.snapshot_target(creation_target)
+                        creation_fence.require_pending(
+                            creation_target,
+                            _creation_fence.sqlite_read(self._connection, creation_target),
+                            request_commitment=participant_request_commitment,
+                            requested_session_id=request.session_id,
+                        )
                     parent_session = (
                         None
                         if request.parent_session_id is None
@@ -3810,6 +3834,63 @@ class SQLiteSessionStore(SessionStore):
                                 sqlite_support.json_dumps(receipt.model_dump(mode="json")),
                             ),
                         )
+                        if recipient_selection is not None:
+                            from cayu.sessions.context_views import ContextViewSelectionReceipt
+
+                            row = self._connection.execute(
+                                "SELECT receipt_json FROM cayu_context_view_selections "
+                                "WHERE selection_key = ?",
+                                (recipient_selection.selection_key,),
+                            ).fetchone()
+                            stored_selection = (
+                                None
+                                if row is None
+                                else ContextViewSelectionReceipt.model_validate_json(row[0])
+                            )
+                            if (
+                                stored_selection is None
+                                or stored_selection != recipient_selection
+                                or stored_selection.state not in {"adopted", "transferred"}
+                            ):
+                                raise PermissionError(
+                                    "Recipient context-view ownership changed before child creation."
+                                )
+                        if receipt.recipient_metadata_json is not None:
+                            from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+
+                            if participant_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY:
+                                raise PermissionError(
+                                    "Recipient provenance requires the trusted application boundary."
+                                )
+                            self._connection.executemany(
+                                "INSERT INTO cayu_transcript_messages "
+                                "(session_id, role, interaction_id, message_json, transcript_search_document) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                [
+                                    (
+                                        session.id,
+                                        str(message.role),
+                                        None,
+                                        sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                        transcript_search_document(message),
+                                    )
+                                    for message in request.messages
+                                ],
+                            )
+                        if recipient_receipt_validator is not None:
+                            recipient_receipt_validator(session, receipt)
+                        if creation_target is not None:
+                            creation_fence.validate_binding(
+                                creation_target,
+                                binding,
+                                requested_session_id=receipt.requested_session_id,
+                            )
+                            _creation_fence.sqlite_write(
+                                self._connection,
+                                creation_fence.created(creation_target, session, receipt),
+                            )
+                    elif creation_target is not None:
+                        raise PermissionError("Creation targets require participant ownership.")
                     if initial_operation_records:
                         self._connection.executemany(
                             "INSERT INTO cayu_session_operations "
@@ -3997,13 +4078,28 @@ class SQLiteSessionStore(SessionStore):
         resolved_request,
         identity,
         binding_factory,
+        recipient_provenance=None,
+        recipient_selection=None,
+        creation_target=None,
+        recipient_receipt_validator=None,
     ):
+        if creation_request.metadata_json is not None:
+            from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
+
+            if recipient_provenance is not _RECIPIENT_PROVENANCE_CAPABILITY:
+                raise PermissionError(
+                    "Recipient provenance requires the trusted application boundary."
+                )
         async with self._participant_creation_lock:
             return await self._create_participant_owned_session_unserialized(
                 creation_request,
                 resolved_request=resolved_request,
                 identity=identity,
                 binding_factory=binding_factory,
+                recipient_provenance=recipient_provenance,
+                recipient_selection=recipient_selection,
+                creation_target=creation_target,
+                recipient_receipt_validator=recipient_receipt_validator,
             )
 
     async def _create_participant_owned_session_unserialized(
@@ -4013,25 +4109,37 @@ class SQLiteSessionStore(SessionStore):
         resolved_request,
         identity,
         binding_factory,
+        recipient_provenance=None,
+        recipient_selection=None,
+        creation_target=None,
+        recipient_receipt_validator=None,
     ):
         from cayu.storage._participant_session_records import validate_replay
 
         existing = await self._lookup_participant_session_creation_unserialized(creation_request)
         if existing is not None:
+            if creation_target is not None:
+                await _creation_fence.validate_replay(self, creation_target, existing[0])
             return validate_replay(existing, identity, binding_factory)
         try:
             session = await self.create(
                 resolved_request,
                 identity=identity,
                 participant_binding_factory=binding_factory,
+                participant_provenance=recipient_provenance,
+                recipient_selection=recipient_selection,
+                creation_target=creation_target,
                 participant_request_commitment=creation_request.request_commitment,
+                recipient_receipt_validator=recipient_receipt_validator,
             )
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, creation_fence.SessionCreationConflict):
             existing = await self._lookup_participant_session_creation_unserialized(
                 creation_request
             )
             if existing is None:
                 raise
+            if creation_target is not None:
+                await _creation_fence.validate_replay(self, creation_target, existing[0])
             return validate_replay(existing, identity, binding_factory)
         receipt = await self.load_participant_session_creation_receipt(session.id)
         if receipt is None:
@@ -4570,6 +4678,20 @@ class SQLiteSessionStore(SessionStore):
             )
             self._connection.commit()
             return receipt.model_copy(deep=True)
+
+    async def lookup_context_view_selection(self, selection_key):
+        from cayu.sessions.context_views import ContextViewSelectionReceipt
+
+        if type(selection_key) is not str:
+            raise TypeError("Context-view selection key must be a string.")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT receipt_json FROM cayu_context_view_selections WHERE selection_key = ?",
+                (selection_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ContextViewSelectionReceipt.model_validate_json(row[0])
 
     async def transition_context_view_ownership(self, request):
         from cayu.sessions.context_views import (
