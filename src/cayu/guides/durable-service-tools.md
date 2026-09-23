@@ -1,5 +1,8 @@
 # Durable service-backed tools
 
+For a complete installed-package support agent with restartable clarification and
+external approval receipts, run `cayu guide order-support`.
+
 Use this recipe when a custom tool wraps an application-owned service and must
 resume a saved session in a replacement process. For the complete proposal,
 approval, action, verification, and recovery lifecycle, keep using

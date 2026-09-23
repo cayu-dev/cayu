@@ -1,5 +1,8 @@
 # Building applications with Cayu
 
+For a complete installed-package support agent with restartable clarification and
+external approval receipts, run `cayu guide order-support`.
+
 This guide is the canonical concept map and implementation path for Cayu
 applications. Generated projects repeat only their local commands and
 registration rules in `AGENTS.md`.

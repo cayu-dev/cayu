@@ -1,5 +1,8 @@
 # Cayu examples
 
+The installed restartable order-support application runs with
+`python -m cayu.examples.order_support`; see `cayu guide order-support`.
+
 Start with the smallest example that matches the capability you need. Examples
 are references, not a checklist or a required project structure. Files ending
 in `_live.py` cross a real provider or infrastructure boundary and require the

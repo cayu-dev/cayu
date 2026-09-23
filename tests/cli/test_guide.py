@@ -648,3 +648,20 @@ def test_human_attention_guide_discovery_and_public_contracts(capsys) -> None:
     assert "unavailable" in result["content"] and "next_cursor" in result["content"]
     assert main(["guide", "human-attention#one-underlying-action"]) == 0
     assert "attention_id" in capsys.readouterr().out
+
+
+def test_installed_order_support_discovery(capsys) -> None:
+    assert main(["guide", "order-support", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["package_source"] == "cayu.guides/order-support.md"
+    assert "python -m cayu.examples.order_support" in result["content"]
+    assert "receipt_to_native_request" in result["content"]
+    for topic in (
+        "authoring",
+        "references#sessions",
+        "references#approvals",
+        "durable-operations",
+        "durable-service-tools",
+    ):
+        assert main(["guide", topic]) == 0
+        assert "cayu guide order-support" in capsys.readouterr().out

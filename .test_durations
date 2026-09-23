@@ -37012,5 +37012,9 @@
     "tests/core/test_actionable_admission_errors.py::test_duplicate_run_explains_continuation_without_admitting_work": 0.5035117919323966,
     "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileAdoptionRejected-adoption was rejected]": 0.0002535419771447778,
     "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileMigrationRequired-requires an execution-profile migration]": 0.000243500922806561,
-    "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileMismatchError-Start a new session]": 0.0003743330016732216
+    "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileMismatchError-Start a new session]": 0.0003743330016732216,
+    "tests/cli/test_guide.py::test_installed_order_support_discovery": 0.0667676260927692,
+    "tests/examples/test_order_support.py::test_invalid_receipts_and_changed_version_never_execute": 27.05577712401282,
+    "tests/examples/test_order_support.py::test_restart_approval_repeat_and_independent_verification[approve]": 29.701313625089824,
+    "tests/examples/test_order_support.py::test_restart_approval_repeat_and_independent_verification[deny]": 25.878794290008955
 }

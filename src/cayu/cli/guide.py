@@ -10,6 +10,10 @@ from typing import Any
 from cayu._version import package_version
 
 _GUIDES = {
+    "order-support": (
+        "order-support.md",
+        "Restartable support agent with external approval receipts.",
+    ),
     "anatomy": ("application-anatomy.md", "Application lifecycle and process roles."),
     "applications": (
         "applications.md",
@@ -61,6 +65,7 @@ _INCLUDES = {
     ),
 }
 _RELATED = {
+    "order-support": ("durable-service-tools", "durable-operations", "references"),
     "anatomy": ("applications", "authoring", "diagnostics"),
     "applications": ("anatomy", "authoring", "diagnostics", "references"),
     "authoring": (

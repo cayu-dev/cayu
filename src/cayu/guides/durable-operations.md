@@ -1,5 +1,8 @@
 # Durable operations lifecycle
 
+For a complete installed-package support agent with restartable clarification and
+external approval receipts, run `cayu guide order-support`.
+
 Use this quickstart when an agent must observe a system, diagnose it, propose a
 change, obtain authority, act, verify the result, and survive process restarts.
 It is a paved composition of existing public Cayu APIs, not a second

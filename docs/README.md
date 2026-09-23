@@ -1,5 +1,8 @@
 # Cayu documentation
 
+The installed restartable order-support application runs with
+`python -m cayu.examples.order_support`; see `cayu guide order-support`.
+
 This is the canonical index for repository documentation. Runtime behavior is
 authoritative only where a maintained guide points to the implementation or the
 [runtime contracts](runtime-contracts.md).

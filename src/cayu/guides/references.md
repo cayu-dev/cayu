@@ -106,6 +106,9 @@ runtime test, eval, and tracer-bullet check loop through Cayu.
 
 ## approvals
 
+Run `cayu guide order-support` for the installed restartable support agent and
+external-receipt-to-native-approval adapter.
+
 The runnable proposal-to-verification recipe is `cayu guide durable-operations`.
 Tool effects describe replay risk; tool policies authorize execution. Use
 `AlwaysRequireApprovalToolPolicy` for a named external-effect tool that needs a
@@ -158,6 +161,9 @@ HTTP 405 falling back to explicit refresh and never polling. See
 MCP 2026-07-28 subscription and cache-hint capabilities remain deferred.
 
 ## sessions
+
+Run `cayu guide order-support` for the installed restartable support agent and
+external-receipt-to-native-approval adapter.
 
 `SessionStore` owns durable session identity, transcript, events, status,
 checkpoints, and pending actions. Use `RunRequest.session_id` when identity must
