@@ -183,6 +183,8 @@ class AuxiliaryInferenceOwner:
                     expected_profile_fingerprint=invocation.profile.fingerprint,
                     candidate_profile_fingerprint=candidate.fingerprint,
                     changed_component_classes=(component.component_class,),
+                    expected_profile=invocation.profile,
+                    candidate_profile=candidate,
                 )
 
         async def refresh_execution() -> None:

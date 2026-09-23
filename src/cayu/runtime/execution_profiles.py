@@ -927,6 +927,50 @@ class _ExecutionProfileAdmissionRequestRejected(RuntimeError):
     """Private signal for deterministic request rejection before admission."""
 
 
+class ExecutionProfileDifference(BaseModel):
+    """Bounded class-level evidence; profile digests do not identify members."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component_class: ExecutionProfileComponentClass
+    category: Literal["opaque_identity", "other_or_unknown"]
+
+
+def _profile_differences(
+    changed: tuple[ExecutionProfileComponentClass, ...],
+    expected: ExecutionProfileIdentity | None,
+    candidate: ExecutionProfileIdentity | None,
+    expected_fingerprint: str,
+    candidate_fingerprint: str,
+) -> tuple[ExecutionProfileDifference, ...]:
+    # Only exact runtime value objects may participate. Never inspect tools,
+    # services, configuration, reprs, or user-provided identity hooks here.
+    profiles = (expected, candidate)
+    trusted = (
+        all(type(profile) is ExecutionProfileIdentity for profile in profiles)
+        and expected is not None
+        and candidate is not None
+        and expected.fingerprint == expected_fingerprint
+        and candidate.fingerprint == candidate_fingerprint
+    )
+    opaque = set()
+    if trusted:
+        for profile in profiles:
+            assert profile is not None
+            for component in profile.components:
+                if type(component) is ExecutionProfileComponentIdentity and (
+                    component.strength is ExecutionProfileIdentityStrength.PROCESS_LOCAL
+                ):
+                    opaque.add(component.component_class)
+    return tuple(
+        ExecutionProfileDifference(
+            component_class=component,
+            category="opaque_identity" if component in opaque else "other_or_unknown",
+        )
+        for component in changed
+    )
+
+
 class ExecutionProfileMismatchError(RuntimeError):
     """Raised after durable evidence rejects a changed execution profile."""
 
@@ -937,6 +981,8 @@ class ExecutionProfileMismatchError(RuntimeError):
         expected_profile_fingerprint: str,
         candidate_profile_fingerprint: str,
         changed_component_classes: tuple[ExecutionProfileComponentClass, ...],
+        expected_profile: ExecutionProfileIdentity | None = None,
+        candidate_profile: ExecutionProfileIdentity | None = None,
     ) -> None:
         self.session_id = session_id
         self.expected_profile_fingerprint = expected_profile_fingerprint
@@ -945,7 +991,32 @@ class ExecutionProfileMismatchError(RuntimeError):
         changed = ", ".join(component.value for component in changed_component_classes) or (
             "decision-bearing authority outside the structural profile"
         )
-        super().__init__(self._message(session_id=session_id, changed=changed))
+        self.differences = _profile_differences(
+            changed_component_classes,
+            expected_profile,
+            candidate_profile,
+            expected_profile_fingerprint,
+            candidate_profile_fingerprint,
+        )
+        guidance = (
+            " Class-level digest evidence cannot identify individual components, "
+            "changed declared versions, or additions/removals. Inspect the persisted "
+            "execution-profile decision and your component declarations; "
+            "see `cayu guide durable-service-tools`."
+        )
+        opaque = ", ".join(
+            item.component_class.value
+            for item in self.differences
+            if item.category == "opaque_identity"
+        )
+        if opaque:
+            guidance += (
+                f" Process-local (opaque) identity is present in: {opaque}. "
+                "Reconstructed components need explicit stable behavior and implementation "
+                "identities declared from the first run. Adding a declaration does not "
+                "repair an already persisted opaque baseline."
+            )
+        super().__init__(self._message(session_id=session_id, changed=changed) + guidance)
 
     def _message(self, *, session_id: str, changed: str) -> str:
         return (

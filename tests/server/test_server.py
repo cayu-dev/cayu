@@ -12672,7 +12672,11 @@ def test_run_rejects_duplicate_client_session_id_before_starting_work() -> None:
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "Session already exists: session_duplicate"
+    detail = response.json()["detail"]
+    assert detail.startswith("Session already exists: session_duplicate.")
+    assert "app.run creates a new session" in detail
+    assert "app.resume(ResumeRequest(" in detail
+    assert "pending approval/input" in detail
     assert client.get("/api/tasks").json() == []
 
 

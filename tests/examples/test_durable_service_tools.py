@@ -61,6 +61,14 @@ def test_changed_identity_rejected_before_provider_or_effect(tmp_path: Path, opt
     run_phase(state, "pause", "--wiring", "environment")
     output = run_phase(state, "approve", "--wiring", "environment", option, "2", succeeds=False)
     assert "ExecutionProfileMismatchError" in output
+    expected_class = {
+        "--version": "tool_implementations",
+        "--policy-version": "execution_policies",
+        "--environment-version": "execution_environment",
+    }[option]
+    assert expected_class in output
+    assert "Class-level digest evidence" in output
+    assert "Process-local" not in output
     assert observations(state, "approve") == {"searches": 0, "provider_requests": 0}
     assert not (state / "effects.sqlite").exists()
 
@@ -70,6 +78,8 @@ def test_undeclared_service_identity_remains_fail_closed(tmp_path: Path) -> None
     run_phase(state, "start", "--opaque")
     output = run_phase(state, "resume", "--opaque", succeeds=False)
     assert "ExecutionProfileMismatchError" in output
+    assert "Process-local (opaque) identity is present in: tool_implementations" in output
+    assert "does not repair an already persisted opaque baseline" in output
     assert observations(state, "resume") == {"searches": 0, "provider_requests": 0}
 
 

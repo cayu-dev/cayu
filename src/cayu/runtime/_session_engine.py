@@ -5713,6 +5713,8 @@ class SessionEngine:
                         initial_profile,
                         candidate,
                     ),
+                    expected_profile=initial_profile,
+                    candidate_profile=candidate,
                 )
             return initial_profile
         return candidate
@@ -5947,6 +5949,8 @@ class SessionEngine:
                 expected_profile_fingerprint=snapshot.profile.fingerprint,
                 candidate_profile_fingerprint=candidate.fingerprint,
                 changed_component_classes=changed,
+                expected_profile=snapshot.profile,
+                candidate_profile=candidate,
             )
 
         policy_identity = "cayu:active-invocation-profile:v1"
@@ -5985,6 +5989,8 @@ class SessionEngine:
             expected_profile_fingerprint=snapshot.profile.fingerprint,
             candidate_profile_fingerprint=candidate.fingerprint,
             changed_component_classes=changed,
+            expected_profile=snapshot.profile,
+            candidate_profile=candidate,
         )
 
     async def _repair_historical_queued_profile_handoff(
@@ -6447,6 +6453,8 @@ class SessionEngine:
                 expected_profile_fingerprint=expected_profile.fingerprint,
                 candidate_profile_fingerprint=persisted_candidate.fingerprint,
                 changed_component_classes=changed,
+                expected_profile=expected_profile,
+                candidate_profile=persisted_candidate,
             )
         return copy_event(event)
 
@@ -10403,6 +10411,8 @@ class SessionEngine:
                     expected_execution_profile,
                     execution_profile,
                 ),
+                expected_profile=expected_execution_profile,
+                candidate_profile=execution_profile,
             )
         # Native schema validation is provider-owned code, but it is not an
         # execution attempt. Freeze the invocation profile first while retaining
@@ -10435,7 +10445,15 @@ class SessionEngine:
                 and (store_resolved_existing_session_id != prepared_session_id)
             ):
                 del existing_session
-                raise ValueError(f"Session already exists: {prepared_session_id}")
+                raise ValueError(
+                    f"Session already exists: {prepared_session_id}. "
+                    "app.run creates a new session. For ordinary conversation continuation, "
+                    "use app.resume(ResumeRequest(session_id=existing_id, "
+                    "messages=[Message.text('user', 'Next turn')])). "
+                    "Resume is subject to admission: running sessions, pending approval/input, "
+                    "or incomplete work may require their resolution or recovery API first. "
+                    "See `cayu guide references#sessions` and `cayu guide durable-service-tools`."
+                )
         for candidate_provider, candidate_model in candidate_configurations:
             candidate_provider.provider.preflight_hosted_tools(
                 model=candidate_model,
@@ -15140,6 +15158,8 @@ class SessionEngine:
                 expected_profile_fingerprint=expected_profile.fingerprint,
                 candidate_profile_fingerprint=profile_candidate.fingerprint,
                 changed_component_classes=changed_registration_components,
+                expected_profile=expected_profile,
+                candidate_profile=profile_candidate,
             )
         if expected_profile.schema_version < 3:
             compaction_execution_profile = profile_candidate
@@ -15170,6 +15190,8 @@ class SessionEngine:
                     expected_profile_fingerprint=compaction_execution_profile.fingerprint,
                     candidate_profile_fingerprint=candidate.fingerprint,
                     changed_component_classes=changed,
+                    expected_profile=compaction_execution_profile,
+                    candidate_profile=candidate,
                 )
 
         def governed_compaction_events(events: Iterable[Event]) -> list[Event]:
@@ -15247,6 +15269,8 @@ class SessionEngine:
                         stored_profile,
                         compaction_execution_profile,
                     ),
+                    expected_profile=stored_profile,
+                    candidate_profile=compaction_execution_profile,
                 )
         model_step_identity = stored_model_step_identity or new_model_step_identity()
         reservation_identity_guard = self._run_limit_controller.reservation_identity_guard()
@@ -21100,6 +21124,8 @@ class SessionEngine:
                             source_execution_profile,
                             expected_execution_profile,
                         ),
+                        expected_profile=source_execution_profile,
+                        candidate_profile=expected_execution_profile,
                     )
                 if candidate_execution_profile != required_execution_profile:
                     raise ExecutionProfileMismatchError(
@@ -21110,6 +21136,8 @@ class SessionEngine:
                             required_execution_profile,
                             candidate_execution_profile,
                         ),
+                        expected_profile=required_execution_profile,
+                        candidate_profile=candidate_execution_profile,
                     )
             changed_profile_components = changed_execution_profile_components(
                 expected_execution_profile,
@@ -21127,6 +21155,8 @@ class SessionEngine:
                         fork_initial_profile,
                         candidate_execution_profile,
                     ),
+                    expected_profile=fork_initial_profile,
+                    candidate_profile=candidate_execution_profile,
                 )
             if fork_initial_profile is not None and changed_profile_components:
                 execution_profile_decision = _execution_profile_decision_event(
@@ -21213,6 +21243,8 @@ class SessionEngine:
                     expected_profile_fingerprint=expected_execution_profile.fingerprint,
                     candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
                     changed_component_classes=changed_profile_components,
+                    expected_profile=expected_execution_profile,
+                    candidate_profile=candidate_execution_profile,
                 )
         if continuing_recovery_boundary:
             continuing_profile_resolution = await self._resolve_execution_profile_continuation(
@@ -21253,6 +21285,8 @@ class SessionEngine:
                         required_execution_profile,
                         continuing_execution_profile_snapshot.profile,
                     ),
+                    expected_profile=required_execution_profile,
+                    candidate_profile=continuing_execution_profile_snapshot.profile,
                 )
         # Provider-owned schema validation runs only after the current process's
         # execution profile has been frozen and any ordinary-resume drift has
@@ -22686,6 +22720,8 @@ class SessionEngine:
                     expected_profile_fingerprint=source_execution_profile.fingerprint,
                     candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
                     changed_component_classes=changed_profile_components,
+                    expected_profile=source_execution_profile,
+                    candidate_profile=candidate_execution_profile,
                 )
             selected_execution_profile = candidate_execution_profile
             selected_runtime_identity = current_child_runtime_identity
@@ -25587,6 +25623,8 @@ class SessionEngine:
                         expected_profile_fingerprint=execution_profile.fingerprint,
                         candidate_profile_fingerprint=candidate.fingerprint,
                         changed_component_classes=changed,
+                        expected_profile=execution_profile,
+                        candidate_profile=candidate,
                     )
 
             model_step_run = self._model_step_executor.create_run(

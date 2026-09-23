@@ -37008,5 +37008,9 @@
     "tests/core/test_ci_verification_scope.py::test_relocated_runtime_implementations_keep_runtime_ci_coverage[cayu.workspaces.checkpoint_lifecycle]": 0.000394369984860532,
     "tests/core/test_ci_verification_scope.py::test_relocated_runtime_implementations_keep_runtime_ci_coverage[cayu.workspaces.mutation_attribution]": 0.0003388530167285353,
     "tests/core/test_ci_verification_scope.py::test_relocated_runtime_implementations_keep_runtime_ci_coverage[cayu.workspaces.observation_recovery]": 0.00037033001717645675,
-    "tests/core/test_collaboration_lifecycle_contracts.py::test_permit_exclusion_proof_requires_a_boolean[1]": 0.3691623410122702
+    "tests/core/test_collaboration_lifecycle_contracts.py::test_permit_exclusion_proof_requires_a_boolean[1]": 0.3691623410122702,
+    "tests/core/test_actionable_admission_errors.py::test_duplicate_run_explains_continuation_without_admitting_work": 0.5035117919323966,
+    "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileAdoptionRejected-adoption was rejected]": 0.0002535419771447778,
+    "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileMigrationRequired-requires an execution-profile migration]": 0.000243500922806561,
+    "tests/core/test_actionable_admission_errors.py::test_unknown_evidence_and_hostile_objects_are_not_inspected[ExecutionProfileMismatchError-Start a new session]": 0.0003743330016732216
 }

@@ -160,3 +160,39 @@ Negative checks matter: a changed tool, policy, or environment version must fail
 before a protected effect or provider request; an opaque undeclared tool must
 remain incompatible across reconstruction. For a real service, also test
 unknown external outcomes and reconciliation using `cayu guide tool-effects`.
+
+## Reading admission errors
+
+`app.run` creates a new session. For an ordinary next conversational turn:
+
+```python
+from cayu import CayuApp, Message, ResumeRequest
+
+async def next_turn(app: CayuApp, existing_id: str) -> None:
+    async for event in app.resume(ResumeRequest(
+        session_id=existing_id,
+        messages=[Message.text("user", "Next turn")],
+    )):
+        print(event.type)
+```
+
+An existing session may instead be running, awaiting approval/input, or require
+recovery. Inspect its status and pending actions before choosing the corresponding
+resolution/recovery API (`cayu guide references#sessions`). Ordinary resume does not resolve
+an approval.
+
+`ExecutionProfileMismatchError.differences` reports bounded class-level categories:
+`opaque_identity` means at least one compared class has process-local identity;
+`other_or_unknown` means the available evidence cannot diagnose the change.
+An opaque category is evidence about identity strength, not proof that reconstruction
+caused the mismatch. Declare stable behavior and implementation identities from the
+first run. Adding one later does not repair an existing opaque baseline.
+
+The persisted profile format retains aggregate digests and identity strength, not
+individual member identifiers or declared versions. No durable evidence extension is
+introduced here. Consequently errors cannot distinguish a changed declared version
+from a member addition/removal, nor name the member responsibly. Inspect the persisted
+execution-profile decision, its changed classes, and the application's declarations.
+For real behavior changes start a new session or follow explicit profile adoption;
+never reuse an old version to conceal a change. Adoption rejection and migration
+requirements remain distinct outcomes.
