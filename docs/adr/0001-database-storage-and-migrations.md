@@ -81,6 +81,15 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
    `cayu storage migrate` / app-owned deploy step applies pending migrations;
    running app instances use `validate` at startup. Auto-`create` is allowed only
    for empty databases and only when explicitly enabled.
+   Published migration steps must not be relied on to repair databases that have
+   already recorded those revisions. Revision 102 repairs SQLite and PostgreSQL
+   databases that applied revision 96 before participant session bindings were
+   included, including affected databases already advanced to revisions 99–101.
+   Run the normal `cayu storage migrate` flow with its retained backup and receipt;
+   do not reset revision bookkeeping. Startup validates the binding table, columns,
+   identity keys, session foreign key, and participant lookup index independently
+   of the recorded revision. A conflicting existing structure fails validation
+   rather than being replaced or acknowledged as a successful repair.
 7. **Revision compatibility model.** Every revision is **additive**
    (forward-compatible — only adds tables/columns/indexes; older binaries keep
    working because the store selects explicit columns) or **breaking** (rename /

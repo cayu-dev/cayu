@@ -480,6 +480,8 @@ REVISIONS: tuple[Revision, ...] = (
     # Common-root budget bindings are durably registered before admission.
     Revision(revision=100, kind=RevisionKind.ADDITIVE, compatible_from=99),
     Revision(revision=101, kind=RevisionKind.ADDITIVE, compatible_from=99),
+    # Repair databases that applied revision 96 before participant bindings were added.
+    Revision(revision=102, kind=RevisionKind.ADDITIVE, compatible_from=99),
 )
 
 #: The revision an empty database is initialized to.

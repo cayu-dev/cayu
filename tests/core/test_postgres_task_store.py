@@ -229,6 +229,7 @@ _TABLES = (
     "cayu_checkpoints",
     "cayu_session_operations",
     "cayu_tasks",
+    "cayu_participant_session_bindings",
     "cayu_sessions",
     "cayu_eval_baseline_mutations",
     "cayu_eval_baselines",

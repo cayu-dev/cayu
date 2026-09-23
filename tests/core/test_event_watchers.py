@@ -79,6 +79,7 @@ _POSTGRES_TABLES = (
     "cayu_tasks",
     "cayu_targeted_tool_grant_uses",
     "cayu_targeted_tool_grants",
+    "cayu_participant_session_bindings",
     "cayu_sessions",
     "cayu_eval_baseline_mutations",
     "cayu_eval_baselines",

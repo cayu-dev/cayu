@@ -1000,6 +1000,7 @@ def _request(agent_name: str) -> RunRequest:
 
 
 _TABLES = (
+    "cayu_participant_session_bindings",
     "cayu_schema_migration_receipts",
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",

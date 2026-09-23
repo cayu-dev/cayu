@@ -436,6 +436,7 @@ _POSTGRES_TABLES = (
     "cayu_session_operations",
     "cayu_local_execution_attempts",
     "cayu_tasks",
+    "cayu_participant_session_bindings",
     "cayu_sessions",
     "cayu_eval_baseline_mutations",
     "cayu_eval_baselines",

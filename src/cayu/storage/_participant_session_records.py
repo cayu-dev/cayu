@@ -8,33 +8,13 @@ from typing import Any
 
 from cayu.sessions.base import Session, SessionIdentity
 from cayu.sessions.context_views import ParticipantSessionBinding, ParticipantSessionCreationReceipt
+from cayu.storage._participant_bindings_schema import PARTICIPANT_BINDING_COLUMNS
 
 
 def reconstruct(
     row: Mapping[str, Any], session: Session | None
 ) -> ParticipantSessionCreationReceipt:
-    if not isinstance(row, Mapping):
-        columns = (
-            "creation_key",
-            "request_commitment",
-            "session_id",
-            "session_instance_id",
-            "application_scope",
-            "participant_owner_id",
-            "participant_owner_incarnation",
-            "participant_id",
-            "participant_incarnation",
-            "lifecycle_revision",
-            "configuration_revision",
-            "admission_generation",
-            "creator_commitment",
-            "authorization_commitment",
-            "initial_input_commitment",
-            "execution_profile_commitment",
-            "binding_json",
-            "receipt_json",
-        )
-        row = dict(zip(columns, row, strict=True))
+    row = row_mapping(row)
 
     def document(value: Any) -> Any:
         return json.loads(value) if isinstance(value, str) else value
@@ -74,27 +54,7 @@ def reconstruct(
 def row_mapping(row: Any) -> Mapping[str, Any]:
     if isinstance(row, Mapping):
         return row
-    columns = (
-        "creation_key",
-        "request_commitment",
-        "session_id",
-        "session_instance_id",
-        "application_scope",
-        "participant_owner_id",
-        "participant_owner_incarnation",
-        "participant_id",
-        "participant_incarnation",
-        "lifecycle_revision",
-        "configuration_revision",
-        "admission_generation",
-        "creator_commitment",
-        "authorization_commitment",
-        "initial_input_commitment",
-        "execution_profile_commitment",
-        "binding_json",
-        "receipt_json",
-    )
-    return dict(zip(columns, row, strict=True))
+    return dict(zip(PARTICIPANT_BINDING_COLUMNS, row, strict=True))
 
 
 def validate_replay(

@@ -617,6 +617,11 @@ from cayu.storage._knowledge_closure import (
     KnowledgeClosureQuery,
     copy_knowledge_closure_query,
 )
+from cayu.storage._participant_bindings_schema import (
+    PARTICIPANT_BINDING_PROJECTION,
+    POSTGRES_PARTICIPANT_BINDINGS_DDL,
+    validate_postgres_participant_bindings,
+)
 from cayu.storage._postgres_verified_work import (
     PostgresVerifiedWorkMixin,
     _PostgresMutationConnectionOwner,
@@ -1533,37 +1538,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             ON cayu_context_view_selections(view_id, state)
         """,
     ),
-    96: (
-        *POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
-        """
-        CREATE TABLE IF NOT EXISTS cayu_participant_session_bindings (
-            creation_key TEXT PRIMARY KEY,
-            request_commitment TEXT NOT NULL,
-            session_id TEXT NOT NULL UNIQUE REFERENCES cayu_sessions(id) ON DELETE CASCADE,
-            session_instance_id TEXT NOT NULL,
-            application_scope TEXT NOT NULL,
-            participant_owner_id TEXT NOT NULL,
-            participant_owner_incarnation TEXT NOT NULL,
-            participant_id TEXT NOT NULL,
-            participant_incarnation TEXT NOT NULL,
-            lifecycle_revision BIGINT NOT NULL,
-            configuration_revision BIGINT NOT NULL,
-            admission_generation BIGINT NOT NULL,
-            creator_commitment TEXT NOT NULL,
-            authorization_commitment TEXT NOT NULL,
-            initial_input_commitment TEXT NOT NULL,
-            execution_profile_commitment TEXT NOT NULL,
-            binding_json JSONB NOT NULL,
-            receipt_json JSONB NOT NULL,
-            CHECK (char_length(creation_key) BETWEEN 1 AND 256),
-            CHECK (char_length(request_commitment) BETWEEN 1 AND 256)
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_cayu_participant_session_bindings_participant
-            ON cayu_participant_session_bindings(participant_owner_id, participant_id)
-        """,
-    ),
+    96: (*POSTGRES_TASK_GROUP_QUIESCENCE_DDL, *POSTGRES_PARTICIPANT_BINDINGS_DDL),
+    102: POSTGRES_PARTICIPANT_BINDINGS_DDL,
     90: POSTGRES_SCHEDULING_DDL,
     92: POSTGRES_TASK_GROUP_DDL,
     93: POSTGRES_COLLABORATION_DDL,
@@ -6716,6 +6692,8 @@ class _PostgresStoreBase:
                             app_min_supported=self._min_required_revision,
                         )
                         self._validate_postgres_revision(current_state)
+                        if current_state.revision >= 96:
+                            await validate_postgres_participant_bindings(cur)
                         if self._min_required_revision >= 36:
                             await self._validate_session_invocation_column(cur)
                         if self._min_required_revision >= 38:
@@ -7029,6 +7007,8 @@ class _PostgresStoreBase:
 
     async def _validate_postgres_schema(self, cur: Any, state: schema.SchemaState) -> None:
         self._validate_postgres_revision(state)
+        if state.revision >= 96:
+            await validate_postgres_participant_bindings(cur)
         if state.revision >= 93:
             await validate_postgres_collaboration_schema(
                 cur, lifecycle=state.revision >= 94, requests=state.revision >= 95
@@ -7189,6 +7169,8 @@ class _PostgresStoreBase:
     ) -> None:
         """Validate non-index objects before recording their owning revision."""
 
+        if revision.revision == 102:
+            await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:
             await self._validate_session_invocation_column(cur)
         if revision.revision == 38:
@@ -27480,7 +27462,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "SELECT * FROM cayu_participant_session_bindings WHERE creation_key = %s",
+                f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE creation_key = %s",
                 (creation_request.creation_key,),
             )
             row = await cur.fetchone()
@@ -27504,7 +27486,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "SELECT * FROM cayu_participant_session_bindings WHERE session_id = %s",
+                f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE session_id = %s",
                 (session_id,),
             )
             row = await cur.fetchone()
@@ -27528,7 +27510,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             session = await self._load(cur, session_id)
             await cur.execute(
-                "SELECT * FROM cayu_participant_session_bindings WHERE session_id = %s",
+                f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE session_id = %s",
                 (session_id,),
             )
             row = await cur.fetchone()

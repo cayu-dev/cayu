@@ -55,6 +55,10 @@ from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
 )
+from cayu.storage._participant_bindings_schema import (
+    SQLITE_PARTICIPANT_BINDINGS_DDL,
+    validate_sqlite_participant_bindings,
+)
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
     SQLITE_TASK_GROUP_DDL,
@@ -980,6 +984,7 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    102: SQLITE_PARTICIPANT_BINDINGS_DDL,
     101: """
         CREATE TABLE IF NOT EXISTS cayu_budget_binding_consumptions (
             binding_id TEXT NOT NULL,
@@ -1056,33 +1061,7 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_context_view_selections_view
             ON cayu_context_view_selections(view_id, state);
     """,
-    96: SQLITE_TASK_GROUP_QUIESCENCE_DDL
-    + """
-        CREATE TABLE IF NOT EXISTS cayu_participant_session_bindings (
-            creation_key TEXT PRIMARY KEY,
-            request_commitment TEXT NOT NULL,
-            session_id TEXT NOT NULL UNIQUE REFERENCES cayu_sessions(id) ON DELETE CASCADE,
-            session_instance_id TEXT NOT NULL,
-            application_scope TEXT NOT NULL,
-            participant_owner_id TEXT NOT NULL,
-            participant_owner_incarnation TEXT NOT NULL,
-            participant_id TEXT NOT NULL,
-            participant_incarnation TEXT NOT NULL,
-            lifecycle_revision INTEGER NOT NULL,
-            configuration_revision INTEGER NOT NULL,
-            admission_generation INTEGER NOT NULL,
-            creator_commitment TEXT NOT NULL,
-            authorization_commitment TEXT NOT NULL,
-            initial_input_commitment TEXT NOT NULL,
-            execution_profile_commitment TEXT NOT NULL,
-            binding_json TEXT NOT NULL,
-            receipt_json TEXT NOT NULL,
-            CHECK (length(creation_key) BETWEEN 1 AND 256),
-            CHECK (length(request_commitment) BETWEEN 1 AND 256)
-        );
-        CREATE INDEX IF NOT EXISTS idx_cayu_participant_session_bindings_participant
-            ON cayu_participant_session_bindings(participant_owner_id, participant_id);
-    """,
+    96: SQLITE_TASK_GROUP_QUIESCENCE_DDL + SQLITE_PARTICIPANT_BINDINGS_DDL,
     92: SQLITE_TASK_GROUP_DDL,
     93: SQLITE_COLLABORATION_DDL,
     94: SQLITE_COLLABORATION_LIFECYCLE_DDL,
@@ -6363,6 +6342,8 @@ def reconcile_schema(
             app_min_supported=app_min_supported,
         )
     current = read_schema_state(connection)
+    if current.revision >= 96:
+        validate_sqlite_participant_bindings(connection)
     if current.revision >= 17:
         if schema_mode is schema.SchemaMode.MIGRATE:
             _repair_missing_revision_17_indexes(connection)
@@ -11105,6 +11086,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             validate_sqlite_collaboration_schema(connection)
         if rev.revision == 94:
             validate_sqlite_collaboration_schema(connection, lifecycle=True)
+        if rev.revision == 102:
+            validate_sqlite_participant_bindings(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
