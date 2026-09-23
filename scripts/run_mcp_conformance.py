@@ -113,6 +113,19 @@ def validate_checks(checks: Any, required: frozenset[str]) -> None:
         raise ValueError(f"Required successful checks missing: {sorted(missing)}")
 
 
+def report_sdk_failure(directory: Path) -> None:
+    """Expose bounded local test diagnostics even when artifact uploads are unavailable."""
+    for name in ("runner.stdout.txt", "runner.stderr.txt"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 65536))
+            tail = stream.read(65536).decode("utf-8", errors="replace")
+        print(f"SDK diagnostic {name} (last 65536 bytes):\n{tail}", flush=True)
+
+
 def validate_sdk_report(path: Path) -> None:
     cases = ET.parse(path).getroot().findall(".//testcase")
     expected = {node.split("::")[1] for node in SDK_TESTS}
@@ -247,6 +260,9 @@ def main() -> int:
         except (OSError, ValueError, ET.ParseError, subprocess.SubprocessError) as exc:
             record["error"] = str(exc)
         print(f"SDK interoperability: {record['status']}", flush=True)
+        if record["status"] != "passed":
+            print(f"SDK failure: {record.get('error', 'unknown')}", flush=True)
+            report_sdk_failure(directory)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         report["error"] = str(exc)
     finally:

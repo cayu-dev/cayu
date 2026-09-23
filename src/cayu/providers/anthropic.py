@@ -19,6 +19,7 @@ from cayu.messages import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -389,6 +390,7 @@ class AnthropicProvider(ModelProvider):
             supports_tool_history=True,
             supports_tool_definitions=True,
             supports_file_attachments=True,
+            supports_peer_content=True,
             tool_name_validator=_validate_anthropic_tool_name,
             tool_definition_validator=_anthropic_tool,
         )
@@ -586,6 +588,9 @@ class AnthropicProvider(ModelProvider):
                 cache_policy=policy,
                 reasoning_provenance=self._reasoning_state_provenance,
             )
+            from cayu.providers.base import record_peer_serialization
+
+            await record_peer_serialization(request)
             stream_transport = getattr(self.transport, "stream_message_events", None)
             if stream_transport is None:
                 # Back-compat: transports predating SSE support fall back to one
@@ -710,6 +715,9 @@ class AnthropicProvider(ModelProvider):
         self,
         request: ModelRequest,
     ) -> InputTokenCountResult | None:
+        from cayu.providers.base import reject_peer_token_counting
+
+        reject_peer_token_counting(request)
         policy = resolve_cache_policy(self.cache_policy, request.options)
         payload = build_anthropic_token_count_payload(
             request,
@@ -1677,7 +1685,8 @@ def _user_block(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1711,10 +1720,19 @@ def _assistant_block(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
 ) -> dict[str, Any]:
     if type(part) is TextPart:
         return {"type": "text", "text": part.text}
+    if type(part) is PeerContentPart:
+        return {
+            "type": "text",
+            "text": (
+                f"[Peer content from {part.sender_participant_id}; "
+                f"occurrence {part.occurrence_id}]\n{part.text}"
+            ),
+        }
     if type(part) is ToolCallPart:
         return {
             "type": "tool_use",
@@ -1763,7 +1781,8 @@ def _tool_result_block(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:

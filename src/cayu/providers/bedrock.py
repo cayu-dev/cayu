@@ -25,6 +25,7 @@ from cayu.messages import (
     FilePart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -370,6 +371,7 @@ class BedrockProvider(ModelProvider):
             supports_tool_history=True,
             supports_tool_definitions=True,
             supports_file_attachments=True,
+            supports_peer_content=True,
             tool_name_validator=_validate_bedrock_tool_name,
             tool_definition_validator=_bedrock_tool,
         )
@@ -527,6 +529,9 @@ class BedrockProvider(ModelProvider):
         owns_deadline_controller = False
         try:
             payload = build_bedrock_converse_payload(request, default_max_tokens=self.max_tokens)
+            from cayu.providers.base import record_peer_serialization
+
+            await record_peer_serialization(request)
             client = await self._get_client()
             deadline_controller = current_provider_deadline_controller()
             owns_deadline_controller = deadline_controller is None
@@ -595,6 +600,9 @@ class BedrockProvider(ModelProvider):
 
     @detach_provider_call_traceback
     async def count_input_tokens(self, request: ModelRequest) -> InputTokenCountResult | None:
+        from cayu.providers.base import reject_peer_token_counting
+
+        reject_peer_token_counting(request)
         payload = build_bedrock_converse_payload(request, default_max_tokens=self.max_tokens)
         model_id = payload.pop("modelId")
         count_input = {
@@ -1202,6 +1210,15 @@ def _bedrock_message_content(
     for part in parts:
         if isinstance(part, TextPart):
             result.append({"text": part.text})
+        elif isinstance(part, PeerContentPart):
+            result.append(
+                {
+                    "text": (
+                        f"[Peer content from {part.sender_participant_id}; "
+                        f"occurrence {part.occurrence_id}]\n{part.text}"
+                    )
+                }
+            )
         elif isinstance(part, ProviderStatePart):
             continue
         elif isinstance(part, ThinkingPart):

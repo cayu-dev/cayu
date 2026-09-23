@@ -9,7 +9,7 @@ import mimetypes
 import os
 import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -109,10 +109,15 @@ from cayu.collaboration._permits import (
 from cayu.collaboration._request_coordinator import RequestCoordinator
 from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
 from cayu.collaboration._wait_coordinator import WaitCoordinator
-from cayu.collaboration.access import CollaborationAccessContext, CollaborationRegistration
+from cayu.collaboration.access import (
+    CollaborationAccessContext,
+    CollaborationAccessDenied,
+    CollaborationRegistration,
+)
 from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.exports import (
     SessionExportAccessContext,
+    SessionExportDenied,
     SessionExportNamespace,
     SessionExportReceipt,
     SessionExportReconciliation,
@@ -149,6 +154,19 @@ from cayu.collaboration.participants import (
     ParticipantPage,
     ParticipantReceipt,
     ParticipantRef,
+)
+from cayu.collaboration.peer_content import (
+    PeerAppendKey,
+    PeerContentAppendAuthorization,
+    PeerContentAppendRequest,
+    PeerContentConflict,
+    PeerContentExposureItem,
+    PeerContentExposureReceipt,
+    PeerContentExposureRequest,
+    PeerContentPayload,
+    PeerContentReceipt,
+    PeerContentUnavailable,
+    PeerModelAttemptOrigin,
 )
 from cayu.collaboration.request_access import RequestRegistration
 from cayu.collaboration.requests import (
@@ -228,6 +246,7 @@ from cayu.mcp.tools import (
 from cayu.messages import (
     FilePart,
     Message,
+    PeerContentPart,
 )
 from cayu.observability.events import EventSink
 from cayu.observability.hooks import (
@@ -248,7 +267,7 @@ from cayu.observability.watchers import (
     event_query_after_cursor,
     event_watcher_error_payload,
 )
-from cayu.providers.base import ModelProvider, copy_usage_dialect
+from cayu.providers.base import ModelProvider, ModelRequest, copy_usage_dialect
 from cayu.providers.hosted import OpenAIWebSearch, copy_openai_web_search
 from cayu.providers.operations import ProviderOperationSnapshot
 from cayu.runtime import _approval_support as approval_support
@@ -1405,6 +1424,7 @@ class CayuApp:
             provider_operation_cancellation_lifecycle=(
                 self._provider_operation_cancellation_lifecycle
             ),
+            peer_exposure_guard=self._acquire_peer_exposure_for_model_attempt,
         )
         self._tool_round_executor = ToolRoundExecutor(
             session_store=self._runtime_session_store,
@@ -1630,6 +1650,183 @@ class CayuApp:
             redactor=self._secret_redactor,
             participants=self._participant_coordinator,
         )
+
+    @asynccontextmanager
+    async def _acquire_peer_exposure_for_model_attempt(
+        self,
+        session: Session,
+        model_request: ModelRequest,
+        model_attempt_identity,
+        provider_name: str,
+        model: str,
+        invocation_context,
+    ):
+        """Hold registered disclosure guards through one provider serialization."""
+        stack = AsyncExitStack()
+        exposure_requests: list[PeerContentExposureRequest] = []
+        exposure_items: list[PeerContentExposureItem] = []
+        try:
+            parts = [
+                part
+                for message in model_request.messages
+                for part in message.content
+                if type(part) is PeerContentPart
+            ]
+            if parts:
+                if invocation_context is None:
+                    raise PeerContentUnavailable()
+                subject = session.invocation.origin.subject
+                if subject is None:
+                    raise PeerContentUnavailable()
+                interaction_id = invocation_context.binding.interaction_id
+                for part in parts:
+                    append_key = PeerAppendKey.model_validate_json(part.append_key_json)
+                    receipt = await self.session_store.read_peer_content(append_key)
+                    if (
+                        receipt is None
+                        or receipt.status != "appended"
+                        or receipt.occurrence is None
+                    ):
+                        raise PeerContentUnavailable()
+                    occurrence = receipt.occurrence
+                    if (
+                        part.operation_key != receipt.operation_key
+                        or part.projection_id != append_key.projection_id
+                        or part.occurrence_id != occurrence.occurrence_id
+                        or part.sender_participant_id != occurrence.sender_participant_id
+                        or part.sender_participant_incarnation
+                        != occurrence.sender_participant_incarnation
+                        or part.sender_session_id != occurrence.sender_session_id
+                        or part.sender_session_instance_id != occurrence.sender_session_instance_id
+                        or part.provenance_sha256 != occurrence.provenance_sha256
+                    ):
+                        raise PeerContentUnavailable()
+                    if receipt.target_session_id != session.id or (
+                        receipt.target_session_instance_id != session.instance_id
+                    ):
+                        raise PeerContentUnavailable()
+                    target_binding = await self.session_store.load_participant_session_binding(
+                        session.id
+                    )
+                    if target_binding is None or (
+                        target_binding.participant.participant_id != append_key.consumer_id
+                        or target_binding.participant.incarnation
+                        != append_key.consumer_participant_incarnation
+                    ):
+                        raise PeerContentUnavailable()
+                    audience = target_binding.participant.owner
+                    origin = PeerModelAttemptOrigin(
+                        target_session_id=session.id,
+                        target_session_instance_id=session.instance_id,
+                        run_epoch=session.run_epoch,
+                        root_invocation_id=session.invocation.root_invocation_id,
+                        requester_principal=subject,
+                        interaction_id=interaction_id,
+                        model_step_id=model_attempt_identity.model_step_id,
+                        model_attempt_id=model_attempt_identity.model_attempt_id,
+                        append_key=append_key,
+                        provider_name=provider_name,
+                        model=model,
+                        capability_version=1,
+                        exposure_generation=receipt.attempt_generation,
+                    )
+                    exposure_items.append(
+                        PeerContentExposureItem(
+                            origin=origin, occurrence=occurrence, audience=audience
+                        )
+                    )
+                    exposure_request = PeerContentExposureRequest.for_model_attempt(
+                        append_operation_key=part.operation_key,
+                        append_key=append_key,
+                        model_attempt_id=model_attempt_identity.model_attempt_id,
+                        provider_name=provider_name,
+                        capability_version=1,
+                    )
+                    reservation = await self.session_store.begin_peer_content_exposure(
+                        exposure_request
+                    )
+                    if reservation.outcome != "pending":
+                        # A terminal receipt is authoritative.  Never reopen a
+                        # settled exposure by re-running provider serialization
+                        # under the same model-attempt identity.
+                        raise PeerContentUnavailable()
+                    exposure_requests.append(exposure_request)
+                try:
+                    projections = await stack.enter_async_context(
+                        self._session_export_coordinator.acquire_peer_exposures_runtime(
+                            tuple(exposure_items)
+                        )
+                    )
+                except (PeerContentUnavailable, SessionExportDenied):
+                    for exposure_request in exposure_requests:
+                        await self.session_store.record_peer_content_exposure(
+                            exposure_request.model_copy(
+                                update={
+                                    "outcome": "not_exposed",
+                                    "reason": "current_authority_denied",
+                                }
+                            )
+                        )
+                    raise
+                if (
+                    type(projections) is not tuple
+                    or len(projections) != len(parts)
+                    or any(type(projection) is not PeerContentPayload for projection in projections)
+                ):
+                    for exposure_request in exposure_requests:
+                        await self.session_store.record_peer_content_exposure(
+                            exposure_request.model_copy(
+                                update={
+                                    "outcome": "not_exposed",
+                                    "reason": "invalid_receiver_projection",
+                                }
+                            )
+                        )
+                    raise PeerContentUnavailable()
+                projections = tuple(
+                    PeerContentPayload.model_validate(projection) for projection in projections
+                )
+                for part, projection in zip(parts, projections, strict=True):
+                    projected_part = part.model_copy(update={"text": projection.text})
+                    model_request.messages[:] = [
+                        message.model_copy(
+                            update={
+                                "content": tuple(
+                                    projected_part if candidate is part else candidate
+                                    for candidate in message.content
+                                )
+                            }
+                        )
+                        if part in message.content
+                        else message
+                        for message in model_request.messages
+                    ]
+            if parts:
+                from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
+
+                model_request.messages[:] = [
+                    redact_runtime_message_for_boundary(
+                        message, redactor=self._secret_redactor, field_name="peer_model_message"
+                    )
+                    for message in model_request.messages
+                ]
+            expected_projection = model_request.model_dump_json()
+
+            async def serialized(actual_request):
+                if (
+                    actual_request is not model_request
+                    or actual_request.model_dump_json() != expected_projection
+                ):
+                    raise PeerContentUnavailable()
+                for exposure_request in exposure_requests:
+                    await self.session_store.record_peer_content_exposure(exposure_request)
+
+            if exposure_requests:
+                model_request._peer_serialization_observer = serialized
+            yield
+        finally:
+            model_request._peer_serialization_observer = None
+            await stack.aclose()
 
     async def accept_collaboration_request(
         self,
@@ -2806,7 +3003,7 @@ class CayuApp:
                 )
                 self._participant_session_execution_locks[session.id] = (lock, users + 1)
 
-        async def guarded_events() -> AsyncIterator[Event]:
+        async def guarded_events() -> AsyncGenerator[Event, None]:
             # Serialize only this session's delegated stream. Two identical
             # callers may both pass the read-only preflight, but only one may
             # consume the pending root-session activation. Unrelated sessions
@@ -2879,8 +3076,9 @@ class CayuApp:
                         else:
                             del self._participant_session_execution_locks[session.id]
 
-        async for event in guarded_events():
-            yield event
+        async with _close_delegated_event_stream(guarded_events()) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     async def configure_participant(
         self, request: ParticipantConfigure, *, context: CollaborationAccessContext
@@ -7212,6 +7410,247 @@ class CayuApp:
     ) -> EnqueueSessionMessageResult:
         """Queue steering; scoped/provenance admission requires trusted context."""
         return await self._session_message_coordinator.enqueue(request, context=context)
+
+    async def append_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        context: CollaborationAccessContext,
+    ) -> PeerContentReceipt:
+        """Append one authenticated peer occurrence to a participant session.
+
+        The application facade intentionally remains thin: durable append-key
+        replay/conflict and target-incarnation fencing belong to SessionStore.
+        A collaboration access context is mandatory so ordinary unauthenticated
+        callers cannot turn a matching payload into peer authority.
+        """
+        return await self._append_peer_content(request, context=context)
+
+    async def _append_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        context: CollaborationAccessContext,
+        pending_transcript_cursor: int | None = None,
+    ) -> PeerContentReceipt:
+        if type(request) is not PeerContentAppendRequest:
+            raise TypeError("Peer content append requires a PeerContentAppendRequest.")
+        request = PeerContentAppendRequest.model_validate(request)
+        if type(context) is not CollaborationAccessContext:
+            raise TypeError("Peer content append requires CollaborationAccessContext.")
+        _, grant = self._participant_coordinator.authorize_peer_content(context)
+        async with self._session_export_coordinator.acquire_peer_append(
+            context,
+            request=request,
+            append_key=request.append_key,
+            occurrence=request.occurrence,
+        ) as authorization:
+            if type(authorization) is not PeerContentAppendAuthorization or (
+                authorization.source_export_receipt_id
+                != request.occurrence.source_export_receipt_id
+                or authorization.producer_receipt_id != request.occurrence.producer_receipt_id
+                or authorization.source_session_id != request.occurrence.sender_session_id
+                or authorization.source_session_instance_id
+                != request.occurrence.sender_session_instance_id
+                or authorization.content_sha256 != request.occurrence.payload.content_sha256
+                or authorization.audience != request.occurrence.audience
+            ):
+                raise SessionExportDenied()
+            for participant_id, incarnation in (
+                (
+                    request.occurrence.sender_participant_id,
+                    request.occurrence.sender_participant_incarnation,
+                ),
+                (
+                    request.append_key.consumer_id,
+                    request.append_key.consumer_participant_incarnation,
+                ),
+            ):
+                await self._participant_coordinator.require_active_peer_participant(
+                    participant_id, incarnation, context=context
+                )
+            if grant.participants is not None:
+                allowed = {(ref.participant_id, ref.incarnation) for ref in grant.participants}
+                if (
+                    request.occurrence.sender_participant_id,
+                    request.occurrence.sender_participant_incarnation,
+                ) not in allowed or (
+                    request.append_key.consumer_id,
+                    request.append_key.consumer_participant_incarnation,
+                ) not in allowed:
+                    raise CollaborationAccessDenied(
+                        "Peer participants are outside the authorized scope."
+                    )
+            if self.session_store.peer_content_version != 1:
+                raise RuntimeError("The configured SessionStore cannot append peer content safely.")
+            return await self._session_engine.append_peer_content(
+                request, pending_transcript_cursor=pending_transcript_cursor
+            )
+
+    async def read_peer_content(
+        self,
+        append_key: PeerAppendKey,
+        *,
+        context: CollaborationAccessContext,
+        expected: PeerContentAppendRequest | None = None,
+    ) -> PeerContentReceipt | None:
+        """Read only the exact durable peer append receipt."""
+        if type(append_key) is not PeerAppendKey:
+            raise TypeError("Peer readback requires a PeerAppendKey.")
+        append_key = PeerAppendKey.model_validate(append_key)
+        if type(context) is not CollaborationAccessContext:
+            raise TypeError("Peer content readback requires CollaborationAccessContext.")
+        _, grant = self._participant_coordinator.authorize_peer_content(context)
+        if grant.participants is not None and (
+            append_key.consumer_id,
+            append_key.consumer_participant_incarnation,
+        ) not in {(ref.participant_id, ref.incarnation) for ref in grant.participants}:
+            raise CollaborationAccessDenied("Peer target is outside the authorized scope.")
+        if self.session_store.peer_content_version != 1:
+            raise RuntimeError("The configured SessionStore cannot read peer content safely.")
+        if expected is not None:
+            expected = PeerContentAppendRequest.model_validate(expected)
+            if expected.append_key != append_key:
+                raise PeerContentConflict()
+            receipt = await self.session_store.read_peer_content_attempt(expected)
+        else:
+            receipt = await self.session_store.read_peer_content(append_key)
+        if receipt is None:
+            return None
+        try:
+            async with self._session_export_coordinator.acquire_peer_read(
+                context, append_key=append_key, receipt=receipt
+            ):
+                return receipt
+        except (SessionExportDenied, PeerContentUnavailable):
+            return receipt.model_copy(update={"occurrence": None, "disclosure": "withheld"})
+
+    async def service_pending_peer_content(
+        self, session_id: str, *, context: CollaborationAccessContext
+    ) -> tuple[PeerContentReceipt, ...]:
+        """Service durable pending work with fresh authority, without starting a model."""
+        if type(context) is not CollaborationAccessContext:
+            raise TypeError("Peer servicing requires CollaborationAccessContext.")
+        self._participant_coordinator.authorize_peer_content(context)
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise PeerContentUnavailable()
+
+        cursor = len(await self.session_store.load_transcript(session_id))
+
+        async def admit(request, *, pending_transcript_cursor):
+            return await self._append_peer_content(
+                request, context=context, pending_transcript_cursor=pending_transcript_cursor
+            )
+
+        return await self.session_store.retry_pending_peer_content(
+            session_id,
+            expected_session_instance_id=session.instance_id,
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=cursor,
+            admit=admit,
+        )
+
+    async def exclude_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        reason: str,
+        context: CollaborationAccessContext,
+    ) -> PeerContentReceipt:
+        """Record a definitive, authenticated non-delivery outcome."""
+        reason = require_durable_clean_nonblank(reason, "reason")
+        if type(request) is not PeerContentAppendRequest:
+            raise TypeError("Peer content exclusion requires a PeerContentAppendRequest.")
+        request = PeerContentAppendRequest.model_validate(request)
+        if type(context) is not CollaborationAccessContext:
+            raise TypeError("Peer content exclusion requires CollaborationAccessContext.")
+        _, grant = self._participant_coordinator.authorize_peer_content(context)
+        if grant.participants is not None:
+            allowed = {(ref.participant_id, ref.incarnation) for ref in grant.participants}
+            if (
+                not {
+                    (
+                        request.occurrence.sender_participant_id,
+                        request.occurrence.sender_participant_incarnation,
+                    ),
+                    (
+                        request.append_key.consumer_id,
+                        request.append_key.consumer_participant_incarnation,
+                    ),
+                }
+                <= allowed
+            ):
+                raise CollaborationAccessDenied(
+                    "Peer participants are outside the authorized scope."
+                )
+        if self.session_store.peer_content_version != 1:
+            raise PeerContentUnavailable()
+        retained = await self.session_store.read_peer_content_attempt(request)
+        if retained is not None:
+            async with self._session_export_coordinator.acquire_peer_exclusion(
+                context, request=request, receipt=retained, reason=reason
+            ):
+                result = await self.session_store.exclude_peer_content(request, reason=reason)
+                # Cleanup authority is not content-read authority. A concurrent
+                # successful append remains truthful, but its payload is withheld.
+                if result.occurrence is not None:
+                    result = result.model_copy(
+                        update={"occurrence": None, "disclosure": "withheld"}
+                    )
+                return result
+        async with self._session_export_coordinator.acquire_peer_append(
+            context,
+            request=request,
+            append_key=request.append_key,
+            occurrence=request.occurrence,
+        ) as authorization:
+            if type(authorization) is not PeerContentAppendAuthorization or (
+                authorization.source_export_receipt_id
+                != request.occurrence.source_export_receipt_id
+                or authorization.producer_receipt_id != request.occurrence.producer_receipt_id
+                or authorization.source_session_id != request.occurrence.sender_session_id
+                or authorization.source_session_instance_id
+                != request.occurrence.sender_session_instance_id
+                or authorization.content_sha256 != request.occurrence.payload.content_sha256
+                or authorization.audience != request.occurrence.audience
+            ):
+                raise SessionExportDenied()
+            if grant.participants is not None:
+                allowed = {(ref.participant_id, ref.incarnation) for ref in grant.participants}
+                if (
+                    request.occurrence.sender_participant_id,
+                    request.occurrence.sender_participant_incarnation,
+                ) not in allowed or (
+                    request.append_key.consumer_id,
+                    request.append_key.consumer_participant_incarnation,
+                ) not in allowed:
+                    raise CollaborationAccessDenied(
+                        "Peer participants are outside the authorized scope."
+                    )
+            if self.session_store.peer_content_version != 1:
+                raise RuntimeError(
+                    "The configured SessionStore cannot exclude peer content safely."
+                )
+            return await self.session_store.exclude_peer_content(request, reason=reason)
+
+    async def expose_peer_content(
+        self,
+        request: PeerContentExposureRequest,
+        *,
+        context: CollaborationAccessContext,
+    ) -> PeerContentExposureReceipt:
+        """Reject caller-authored settlement; model-attempt owners settle exposure."""
+        if type(request) is not PeerContentExposureRequest:
+            raise TypeError("Peer exposure requires a PeerContentExposureRequest.")
+        if type(context) is not CollaborationAccessContext:
+            raise TypeError("Peer exposure requires CollaborationAccessContext.")
+        # Exposure evidence is authoritative only when minted by the model-step
+        # owner after provider serialization. Public callers may not forge an
+        # exposed receipt by selecting an attempt/provider identity.
+        raise PeerContentUnavailable(
+            "Peer exposure receipts are recorded only by the runtime owner."
+        )
 
     async def inspect_session_messages(
         self,

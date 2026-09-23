@@ -14,6 +14,7 @@ from cayu.messages import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -201,6 +202,7 @@ def assistant_message(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | PeerContentPart
     ] = []
     for part in content_parts:
         if type(part) is AssistantTextPart:
@@ -380,6 +382,7 @@ def assistant_message_without_tool_round(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | PeerContentPart
     ] = []
     for part in message.content:
         if type(part) is not ToolCallPart:

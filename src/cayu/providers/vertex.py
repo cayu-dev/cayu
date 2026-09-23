@@ -331,6 +331,7 @@ class VertexProvider(ModelProvider):
             supports_tool_history=True,
             supports_tool_definitions=True,
             supports_file_attachments=True,
+            supports_peer_content=True,
             tool_name_validator=_validate_anthropic_tool_name,
             tool_definition_validator=_anthropic_tool,
         )
@@ -428,6 +429,9 @@ class VertexProvider(ModelProvider):
                 default_max_tokens=self.max_tokens,
                 reasoning_provenance=self._reasoning_state_provenance,
             )
+            from cayu.providers.base import record_peer_serialization
+
+            await record_peer_serialization(request)
             payload.pop("model", None)
             payload["anthropic_version"] = self.anthropic_version
             token = await self._access_token()
@@ -548,6 +552,9 @@ class VertexProvider(ModelProvider):
         call on the literal ``count-tokens`` model segment; unlike ``stream``,
         the real model stays in the request body.
         """
+        from cayu.providers.base import reject_peer_token_counting
+
+        reject_peer_token_counting(request)
         count_transport = getattr(self.transport, "count_message_tokens", None)
         if count_transport is None:
             # Back-compat: transports predating token counting stay source-compatible.

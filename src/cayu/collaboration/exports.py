@@ -8,7 +8,7 @@ receive access context separately from requests. Inline payloads remain private.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -43,6 +43,18 @@ from cayu.collaboration.releases import (
 from cayu.sessions.invocation import SessionInvocation
 
 if TYPE_CHECKING:
+    from cayu.collaboration.access import CollaborationAccessContext
+    from cayu.collaboration.peer_content import (
+        PeerAppendKey,
+        PeerContentAppendAuthorization,
+        PeerContentAppendRequest,
+        PeerContentExposureItem,
+        PeerContentExposureReceiver,
+        PeerContentOccurrence,
+        PeerContentPayload,
+        PeerContentReceipt,
+        PeerModelAttemptOrigin,
+    )
     from cayu.sessions.base import TranscriptRecord
 
 
@@ -82,6 +94,7 @@ class SessionExportRef(ContractValue):
 class SessionExportRequest(ContractValue):
     ref: SessionExportRef
     source_indices: tuple[SourceIndex, ...] = Field(max_length=16)
+    source_selection: Literal["whole_records", "assistant_visible_text_v1"] = "whole_records"
     audience: OwnerRef
     projector: ObjectRef
     policy: ObjectRef
@@ -90,6 +103,10 @@ class SessionExportRequest(ContractValue):
 
     @model_validator(mode="after")
     def qualified_mode(self) -> SessionExportRequest:
+        if self.source_selection == "assistant_visible_text_v1" and self.mode != "deterministic":
+            raise ValueError("Visible assistant text requires deterministic export.")
+        if self.source_selection == "assistant_visible_text_v1" and not self.source_indices:
+            raise ValueError("Visible assistant text requires source records.")
         if (self.mode == "reviewed_prose") != (self.release is not None):
             raise ValueError("Export mode requires its exact release input.")
         return self
@@ -352,6 +369,88 @@ class SessionExportPolicy(ABC):
         """
         raise SessionExportDenied()
 
+    @asynccontextmanager
+    async def acquire_peer_exposures(self, context, *, items: tuple[PeerContentExposureItem, ...]):
+        """Hold one revocation guard for a complete model-attempt batch.
+
+        Policies supporting multiple occurrences must override this hook and
+        authenticate every item under a shared guard, yielding projections in
+        item order. The default supports exactly one item through the single
+        hook; it never nests potentially non-reentrant guards.
+        """
+        if len(items) != 1:
+            raise SessionExportDenied()
+        async with self.acquire_peer_exposure(context, **items[0].single_arguments()) as projection:
+            yield (projection,)
+
+    def acquire_peer_exposure(
+        self,
+        context: SessionExportAccessContext | None,
+        *,
+        origin: PeerModelAttemptOrigin,
+        append_key: PeerAppendKey,
+        occurrence: PeerContentOccurrence,
+        audience: OwnerRef,
+        provider_name: Identifier,
+        model: Identifier,
+        model_attempt_id: Identifier,
+        capability_version: Generation,
+    ) -> AbstractAsyncContextManager[PeerContentPayload]:
+        """Authorize one trusted model-attempt peer disclosure.
+
+        The default is deliberately fail-closed. A production policy may
+        override this method to serialize its current revocation and mandate
+        checks while yielding the bounded projection sent to the provider.
+        """
+        raise SessionExportDenied()
+
+    def acquire_peer_exclusion(
+        self,
+        context: CollaborationAccessContext,
+        *,
+        request: PeerContentAppendRequest,
+        receipt: PeerContentReceipt,
+        reason: str,
+    ) -> AbstractAsyncContextManager[None]:
+        """Authorize discharge of an exact retained delivery, not new disclosure.
+
+        The receiver verifies current withdrawal/cleanup authority and binds the
+        complete request and reason. Revoking source disclosure must not itself
+        revoke an independently authorized cleanup obligation. The store-owned
+        receipt is evidence of that obligation, never permission by itself.
+        The default denies; no unregistered cleanup authority is inferred.
+        """
+        raise SessionExportDenied()
+
+    def acquire_peer_read(
+        self,
+        context: CollaborationAccessContext,
+        *,
+        append_key: PeerAppendKey,
+        receipt: PeerContentReceipt,
+    ) -> AbstractAsyncContextManager[None]:
+        """Hold current source/read authority; historical receipts are not grants."""
+        raise SessionExportDenied()
+
+    def acquire_peer_append(
+        self,
+        context: CollaborationAccessContext,
+        *,
+        request: PeerContentAppendRequest,
+        append_key: PeerAppendKey,
+        occurrence: PeerContentOccurrence,
+    ) -> AbstractAsyncContextManager[PeerContentAppendAuthorization]:
+        """Hold producing authorization through queue admission.
+
+        A caller-supplied payload and provenance digest are not evidence that a
+        source produced or authorized the occurrence. Implementations must
+        resolve the exact source/export receipt and current disclosure grant,
+        yield typed evidence matching the occurrence, and serialize revocation
+        with the yielded append operation.
+        """
+        del context, append_key, occurrence
+        raise SessionExportDenied()
+
 
 class SessionExportProjector(ABC):
     @property
@@ -457,3 +556,6 @@ class SessionExportRegistration:
     release_readers: tuple[ContentReleaseReader, ...] = ()
     mandates: MandateResolver | None = None
     resource_owners: tuple[ResourceSelectorOwner, ...] = ()
+    # Optional peer disclosure owner.  Absence is fail-closed; peer content
+    # must never reuse a historical export receipt as current authority.
+    peer_exposure_receiver: PeerContentExposureReceiver | None = None

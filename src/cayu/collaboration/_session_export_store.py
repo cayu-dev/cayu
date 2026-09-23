@@ -73,11 +73,17 @@ class ExportAdmission(ContractValue):
     request: SessionExportRequest
     authorization: SessionExportAuthorization
     source_commitment: ExportDigest
+    # Source-owner-only CAS evidence; never part of the public export intent.
+    validation_source_commitment: ExportDigest | None = None
     permit: PermitCommand
     settled: StrictBool = False
 
     @model_validator(mode="after")
     def exact_permit(self) -> ExportAdmission:
+        if (self.request.source_selection == "assistant_visible_text_v1") != (
+            self.validation_source_commitment is not None
+        ):
+            raise ValueError("Export admission requires exact source validation evidence.")
         mandate = self.authorization.mandate
         permit = self.permit.intent.request
         if (

@@ -363,6 +363,8 @@ def test_repair_preserves_existing_participant_binding(
             return own(SQLiteSessionStore(tmp_path / "existing-bindings.sqlite", schema_mode=mode))
 
         with monkeypatch.context() as historical:
+            # Emulate the historical writer only while constructing its fixture.
+            historical.setattr("cayu.storage.sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION", 101)
             historical.setattr(
                 schema, "REVISIONS", tuple(r for r in schema.REVISIONS if r.revision <= 101)
             )

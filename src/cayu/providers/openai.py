@@ -37,6 +37,7 @@ from cayu.messages import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -651,6 +652,9 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
         )
         payload["background"] = True
         payload["store"] = True
+        from cayu.providers.base import record_peer_serialization
+
+        await record_peer_serialization(request.request)
         raw_events: AsyncIterator[Mapping[str, Any]] | None = None
         controller = ProviderStreamDeadlineController(self._provider.stream_deadlines)
         controller_handed_off = False
@@ -1093,6 +1097,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             supports_tool_history=True,
             supports_tool_definitions=True,
             supports_file_attachments=True,
+            supports_peer_content=True,
             tool_name_validator=_validate_openai_tool_name,
             tool_definition_validator=_openai_tool,
         )
@@ -1359,6 +1364,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             payload = build_openai_payload(
                 request, stream=self.streaming, reasoning_state=self.reasoning_state
             )
+            from cayu.providers.base import record_peer_serialization
+
+            await record_peer_serialization(request)
             yielded_any = False
             try:
                 events = self._consume(payload)
@@ -1529,6 +1537,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self,
         request: ModelRequest,
     ) -> InputTokenCountResult | None:
+        from cayu.providers.base import reject_peer_token_counting
+
+        reject_peer_token_counting(request)
         self._preflight_dynamic_tool_request(request)
         payload = build_openai_token_count_payload(
             request,
@@ -6232,7 +6243,11 @@ def _openai_input_items(
             )
 
         items: list[dict[str, Any]] = []
-        text_parts = [_output_text_part(part) for part in message.content if type(part) is TextPart]
+        text_parts = [
+            _output_text_part(part)
+            for part in message.content
+            if type(part) in {TextPart, PeerContentPart}
+        ]
         if text_parts:
             items.append(
                 {
@@ -6256,6 +6271,7 @@ def _openai_input_items(
                 ThinkingPart,
                 HostedToolCallPart,
                 CitationPart,
+                PeerContentPart,
             }:
                 raise OpenAIProtocolError(
                     "Assistant messages can only contain text, tool_call, provider_state, "
@@ -6365,11 +6381,18 @@ def _openai_neutral_assistant_items(
         pending_text_offset = assembled_text_length
 
     for part in message.content:
-        if type(part) is TextPart:
+        if type(part) is TextPart or type(part) is PeerContentPart:
             if not pending_text:
                 pending_text_offset = assembled_text_length
-            pending_text.append(part.text)
-            assembled_text_length += len(part.text)
+            if type(part) is PeerContentPart:
+                rendered = (
+                    f"[Peer content from {part.sender_participant_id}; "
+                    f"occurrence {part.occurrence_id}]\n{part.text}"
+                )
+            else:
+                rendered = part.text
+            pending_text.append(rendered)
+            assembled_text_length += len(rendered)
             continue
         if type(part) is CitationPart:
             pending_citations.append(part)
@@ -6894,7 +6917,8 @@ def _user_input_part(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     if type(part) is TextPart:
@@ -6934,13 +6958,22 @@ def _output_text_part(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
 ) -> dict[str, str]:
-    if type(part) is not TextPart:
+    if type(part) is not TextPart and type(part) is not PeerContentPart:
         raise OpenAIProtocolError(
             "Assistant text output requires a text part.",
             reason_code="assistant_text_output_requires_a_text_part",
         )
+    if type(part) is PeerContentPart:
+        return {
+            "type": "output_text",
+            "text": (
+                f"[Peer content from {part.sender_participant_id}; "
+                f"occurrence {part.occurrence_id}]\n{part.text}"
+            ),
+        }
     return {"type": "output_text", "text": part.text}
 
 
@@ -7019,7 +7052,8 @@ def _tool_result_output_item(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
     *,
     tool_discovery_projection: ToolDiscoveryProjectionRequest | None,
 ) -> dict[str, Any]:
@@ -7123,7 +7157,8 @@ def _function_call_output_item(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:
         raise OpenAIProtocolError(

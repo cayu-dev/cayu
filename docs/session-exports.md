@@ -56,6 +56,24 @@ and limited to 16. The current source adapter admits text and structured tool
 results, not hidden thinking or assets. The registered projector must select only
 approved fields; source admission alone is not disclosure permission.
 
+`source_selection` defaults to `whole_records`, preserving that record-level
+restriction. Explicit `assistant_visible_text_v1` selection is available only for
+deterministic exports of assistant records containing nonblank visible text.
+Those records may also contain provider-state and thinking parts; the source
+owner removes these private parts before either projector callback. Other part
+types, other roles, empty selection, and records without eligible text are denied.
+The callback view preserves record indices, interaction attribution, text order,
+and text-part attribution; it does not create a new transcript record or tool result.
+
+The immutable request and receipt bind the selection/version, original session
+incarnation and record indices, audience, policy and projector. The public
+`source_commitment` commits the selected text view, not private provider state.
+Complete original records are independently validated inside native publication;
+that validation commitment stays internal, including during participant admission.
+Changing selection under the same operation key conflicts. Historical replay
+returns the original output under fresh authorization, without re-projecting
+source material or renewing revoked access.
+
 ## Authorization is a held guard, not a boolean
 
 `SessionExportAccessContext` is authenticated host input, supplied separately from

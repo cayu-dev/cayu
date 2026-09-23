@@ -26,6 +26,7 @@ from cayu.messages import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -454,6 +455,7 @@ class ChatCompletionsProvider(ModelProvider):
             supports_tool_history=True,
             supports_tool_definitions=True,
             supports_file_attachments=True,
+            supports_peer_content=True,
             tool_name_validator=_validate_chat_completions_tool_name,
             tool_definition_validator=lambda tool: _chat_completions_tool(
                 tool,
@@ -634,6 +636,9 @@ class ChatCompletionsProvider(ModelProvider):
                 include_usage=self.stream_include_usage,
                 provider_state_target_sha256=provider_state_target_sha256,
             )
+            from cayu.providers.base import record_peer_serialization
+
+            await record_peer_serialization(request)
             raw_events = self.transport.stream_chat_completions(
                 url=endpoint,
                 headers=self._headers(),
@@ -1793,6 +1798,11 @@ def _assistant_message(
     for part in message.content:
         if type(part) is TextPart:
             text_parts.append(part.text)
+        elif type(part) is PeerContentPart:
+            text_parts.append(
+                f"[Peer content from {part.sender_participant_id}; "
+                f"occurrence {part.occurrence_id}]\n{part.text}"
+            )
         elif type(part) is ToolCallPart:
             tool_call = {
                 "id": part.tool_call_id,
@@ -1811,6 +1821,7 @@ def _assistant_message(
             ThinkingPart,
             HostedToolCallPart,
             CitationPart,
+            PeerContentPart,
         }:
             raise ChatCompletionsProtocolError(
                 "Assistant messages can only contain portable assistant parts."
@@ -1912,7 +1923,8 @@ def _user_message(
         | ThinkingPart
         | FilePart
         | HostedToolCallPart
-        | CitationPart,
+        | CitationPart
+        | PeerContentPart,
         ...,
     ],
     resolved_attachments: dict[str, dict[str, Any]],

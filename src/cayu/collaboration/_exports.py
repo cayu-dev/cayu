@@ -11,6 +11,42 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.collaboration._wait_coordinator",
         "CollaborationWaitLatchReceiver",
     ),
+    "PeerContentAppendAuthorization": (
+        "cayu.collaboration.peer_content",
+        "PeerContentAppendAuthorization",
+    ),
+    "PeerAppendKey": ("cayu.collaboration.peer_content", "PeerAppendKey"),
+    "PeerContentAppendRequest": (
+        "cayu.collaboration.peer_content",
+        "PeerContentAppendRequest",
+    ),
+    "PeerContentConflict": ("cayu.collaboration.peer_content", "PeerContentConflict"),
+    "PeerContentOccurrence": (
+        "cayu.collaboration.peer_content",
+        "PeerContentOccurrence",
+    ),
+    "PeerContentPayload": ("cayu.collaboration.peer_content", "PeerContentPayload"),
+    "PeerContentReceipt": ("cayu.collaboration.peer_content", "PeerContentReceipt"),
+    "PeerContentExposureRequest": ("cayu.collaboration.peer_content", "PeerContentExposureRequest"),
+    "PeerContentExposureItem": ("cayu.collaboration.peer_content", "PeerContentExposureItem"),
+    "PeerContentExposureReceipt": ("cayu.collaboration.peer_content", "PeerContentExposureReceipt"),
+    "PeerContentExposureReceiver": (
+        "cayu.collaboration.peer_content",
+        "PeerContentExposureReceiver",
+    ),
+    "RegisteredPeerContentExposureReceiver": (
+        "cayu.collaboration.peer_content",
+        "RegisteredPeerContentExposureReceiver",
+    ),
+    "PeerModelAttemptOrigin": ("cayu.collaboration.peer_content", "PeerModelAttemptOrigin"),
+    "PeerContentUnavailable": (
+        "cayu.collaboration.peer_content",
+        "PeerContentUnavailable",
+    ),
+    "PeerDeliveryAttemptKey": (
+        "cayu.collaboration.peer_content",
+        "PeerDeliveryAttemptKey",
+    ),
     "RequestDueCursor": ("cayu.collaboration.requests", "RequestDueCursor"),
     "RequestDuePage": ("cayu.collaboration.requests", "RequestDuePage"),
     "RequestRegistration": ("cayu.collaboration.request_access", "RequestRegistration"),

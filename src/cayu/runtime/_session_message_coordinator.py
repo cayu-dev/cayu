@@ -398,6 +398,22 @@ class SessionMessageCoordinator:
         message = record.message
         if message is None:
             raise SessionMessageConflict()
+        from cayu.messages import PeerContentPart
+
+        if message.message is not None and any(
+            type(part) is PeerContentPart for part in message.message.content
+        ):
+            # Queue credentials do not authenticate source disclosure. The
+            # peer read API owns that separate context and policy guard. Keep
+            # lifecycle/CAS evidence available without publishing the payload.
+            return record.model_copy(
+                update={
+                    "validity": "unreadable",
+                    "message": None,
+                    "terminal_event_id": terminal_event_id,
+                },
+                deep=True,
+            )
         try:
             accepted_event_id = await self._project_event_reference(
                 session_id, record.queue_id, message.accepted_event_id, "session.message.queued"

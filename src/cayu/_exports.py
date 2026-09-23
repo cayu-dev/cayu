@@ -1,6 +1,30 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "PeerContentAppendAuthorization": (
+        "cayu.collaboration.peer_content",
+        "PeerContentAppendAuthorization",
+    ),
+    "PeerAppendKey": ("cayu.collaboration.peer_content", "PeerAppendKey"),
+    "PeerContentAppendRequest": ("cayu.collaboration.peer_content", "PeerContentAppendRequest"),
+    "PeerContentConflict": ("cayu.collaboration.peer_content", "PeerContentConflict"),
+    "PeerContentOccurrence": ("cayu.collaboration.peer_content", "PeerContentOccurrence"),
+    "PeerContentPayload": ("cayu.collaboration.peer_content", "PeerContentPayload"),
+    "PeerContentReceipt": ("cayu.collaboration.peer_content", "PeerContentReceipt"),
+    "PeerContentExposureRequest": ("cayu.collaboration.peer_content", "PeerContentExposureRequest"),
+    "PeerContentExposureItem": ("cayu.collaboration.peer_content", "PeerContentExposureItem"),
+    "PeerContentExposureReceipt": ("cayu.collaboration.peer_content", "PeerContentExposureReceipt"),
+    "PeerContentExposureReceiver": (
+        "cayu.collaboration.peer_content",
+        "PeerContentExposureReceiver",
+    ),
+    "RegisteredPeerContentExposureReceiver": (
+        "cayu.collaboration.peer_content",
+        "RegisteredPeerContentExposureReceiver",
+    ),
+    "PeerModelAttemptOrigin": ("cayu.collaboration.peer_content", "PeerModelAttemptOrigin"),
+    "PeerContentUnavailable": ("cayu.collaboration.peer_content", "PeerContentUnavailable"),
+    "PeerDeliveryAttemptKey": ("cayu.collaboration.peer_content", "PeerDeliveryAttemptKey"),
     "CollaborationRequest": ("cayu.collaboration.requests", "CollaborationRequest"),
     "RequestAlias": ("cayu.collaboration.requests", "RequestAlias"),
     "RequestCommand": ("cayu.collaboration.requests", "RequestCommand"),
@@ -999,6 +1023,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "ChildStatusAssertionSpec": ("cayu.evals.corpus", "ChildStatusAssertionSpec"),
     "CitationPart": ("cayu.messages", "CitationPart"),
+    "PeerContentPart": ("cayu.messages", "PeerContentPart"),
     "CitationProvenance": ("cayu.messages", "CitationProvenance"),
     "CodingArtifactReference": ("cayu.coding_products", "CodingArtifactReference"),
     "CodingCheckEvidence": ("cayu.coding_products", "CodingCheckEvidence"),
@@ -5991,6 +6016,21 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "PeerContentAppendAuthorization",
+    "PeerAppendKey",
+    "PeerContentAppendRequest",
+    "PeerContentConflict",
+    "PeerContentOccurrence",
+    "PeerContentPayload",
+    "PeerContentReceipt",
+    "PeerContentExposureRequest",
+    "PeerContentExposureItem",
+    "PeerContentExposureReceipt",
+    "PeerContentExposureReceiver",
+    "RegisteredPeerContentExposureReceiver",
+    "PeerModelAttemptOrigin",
+    "PeerContentUnavailable",
+    "PeerDeliveryAttemptKey",
     "CollaborationRequest",
     "RequestAlias",
     "RequestCommand",

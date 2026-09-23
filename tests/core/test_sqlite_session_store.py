@@ -3464,6 +3464,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (101, 99),
         (102, 99),
         (103, 103),
+        (104, 104),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3478,11 +3479,13 @@ def test_sqlite_revision_95_migrates_task_group_quiescence_schema(tmp_path, monk
         "REVISIONS",
         tuple(revision for revision in revisions if revision.revision <= 95),
     )
-    historical = SQLiteSessionStore(
-        db_path,
-        schema_mode=schema_migrations.SchemaMode.MIGRATE,
-    )
-    asyncio.run(_close(historical))
+    connection = sqlite_support.connect(db_path)
+    try:
+        sqlite_support.reconcile_schema(
+            connection, schema_migrations.SchemaMode.MIGRATE, app_min_supported=95
+        )
+    finally:
+        connection.close()
     monkeypatch.setattr(schema_migrations, "REVISIONS", revisions)
 
     with sqlite3.connect(db_path) as connection:

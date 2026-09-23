@@ -72,12 +72,21 @@ from cayu.collaboration.exports import (
     SessionExportReconciliation,
     SessionExportRegistration,
     SessionExportRequest,
+    SessionExportRuntimeOrigin,
     SessionExportSettlementReceipt,
     SessionExportSettlementRequest,
     SessionExportUnavailable,
 )
 from cayu.collaboration.mandates import MandateDenied, MandateResolver, ResourceSelectorOwner
 from cayu.collaboration.participants import CollaborationCapacityExceeded
+from cayu.collaboration.peer_content import (
+    PeerAppendKey,
+    PeerContentExposureItem,
+    PeerContentExposureReceiver,
+    PeerContentOccurrence,
+    PeerModelAttemptOrigin,
+    RegisteredPeerContentExposureReceiver,
+)
 from cayu.collaboration.releases import (
     ContentReleaseExpectation,
     ContentReleaseReader,
@@ -85,6 +94,7 @@ from cayu.collaboration.releases import (
     ReleasedContent,
 )
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.messages import TextPart
 from cayu.sessions.base import Session, SessionOperationPublication, SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
@@ -305,6 +315,157 @@ class SessionExportCoordinator:
             resource_owners=self.resource_owners,
             runtime_origin=runtime_origin,
             participant_access=None if self.participants is None else self.participants.inspect,
+        )
+
+    def acquire_peer_exposure(
+        self,
+        context: SessionExportAccessContext | None,
+        *,
+        origin,
+        append_key: PeerAppendKey,
+        occurrence: PeerContentOccurrence,
+        audience: OwnerRef,
+        provider_name: str,
+        model: str,
+        model_attempt_id: str,
+        capability_version: int,
+    ):
+        """Return the registered #1763 disclosure guard for one peer attempt.
+
+        The receiver owns current source/export/audience authorization and
+        revocation. This coordinator never treats an append receipt as a
+        disclosure grant and never fabricates a runtime origin.
+        """
+        registration = self.ready(access="readback")
+        receiver = registration.peer_exposure_receiver or RegisteredPeerContentExposureReceiver(
+            registration.policy
+        )
+        if not isinstance(receiver, PeerContentExposureReceiver):
+            raise SessionExportDenied()
+        if type(origin) not in {SessionExportRuntimeOrigin, PeerModelAttemptOrigin}:
+            raise SessionExportDenied()
+        return receiver.acquire_peer_exposure(
+            context,
+            origin=origin,
+            append_key=append_key,
+            occurrence=occurrence,
+            audience=audience,
+            provider_name=provider_name,
+            model=model,
+            model_attempt_id=model_attempt_id,
+            capability_version=capability_version,
+        )
+
+    def acquire_peer_exclusion(self, context, *, request, receipt, reason):
+        registration = self.ready(access="mutation")
+        return registration.policy.acquire_peer_exclusion(
+            context, request=request, receipt=receipt, reason=reason
+        )
+
+    def acquire_peer_read(self, context, *, append_key, receipt):
+        registration = self.ready(access="readback")
+        return registration.policy.acquire_peer_read(
+            context, append_key=append_key, receipt=receipt
+        )
+
+    def acquire_peer_append(
+        self,
+        context,
+        *,
+        request,
+        append_key: PeerAppendKey,
+        occurrence: PeerContentOccurrence,
+    ):
+        registration = self.ready(access="mutation")
+        acquire = getattr(registration.policy, "acquire_peer_append", None)
+        if not callable(acquire):
+            raise SessionExportDenied()
+        return acquire(context, request=request, append_key=append_key, occurrence=occurrence)
+
+    def acquire_peer_exposures_runtime(self, items: tuple[PeerContentExposureItem, ...]):
+        """One registered guard for a coherent runtime-owned model attempt."""
+        if (
+            type(items) is not tuple
+            or not items
+            or any(type(item) is not PeerContentExposureItem for item in items)
+        ):
+            raise SessionExportDenied()
+        items = tuple(PeerContentExposureItem.model_validate(item) for item in items)
+        first = items[0].origin
+        fields = (
+            "target_session_id",
+            "target_session_instance_id",
+            "run_epoch",
+            "root_invocation_id",
+            "requester_principal",
+            "interaction_id",
+            "model_step_id",
+            "model_attempt_id",
+            "provider_name",
+            "model",
+            "capability_version",
+        )
+        if any(
+            any(getattr(item.origin, field) != getattr(first, field) for field in fields)
+            for item in items
+        ):
+            raise SessionExportDenied()
+        registration = self.ready(access="readback")
+        receiver = registration.peer_exposure_receiver or RegisteredPeerContentExposureReceiver(
+            registration.policy
+        )
+        if not isinstance(receiver, PeerContentExposureReceiver):
+            raise SessionExportDenied()
+        return receiver.acquire_peer_exposures(None, items=items)
+
+    def acquire_peer_exposure_runtime(
+        self,
+        origin: PeerModelAttemptOrigin,
+        *,
+        append_key: PeerAppendKey,
+        occurrence: PeerContentOccurrence,
+        audience: OwnerRef | None,
+        provider_name: str,
+        model: str,
+        model_attempt_id: str,
+        capability_version: int,
+    ):
+        """Create only the runtime-owned context for the registered receiver.
+
+        The origin is minted by the model-attempt owner; callers cannot supply
+        this entrance because it is not part of the public application API.
+        The registered receiver still performs current authorization and
+        revocation checks.
+        """
+        if type(origin) is not PeerModelAttemptOrigin:
+            raise SessionExportDenied()
+        if (
+            origin.append_key != append_key
+            or (
+                append_key.creation_target is None
+                and (
+                    origin.target_session_id != append_key.target_session_id
+                    or origin.target_session_instance_id != append_key.target_session_instance_id
+                )
+            )
+            or origin.provider_name != provider_name
+            or origin.model != model
+            or origin.model_attempt_id != model_attempt_id
+            or origin.capability_version != capability_version
+        ):
+            raise SessionExportDenied()
+        if audience is None:
+            raise SessionExportDenied()
+        return self.acquire_peer_exposure(
+            None,
+            origin=origin,
+            append_key=append_key,
+            occurrence=occurrence,
+            audience=audience,
+            provider_name=provider_name,
+            model=model,
+            model_attempt_id=model_attempt_id,
+            capability_version=capability_version,
         )
 
     async def observed(
@@ -715,6 +876,7 @@ class SessionExportCoordinator:
                 if existing is not None:
                     return await self.finish_admission(session, existing, authorization)
                 source = []
+                selected_source = []
                 for index in request.source_indices:
                     page = await self.store.load_transcript_window(
                         session.id, start_index=index, limit=1
@@ -722,14 +884,42 @@ class SessionExportCoordinator:
                     if not page.records or page.records[0].index != index:
                         raise SessionExportUnavailable()
                     record = page.records[0]
-                    # Initial source adapter permits text and structured tool results, never hidden thinking/assets.
-                    if any(
-                        part.type not in {"text", "tool_result"} for part in record.message.content
-                    ):
-                        raise SessionExportDenied()
                     source.append(record.model_copy(deep=True))
+                    if request.source_selection == "assistant_visible_text_v1":
+                        if record.message.role != "assistant" or any(
+                            part.type not in {"text", "provider_state", "thinking"}
+                            for part in record.message.content
+                        ):
+                            raise SessionExportDenied()
+                        visible = tuple(
+                            part for part in record.message.content if part.type == "text"
+                        )
+                        if not any(
+                            part.text.strip() for part in visible if isinstance(part, TextPart)
+                        ):
+                            raise SessionExportDenied()
+                        selected_source.append(
+                            record.model_copy(
+                                update={
+                                    "message": record.message.model_copy(
+                                        update={"content": visible}
+                                    )
+                                },
+                                deep=True,
+                            )
+                        )
+                    else:
+                        if any(
+                            part.type not in {"text", "tool_result"}
+                            for part in record.message.content
+                        ):
+                            raise SessionExportDenied()
+                        selected_source.append(record.model_copy(deep=True))
                 source_tuple = tuple(source)
-                source_commitment = source_digest(source_tuple)
+                selected_tuple = tuple(selected_source)
+                # Public evidence commits only approved source text and attribution.
+                # publish() independently validates the complete original rows.
+                source_commitment = source_digest(selected_tuple)
                 if len(encoded([r.model_dump(mode="json") for r in source_tuple])) > 32 * 1024:
                     raise SessionExportCapacityExceeded()
                 preparation = None
@@ -743,6 +933,9 @@ class SessionExportCoordinator:
                         authorization,
                         source_tuple,
                         reserved_bytes=_RESERVATION_BYTES,
+                        selected_source=selected_tuple
+                        if request.source_selection == "assistant_visible_text_v1"
+                        else None,
                     )
                     if isinstance(admitted, ExportRecord):
                         return await self.finish_admission(session, admitted, authorization)
@@ -753,7 +946,7 @@ class SessionExportCoordinator:
                 def project():
                     projector = self.projectors[request.projector]
                     # Detach callback values from the retained source commitment and output.
-                    selected = tuple(record.model_copy(deep=True) for record in source_tuple)
+                    selected = tuple(record.model_copy(deep=True) for record in selected_tuple)
                     raw_output = projector.project(selected)
                     output = self.output(raw_output)
                     if len(encoded(output)) > 8192:
@@ -761,7 +954,7 @@ class SessionExportCoordinator:
                     checked = self.output(output)
                     if (
                         projector.validate(
-                            tuple(r.model_copy(deep=True) for r in source_tuple),
+                            tuple(r.model_copy(deep=True) for r in selected_tuple),
                             checked,
                             request.audience,
                         )

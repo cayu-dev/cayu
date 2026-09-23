@@ -525,6 +525,31 @@ class ParticipantCoordinator:
             )
         return context, grant
 
+    def authorize_peer_content(
+        self, context: CollaborationAccessContext
+    ) -> tuple[CollaborationAccessContext, CollaborationAccessGrant]:
+        """Authorize the peer-content facade without exposing private policy state."""
+        return self._authorize(context, "readback")
+
+    async def require_active_peer_participant(
+        self,
+        participant_id: str,
+        incarnation: str,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ParticipantInspection:
+        """Resolve current lifecycle before a peer append can become deliverable."""
+        _, initialized = self._ready()
+        participant = ParticipantRef(
+            owner=initialized.owner,
+            participant_id=participant_id,
+            incarnation=incarnation,
+        )
+        inspected = await self.inspect(participant, context=context, action="readback")
+        if inspected.participant.lifecycle != "active":
+            raise CollaborationAccessDenied("Peer participant is not active.")
+        return inspected
+
     def _require_refs(
         self,
         grant: CollaborationAccessGrant,

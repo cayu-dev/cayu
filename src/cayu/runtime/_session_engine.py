@@ -123,6 +123,7 @@ from cayu.budgets.usage import (
     session_usage_summary_payload,
 )
 from cayu.collaboration.access import CollaborationAccessContext
+from cayu.collaboration.peer_content import PeerContentAppendRequest, PeerContentReceipt
 from cayu.configuration import RunDefaults
 from cayu.context.base import (
     _COMPACTION_ATTEMPT_ID_KEY,
@@ -14579,6 +14580,67 @@ class SessionEngine:
             await self._event_writer.fan_out_persisted([result.event])
         return result
 
+    async def append_peer_content(
+        self, request: PeerContentAppendRequest, *, pending_transcript_cursor: int | None = None
+    ) -> PeerContentReceipt:
+        """Admit peer content through the runtime session owner.
+
+        Appending historical peer data never starts a model or tool. The
+        store's target incarnation/cursor CAS remains the final mutation gate.
+        """
+        if type(request) is not PeerContentAppendRequest:
+            raise TypeError("Peer append requires a PeerContentAppendRequest.")
+        if request.append_key.creation_target is None:
+            assert request.append_key.target_session_id is not None
+            await self._require_ordinary_session_execution(
+                request.append_key.target_session_id, admit_session=False
+            )
+
+        def qualify_target(target: Session) -> None:
+            # Invoked against the exact transaction-owned target, including a
+            # creation which won the race after the facade's initial read.
+            profile = execution_profile_from_session_metadata(target.metadata)
+            targets = [(target.provider_name, target.model)]
+            if profile is not None and profile.model_failover is not None:
+                targets = [
+                    (candidate.provider_name, candidate.model)
+                    for candidate in profile.model_failover.plan.candidates
+                ]
+            for provider_name, model in targets:
+                provider = self._get_registered_provider(provider_name).provider
+                qualification = provider.preflight_portable_messages(
+                    model=model,
+                    messages=[
+                        Message(
+                            role=MessageRole.ASSISTANT,
+                            content=(
+                                request.occurrence.to_message_part(
+                                    append_key=request.append_key,
+                                    projection_id=request.append_key.projection_id,
+                                    operation_key=request.operation_key,
+                                ),
+                            ),
+                        )
+                    ],
+                    tools=[],
+                )
+                if qualification is not None:
+                    import inspect
+
+                    from cayu.collaboration.peer_content import PeerContentUnavailable
+
+                    if inspect.iscoroutine(qualification):
+                        qualification.close()
+                    raise PeerContentUnavailable(
+                        "Peer provider qualification must complete synchronously."
+                    )
+
+        return await self.session_store.append_peer_content(
+            request,
+            qualify_target=qualify_target,
+            pending_transcript_cursor=pending_transcript_cursor,
+        )
+
     async def _deliver_queued_session_messages(
         self,
         *,
@@ -14601,6 +14663,9 @@ class SessionEngine:
                 "Queued steering cannot extend an admitted work attempt."
             )
         delivered_events: list[Event] = []
+        # Pending peer admission requires fresh export-owner authority. The host
+        # services the durable index through CayuApp.service_pending_peer_content;
+        # ordinary execution must not turn historical requests into new grants.
         eligible_through: int | None = None
         profile_handoff: QueuedInteractionProfileHandoff | None = None
         if continue_active_interaction:

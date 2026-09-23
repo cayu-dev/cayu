@@ -71,6 +71,22 @@ _MESSAGE_PART_STRUCTURE_KEYS = {
             "url",
         }
     ),
+    "peer_content": frozenset(
+        {
+            "append_key_json",
+            "executable",
+            "occurrence_id",
+            "operation_key",
+            "projection_id",
+            "provenance_sha256",
+            "sender_participant_id",
+            "sender_participant_incarnation",
+            "sender_session_id",
+            "sender_session_instance_id",
+            "text",
+            "type",
+        }
+    ),
 }
 _MESSAGE_PART_UNTRUSTED_CONTAINERS = {
     "tool_call": frozenset({"arguments"}),

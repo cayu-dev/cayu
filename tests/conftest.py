@@ -40,6 +40,16 @@ def pytest_configure(config: pytest.Config) -> None:
     _CI_FAILURE_LOGGING = owner == str(os.getpid())
 
 
+def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
+    if _CI_FAILURE_LOGGING:
+        print(f"\nCI test started: {nodeid}", file=sys.stderr, flush=True)
+
+
+def pytest_runtest_logfinish(nodeid: str, location: tuple[str, int | None, str]) -> None:
+    if _CI_FAILURE_LOGGING:
+        print(f"\nCI test finished: {nodeid}", file=sys.stderr, flush=True)
+
+
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if _CI_FAILURE_LOGGING and report.failed:
         # Preserve failure evidence if a deadline prevents pytest's final summary.

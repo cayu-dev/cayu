@@ -23314,6 +23314,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/CitationPart"
+                },
+                {
+                  "$ref": "#/components/schemas/PeerContentPart"
                 }
               ]
             },
@@ -24868,6 +24871,88 @@
           "status"
         ],
         "title": "PairedQualityEvidence",
+        "type": "object"
+      },
+      "PeerContentPart": {
+        "additionalProperties": false,
+        "description": "Attributed, non-executable content delivered by another participant.",
+        "properties": {
+          "append_key_json": {
+            "maxLength": 16384,
+            "title": "Append Key Json",
+            "type": "string"
+          },
+          "executable": {
+            "const": false,
+            "default": false,
+            "title": "Executable",
+            "type": "boolean"
+          },
+          "occurrence_id": {
+            "maxLength": 512,
+            "title": "Occurrence Id",
+            "type": "string"
+          },
+          "operation_key": {
+            "maxLength": 512,
+            "title": "Operation Key",
+            "type": "string"
+          },
+          "projection_id": {
+            "maxLength": 256,
+            "title": "Projection Id",
+            "type": "string"
+          },
+          "provenance_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Provenance Sha256",
+            "type": "string"
+          },
+          "sender_participant_id": {
+            "maxLength": 512,
+            "title": "Sender Participant Id",
+            "type": "string"
+          },
+          "sender_participant_incarnation": {
+            "maxLength": 512,
+            "title": "Sender Participant Incarnation",
+            "type": "string"
+          },
+          "sender_session_id": {
+            "maxLength": 512,
+            "title": "Sender Session Id",
+            "type": "string"
+          },
+          "sender_session_instance_id": {
+            "maxLength": 512,
+            "title": "Sender Session Instance Id",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 131072,
+            "title": "Text",
+            "type": "string"
+          },
+          "type": {
+            "const": "peer_content",
+            "default": "peer_content",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "sender_participant_id",
+          "sender_participant_incarnation",
+          "sender_session_id",
+          "sender_session_instance_id",
+          "occurrence_id",
+          "append_key_json",
+          "operation_key",
+          "projection_id",
+          "provenance_sha256"
+        ],
+        "title": "PeerContentPart",
         "type": "object"
       },
       "PendingActionKind": {

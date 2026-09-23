@@ -442,9 +442,10 @@ async def test_reviewed_manifest_channels_are_checked_at_export_and_exposure(
         "cancelled_after_registration",
     ],
 )
+@pytest.mark.parametrize("source_selection", ["whole_records", "assistant_visible_text_v1"])
 @run_async
 async def test_participant_export_settles_its_registered_responsibility(
-    backend, outcome, monkeypatch, participant_backend
+    backend, outcome, monkeypatch, participant_backend, source_selection
 ):
     from tests.core.test_participant_identity import configuration, registration
 
@@ -466,6 +467,27 @@ async def test_participant_export_settles_its_registered_responsibility(
             initial, store, _, _ = case.app()
             await case.create(store)
             request = await case.request(initial)
+            if source_selection == "assistant_visible_text_v1":
+                from cayu.messages import Message, ProviderStatePart, TextPart
+
+                await store.append_transcript_messages(
+                    case.session_id,
+                    [
+                        Message(
+                            role="assistant",
+                            content=(
+                                TextPart(text="approved"),
+                                ProviderStatePart(
+                                    provider="openai",
+                                    state={"private": "participant-private-canary"},
+                                ),
+                            ),
+                        )
+                    ],
+                )
+                request = request.model_copy(
+                    update={"source_indices": (1,), "source_selection": source_selection}
+                )
             resolver = Resolver(request)
             participant_registration = registration(policy=Access(), scope=OWNER.application_scope)
             app, _, _, projector = case.app(

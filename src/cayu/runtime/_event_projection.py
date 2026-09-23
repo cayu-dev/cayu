@@ -423,6 +423,7 @@ _REQUEST_MESSAGE_PART_TYPE_VALUES = frozenset(
         "file",
         "hosted_tool_call",
         "citation",
+        "peer_content",
     }
 )
 _REQUEST_ATTACHMENT_KIND_VALUES = frozenset({"image", "document"})

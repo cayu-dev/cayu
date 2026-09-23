@@ -453,6 +453,51 @@ class CitationPart(BaseModel):
         return self
 
 
+class PeerContentPart(BaseModel):
+    """Attributed, non-executable content delivered by another participant."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    type: Literal["peer_content"] = "peer_content"
+    text: str = Field(max_length=131072)
+    sender_participant_id: str = Field(max_length=512)
+    sender_participant_incarnation: str = Field(max_length=512)
+    sender_session_id: str = Field(max_length=512)
+    sender_session_instance_id: str = Field(max_length=512)
+    occurrence_id: str = Field(max_length=512)
+    append_key_json: str = Field(max_length=16384)
+    operation_key: str = Field(max_length=512)
+    projection_id: str = Field(max_length=256)
+    provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    executable: Literal[False] = False
+
+    @field_validator(
+        "sender_participant_id",
+        "sender_participant_incarnation",
+        "sender_session_id",
+        "sender_session_instance_id",
+        "occurrence_id",
+        "operation_key",
+        "projection_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _require_clean_nonblank(info.field_name, value)
+
+    @field_validator("text")
+    @classmethod
+    def validate_peer_text(cls, value: str) -> str:
+        return require_durable_text(value, "peer_content.text")
+
+    @field_validator("append_key_json")
+    @classmethod
+    def validate_append_key_json(cls, value: str) -> str:
+        value = _require_clean_nonblank("append_key_json", value)
+        if len(value.encode("utf-8")) > 16384:
+            raise ValueError("append_key_json exceeds its byte limit.")
+        return value
+
+
 class _ValidatedContent(
     tuple[
         TextPart
@@ -462,7 +507,8 @@ class _ValidatedContent(
         | ThinkingPart
         | FilePart
         | HostedToolCallPart
-        | CitationPart,
+        | CitationPart
+        | PeerContentPart,
         ...,
     ]
 ):
@@ -502,7 +548,8 @@ class Message(BaseModel):
         | ThinkingPart
         | FilePart
         | HostedToolCallPart
-        | CitationPart,
+        | CitationPart
+        | PeerContentPart,
         ...,
     ] = ()
 
@@ -529,6 +576,7 @@ class Message(BaseModel):
                 ThinkingPart,
                 HostedToolCallPart,
                 CitationPart,
+                PeerContentPart,
             )
         elif self.role == MessageRole.TOOL:
             _require_parts(self.role, self.content, ToolResultPart)
@@ -569,6 +617,7 @@ class Message(BaseModel):
             | FilePart
             | HostedToolCallPart
             | CitationPart
+            | PeerContentPart
         ]
         if calls is not None:
             if any(
@@ -626,6 +675,7 @@ class Message(BaseModel):
             | FilePart
             | HostedToolCallPart
             | CitationPart
+            | PeerContentPart
         ]
         if not isinstance(content, str):
             raise ValueError("`content` must be a string.")
@@ -678,6 +728,7 @@ def _require_parts(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | PeerContentPart
     ],
     *allowed_types: (
         type[TextPart]
@@ -688,6 +739,7 @@ def _require_parts(
         | type[FilePart]
         | type[HostedToolCallPart]
         | type[CitationPart]
+        | type[PeerContentPart]
     ),
 ) -> None:
     invalid_parts = [part.type for part in content if not isinstance(part, allowed_types)]
@@ -712,6 +764,7 @@ _MESSAGE_PART_TYPES = (
     FilePart,
     HostedToolCallPart,
     CitationPart,
+    PeerContentPart,
 )
 
 
@@ -755,7 +808,8 @@ def copy_message_part(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
 ) -> (
     TextPart
     | ToolCallPart
@@ -765,6 +819,7 @@ def copy_message_part(
     | FilePart
     | HostedToolCallPart
     | CitationPart
+    | PeerContentPart
 ):
     """Return an owned copy of `part`.
 

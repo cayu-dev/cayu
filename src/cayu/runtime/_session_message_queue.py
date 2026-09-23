@@ -35,6 +35,25 @@ class OversizedStorageValue:
     storage_type: str | None = None
 
 
+def require_open_admission(status: str, checkpoint: object) -> None:
+    """Validate the shared queue gate under the receiving transaction."""
+    from cayu.sessions.base import (
+        PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+        SessionStatusConflict,
+    )
+
+    if status not in {"pending", "running"}:
+        raise SessionStatusConflict(
+            "Session messages may be enqueued only while a session is pending or running."
+        )
+    if isinstance(checkpoint, dict) and (
+        PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint
+    ):
+        raise SessionStatusConflict(
+            "Session messages cannot be enqueued while completion finalization is pending."
+        )
+
+
 def _storage_value(value: Any) -> Any:
     if type(value) is OversizedStorageValue:
         return ["oversized", value.sha256, value.byte_length, value.storage_type]

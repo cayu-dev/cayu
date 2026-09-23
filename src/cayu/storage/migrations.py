@@ -484,6 +484,9 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=102, kind=RevisionKind.ADDITIVE, compatible_from=99),
     # Every recipient creator must honor durable future-target exclusion.
     Revision(revision=103, kind=RevisionKind.BREAKING, compatible_from=103),
+    # Peer append and exposure receipts are durable session-owned records;
+    # every writer must preserve their exact replay and pending-recovery state.
+    Revision(revision=104, kind=RevisionKind.BREAKING, compatible_from=104),
 )
 
 #: The revision an empty database is initialized to.

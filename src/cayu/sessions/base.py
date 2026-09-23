@@ -32,6 +32,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast, overload
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu.collaboration.peer_content import (
+    PeerAppendKey,
+    PeerContentAppendRequest,
+    PeerContentConflict,
+    PeerContentExposureReceipt,
+    PeerContentExposureRequest,
+    PeerContentReceipt,
+    PeerContentUnavailable,
+)
 from cayu.deadlines import (
     EXECUTION_DEADLINE_METADATA_KEY,
     ExecutionDeadline,
@@ -240,6 +249,7 @@ from cayu.memory.evidence import (
 from cayu.messages import (
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -1816,7 +1826,7 @@ class RunRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        return [detach_message(message) for message in value]
+        return [_copy_caller_input_message(message) for message in value]
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -2075,7 +2085,7 @@ class ResumeRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        copied_messages = [detach_message(message) for message in value]
+        copied_messages = [_copy_caller_input_message(message) for message in value]
         if not copied_messages:
             raise ValueError("ResumeRequest messages cannot be empty.")
         return copied_messages
@@ -2352,8 +2362,14 @@ class SessionQueuedMessage(BaseModel):
         if value is None:
             return None
         message = detach_message(value)
-        if message.role is not MessageRole.USER:
-            raise ValueError("Queued session messages must have the user role.")
+        if message.role is not MessageRole.USER and not (
+            message.role is MessageRole.ASSISTANT
+            and message.content
+            and all(type(part) is PeerContentPart for part in message.content)
+        ):
+            raise ValueError(
+                "Queued session messages must have the user role or peer assistant content."
+            )
         return message
 
 
@@ -10227,6 +10243,9 @@ class SessionStore(ABC):
 
     participant_session_binding_version: ClassVar[int | None] = None
     context_view_version: ClassVar[int | None] = None
+    # Versioned proof for authenticated peer-content append/readback.  Stores
+    # must implement the exact append-key CAS before advertising this value.
+    peer_content_version: ClassVar[int | None] = None
 
     async def _prepare_session_creation_target(self, target, *, authority):
         raise NotImplementedError("This SessionStore does not support creation decisions.")
@@ -11572,6 +11591,79 @@ class SessionStore(ABC):
         match under the transaction lock before either replay or admission.
         This fence is not a persisted message freshness condition.
         """
+
+    async def append_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        qualify_target: Callable[[Session], None] | None = None,
+        pending_transcript_cursor: int | None = None,
+    ) -> PeerContentReceipt:
+        """Atomically append or replay one authenticated peer occurrence.
+
+        The default is fail-closed: a custom store cannot accidentally expose
+        peer content by inheriting a user-message implementation.
+        Before queue insertion, native owners call the runtime's synchronous,
+        side-effect-free qualifier with a detached transaction-owned target.
+        Missing qualification permits only pending/excluded decisions or replay.
+        pending_transcript_cursor is a receiving-owner fence for servicing an
+        already retained exact pending operation. It never changes caller intent.
+        """
+        raise NotImplementedError("This SessionStore does not support peer content.")
+
+    async def read_peer_content(
+        self,
+        append_key: PeerAppendKey,
+    ) -> PeerContentReceipt | None:
+        """Return the bounded append receipt for an exact key, if present."""
+        raise NotImplementedError("This SessionStore does not support peer content.")
+
+    async def exclude_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        reason: str,
+    ) -> PeerContentReceipt:
+        """Record a definitive exclusion without pretending it was appended."""
+        raise NotImplementedError("This SessionStore does not support peer content.")
+
+    async def read_peer_content_attempt(
+        self, request: PeerContentAppendRequest
+    ) -> PeerContentReceipt | None:
+        """Reconcile the complete expected operation, including excluded predecessors."""
+        raise NotImplementedError("This SessionStore does not support exact peer reconciliation.")
+
+    async def list_pending_peer_content(self, *, after_operation_key=None, limit=32):
+        """Discover bounded peer responsibility independently of creation settlement."""
+        raise NotImplementedError("This SessionStore does not support peer discovery.")
+
+    async def retry_pending_peer_content(
+        self,
+        session_id: str,
+        *,
+        expected_session_instance_id: str,
+        expected_run_epoch: int,
+        expected_transcript_cursor: int,
+        admit=None,
+    ) -> tuple[PeerContentReceipt, ...]:
+        """Retry retained peer appends only when the existing host reaches a boundary."""
+        raise NotImplementedError("This SessionStore does not support peer delivery servicing.")
+
+    async def record_peer_content_exposure(
+        self, request: PeerContentExposureRequest
+    ) -> PeerContentExposureReceipt:
+        raise NotImplementedError("This SessionStore does not support peer exposure receipts.")
+
+    async def begin_peer_content_exposure(
+        self, request: PeerContentExposureRequest
+    ) -> PeerContentExposureReceipt:
+        """Durably reserve an exposure before provider serialization."""
+        raise NotImplementedError("This SessionStore does not support peer exposure receipts.")
+
+    async def read_peer_content_exposure(
+        self, append_key: PeerAppendKey, exposure_id: str
+    ) -> PeerContentExposureReceipt | None:
+        raise NotImplementedError("This SessionStore does not support peer exposure receipts.")
 
     async def inspect_session_messages(
         self,
@@ -14543,6 +14635,8 @@ class _InMemoryContextViewSelectionTransaction:
 class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     """In-process session store for tests, local development, and examples."""
 
+    peer_content_version: ClassVar[int | None] = 1
+
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
     supports_session_closure_receipts: ClassVar[bool] = True
@@ -14926,6 +15020,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         self._context_ownership_operation_commitments: dict[str, str] = {}
         self._context_ownership_operation_receipts: dict[str, Any] = {}
         self._context_lifecycle_events: dict[str, Any] = {}
+        self._peer_content_receipts: dict[str, Any] = {}
+        self._peer_content_deleted_targets: set[tuple[str, str]] = set()
+        self._peer_content_operation_commitments: dict[str, str] = {}
+        self._peer_content_operations: dict[str, str] = {}
+        self._peer_content_requests: dict[str, PeerContentAppendRequest] = {}
+        self._peer_content_attempts: dict[str, tuple[str, str]] = {}
+        self._peer_content_exposures: dict[str, tuple[str, PeerContentExposureReceipt]] = {}
         self._session_closure_receipts: dict[tuple[str, str], dict[str, Any]] = {}
         self._session_closure_progress: dict[tuple[str, str], dict[str, Any]] = {}
         self._session_closure_tombstones: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -17943,6 +18044,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 if key[0] != session_id and binding.grant_id not in targeted_grant_ids
             }
             self._sessions.pop(session_id, None)
+            if any(
+                receipt.status == "appended"
+                and receipt.target_session_id == session.id
+                and receipt.target_session_instance_id == session.instance_id
+                for receipt in self._peer_content_receipts.values()
+            ):
+                self._peer_content_deleted_targets.add((session.id, session.instance_id))
             binding = self._participant_session_bindings.pop(session_id, None)
             self._participant_session_receipts.pop(session_id, None)
             if binding is not None:
@@ -20522,6 +20630,512 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 include_checkpoint_digest=include_checkpoint_digest,
             )
 
+    async def append_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        qualify_target: Callable[[Session], None] | None = None,
+        pending_transcript_cursor: int | None = None,
+    ) -> PeerContentReceipt:
+        from cayu.collaboration.peer_content import PeerContentReceipt
+
+        if type(request) is not PeerContentAppendRequest:
+            raise TypeError("Peer append requires a PeerContentAppendRequest.")
+        request = PeerContentAppendRequest.model_validate(request)
+        from cayu.collaboration.peer_content import resolve_peer_target
+
+        key = request.append_key.model_dump_json()
+        commitment = request.model_dump_json()
+        async with self._lock:
+            creation = request.append_key.creation_target
+            target_id, target_instance, creation_excluded = resolve_peer_target(
+                request.append_key,
+                None if creation is None else self._session_creation_decisions.get(creation.key),
+            )
+            from cayu.storage._peer_attempts import historical_replay, replay_or_advance
+
+            historical = historical_replay(
+                request, self._peer_content_attempts.get(request.operation_key)
+            )
+            if historical is not None:
+                return historical
+            existing = self._peer_content_receipts.get(key)
+            if existing is not None:
+                replay = replay_or_advance(request, self._peer_content_requests[key], existing)
+                if replay is not None:
+                    return replay
+            elif request.replaces_operation_key is not None:
+                raise PeerContentConflict()
+            from cayu.storage._peer_attempts import receiving_cursor
+
+            target_cursor = receiving_cursor(request, existing, pending_transcript_cursor)
+            target = None if target_id is None else self._sessions.get(target_id)
+            if target is not None and target.status not in {
+                SessionStatus.COMPLETED,
+                SessionStatus.FAILED,
+                SessionStatus.INTERRUPTED,
+            }:
+                from cayu.runtime._session_message_queue import require_open_admission
+
+                require_open_admission(target.status, self._checkpoints.get(target.id))
+            target_binding = (
+                None if target_id is None else self._participant_session_bindings.get(target_id)
+            )
+            target_binding_valid = target_binding is not None and (
+                target_binding.session_instance_id == target_instance
+                and target_binding.participant.participant_id == request.append_key.consumer_id
+                and target_binding.participant.incarnation
+                == request.append_key.consumer_participant_incarnation
+            )
+            source_binding = self._participant_session_bindings.get(
+                request.occurrence.sender_session_id
+            )
+            source_valid = (
+                source_binding is not None
+                and source_binding.session_instance_id
+                == request.occurrence.sender_session_instance_id
+                and source_binding.participant.participant_id
+                == request.occurrence.sender_participant_id
+                and source_binding.participant.incarnation
+                == request.occurrence.sender_participant_incarnation
+            )
+            expired = (
+                int(self._ownership_clock().timestamp() * 1000)
+                >= request.attempt_key.deadline_at_ms
+            )
+            from cayu.storage._peer_attempts import qualify, require_capacity
+
+            outstanding = 0
+            for other_key, other in self._peer_content_receipts.items():
+                if other_key == key or (
+                    other.append_key.consumer_id != request.append_key.consumer_id
+                    or other.append_key.consumer_participant_incarnation
+                    != request.append_key.consumer_participant_incarnation
+                ):
+                    continue
+                if other.status == "pending":
+                    outstanding += 1
+                elif other.status == "appended":
+                    if (other.target_session_id, other.target_session_instance_id) in (
+                        self._peer_content_deleted_targets
+                    ):
+                        continue
+                    queued = self._queued_session_messages_by_idempotency.get(
+                        other.target_session_id, {}
+                    ).get(other.operation_key)
+                    if queued is None or queued.status == SessionMessageQueueStatus.QUEUED:
+                        outstanding += 1
+            if expired:
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="excluded",
+                    reason="delivery_deadline_expired",
+                )
+            elif (
+                creation_excluded
+                or not source_valid
+                or (
+                    target is not None
+                    and target.status
+                    in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                        SessionStatus.INTERRUPTED,
+                    }
+                )
+            ):
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="excluded",
+                    reason="source_or_target_unavailable",
+                )
+            elif target is None:
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="pending",
+                    reason="target_not_created",
+                )
+            elif target_binding is None:
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="pending",
+                    reason="target_binding_pending",
+                )
+            elif not target_binding_valid or target.instance_id != target_instance:
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="excluded",
+                    reason="target_binding_mismatch",
+                )
+            elif (
+                isinstance(self._checkpoints.get(target.id), dict)
+                and _PENDING_TOOL_ROUND_CHECKPOINT_KEY in self._checkpoints[target.id]
+            ):
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="pending",
+                    reason="target_busy",
+                )
+            elif (
+                target.run_epoch != request.attempt_key.target_run_epoch
+                or len(self._transcripts.get(target.id, ())) != target_cursor
+            ):
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="pending",
+                    reason="target_cursor_changed",
+                )
+            else:
+                require_capacity(outstanding)
+                qualify(qualify_target, target)
+                peer_message = Message(
+                    role=MessageRole.ASSISTANT,
+                    content=(
+                        request.occurrence.to_message_part(
+                            append_key=request.append_key,
+                            projection_id=request.append_key.projection_id,
+                            operation_key=request.operation_key,
+                        ),
+                    ),
+                )
+                from cayu.collaboration.peer_content import peer_queue_id
+
+                assert target_id is not None and target_instance is not None
+                queue_id = peer_queue_id(request.append_key, target_id, target_instance)
+                if any(
+                    item.queue_id == queue_id or item.idempotency_key == request.operation_key
+                    for item in self._queued_session_messages_by_idempotency.get(
+                        target_id, {}
+                    ).values()
+                ):
+                    raise PeerContentConflict("Peer queue identity already has another authority.")
+                delivery_mode = (
+                    SessionMessageDeliveryMode.ON_IDLE
+                    if request.wake_policy == "ordinary_continuation"
+                    else SessionMessageDeliveryMode.NEXT_TURN
+                )
+                accepted_at = self._ownership_clock()
+                ordering_key = self._next_session_message_ordering_key
+                accepted_event = Event(
+                    type=EventType.SESSION_MESSAGE_QUEUED,
+                    session_id=target.id,
+                    agent_name=target.agent_name,
+                    environment_name=target.environment_name,
+                    timestamp=accepted_at,
+                    payload={
+                        **_queued_session_message_event_payload(
+                            queue_id=queue_id,
+                            delivery_mode=delivery_mode,
+                            ordering_key=ordering_key,
+                            actor=None,
+                            run_epoch=target.run_epoch,
+                            transcript_cursor=len(self._transcripts.get(target.id, [])),
+                        ),
+                        "peer_occurrence_id": request.occurrence.occurrence_id,
+                        "peer_provenance_sha256": request.occurrence.provenance_sha256,
+                    },
+                )
+                queued_message = SessionQueuedMessage(
+                    queue_id=queue_id,
+                    session_id=target.id,
+                    idempotency_key=request.operation_key,
+                    content=request.occurrence.payload.text,
+                    message=peer_message,
+                    delivery_mode=delivery_mode,
+                    status=SessionMessageQueueStatus.QUEUED,
+                    ordering_key=ordering_key,
+                    accepted_run_epoch=target.run_epoch,
+                    accepted_transcript_cursor=len(self._transcripts.get(target.id, [])),
+                    accepted_event_id=accepted_event.id,
+                    accepted_at=accepted_at,
+                    conditions=SessionMessageConditions(),
+                )
+                self._sessions[target.id] = self._append_events_unlocked(target, [accepted_event])
+                self._queued_session_messages_by_idempotency.setdefault(target.id, {})[
+                    queued_message.idempotency_key
+                ] = queued_message
+                self._pending_session_messages.setdefault(
+                    (target.id, delivery_mode), deque()
+                ).append(queued_message)
+                self._next_session_message_ordering_key += 1
+                receipt = PeerContentReceipt(
+                    operation_key=request.operation_key,
+                    append_key=request.append_key,
+                    attempt_generation=request.attempt_key.attempt_generation,
+                    status="appended",
+                    target_session_id=target_id,
+                    target_session_instance_id=target_instance,
+                    occurrence=request.occurrence,
+                    queue_id=queue_id,
+                )
+            if receipt.status == "pending":
+                require_capacity(outstanding)
+            self._peer_content_receipts[key] = receipt
+            self._peer_content_operation_commitments[key] = commitment
+            self._peer_content_operations[request.operation_key] = commitment
+            self._peer_content_requests[key] = request.model_copy(deep=True)
+            self._peer_content_attempts[request.operation_key] = (
+                request.model_dump_json(),
+                receipt.model_dump_json(),
+            )
+            return receipt.model_copy(deep=True)
+
+    async def read_peer_content_attempt(
+        self, request: PeerContentAppendRequest
+    ) -> PeerContentReceipt | None:
+        from cayu.storage._peer_attempts import exact_read
+
+        request = PeerContentAppendRequest.model_validate(request)
+        async with self._lock:
+            return exact_read(request, self._peer_content_attempts.get(request.operation_key))
+
+    async def list_pending_peer_content(self, *, after_operation_key=None, limit=32):
+        """Trusted receiving-owner discovery, independent of creation settlement."""
+        from cayu.collaboration.peer_content import validate_peer_discovery
+
+        validate_peer_discovery(after_operation_key, limit)
+        async with self._lock:
+            keys = sorted(
+                self._peer_content_requests,
+                key=lambda key: self._peer_content_requests[key].operation_key,
+            )
+            return tuple(
+                self._peer_content_requests[key].model_copy(deep=True)
+                for key in keys
+                if self._peer_content_receipts[key].status == "pending"
+                and self._peer_content_requests[key].operation_key > (after_operation_key or "")
+            )[:limit]
+
+    async def read_peer_content(self, append_key: PeerAppendKey) -> PeerContentReceipt | None:
+        if type(append_key) is not PeerAppendKey:
+            raise TypeError("append_key must be a PeerAppendKey.")
+        append_key = PeerAppendKey.model_validate(append_key)
+        async with self._lock:
+            value = self._peer_content_receipts.get(append_key.model_dump_json())
+            return None if value is None else value.model_copy(deep=True)
+
+    async def record_peer_content_exposure(
+        self, request: PeerContentExposureRequest
+    ) -> PeerContentExposureReceipt:
+        if type(request) is not PeerContentExposureRequest:
+            raise TypeError("Exposure requires a PeerContentExposureRequest.")
+        key = request.exposure_id
+        commitment = request.model_dump_json()
+        async with self._lock:
+            existing = self._peer_content_exposures.get(key)
+            if existing is None:
+                existing = next(
+                    (
+                        value
+                        for value in self._peer_content_exposures.values()
+                        if value[1].operation_key == request.operation_key
+                    ),
+                    None,
+                )
+            if existing is not None:
+                expected = (
+                    request.identity_commitment()
+                    if existing[1].outcome == "pending"
+                    else commitment
+                )
+                actual = existing[0]
+                if actual != expected:
+                    raise PeerContentConflict()
+                if existing[1].outcome == "pending":
+                    receipt = PeerContentExposureReceipt(
+                        operation_key=request.operation_key,
+                        append_key=request.append_key,
+                        exposure_id=request.exposure_id,
+                        model_attempt_id=request.model_attempt_id,
+                        outcome=request.outcome,
+                        reason=request.reason,
+                    )
+                    self._peer_content_exposures[key] = (commitment, receipt)
+                    return receipt
+                return existing[1].model_copy(update={"replayed": True})
+            append = self._peer_content_receipts.get(request.append_key.model_dump_json())
+            if append is None or append.status != "appended":
+                raise PeerContentUnavailable("Peer content was not durably appended.")
+            receipt = PeerContentExposureReceipt(
+                operation_key=request.operation_key,
+                append_key=request.append_key,
+                exposure_id=request.exposure_id,
+                model_attempt_id=request.model_attempt_id,
+                outcome=request.outcome,
+                reason=request.reason,
+            )
+            self._peer_content_exposures[key] = (commitment, receipt)
+            return receipt.model_copy(deep=True)
+
+    async def begin_peer_content_exposure(
+        self, request: PeerContentExposureRequest
+    ) -> PeerContentExposureReceipt:
+        if type(request) is not PeerContentExposureRequest:
+            raise TypeError("Exposure requires a PeerContentExposureRequest.")
+        identity = request.identity_commitment()
+        key = request.exposure_id
+        async with self._lock:
+            existing = self._peer_content_exposures.get(key)
+            if existing is None:
+                existing = next(
+                    (
+                        value
+                        for value in self._peer_content_exposures.values()
+                        if value[1].operation_key == request.operation_key
+                    ),
+                    None,
+                )
+            if existing is not None:
+                if existing[1].outcome == "pending" and existing[0] == identity:
+                    return existing[1].model_copy(update={"replayed": True})
+                if existing[1].outcome != "pending" and existing[0] == request.model_dump_json():
+                    return existing[1].model_copy(update={"replayed": True})
+                raise PeerContentConflict()
+            append = self._peer_content_receipts.get(request.append_key.model_dump_json())
+            if append is None or append.status != "appended":
+                raise PeerContentUnavailable("Peer content was not durably appended.")
+            receipt = PeerContentExposureReceipt(
+                operation_key=request.operation_key,
+                append_key=request.append_key,
+                exposure_id=request.exposure_id,
+                model_attempt_id=request.model_attempt_id,
+                outcome="pending",
+            )
+            self._peer_content_exposures[key] = (identity, receipt)
+            return receipt.model_copy(deep=True)
+
+    async def read_peer_content_exposure(
+        self, append_key: PeerAppendKey, exposure_id: str
+    ) -> PeerContentExposureReceipt | None:
+        if type(append_key) is not PeerAppendKey or type(exposure_id) is not str:
+            raise TypeError("Invalid exposure lookup.")
+        append_key = PeerAppendKey.model_validate(append_key)
+        async with self._lock:
+            value = self._peer_content_exposures.get(exposure_id)
+            if value is None or value[1].append_key != append_key:
+                return None
+            return value[1].model_copy(deep=True)
+
+    async def exclude_peer_content(
+        self,
+        request: PeerContentAppendRequest,
+        *,
+        reason: str,
+    ) -> PeerContentReceipt:
+        from cayu.collaboration.peer_content import PeerContentReceipt
+
+        if type(request) is not PeerContentAppendRequest:
+            raise TypeError("Peer exclusion requires a PeerContentAppendRequest.")
+        request = PeerContentAppendRequest.model_validate(request)
+        reason = require_clean_nonblank(reason, "reason")
+        from cayu.collaboration.peer_content import resolve_peer_target
+
+        key = request.append_key.model_dump_json()
+        async with self._lock:
+            creation = request.append_key.creation_target
+            resolve_peer_target(
+                request.append_key,
+                None if creation is None else self._session_creation_decisions.get(creation.key),
+            )
+            commitment = request.model_dump_json()
+            from cayu.storage._peer_attempts import historical_replay
+
+            replay = historical_replay(
+                request, self._peer_content_attempts.get(request.operation_key)
+            )
+            if replay is not None:
+                if replay.status == "excluded" and replay.reason != reason:
+                    raise PeerContentConflict()
+                return replay
+            prior_operation = self._peer_content_operations.get(request.operation_key)
+            if prior_operation is not None and prior_operation != commitment:
+                raise PeerContentConflict()
+            existing = self._peer_content_receipts.get(key)
+            if existing is not None:
+                if self._peer_content_operation_commitments[key] != commitment:
+                    raise PeerContentConflict()
+                if existing.status == "excluded" and existing.reason != reason:
+                    raise PeerContentConflict()
+                if existing.status != "pending":
+                    return existing.model_copy(deep=True).model_copy(update={"replayed": True})
+            receipt = PeerContentReceipt(
+                operation_key=request.operation_key,
+                append_key=request.append_key,
+                attempt_generation=request.attempt_key.attempt_generation,
+                status="excluded",
+                reason=reason,
+            )
+            self._peer_content_receipts[key] = receipt
+            self._peer_content_operation_commitments[key] = commitment
+            self._peer_content_operations[request.operation_key] = commitment
+            self._peer_content_requests[key] = request.model_copy(deep=True)
+            self._peer_content_attempts[request.operation_key] = (
+                request.model_dump_json(),
+                receipt.model_dump_json(),
+            )
+            return receipt.model_copy(deep=True)
+
+    async def retry_pending_peer_content(
+        self,
+        session_id: str,
+        *,
+        expected_session_instance_id: str,
+        expected_run_epoch: int,
+        expected_transcript_cursor: int,
+        admit=None,
+    ) -> tuple[PeerContentReceipt, ...]:
+        if type(session_id) is not str or type(expected_session_instance_id) is not str:
+            raise TypeError("Peer retry identity values must be strings.")
+        from cayu.collaboration.peer_content import resolve_peer_target
+
+        def target_matches(request):
+            creation = request.append_key.creation_target
+            target_id, instance, _ = resolve_peer_target(
+                request.append_key,
+                None if creation is None else self._session_creation_decisions.get(creation.key),
+            )
+            return target_id == session_id and instance == expected_session_instance_id
+
+        async with self._lock:
+            requests = [
+                request.model_copy(deep=True)
+                for key, request in self._peer_content_requests.items()
+                if target_matches(request)
+                and self._peer_content_receipts.get(key) is not None
+                and self._peer_content_receipts[key].status == "pending"
+            ][:SESSION_MESSAGE_DELIVERY_BATCH_LIMIT]
+        results: list[PeerContentReceipt] = []
+        for request in requests:
+            if (
+                request.append_key.creation_target is None
+                and request.append_key.target_session_instance_id != expected_session_instance_id
+            ):
+                continue
+            if request.attempt_key.target_run_epoch != expected_run_epoch:
+                continue
+            if admit is None:
+                raise PeerContentUnavailable(
+                    "Pending delivery requires fresh export authorization."
+                )
+            results.append(
+                await admit(request, pending_transcript_cursor=expected_transcript_cursor)
+            )
+        return tuple(results)
+
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
@@ -20569,17 +21183,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 )
             for owner in self._session_closure_progress.values():
                 _check_closure_lineage_owner(owner, (request.session_id,))
-            if session.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
-                raise SessionStatusConflict(
-                    "Session messages may be enqueued only while a session is pending or running."
-                )
-            if (
-                self._checkpoints.get(session.id) is not None
-                and PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in self._checkpoints[session.id]
-            ):
-                raise SessionStatusConflict(
-                    "Session messages cannot be enqueued while completion finalization is pending."
-                )
+            from cayu.runtime._session_message_queue import require_open_admission
+
+            require_open_admission(session.status, self._checkpoints.get(session.id))
             accepted_at = self._ownership_clock()
             queue_id = str(uuid4())
             source = request.conditions.source
@@ -26281,6 +26887,13 @@ def fork_session_invocation(source_session: Session) -> SessionInvocation:
         source_session.invocation,
         source=SessionExecutionSource.FORK,
     )
+
+
+def _copy_caller_input_message(message: Message) -> Message:
+    copied = detach_message(message)
+    if any(isinstance(part, PeerContentPart) for part in copied.content):
+        raise ValueError("Peer content requires authenticated peer delivery.")
+    return copied
 
 
 def copy_resume_request(request: ResumeRequest) -> ResumeRequest:

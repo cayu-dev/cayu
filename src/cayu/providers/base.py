@@ -4,11 +4,11 @@ import asyncio
 import json
 import math
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -29,6 +29,7 @@ from cayu.messages import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -158,6 +159,7 @@ def _preflight_provider_portable_messages(
     supports_tool_history: bool,
     supports_tool_definitions: bool,
     supports_file_attachments: bool,
+    supports_peer_content: bool = False,
     tool_name_validator: Callable[[str], None] | None = None,
     tool_definition_validator: Callable[[Mapping[str, Any]], object] | None = None,
 ) -> None:
@@ -176,6 +178,8 @@ def _preflight_provider_portable_messages(
         raise TypeError("supports_tool_definitions must be a bool.")
     if type(supports_file_attachments) is not bool:
         raise TypeError("supports_file_attachments must be a bool.")
+    if type(supports_peer_content) is not bool:
+        raise TypeError("supports_peer_content must be a bool.")
     if tool_name_validator is not None and not callable(tool_name_validator):
         raise TypeError("tool_name_validator must be callable or None.")
     if tool_definition_validator is not None and not callable(tool_definition_validator):
@@ -227,6 +231,15 @@ def _preflight_provider_portable_messages(
             if type(part) in {HostedToolCallPart, CitationPart}:
                 # Provider-neutral terminal evidence is not executable input.
                 # The assistant text remains the portable conversation surface.
+                continue
+            if type(part) is PeerContentPart:
+                # Peer content is historical, attributed external data.  A
+                # provider may accept it only through its explicit adapter;
+                # the generic preflight never treats it as user authority.
+                if message.role is not MessageRole.ASSISTANT:
+                    raise ValueError("Peer content is valid only in assistant history.")
+                if not supports_peer_content:
+                    raise ValueError("Target provider does not declare peer-content support.")
                 continue
             raise TypeError("Portable target messages contain an unsupported message part.")
 
@@ -841,8 +854,42 @@ class ToolDiscoveryProjectionResult(BaseModel):
         return tuple(cast("str", tool["name"]) for tool in self.loaded_tools)
 
 
+def has_peer_content(request: ModelRequest) -> bool:
+    return any(
+        type(part) is PeerContentPart for message in request.messages for part in message.content
+    )
+
+
+def reject_peer_token_counting(request: ModelRequest) -> None:
+    """Remote counting has no authenticated peer-disclosure handoff."""
+    if has_peer_content(request):
+        from cayu.collaboration.peer_content import PeerContentUnavailable
+
+        raise PeerContentUnavailable("Remote token counting cannot disclose peer content.")
+
+
+async def record_peer_serialization(request: ModelRequest) -> None:
+    """Notify the runtime owner after approved peer data is serialized.
+
+    This is serialization evidence, not proof of transport acceptance. An opaque
+    provider that does not report this boundary leaves its exposure unresolved.
+    The observer is runtime-only and cannot be supplied in request JSON.
+    """
+    if request._peer_serialization_observer is not None:
+        await request._peer_serialization_observer(request)
+    elif any(
+        type(part) is PeerContentPart for message in request.messages for part in message.content
+    ):
+        from cayu.collaboration.peer_content import PeerContentUnavailable
+
+        raise PeerContentUnavailable("Peer serialization requires current runtime authority.")
+
+
 class ModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    _peer_serialization_observer: Callable[[ModelRequest], Awaitable[None]] | None = PrivateAttr(
+        default=None
+    )
 
     model: str
     messages: list[Message]
@@ -1519,7 +1566,11 @@ class ModelProvider(ABC):
         """Reject portable messages or active tools this adapter cannot render.
 
         The runtime calls this side-effect-free hook before durably adopting a
-        different provider/model target. Adapters must explicitly override this
+        different provider/model target and during native peer queue admission.
+        Peer admission may invoke it on a storage worker thread while holding
+        the receiving transaction: it must complete synchronously, return None,
+        perform no I/O, and never reenter storage.
+        Adapters must explicitly override this
         method to admit system messages, tool history, active tool definitions, or
         file attachments. The conservative default accepts only user/assistant text
         with no active tools, so an existing custom provider cannot silently claim

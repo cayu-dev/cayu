@@ -66,6 +66,7 @@ from cayu.messages import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    PeerContentPart,
     ProviderStatePart,
     TextPart,
     ThinkingPart,
@@ -5968,6 +5969,12 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                     request.messages,
                     max_attachment_results=self.max_attachment_results,
                 )
+                has_peer_content = any(
+                    type(part) is PeerContentPart
+                    for message in context_messages
+                    for part in message.content
+                )
+                context_messages = _peer_free_compaction_messages(context_messages)
                 cache_prefix_request = None
                 force_bounded_compaction = request.force_bounded_compaction
                 prompt_cache_mode = None
@@ -5981,6 +5988,12 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         prompt_cache_mode == _PromptCacheCompactionMode.BOUNDED
                     )
                     attempt_bounded_input = True if force_bounded_compaction else None
+                    if has_peer_content:
+                        # Exact cached-prefix compaction has no peer disclosure
+                        # receiver. Compact only the content-free projection.
+                        prompt_cache_mode = _PromptCacheCompactionMode.BOUNDED
+                        force_bounded_compaction = True
+                        attempt_bounded_input = True
                 if (
                     prompt_cache_mode == _PromptCacheCompactionMode.EXACT
                     and request.build_cache_prefix_request is not None
@@ -5996,7 +6009,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 compaction_request = CompactionRequest(
                     session=request.session,
                     agent=request.agent,
-                    messages=newly_compactable,
+                    messages=_peer_free_compaction_messages(newly_compactable),
                     existing_summary=previous_summary,
                     metadata=request.metadata,
                     context_messages=context_messages,
@@ -6226,11 +6239,19 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 )
             )
 
+        retained_peer_messages = [
+            Message(role=MessageRole.ASSISTANT, content=parts)
+            for message in request.messages[:represented_cursor]
+            if (parts := tuple(part for part in message.content if type(part) is PeerContentPart))
+        ]
         if summary is None:
             messages = [copy_message(message) for message in request.messages]
         else:
             messages = [copy_message(message) for message in system_prefix]
             messages.append(Message.text(MessageRole.USER, f"{self.summary_prefix}\n{summary}"))
+            # Retain typed provenance, not a summary which could renew revoked
+            # disclosure. The model-attempt owner still guards every peer part.
+            messages.extend(retained_peer_messages)
             messages.extend(
                 copy_message(message)
                 for message in request.messages[represented_cursor:compactable_cursor]
@@ -6297,6 +6318,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         [
                             *system_prefix,
                             Message.text(MessageRole.USER, f"{self.summary_prefix}\n{summary}"),
+                            *retained_peer_messages,
                             *recent_messages,
                         ],
                         max_attachment_results=self.max_attachment_results,
@@ -6656,6 +6678,7 @@ def _strip_old_tool_result_attachments(
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | PeerContentPart
     ] = []
     for part_index, part in enumerate(message.content):
         if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
@@ -6703,6 +6726,7 @@ def _strip_file_parts_from_user_message(message: Message) -> Message:
         | FilePart
         | HostedToolCallPart
         | CitationPart
+        | PeerContentPart
     ] = []
     stripped_attachments: list[FileAttachment] = []
     for part in message.content:
@@ -6749,6 +6773,7 @@ def noteify_unresolvable_prompt_files(
             | FilePart
             | HostedToolCallPart
             | CitationPart
+            | PeerContentPart
         ] = []
         removed_attachments: list[FileAttachment] = []
         for part in message.content:
@@ -7153,6 +7178,29 @@ def _compaction_telemetry(
     return ContextCompactionTelemetry(event_type=event_type, payload=event_payload)
 
 
+_PEER_COMPACTION_MARKER = (
+    "[Historical peer content retained separately under current disclosure authority.]"
+)
+
+
+def _peer_free_compaction_messages(messages: list[Message]) -> list[Message]:
+    """Detach compactor input without granting disclosure of peer payloads."""
+    return [
+        message.model_copy(
+            update={
+                "content": tuple(
+                    TextPart(text=_PEER_COMPACTION_MARKER)
+                    if type(part) is PeerContentPart
+                    else part
+                    for part in message.content
+                )
+            },
+            deep=True,
+        )
+        for message in messages
+    ]
+
+
 def _messages_digest(messages: list[Message]) -> str:
     return "\n".join(_message_digest(message) for message in messages)
 
@@ -7170,7 +7218,8 @@ def _message_part_digest(
     | ThinkingPart
     | FilePart
     | HostedToolCallPart
-    | CitationPart,
+    | CitationPart
+    | PeerContentPart,
 ) -> str:
     if type(part) is TextPart:
         return part.text
@@ -7198,6 +7247,8 @@ def _message_part_digest(
         return f"[hosted_tool_call type={part.hosted_tool} status={part.status}]"
     if type(part) is CitationPart:
         return f"[citation url={part.url}]"
+    if type(part) is PeerContentPart:
+        return _PEER_COMPACTION_MARKER
     raise TypeError("Unsupported message part.")
 
 

@@ -171,16 +171,33 @@ def test_docker_build_pins_the_same_official_revision():
 
 
 @pytest.mark.parametrize("return_code", [0, 1])
-def test_nonzero_exit_or_missing_artifacts_fail_with_report(tmp_path, monkeypatch, return_code):
+def test_nonzero_exit_or_missing_artifacts_fail_with_report(
+    tmp_path, monkeypatch, return_code, capsys
+):
     output = tmp_path / "evidence"
     monkeypatch.setattr(sys, "argv", ["run", "--upstream", str(tmp_path), "--output", str(output)])
     monkeypatch.setattr(runner, "verify_build", lambda path: {})
-    monkeypatch.setattr(runner, "run_bounded", lambda *args, **kwargs: return_code)
+
+    def execute(command, directory, **kwargs):
+        if directory.name == "sdk-interoperability":
+            (directory / "runner.stdout.txt").write_text(
+                "omitted-prefix" + "x" * 70000 + "retained-failure-tail"
+            )
+            (directory / "runner.stderr.txt").write_text("sdk-stderr-evidence")
+        return return_code
+
+    monkeypatch.setattr(runner, "run_bounded", execute)
     assert runner.main() == 1
     report = json.loads((output / "summary.json").read_text())
     assert report["full_conformance"] is False
     assert report["covered_subset_passed"] is False
     assert all(record["status"] == "failed" for record in report["results"])
+    diagnostic = capsys.readouterr().out
+    assert "SDK failure:" in diagnostic
+    assert "retained-failure-tail" in diagnostic
+    assert "sdk-stderr-evidence" in diagnostic
+    assert "omitted-prefix" not in diagnostic
+    assert len(diagnostic) < 68000
 
 
 def test_output_directory_cannot_reuse_stale_evidence(tmp_path, monkeypatch):

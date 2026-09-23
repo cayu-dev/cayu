@@ -11619,7 +11619,7 @@ export type Message = {
     /**
      * Content
      */
-    content?: Array<TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart | HostedToolCallPart | CitationPart>;
+    content?: Array<TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart | HostedToolCallPart | CitationPart | PeerContentPart>;
     role: MessageRole;
 };
 
@@ -12399,6 +12399,62 @@ export type PairedQualityEvidenceOutput = {
      * Threshold
      */
     threshold: string;
+};
+
+/**
+ * PeerContentPart
+ *
+ * Attributed, non-executable content delivered by another participant.
+ */
+export type PeerContentPart = {
+    /**
+     * Append Key Json
+     */
+    append_key_json: string;
+    /**
+     * Executable
+     */
+    executable?: false;
+    /**
+     * Occurrence Id
+     */
+    occurrence_id: string;
+    /**
+     * Operation Key
+     */
+    operation_key: string;
+    /**
+     * Projection Id
+     */
+    projection_id: string;
+    /**
+     * Provenance Sha256
+     */
+    provenance_sha256: string;
+    /**
+     * Sender Participant Id
+     */
+    sender_participant_id: string;
+    /**
+     * Sender Participant Incarnation
+     */
+    sender_participant_incarnation: string;
+    /**
+     * Sender Session Id
+     */
+    sender_session_id: string;
+    /**
+     * Sender Session Instance Id
+     */
+    sender_session_instance_id: string;
+    /**
+     * Text
+     */
+    text: string;
+    /**
+     * Type
+     */
+    type?: 'peer_content';
 };
 
 /**

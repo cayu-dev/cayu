@@ -1011,6 +1011,28 @@ _MIGRATION_STEPS: dict[int, str] = {
             registered_at TEXT NOT NULL
         );
     """,
+    104: """
+        CREATE TABLE IF NOT EXISTS cayu_peer_content_attempts (
+            operation_key TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cayu_peer_content_receipts (
+            append_key_json TEXT PRIMARY KEY,
+            operation_key TEXT NOT NULL UNIQUE,
+            commitment_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
+            request_json TEXT,
+            target_deleted INTEGER NOT NULL DEFAULT 0 CHECK (target_deleted IN (0, 1))
+        );
+        CREATE TABLE IF NOT EXISTS cayu_peer_content_exposures (
+            exposure_id TEXT PRIMARY KEY,
+            operation_key TEXT NOT NULL UNIQUE,
+            append_key_json TEXT NOT NULL,
+            commitment_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_peer_content_exposures_append
+            ON cayu_peer_content_exposures(append_key_json, exposure_id);
+    """,
     99: """
         CREATE TABLE IF NOT EXISTS cayu_context_view_lifecycle_events (
             event_id TEXT PRIMARY KEY,

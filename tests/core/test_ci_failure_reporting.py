@@ -58,4 +58,19 @@ def test_ci_controller_prints_failure_before_summary_with_xdist(tmp_path):
     assert result.stdout.count("CI failure: test_sample.py::test_failure [call]") == 1
     assert result.stdout.index("CI failure:") < result.stdout.index("FAILURES")
     assert "ci-immediate-evidence" in result.stdout
+    for name in ("test_failure", "test_success"):
+        started = f"CI test started: test_sample.py::{name}"
+        finished = f"CI test finished: test_sample.py::{name}"
+        assert result.stdout.count(started) == 1
+        assert result.stdout.count(finished) == 1
+        assert result.stdout.index(started) < result.stdout.index(finished)
     assert not (tmp_path / ".ci-test-reports.jsonl").exists()
+
+
+def test_ci_progress_is_silent_outside_controller(monkeypatch, capsys):
+    monkeypatch.setattr(reporting, "_CI_FAILURE_LOGGING", False)
+    reporting.pytest_runtest_logstart("test_example.py::test_ok", ("test_example.py", 1, "test_ok"))
+    reporting.pytest_runtest_logfinish(
+        "test_example.py::test_ok", ("test_example.py", 1, "test_ok")
+    )
+    assert not capsys.readouterr().err

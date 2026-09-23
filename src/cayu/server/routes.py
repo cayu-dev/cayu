@@ -3686,6 +3686,10 @@ TraceContextMetadata = Annotated[dict[str, Any], Depends(_trace_context_metadata
 
 
 def _serialize_message_part(cayu_app: Any, part: Any) -> dict[str, Any]:
+    if part.type == "peer_content":
+        # Server authentication is not current source/export read authority.
+        # Do not even serialize the payload or private append/permit identity.
+        return {"type": "peer_content", "disclosure": "withheld"}
     excluded_fields = {
         field_name
         for field_name in ("model_step_id", "model_attempt_id", "tool_round_id")

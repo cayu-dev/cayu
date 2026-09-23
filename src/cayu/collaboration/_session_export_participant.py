@@ -136,9 +136,14 @@ class ExportParticipantAdapter:
             context=CollaborationAccessContext(principal=resolution.principal.principal),
         )
 
-    async def admit(self, session, request, authorization, source, *, reserved_bytes):
+    async def admit(
+        self, session, request, authorization, source, *, reserved_bytes, selected_source=None
+    ):
         exports = self.exports
-        commitment = source_digest(source)
+        validation_commitment = source_digest(source)
+        commitment = (
+            validation_commitment if selected_source is None else source_digest(selected_source)
+        )
         proposal = None
         for _ in range(4):
             root = await exports.root(session)
@@ -152,7 +157,12 @@ class ExportParticipantAdapter:
                 return current
             if isinstance(current, ExportPreparation):
                 exports.require_replay_identity(current.admission.authorization, authorization)
-                if current.state != "prepared" or current.admission.source_commitment != commitment:
+                if (
+                    current.state != "prepared"
+                    or current.admission.source_commitment != commitment
+                    or current.admission.validation_source_commitment
+                    != (None if selected_source is None else validation_commitment)
+                ):
                     raise SessionExportConflict()
                 proposal = current
                 break
@@ -160,7 +170,14 @@ class ExportParticipantAdapter:
                 proposal = exports.prepare(
                     ExportPreparation,
                     {
-                        "admission": await self.prepare(request, authorization, commitment),
+                        "admission": await self.prepare(
+                            request,
+                            authorization,
+                            commitment,
+                            validation_source_commitment=None
+                            if selected_source is None
+                            else validation_commitment,
+                        ),
                         "reserved_bytes": reserved_bytes,
                     },
                 )
@@ -380,6 +397,8 @@ class ExportParticipantAdapter:
         request: SessionExportRequest,
         authorization: SessionExportAuthorization,
         source_commitment: str,
+        *,
+        validation_source_commitment: str | None = None,
     ) -> ExportAdmission:
         resolution = authorization.mandate
         if resolution is None or resolution.chain.entries[-1].participant is None:
@@ -455,6 +474,7 @@ class ExportParticipantAdapter:
                 "request": request,
                 "authorization": authorization,
                 "source_commitment": source_commitment,
+                "validation_source_commitment": validation_source_commitment,
                 "permit": permit,
             },
         )

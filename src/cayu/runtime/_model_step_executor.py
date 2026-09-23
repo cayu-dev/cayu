@@ -2926,6 +2926,11 @@ class ModelStepExecutor:
         apply_limit_evaluation: LimitEvaluationEventStream,
         stop_for_budget_reservation_failure: BudgetReservationFailureEventStream,
         provider_operation_cancellation_lifecycle: ProviderOperationCancellationLifecycle,
+        peer_exposure_guard: Callable[
+            [Session, ModelRequest, ModelAttemptIdentity, str, str, InvocationContext | None],
+            contextlib.AbstractAsyncContextManager[None],
+        ]
+        | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -2943,6 +2948,7 @@ class ModelStepExecutor:
         self._apply_limit_evaluation = apply_limit_evaluation
         self._stop_for_budget_reservation_failure = stop_for_budget_reservation_failure
         self._provider_operation_cancellation_lifecycle = provider_operation_cancellation_lifecycle
+        self._peer_exposure_guard = peer_exposure_guard
         self._provider_operation_reconciliation_tasks: set[asyncio.Task[None]] = set()
         self._provider_operation_cancellation_heartbeats: dict[
             str,
@@ -6156,56 +6162,68 @@ class ModelStepExecutor:
             # mutation cannot corrupt a later attempt.
             attempt_model_request = _detach_model_request(model_request)
 
-            request_footprint, request_footprint_event = await self._observe_request_footprint(
-                model_request=attempt_model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                attempt=attempt,
-                max_attempts=retry_policy.max_attempts,
-                request_variant=request_variant,
-                model_attempt_identity=model_attempt_identity,
-                prompt_contribution_manifest=prompt_contribution_manifest,
-                structured_output=structured_output,
-                execution_profile=execution_profile,
-                tool_exposure=tool_exposure_evidence,
-                targeted_tool_grants=targeted_tool_grants,
-                tool_discovery_view=discovery_view_footprint,
-            )
-            if request_footprint_event is not None:
-                yield request_footprint_event, None
-            request_context_pressure = (
-                request_footprint.context_pressure
-                if request_footprint is not None
-                else analyze_request_context_pressure(
-                    attempt_model_request,
-                    provider=registered_provider.provider,
-                )
-            )
-
-            (
-                context_pressure_observation,
-                context_pressure_event,
-            ) = await self._observe_context_pressure(
-                model_request=attempt_model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                attempt=attempt,
-                max_attempts=retry_policy.max_attempts,
-                model_attempt_identity=model_attempt_identity,
-                estimate=request_context_pressure,
-                execution_profile=execution_profile,
-            )
-            if context_pressure_event is not None:
-                yield context_pressure_event, None
             deadline_admission: ProviderStreamDeadlineAdmission | None = None
             attempt_events = None
+            peer_exposure_stack = contextlib.AsyncExitStack()
             try:
+                if self._peer_exposure_guard is not None:
+                    await peer_exposure_stack.enter_async_context(
+                        self._peer_exposure_guard(
+                            session,
+                            attempt_model_request,
+                            model_attempt_identity,
+                            registered_provider.name,
+                            attempt_model_request.model,
+                            invocation_context,
+                        )
+                    )
+                request_footprint, request_footprint_event = await self._observe_request_footprint(
+                    model_request=attempt_model_request,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    environment_name=environment_name,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=retry_policy.max_attempts,
+                    request_variant=request_variant,
+                    model_attempt_identity=model_attempt_identity,
+                    prompt_contribution_manifest=prompt_contribution_manifest,
+                    structured_output=structured_output,
+                    execution_profile=execution_profile,
+                    tool_exposure=tool_exposure_evidence,
+                    targeted_tool_grants=targeted_tool_grants,
+                    tool_discovery_view=discovery_view_footprint,
+                )
+                if request_footprint_event is not None:
+                    yield request_footprint_event, None
+                request_context_pressure = (
+                    request_footprint.context_pressure
+                    if request_footprint is not None
+                    else analyze_request_context_pressure(
+                        attempt_model_request,
+                        provider=registered_provider.provider,
+                    )
+                )
+
+                (
+                    context_pressure_observation,
+                    context_pressure_event,
+                ) = await self._observe_context_pressure(
+                    model_request=attempt_model_request,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    environment_name=environment_name,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=retry_policy.max_attempts,
+                    model_attempt_identity=model_attempt_identity,
+                    estimate=request_context_pressure,
+                    execution_profile=execution_profile,
+                )
+                if context_pressure_event is not None:
+                    yield context_pressure_event, None
                 pre_count_completion_dispatch: ModelCompletionDispatch | None = None
                 if (
                     memory_evidence_reference is not None
@@ -6520,8 +6538,21 @@ class ModelStepExecutor:
                     if attempt_events is not None:
                         await _close_async_iterator(attempt_events)
                 finally:
-                    if deadline_admission is not None:
-                        deadline_admission.close()
+                    try:
+                        if deadline_admission is not None:
+                            deadline_admission.close()
+                    finally:
+                        primary_failure = sys.exception() or prior_retry_failure
+                        try:
+                            await peer_exposure_stack.aclose()
+                        except BaseException as cleanup_failure:
+                            if primary_failure is None or primary_failure is cleanup_failure:
+                                raise
+                            if isinstance(primary_failure, asyncio.CancelledError):
+                                raise primary_failure from cleanup_failure
+                            raise _combine_post_completion_failures(
+                                primary_failure, cleanup_failure
+                            ) from None
 
     async def _observe_request_footprint(
         self,
@@ -6695,7 +6726,15 @@ class ModelStepExecutor:
         # mismatch outside the optional-counter failure projection below.
         await refresh_live_model_semantics()
         try:
-            provider_result = await provider.count_input_tokens(count_request)
+            from cayu.providers.base import has_peer_content
+
+            # Optional verification must not create a second disclosure path.
+            # Counting has no model-attempt receiver or exposure receipt.
+            provider_result = (
+                None
+                if has_peer_content(count_request)
+                else await provider.count_input_tokens(count_request)
+            )
             provider_result = copy_input_token_count_result(provider_result)
             result = (
                 provider_result
@@ -13692,6 +13731,10 @@ class ModelStepRun:
                 await self._refresh_live_model_semantics()
             except Exception as authority_error:
                 raise _ContextCountAuthorityError(authority_error) from None
+            from cayu.providers.base import has_peer_content
+
+            if has_peer_content(request):
+                return None
             result = await self._request_provider.count_input_tokens(request)
             return None if result is None else result.input_tokens
 

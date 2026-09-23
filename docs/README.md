@@ -45,6 +45,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Process-isolated host tools](process-isolated-tools.md)
 - [Server configuration](server-configuration.md)
 - [Registered session exports](session-exports.md)
+- [Authenticated peer-content delivery](peer-content.md)
 - [Session inspection](session-inspection.md)
 - [Session-message lifecycle](session-message-lifecycle.md)
 - [Session-store targets](session-store-targets.md)

@@ -123,7 +123,7 @@ def test_binding_allowance_is_not_consumed_by_rejected_reservation(
     postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
 
     async def scenario() -> None:
-        binding = _binding(allowance=1)
+        binding = _binding(binding_id="allowance-retry", allowance=1)
         if backend == "memory":
             ledger = InMemoryBudgetLedger()
         elif backend == "sqlite":
@@ -320,7 +320,7 @@ def test_bound_public_auxiliary_settlement(backend, tmp_path, request):
                 "reservation": BudgetReservation(max_input_tokens=1000, max_output_tokens=10),
             }
         )
-        binding = _binding(limits=(limit,))
+        binding = _binding(binding_id="public-auxiliary", limits=(limit,))
         requests = []
 
         class Receiver:

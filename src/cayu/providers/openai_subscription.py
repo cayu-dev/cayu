@@ -685,6 +685,7 @@ class OpenAISubscriptionProvider(ModelProvider):
             supports_tool_history=True,
             supports_tool_definitions=True,
             supports_file_attachments=True,
+            supports_peer_content=True,
             tool_name_validator=_validate_openai_tool_name,
             tool_definition_validator=_openai_tool,
         )
@@ -788,6 +789,9 @@ class OpenAISubscriptionProvider(ModelProvider):
         completion_emitted = False
         try:
             payload = build_openai_payload(request, stream=True, reasoning_state="inline")
+            from cayu.providers.base import record_peer_serialization
+
+            await record_peer_serialization(request)
             credentials = await self.auth.credentials()
             raw_events = self.transport.stream_response_events(
                 url=_subscription_request_url(self.base_url, "responses"),
