@@ -1,5 +1,6 @@
 """Runtime-owned recipient creation responsibility and exact settlement."""
 
+import json
 from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes
@@ -22,6 +23,80 @@ from cayu.collaboration.participants import CollaborationUnavailable
 
 def _digest(value):
     return sha256(canonical_durable_json_bytes(value, "recipient creation authority")).hexdigest()
+
+
+async def prepare_request_admission(app, creation, *, context):
+    """Read native FRESH evidence without creating or admitting recipient work.
+
+    This returns a proposal, not an authorization. The receiving owner rechecks
+    native evidence and the permit owner arbitrates lifecycle at admission.
+    """
+    from dataclasses import replace
+
+    from cayu.collaboration._preparation import prepare_contract
+    from cayu.collaboration.prepared_admission import (
+        FreshRecipientAdmissionTarget,
+        PreparedRecipientAdmission,
+        prepared_budget_request,
+        prepared_budget_snapshot,
+        require_secret_free_prepared,
+    )
+    from cayu.sessions.context_views import RecipientSessionCreationRequest
+
+    if type(creation) is not RecipientSessionCreationRequest:
+        raise TypeError("Prepared admission requires typed recipient creation.")
+    creation = replace(creation)
+    receiver = app._request_coordinator.prepared_receiver_ref()
+    if creation.mode != "fresh" or creation.resource_transfers or creation.preparation_receipts:
+        raise CollaborationUnavailable("Only resource-free FRESH admission is qualified.")
+    found = await app.lookup_recipient_session(creation, context=context)
+    if found is None:
+        raise CollaborationUnavailable("Recipient creation is unavailable.")
+    session, recipient_receipt = found
+    receipt = recipient_receipt.participant_receipt
+    inspected = await app.inspect_participant(creation.recipient, context=context)
+    participant = inspected.participant
+    if participant.lifecycle != "active":
+        raise PermissionError("Only active recipients can prepare admission.")
+    target = await admit_recipient_creation(
+        app,
+        creation.participant_request,
+        creation.recipient,
+        context,
+        None,
+        receipt.initial_input_commitment,
+        receipt.binding.execution_profile_commitment,
+        recovery=True,
+    )
+    binding = await app._run_limit_controller.inspect_budget_binding(
+        request=prepared_budget_request(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            profile=receipt.execution_profile_json,
+        )
+    )
+    evidence = PreparedRecipientAdmission(
+        receiver=receiver,
+        recipient=creation.recipient,
+        lifecycle_revision=participant.lifecycle_revision,
+        configuration_revision=participant.configuration_revision,
+        admission_generation=participant.admission_generation,
+        target=FreshRecipientAdmissionTarget(
+            creation=target,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            creation_receipt_commitment=receipt.receipt_commitment,
+            initial_input_commitment=receipt.initial_input_commitment,
+            definition_commitment=json.loads(receipt.binding.historical_definition_json)[
+                "agent_definition_commitment"
+            ],
+        ),
+        execution_profile_json=receipt.execution_profile_json,
+        budget_binding_json=prepared_budget_snapshot(binding),
+    )
+    checked = prepare_contract(PreparedRecipientAdmission, evidence, redactor=app._secret_redactor)
+    require_secret_free_prepared(checked, app._secret_redactor)
+    return checked
 
 
 async def admit_recipient_creation(

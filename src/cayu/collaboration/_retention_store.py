@@ -139,6 +139,37 @@ async def prune_namespace(
             break
         mode = _stored_mode(raw)
         metadata = request_receipt_metadata(raw, redactor=redactor)
+        if (
+            mode == "permit"
+            and isinstance(raw, dict)
+            and cast("dict[object, object]", raw).get("record_type") != "permit_excluded"
+        ):
+            from cayu.collaboration.requests import RequestAdmissionReceipt
+
+            permit_item = prepare_permit_record(raw, redactor)
+            registration = permit_item.expected.intent.request
+            if registration.effect_scope == "request_prepared_admission":
+                source = registration.source_operation
+                parent_raw = await tx.get(
+                    "operations",
+                    (source.namespace_incarnation, source.generation, source.caller_key),
+                )
+                if parent_raw is not None:
+                    # A small caller-key-ordered batch may encounter the permit
+                    # before the admission. Validate/prune the parent first;
+                    # deleting evidence first would strand retained_request().
+                    parent_metadata = request_receipt_metadata(parent_raw, redactor=redactor)
+                    if (
+                        parent_metadata is None
+                        or parent_metadata.mode != "request_admission"
+                        or not isinstance(parent_metadata.receipt, RequestAdmissionReceipt)
+                        or parent_metadata.receipt.admission_permit is None
+                        or parent_metadata.receipt.admission_permit.expected != permit_item.expected
+                    ):
+                        raise CollaborationUnavailable(
+                            "Prepared admission pruning evidence conflicts."
+                        )
+                    metadata = parent_metadata
         if metadata is not None or mode in ("request", "request_control"):
             command = metadata.expected if metadata is not None else None
             if metadata is None:

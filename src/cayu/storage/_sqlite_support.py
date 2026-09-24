@@ -1012,6 +1012,7 @@ _MIGRATION_STEPS: dict[int, str] = {
             registered_at TEXT NOT NULL
         );
     """,
+    106: "",  # Contract-only writer fence; existing typed request records own storage.
     105: SQLITE_COLLABORATION_CLARIFICATION_DDL,
     104: """
         CREATE TABLE IF NOT EXISTS cayu_peer_content_attempts (

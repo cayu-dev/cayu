@@ -490,6 +490,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Clarification records retain input/service responsibilities which older
     # request and session writers cannot preserve or settle.
     Revision(revision=105, kind=RevisionKind.BREAKING, compatible_from=105),
+    # Prepared recipient admissions carry native target, profile, sponsor and
+    # lifecycle evidence that prior request writers cannot preserve or settle.
+    Revision(revision=106, kind=RevisionKind.BREAKING, compatible_from=106),
 )
 
 #: The revision an empty database is initialized to.

@@ -3,14 +3,16 @@
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from typing import ClassVar
 
-from cayu.collaboration._contracts import ContractValue, ObjectRef
+from cayu.collaboration._contracts import ContractValue, ExactLookup, ObjectRef
 from cayu.collaboration._permits import PermitCommand, ReceivingSettlementReceipt
 from cayu.collaboration.clarifications import ClarificationPolicy
 from cayu.collaboration.mandates import MandateAccessContext, MandateResolver, ResourceSelectorOwner
 from cayu.collaboration.requests import (
     Millis,
     RequestAdmissionCommand,
+    RequestAdmissionReceipt,
     RequestControlCommand,
     RequestOutcomeCommand,
     RequestProgressCommand,
@@ -19,6 +21,20 @@ from cayu.collaboration.requests import (
 RequestReceivingCommand = (
     RequestAdmissionCommand | RequestProgressCommand | RequestOutcomeCommand | RequestControlCommand
 )
+
+
+class RequestAdmissionReader(ABC):
+    """Registered exact historical readback, not a recipient launch capability.
+
+    Implementations must authenticate the current read context on each lookup
+    and compare the complete expected command, including effective input and
+    native target. Receipts must come from the durable receiving owner.
+    """
+
+    @abstractmethod
+    async def lookup(
+        self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
+    ) -> ExactLookup[RequestAdmissionReceipt]: ...
 
 
 class RequestReceivingAuthorization(ContractValue):
@@ -39,6 +55,9 @@ class RequestReceivingOwner(ABC):
     yielded authorization until publication settles. It runs outside the store
     transaction and must never launch work. Missing adapters must refuse.
     """
+
+    # Explicit qualification, not inherited from the existing export contract.
+    prepared_admission_version: ClassVar[int] = 0
 
     @property
     @abstractmethod
@@ -61,9 +80,21 @@ class RequestReceivingOwner(ABC):
 
 
 @dataclass(frozen=True)
+class PreparedAdmissionRegistration:
+    """Opt in to the application-wired native FRESH receiving owner.
+
+    Native sessions and the frozen runtime budget receiver are wired by CayuApp;
+    an admission command cannot install callbacks or choose another store.
+    """
+
+    receiver: ObjectRef
+
+
+@dataclass(frozen=True)
 class RequestRegistration:
     mandates: MandateResolver
     max_ttl_ms: int
     resource_owners: tuple[ResourceSelectorOwner, ...] = ()
     receiving_owner: RequestReceivingOwner | None = None
     clarification_policies: tuple[ClarificationPolicy, ...] = ()
+    prepared_admission: PreparedAdmissionRegistration | None = None

@@ -214,12 +214,22 @@ from cayu.collaboration.peer_content import PeerModelAttemptOrigin as PeerModelA
 from cayu.collaboration.peer_content import (
     RegisteredPeerContentExposureReceiver as RegisteredPeerContentExposureReceiver,
 )
+from cayu.collaboration.prepared_admission import (
+    FreshRecipientAdmissionTarget as FreshRecipientAdmissionTarget,
+)
+from cayu.collaboration.prepared_admission import (
+    PreparedRecipientAdmission as PreparedRecipientAdmission,
+)
 from cayu.collaboration.releases import ContentExposure as ContentExposure
 from cayu.collaboration.releases import ContentReleaseExpectation as ContentReleaseExpectation
 from cayu.collaboration.releases import ContentReleaseReader as ContentReleaseReader
 from cayu.collaboration.releases import ContentReleaseReceipt as ContentReleaseReceipt
 from cayu.collaboration.releases import ContentReleaseRequest as ContentReleaseRequest
 from cayu.collaboration.releases import ReleasedContent as ReleasedContent
+from cayu.collaboration.request_access import (
+    PreparedAdmissionRegistration as PreparedAdmissionRegistration,
+)
+from cayu.collaboration.request_access import RequestAdmissionReader as RequestAdmissionReader
 from cayu.collaboration.request_access import (
     RequestReceivingAuthorization as RequestReceivingAuthorization,
 )

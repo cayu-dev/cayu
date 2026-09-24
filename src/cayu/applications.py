@@ -199,7 +199,8 @@ from cayu.collaboration.peer_content import (
     PeerContentUnavailable,
     PeerModelAttemptOrigin,
 )
-from cayu.collaboration.request_access import RequestRegistration
+from cayu.collaboration.prepared_admission import PreparedRecipientAdmission
+from cayu.collaboration.request_access import RequestAdmissionReader, RequestRegistration
 from cayu.collaboration.requests import (
     CollaborationRequest,
     RequestAdmissionCommand,
@@ -1679,6 +1680,12 @@ class CayuApp:
             participants=self._participant_coordinator,
             registration=collaboration_requests,
             redactor=self._secret_redactor,
+            prepared_sessions=self.session_store,
+            resolve_prepared_budget=(
+                self._run_limit_controller.inspect_budget_binding
+                if self.enable_common_root_budget_binding
+                else None
+            ),
         )
         self._wait_coordinator = WaitCoordinator(
             participants=self._participant_coordinator,
@@ -1922,6 +1929,29 @@ class CayuApp:
         self, command: RequestProgressCommand, *, context: MandateAccessContext
     ) -> RequestProgressReceipt:
         return await self._request_coordinator.progress(command, context=context)
+
+    async def prepare_recipient_admission(
+        self,
+        creation: RecipientSessionCreationRequest,
+        *,
+        context: CollaborationAccessContext,
+    ) -> PreparedRecipientAdmission:
+        """Read an inert FRESH child's proposal; admission separately authenticates it."""
+        from cayu.sessions._recipient_admission import prepare_request_admission
+
+        return await prepare_request_admission(self, creation, context=context)
+
+    def collaboration_admission_reader(self) -> RequestAdmissionReader:
+        """Return this application's authenticated exact historical admission reader."""
+        from cayu.collaboration._admission_reader import RegisteredRequestAdmissionReader
+
+        return RegisteredRequestAdmissionReader(self._request_coordinator)
+
+    async def lookup_collaboration_admission(
+        self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
+    ) -> ExactLookup[RequestAdmissionReceipt]:
+        """Read exact historical admission evidence without renewing execution authority."""
+        return await self._request_coordinator.lookup_admission(expected, context=context)
 
     async def publish_collaboration_outcome(
         self, command: RequestOutcomeCommand, *, context: MandateAccessContext

@@ -173,6 +173,11 @@ async def admit_in_transaction(
     settlement: ReceivingSettlementReceipt | None = None,
     redactor: SecretRedactor,
 ) -> RequestAdmissionReceipt:
+    from cayu.collaboration._prepared_admission_store import (
+        register_prepared_admission,
+        require_prepared_admission_evidence,
+    )
+
     command = prepare_contract(RequestAdmissionCommand, command, redactor=redactor)
     anchor = await store._anchor(tx, initialized, redactor)
     prior = await _expected_prior(store, tx, initialized, command, redactor)
@@ -181,6 +186,7 @@ async def admit_in_transaction(
         receipt = prepare_contract(RequestAdmissionReceipt, raw, redactor=redactor)
         require_exact_contract(command, receipt.command, redactor=redactor)
         await require_request_event(tx, receipt.event, redactor)
+        await require_prepared_admission_evidence(tx, receipt, redactor=redactor)
         return receipt
     if prior.state != "open":
         raise CollaborationUnavailable("Request is not available for admission.")
@@ -200,12 +206,18 @@ async def admit_in_transaction(
     now = await tx.now_ms()
     if now >= prior.receipt.expected.intent.selection.expires_at_ms:
         raise CollaborationConflict("Request expired before admission.")
+    admission_permit = None
+    if command.prepared is not None:
+        admission_permit = await register_prepared_admission(
+            store, tx, initialized, command, redactor=redactor
+        )
+        anchor = await store._anchor(tx, initialized, redactor)
     state = cast(
         "AdmissionState",
         {
             "continue": "admitted" if command.evidence else "preparing",
             "fork": "admitted" if command.evidence else "preparing",
-            "fresh": "admitted" if command.evidence else "preparing",
+            "fresh": "admitted" if command.evidence or command.prepared else "preparing",
             "defer": "deferred",
             "clarify": "clarifying",
             "decline": "closed",
@@ -227,6 +239,7 @@ async def admit_in_transaction(
             revision=prior.revision + 1,
             decided_at_ms=now,
             event=event,
+            admission_permit=admission_permit,
         ),
         redactor=redactor,
     )
@@ -440,6 +453,16 @@ async def outcome_in_transaction(
         "admitted",
     }:
         raise CollaborationConflict("Failure or decline requires an active admission.")
+    if prior.admission_operation is not None:
+        retained_admission = prepare_contract(
+            RequestAdmissionReceipt,
+            await tx.get("operations", _operation_key(prior.admission_operation)),
+            redactor=redactor,
+        )
+        if retained_admission.command.prepared is not None:
+            raise CollaborationConflict(
+                "Prepared recipient outcomes require a qualified attached output owner."
+            )
     if command.outcome == "answered":
         if prior.admission_operation is None:
             raise CollaborationConflict("Answer lacks its admitted export identity.")

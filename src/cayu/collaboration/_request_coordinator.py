@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from functools import partial
-from typing import Annotated, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Annotated, NamedTuple, TypeVar
 
 from pydantic import Field, StrictInt
 
@@ -79,6 +80,7 @@ from cayu.collaboration.participants import (
     ParticipantRef,
 )
 from cayu.collaboration.request_access import (
+    PreparedAdmissionRegistration,
     RequestReceivingAuthorization,
     RequestReceivingOwner,
     RequestRegistration,
@@ -106,6 +108,10 @@ from cayu.collaboration.requests import (
     RequestSnapshot,
 )
 from cayu.vaults.redaction import SecretRedactor
+
+if TYPE_CHECKING:
+    from cayu.budgets.binding import BudgetBinding
+    from cayu.sessions.base import SessionStore
 
 T = TypeVar("T")
 
@@ -159,7 +165,13 @@ def _safe_request_failure(error: BaseException, redactor: SecretRedactor) -> Bas
 
 
 class _Submission(ContractValue):
-    request: CollaborationRequest | RequestCommand | RequestControl | RequestControlCommand
+    request: (
+        CollaborationRequest
+        | RequestCommand
+        | RequestControl
+        | RequestControlCommand
+        | RequestAdmissionCommand
+    )
     context: MandateAccessContext
     observation: RequestObservation | None = None
     allow_retention: bool = False
@@ -215,6 +227,8 @@ class RequestCoordinator:
         participants: ParticipantCoordinator,
         registration: RequestRegistration | None,
         redactor: SecretRedactor,
+        prepared_sessions: SessionStore | None = None,
+        resolve_prepared_budget: Callable[..., Awaitable[BudgetBinding]] | None = None,
     ):
         self._participants = participants
         self._registration = registration
@@ -243,6 +257,37 @@ class RequestCoordinator:
             self._resolver_ref = prepare_contract(
                 ObjectRef, registration.mandates.ref, redactor=redactor
             )
+            if registration.prepared_admission is not None:
+                from cayu.collaboration._recipient_admission_receiver import (
+                    RecipientAdmissionReceivingOwner,
+                )
+
+                if (
+                    type(registration.prepared_admission) is not PreparedAdmissionRegistration
+                    or prepared_sessions is None
+                ):
+                    raise CollaborationContractError(
+                        "Prepared admission dependencies are unavailable."
+                    )
+                registration = replace(
+                    registration,
+                    prepared_admission=PreparedAdmissionRegistration(
+                        receiver=prepare_contract(
+                            ObjectRef, registration.prepared_admission.receiver, redactor=redactor
+                        )
+                    ),
+                    receiving_owner=RecipientAdmissionReceivingOwner(
+                        ref=registration.prepared_admission.receiver,
+                        sessions=prepared_sessions,
+                        mandates=registration.mandates,
+                        resolve_budget=resolve_prepared_budget,
+                        now_ms=self._prepared_owner_time,
+                        read_admission=self._prepared_read_admission,
+                        delegate=registration.receiving_owner,
+                        redactor=redactor,
+                    ),
+                )
+                self._registration = registration
             for candidate in registration.clarification_policies:
                 policy = prepare_contract(ClarificationPolicy, candidate, redactor=redactor)
                 if (
@@ -268,6 +313,34 @@ class RequestCoordinator:
                 ):
                     raise CollaborationContractError("Invalid request resource owner registration.")
                 self._resource_owners[owner.owner] = owner
+
+    async def _prepared_owner_time(self) -> int:
+        store, initialized = self._participants._ready()
+        async with store._transaction(initialized.binding.application_scope, write=False) as tx:
+            return await tx.now_ms()
+
+    async def _prepared_read_admission(
+        self, expected: RequestCommand
+    ) -> tuple[RequestSnapshot, RequestAdmissionReceipt]:
+        """Private receiving read under the already-held request control authorization."""
+        store, initialized = self._participants._ready()
+        async with store._transaction(initialized.binding.application_scope, write=False) as tx:
+            prior = await retained_request(
+                store, tx, initialized, expected.intent.request, expected.initiator, self._redactor
+            )
+            if prior is None or prior.admission_operation is None:
+                raise CollaborationUnavailable("Retained admission is unavailable.")
+            require_exact_contract(expected, prior.receipt.expected, redactor=self._redactor)
+            operation = prior.admission_operation
+            receipt = prepare_contract(
+                RequestAdmissionReceipt,
+                await tx.get(
+                    "operations",
+                    (operation.namespace_incarnation, operation.generation, operation.caller_key),
+                ),
+                redactor=self._redactor,
+            )
+            return prior, receipt
 
     def _require_clarification_policy(self, candidate: ClarificationPolicy) -> ClarificationPolicy:
         """Use a frozen explicit registration, never a caller-selected allowance.
@@ -362,6 +435,16 @@ class RequestCoordinator:
                 failure_snapshot=lambda error: _safe_request_failure(error, self._redactor),
             )
         )
+
+    def prepared_receiver_ref(self) -> ObjectRef:
+        registration = self._registration
+        if (
+            registration is None
+            or registration.prepared_admission is None
+            or self._receiving_ref is None
+        ):
+            raise CollaborationUnavailable("Prepared recipient admission is not registered.")
+        return prepare_contract(ObjectRef, self._receiving_ref, redactor=self._redactor)
 
     async def _due(self, query: _DueQuery) -> RequestDuePage:
         store, initialized = self._participants._ready()
@@ -577,6 +660,19 @@ class RequestCoordinator:
             command, context=context, operation=admit_in_transaction
         )
 
+    async def lookup_admission(
+        self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
+    ) -> ExactLookup[RequestAdmissionReceipt]:
+        value = prepare_contract(
+            _Submission, {"request": expected, "context": context}, redactor=self._redactor
+        )
+        if not isinstance(value.request, RequestAdmissionCommand):
+            raise CollaborationContractError("Admission readback requires an exact command.")
+        try:
+            return await self._run(value, mode="lookup_admission")
+        except (CollaborationUnavailable, CollaborationContractError):
+            return ExactUnavailable()
+
     async def progress(
         self, command: RequestProgressCommand, *, context: MandateAccessContext
     ) -> RequestProgressReceipt:
@@ -710,8 +806,6 @@ class RequestCoordinator:
         registration = self._registration
         assert registration is not None
         receiver = registration.receiving_owner
-        if receiver is None or self._receiving_ref is None:
-            raise CollaborationUnavailable("No qualified receiving owner is registered.")
         command, context = value.command, value.context
         initiating = (
             command.publisher if isinstance(command, RequestProgressCommand) else command.initiator
@@ -728,11 +822,6 @@ class RequestCoordinator:
         self._participants._require_refs(
             grant, (selected.sender.reference, selected.recipient.reference)
         )
-        require_exact_contract(
-            self._receiving_ref,
-            prepare_contract(ObjectRef, receiver.ref, redactor=self._redactor),
-            redactor=self._redactor,
-        )
         # A committed operation is replayed from the collaboration store before
         # consulting the producer.  Producer authority may have expired or
         # been retired after the durable receipt was published; replay must not
@@ -745,6 +834,26 @@ class RequestCoordinator:
         async with store._transaction(initialized.binding.application_scope, write=False) as tx:
             if await tx.get("operations", key) is not None:
                 return await operation(store, tx, initialized, command, redactor=self._redactor)
+        # Only new work needs the currently registered receiver. A deployment
+        # change cannot reinterpret or prevent replay of exact committed evidence.
+        if receiver is None or self._receiving_ref is None:
+            raise CollaborationUnavailable("No qualified receiving owner is registered.")
+        require_exact_contract(
+            self._receiving_ref,
+            prepare_contract(ObjectRef, receiver.ref, redactor=self._redactor),
+            redactor=self._redactor,
+        )
+        if isinstance(command, RequestAdmissionCommand) and command.prepared is not None:
+            if (
+                type(receiver.prepared_admission_version) is not int
+                or receiver.prepared_admission_version != 1
+            ):
+                raise CollaborationUnavailable(
+                    "Receiving owner does not qualify prepared admission."
+                )
+            require_exact_contract(
+                command.prepared.receiver, self._receiving_ref, redactor=self._redactor
+            )
         async with receiver.acquire(command, context=context) as raw:
             authority = prepare_contract(
                 RequestReceivingAuthorization, raw, redactor=self._redactor
@@ -850,15 +959,14 @@ class RequestCoordinator:
         elif mode == "request_control":
             control = prepare_contract(RequestControlReceipt, raw, redactor=self._redactor)
             selected = control.expected.intent.expected.intent.selection
-        elif mode == "clarification_open":
-            clarification = prepare_contract(ClarificationOpenReceipt, raw, redactor=self._redactor)
-            selected = clarification.command.expected.intent.selection
-        elif mode == "clarification_close":
-            closure = prepare_contract(ClarificationCloseReceipt, raw, redactor=self._redactor)
-            selected = closure.command.expected.intent.selection
         else:
-            # Another operation family is not evidence of request read access.
-            raise CollaborationAccessDenied("Operation is outside request read authority.")
+            from cayu.collaboration._request_receipts import request_receipt_metadata
+
+            metadata = request_receipt_metadata(raw, redactor=self._redactor)
+            if metadata is None:
+                # Another operation family is not evidence of request read access.
+                raise CollaborationAccessDenied("Operation is outside request read authority.")
+            selected = metadata.expected.intent.selection
         self._participants._require_refs(
             grant, (selected.sender.reference, selected.recipient.reference)
         )
@@ -882,7 +990,7 @@ class RequestCoordinator:
             else raw_request.intent.expected
             if isinstance(raw_request, RequestControlCommand)
             else raw_request.expected
-            if isinstance(raw_request, RequestControl)
+            if isinstance(raw_request, (RequestControl, RequestAdmissionCommand))
             else None
         )
         if isinstance(raw_request, CollaborationRequest):
@@ -961,6 +1069,30 @@ class RequestCoordinator:
             await validate(("readback",))
             if mode == "authorize_retained":
                 return None
+            if mode == "lookup_admission":
+                from cayu.collaboration._prepared_admission_store import (
+                    lookup_admission_in_transaction,
+                )
+
+                assert isinstance(raw_request, RequestAdmissionCommand)
+                async with store._transaction(
+                    initialized.binding.application_scope, write=False
+                ) as tx:
+                    await self._require_retained_read_grant(tx, raw_request.operation, read_grant)
+                    await self._require_retained_read_grant(
+                        tx, raw_request.expected.operation, read_grant
+                    )
+                    try:
+                        result = await lookup_admission_in_transaction(
+                            store, tx, initialized, raw_request, redactor=self._redactor
+                        )
+                    except CollaborationConflict:
+                        result = ExactConflict()
+                    except (CollaborationUnavailable, CollaborationContractError):
+                        result = ExactUnavailable()
+                    if await tx.now_ms() >= permission_deadline:
+                        raise CollaborationAccessDenied("Admission read authority expired.")
+                return result
             if mode in {"lookup_clarification", "inspect_clarification"}:
                 from cayu.collaboration._clarification_store import (
                     lookup_clarification_in_transaction,

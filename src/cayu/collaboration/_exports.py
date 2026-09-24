@@ -1,6 +1,19 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "PreparedRecipientAdmission": (
+        "cayu.collaboration.prepared_admission",
+        "PreparedRecipientAdmission",
+    ),
+    "FreshRecipientAdmissionTarget": (
+        "cayu.collaboration.prepared_admission",
+        "FreshRecipientAdmissionTarget",
+    ),
+    "PreparedAdmissionRegistration": (
+        "cayu.collaboration.request_access",
+        "PreparedAdmissionRegistration",
+    ),
+    "RequestAdmissionReader": ("cayu.collaboration.request_access", "RequestAdmissionReader"),
     "ClarificationQuestionRecovery": (
         "cayu.collaboration._clarification_recovery_types",
         "ClarificationQuestionRecovery",

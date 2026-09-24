@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import Annotated, Literal
 
 from pydantic import Field, StrictInt, StrictStr, model_validator
@@ -20,7 +21,7 @@ from cayu.collaboration._contracts import (
     OwnerRef,
     snapshot_input,
 )
-from cayu.collaboration._permits import PermitCommand
+from cayu.collaboration._permits import PermitCommand, PermitReceipt
 from cayu.collaboration.exports import SessionExportReceipt, SessionExportRef
 from cayu.collaboration.mandates import MandateResolution
 from cayu.collaboration.participants import (
@@ -29,6 +30,10 @@ from cayu.collaboration.participants import (
     ParticipantRef,
     ParticipantSnapshot,
     VersionOne,
+)
+from cayu.collaboration.prepared_admission import (
+    MAX_PREPARED_ADMISSION_BYTES,
+    PreparedRecipientAdmission,
 )
 
 Millis = Annotated[StrictInt, Field(ge=1, le=2**53 - 1)]
@@ -288,10 +293,11 @@ class RequestAdmissionCommand(ContractValue):
     source_receipt: SessionExportReceipt | None = None
     evidence: tuple[ObjectRef, ...] = Field(max_length=32)
     initiator: InitiatorBinding
+    prepared: PreparedRecipientAdmission | None = None
 
     @model_validator(mode="after")
     def exact_admission(self) -> RequestAdmissionCommand:
-        source_required = self.decision in {"continue", "fork", "fresh"}
+        source_required = self.prepared is None and self.decision in {"continue", "fork", "fresh"}
         if (
             self.operation.application_scope != self.expected.operation.application_scope
             or self.operation.namespace_incarnation != self.expected.operation.namespace_incarnation
@@ -314,6 +320,22 @@ class RequestAdmissionCommand(ContractValue):
             )
         ):
             raise ValueError("Admission operation conflicts with its request.")
+        if self.prepared is not None:
+            if (
+                self.decision != "fresh"
+                or self.source_export is not None
+                or self.source_receipt is not None
+                or self.evidence
+                or self.prepared.recipient != self.expected.intent.selection.recipient.reference
+            ):
+                raise ValueError("Prepared admission conflicts with its request.")
+            canonical_bounded_durable_json_bytes(
+                snapshot_input(self),
+                "prepared admission",
+                max_bytes=MAX_PREPARED_ADMISSION_BYTES,
+                max_nodes=MAX_NODES,
+                max_nesting=MAX_DEPTH,
+            )
         return self
 
 
@@ -347,6 +369,7 @@ class RequestAdmissionReceipt(ContractValue):
     revision: Generation
     decided_at_ms: Millis
     event: RequestEvent
+    admission_permit: PermitReceipt | None = None
 
     @model_validator(mode="after")
     def exact_receipt(self) -> RequestAdmissionReceipt:
@@ -354,7 +377,7 @@ class RequestAdmissionReceipt(ContractValue):
         expected_state = {
             "continue": "admitted" if self.command.evidence else "preparing",
             "fork": "admitted" if self.command.evidence else "preparing",
-            "fresh": "admitted" if self.command.evidence else "preparing",
+            "fresh": "admitted" if self.command.evidence or self.command.prepared else "preparing",
             "defer": "deferred",
             "clarify": "clarifying",
             "decline": "closed",
@@ -370,6 +393,61 @@ class RequestAdmissionReceipt(ContractValue):
             or self.decided_at_ms < selected.accepted_at_ms
         ):
             raise ValueError("Admission receipt conflicts with its decision.")
+        if (self.command.prepared is None) != (self.admission_permit is None):
+            raise ValueError("Prepared admission requires exact lifecycle evidence.")
+        if self.admission_permit is not None:
+            prepared = self.command.prepared
+            assert prepared is not None
+            permit = self.admission_permit.expected.intent.request
+            permit_command = self.admission_permit.expected
+            identity = (
+                "prepared-admission:"
+                + sha256(
+                    canonical_bounded_durable_json_bytes(
+                        snapshot_input(self.command.operation),
+                        "prepared admission operation",
+                        max_bytes=MAX_PREPARED_ADMISSION_BYTES,
+                        max_nodes=MAX_NODES,
+                        max_nesting=MAX_DEPTH,
+                    )
+                ).hexdigest()
+            )
+            commitment = sha256(
+                canonical_bounded_durable_json_bytes(
+                    snapshot_input(self.command),
+                    "prepared admission",
+                    max_bytes=MAX_PREPARED_ADMISSION_BYTES,
+                    max_nodes=MAX_NODES,
+                    max_nesting=MAX_DEPTH,
+                )
+            ).hexdigest()
+            if (
+                permit.participant != prepared.recipient
+                or permit.operation
+                != self.command.operation.model_copy(update={"caller_key": identity + ":permit"})
+                or permit.settlement_operation
+                != self.command.operation.model_copy(update={"caller_key": identity + ":settled"})
+                or permit_command.initiator != self.command.initiator
+                or permit_command.source != selected.reference.owner
+                or permit_command.destination != selected.reference.owner
+                or permit_command.intent.limits != self.command.expected.intent.limits
+                or permit.expected_lifecycle_revision != prepared.lifecycle_revision
+                or permit.expected_configuration_revision != prepared.configuration_revision
+                or permit.admission_generation != prepared.admission_generation
+                or permit.source_operation != self.command.operation
+                or permit.admission_commitment != commitment
+                or permit.effect_scope != "request_prepared_admission"
+                or permit.target_state != "existing"
+                or permit.required_settlement != "quiescence"
+                or permit.target
+                != ObjectRef(
+                    owner=selected.reference.owner,
+                    kind="collaboration_request",
+                    object_id=selected.reference.request_id,
+                    incarnation=selected.reference.incarnation,
+                )
+            ):
+                raise ValueError("Prepared admission lifecycle evidence conflicts.")
         return self
 
 

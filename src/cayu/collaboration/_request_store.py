@@ -168,6 +168,9 @@ async def retained_request(
         ):
             raise CollaborationUnavailable("Request admission contradicts its receipt.")
         await require_request_event(tx, admission.event, redactor)
+        from cayu.collaboration._prepared_admission_store import require_prepared_admission_evidence
+
+        await require_prepared_admission_evidence(tx, admission, redactor=redactor)
     elif snapshot.admission_generation:
         raise CollaborationUnavailable("Request lacks its admission receipt identity.")
     for progress in snapshot.progress:

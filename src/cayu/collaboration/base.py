@@ -105,7 +105,7 @@ Table = Literal[
 Key = tuple[str | int, ...]
 IDENTITY_FAMILY = FamilyVersion(family="participant.identity", version=1)
 LIFECYCLE_FAMILY = FamilyVersion(family="collaboration.lifecycle", version=1)
-REQUEST_FAMILY = FamilyVersion(family="collaboration.request.acceptance", version=1)
+REQUEST_FAMILY = FamilyVersion(family="collaboration.request.acceptance", version=2)
 # Reserve the maximum bounded anchor envelope once. Its counters can grow
 # without changing the admission decision that those same counters describe.
 _ANCHOR_BYTES = 64 * 1024
@@ -269,7 +269,7 @@ class CollaborationStore(ABC):
 
     def capabilities(self, owner: OwnerRef) -> CapabilityDescriptor:
         families = (IDENTITY_FAMILY, LIFECYCLE_FAMILY)
-        if type(self.request_contract_version) is int and self.request_contract_version == 1:
+        if type(self.request_contract_version) is int and self.request_contract_version == 2:
             families += (REQUEST_FAMILY,)
         return CapabilityDescriptor(
             owner=owner,

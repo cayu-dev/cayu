@@ -13,9 +13,9 @@ from cayu.storage.postgres import _PostgresStoreBase
 
 
 class PostgresCollaborationStore(_PostgresStoreBase, CollaborationStore):
-    request_contract_version = 1
+    request_contract_version = 2
 
-    _min_required_revision = 105
+    _min_required_revision = 106
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

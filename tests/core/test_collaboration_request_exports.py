@@ -31,7 +31,7 @@ from cayu.collaboration.exports import (
 )
 from cayu.collaboration.mandates import ResourceSelector
 from cayu.collaboration.participants import CollaborationUnavailable
-from cayu.collaboration.request_access import RequestRegistration
+from cayu.collaboration.request_access import PreparedAdmissionRegistration, RequestRegistration
 from cayu.collaboration.requests import (
     RequestAdmissionCommand,
     RequestControl,
@@ -163,7 +163,7 @@ class _Integration:
         self.context = None
 
 
-async def _integration(store, tmp_path, postgres_dsn, *, lose_ack=False):
+async def _integration(store, tmp_path, postgres_dsn, *, lose_ack=False, prepared_receiver=False):
     base, resolver, values = await public_setup(store)
     export_resolver = type(resolver)(values[4])
     collaboration_registration = base._participant_coordinator._registration
@@ -234,6 +234,17 @@ async def _integration(store, tmp_path, postgres_dsn, *, lose_ack=False):
             mandates=resolver,
             max_ttl_ms=300_000,
             receiving_owner=receiving_owner,
+            prepared_admission=PreparedAdmissionRegistration(
+                receiver=ObjectRef(
+                    owner=owner,
+                    kind="request_receiver",
+                    object_id="prepared-with-export",
+                    incarnation=owner.incarnation,
+                    revision=1,
+                )
+            )
+            if prepared_receiver
+            else None,
         ),
         session_exports=registration,
         enable_logging=False,

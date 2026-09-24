@@ -428,6 +428,59 @@ the exact source export receipt. This is required for continue, fork, fresh,
 answer, cancellation, and failure paths; a source reference without its
 authenticated receipt is not enough to authorize or settle the request.
 
+### Prepared FRESH recipient admission
+
+`RequestRegistration.prepared_admission=PreparedAdmissionRegistration(receiver=...)`
+opts into the production native recipient receiver. Its `ObjectRef` must carry
+an explicit revision. Register the ordinary mandate resolver and enable a trusted
+common-root budget binding receiver as well. No permissive receiver is installed
+by default. An optional existing `receiving_owner` continues to handle export-backed
+operations; it does not authenticate the prepared branch.
+
+After `create_recipient_session` creates an inert resource-free FRESH child, call
+`prepare_recipient_admission(creation, context=...)`. This read-only entrance
+reconstructs the exact native creation target and retains the full resolved
+profile and sponsor binding. The returned proposal is data, not authority.
+Submit it as `RequestAdmissionCommand.prepared` with `decision="fresh"`, empty
+`evidence`, no source export, and the exact request revision, effective-input
+revision/commitment and next admission generation. The receiving owner checks
+the native creation decision, incarnation, immutable receipt and current mandate
+and budget receiver before admission. FORK, resources and live CONTINUE planning
+are not qualified by this branch.
+
+The existing participant permit protocol orders admission against disablement:
+registration and local settlement of the admission-only permit commit in the
+same CollaborationStore transaction as the request receipt. Disablement first
+rejects new admission; an already committed admission remains exactly replayable.
+This is not a cross-store transaction, a recipient execution permit or a guarantee
+that the child will remain available for a later execution owner.
+
+`lookup_collaboration_admission(expected, context=...)` and the application's
+`collaboration_admission_reader().lookup(expected, context=...)` authenticate
+current read access and compare the complete expected command. Historical
+readback does not re-resolve a budget binding or launch work. Same-key changed
+input, target, profile, sponsor or contract evidence is not an exact replay.
+Keep the same command/key after cancellation, timeout or lost acknowledgement
+and reconcile before attempting another admission.
+Committed admission retry authenticates current read access before comparing
+durable evidence, even if its receiver registration changed or was removed.
+New admission still requires the exact currently qualified receiver.
+
+An inert prepared admission can be cancelled or expired through the existing
+request control entrance, including after participant disablement. That settles
+the request's unstarted obligation, not child deletion or unrelated execution.
+Prepared producer progress and outcomes require a later qualified output-owner
+attachment and are refused here. Receipt and proposal data never grant launch
+authority. This shared-contract slice does not implement the complete admission
+planner.
+
+Prepared profile and budget snapshots have canonical JSON ceilings of 16 KiB
+and 8 KiB respectively; the complete prepared command is limited to 48 KiB,
+within the existing 64 KiB contract envelope. Request capability version 2 and
+schema revision 106 fence writers that cannot preserve this evidence. The existing
+typed request, event and permit records remain the durable owners; there is no
+second admission database.
+
 ## State, receipts, and recovery
 
 The request lifecycle retains `open`, `answered`, `failed`, `declined`,

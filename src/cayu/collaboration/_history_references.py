@@ -82,4 +82,12 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
                 request.expected_lifecycle_revision,
             )
         )
+    if isinstance(value, RequestAdmissionReceipt) and value.command.prepared is not None:
+        prepared = value.command.prepared
+        refs.add(
+            ("configurations", prepared.recipient.participant_id, prepared.configuration_revision)
+        )
+        refs.add(
+            ("lifecycle_history", prepared.recipient.participant_id, prepared.lifecycle_revision)
+        )
     return tuple(sorted(refs))

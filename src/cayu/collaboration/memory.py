@@ -263,7 +263,7 @@ class _MemoryRepository:
 
 
 class InMemoryCollaborationStore(CollaborationStore):
-    request_contract_version = 1
+    request_contract_version = 2
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()

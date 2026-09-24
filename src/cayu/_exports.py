@@ -133,6 +133,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RequestAlias": ("cayu.collaboration.requests", "RequestAlias"),
     "RequestCommand": ("cayu.collaboration.requests", "RequestCommand"),
     "RequestAdmissionCommand": ("cayu.collaboration.requests", "RequestAdmissionCommand"),
+    "PreparedRecipientAdmission": (
+        "cayu.collaboration.prepared_admission",
+        "PreparedRecipientAdmission",
+    ),
+    "FreshRecipientAdmissionTarget": (
+        "cayu.collaboration.prepared_admission",
+        "FreshRecipientAdmissionTarget",
+    ),
+    "PreparedAdmissionRegistration": (
+        "cayu.collaboration.request_access",
+        "PreparedAdmissionRegistration",
+    ),
+    "RequestAdmissionReader": ("cayu.collaboration.request_access", "RequestAdmissionReader"),
     "RequestAdmissionReceipt": ("cayu.collaboration.requests", "RequestAdmissionReceipt"),
     "RequestReceivingAuthorization": (
         "cayu.collaboration.request_access",
@@ -6172,6 +6185,10 @@ PUBLIC_NAMES = [
     "RequestAlias",
     "RequestCommand",
     "RequestAdmissionCommand",
+    "PreparedRecipientAdmission",
+    "FreshRecipientAdmissionTarget",
+    "PreparedAdmissionRegistration",
+    "RequestAdmissionReader",
     "RequestAdmissionReceipt",
     "RequestReceivingAuthorization",
     "RequestReceivingOwner",
