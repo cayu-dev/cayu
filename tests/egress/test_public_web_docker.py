@@ -31,8 +31,10 @@ pytestmark = [
 ]
 
 
-def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch):
+@pytest.mark.parametrize("large_page", [False, True])
+def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch, large_page):
     observed = []
+    audited = []
 
     class Fixture(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -44,10 +46,14 @@ def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch):
                 self.end_headers()
                 return
             body = (
-                b"document.getElementById('result').textContent='Discovered resource loaded'"
+                b"const xhr = new XMLHttpRequest();"
+                b"xhr.open('POST', '/sentry', false); xhr.send('telemetry');"
+                b"if (xhr.status === 403) document.getElementById('result').textContent='Discovered resource loaded';"
                 if self.path == "/script.js"
                 else b"<html><p id='result'>Loading</p><script src='https://static.research.test/script.js'></script></html>"
             )
+            if large_page and self.path != "/script.js":
+                body += b"<p>Pricing table row: input 1 output 5 per million tokens</p>" * 1_000
             self.send_response(200)
             self.send_header(
                 "Content-Type",
@@ -84,6 +90,11 @@ def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch):
 
         monkeypatch.setattr(HttpxUpstream, "_target", synthetic_target)
         repo = Path(__file__).resolve().parents[2]
+
+        async def audit(event):
+            audited.append(event)
+            return event
+
         factory = VirtualEgressEnvironmentFactory(
             policies={"research": PublicWebEgressPolicy(name="research")},
             public_web_policy="research",
@@ -93,7 +104,9 @@ def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch):
             ),
             image=PINNED_BROWSER_SESSION_WORKLOAD.image,
             upstream=HttpxUpstream(destination_resolver=resolver),
+            event_emitter=audit,
         )
+
         allocation = None
         try:
             allocation = await factory.create(
@@ -123,6 +136,18 @@ def test_public_web_discovery_and_private_redirect(tmp_path, monkeypatch):
             )
             assert not opened.is_error, opened
             assert "Discovered resource loaded" in opened.content
+            if large_page:
+                assert "[Bounded rendered text;" in opened.content
+                assert opened.structured["refs"] == []
+                assert "Pricing table row: input 1 output 5" in opened.content
+            await asyncio.sleep(0)
+            assert any(
+                event.type.value == "egress.request.denied"
+                and event.payload.get("method") == "POST"
+                and event.payload.get("path") == "/sentry"
+                for event in audited
+            )
+            assert not any(path == "/sentry" for _, path in observed)
             assert {host for host, _ in observed} >= {
                 "start.research.test",
                 "next.research.test",

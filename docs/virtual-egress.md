@@ -453,7 +453,7 @@ factory = VirtualEgressEnvironmentFactory(
     adapter=DockerEgressAdapter(
         seccomp_profile="/absolute/path/to/browser_fetch/seccomp_profile.json",
     ),
-    image="cayu-browser-fetch:15-playwright-1.62.0",
+    image="cayu-browser-fetch:17-playwright-1.62.0",
     artifact_store=S3ArtifactStore("production-artifacts"),
 )
 
@@ -1501,6 +1501,12 @@ destination. Every navigation, redirect, popup and subresource still passes thro
 the enforcing adapter and broker. Existing applications retain concrete-destination,
 deny-by-default behavior. Browser popup admission remains an additional independent
 restriction; public research does not implicitly enable popups.
+
+The interactive browser retains readable pages when the broker denies a background
+request, such as a telemetry POST. The denied request remains blocked and appears in
+the configured egress audit stream; this does not authorize additional methods or destinations.
+Denied navigation (including frame navigation and redirects) still fails. Resource
+and response-byte limits continue to apply to all responses.
 
 This mode permits only bodyless GET/HEAD over HTTPS port 443, using canonical FQDNs.
 IP literals and ambiguous authorities are rejected. Before each upstream connection,

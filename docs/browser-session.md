@@ -21,8 +21,8 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:15-playwright-1.62.0` image, the
-`cayu.browser-session.v4` protocol and worker version 15, brokered deny-by-default egress,
+`cayu-browser-fetch:17-playwright-1.62.0` image, the
+`cayu.browser-session.v4` protocol and worker version 17, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -915,3 +915,19 @@ These codes appear in the normal tool failure evidence with concise remediation.
 A startup failure reports a retired allocation only after daemon cleanup succeeds.
 `browser_unavailable` remains the fallback for an absent/unreachable worker or
 startup loss without a known safe diagnostic.
+
+### Large documentation pages
+
+When the conservative accessibility-name amplification estimate exceeds the worker's
+64 MiB materialization ceiling, the interactive browser can return bounded rendered
+text instead of allocating that accessibility tree. DOM-node, source/scalar, response,
+and text-capture limits still apply. The snapshot explicitly identifies main-document
+text, omits element references, and marks snapshot/reference truncation; it must not
+be treated as a complete accessibility tree. Screenshots and text export remain
+available through the same session.
+
+Configure the returned snapshot size through
+`WebBridge.sandboxed_browser(..., interactive_options={"max_snapshot_bytes": 65536})`.
+This bounds returned text; it does not raise the accessibility allocation ceiling.
+The existing `max_dom_nodes` and `max_artifact_bytes` settings also bound fallback
+text capture. If bounded capture cannot succeed, the browser retains its size refusal.

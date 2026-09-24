@@ -95,7 +95,7 @@ _IDENTITY = BrowserBackendIdentity(
     browser="chromium",
     browser_version="test-chromium",
     worker_protocol="cayu.browser-session.v4",
-    worker_version="15",
+    worker_version="17",
 )
 
 
@@ -964,7 +964,7 @@ class _WireRunner:
             stdout=json.dumps(
                 {
                     "protocol_version": "cayu.browser-session.v4",
-                    "worker_version": "15",
+                    "worker_version": "17",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -988,7 +988,7 @@ class _WireRunner:
                             "browser": "chromium",
                             "browser_version": "test-chromium",
                             "worker_protocol": "cayu.browser-session.v4",
-                            "worker_version": "15",
+                            "worker_version": "17",
                         },
                     },
                     "page_set": {
@@ -1069,7 +1069,7 @@ class _ProfileWireRunner(_WireRunner):
                     stdout=json.dumps(
                         {
                             "protocol_version": "cayu.browser-session.v4",
-                            "worker_version": "15",
+                            "worker_version": "17",
                             "playwright_version": "1.62.0",
                             "kind": "error",
                             "allocation_disposition": "retired",
@@ -1081,7 +1081,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "15",
+                        "worker_version": "17",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -1094,7 +1094,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "15",
+                        "worker_version": "17",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -1107,7 +1107,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "15",
+                        "worker_version": "17",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -1295,7 +1295,7 @@ def _browser_profile_binding(
         ),
         destination_policy=BrowserProfileDestinationPolicy.build(("https://example.test",)),
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="15",
+        browser_worker_version="17",
         store=store,
         key_authority=AESGCMBrowserProfileKeyAuthority(
             authority_id="browser-profile-test-key",
@@ -1729,7 +1729,7 @@ def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "visual_policy": None,
         "protocol_version": "cayu.browser-session.v4",
-        "worker_version": "15",
+        "worker_version": "17",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -5073,7 +5073,7 @@ def test_profile_guest_response_protects_page_evidence(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "15",
+                "worker_version": "17",
             },
         }
 
@@ -7706,7 +7706,7 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
             self.calls += 1
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "15",
+                "worker_version": "17",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -7832,7 +7832,7 @@ def test_interactive_guest_admits_switches_closes_and_tracks_popup_lineage() -> 
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "15",
+                    "worker_version": "17",
                 },
             }
 
@@ -8501,7 +8501,10 @@ def test_interactive_guest_whole_close_preserves_cancellation_after_all_cleanup(
     asyncio.run(scenario())
 
 
-def test_interactive_guest_retires_before_materializing_amplified_accessibility() -> None:
+@pytest.mark.parametrize("text_fits", [True, False])
+def test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility(
+    monkeypatch, text_fits
+) -> None:
     class _AmplifiedCdp(_BoundedSnapshotCdp):
         async def send(
             self,
@@ -8530,6 +8533,11 @@ def test_interactive_guest_retires_before_materializing_amplified_accessibility(
             raise AssertionError("amplified accessibility must fail before materialization")
 
     class _Page:
+        url = "https://example.test/pricing"
+
+        async def title(self):
+            return "Pricing"
+
         def __init__(self) -> None:
             self.locator_owner = _Locator()
 
@@ -8569,13 +8577,29 @@ def test_interactive_guest_retires_before_materializing_amplified_accessibility(
         )
         await _configure_interactive_daemon_for_test(daemon, request)
 
+        async def bounded_text(page, cdp, limits):
+            assert cdp.scripts_disabled
+            if not text_fits:
+                raise _browser_guest._GuestFailure("oversized_artifact")
+            return ("Pricing é\n" * 100_000).encode(), {}
+
+        monkeypatch.setattr(_browser_guest, "_interactive_rendered_text", bounded_text)
         result = await daemon.execute(request)
 
-        assert result["error"] == "oversized_snapshot"
-        assert result["allocation_disposition"] == "retired"
+        if text_fits:
+            assert result["kind"] == "success", result
+            observation = result["observation"]
+            assert observation["snapshot"].startswith("[Bounded rendered text;")
+            assert len(observation["snapshot"].encode()) <= request.limits.max_snapshot_bytes
+            assert observation["refs"] == []
+            assert set(observation["truncation_reasons"]) >= {"snapshot", "refs"}
+            assert not context.closed
+        else:
+            assert result["error"] == "oversized_snapshot"
+            assert result["allocation_disposition"] == "retired"
+            assert context.closed
         assert page.locator_owner.called is False
         assert cdp.script_execution_transitions == [True, False]
-        assert context.closed is True
 
     asyncio.run(scenario())
 
@@ -8699,7 +8723,7 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
         async def _execute_locked(self, request):
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "15",
+                "worker_version": "17",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -9626,7 +9650,7 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "15",
+                "worker_version": "17",
             },
         }
 
@@ -9925,7 +9949,7 @@ def test_interactive_guest_popup_guard_bounds_one_effect_before_target_admission
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "15",
+                    "worker_version": "17",
                 },
             }
 
@@ -13618,3 +13642,72 @@ def test_browser_limit_diagnostics_reject_untrusted_prose() -> None:
     assert unknown.structured["limit"]["measurement"] == "unavailable"
     assert unknown.structured["limit"]["observed"] is None
     assert "smaller response" in unknown.content
+
+
+@pytest.mark.parametrize(
+    ("navigation", "main_frame", "redirect", "expected"),
+    [
+        (False, True, False, None),
+        (False, False, False, None),
+        (True, True, False, "destination_denied"),
+        (True, True, True, "redirect_denied"),
+        (True, False, False, "destination_denied"),
+    ],
+)
+def test_interactive_guest_background_denial_does_not_poison_page(
+    navigation, main_frame, redirect, expected
+):
+    from types import SimpleNamespace
+
+    class Cdp:
+        async def send(self, method, params=None):
+            if method == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"id": "main"}}}
+            return {}
+
+        def on(self, event, callback):
+            pass
+
+    class Page:
+        def __init__(self):
+            self.main_frame = object()
+            self.handlers = {}
+
+        def set_default_timeout(self, timeout):
+            pass
+
+        def set_default_navigation_timeout(self, timeout):
+            pass
+
+        def on(self, event, callback):
+            self.handlers[event] = callback
+
+    class Context:
+        async def new_cdp_session(self, page):
+            return Cdp()
+
+    async def scenario():
+        page = Page()
+        daemon = _browser_guest._InteractiveDaemon("bs_test")
+        daemon.context = Context()
+        state = _browser_guest._InteractivePage(
+            page=page,
+            session_id="bs_test",
+            page_id="bp_test",
+        )
+        await daemon._configure_page(state, _interactive_limits())
+        response = SimpleNamespace(
+            headers={_browser_guest._BROKER_ERROR_HEADER: "destination_denied"},
+            url="https://docs.browser.test/sentry",
+            status=403,
+            request=SimpleNamespace(
+                is_navigation_request=lambda: navigation,
+                frame=page.main_frame if main_frame else object(),
+                redirected_from=object() if redirect else None,
+            ),
+        )
+        page.handlers["response"](response)
+        assert state.denied_code == expected
+        assert not state.limit_exceeded
+
+    asyncio.run(scenario())

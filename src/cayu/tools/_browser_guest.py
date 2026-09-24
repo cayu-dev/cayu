@@ -124,7 +124,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "15"
+INTERACTIVE_WORKER_VERSION = "17"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -7507,7 +7507,11 @@ class _InteractiveDaemon:
                     ),
                     None,
                 )
-                if broker_code is not None:
+                # The broker already blocked this request and recorded its denial.
+                # Ancillary requests (for example telemetry POSTs) must not poison
+                # an otherwise readable document. Navigation failures remain fatal,
+                # including subframes and redirects; byte limits still cover all responses.
+                if broker_code is not None and response.request.is_navigation_request():
                     state.denied_code = (
                         "redirect_denied"
                         if broker_code == "destination_denied"
@@ -8651,28 +8655,28 @@ async def _admit_interactive_snapshot_materialization(
             raise _GuestFailure("oversized_snapshot", limit=diagnostic)
         total_nodes += node_count
         total_source_bytes += source_bytes
-        # One accessibility node can reuse any source-derived accessible name
-        # in its frame (for example through aria-labelledby). Bound that
-        # expansion before Playwright builds the AI-mode snapshot. The fixed
-        # envelope covers roles, states, indentation, refs, and YAML framing;
-        # the serialization multiplier covers worst-case escaping.
-        materialization_upper_bound = total_nodes * (
-            total_source_bytes * _INTERACTIVE_ACCESSIBILITY_SERIALIZATION_MULTIPLIER
-            + _INTERACTIVE_ACCESSIBILITY_NODE_ENVELOPE_BYTES
-        )
-        if materialization_upper_bound > _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES:
-            raise _GuestFailure(
-                "oversized_snapshot",
-                limit=_limit_diagnostic(
-                    "accessibility_materialization_upper_bound",
-                    _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES,
-                    materialization_upper_bound,
-                    "bytes",
-                    "upper_bound",
-                ),
-            )
         remaining_nodes -= node_count
         remaining_source_bytes -= source_bytes
+    # One accessibility node can reuse any source-derived accessible name
+    # in its frame (for example through aria-labelledby). Bound that
+    # expansion before Playwright builds the AI-mode snapshot. The fixed
+    # envelope covers roles, states, indentation, refs, and YAML framing;
+    # the serialization multiplier covers worst-case escaping.
+    materialization_upper_bound = total_nodes * (
+        total_source_bytes * _INTERACTIVE_ACCESSIBILITY_SERIALIZATION_MULTIPLIER
+        + _INTERACTIVE_ACCESSIBILITY_NODE_ENVELOPE_BYTES
+    )
+    if materialization_upper_bound > _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES:
+        raise _GuestFailure(
+            "oversized_snapshot",
+            limit=_limit_diagnostic(
+                "accessibility_materialization_upper_bound",
+                _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES,
+                materialization_upper_bound,
+                "bytes",
+                "upper_bound",
+            ),
+        )
 
 
 async def _interactive_frame_ids(cdp: Any) -> tuple[str, ...]:
@@ -8994,7 +8998,31 @@ async def _interactive_observation(
             ref_metadata: dict[str, tuple[str, str]] = {}
             truncation: list[str] = []
         else:
-            await _admit_interactive_snapshot_materialization(state, limits)
+            text_snapshot: str | None = None
+            try:
+                await _admit_interactive_snapshot_materialization(state, limits)
+            except _GuestFailure as failure:
+                # Preserve the hard ARIA allocation bound. A conservative name
+                # amplification estimate need not prevent bounded plain-text reading.
+                if (
+                    failure.code != "oversized_snapshot"
+                    or failure.limit is None
+                    or failure.limit.get("identifier")
+                    != "accessibility_materialization_upper_bound"
+                ):
+                    raise
+                try:
+                    text, _ = await _interactive_rendered_text(page, state.cdp, limits)
+                except _GuestFailure as text_failure:
+                    if text_failure.code == "oversized_artifact":
+                        raise failure from text_failure
+                    raise
+                heading = (
+                    "[Bounded rendered text; main document only; element references unavailable]\n"
+                )
+                text_snapshot = (heading.encode("utf-8") + text)[
+                    : limits.max_snapshot_bytes
+                ].decode("utf-8", errors="ignore")
             if visual_policy is not None:
                 if state.visual_owner is None:
                     raise VisualGuestFailure("visual_mode_disabled")
@@ -9002,17 +9030,25 @@ async def _interactive_observation(
                     visual_policy,
                     max_dom_nodes=limits.max_dom_nodes,
                 )
-            raw_snapshot = await page.locator(":root").aria_snapshot(
-                mode="ai",
-                depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
-                timeout=max(1_000, limits.max_wait_ms),
-            )
-            if type(raw_snapshot) is not str:
-                raise _GuestFailure("browser_crash")
-            snapshot, refs, ref_metadata, truncation = _interactive_snapshot(
-                raw_snapshot,
-                limits,
-            )
+            if text_snapshot is not None:
+                snapshot, refs, ref_metadata, truncation = (
+                    text_snapshot,
+                    {},
+                    {},
+                    ["snapshot", "refs"],
+                )
+            else:
+                raw_snapshot = await page.locator(":root").aria_snapshot(
+                    mode="ai",
+                    depth=_ACCESSIBILITY_SNAPSHOT_DEPTH,
+                    timeout=max(1_000, limits.max_wait_ms),
+                )
+                if type(raw_snapshot) is not str:
+                    raise _GuestFailure("browser_crash")
+                snapshot, refs, ref_metadata, truncation = _interactive_snapshot(
+                    raw_snapshot,
+                    limits,
+                )
             ref_targets = {}
             for opaque, internal in refs.items():
                 target = await page.locator(f"aria-ref={internal}").element_handle()

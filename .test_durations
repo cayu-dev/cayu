@@ -3970,7 +3970,6 @@
     "tests/core/test_browser_session.py::test_interactive_guest_request_parser_rejects_escape_hatches": 0.0009813299999734681,
     "tests/core/test_browser_session.py::test_interactive_guest_requires_durable_marker_before_reporting_retirement": 0.002414867999988246,
     "tests/core/test_browser_session.py::test_interactive_guest_retirement_markers_do_not_alias_digest_prefixes": 0.0014159590000417666,
-    "tests/core/test_browser_session.py::test_interactive_guest_retires_before_materializing_amplified_accessibility": 0.0019752480000647665,
     "tests/core/test_browser_session.py::test_interactive_guest_retires_before_materializing_oversized_accessible_text": 0.0018260450000298079,
     "tests/core/test_browser_session.py::test_interactive_guest_retires_before_materializing_oversized_snapshot": 0.0019729189999679875,
     "tests/core/test_browser_session.py::test_interactive_guest_revalidates_profile_authority_before_import[cookie-origin-widening]": 0.0010117329999843605,
@@ -35434,7 +35433,6 @@
     "tests/egress/test_public_web.py::test_public_reconnect_refuses_missing_or_stale_authority_before_adapter_access[None]": 0.0011092080094385892,
     "tests/egress/test_public_web.py::test_public_reconnect_refuses_missing_or_stale_authority_before_adapter_access[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]": 0.0007833319832570851,
     "tests/egress/test_public_web.py::test_public_web_is_explicit_and_durable": 0.029432292038109154,
-    "tests/egress/test_public_web_docker.py::test_public_web_discovery_and_private_redirect": 9.00132845796179,
     "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[False-False-True]": 0.07646304101217538,
     "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[False-True-False]": 0.07559033299912699,
     "tests/egress/test_public_web.py::test_public_authority_adoption_preserves_reconnect[False-True-True]": 0.8390984160068911,
@@ -37136,5 +37134,14 @@
     "tests/core/test_tool_effect_receipts.py::test_receipt_rejects_invalid_or_unbounded_material[changes15]": 0.0004097501514479518,
     "tests/core/test_tool_effect_receipts.py::test_receipt_rejects_invalid_or_unbounded_material[changes16]": 0.00021087494678795338,
     "tests/core/test_tool_effect_state.py::test_receipt_cannot_select_a_different_terminal_result[changes0]": 0.007901208009570837,
-    "tests/core/test_tool_effect_state.py::test_receipt_cannot_select_a_different_terminal_result[changes1]": 0.007485917070880532
+    "tests/core/test_tool_effect_state.py::test_receipt_cannot_select_a_different_terminal_result[changes1]": 0.007485917070880532,
+    "tests/core/test_browser_session.py::test_interactive_guest_background_denial_does_not_poison_page[False-False-False-None]": 0.0008234999841079116,
+    "tests/core/test_browser_session.py::test_interactive_guest_background_denial_does_not_poison_page[False-True-False-None]": 0.00123104196973145,
+    "tests/core/test_browser_session.py::test_interactive_guest_background_denial_does_not_poison_page[True-False-False-destination_denied]": 0.0007195411017164588,
+    "tests/core/test_browser_session.py::test_interactive_guest_background_denial_does_not_poison_page[True-True-False-destination_denied]": 0.0018912090454250574,
+    "tests/core/test_browser_session.py::test_interactive_guest_background_denial_does_not_poison_page[True-True-True-redirect_denied]": 0.0007740409346297383,
+    "tests/core/test_browser_session.py::test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility[False]": 0.0011636250419542193,
+    "tests/core/test_browser_session.py::test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility[True]": 0.004639250109903514,
+    "tests/egress/test_public_web_docker.py::test_public_web_discovery_and_private_redirect[False]": 12.387515333015472,
+    "tests/egress/test_public_web_docker.py::test_public_web_discovery_and_private_redirect[True]": 11.400538291083649
 }
