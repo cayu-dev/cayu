@@ -47,7 +47,7 @@ class SQLiteCollaborationStore(CollaborationStore):
         self._close_task: asyncio.Task[None] | None = None
         self._connection = sqlite.connect(Path(path))
         try:
-            sqlite.reconcile_schema(self._connection, schema_mode, app_min_supported=95)
+            sqlite.reconcile_schema(self._connection, schema_mode, app_min_supported=105)
         except BaseException:
             self._connection.close()
             raise

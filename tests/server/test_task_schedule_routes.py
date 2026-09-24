@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import warnings
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -110,26 +112,34 @@ def test_schedule_http_rejects_invalid_revision_without_mutation(invalid):
 
 
 @pytest.mark.parametrize("bad_field", ["available_at", "operation_id", "policy"])
-def test_schedule_http_validation_is_secret_safe(bad_field, capsys, caplog, recwarn):
+def test_schedule_http_validation_is_secret_safe(bad_field, capsys, caplog):
+    # Drain unrelated cyclic garbage before attributing warnings to this
+    # request. Warnings produced by this flow, including cleanup, remain errors.
+    gc.collect()
     canary = "private-http-scheduling-canary"
-    store = InMemoryTaskStore()
-    app = CayuApp(task_store=store, enable_logging=False, secret_redactor=SecretRedactor(canary))
-    body = {
-        "task_id": "followup",
-        "operation_id": "move",
-        "expected_revision": 1,
-        "available_at": "2026-09-20T12:00:00+00:00",
-        "policy": {},
-    }
-    body[bad_field] = {"private": canary}
-    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
-        response = client.post("/api/tasks/schedule/reschedule", json=body)
-        assert response.status_code == 422
-        assert canary not in response.text
-    assert asyncio.run(store.list_tasks()) == []
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        store = InMemoryTaskStore()
+        app = CayuApp(
+            task_store=store, enable_logging=False, secret_redactor=SecretRedactor(canary)
+        )
+        body = {
+            "task_id": "followup",
+            "operation_id": "move",
+            "expected_revision": 1,
+            "available_at": "2026-09-20T12:00:00+00:00",
+            "policy": {},
+        }
+        body[bad_field] = {"private": canary}
+        with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+            response = client.post("/api/tasks/schedule/reschedule", json=body)
+            assert response.status_code == 422
+            assert canary not in response.text
+        assert asyncio.run(store.list_tasks()) == []
+        gc.collect()
     captured = capsys.readouterr()
     assert canary not in captured.out + captured.err + caplog.text
-    assert not recwarn, [
+    assert not emitted, [
         (warning.category.__name__, str(warning.message), warning.filename, warning.lineno)
-        for warning in recwarn
+        for warning in emitted
     ]

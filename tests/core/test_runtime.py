@@ -547,12 +547,17 @@ class RejectingHeartbeatBudgetLedger(InMemoryBudgetLedger):
 
 class ObservingHeartbeatBudgetLedger(InMemoryBudgetLedger):
     def __init__(self) -> None:
-        super().__init__(reservation_ttl_seconds=1)
+        self.now = datetime.now(UTC)
+        super().__init__(clock=lambda: self.now, reservation_ttl_seconds=1)
         self.heartbeat_calls = 0
         self.renewed_past_initial_ttl = asyncio.Event()
 
     async def heartbeat(self, *, reservation_id: str) -> bool:
+        # Exercise the real heartbeat task across more than one lease lifetime
+        # without making an unrelated loaded-runner pause expire the lease.
+        self.now += timedelta(milliseconds=250)
         renewed = await super().heartbeat(reservation_id=reservation_id)
+        assert renewed
         self.heartbeat_calls += 1
         if self.heartbeat_calls >= 6:
             self.renewed_past_initial_ttl.set()
@@ -11207,7 +11212,7 @@ def test_cayu_app_heartbeats_silent_live_budget_reservation() -> None:
             )
         )
         await provider.started.wait()
-        await asyncio.wait_for(ledger.renewed_past_initial_ttl.wait(), timeout=5)
+        await asyncio.wait_for(ledger.renewed_past_initial_ttl.wait(), timeout=30)
         blocked = await ledger.reserve(
             limit=limit,
             session_id="sess_concurrent",

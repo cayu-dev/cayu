@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from cayu._validation import canonical_durable_json_bytes
@@ -25,11 +25,39 @@ if TYPE_CHECKING:
     from cayu.runtime._session_continuation_owner import SessionContinuationOwner
 
 
+class _ResumeAdmissionHandoff(Protocol):
+    """Private runtime extension point; implementations must own exact admission."""
+
+    @property
+    def interaction_id(self) -> str: ...
+
+    @property
+    def interaction_started_event_id(self) -> str: ...
+
+    @property
+    def interaction_started_at(self) -> datetime: ...
+
+    @property
+    def run_operation_id(self) -> str: ...
+
+    @property
+    def model_transition_event_id(self) -> str: ...
+
+    async def admit(
+        self, command: AdmitInvocationCommand, invocation: InvocationContext
+    ) -> InvocationMutationResult: ...
+
+    async def after_admission(self, invocation: InvocationContext) -> None: ...
+
+
 @dataclass(frozen=True)
 class _ContinuationResumeHandoff:
     owner: SessionContinuationOwner
     service: ContinuationService
     service_digest: str
+
+    async def after_admission(self, invocation: InvocationContext) -> None:
+        invocation.require_runtime_authority()
 
     @property
     def interaction_id(self) -> str:

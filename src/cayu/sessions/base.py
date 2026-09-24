@@ -83,6 +83,11 @@ if TYPE_CHECKING:
         ContinuationRetirement,
         ContinuationTicket,
     )
+    from cayu.runtime._temporary_continuation import (
+        TemporaryServiceAdmission,
+        TemporaryServicePreparation,
+        TemporaryServiceRecord,
+    )
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -5185,8 +5190,22 @@ class SessionInvocationAdmission:
     adopted_runtime_identity: SessionRuntimeIdentity | None = None
     expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None
     allow_pending_initial_interaction: bool = False
+    temporary_service_admission: TemporaryServiceAdmission | None = None
 
     def __post_init__(self) -> None:
+        if self.temporary_service_admission is not None:
+            from cayu.collaboration._preparation import prepare_contract
+            from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
+            from cayu.runtime._temporary_continuation_scope import require_temporary_transition
+            from cayu.vaults.redaction import SecretRedactor
+
+            prepared_service = prepare_contract(
+                TemporaryServiceAdmission,
+                self.temporary_service_admission,
+                redactor=SecretRedactor(),
+            )
+            require_temporary_transition(prepared_service)
+            object.__setattr__(self, "temporary_service_admission", prepared_service)
         if type(self.from_statuses) is not frozenset or not self.from_statuses:
             raise ValueError("from_statuses must be a non-empty frozenset.")
         if any(not isinstance(status, SessionStatus) for status in self.from_statuses):
@@ -10123,6 +10142,13 @@ def _session_continuation_methods_owned(store: object) -> bool:
         (
             *_SESSION_EXPORT_OWNER_METHODS,
             "_publish_continuation_operation",
+            "_publish_temporary_continuation_service",
+            "_publish_temporary_service_target",
+            "_prepare_temporary_side_service",
+            "_load_temporary_service_target",
+            "_load_temporary_continuation_service",
+            "_read_temporary_continuation_outcome",
+            "_reconcile_temporary_continuation_service",
             "_initialize_continuation_namespace",
             "prepare_continuation_ticket",
             "load_continuation_ticket",
@@ -10694,6 +10720,7 @@ class SessionStore(ABC):
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
         expected_latest_interaction_event_id: str | None = None,
         require_no_active_model_completion_dispatch: bool = False,
+        temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
         """Atomically persist status, checkpoint, interaction, target, and profile admission.
 
@@ -10718,6 +10745,7 @@ class SessionStore(ABC):
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
+        temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
         """Atomically compare a profile through the normal resume transition."""
 
@@ -10741,6 +10769,8 @@ class SessionStore(ABC):
         }
         if adopted_runtime_identity is not None:
             transition_kwargs["adopted_runtime_identity"] = adopted_runtime_identity
+        if temporary_service_admission is not None:
+            transition_kwargs["temporary_service_admission"] = temporary_service_admission
         return await self.transition_status_and_checkpoint(session_id, **transition_kwargs)
 
     async def admit_session_invocation(
@@ -10820,6 +10850,8 @@ class SessionStore(ABC):
             transition_kwargs["execution_profile"] = admission.execution_profile
         if admission.result_checkpoint_transform is not None:
             transition_kwargs["result_checkpoint_transform"] = admission.result_checkpoint_transform
+        if admission.temporary_service_admission is not None:
+            transition_kwargs["temporary_service_admission"] = admission.temporary_service_admission
         if active_profile is None:
             return await self.admit_execution_profile_resume(
                 session_id,
@@ -12018,6 +12050,335 @@ class SessionStore(ABC):
                 events=events,
             )
 
+    async def _publish_temporary_continuation_service(
+        self,
+        *,
+        previous: TemporaryServiceRecord | None,
+        proposed: TemporaryServiceRecord,
+    ) -> TemporaryServiceRecord:
+        """Publish a receiving owner's exact child under the native session lock.
+
+        This private mutation is not an application execution entrance. The
+        registered runtime owner must authenticate permits and receiving evidence
+        before calling it; it cannot wrap foreign callbacks in publication scope.
+        """
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationUnavailable,
+            continuation_operation_key,
+        )
+        from cayu.runtime._session_continuation_scope import service_publication_scope
+        from cayu.runtime._temporary_continuation import (
+            TemporaryServiceRecord,
+            temporary_service_key,
+        )
+        from cayu.runtime._temporary_continuation_store import (
+            publish_service_record,
+            require_service_deadline,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        proposed = prepare_contract(TemporaryServiceRecord, proposed, redactor=SecretRedactor())
+        if previous is not None:
+            previous = prepare_contract(TemporaryServiceRecord, previous, redactor=SecretRedactor())
+        ticket = proposed.intent.ticket
+        key = continuation_operation_key(ticket)
+
+        def transform(session, checkpoint, current, now):
+            return publish_service_record(session, checkpoint, current, previous, proposed, now)
+
+        def check_commit_time(now):
+            if previous is None:
+                require_service_deadline(proposed, now)
+
+        with (
+            service_publication_scope(key, temporary_service_key(proposed.intent.operation)),
+            _invocation_lifecycle_authority_read_scope(),
+        ):
+            await self.publish_session_operation_guarded_with_store_time(
+                ticket.session_id,
+                idempotency_key=key,
+                operation_transform=transform,
+                commit_guard=lambda: None,
+                commit_time_guard=check_commit_time,
+                events=[],
+            )
+            retained = await self.load_session_operation(
+                ticket.session_id, temporary_service_key(proposed.intent.operation)
+            )
+        if retained is None:
+            raise ContinuationUnavailable("Temporary service publication is not durably readable.")
+        observed = prepare_contract(TemporaryServiceRecord, retained, redactor=SecretRedactor())
+        if observed != proposed and not (
+            proposed.state in {"returned", "excluded"}
+            and observed == proposed.model_copy(update={"settlement_acknowledged": True})
+        ):
+            raise ContinuationUnavailable("Temporary service readback differs from publication.")
+        return observed
+
+    async def _prepare_temporary_side_service(self, preparation):
+        """Native stores must reserve both existing-session preparations atomically."""
+        from cayu.runtime._session_continuation import ContinuationUnavailable
+
+        raise ContinuationUnavailable("Session store lacks joint side-service preparation.")
+
+    async def _publish_temporary_service_target(self, *, previous, proposed):
+        """Private registered-owner compare under the target's native transaction."""
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            CONTINUATION_NAMESPACE_KEY,
+            ContinuationUnavailable,
+        )
+        from cayu.runtime._session_continuation_scope import service_publication_scope
+        from cayu.runtime._temporary_service_target import (
+            TemporaryServiceTarget,
+            publish_target_record,
+            target_service_key,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        proposed = prepare_contract(TemporaryServiceTarget, proposed, redactor=SecretRedactor())
+        if previous is not None:
+            previous = prepare_contract(TemporaryServiceTarget, previous, redactor=SecretRedactor())
+        if previous == proposed:
+            retained = await self._load_temporary_service_target(proposed.service.admission)
+            if retained != proposed and not (
+                proposed.service.state in {"returned", "excluded"}
+                and retained == proposed.model_copy(update={"source_acknowledged": True})
+            ):
+                raise ContinuationUnavailable("Side-session target replay changed its exact state.")
+            return retained
+        target = proposed.service.intent.target
+        key = target_service_key(proposed.service.intent.operation)
+
+        def transform(session, checkpoint, current, now):
+            return publish_target_record(session, checkpoint, current, previous, proposed, now)
+
+        with (
+            service_publication_scope(key, CONTINUATION_NAMESPACE_KEY),
+            _invocation_lifecycle_authority_read_scope(),
+        ):
+            await self.publish_session_operation_guarded_with_store_time(
+                target.object_id,
+                idempotency_key=key,
+                operation_transform=transform,
+                commit_guard=lambda: None,
+                commit_time_guard=lambda now: None,
+                events=[],
+            )
+            raw = await self.load_session_operation(target.object_id, key)
+        if raw is None:
+            raise ContinuationUnavailable("Side-session target publication is unreadable.")
+        retained = prepare_contract(TemporaryServiceTarget, raw, redactor=SecretRedactor())
+        if retained != proposed and not (
+            proposed.service.state in {"returned", "excluded"}
+            and retained == proposed.model_copy(update={"source_acknowledged": True})
+        ):
+            raise ContinuationUnavailable("Side-session target acknowledgement changed.")
+        return retained
+
+    async def _load_temporary_service_target(self, expected):
+        """Read an exact indexed target, retaining ambiguity across concurrent changes."""
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import ContinuationConflict, ContinuationUnavailable
+        from cayu.runtime._session_continuation_scope import publication_scope
+        from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
+        from cayu.runtime._temporary_continuation import (
+            TemporaryServiceAdmission,
+            TemporaryServicePreparation,
+        )
+        from cayu.runtime._temporary_service_target import (
+            TemporaryServiceTarget,
+            target_reference,
+            target_service_key,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        expected = prepare_contract(
+            TemporaryServiceAdmission
+            if isinstance(expected, TemporaryServiceAdmission)
+            else TemporaryServicePreparation,
+            expected,
+            redactor=SecretRedactor(),
+        )
+        intent = expected.dispatch.intent
+        key = target_service_key(intent.operation)
+        with publication_scope(key), _invocation_lifecycle_authority_read_scope():
+            session = await self.load(intent.target.object_id)
+            checkpoint = await self.load_checkpoint(intent.target.object_id)
+            raw = await self.load_session_operation(intent.target.object_id, key)
+        if session is None or session.instance_id != intent.target.incarnation:
+            raise ContinuationUnavailable("Side-session receiving incarnation is unavailable.")
+        root_raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
+        root = None if root_raw is None else ContinuationRoot.model_validate(root_raw)
+        if root is not None and (
+            root.namespace.session_id != session.id
+            or root.namespace.session_instance_id != session.instance_id
+            or root.namespace.owner != intent.target.owner
+        ):
+            raise ContinuationConflict("Side-session target index belongs to another owner.")
+        reference = (
+            None
+            if root is None
+            else next((item for item in root.target_services if item.key == key), None)
+        )
+        if raw is None and reference is None:
+            return None
+        if raw is None or reference is None:
+            raise ContinuationUnavailable("Side-session target has incomplete native evidence.")
+        retained = TemporaryServiceTarget.model_validate(raw)
+        if target_reference(retained) != reference:
+            raise ContinuationUnavailable("Side-session target changed during indexed readback.")
+        observed = retained.service.admission
+        if isinstance(observed, TemporaryServiceAdmission) and not isinstance(
+            expected, TemporaryServiceAdmission
+        ):
+            observed = observed.preparation
+        if observed != expected:
+            raise ContinuationConflict("Side-session target conflicts with the expected operation.")
+        return retained
+
+    async def _load_temporary_continuation_service(
+        self, expected: TemporaryServiceAdmission | TemporaryServicePreparation
+    ) -> TemporaryServiceRecord | None:
+        """Reconstruct one exact child, never treating a missing indexed row as absence."""
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import (
+            ContinuationConflict,
+            ContinuationUnavailable,
+            require_ticket_identity,
+        )
+        from cayu.runtime._temporary_continuation import (
+            TemporaryServiceAdmission,
+            TemporaryServicePreparation,
+            TemporaryServiceRecord,
+            reference_for_service,
+            temporary_service_key,
+        )
+        from cayu.vaults.redaction import SecretRedactor
+
+        expected = (
+            prepare_contract(TemporaryServiceAdmission, expected, redactor=SecretRedactor())
+            if isinstance(expected, TemporaryServiceAdmission)
+            else prepare_contract(TemporaryServicePreparation, expected, redactor=SecretRedactor())
+        )
+        ticket = expected.dispatch.intent.ticket
+        retained = await self.load_continuation_ticket(
+            ticket.session_id,
+            session_instance_id=ticket.session_instance_id,
+            registration_key=ticket.registration_key,
+        )
+        if retained is None:
+            raise ContinuationUnavailable("Temporary service has no retained source ticket.")
+        require_ticket_identity(ticket, retained.ticket)
+        key = temporary_service_key(expected.dispatch.intent.operation)
+        reference = next((item for item in retained.services if item.key == key), None)
+        raw = await self.load_session_operation(ticket.session_id, key)
+        if reference is None:
+            if raw is not None:
+                raise ContinuationUnavailable("Temporary service child has lost its source index.")
+            return None
+        if raw is None:
+            raise ContinuationUnavailable("Temporary service index has lost its child evidence.")
+        observed = prepare_contract(TemporaryServiceRecord, raw, redactor=SecretRedactor())
+        if reference_for_service(observed, retained.services) != reference:
+            # A concurrent transition may have advanced between these reads.
+            # Neither the stale index nor the new child proves an exact match.
+            raise ContinuationUnavailable("Temporary service changed during reconstruction.")
+        observed_expected = (
+            observed.admission.preparation
+            if isinstance(observed.admission, TemporaryServiceAdmission)
+            and not isinstance(expected, TemporaryServiceAdmission)
+            else observed.admission
+        )
+        if observed_expected != expected:
+            raise ContinuationConflict(
+                "Temporary service readback conflicts with expected admission."
+            )
+        return observed
+
+    async def _read_temporary_continuation_outcome(
+        self, expected: TemporaryServiceAdmission
+    ) -> TemporaryServiceRecord | None:
+        """Read exact native admission/release; absence never proves exclusion."""
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._session_continuation import ContinuationUnavailable
+        from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
+        from cayu.runtime._temporary_continuation_store import native_service_outcome
+        from cayu.vaults.redaction import SecretRedactor
+
+        expected = prepare_contract(TemporaryServiceAdmission, expected, redactor=SecretRedactor())
+        target = expected.dispatch.intent.target
+        session = await self.load(target.object_id)
+        if session is None or session.instance_id != target.incarnation:
+            raise ContinuationUnavailable("Temporary service receiving incarnation is unavailable.")
+        with _invocation_lifecycle_authority_read_scope():
+            checkpoint = await self.load_checkpoint(session.id)
+        return native_service_outcome(expected, checkpoint)
+
+    async def _reconcile_temporary_continuation_service(
+        self, expected: TemporaryServiceAdmission
+    ) -> TemporaryServiceRecord:
+        """Settle the source only from native receiving evidence, retaining ambiguity."""
+        from cayu.runtime._session_continuation import ContinuationUnavailable
+
+        previous = await self._load_temporary_continuation_service(expected)
+        if previous is None:
+            raise ContinuationUnavailable(
+                "Temporary service has no source responsibility to reconcile."
+            )
+        target_record = None
+        if expected.dispatch.intent.mode == "side_session":
+            if previous.state in {"returned", "excluded"}:
+                target = expected.dispatch.intent.target
+                target_session = await self.load(target.object_id)
+                if target_session is None or target_session.instance_id != target.incarnation:
+                    # The exact source record already contains positive receiving
+                    # settlement. Target absence grants nothing: it only means
+                    # there is no old incarnation left to acknowledge/clean up.
+                    # Never make terminal replay depend on an unrelated reuse of
+                    # the target's public ID.
+                    return previous
+            target_record = await self._load_temporary_service_target(expected)
+            if target_record is None:
+                raise ContinuationUnavailable("Side-session receiving fence is unavailable.")
+        if previous.state in {"returned", "excluded"}:
+            if target_record is not None:
+                from cayu.runtime._temporary_service_target import acknowledge_side_target
+
+                await self._publish_temporary_service_target(
+                    previous=target_record,
+                    proposed=acknowledge_side_target(target_record, previous),
+                )
+            return previous
+        observed = await self._read_temporary_continuation_outcome(expected)
+        if observed is None:
+            if previous.state == "admitted":
+                raise ContinuationUnavailable(
+                    "Temporary service native admission evidence is unavailable."
+                )
+            return previous
+        if target_record is not None and observed.state == "returned":
+            from cayu.runtime._temporary_service_target import return_side_target
+
+            target_record = await self._publish_temporary_service_target(
+                previous=target_record,
+                proposed=return_side_target(target_record, observed),
+            )
+        if observed == previous:
+            return previous
+        settled = await self._publish_temporary_continuation_service(
+            previous=previous, proposed=observed
+        )
+        if target_record is not None and settled.state == "returned":
+            from cayu.runtime._temporary_service_target import acknowledge_side_target
+
+            await self._publish_temporary_service_target(
+                previous=target_record,
+                proposed=acknowledge_side_target(target_record, settled),
+            )
+        return settled
+
     async def _initialize_continuation_namespace(
         self, namespace: ContinuationNamespace
     ) -> ContinuationNamespace:
@@ -12329,8 +12690,8 @@ class SessionStore(ABC):
             ContinuationUnavailable,
             continuation_operation_key,
             require_latch_identity,
+            require_record_writer_generation,
             require_ticket_identity,
-            require_writer_generation,
         )
         from cayu.runtime._session_continuation_scope import require_authenticated_latch
 
@@ -12361,16 +12722,16 @@ class SessionStore(ABC):
         ) -> SessionOperationPublication:
             if current_session.instance_id != ticket.session_instance_id:
                 raise SessionRunFenced("Continuation latch belongs to a retired session instance.")
-            require_writer_generation(
-                ticket,
+            if current is None:
+                raise ContinuationConflict("Continuation ticket is not durably armed.")
+            record = ContinuationRecord.model_validate(current)
+            require_record_writer_generation(
+                record,
                 current_session.run_epoch,
                 allow_released_next_generation=_continuation_writer_was_released(
                     current_session, checkpoint
                 ),
             )
-            if current is None:
-                raise ContinuationConflict("Continuation ticket is not durably armed.")
-            record = ContinuationRecord.model_validate(current)
             require_ticket_identity(ticket, record.ticket)
             if record.latch is not None:
                 require_latch_identity(record.latch, latch)
@@ -12692,8 +13053,8 @@ class SessionStore(ABC):
             continuation_admission_digest,
             continuation_operation_key,
             require_latch_identity,
+            require_record_writer_generation,
             require_ticket_identity,
-            require_writer_generation,
         )
 
         ticket = consumption.ticket
@@ -12817,14 +13178,14 @@ class SessionStore(ABC):
                 # the wait's originating authority. A previously latched result
                 # must not let an overtaken wait start a fresh consumption.
                 # Existing preparations above reconcile their exact handoff.
-                require_writer_generation(
-                    record.ticket,
+                require_record_writer_generation(
+                    record,
                     current_session.run_epoch,
                     allow_released_next_generation=_continuation_writer_was_released(
                         current_session, checkpoint
                     ),
                 )
-                if record.latch is None or record.ticket.state not in {"WAITING", "SERVICING"}:
+                if record.latch is None or record.ticket.state != "WAITING":
                     raise ContinuationConflict("Continuation is not ready for consumption.")
                 if consumption.receipt_stage != "prepared":
                     raise ContinuationConflict(
@@ -12864,17 +13225,19 @@ class SessionStore(ABC):
         from cayu.runtime._session_continuation import (
             ContinuationConflict,
             ContinuationRecord,
+            ContinuationReleasedRetirement,
             ContinuationRetirement,
             ContinuationUnavailable,
             continuation_operation_key,
+            continuation_writer_frontier,
+            require_record_writer_generation,
             require_ticket_identity,
-            require_writer_generation,
         )
         from cayu.runtime._session_continuation_scope import require_retirement
         from cayu.vaults.redaction import SecretRedactor
 
         retirement = prepare_contract(ContinuationRetirement, retirement, redactor=SecretRedactor())
-        supersession_only = require_retirement(retirement)
+        retirement_authority = require_retirement(retirement)
         ticket = retirement.ticket
         key = continuation_operation_key(ticket)
 
@@ -12890,6 +13253,30 @@ class SessionStore(ABC):
             if current is None:
                 raise ContinuationConflict("Continuation ticket is unavailable.")
             record = ContinuationRecord.model_validate(current)
+            if record.ticket.state == "SERVICING":
+                raise ContinuationConflict("Temporary service must settle before retirement.")
+            released_evidence = record.released_retirement
+            if isinstance(retirement_authority, ContinuationReleasedRetirement):
+                from cayu.runtime._session_continuation_store import (
+                    require_released_wait_invocation,
+                )
+
+                if released_evidence is None:
+                    if record.retirement is not None:
+                        raise ContinuationConflict(
+                            "Retirement has no retained released-execution proof."
+                        )
+                    released_evidence = require_released_wait_invocation(
+                        ticket,
+                        checkpoint,
+                        permit_operation=retirement_authority.permit_operation,
+                        permit_commitment=retirement_authority.permit_commitment,
+                    )
+                elif (
+                    released_evidence.permit_operation != retirement_authority.permit_operation
+                    or released_evidence.permit_commitment != retirement_authority.permit_commitment
+                ):
+                    raise ContinuationConflict("Retirement replay changed its released execution.")
             if record.retirement is not None:
                 existing = record.retirement
                 require_ticket_identity(existing.ticket, retirement.ticket)
@@ -12899,21 +13286,39 @@ class SessionStore(ABC):
                 else:
                     raise ContinuationConflict("Continuation was retired differently.")
             else:
-                if supersession_only:
+                if isinstance(retirement_authority, ContinuationReleasedRetirement):
+                    if (
+                        record.ticket.state not in {"ARMING", "WAITING"}
+                        or record.consumption is not None
+                        or any(
+                            item.state not in {"returned", "excluded"} for item in record.services
+                        )
+                        or retirement_authority.settled_services
+                        != tuple((item.key, item.record_sha256) for item in record.services)
+                        or not _continuation_writer_was_released(current_session, checkpoint)
+                    ):
+                        raise ContinuationConflict(
+                            "Released cleanup requires a quiescent wait and settled services."
+                        )
+                    require_record_writer_generation(
+                        record, current_session.run_epoch, allow_released_next_generation=True
+                    )
+                elif retirement_authority:
                     # A release alone advances by one. A later epoch in this
                     # exact incarnation proves the old wait has been overtaken.
                     # Never settle prepared/claimed receiving work by inference.
+                    writer, released = continuation_writer_frontier(record)
                     if (
                         retirement.reason != "superseded"
-                        or current_session.run_epoch <= ticket.writer_generation + 1
+                        or current_session.run_epoch <= writer + (not released)
                         or record.consumption is not None
                     ):
                         raise ContinuationConflict(
                             "Supersession requires an overtaken, unconsumed continuation."
                         )
                 else:
-                    require_writer_generation(
-                        ticket,
+                    require_record_writer_generation(
+                        record,
                         current_session.run_epoch,
                         allow_released_next_generation=_continuation_writer_was_released(
                             current_session, checkpoint
@@ -12948,7 +13353,11 @@ class SessionStore(ABC):
                     )
                 else:
                     updated = record.model_copy(
-                        update={"ticket": retired_ticket, "retirement": updated_retirement}
+                        update={
+                            "ticket": retired_ticket,
+                            "retirement": updated_retirement,
+                            "released_retirement": released_evidence,
+                        }
                     )
             return SessionOperationPublication(
                 checkpoint={} if checkpoint is None else checkpoint,
@@ -18387,7 +18796,11 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
         expected_latest_interaction_event_id: str | None = None,
         require_no_active_model_completion_dispatch: bool = False,
+        temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
+        from cayu.runtime._temporary_continuation_scope import prepare_temporary_transition
+
+        temporary_service_admission = prepare_temporary_transition(temporary_service_admission)
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
@@ -18589,6 +19002,39 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                         session_id=session_id,
                     )
                 )
+            temporary_records: dict[str, dict[str, Any]] = {}
+            if temporary_service_admission is not None:
+                from cayu.runtime._session_continuation import continuation_operation_key
+                from cayu.runtime._temporary_continuation import temporary_service_key
+                from cayu.runtime._temporary_continuation_store import (
+                    compose_temporary_service_admission,
+                )
+
+                parent_key = continuation_operation_key(
+                    temporary_service_admission.dispatch.intent.ticket
+                )
+                from cayu.runtime._temporary_service_target import target_service_key
+
+                intent = temporary_service_admission.dispatch.intent
+                child_key = (
+                    temporary_service_key(intent.operation)
+                    if intent.mode == "same_session"
+                    else target_service_key(intent.operation)
+                )
+                publication = compose_temporary_service_admission(
+                    source_session=session,
+                    source_checkpoint=current_checkpoint,
+                    parent_record=self._session_operation_records.get(session_id, {}).get(
+                        parent_key
+                    ),
+                    child_record=self._session_operation_records.get(session_id, {}).get(child_key),
+                    admitted_session=updated,
+                    admitted_checkpoint=transformed_checkpoint,
+                    admission=temporary_service_admission,
+                    now=now,
+                )
+                transformed_checkpoint = publication.checkpoint
+                temporary_records = publication.operation_records
             prepared_events: _PreparedInMemoryEventAppend | None = None
             admission_events = []
             if prepared_execution_profile_decision is not None:
@@ -18620,6 +19066,8 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             self._refresh_child_lifecycle_candidate_unlocked(updated)
             if prepared_checkpoint is not None:
                 self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
+            if temporary_records:
+                self._session_operation_records.setdefault(session_id, {}).update(temporary_records)
             if admission is not None:
                 _, interaction_id, source_messages, defer_source = admission
                 if prepared_events is not None:
@@ -20670,6 +21118,30 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
 
             target_cursor = receiving_cursor(request, existing, pending_transcript_cursor)
             target = None if target_id is None else self._sessions.get(target_id)
+            parked_target = False
+            if target is not None and target.status in {
+                SessionStatus.COMPLETED,
+                SessionStatus.FAILED,
+                SessionStatus.INTERRUPTED,
+            }:
+                from cayu.storage._peer_attempts import (
+                    parked_clarification_key,
+                    permits_parked_clarification_append,
+                )
+
+                checkpoint = self._checkpoints.get(target.id)
+                wait_key = parked_clarification_key(
+                    checkpoint, session_id=target.id, instance_id=target.instance_id
+                )
+                if wait_key is not None:
+                    parked_target = permits_parked_clarification_append(
+                        request,
+                        checkpoint,
+                        self._session_operation_records.get(target.id, {}).get(wait_key),
+                        session_id=target.id,
+                        instance_id=target.instance_id,
+                        run_epoch=target.run_epoch,
+                    )
             if target is not None and target.status not in {
                 SessionStatus.COMPLETED,
                 SessionStatus.FAILED,
@@ -20738,6 +21210,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 or not source_valid
                 or (
                     target is not None
+                    and not parked_target
                     and target.status
                     in {
                         SessionStatus.COMPLETED,
@@ -22002,6 +22475,55 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             expected_transcript_cursor=expected_transcript_cursor,
             context_view_compaction_cursor=context_view_compaction_cursor,
         )
+
+    async def _prepare_temporary_side_service(self, preparation):
+        from cayu.runtime._side_service_preparation import (
+            SidePreparationSnapshot,
+            plan_preparation,
+            preparation_record_keys,
+            prepare_selection,
+        )
+
+        prepared = prepare_selection(preparation)
+        keys = preparation_record_keys(prepared)
+        async with self._lock:
+            snapshots = {}
+            for session_id in sorted(keys):
+                session = self._sessions.get(session_id)
+                if session is None:
+                    raise KeyError("Side-service session is unavailable.")
+                _assert_session_run_epoch(session_id, session)
+                for owner in self._session_closure_progress.values():
+                    _check_closure_lineage_owner(owner, (session_id,))
+                snapshots[session_id] = SidePreparationSnapshot(
+                    session=session,
+                    checkpoint=self._checkpoints.get(session_id),
+                    records={
+                        key: value
+                        for key in keys[session_id]
+                        if (value := self._session_operation_records.get(session_id, {}).get(key))
+                        is not None
+                    },
+                )
+            now = self._ownership_clock()
+            plans = plan_preparation(prepared, snapshots, now)
+            sessions = {
+                session_id: snapshots[session_id].session.model_copy(
+                    update={"updated_at": now, "last_activity_at": now}
+                )
+                for session_id in plans
+            }
+            operations = {
+                session_id: self._session_operation_records.get(session_id, {})
+                | plan.operation_records
+                for session_id, plan in plans.items()
+            }
+            # Planning verifies that only the continuation root changes. Other
+            # checkpoint owners' material and derived indexes remain unchanged.
+            for session_id, plan in plans.items():
+                self._checkpoints[session_id] = plan.checkpoint
+                self._session_operation_records[session_id] = operations[session_id]
+                self._sessions[session_id] = sessions[session_id]
 
     async def _publish_session_operation(
         self,

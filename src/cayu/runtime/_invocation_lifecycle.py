@@ -1134,6 +1134,7 @@ class AdmitInvocationCommand(_InvocationCommandModel):
     allow_pending_initial_interaction: StrictBool = False
     participant_permit_operation: str | None = None
     participant_permit_commitment: str | None = None
+    temporary_service_operation_key: str | None = None
 
     @field_validator("expected_statuses", mode="before")
     @classmethod
@@ -1197,6 +1198,17 @@ class AdmitInvocationCommand(_InvocationCommandModel):
 
     @model_validator(mode="after")
     def validate_admission_authority(self) -> AdmitInvocationCommand:
+        if self.temporary_service_operation_key is not None:
+            from cayu.runtime._session_continuation import CONTINUATION_SERVICE_PREFIX
+
+            key = self.temporary_service_operation_key
+            suffix = key.removeprefix(CONTINUATION_SERVICE_PREFIX)
+            if (
+                not key.startswith(CONTINUATION_SERVICE_PREFIX)
+                or len(suffix) != 64
+                or any(character not in "0123456789abcdef" for character in suffix)
+            ):
+                raise ValueError("Temporary service operation key is invalid.")
         if (self.participant_permit_operation is None) != (
             self.participant_permit_commitment is None
         ):
@@ -1551,6 +1563,9 @@ class _InvocationLifecycleCommandReceipt(BaseModel):
     active_profile: ActiveInvocationExecutionProfile
     participant_permit_operation: str | None = None
     participant_permit_commitment: str | None = None
+    temporary_service_operation_key: str | None = Field(
+        default=None, pattern=r"^session-continuation:service:[0-9a-f]{64}$"
+    )
     record_sha256: str = ""
 
     @field_validator(
@@ -1584,6 +1599,12 @@ class _InvocationLifecycleCommandReceipt(BaseModel):
 
     @model_validator(mode="after")
     def validate_record(self) -> _InvocationLifecycleCommandReceipt:
+        if self.temporary_service_operation_key is not None and (
+            self.kind is not InvocationLifecycleCommandKind.ADMIT
+            or self.participant_permit_operation is None
+            or self.participant_permit_commitment is None
+        ):
+            raise ValueError("Temporary service evidence requires exact permit admission.")
         if (
             self.result_session.id != self.session_id
             or self.result_session.instance_id != self.session_instance_id
@@ -2044,6 +2065,7 @@ def _invocation_lifecycle_command_receipt(
         active_profile=active_profile,
         participant_permit_operation=getattr(command, "participant_permit_operation", None),
         participant_permit_commitment=getattr(command, "participant_permit_commitment", None),
+        temporary_service_operation_key=getattr(command, "temporary_service_operation_key", None),
     )
 
 
@@ -2946,9 +2968,15 @@ def invocation_checkpoint_state_sha256(
     # stale.
     if checkpoint is not None:
         checkpoint = copy_durable_json_object(checkpoint, "invocation lifecycle checkpoint")
+        from cayu.collaboration._session_export_store import ROOT_KEY as EXPORT_ROOT_KEY
         from cayu.runtime._session_continuation_store import ROOT_KEY
 
         checkpoint.pop(ROOT_KEY, None)
+        # Export ownership is projected separately by native stores and is not
+        # visible to lifecycle mutation callbacks. Including it only in the
+        # preparation read makes an unchanged exported session falsely stale.
+        # The export owner still validates/preserves its root independently.
+        checkpoint.pop(EXPORT_ROOT_KEY, None)
     return sha256(
         canonical_durable_json_bytes(
             checkpoint,
@@ -3092,6 +3120,11 @@ async def apply_invocation_lifecycle_command(
     """Apply one version-1 command through a store's atomic lifecycle primitives."""
 
     copied = copy_invocation_lifecycle_command(command)
+    temporary_service = None
+    if type(copied) is AdmitInvocationCommand:
+        from cayu.runtime._temporary_continuation_scope import require_temporary_admission
+
+        temporary_service = require_temporary_admission(copied)
     if type(copied) is ReleaseInvocationCommand:
         copied = await _prepare_release_invocation_command_for_store(store, copied)
     else:
@@ -3231,6 +3264,7 @@ async def apply_invocation_lifecycle_command(
                         allow_pending_initial_interaction=(
                             copied.allow_pending_initial_interaction
                         ),
+                        temporary_service_admission=temporary_service,
                     ),
                 )
         except Exception:

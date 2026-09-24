@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from cayu.collaboration._contracts import ContractValue, ObjectRef
 from cayu.collaboration._permits import PermitCommand, ReceivingSettlementReceipt
+from cayu.collaboration.clarifications import ClarificationPolicy
 from cayu.collaboration.mandates import MandateAccessContext, MandateResolver, ResourceSelectorOwner
 from cayu.collaboration.requests import (
     Millis,
@@ -65,3 +66,4 @@ class RequestRegistration:
     max_ttl_ms: int
     resource_owners: tuple[ResourceSelectorOwner, ...] = ()
     receiving_owner: RequestReceivingOwner | None = None
+    clarification_policies: tuple[ClarificationPolicy, ...] = ()

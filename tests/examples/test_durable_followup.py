@@ -21,12 +21,14 @@ def test_followup_survives_worker_process_loss_before_due(tmp_path):
             env=environment,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=90,
             check=True,
         )
         return [json.loads(line) for line in result.stdout.splitlines()]
 
-    due = datetime.now(UTC) + timedelta(seconds=15)
+    # Include producer/replay/interpreter startup in the pre-due window.
+    # CI can spend more than 15 seconds starting these three processes.
+    due = datetime.now(UTC) + timedelta(seconds=60)
     assert invoke("schedule", "--due", due.isoformat())[0]["status"] == "pending"
     # A distinct producer replay converges without adding another occurrence.
     assert invoke("schedule", "--due", due.isoformat())[0]["status"] == "pending"
@@ -38,7 +40,7 @@ def test_followup_survives_worker_process_loss_before_due(tmp_path):
         text=True,
     )
     try:
-        readiness_deadline = time.monotonic() + 8
+        readiness_deadline = time.monotonic() + 30
         while True:
             try:
                 worker.communicate(timeout=0.25)

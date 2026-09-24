@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 if TYPE_CHECKING:
-    from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
+    from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
 
 from pydantic import (
     BaseModel,
@@ -333,6 +333,7 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._execution_to_wait import _ExecutionToWait
 from cayu.runtime._foreground_child_wait import (
     FOREGROUND_CHILD_TERMINAL_KEY,
     FOREGROUND_CHILD_WAIT_KEY,
@@ -13130,6 +13131,7 @@ class SessionEngine:
         participant_context: CollaborationAccessContext | None = None,
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
+        execution_to_wait: _ExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(pause_after_initial_transcript) is not bool:
             raise TypeError("pause_after_initial_transcript must be a bool.")
@@ -14035,6 +14037,7 @@ class SessionEngine:
                 raise RuntimeError("Initial transcript was not finalized during setup.")
             session_stream = self._run_session(
                 session=session,
+                execution_to_wait=execution_to_wait,
                 participant_context=participant_context,
                 invocation_context=invocation_context,
                 model_failover=model_failover,
@@ -14420,7 +14423,7 @@ class SessionEngine:
         request: ResumeRequest,
         *,
         store_resolved_session_id: str | None = None,
-        continuation_handoff: _ContinuationResumeHandoff | None = None,
+        continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_resume_request(
@@ -20346,7 +20349,7 @@ class SessionEngine:
         required_foreground_terminal: ForegroundChildTerminal | None = None,
         required_foreground_continuation: ForegroundParentContinuation | None = None,
         foreground_before_mutation: Callable[[], Awaitable[None]] | None = None,
-        continuation_handoff: _ContinuationResumeHandoff | None = None,
+        continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if request.failover is not None:
@@ -21829,6 +21832,8 @@ class SessionEngine:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
             _activate_session_interaction(session.id, interaction_id)
         try:
+            if continuation_handoff is not None:
+                await continuation_handoff.after_admission(invocation_context)
             (
                 issued_targeted_tool_grant_records,
                 targeted_tool_grant_events,
@@ -24359,6 +24364,7 @@ class SessionEngine:
         foreground_wait: ForegroundChildWait | None = None,
         model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        execution_to_wait: _ExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -24948,6 +24954,8 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                 )
             await turn_usage_tracker.mark_current_position()
+            if execution_to_wait is not None:
+                await execution_to_wait.prepare(invocation_context)
             if task_started and task_id is not None:
                 from cayu.runtime._task_group_invocation import bind_invocation
 
@@ -26538,6 +26546,15 @@ class SessionEngine:
                         yield event
                         if policy_decision is not None:
                             before_stop_decision = policy_decision
+                    if execution_to_wait is not None and (
+                        before_stop_decision is None
+                        or before_stop_decision.action == BeforeStopAction.COMPLETE
+                    ):
+                        await execution_to_wait.park(invocation_context)
+                        before_stop_decision = BeforeStopDecision(
+                            action=BeforeStopAction.INTERRUPT,
+                            reason="Explicit continuation wait reached a whole-turn boundary.",
+                        )
                     if before_stop_decision is not None:
                         if before_stop_decision.action == BeforeStopAction.CONTINUE:
                             if step >= max_steps:

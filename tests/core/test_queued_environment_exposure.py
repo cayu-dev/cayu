@@ -181,7 +181,7 @@ def test_queued_search_tool_preserves_exact_admission(
         ExecutionToolRequirementEvidence,
     )
     from cayu.runners.base import Runner
-    from cayu.runtime import _environment_lifecycle
+    from cayu.runtime import _environment_exposure, _environment_lifecycle
     from cayu.runtime._environment_exposure import require_environment_exposed
     from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
     from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
@@ -190,9 +190,18 @@ def test_queued_search_tool_preserves_exact_admission(
     from cayu.tools.base import ToolExecutableRequirement
     from cayu.tools.search import SearchTextTool
 
+    admission_now = datetime.now(UTC)
+    evaluate = _environment_lifecycle.evaluate_execution_admission
+
+    def evaluate_at_owned_time(*args, **kwargs):
+        return evaluate(*args, **{**kwargs, "now": admission_now})
+
+    for owner in (_environment_lifecycle, _environment_exposure):
+        monkeypatch.setattr(owner, "evaluate_execution_admission", evaluate_at_owned_time)
+
     class EvidenceRunner(Runner):
         def __init__(self):
-            self.observed_at = datetime.now(UTC)
+            self.observed_at = admission_now
             self.image = "sha256:" + "1" * 64
             self.snapshots = 0
             self.observers = []
@@ -235,6 +244,7 @@ def test_queued_search_tool_preserves_exact_admission(
             raise AssertionError("The scripted provider must not dispatch a tool.")
 
     async def run():
+        nonlocal admission_now
         store = (
             InMemorySessionStore()
             if backend == "memory"
@@ -323,7 +333,9 @@ def test_queued_search_tool_preserves_exact_admission(
                 )
                 assert task.cancelling() == 0
             if proof == "expired":
-                await asyncio.sleep(2.1)
+                # Advance only after the first real dispatch. Slow CI startup
+                # must not consume the evidence before this continuation race.
+                admission_now += timedelta(seconds=2.1)
             elif proof == "changed_image":
                 runner.image = "sha256:" + "3" * 64
             provider.release.set()

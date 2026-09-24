@@ -10,6 +10,7 @@ from tests.core import test_participant_identity as identity_tests
 from tests.core.test_collaboration_request_foundation import public_setup
 
 from cayu.applications import CayuApp
+from cayu.collaboration._clarification_state import clarification_commitment
 from cayu.collaboration._contracts import CollaborationConflict, ExactMatch, ObjectRef, OperationRef
 from cayu.collaboration._permits import ReceivingSettlementReceipt
 from cayu.collaboration._session_export_participant import (
@@ -42,6 +43,7 @@ from cayu.messages import Message
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
+from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.anyio
 stores = identity_tests.stores
@@ -342,6 +344,8 @@ async def _admit(case, *, decision="continue", with_source=True):
         operation=values[1].operation("admission"),
         expected=accepted.expected,
         expected_revision=1,
+        expected_input_revision=0,
+        expected_input_sha256=clarification_commitment(accepted.expected, SecretRedactor()),
         generation=1,
         decision=decision,
         source_export=case.source.expected.intent.request.ref if with_source else None,
@@ -523,6 +527,8 @@ async def test_source_evidence_is_bound_to_the_request_contract_and_producer(
                 operation=values[1].operation("admission-mismatch"),
                 expected=accepted.expected,
                 expected_revision=1,
+                expected_input_revision=0,
+                expected_input_sha256=clarification_commitment(accepted.expected, SecretRedactor()),
                 generation=1,
                 decision="continue",
                 source_export=changed_source.expected.intent.request.ref,

@@ -85,6 +85,74 @@ def test_terminalization_without_registrations_publishes_one_outcome(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_terminalizer_settles_between_other_owners_preflight_reads(
+    tmp_path, backend, request, monkeypatch
+):
+    from cayu import SessionRunFenced
+
+    async def exercise():
+        store = _store_for_backend(backend, tmp_path / "preflight-race.db", request)
+        other = (
+            store
+            if backend == "memory"
+            else _store_for_backend(backend, tmp_path / "preflight-race.db", request)
+        )
+        running, _, stage = await _stage_in_flight_model_boundary(
+            store,
+            session_id="terminalization-read-race",
+            provider_name=_RecordingProvider.name,
+            reservation_ids=(),
+        )
+        command = ModelCompletionManualRecoveryRequest(
+            session_id=running.id,
+            stage_id=stage.stage_id,
+            expected_run_epoch=running.run_epoch,
+            terminal_status="failed",
+            terminalization_only=True,
+            expected_session_instance_id=running.instance_id,
+            inactive_for_seconds=0,
+        )
+        before, release = asyncio.Event(), asyncio.Event()
+        original = store.load_model_completion_stage_settlement
+        losing = None
+
+        async def paused(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            if asyncio.current_task() is losing and result is None:
+                before.set()
+                await release.wait()
+            return result
+
+        monkeypatch.setattr(store, "load_model_completion_stage_settlement", paused)
+        app = CayuApp(session_store=store, enable_logging=False)
+        winner = CayuApp(session_store=other, enable_logging=False)
+        losing = asyncio.create_task(app.recover_model_completion_stage(command))
+        try:
+            await asyncio.wait_for(before.wait(), 30)
+            result = await winner.recover_model_completion_stage(command)
+            release.set()
+            with pytest.raises(SessionRunFenced):
+                await losing
+            replay = await app.recover_model_completion_stage(command)
+            assert replay.replayed and replay.settlement == result.settlement
+            events = await store.query_events(
+                EventQuery(
+                    session_id=running.id,
+                    event_types=(EventType.SESSION_FAILED, EventType.SESSION_INTERRUPTED),
+                )
+            )
+            assert len(events) == 1
+        finally:
+            release.set()
+            await asyncio.gather(losing, return_exceptions=True)
+            if backend != "memory":
+                await other.close()
+                await store.close()
+
+    asyncio.run(exercise())
+
+
 def test_recovery_plan_executes_terminalization_without_registrations(tmp_path):
     from cayu import (
         RecoveryDecision,

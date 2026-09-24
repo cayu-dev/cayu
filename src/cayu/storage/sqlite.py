@@ -57,6 +57,7 @@ from cayu.storage import _creation_fence
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 
 if TYPE_CHECKING:
+    from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -6345,12 +6346,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                         "Session closure requires settled protected tool effects."
                     ) from None
                 if key.startswith(continuations.CONTINUATION_OPERATION_PREFIX):
-                    if (
-                        type(value) is not dict
-                        or len(continuation_records) >= continuations.MAX_RETAINED_TICKETS + 1
-                    ):
-                        raise ValueError("Continuation retention evidence is malformed.")
-                    continuation_records[key] = value
+                    continuations.collect_retained_record(continuation_records, key, value)
                 elif key.startswith(session_exports.OPERATION_PREFIX):
                     if type(value) is not dict:
                         raise ValueError("Session export retention evidence is malformed.")
@@ -6798,8 +6794,12 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
         expected_latest_interaction_event_id: str | None = None,
         require_no_active_model_completion_dispatch: bool = False,
+        temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
+        from cayu.runtime._temporary_continuation_scope import prepare_temporary_transition
         from cayu.sessions.pending_actions import pending_action_event_storage_values
+
+        temporary_service_admission = prepare_temporary_transition(temporary_service_admission)
 
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -7122,6 +7122,57 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                         transformed_checkpoint,
                         result_checkpoint,
                         session_id=session_id,
+                    )
+                if temporary_service_admission is not None:
+                    from cayu.runtime._session_continuation import continuation_operation_key
+                    from cayu.runtime._temporary_continuation import temporary_service_key
+                    from cayu.runtime._temporary_continuation_store import (
+                        compose_temporary_service_admission,
+                    )
+
+                    intent = temporary_service_admission.dispatch.intent
+                    parent_key = continuation_operation_key(intent.ticket)
+                    from cayu.runtime._temporary_service_target import target_service_key
+
+                    child_key = (
+                        temporary_service_key(intent.operation)
+                        if intent.mode == "same_session"
+                        else target_service_key(intent.operation)
+                    )
+                    service_rows = self._connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                        (session_id, parent_key, child_key),
+                    ).fetchall()
+                    service_records = {
+                        row["idempotency_key"]: json.loads(row["record_json"])
+                        for row in service_rows
+                    }
+                    publication = compose_temporary_service_admission(
+                        source_session=loaded,
+                        source_checkpoint=current_checkpoint,
+                        parent_record=service_records.get(parent_key),
+                        child_record=service_records.get(child_key),
+                        admitted_session=transitioned,
+                        admitted_checkpoint=transformed_checkpoint,
+                        admission=temporary_service_admission,
+                        now=updated_at,
+                    )
+                    transformed_checkpoint = publication.checkpoint
+                    self._connection.executemany(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                        "record_json = excluded.record_json, updated_at = excluded.updated_at",
+                        [
+                            (
+                                session_id,
+                                key,
+                                sqlite_support.json_dumps(record),
+                                sqlite_support.format_datetime(updated_at),
+                            )
+                            for key, record in publication.operation_records.items()
+                        ],
                     )
                 if transformed_checkpoint is not None:
                     self._connection.execute(
@@ -12395,6 +12446,83 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             preserve_completion_result_publications=True,
         )
 
+    async def _prepare_temporary_side_service(self, preparation):
+        from cayu.runtime._side_service_preparation import (
+            SidePreparationSnapshot,
+            plan_preparation,
+            preparation_record_keys,
+            prepare_selection,
+        )
+
+        prepared = prepare_selection(preparation)
+        keys = preparation_record_keys(prepared)
+
+        def statement(connection):
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                snapshots = {}
+                for session_id in sorted(keys):
+                    session = self._load_unlocked(session_id)
+                    if session is None:
+                        raise KeyError("Side-service session is unavailable.")
+                    _assert_session_run_epoch(session_id, session)
+                    for owner in self._closure_lineage_owners_unlocked((session_id,)):
+                        _check_closure_lineage_owner(owner, (session_id,))
+                    records = {}
+                    for key in keys[session_id]:
+                        row = connection.execute(
+                            "SELECT record_json FROM cayu_session_operations WHERE session_id = ? AND idempotency_key = ?",
+                            (session_id, key),
+                        ).fetchone()
+                        if row is not None:
+                            records[key] = json.loads(row["record_json"])
+                    snapshots[session_id] = SidePreparationSnapshot(
+                        session, self._load_checkpoint_unlocked(session_id), records
+                    )
+                now = self._ownership_clock()
+                plans = plan_preparation(prepared, snapshots, now)
+                # Serialize and validate every row before starting either write.
+                checkpoints = {
+                    session_id: sqlite_support.checkpoint_row_values(
+                        session_id, plan.checkpoint, now
+                    )
+                    for session_id, plan in plans.items()
+                }
+                operations = [
+                    (
+                        session_id,
+                        key,
+                        sqlite_support.json_dumps(record),
+                        sqlite_support.format_datetime(now),
+                    )
+                    for session_id, plan in plans.items()
+                    for key, record in plan.operation_records.items()
+                ]
+                for session_id, values in checkpoints.items():
+                    connection.execute(
+                        "INSERT INTO cayu_checkpoints (session_id, state_json, updated_at, pending_action_source_bytes, "
+                        "pending_action_tool_call_count, pending_action_flags, pending_action_metrics_ready) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                        "state_json=excluded.state_json, updated_at=excluded.updated_at, "
+                        "pending_action_source_bytes=excluded.pending_action_source_bytes, "
+                        "pending_action_tool_call_count=excluded.pending_action_tool_call_count, "
+                        "pending_action_flags=excluded.pending_action_flags, pending_action_metrics_ready=excluded.pending_action_metrics_ready",
+                        values,
+                    )
+                    _touch_session_activity(connection, session_id, now)
+                connection.executemany(
+                    "INSERT INTO cayu_session_operations (session_id, idempotency_key, record_json, updated_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                    "record_json=excluded.record_json, updated_at=excluded.updated_at",
+                    operations,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+        await self._run_write(statement)
+
     async def publish_session_operation_guarded_with_store_time(
         self,
         session_id: str,
@@ -16407,6 +16535,29 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     (target_id,),
                 ).fetchone()
                 checkpoint = None if checkpoint_row is None else json.loads(checkpoint_row[0])
+                parked_target = False
+                if session is not None and session.status in {"completed", "failed", "interrupted"}:
+                    from cayu.storage._peer_attempts import (
+                        parked_clarification_key,
+                        permits_parked_clarification_append,
+                    )
+
+                    wait_key = parked_clarification_key(
+                        checkpoint, session_id=session.id, instance_id=session.instance_id
+                    )
+                    if wait_key is not None:
+                        wait_row = connection.execute(
+                            "SELECT record_json FROM cayu_session_operations WHERE session_id = ? AND idempotency_key = ?",
+                            (session.id, wait_key),
+                        ).fetchone()
+                        parked_target = permits_parked_clarification_append(
+                            request,
+                            checkpoint,
+                            None if wait_row is None else json.loads(wait_row[0]),
+                            session_id=session.id,
+                            instance_id=session.instance_id,
+                            run_epoch=session.run_epoch,
+                        )
                 if session is not None and session.status not in {
                     "completed",
                     "failed",
@@ -16445,6 +16596,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     or not source_valid
                     or (
                         session is not None
+                        and not parked_target
                         and session.status in {"completed", "failed", "interrupted"}
                     )
                 ):

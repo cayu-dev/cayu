@@ -2,6 +2,11 @@
 
 from typing import Literal
 
+from cayu.collaboration._clarification_commands import (
+    ClarificationCloseReceipt,
+    ClarificationOpenReceipt,
+    ClarificationReplyReceipt,
+)
 from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration._permits import PermitReceipt
 from cayu.collaboration.lifecycle import LifecycleReceipt
@@ -34,6 +39,9 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
             RequestProgressReceipt,
             RequestOutcomeReceipt,
             RequestObservationReceipt,
+            ClarificationOpenReceipt,
+            ClarificationReplyReceipt,
+            ClarificationCloseReceipt,
         ),
     ):
         command = (
@@ -43,7 +51,15 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
             if isinstance(value, RequestControlReceipt)
             else value.command.expected
             if isinstance(
-                value, (RequestAdmissionReceipt, RequestProgressReceipt, RequestOutcomeReceipt)
+                value,
+                (
+                    RequestAdmissionReceipt,
+                    RequestProgressReceipt,
+                    RequestOutcomeReceipt,
+                    ClarificationOpenReceipt,
+                    ClarificationReplyReceipt,
+                    ClarificationCloseReceipt,
+                ),
             )
             else value.expected
         )

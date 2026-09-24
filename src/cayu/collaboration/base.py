@@ -39,6 +39,7 @@ from cayu.collaboration._permits import (
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
 from cayu.collaboration._request_receipts import request_receipt_metadata
+from cayu.collaboration.clarifications import ClarificationDueCursor
 from cayu.collaboration.lifecycle import (
     CollaborationHistoryUnavailable,
     LifecycleCommand,
@@ -75,6 +76,7 @@ from cayu.collaboration.requests import (
     RequestControlCommand,
     RequestControlReceipt,
     RequestReceipt,
+    RequestRef,
 )
 from cayu.collaboration.waits import wait_identity_digest
 from cayu.vaults.redaction import SecretRedactor
@@ -93,6 +95,12 @@ Table = Literal[
     "history_uses",
     "requests",
     "request_events",
+    "request_pruning",
+    "clarification_questions",
+    "clarification_inputs",
+    "clarification_lineages",
+    "clarification_services",
+    "clarification_deliveries",
 ]
 Key = tuple[str | int, ...]
 IDENTITY_FAMILY = FamilyVersion(family="participant.identity", version=1)
@@ -133,6 +141,35 @@ class _Repository(Protocol):
     async def scan_due_requests(self, *, after: int, now_ms: int, limit: int) -> list[object]: ...
 
     async def scan_request_events(self, *, after: int, limit: int) -> list[object]: ...
+
+    async def scan_clarification_questions(
+        self, request: RequestRef, *, limit: int
+    ) -> list[object]: ...
+
+    async def scan_clarification_lineage_questions(
+        self, lineage: OperationRef, *, limit: int
+    ) -> list[object]: ...
+
+    async def scan_due_clarifications(
+        self, *, after: ClarificationDueCursor | None, now_ms: int, limit: int
+    ) -> list[object]: ...
+
+    async def scan_pending_clarification_services(
+        self, *, after: ClarificationDueCursor | None, limit: int
+    ) -> list[object]: ...
+
+    async def scan_clarification_request_handoffs(
+        self,
+        request: RequestRef,
+        *,
+        family: Literal["clarification_services", "clarification_deliveries"],
+        limit: int,
+        pending_only: bool = False,
+    ) -> list[object]: ...
+
+    async def scan_pending_clarification_deliveries(
+        self, *, after: ClarificationDueCursor | None, limit: int
+    ) -> list[object]: ...
 
 
 class _Anchor(ContractValue):
@@ -421,6 +458,7 @@ class CollaborationStore(ABC):
         wait,
         *,
         redactor: SecretRedactor,
+        cancelled_preparation: bool = False,
     ):
         """Persist one exact wait registration without dispatching source work."""
 
@@ -454,8 +492,20 @@ class CollaborationStore(ABC):
                 if wait_identity_digest(existing.registration.wait) != wait_identity_digest(wait):
                     raise CollaborationConflict("Wait registration intent changed.")
                 return existing
-            await require_open_namespace(tx, anchor, wait.operation, redactor)
-            if await tx.now_ms() >= deadline_ms(wait.deadline):
+            if cancelled_preparation:
+                # This private receiving-owner path discharges an already
+                # prepared native wait. Sealing/rotation forbids new work, not
+                # exact cancellation. Retirement/pruning still fails closed:
+                # retired generations must never acquire fresh responsibility.
+                from cayu.collaboration._namespace_store import load_namespace
+
+                namespace = await load_namespace(tx, anchor, wait.operation.generation, redactor)
+                if namespace.state == "retired":
+                    raise CollaborationConflict("Retired namespace cannot acquire wait cleanup.")
+            else:
+                await require_open_namespace(tx, anchor, wait.operation, redactor)
+            now = await tx.now_ms()
+            if now >= deadline_ms(wait.deadline) and not cancelled_preparation:
                 raise CollaborationConflict("Wait deadline has already passed.")
             registration = WaitRegistration(
                 wait=wait,
@@ -470,6 +520,23 @@ class CollaborationStore(ABC):
                 source_pins=wait.source_keys,
                 events=(event,),
             )
+            if cancelled_preparation:
+                if wait.delivery_ticket is None:
+                    raise CollaborationConflict("Cancelled preparation requires a native ticket.")
+                state = "expired" if now >= deadline_ms(wait.deadline) else "cancelled"
+                snapshot = _consume_wait_reservation(
+                    snapshot,
+                    snapshot.model_copy(
+                        update={
+                            "state": state,
+                            "delivery": "pending",
+                            "terminal_at_ms": now,
+                            "revision": 2,
+                            "events": (event, WaitEvent(sequence=2, kind=state)),
+                        }
+                    ),
+                    redactor=redactor,
+                )
             updated = prepare_contract(
                 _Anchor,
                 anchor.model_copy(

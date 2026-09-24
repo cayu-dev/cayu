@@ -9,6 +9,13 @@ from typing import Annotated, NamedTuple, TypeVar
 
 from pydantic import Field, StrictInt
 
+from cayu.collaboration._clarification_commands import (
+    ClarificationCloseCommand,
+    ClarificationCloseReceipt,
+    ClarificationOpenCommand,
+    ClarificationOpenReceipt,
+)
+from cayu.collaboration._clarification_state import ClarificationQuestionState
 from cayu.collaboration._contracts import (
     CollaborationConflict,
     CollaborationContractError,
@@ -51,6 +58,7 @@ from cayu.collaboration.access import (
     CollaborationAccessGrant,
 )
 from cayu.collaboration.base import REQUEST_FAMILY, _key, _Repository, _stored_mode
+from cayu.collaboration.clarifications import MAX_CLARIFICATION_POLICIES, ClarificationPolicy
 from cayu.collaboration.lifecycle import (
     CollaborationHistoryUnavailable,
     CollaborationNamespaceRetired,
@@ -155,6 +163,7 @@ class _Submission(ContractValue):
     context: MandateAccessContext
     observation: RequestObservation | None = None
     allow_retention: bool = False
+    clarification: ClarificationOpenCommand | ClarificationCloseCommand | None = None
 
 
 class _DueQuery(ContractValue):
@@ -218,6 +227,7 @@ class RequestCoordinator:
         self._resource_owners = {}
         self._resolver_ref = None
         self._receiving_ref = None
+        self._clarification_policies: dict[ObjectRef, ClarificationPolicy] = {}
         if registration is not None:
             if (
                 type(registration) is not RequestRegistration
@@ -226,11 +236,23 @@ class RequestCoordinator:
                 or not 1 <= registration.max_ttl_ms <= 2**53 - 1
                 or type(registration.resource_owners) is not tuple
                 or len(registration.resource_owners) > 32
+                or type(registration.clarification_policies) is not tuple
+                or len(registration.clarification_policies) > MAX_CLARIFICATION_POLICIES
             ):
                 raise CollaborationContractError("Invalid request owner registration.")
             self._resolver_ref = prepare_contract(
                 ObjectRef, registration.mandates.ref, redactor=redactor
             )
+            for candidate in registration.clarification_policies:
+                policy = prepare_contract(ClarificationPolicy, candidate, redactor=redactor)
+                if (
+                    policy.reference.revision is None
+                    or policy.reference.owner.application_scope
+                    != self._resolver_ref.owner.application_scope
+                    or policy.reference in self._clarification_policies
+                ):
+                    raise CollaborationContractError("Invalid clarification policy registration.")
+                self._clarification_policies[policy.reference] = policy
             if registration.receiving_owner is not None:
                 if not isinstance(registration.receiving_owner, RequestReceivingOwner):
                     raise CollaborationContractError("Invalid receiving owner registration.")
@@ -246,6 +268,20 @@ class RequestCoordinator:
                 ):
                     raise CollaborationContractError("Invalid request resource owner registration.")
                 self._resource_owners[owner.owner] = owner
+
+    def _require_clarification_policy(self, candidate: ClarificationPolicy) -> ClarificationPolicy:
+        """Use a frozen explicit registration, never a caller-selected allowance.
+
+        Historical commitments remain evidence after a registration changes;
+        this check admits only new work under the currently registered policy.
+        It must not be used to prevent settlement of older responsibility.
+        """
+        policy = prepare_contract(ClarificationPolicy, candidate, redactor=self._redactor)
+        registered = self._clarification_policies.get(policy.reference)
+        if registered is None:
+            raise CollaborationAccessDenied("No matching clarification policy is registered.")
+        require_exact_contract(registered, policy, redactor=self._redactor)
+        return prepare_contract(ClarificationPolicy, registered, redactor=self._redactor)
 
     async def close(self) -> None:
         await self._owners.drain()
@@ -432,6 +468,59 @@ class RequestCoordinator:
         result = await self._run(value, mode="inspect")
         assert result is None or isinstance(result, RequestSnapshot)
         return result
+
+    async def close_clarification(
+        self, command: ClarificationCloseCommand, *, context: MandateAccessContext
+    ) -> ClarificationCloseReceipt:
+        command = prepare_contract(ClarificationCloseCommand, command, redactor=self._redactor)
+        value = prepare_contract(
+            _Submission,
+            {"request": command.expected, "clarification": command, "context": context},
+            redactor=self._redactor,
+        )
+        require_exact_contract(
+            command.initiator, _initiator(value.context), redactor=self._redactor
+        )
+        return await self._run(value, mode="close_clarification")
+
+    async def lookup_clarification(
+        self,
+        expected: ClarificationOpenCommand | ClarificationCloseCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> ExactLookup[ClarificationOpenReceipt | ClarificationCloseReceipt]:
+        return await self._lookup_clarification(expected, context=context, include_state=False)
+
+    async def inspect_clarification(
+        self, expected: ClarificationOpenCommand, *, context: MandateAccessContext
+    ) -> ExactLookup[ClarificationQuestionState]:
+        expected = prepare_contract(ClarificationOpenCommand, expected, redactor=self._redactor)
+        return await self._lookup_clarification(expected, context=context, include_state=True)
+
+    async def _lookup_clarification(
+        self,
+        expected: ClarificationOpenCommand | ClarificationCloseCommand,
+        *,
+        context: MandateAccessContext,
+        include_state: bool,
+    ):
+        schema = (
+            ClarificationCloseCommand
+            if isinstance(expected, ClarificationCloseCommand)
+            else ClarificationOpenCommand
+        )
+        expected = prepare_contract(schema, expected, redactor=self._redactor)
+        value = prepare_contract(
+            _Submission,
+            {"request": expected.expected, "clarification": expected, "context": context},
+            redactor=self._redactor,
+        )
+        try:
+            return await self._run(
+                value, mode="inspect_clarification" if include_state else "lookup_clarification"
+            )
+        except (CollaborationUnavailable, CollaborationContractError):
+            return ExactUnavailable()
 
     async def lookup(
         self, expected: RequestCommand | RequestControlCommand, *, context: MandateAccessContext
@@ -761,6 +850,12 @@ class RequestCoordinator:
         elif mode == "request_control":
             control = prepare_contract(RequestControlReceipt, raw, redactor=self._redactor)
             selected = control.expected.intent.expected.intent.selection
+        elif mode == "clarification_open":
+            clarification = prepare_contract(ClarificationOpenReceipt, raw, redactor=self._redactor)
+            selected = clarification.command.expected.intent.selection
+        elif mode == "clarification_close":
+            closure = prepare_contract(ClarificationCloseReceipt, raw, redactor=self._redactor)
+            selected = closure.command.expected.intent.selection
         else:
             # Another operation family is not evidence of request read access.
             raise CollaborationAccessDenied("Operation is outside request read authority.")
@@ -866,6 +961,67 @@ class RequestCoordinator:
             await validate(("readback",))
             if mode == "authorize_retained":
                 return None
+            if mode in {"lookup_clarification", "inspect_clarification"}:
+                from cayu.collaboration._clarification_store import (
+                    lookup_clarification_in_transaction,
+                )
+
+                if value.clarification is None:
+                    raise CollaborationContractError(
+                        "Clarification readback requires exact intent."
+                    )
+                async with store._transaction(
+                    initialized.binding.application_scope, write=False
+                ) as tx:
+                    await self._require_retained_read_grant(
+                        tx, value.clarification.operation, read_grant
+                    )
+                    if isinstance(value.clarification, ClarificationCloseCommand):
+                        await self._require_retained_read_grant(
+                            tx, value.clarification.question, read_grant
+                        )
+                    # Compare only inside the held authorization and snapshot.
+                    # Later guard cleanup failures are not operation conflicts.
+                    try:
+                        result = await lookup_clarification_in_transaction(
+                            store,
+                            tx,
+                            initialized,
+                            value.clarification,
+                            redactor=self._redactor,
+                            include_state=mode == "inspect_clarification",
+                        )
+                    except CollaborationConflict:
+                        result = ExactConflict()
+                    except (CollaborationUnavailable, CollaborationContractError):
+                        result = ExactUnavailable()
+                    if await tx.now_ms() >= permission_deadline:
+                        raise CollaborationAccessDenied("Clarification read authority expired.")
+                    return result
+            if mode == "close_clarification":
+                from cayu.collaboration._clarification_store import close_in_transaction
+
+                closure = value.clarification
+                if not isinstance(closure, ClarificationCloseCommand):
+                    raise CollaborationContractError("Clarification closure requires exact intent.")
+                await validate(("readback", "administer"))
+                _, control_grant = self._participants._authorize(
+                    CollaborationAccessContext(principal=context.principal), "request_control"
+                )
+                self._participants._require_refs(control_grant, declared)
+                self._participants._capability(
+                    store, initialized, mutation=True, family=REQUEST_FAMILY
+                )
+                async with store._transaction(
+                    initialized.binding.application_scope, write=True
+                ) as tx:
+                    await self._require_retained_read_grant(tx, closure.question, control_grant)
+                    await self._require_retained_read_grant(tx, closure.operation, control_grant)
+                    if await tx.now_ms() >= permission_deadline:
+                        raise CollaborationAccessDenied("Clarification closure authority expired.")
+                    return await close_in_transaction(
+                        store, tx, initialized, closure, redactor=self._redactor
+                    )
             original_initiator = _initiator(context) if command is None else command.initiator
             async with store._transaction(initialized.binding.application_scope, write=False) as tx:
                 await self._require_retained_read_grant(tx, request.operation, read_grant)

@@ -43,6 +43,7 @@ from cayu.collaboration.releases import (
 from cayu.sessions.invocation import SessionInvocation
 
 if TYPE_CHECKING:
+    from cayu.collaboration._clarification_deliveries import ClarificationDeliveryRecord
     from cayu.collaboration.access import CollaborationAccessContext
     from cayu.collaboration.peer_content import (
         PeerAppendKey,
@@ -409,7 +410,7 @@ class SessionExportPolicy(ABC):
         context: CollaborationAccessContext,
         *,
         request: PeerContentAppendRequest,
-        receipt: PeerContentReceipt,
+        receipt: PeerContentReceipt | ClarificationDeliveryRecord,
         reason: str,
     ) -> AbstractAsyncContextManager[None]:
         """Authorize discharge of an exact retained delivery, not new disclosure.
@@ -418,6 +419,10 @@ class SessionExportPolicy(ABC):
         complete request and reason. Revoking source disclosure must not itself
         revoke an independently authorized cleanup obligation. The store-owned
         receipt is evidence of that obligation, never permission by itself.
+        For a clarification not yet received by SessionStore, its registered
+        owner supplies the exact durable ClarificationDeliveryRecord instead.
+        Policies must authenticate that preparation independently; it grants
+        cleanup only, never source read, append, or provider exposure authority.
         The default denies; no unregistered cleanup authority is inferred.
         """
         raise SessionExportDenied()

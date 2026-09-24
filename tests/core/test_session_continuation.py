@@ -1054,6 +1054,37 @@ def _consumption(
     )
 
 
+def test_temporary_service_cannot_carry_final_consumption_authority() -> None:
+    async def run():
+        store, ticket, latch = await _ready_continuation()
+        prepared = _consumption(ticket, latch, "final-continuation")
+        assert prepared.ticket.state == "WAITING"
+        servicing = ticket.model_copy(
+            update={"state": "SERVICING", "revision": ticket.revision + 1}
+        )
+        with pytest.raises(ValueError, match="waiting or consumed"):
+            ContinuationConsumption.model_validate(
+                prepared.model_dump() | {"ticket": servicing.model_dump()}
+            )
+        retained = await store.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        assert retained is not None
+        # The aggregate now rejects an unbacked SERVICING state even before
+        # checking its attempted final consumption.
+        with pytest.raises(ValueError, match="Temporary service ownership"):
+            ContinuationRecord.model_validate(
+                retained.model_dump()
+                | {"ticket": servicing.model_dump(), "consumption": prepared.model_dump()}
+            )
+        assert retained.consumption is None
+        assert retained.latch is not None
+
+    asyncio.run(run())
+
+
 async def _test_concurrent_consumption_and_retirement_elect_once() -> None:
     store, ticket, latch = await _ready_continuation()
     first = _consumption(ticket, latch, "continuation-1")
@@ -1441,6 +1472,9 @@ def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> No
         "publish_session_operation",
         "latch_continuation",
         "_initialize_continuation_namespace",
+        "_publish_temporary_service_target",
+        "_prepare_temporary_side_service",
+        "_load_temporary_service_target",
         "apply_invocation_lifecycle_command",
     ],
 )
@@ -1838,7 +1872,15 @@ async def _test_continuation_admission_uses_typed_lifecycle_boundary(
                     assert len(ledger.receipts) <= 6
                     return {item.command_identity for item in ledger.receipts}
 
-                assert identity in await advance("pending")
+                original_receipts = {
+                    f"{kind}:{session.id}:{session.instance_id}:{ticket.writer_generation}"
+                    # This native fixture starts with CREATE, unlike the public
+                    # participant-root fixture's inert creation then ADMIT.
+                    for kind in ("create", "release")
+                }
+                protected = await advance("pending")
+                assert identity in protected
+                assert original_receipts <= protected
                 await owner.drain()
                 if persistent_store:
                     await close_store()
@@ -1861,7 +1903,9 @@ async def _test_continuation_admission_uses_typed_lifecycle_boundary(
                 assert settled.consumption.receipt_stage == (
                     "excluded" if compact_before_recovery == "superseded" else "admitted"
                 )
-                assert identity not in await advance("settled")
+                unprotected = await advance("settled")
+                assert identity not in unprotected
+                assert original_receipts.isdisjoint(unprotected)
                 assert await owner.reconcile_admission(prepared) == settled
                 await store.append_event(
                     session.id,

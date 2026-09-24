@@ -9,6 +9,7 @@ from tests.core import test_participant_identity as identity_tests
 from tests.core.test_participant_identity import CONTEXT, app, create, registration
 from tests.core.test_participant_lifecycle import change
 
+from cayu.collaboration._clarification_state import clarification_commitment
 from cayu.collaboration._contracts import (
     CollaborationConflict,
     ExactMatch,
@@ -58,8 +59,13 @@ stores = identity_tests.stores
 REDACTOR = SecretRedactor()
 
 
-async def setup(store, *, reg=None):
-    application = app(store, registration() if reg is None else reg)
+async def setup(store, *, reg=None, session_store=None, application_options=None):
+    application = app(
+        store,
+        registration() if reg is None else reg,
+        **({} if session_store is None else {"session_store": session_store}),
+        **(application_options or {}),
+    )
     initialized = await application.initialize_collaboration()
     _, first = await create(application, initialized, "sender")
     _, second = await create(application, initialized, "recipient", alias="reviewer")
@@ -282,6 +288,8 @@ async def test_admission_progress_outcome_and_observation_are_exactly_replayable
         operation=initialized.operation("admission"),
         expected=accepted.receipt.expected,
         expected_revision=1,
+        expected_input_revision=0,
+        expected_input_sha256=clarification_commitment(accepted.receipt.expected, REDACTOR),
         generation=1,
         decision=decision,
         source_export=export_request.ref if decision in {"continue", "fork", "fresh"} else None,

@@ -46,6 +46,7 @@ from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL, SQLITE_AUXILIARY_ACCOUNTING_DDL
 from cayu.storage._collaboration_schema import (
+    SQLITE_COLLABORATION_CLARIFICATION_DDL,
     SQLITE_COLLABORATION_DDL,
     SQLITE_COLLABORATION_LIFECYCLE_DDL,
     SQLITE_COLLABORATION_REQUEST_DDL,
@@ -1011,6 +1012,7 @@ _MIGRATION_STEPS: dict[int, str] = {
             registered_at TEXT NOT NULL
         );
     """,
+    105: SQLITE_COLLABORATION_CLARIFICATION_DDL,
     104: """
         CREATE TABLE IF NOT EXISTS cayu_peer_content_attempts (
             operation_key TEXT PRIMARY KEY, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL
@@ -6440,7 +6442,10 @@ def reconcile_schema(
         _validate_revision_88_closure_schema(connection)
     if current.revision >= 93:
         validate_sqlite_collaboration_schema(
-            connection, lifecycle=current.revision >= 94, requests=current.revision >= 95
+            connection,
+            lifecycle=current.revision >= 94,
+            requests=current.revision >= 95,
+            clarifications=current.revision >= 105,
         )
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)

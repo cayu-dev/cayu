@@ -123,6 +123,11 @@ withdrawal/cleanup authority for the full request, retained receipt and reason.
 This guard cannot create a fresh obligation or grant content access. If append
 already won, exclusion returns truthful appended status with its payload withheld.
 Exclusion before any retained operation still requires producing authorization.
+For prepared clarification delivery, the registered clarification owner may
+instead supply its exact durable `ClarificationDeliveryRecord` to this guard.
+The policy must independently authorize discharge of that preparation; neither
+its payload nor historical export evidence grants disclosure. Ordinary raw peer
+exclusion does not accept caller-supplied preparation records.
 
 Checkpoint compaction retains historical peer parts separately as typed messages.
 Compactors receive content-free markers, never the peer payload; peer-bearing

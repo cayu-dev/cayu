@@ -14,7 +14,10 @@ from cayu.runtime._session_continuation import (
     CONTINUATION_MAX_EVENT_BYTES,
     CONTINUATION_MAX_EVENTS,
     CONTINUATION_MAX_LATCH_EVIDENCE_BYTES,
+    CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES,
     CONTINUATION_MAX_RETIREMENT_EVIDENCE_BYTES,
+    CONTINUATION_MAX_SERVICE_REFERENCE_BYTES,
+    CONTINUATION_MAX_SERVICES,
     CONTINUATION_NAMESPACE_KEY,
     CONTINUATION_OPERATION_PREFIX,
     ContinuationConflict,
@@ -22,11 +25,17 @@ from cayu.runtime._session_continuation import (
     ContinuationNamespace,
     ContinuationPreparation,
     ContinuationRecord,
+    ContinuationReleasedExecution,
+    ContinuationTicket,
     continuation_operation_key,
 )
 from cayu.runtime._session_continuation_scope import (
     continuation_authority_visible,
     current_publication_key,
+)
+from cayu.runtime._temporary_service_target import (
+    MAX_TARGET_SERVICES,
+    TemporaryServiceTargetReference,
 )
 
 if TYPE_CHECKING:
@@ -34,6 +43,18 @@ if TYPE_CHECKING:
 
 ROOT_KEY = "session_continuations"
 MAX_RETAINED_TICKETS = 64
+# One namespace, every retained ticket and its bounded children, plus receiving
+# responsibilities owned by this session for services originating elsewhere.
+MAX_RETAINED_CONTINUATION_RECORDS = (
+    1 + MAX_RETAINED_TICKETS * (1 + CONTINUATION_MAX_SERVICES) + MAX_TARGET_SERVICES
+)
+
+
+def collect_retained_record(records: dict[str, Any], key: str, value: Any) -> None:
+    """Bound hydration before the shared owner validates the complete index."""
+    if type(value) is not dict or len(records) >= MAX_RETAINED_CONTINUATION_RECORDS:
+        raise ValueError("Continuation retention evidence is malformed.")
+    records[key] = value
 
 
 def encoded(value: Any) -> bytes:
@@ -48,26 +69,42 @@ class _Entry(ContractValue):
     ticket_key: StrictStr = Field(pattern=r"^session-continuation:[0-9a-f]{64}$")
     state: Literal["ARMING", "WAITING", "SERVICING", "CONSUMED", "RETIRED"]
     record_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    originating_writer_generation: StrictInt = Field(ge=1, le=2**53 - 1)
     reserved_bytes: Literal[65536] = MAX_ENVELOPE_BYTES
     admission_claim_id: StrictStr | None = Field(default=None, min_length=1, max_length=128)
     admission_command_digest: StrictStr | None = None
     admission_expected_run_epoch: StrictInt | None = Field(default=None, ge=1)
+    service_receipt_epochs: tuple[StrictInt, ...] = Field(
+        default=(), max_length=CONTINUATION_MAX_SERVICES
+    )
 
     @model_validator(mode="after")
     def complete_admission_identity(self) -> _Entry:
         if (self.admission_command_digest is None) != (self.admission_expected_run_epoch is None):
             raise ValueError("Continuation index has incomplete admission identity.")
+        if (
+            tuple(sorted(set(self.service_receipt_epochs))) != self.service_receipt_epochs
+            or any(epoch < 1 or epoch > 2**53 - 1 for epoch in self.service_receipt_epochs)
+            or (self.service_receipt_epochs and self.state != "SERVICING")
+        ):
+            raise ValueError("Continuation index has invalid service receipt retention.")
         return self
 
 
 class ContinuationRoot(ContractValue):
+    schema_version: Literal[2] = 2
     namespace: ContinuationNamespace
     entries: tuple[_Entry, ...] = Field(default=(), max_length=MAX_RETAINED_TICKETS)
+    target_services: tuple[TemporaryServiceTargetReference, ...] = Field(
+        default=(), max_length=MAX_TARGET_SERVICES
+    )
 
     @model_validator(mode="after")
     def unique_entries(self) -> ContinuationRoot:
         if len({entry.ticket_key for entry in self.entries}) != len(self.entries):
             raise ValueError("Continuation index contains duplicate responsibility.")
+        if len({entry.key for entry in self.target_services}) != len(self.target_services):
+            raise ValueError("Continuation index contains duplicate target responsibility.")
         if len(encoded(self.model_dump(mode="json"))) > MAX_ENVELOPE_BYTES:
             raise ValueError("Continuation responsibility index exceeds its envelope.")
         return self
@@ -90,11 +127,74 @@ def require_reserved_capacity(preparation: ContinuationPreparation) -> None:
         + 2 * CONTINUATION_MAX_LATCH_EVIDENCE_BYTES
         + CONTINUATION_MAX_CONSUMPTION_EVIDENCE_BYTES
         + CONTINUATION_MAX_RETIREMENT_EVIDENCE_BYTES
+        + CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES
         + CONTINUATION_MAX_EVENTS * CONTINUATION_MAX_EVENT_BYTES
+        + (
+            0
+            if ticket.service_policy == "none"
+            else CONTINUATION_MAX_SERVICES * CONTINUATION_MAX_SERVICE_REFERENCE_BYTES
+        )
         + 1024
     )
     if required > MAX_ENVELOPE_BYTES:
         raise ContinuationConflict("Continuation cannot reserve complete terminal evidence.")
+
+
+def service_receipt_epochs(record: ContinuationRecord) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            {
+                item.expected_run_epoch + 1
+                for item in record.services
+                if item.mode == "same_session" and item.state in {"reserved", "admitted"}
+            }
+        )
+    )
+
+
+def require_released_wait_invocation(
+    ticket: ContinuationTicket,
+    checkpoint: dict[str, Any] | None,
+    *,
+    permit_operation: str,
+    permit_commitment: str,
+) -> ContinuationReleasedExecution:
+    """Authenticate original admission and release using the native receipt owner."""
+    from cayu.runtime._invocation_lifecycle import (
+        InvocationLifecycleCommandKind,
+        _invocation_lifecycle_receipt_from_checkpoint,
+    )
+
+    identity = f"{ticket.session_id}:{ticket.session_instance_id}:{ticket.writer_generation}"
+    admission = _invocation_lifecycle_receipt_from_checkpoint(
+        checkpoint, command_identity="admit:" + identity
+    )
+    release = _invocation_lifecycle_receipt_from_checkpoint(
+        checkpoint, command_identity="release:" + identity
+    )
+    if (
+        admission is None
+        or release is None
+        or admission.kind is not InvocationLifecycleCommandKind.ADMIT
+        or release.kind is not InvocationLifecycleCommandKind.RELEASE
+        or admission.session_id != ticket.session_id
+        or admission.session_instance_id != ticket.session_instance_id
+        or release.session_id != ticket.session_id
+        or release.session_instance_id != ticket.session_instance_id
+        or admission.participant_permit_operation != permit_operation
+        or admission.participant_permit_commitment != permit_commitment
+        or admission.active_profile.interaction_id != ticket.interaction_id
+        or admission.active_profile.run_epoch != ticket.writer_generation
+        or release.active_profile != admission.active_profile
+        or release.result_session.run_epoch != ticket.writer_generation + 1
+    ):
+        raise ContinuationConflict("Execution wait lacks exact native writer-release evidence.")
+    return ContinuationReleasedExecution(
+        permit_operation=permit_operation,
+        permit_commitment=permit_commitment,
+        admission_receipt_sha256=admission.record_sha256,
+        release_receipt_sha256=release.record_sha256,
+    )
 
 
 def checkpoint_visible() -> bool:
@@ -151,6 +251,8 @@ def require_history(record: ContinuationRecord) -> None:
     if (
         not record.events
         or record.events[0].kind != "prepared"
+        or record.retirement_acknowledged != ("retirement_acknowledged" in seen)
+        or (record.retirement_acknowledged and record.events[-1].kind != "retirement_acknowledged")
         or not history_valid
         or any(
             event.sequence != index or event.ticket_key != key
@@ -165,6 +267,14 @@ def require_history(record: ContinuationRecord) -> None:
 def _event_kind(before: ContinuationRecord | None, after: ContinuationRecord):
     if before is None:
         return "prepared"
+    if after.retirement_acknowledged != before.retirement_acknowledged:
+        if (
+            before.retirement_acknowledged
+            or before.released_retirement is None
+            or before.model_copy(update={"retirement_acknowledged": True}) != after
+        ):
+            raise ContinuationConflict("Invalid retirement acknowledgement transition.")
+        return "retirement_acknowledged"
     if after.retirement != before.retirement:
         return "retired"
     if after.consumption != before.consumption:
@@ -235,7 +345,14 @@ def index_publication(
             if (
                 entry is None
                 or entry.record_sha256 != digest(current_record)
+                or entry.originating_writer_generation != before.ticket.writer_generation
+                or entry.service_receipt_epochs != service_receipt_epochs(before)
                 or record.events != before.events
+                or record.services != before.services
+                or (
+                    record.released_retirement != before.released_retirement
+                    and (before.retirement is not None or record.retirement is None)
+                )
             ):
                 raise ContinuationConflict(
                     "Continuation index or history conflicts with its receipt."
@@ -301,6 +418,7 @@ def index_publication(
             ticket_key=key,
             state=record.ticket.state,
             record_sha256=digest(raw),
+            originating_writer_generation=record.ticket.writer_generation,
             admission_claim_id=None if consumption is None else consumption.admission_claim_id,
             admission_command_digest=(
                 None if consumption is None else consumption.admission_command_digest
@@ -308,6 +426,7 @@ def index_publication(
             admission_expected_run_epoch=(
                 None if consumption is None else consumption.admission_expected_run_epoch
             ),
+            service_receipt_epochs=service_receipt_epochs(record),
         )
         root = root.model_copy(update={"entries": tuple(entries[item] for item in sorted(entries))})
     if (
@@ -331,18 +450,59 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
         or root.namespace.session_instance_id != session.instance_id
     ):
         raise ContinuationConflict("Continuation receipt retention belongs to another session.")
-    return frozenset(
+    final_admissions = frozenset(
         f"admit:{session.id}:{session.instance_id}:{entry.admission_expected_run_epoch + 1}"
         for entry in root.entries
         if entry.state in {"WAITING", "SERVICING"}
         and entry.admission_expected_run_epoch is not None
     )
+    service_receipts = frozenset(
+        f"{kind}:{session.id}:{session.instance_id}:{epoch}"
+        for entry in root.entries
+        for epoch in entry.service_receipt_epochs
+        for kind in ("admit", "release")
+    )
+    target_receipts = frozenset(
+        f"{kind}:{session.id}:{session.instance_id}:{item.expected_run_epoch + 1}"
+        for item in root.target_services
+        if not item.source_acknowledged
+        for kind in ("admit", "release")
+    )
+    original_receipts = frozenset(
+        f"{kind}:{session.id}:{session.instance_id}:{entry.originating_writer_generation}"
+        for entry in root.entries
+        if entry.state in {"ARMING", "WAITING", "SERVICING"}
+        for kind in ("admit", "release")
+    )
+    return final_admissions | service_receipts | target_receipts | original_receipts
 
 
 def require_admission_claim(session: Session, checkpoint, command) -> None:
     """Compare the exact claim in the same transaction that admits the session."""
     from cayu.runtime._session_continuation import continuation_admission_digest
     from cayu.runtime._session_continuation_scope import current_admission_claim
+    from cayu.runtime._temporary_continuation_scope import require_temporary_admission
+
+    raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
+    if raw is not None:
+        root = ContinuationRoot.model_validate(raw)
+        if (
+            root.namespace.session_id != session.id
+            or root.namespace.session_instance_id != session.instance_id
+        ):
+            raise ContinuationConflict(
+                "Continuation admission index belongs to another incarnation."
+            )
+        servicing = tuple(entry for entry in root.entries if entry.state == "SERVICING")
+        if servicing:
+            temporary = require_temporary_admission(command)
+            if temporary is None or any(
+                entry.ticket_key != continuation_operation_key(temporary.dispatch.intent.ticket)
+                for entry in servicing
+            ):
+                raise ContinuationConflict(
+                    "Unsettled temporary service fences a competing invocation."
+                )
 
     claim = current_admission_claim()
     if claim is None:
@@ -368,7 +528,7 @@ def require_admission_claim(session: Session, checkpoint, command) -> None:
     if (
         authority.namespace != ticket.namespace
         or entry is None
-        or entry.state not in {"WAITING", "SERVICING"}
+        or entry.state != "WAITING"
         or entry.admission_claim_id != claim.admission_claim_id
         or entry.admission_command_digest != claim.admission_command_digest
     ):
@@ -390,24 +550,74 @@ def require_erasure_quiescence(*, session: Session, checkpoint, records: dict[st
         raise ContinuationConflict("Continuation deletion authority belongs to another session.")
     if owned.pop(CONTINUATION_NAMESPACE_KEY, None) != namespace.model_dump(mode="json"):
         raise ContinuationConflict("Continuation namespace evidence is unavailable.")
-    if set(owned) != {entry.ticket_key for entry in root.entries}:
+    expected_keys = {entry.ticket_key for entry in root.entries}
+    from cayu.runtime._temporary_service_target import TemporaryServiceTarget, target_reference
+
+    for reference in root.target_services:
+        expected_keys.add(reference.key)
+        raw = owned.get(reference.key)
+        if raw is None:
+            raise ContinuationConflict("Side-session receiving deletion evidence is unavailable.")
+        target = TemporaryServiceTarget.model_validate(raw)
+        if (
+            target_reference(target) != reference
+            or target.service.intent.target.object_id != session.id
+            or target.service.intent.target.incarnation != session.instance_id
+            or not target.source_acknowledged
+        ):
+            raise ContinuationConflict(
+                "Session still owns a side-session receiving responsibility."
+            )
+    for entry in root.entries:
+        raw = owned.get(entry.ticket_key)
+        if raw is None:
+            raise ContinuationConflict("Continuation deletion evidence is unavailable.")
+        record = ContinuationRecord.model_validate(raw)
+        expected_keys.update(item.key for item in record.services)
+    if set(owned) != expected_keys:
         raise ContinuationConflict("Continuation deletion index is incomplete.")
     for entry in root.entries:
         raw = owned[entry.ticket_key]
         record = ContinuationRecord.model_validate(raw)
         require_history(record)
-        if entry.record_sha256 != digest(raw) or entry.state != record.ticket.state:
+        if (
+            entry.record_sha256 != digest(raw)
+            or entry.originating_writer_generation != record.ticket.writer_generation
+            or entry.state != record.ticket.state
+            or entry.service_receipt_epochs != service_receipt_epochs(record)
+        ):
             raise ContinuationConflict("Continuation deletion evidence conflicts.")
         if record.ticket.state not in {"CONSUMED", "RETIRED"}:
             raise ContinuationConflict("Session still owns a continuation responsibility.")
+        if record.released_retirement is not None and not record.retirement_acknowledged:
+            raise ContinuationConflict("Continuation exclusion acknowledgement is pending.")
+        from cayu.runtime._session_continuation import require_ticket_identity
+        from cayu.runtime._temporary_continuation import (
+            TemporaryServiceRecord,
+            reference_for_service,
+        )
+
+        for reference in record.services:
+            service = TemporaryServiceRecord.model_validate(owned[reference.key])
+            require_ticket_identity(record.ticket, service.intent.ticket)
+            if reference != reference_for_service(
+                service, record.services
+            ) or service.state not in {"returned", "excluded"}:
+                raise ContinuationConflict("Session still owns unresolved temporary service.")
+            if not service.settlement_acknowledged:
+                raise ContinuationConflict(
+                    "Temporary service settlement acknowledgement is pending."
+                )
 
 
 def import_history_checkpoint(checkpoint, *, session: Session):
     if checkpoint is None or ROOT_KEY not in checkpoint:
         return checkpoint
     root = ContinuationRoot.model_validate(checkpoint[ROOT_KEY])
-    if root.namespace.session_id != session.id or any(
-        entry.state not in {"CONSUMED", "RETIRED"} for entry in root.entries
+    if (
+        root.namespace.session_id != session.id
+        or any(entry.state not in {"CONSUMED", "RETIRED"} for entry in root.entries)
+        or any(not entry.source_acknowledged for entry in root.target_services)
     ):
         raise ContinuationConflict(
             "Unsettled continuation responsibility cannot be imported as history."

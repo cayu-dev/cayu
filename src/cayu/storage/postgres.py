@@ -72,6 +72,7 @@ if TYPE_CHECKING:
         KnowledgeSemanticWatchAuthority,
         KnowledgeSemanticWatchReceipt,
     )
+    from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -616,6 +617,7 @@ from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migration_authority
 from cayu.storage import migrations as schema
 from cayu.storage._collaboration_schema import (
+    POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     POSTGRES_COLLABORATION_DDL,
     POSTGRES_COLLABORATION_LIFECYCLE_DDL,
     POSTGRES_COLLABORATION_REQUEST_DDL,
@@ -1479,6 +1481,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
         """CREATE TABLE IF NOT EXISTS cayu_peer_content_attempts (
             operation_key TEXT PRIMARY KEY, request_json JSONB NOT NULL, receipt_json JSONB NOT NULL
@@ -7062,7 +7065,10 @@ class _PostgresStoreBase:
             await validate_postgres_participant_bindings(cur)
         if state.revision >= 93:
             await validate_postgres_collaboration_schema(
-                cur, lifecycle=state.revision >= 94, requests=state.revision >= 95
+                cur,
+                lifecycle=state.revision >= 94,
+                requests=state.revision >= 95,
+                clarifications=state.revision >= 105,
             )
         if self._min_required_revision >= 36:
             await self._validate_session_invocation_column(cur)
@@ -29975,12 +29981,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             effects = await cur.fetchall()
             for key, raw in effects:
                 if key.startswith(continuations.CONTINUATION_OPERATION_PREFIX):
-                    if (
-                        type(raw) is not dict
-                        or len(continuation_records) >= continuations.MAX_RETAINED_TICKETS + 1
-                    ):
-                        raise ValueError("Continuation retention evidence is malformed.")
-                    continuation_records[key] = raw
+                    continuations.collect_retained_record(continuation_records, key, raw)
                 elif key.startswith(session_exports.OPERATION_PREFIX):
                     if type(raw) is not dict:
                         raise ValueError("Session export retention evidence is malformed.")
@@ -30401,8 +30402,12 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
         expected_latest_interaction_event_id: str | None = None,
         require_no_active_model_completion_dispatch: bool = False,
+        temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
+        from cayu.runtime._temporary_continuation_scope import prepare_temporary_transition
         from cayu.sessions.pending_actions import pending_action_event_storage_values
+
+        temporary_service_admission = prepare_temporary_transition(temporary_service_admission)
 
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -30726,6 +30731,49 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                             transformed_checkpoint,
                             result_checkpoint,
                             session_id=session_id,
+                        )
+                    if temporary_service_admission is not None:
+                        from cayu.runtime._session_continuation import continuation_operation_key
+                        from cayu.runtime._temporary_continuation import temporary_service_key
+                        from cayu.runtime._temporary_continuation_store import (
+                            compose_temporary_service_admission,
+                        )
+
+                        intent = temporary_service_admission.dispatch.intent
+                        parent_key = continuation_operation_key(intent.ticket)
+                        from cayu.runtime._temporary_service_target import target_service_key
+
+                        child_key = (
+                            temporary_service_key(intent.operation)
+                            if intent.mode == "same_session"
+                            else target_service_key(intent.operation)
+                        )
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key IN (%s, %s) FOR UPDATE",
+                            (session_id, parent_key, child_key),
+                        )
+                        service_records = dict(await cur.fetchall())
+                        publication = compose_temporary_service_admission(
+                            source_session=loaded,
+                            source_checkpoint=current_checkpoint,
+                            parent_record=service_records.get(parent_key),
+                            child_record=service_records.get(child_key),
+                            admitted_session=transitioned,
+                            admitted_checkpoint=transformed_checkpoint,
+                            admission=temporary_service_admission,
+                            now=updated_at,
+                        )
+                        transformed_checkpoint = publication.checkpoint
+                        await cur.executemany(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) VALUES (%s, %s, %s, %s) "
+                            "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                            "record = excluded.record, updated_at = excluded.updated_at",
+                            [
+                                (session_id, key, _dumps(record), updated_at)
+                                for key, record in publication.operation_records.items()
+                            ],
                         )
                     if transformed_checkpoint is not None:
                         await self._upsert_checkpoint(
@@ -36470,6 +36518,60 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             preserve_completion_result_publications=True,
         )
 
+    async def _prepare_temporary_side_service(self, preparation):
+        from cayu.runtime._side_service_preparation import (
+            SidePreparationSnapshot,
+            plan_preparation,
+            preparation_record_keys,
+            prepare_selection,
+        )
+
+        prepared = prepare_selection(preparation)
+        keys = preparation_record_keys(prepared)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    snapshots = {}
+                    # Every pair takes the same stable row-lock order. Single-
+                    # session admission/deletion uses these same session rows.
+                    for session_id in sorted(keys):
+                        session = await self._load_for_update(cur, session_id)
+                        if session is None:
+                            raise KeyError("Side-service session is unavailable.")
+                        _assert_session_run_epoch(session_id, session)
+                        for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                            _check_closure_lineage_owner(owner, (session_id,))
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (session_id, list(keys[session_id])),
+                        )
+                        records = {row[0]: _json_obj(row[1]) for row in await cur.fetchall()}
+                        snapshots[session_id] = SidePreparationSnapshot(
+                            session, await self._load_checkpoint(cur, session_id), records
+                        )
+                    now = await self._session_store_now(cur)
+                    plans = plan_preparation(prepared, snapshots, now)
+                    for session_id, plan in plans.items():
+                        await self._upsert_checkpoint(cur, session_id, plan.checkpoint, now)
+                        await cur.executemany(
+                            "INSERT INTO cayu_session_operations (session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s) ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                            "record=excluded.record, updated_at=excluded.updated_at",
+                            [
+                                (session_id, key, _dumps(record), now)
+                                for key, record in plan.operation_records.items()
+                            ],
+                        )
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET updated_at=%s, last_activity_at=%s WHERE id=%s",
+                            (now, now, session_id),
+                        )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
     async def publish_session_operation_guarded_with_store_time(
         self,
         session_id: str,
@@ -40067,6 +40169,31 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 )
                 checkpoint_row = await cur.fetchone()
                 checkpoint = None if checkpoint_row is None else checkpoint_row[0]
+                parked_target = False
+                if session is not None and session[2] in {"completed", "failed", "interrupted"}:
+                    assert target_id is not None
+                    from cayu.storage._peer_attempts import (
+                        parked_clarification_key,
+                        permits_parked_clarification_append,
+                    )
+
+                    wait_key = parked_clarification_key(
+                        checkpoint, session_id=target_id, instance_id=session[0]
+                    )
+                    if wait_key is not None:
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations WHERE session_id = %s AND idempotency_key = %s",
+                            (target_id, wait_key),
+                        )
+                        wait_row = await cur.fetchone()
+                        parked_target = permits_parked_clarification_append(
+                            request,
+                            checkpoint,
+                            None if wait_row is None else wait_row[0],
+                            session_id=target_id,
+                            instance_id=session[0],
+                            run_epoch=session[1],
+                        )
                 if session is not None and session[2] not in {
                     "completed",
                     "failed",
@@ -40104,7 +40231,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                     creation_excluded
                     or not source_valid
                     or (
-                        session is not None and session[2] in {"completed", "failed", "interrupted"}
+                        session is not None
+                        and not parked_target
+                        and session[2] in {"completed", "failed", "interrupted"}
                     )
                 ):
                     result = PeerContentReceipt(

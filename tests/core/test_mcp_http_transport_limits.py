@@ -4804,17 +4804,19 @@ def test_http_close_fences_late_tool_response_and_waits_for_its_exchange() -> No
 
         session = _session(
             handler,
-            limits=_limits(idle_timeout_s=0.5, total_call_timeout_s=1.0),
+            # This barrier tests close ownership, not deadline expiry. Keep a
+            # finite guard without racing a loaded runner's scheduling delay.
+            limits=_limits(idle_timeout_s=10.0, total_call_timeout_s=30.0),
         )
         request_task = asyncio.create_task(session.call_tool("late", {}))
-        await asyncio.wait_for(request_started.wait(), timeout=0.1)
+        await asyncio.wait_for(request_started.wait(), timeout=10)
         close_task = asyncio.create_task(session.close())
         await asyncio.sleep(0)
         close_waited_for_exchange = not close_task.done()
         release_request.set()
         with pytest.raises(McpProtocolError, match="closed before the response"):
             await request_task
-        await asyncio.wait_for(close_task, timeout=0.2)
+        await asyncio.wait_for(close_task, timeout=10)
         return close_waited_for_exchange, session._closed, session._http.is_closed
 
     close_waited, session_closed, client_closed = asyncio.run(run())
@@ -4854,18 +4856,18 @@ def test_http_close_uses_late_tool_response_session_authority() -> None:
 
         session = _session(
             handler,
-            limits=_limits(idle_timeout_s=0.5, total_call_timeout_s=1.0),
+            limits=_limits(idle_timeout_s=10.0, total_call_timeout_s=30.0),
         )
         session._initialize_result = McpInitializeResult(protocol_version=MCP_PROTOCOL_VERSION)
         session._session_id = "original-session"
         request_task = asyncio.create_task(session.call_tool("late-authority", {}))
-        await asyncio.wait_for(request_started.wait(), timeout=0.1)
+        await asyncio.wait_for(request_started.wait(), timeout=10)
         close_task = asyncio.create_task(session.close())
         await asyncio.sleep(0)
         release_request.set()
         with pytest.raises(McpProtocolError, match="closed before the response"):
             await request_task
-        await asyncio.wait_for(close_task, timeout=0.2)
+        await asyncio.wait_for(close_task, timeout=10)
         return delete_session_id, session._session_id
 
     deleted_session_id, retained_session_id = asyncio.run(run())
@@ -4910,16 +4912,16 @@ def test_http_close_uses_late_initialized_notification_session_authority() -> No
 
         session = _session(
             handler,
-            limits=_limits(idle_timeout_s=0.5, total_call_timeout_s=1.0),
+            limits=_limits(idle_timeout_s=10.0, total_call_timeout_s=30.0),
         )
         initialize_task = asyncio.create_task(session.initialize())
-        await asyncio.wait_for(notification_started.wait(), timeout=0.1)
+        await asyncio.wait_for(notification_started.wait(), timeout=10)
         close_task = asyncio.create_task(session.close())
         await asyncio.sleep(0)
         release_notification.set()
         with pytest.raises(McpProtocolError, match="closed before the notification"):
             await initialize_task
-        await asyncio.wait_for(close_task, timeout=0.2)
+        await asyncio.wait_for(close_task, timeout=10)
         return delete_session_id, session._cleanup_session_id
 
     deleted_session_id, retained_cleanup_session_id = asyncio.run(run())

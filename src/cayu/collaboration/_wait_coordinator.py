@@ -51,7 +51,19 @@ class WaitCoordinator:
         self, wait: CollaborationWait, *, context: MandateAccessContext
     ) -> WaitSnapshot:
         wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
+        await self.authorize_registration(wait, context=context)
         store, initialized = self._participants._ready()
+        snapshot = await store.register_wait(initialized, wait, redactor=self._redactor)
+        for target in wait.targets:
+            await self._register_source_observation(wait, target, context=context)
+        return snapshot
+
+    async def authorize_registration(
+        self, wait: CollaborationWait, *, context: MandateAccessContext
+    ) -> None:
+        """Read-only preflight; registration always repeats current authorization."""
+        wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
+        _, initialized = self._participants._ready()
         if wait.source_owner != initialized.owner:
             raise PermissionError("Wait source belongs to another collaboration owner.")
         if wait.initiator != _initiator(context):
@@ -64,10 +76,6 @@ class WaitCoordinator:
             snapshot = await self._requests.inspect(target, context=context)
             if snapshot is None:
                 raise CollaborationUnavailable("Wait target is unavailable.")
-        snapshot = await store.register_wait(initialized, wait, redactor=self._redactor)
-        for target in wait.targets:
-            await self._register_source_observation(wait, target, context=context)
-        return snapshot
 
     async def observe(
         self, wait: CollaborationWait, *, context: MandateAccessContext
@@ -228,6 +236,33 @@ class WaitCoordinator:
             await self._requests._authorize_retained_source(target, context=context)
         return await store.cancel_wait(initialized, wait, expired=expired, redactor=self._redactor)
 
+    async def cancel_prepared_registration(
+        self, wait: CollaborationWait, *, context: MandateAccessContext
+    ) -> WaitSnapshot:
+        """Fence a native preparation whose foreign registration may be missing.
+
+        The existing operation key serializes this decision with late registration.
+        This is only cancellation of the wait; native exclusion still requires
+        the separate released-invocation proof and acknowledgement handshake.
+        """
+        wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
+        for target in wait.targets:
+            await self._requests._authorize_retained_source(target, context=context)
+        store, initialized = self._participants._ready()
+        snapshot = await store._owned_wait(
+            "cancel_prepared_registration",
+            store._register_wait,
+            initialized,
+            wait,
+            self._redactor,
+            cancelled_preparation=True,
+        )
+        if snapshot.state == "pending":
+            return await store.cancel_wait(
+                initialized, wait, expired=False, redactor=self._redactor
+            )
+        return snapshot
+
     async def deliver(self, wait: CollaborationWait, *, context, continuation_owner):
         """Deliver an elected result through the existing authenticated latch owner."""
 
@@ -260,7 +295,13 @@ class WaitCoordinator:
         )
 
     async def exclude(
-        self, wait: CollaborationWait, *, context, continuation_owner, invocation
+        self,
+        wait: CollaborationWait,
+        *,
+        context,
+        continuation_owner,
+        invocation,
+        _released_permit: tuple[str, str] | None = None,
     ) -> WaitSnapshot:
         """Settle cancellation/expiry through a positive session exclusion receipt."""
 
@@ -271,13 +312,22 @@ class WaitCoordinator:
                 "Wait exclusion requires a registered session continuation owner."
             )
         wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
-        store, initialized = self._participants._ready()
         for target in wait.targets:
             await self._requests._authorize_retained_source(target, context=context)
+        return await self._exclude_owned(
+            wait,
+            continuation_owner=continuation_owner,
+            invocation=invocation,
+            _released_permit=_released_permit,
+        )
+
+    async def _exclude_owned(self, wait, *, continuation_owner, invocation, _released_permit=None):
+        """Shared exclusion mutation after the entrance authenticates its authority."""
+        store, initialized = self._participants._ready()
         current = await store.load_wait(initialized, wait, redactor=self._redactor)
         if current is None:
             raise CollaborationUnavailable("Wait registration is unavailable.")
-        if current.delivery == "excluded":
+        if current.delivery == "excluded" and _released_permit is None:
             return current
         if current.state not in {"cancelled", "expired", "unavailable"}:
             raise CollaborationConflict("Wait is not eligible for exclusion.")
@@ -303,14 +353,97 @@ class WaitCoordinator:
             # content-bound and may be acknowledged after restart.
             retired_at=datetime.fromtimestamp(current.terminal_at_ms / 1000, UTC).isoformat(),
         )
-        record = await continuation_owner.exclude(retirement, invocation=invocation)
-        digest = sha256(contract_bytes(record, redactor=self._redactor)).hexdigest()
-        return await store.record_wait_delivery(
+        if _released_permit is None:
+            record = await continuation_owner.exclude(retirement, invocation=invocation)
+        else:
+            from cayu.runtime._session_continuation import (
+                ContinuationReleasedRetirement,
+                require_ticket_identity,
+            )
+
+            if invocation is not None:
+                raise PermissionError("Released cleanup cannot substitute a live invocation.")
+            ticket = wait.delivery_ticket
+            receiving = await continuation_owner.store.load_continuation_ticket(
+                ticket.session_id,
+                session_instance_id=ticket.session_instance_id,
+                registration_key=ticket.registration_key,
+            )
+            if receiving is None:
+                raise CollaborationUnavailable("Wait receiving responsibility is unavailable.")
+            require_ticket_identity(ticket, receiving.ticket)
+            record = await continuation_owner.retire_released(
+                ContinuationReleasedRetirement(
+                    retirement=retirement.model_copy(update={"ticket": receiving.ticket}),
+                    permit_operation=_released_permit[0],
+                    permit_commitment=_released_permit[1],
+                )
+            )
+        from cayu.runtime._continuation_wait_settlement import (
+            acknowledge_retirement,
+            retirement_receipt,
+        )
+
+        digest = sha256(
+            contract_bytes(retirement_receipt(record), redactor=self._redactor)
+        ).hexdigest()
+        settled = await store.record_wait_delivery(
             initialized,
             wait,
             receipt_digest=digest,
             delivery="excluded",
             redactor=self._redactor,
+        )
+        if _released_permit is not None:
+            await acknowledge_retirement(continuation_owner, wait, record)
+        return settled
+
+    async def _exclude_released_administrative(
+        self, wait, *, context, continuation_owner, permit_operation, permit_commitment
+    ):
+        """Discharge native-verified debt without borrowing disclosure permission."""
+        from cayu.collaboration.access import CollaborationAccessContext
+
+        context = prepare_contract(CollaborationAccessContext, context, redactor=self._redactor)
+        _, grant = self._participants._authorize(context, "request_control")
+        self._participants._require_refs(grant, (), create=True)
+        wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
+        store, initialized = self._participants._ready()
+        current = await store.load_wait(initialized, wait, redactor=self._redactor)
+        if current is None:
+            current = await store._owned_wait(
+                "cancel_prepared_registration",
+                store._register_wait,
+                initialized,
+                wait,
+                self._redactor,
+                cancelled_preparation=True,
+            )
+        if current.state == "pending":
+            await store.cancel_wait(initialized, wait, expired=False, redactor=self._redactor)
+        return await self._exclude_owned(
+            wait,
+            continuation_owner=continuation_owner,
+            invocation=None,
+            _released_permit=(permit_operation, permit_commitment),
+        )
+
+    async def exclude_released(
+        self,
+        wait: CollaborationWait,
+        *,
+        context: MandateAccessContext,
+        continuation_owner,
+        permit_operation: str,
+        permit_commitment: str,
+    ) -> WaitSnapshot:
+        """Settle an interrupted preparation through native released-writer proof."""
+        return await self.exclude(
+            wait,
+            context=context,
+            continuation_owner=continuation_owner,
+            invocation=None,
+            _released_permit=(permit_operation, permit_commitment),
         )
 
 
@@ -348,6 +481,53 @@ class CollaborationWaitLatchReceiver:
         self._store = store
         self._initialized = initialized
         self._redactor = redactor
+
+    async def authenticate_continuation_retirement(self, wait, record):
+        """Authenticate settlement from the exact durable wait, never caller receipts."""
+        from cayu.runtime._session_continuation import (
+            ContinuationRecord,
+            continuation_digest,
+            require_ticket_identity,
+        )
+
+        wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
+        record = prepare_contract(ContinuationRecord, record, redactor=self._redactor)
+        if wait.delivery_ticket is None or record.released_retirement is None:
+            raise PermissionError("Wait has no released receiving responsibility.")
+        require_ticket_identity(wait.delivery_ticket, record.ticket)
+        if record.ticket.collaboration_wait_sha256 is not None and (
+            continuation_digest(wait.model_copy(update={"delivery_ticket": None}))
+            != record.ticket.collaboration_wait_sha256
+        ):
+            raise PermissionError("Retirement belongs to a different complete wait.")
+        retained = await self._store.load_wait(self._initialized, wait, redactor=self._redactor)
+        expected = continuation_digest(record)
+        if retained is None:
+            from cayu.collaboration._namespace_store import inspect_retirement
+            from cayu.collaboration.lifecycle import NamespaceRef
+
+            evidence = await inspect_retirement(
+                self._store,
+                self._initialized,
+                NamespaceRef(
+                    owner=wait.source_owner,
+                    namespace_incarnation=wait.operation.namespace_incarnation,
+                    generation=wait.operation.generation,
+                ),
+                self._redactor,
+            )
+            if evidence is not None and record.ticket.execution_admission_sha256 is not None:
+                # Native released-retirement evidence proves this exact operation
+                # is fenced; retirement proves no foreign obligation can reopen.
+                return expected
+        if (
+            retained is None
+            or retained.registration.wait != wait
+            or retained.delivery != "excluded"
+            or retained.delivery_receipt_digest != expected
+        ):
+            raise PermissionError("Wait exclusion has not acknowledged this retirement.")
+        return expected
 
     async def authenticate_continuation_latch(self, latch):
         from cayu.runtime._session_continuation import ContinuationLatch

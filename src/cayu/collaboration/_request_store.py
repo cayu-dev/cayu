@@ -106,6 +106,10 @@ async def retained_request(
     ):
         raise CollaborationConflict("Request belongs to another owner.")
     await load_namespace(tx, anchor, request.operation.generation, redactor)
+    if await tx.get("request_pruning", operation_key(request.operation)) is not None:
+        raise CollaborationUnavailable(
+            "Request history is being reclaimed in its retired namespace."
+        )
     raw = await tx.get("operations", operation_key(request.operation))
     if raw is None:
         if await tx.get("requests", operation_key(request.operation)) is not None:
@@ -128,6 +132,10 @@ async def retained_request(
         redactor=redactor,
     )
     require_exact_contract(receipt, snapshot.receipt, redactor=redactor)
+    if snapshot.clarification.generation:
+        from cayu.collaboration._clarification_store import validate_request_frontier
+
+        await validate_request_frontier(tx, snapshot, redactor)
     await require_request_event(tx, receipt.event, redactor)
     for sequence in snapshot.event_sequences:
         event = prepare_contract(

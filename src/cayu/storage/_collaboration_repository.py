@@ -7,6 +7,15 @@ import time
 from contextlib import suppress
 from typing import Any, Literal, cast
 
+from cayu.collaboration._clarification_records import (
+    CLARIFICATION_RECORD_FAMILIES,
+    clarification_record_projection,
+    due_cursor_key,
+    prepare_due_scan,
+    prepare_lineage_scan,
+    prepare_question_scan,
+)
+from cayu.collaboration._clarification_state import ClarificationQuestionState
 from cayu.collaboration._contracts import (
     MAX_ENVELOPE_BYTES,
     CollaborationContractError,
@@ -77,10 +86,179 @@ class _SQLRepository:
             result.append(value)
         return result
 
+    async def scan_clarification_questions(self, request, *, limit: int) -> list[object]:
+        request = prepare_question_scan(request, limit)
+        if request.owner.application_scope != self.scope:
+            raise CollaborationContractError("Clarification scan belongs to another scope.")
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), "
+                "request_id, request_incarnation, participant_id, state, next_due_at_ms, "
+                "lineage_namespace, lineage_generation, lineage_key, "
+                "namespace, generation, caller_key FROM cayu_collaboration_clarification_questions "
+                "WHERE scope=? AND request_id=? AND request_incarnation=? "
+                "ORDER BY namespace, generation, caller_key LIMIT ?",
+                (self.scope, request.request_id, request.incarnation, limit),
+            )
+        )
+        result = []
+        for row in rows:
+            value = self._decode(row[0])
+            record, projection = clarification_record_projection(
+                "clarification_questions", value, scope=self.scope, key=tuple(row[9:])
+            )
+            assert isinstance(record, ClarificationQuestionState)
+            if projection != tuple(row[1:9]) or record.question.request != request:
+                raise CollaborationContractError("Clarification scan index contradicts its record.")
+            result.append(value)
+        return result
+
+    async def scan_clarification_lineage_questions(self, lineage, *, limit):
+        lineage = prepare_lineage_scan(lineage, limit, scope=self.scope)
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), "
+                "request_id, request_incarnation, participant_id, state, next_due_at_ms, "
+                "lineage_namespace, lineage_generation, lineage_key, namespace, generation, caller_key "
+                "FROM cayu_collaboration_clarification_questions "
+                "WHERE scope=? AND lineage_namespace=? AND lineage_generation=? AND lineage_key=? "
+                "ORDER BY namespace, generation, caller_key LIMIT ?",
+                (
+                    self.scope,
+                    lineage.namespace_incarnation,
+                    lineage.generation,
+                    lineage.caller_key,
+                    limit,
+                ),
+            )
+        )
+        result = []
+        for row in rows:
+            value = self._decode(row[0])
+            record, projection = clarification_record_projection(
+                "clarification_questions", value, scope=self.scope, key=tuple(row[9:])
+            )
+            assert isinstance(record, ClarificationQuestionState)
+            if projection != tuple(row[1:9]) or record.question.lineage != lineage:
+                raise CollaborationContractError("Lineage index contradicts its question.")
+            result.append(value)
+        return result
+
     async def _execute(self, sql: str, args: tuple = ()):
         if self.postgres:
             return await self.connection.execute(sql.replace("?", "%s"), args)
         return self.connection.execute(sql, args)
+
+    async def scan_pending_clarification_services(self, *, after, limit: int) -> list[object]:
+        return await self._scan_pending_clarification_records(
+            "clarification_services", after=after, limit=limit
+        )
+
+    async def scan_clarification_request_handoffs(
+        self, request, *, family, limit, pending_only=False
+    ):
+        from cayu.collaboration._clarification_records import handoff_request, prepare_handoff_scan
+
+        request, schema = prepare_handoff_scan(
+            family, request, limit, scope=self.scope, pending_only=pending_only
+        )
+        state_filter = "AND state='pending' " if pending_only else ""
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), "
+                "participant_id, state, next_due_at_ms, request_id, request_incarnation, "
+                "namespace, generation, caller_key "
+                f"FROM cayu_collaboration_{family} WHERE scope=? AND request_id=? AND request_incarnation=? "
+                + state_filter
+                + "ORDER BY namespace, generation, caller_key LIMIT ?",
+                (self.scope, request.request_id, request.incarnation, limit),
+            )
+        )
+        result = []
+        for row in rows:
+            value = self._decode(row[0])
+            record, projection = clarification_record_projection(
+                family, value, scope=self.scope, key=tuple(row[6:])
+            )
+            assert isinstance(record, schema)
+            if projection != tuple(row[1:6]) or handoff_request(record) != request:
+                raise CollaborationContractError("Handoff request index contradicts its record.")
+            if pending_only and record.state != "pending":
+                raise CollaborationContractError("Handoff pending index contradicts its record.")
+            result.append(value)
+        return result
+
+    async def scan_pending_clarification_deliveries(self, *, after, limit: int) -> list[object]:
+        return await self._scan_pending_clarification_records(
+            "clarification_deliveries", after=after, limit=limit
+        )
+
+    async def _scan_pending_clarification_records(
+        self,
+        family: Literal["clarification_services", "clarification_deliveries"],
+        *,
+        after,
+        limit: int,
+    ) -> list[object]:
+        cursor = prepare_due_scan(scope=self.scope, after=after, now_ms=1, limit=limit)
+        continuation = ""
+        args = (self.scope,)
+        if cursor is not None:
+            continuation = " AND (next_due_at_ms, namespace, generation, caller_key) > (?, ?, ?, ?)"
+            args = (*args, *due_cursor_key(cursor))
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), "
+                "participant_id, state, next_due_at_ms, request_id, request_incarnation, "
+                "namespace, generation, caller_key "
+                f"FROM cayu_collaboration_{family} WHERE scope=? AND state='pending'"
+                + continuation
+                + " ORDER BY next_due_at_ms, namespace, generation, caller_key LIMIT ?",
+                (*args, limit),
+            )
+        )
+        values = []
+        for row in rows:
+            value = self._decode(row[0])
+            _, projection = clarification_record_projection(
+                family, value, scope=self.scope, key=tuple(row[6:])
+            )
+            if projection != tuple(row[1:6]):
+                raise CollaborationContractError(
+                    "Clarification responsibility index contradicts its record."
+                )
+            values.append(value)
+        return values
+
+    async def scan_due_clarifications(self, *, after, now_ms: int, limit: int) -> list[object]:
+        cursor = prepare_due_scan(scope=self.scope, after=after, now_ms=now_ms, limit=limit)
+        continuation = ""
+        args = (self.scope, now_ms)
+        if cursor is not None:
+            continuation = " AND (next_due_at_ms, namespace, generation, caller_key) > (?, ?, ?, ?)"
+            args = (*args, *due_cursor_key(cursor))
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), "
+                "request_id, request_incarnation, participant_id, state, next_due_at_ms, "
+                "lineage_namespace, lineage_generation, lineage_key, "
+                "namespace, generation, caller_key FROM cayu_collaboration_clarification_questions "
+                "WHERE scope=? AND state='open' AND next_due_at_ms<=?"
+                + continuation
+                + " ORDER BY next_due_at_ms, namespace, generation, caller_key LIMIT ?",
+                (*args, limit),
+            )
+        )
+        values = []
+        for row in rows:
+            value = self._decode(row[0])
+            _, projection = clarification_record_projection(
+                "clarification_questions", value, scope=self.scope, key=tuple(row[9:])
+            )
+            if projection != tuple(row[1:9]):
+                raise CollaborationContractError("Clarification due index contradicts its record.")
+            values.append(value)
+        return values
 
     async def _rows(self, cursor):
         return await cursor.fetchall() if self.postgres else cursor.fetchall()
@@ -114,6 +292,12 @@ class _SQLRepository:
             self._require_permit_projection(value, tuple(rows[0][1:]), key)
         elif table == "requests":
             self._require_request_projection(value, tuple(rows[0][1:]), key)
+        elif table in CLARIFICATION_RECORD_FAMILIES:
+            _, projection = clarification_record_projection(table, value, scope=self.scope, key=key)
+            if tuple(rows[0][1:]) != projection:
+                raise CollaborationContractError(
+                    "Clarification secondary index contradicts its record."
+                )
         return value
 
     def _require_request_projection(self, value: object, projection: tuple, key: Key) -> None:
@@ -170,7 +354,11 @@ class _SQLRepository:
         extra = EXTRA_COLUMNS.get(table, ())
         columns = ("scope", *KEYS[table], *extra)
         extra_values: tuple = ()
-        if table == "permits":
+        if table in CLARIFICATION_RECORD_FAMILIES:
+            value, extra_values = clarification_record_projection(
+                table, value, scope=self.scope, key=key
+            )
+        elif table == "permits":
             if not isinstance(value, PermitSnapshot):
                 raise CollaborationContractError("Permit record requires its typed projection.")
             extra_values = (

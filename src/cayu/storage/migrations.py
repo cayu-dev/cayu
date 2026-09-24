@@ -487,6 +487,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Peer append and exposure receipts are durable session-owned records;
     # every writer must preserve their exact replay and pending-recovery state.
     Revision(revision=104, kind=RevisionKind.BREAKING, compatible_from=104),
+    # Clarification records retain input/service responsibilities which older
+    # request and session writers cannot preserve or settle.
+    Revision(revision=105, kind=RevisionKind.BREAKING, compatible_from=105),
 )
 
 #: The revision an empty database is initialized to.

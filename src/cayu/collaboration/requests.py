@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from cayu._validation import canonical_bounded_durable_json_bytes
 from cayu.collaboration._contracts import (
@@ -33,6 +33,7 @@ from cayu.collaboration.participants import (
 
 Millis = Annotated[StrictInt, Field(ge=1, le=2**53 - 1)]
 MAX_CONTROL_INITIATOR_BYTES = 8 * 1024
+MAX_REQUEST_CLARIFICATIONS = 32
 
 
 class RequestAlias(ContractValue):
@@ -155,6 +156,9 @@ class RequestEvent(ContractValue):
         "request_cancelled",
         "request_expired",
         "request_observation_registered",
+        "clarification_opened",
+        "clarification_replied",
+        "clarification_closed",
     ]
     participants: tuple[ParticipantRef, ...] = Field(min_length=1, max_length=2)
 
@@ -275,6 +279,8 @@ class RequestAdmissionCommand(ContractValue):
     mode: Literal["request_admission"] = "request_admission"
     expected: RequestCommand
     expected_revision: Generation
+    expected_input_revision: Annotated[StrictInt, Field(ge=0, le=MAX_REQUEST_CLARIFICATIONS)]
+    expected_input_sha256: Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
     generation: Generation
     decision: AdmissionDecision
     proposal_commitment: Identifier | None = None
@@ -566,6 +572,25 @@ class RequestObservationPage(ContractValue):
         return self
 
 
+class ClarificationFrontier(ContractValue):
+    """Owner-retained frontier, independent of the bounded ordinary event tuple."""
+
+    generation: StrictInt = Field(default=0, ge=0, le=MAX_REQUEST_CLARIFICATIONS)
+    lineage: OperationRef | None = None
+    input_revision: StrictInt = Field(default=0, ge=0, le=MAX_REQUEST_CLARIFICATIONS)
+    input_sha256: Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+
+    @model_validator(mode="after")
+    def coherent(self) -> ClarificationFrontier:
+        if (
+            (self.generation == 0) != (self.lineage is None)
+            or self.input_revision > self.generation
+            or (self.input_revision == 0) != (self.input_sha256 is None)
+        ):
+            raise ValueError("Clarification frontier is inconsistent.")
+        return self
+
+
 class RequestSnapshot(ContractValue):
     """Current owner state, independently authenticated against immutable receipts."""
 
@@ -585,10 +610,16 @@ class RequestSnapshot(ContractValue):
     observations: tuple[RequestObservation, ...] = Field(default=(), max_length=32)
     observation_revision: Annotated[Generation, Field(ge=0)] = 0
     event_sequences: tuple[Generation, ...] = Field(default=(), max_length=64)
+    clarification: ClarificationFrontier = Field(default_factory=ClarificationFrontier)
 
     @model_validator(mode="after")
     def coherent_state(self) -> RequestSnapshot:
         reference = self.receipt.expected.intent.selection.reference
+        if (
+            self.clarification.lineage is not None
+            and self.clarification.lineage.application_scope != reference.owner.application_scope
+        ):
+            raise ValueError("Clarification frontier belongs to another application scope.")
         if (
             not self.event_sequences
             or self.event_sequences[0] != self.receipt.event.sequence

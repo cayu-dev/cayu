@@ -1417,8 +1417,14 @@ class RunLimitController:
         self._global_settlement_recovery_lock = asyncio.Lock()
         self._global_settlement_recovery_after: BudgetSettlementCursor | None = None
 
-    async def resolve_budget_binding(self, *, request: object) -> BudgetBinding:
-        """Resolve a trusted binding or fail closed for bound dispatch."""
+    async def inspect_budget_binding(self, *, request: object) -> BudgetBinding:
+        """Resolve configured authority without consuming/registering ledger capacity.
+
+        Receiving coordinators use the same frozen runtime receiver as actual
+        dispatch. A mutable facade field cannot silently select another root.
+        The trusted receiver retains its existing resolve/register contract;
+        this method itself performs no budget-ledger mutation.
+        """
 
         receiver = self._budget_binding_receiver
         resolver = None if receiver is None else getattr(receiver, "register", None)
@@ -1429,7 +1435,11 @@ class RunLimitController:
         binding = await resolver(request=request)
         if type(binding) is not BudgetBinding:
             raise TypeError("Budget binding receivers must return BudgetBinding instances.")
-        binding = copy_budget_binding(binding)
+        return copy_budget_binding(binding)
+
+    async def resolve_budget_binding(self, *, request: object) -> BudgetBinding:
+        """Resolve a trusted binding or fail closed for bound dispatch."""
+        binding = await self.inspect_budget_binding(request=request)
         await self._budget_ledger.register_budget_binding(
             binding_id=binding.binding_id,
             authority_digest=binding.authority_digest,
@@ -1440,31 +1450,43 @@ class RunLimitController:
     async def _binding_for_dispatch(
         self,
         *,
-        request: object,
+        request: dict[str, object],
         binding: BudgetBinding | None,
         trusted_binding: bool = False,
     ) -> BudgetBinding | None:
         """Resolve configured authority; never silently downgrade a bound app."""
+        from cayu.runtime._temporary_service_budget import (
+            admitted_service_budget_constraint,
+            require_service_budget_binding,
+        )
 
+        session_id = request.get("session_id")
+        if type(session_id) is not str:
+            raise ValueError("Budget dispatch requires its receiving session identity.")
+        constraint = await admitted_service_budget_constraint(
+            self._session_store, session_id=session_id
+        )
         if binding is not None:
             if trusted_binding:
                 binding = copy_budget_binding(binding)
-                await self._budget_ledger.register_budget_binding(
-                    binding_id=binding.binding_id,
-                    authority_digest=binding.authority_digest,
-                    allowance=binding.allowance,
-                )
-                return binding
-            resolved = await self.resolve_budget_binding(request=request)
-            supplied = copy_budget_binding(binding)
-            if not supplied.exact_match(resolved):
-                raise ValueError(
-                    "Supplied budget binding conflicts with trusted receiver authority."
-                )
-            return resolved
-        if not self._common_root_budget_binding_enabled:
-            return None
-        return await self.resolve_budget_binding(request=request)
+            else:
+                resolved = await self.inspect_budget_binding(request=request)
+                supplied = copy_budget_binding(binding)
+                if not supplied.exact_match(resolved):
+                    raise ValueError(
+                        "Supplied budget binding conflicts with trusted receiver authority."
+                    )
+                binding = resolved
+        elif self._common_root_budget_binding_enabled:
+            binding = await self.inspect_budget_binding(request=request)
+        require_service_budget_binding(constraint, binding)
+        if binding is not None:
+            await self._budget_ledger.register_budget_binding(
+                binding_id=binding.binding_id,
+                authority_digest=binding.authority_digest,
+                allowance=binding.allowance,
+            )
+        return binding
 
     def usage_tracker(self, session_id: str) -> SessionUsageTracker:
         return SessionUsageTracker(self._session_store, session_id=session_id)

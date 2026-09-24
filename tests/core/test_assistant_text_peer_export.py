@@ -14,6 +14,7 @@ from tests.core.test_peer_content import QualificationPeerExposurePolicy, _deliv
 from tests.core.test_session_creation_fence import _collaboration_factory, _store_factory
 
 from cayu.agents import AgentSpec
+from cayu.collaboration._clarification_export import acquire_clarification_source
 from cayu.collaboration._contracts import ObjectRef, OperationRef, OwnerRef
 from cayu.collaboration._session_export_store import source_digest
 from cayu.collaboration.exports import (
@@ -44,12 +45,23 @@ EXPORT_CONTEXT = SessionExportAccessContext(principal=CONTEXT.principal)
 
 
 class Policy(QualificationPeerExposurePolicy):
+    def __init__(self):
+        super().__init__()
+        self.disclosure_lock = asyncio.Lock()
+        self.revocation_attempted = asyncio.Event()
+
+    async def revoke(self):
+        self.revocation_attempted.set()
+        async with self.disclosure_lock:
+            self.revoked = True
+
     @asynccontextmanager
     async def acquire(self, context, **kwargs):
-        if self.revoked:
-            raise SessionExportDenied()
-        async with super().acquire(context, **kwargs) as grant:
-            yield grant
+        async with self.disclosure_lock:
+            if self.revoked:
+                raise SessionExportDenied()
+            async with super().acquire(context, **kwargs) as grant:
+                yield grant
 
     @asynccontextmanager
     async def acquire_peer_exposure(self, context, **kwargs):
@@ -96,8 +108,8 @@ async def test_real_assistant_export_peer_journey(backend, tmp_path, request):
     store_factory = _store_factory(backend, tmp_path, request)
     collaboration_factory = _collaboration_factory(backend, tmp_path, request)
     store, collaboration = store_factory(), collaboration_factory()
-    registered = registration()
     policy = Policy()
+    registered = registration(scope=policy.ref.owner.application_scope)
     projector = TextProjector(policy)
     payloads = []
 
@@ -252,6 +264,32 @@ async def test_real_assistant_export_peer_journey(backend, tmp_path, request):
             assert await current.read_session_export(export_request, context=EXPORT_CONTEXT) == {
                 "text": VISIBLE
             }
+            async with acquire_clarification_source(
+                current._session_export_coordinator,
+                export_request,
+                context=EXPORT_CONTEXT,
+                sender=sender,
+                audience=consumer,
+            ) as clarification:
+                assert clarification.text == VISIBLE
+                assert clarification.receipt == receipt
+                assert clarification.source.producer.object_id == receipt.event_id
+                assert clarification.source.content_sha256 == sha256(VISIBLE.encode()).hexdigest()
+                assert clarification.source.content_bytes == len(VISIBLE.encode())
+                assert PRIVATE not in repr(clarification) and HIDDEN not in repr(clarification)
+                clarification_source = clarification.source
+            before_inspection = await store.load(source.id)
+            assert (
+                await current.inspect_clarification_source(
+                    export_request,
+                    context=EXPORT_CONTEXT,
+                    sender=sender,
+                    audience=consumer,
+                    expected=clarification_source,
+                )
+                == clarification_source
+            )
+            assert await store.load(source.id) == before_inspection
 
             # Reconstruct native owners before replay and before recipient execution.
             if backend != "memory":
@@ -286,6 +324,38 @@ async def test_real_assistant_export_peer_journey(backend, tmp_path, request):
                 store, collaboration = store_factory(), collaboration_factory()
             current = build()
             await current.initialize_collaboration()
+            restored_clarification = await current.inspect_clarification_source(
+                export_request,
+                context=EXPORT_CONTEXT,
+                sender=sender,
+                audience=consumer,
+                expected=clarification_source,
+            )
+            assert restored_clarification == clarification_source
+            with pytest.raises(SessionExportConflict):
+                await current.inspect_clarification_source(
+                    export_request,
+                    context=EXPORT_CONTEXT,
+                    sender=sender,
+                    audience=consumer,
+                    expected=clarification_source.model_copy(update={"content_sha256": "f" * 64}),
+                )
+            with pytest.raises(SessionExportDenied):
+                await current.inspect_clarification_source(
+                    export_request,
+                    context=EXPORT_CONTEXT,
+                    sender=consumer,
+                    audience=consumer,
+                    expected=clarification_source,
+                )
+            with pytest.raises(SessionExportDenied):
+                await current.inspect_clarification_source(
+                    export_request,
+                    context=EXPORT_CONTEXT,
+                    sender=sender,
+                    audience=sender,
+                    expected=clarification_source,
+                )
             assert await current.export_session(export_request, context=EXPORT_CONTEXT) == receipt
             assert len(projector.sources) == 1
             exported = await current.read_session_export(export_request, context=EXPORT_CONTEXT)
@@ -329,7 +399,46 @@ async def test_real_assistant_export_peer_journey(backend, tmp_path, request):
                 ).model_dump_json(),
             ):
                 assert PRIVATE not in value and HIDDEN not in value
-            policy.revoked = True
+            guarded = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_clarification_disclosure():
+                async with acquire_clarification_source(
+                    current._session_export_coordinator,
+                    export_request,
+                    context=EXPORT_CONTEXT,
+                    sender=sender,
+                    audience=consumer,
+                    expected=clarification_source,
+                ):
+                    guarded.set()
+                    await release.wait()
+
+            holder = asyncio.create_task(hold_clarification_disclosure())
+            await asyncio.wait_for(guarded.wait(), 5)
+            revocation = asyncio.create_task(policy.revoke())
+            await asyncio.wait_for(policy.revocation_attempted.wait(), 5)
+            assert not revocation.done()
+            assert not policy.revoked
+            holder.cancel()
+            assert holder.cancelling() == 1
+            try:
+                await holder
+            except asyncio.CancelledError:
+                pass
+            else:
+                pytest.fail("The source guard swallowed caller cancellation")
+            assert holder.cancelled() and holder.cancelling() == 1
+            await asyncio.wait_for(revocation, 5)
+            assert policy.revoked and not policy.disclosure_lock.locked()
+            with pytest.raises(SessionExportDenied):
+                await current.inspect_clarification_source(
+                    export_request,
+                    context=EXPORT_CONTEXT,
+                    sender=sender,
+                    audience=consumer,
+                    expected=clarification_source,
+                )
             with pytest.raises(SessionExportDenied):
                 await current.read_session_export(export_request, context=EXPORT_CONTEXT)
             events = [

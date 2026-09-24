@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import warnings
 from contextlib import asynccontextmanager
 
@@ -334,6 +335,9 @@ def test_public_resource_rejection_does_not_render_unsafe_input(
 ):
     from cayu.collaboration._contracts import CollaborationContractError
 
+    # Attribute diagnostics to this flow, not cyclic objects left by an earlier
+    # test. Collect again inside capture so leaks created here still fail.
+    gc.collect()
     store, artifact = make_store(tmp_path)
     canary = "private-resource-input-canary"
     rendered = []
@@ -398,6 +402,7 @@ def test_public_resource_rejection_does_not_render_unsafe_input(
     with warnings.catch_warnings(record=True) as emitted:
         warnings.simplefilter("always")
         asyncio.run(run())
+        gc.collect()
     assert not emitted
     assert not caplog.records
     captured = capsys.readouterr()
@@ -413,6 +418,7 @@ def test_previously_handled_cancellation_does_not_stop_new_preparation(tmp_path)
         )
         try:
             current = asyncio.current_task()
+            assert current is not None
             current.cancel("previously handled request")
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.sleep(0)

@@ -37,12 +37,19 @@ CONTINUATION_OPERATION_PREFIX = "session-continuation:"
 CONTINUATION_NAMESPACE_KEY = CONTINUATION_OPERATION_PREFIX + "namespace"
 CONTINUATION_SCHEMA_VERSION = 1
 CONTINUATION_MAX_TARGETS = 64
+CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES = 512
 CONTINUATION_MAX_DIGEST_BYTES = 256
 CONTINUATION_MAX_LATCH_EVIDENCE_BYTES = 8192
 CONTINUATION_MAX_CONSUMPTION_EVIDENCE_BYTES = 12288
 CONTINUATION_MAX_RETIREMENT_EVIDENCE_BYTES = 4096
 CONTINUATION_MAX_EVENTS = 8
 CONTINUATION_MAX_EVENT_BYTES = 512
+CONTINUATION_MAX_SERVICES = 32
+# Fixed hash/key encodings, closed enums and portable integer bounds make the
+# largest current reference 352 bytes. Keep explicit headroom without reserving
+# enough redundant slack to exclude ordinary generated continuation identities.
+CONTINUATION_MAX_SERVICE_REFERENCE_BYTES = 384
+CONTINUATION_SERVICE_PREFIX = CONTINUATION_OPERATION_PREFIX + "service:"
 
 
 class ContinuationConflict(ValueError):
@@ -108,8 +115,16 @@ class ContinuationWait(ContractValue):
     service_policy: StrictStr = Field(min_length=1, max_length=128)
     wait_edge_revision: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
     purpose: StrictStr = Field(min_length=1, max_length=256)
+    execution_admission_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    collaboration_wait_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     unordered_fields = frozenset({"targets"})
+
+    @model_validator(mode="after")
+    def validate_execution_commitments(self) -> ContinuationWait:
+        if (self.execution_admission_sha256 is None) != (self.collaboration_wait_sha256 is None):
+            raise ValueError("Execution and collaboration wait commitments must be paired.")
+        return self
 
 
 class ContinuationTicket(ContractValue):
@@ -135,6 +150,8 @@ class ContinuationTicket(ContractValue):
     interaction_id: StrictStr
     writer_generation: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
     purpose: StrictStr = Field(min_length=1, max_length=256)
+    execution_admission_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    collaboration_wait_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     state: Literal["ARMING", "WAITING", "SERVICING", "CONSUMED", "RETIRED"]
     revision: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
 
@@ -154,6 +171,8 @@ class ContinuationTicket(ContractValue):
 
     @model_validator(mode="after")
     def validate_authority(self) -> ContinuationTicket:
+        if (self.execution_admission_sha256 is None) != (self.collaboration_wait_sha256 is None):
+            raise ValueError("Execution and collaboration wait commitments must be paired.")
         if (
             self.namespace.session_id != self.session_id
             or self.namespace.session_instance_id != self.session_instance_id
@@ -323,7 +342,7 @@ class ContinuationConsumption(ContractValue):
         if self.receipt_stage == "excluded":
             if self.ticket.state != "RETIRED":
                 raise ValueError("Excluded continuation must be retired.")
-        elif self.ticket.state not in {"WAITING", "SERVICING", "CONSUMED"}:
+        elif self.ticket.state not in {"WAITING", "CONSUMED"}:
             raise ValueError("Only a waiting or consumed continuation can carry a receipt.")
         return self
 
@@ -378,6 +397,39 @@ class ContinuationRetirement(ContractValue):
         return self
 
 
+class ContinuationReleasedExecution(ContractValue):
+    """Bounded native proof retained after the invocation ledger can be pruned."""
+
+    permit_operation: StrictStr = Field(pattern=r"^participant-execution:[0-9a-f]{64}$")
+    permit_commitment: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    admission_receipt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    release_receipt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def bounded_evidence(self) -> ContinuationReleasedExecution:
+        if (
+            len(canonical_durable_json_bytes(self.model_dump(mode="json"), "released execution"))
+            > CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES
+        ):
+            raise ValueError("Released execution evidence exceeds its reserved capacity.")
+        return self
+
+
+class ContinuationReleasedRetirement(ContractValue):
+    """Exact original execution expected by released-writer cleanup.
+
+    This is data, not invocation authority. The receiving transaction must prove
+    native permit consumption, writer release and exact settled service history.
+    """
+
+    retirement: ContinuationRetirement
+    permit_operation: Identifier
+    permit_commitment: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    settled_services: tuple[tuple[StrictStr, StrictStr], ...] = Field(
+        default=(), max_length=CONTINUATION_MAX_SERVICES
+    )
+
+
 class ContinuationEvent(ContractValue):
     """Bounded receiving-owner history committed atomically with its aggregate."""
 
@@ -393,6 +445,7 @@ class ContinuationEvent(ContractValue):
         "admitted",
         "excluded",
         "retired",
+        "retirement_acknowledged",
     ]
     record_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -406,6 +459,32 @@ class ContinuationEvent(ContractValue):
         return self
 
 
+class ContinuationServiceReference(ContractValue):
+    """Bounded child-history index; the full service receipt is stored separately."""
+
+    key: StrictStr = Field(pattern=r"^session-continuation:service:[0-9a-f]{64}$")
+    record_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    generation: StrictInt = Field(ge=1, le=CONTINUATION_MAX_SERVICES)
+    parent_generation: StrictInt | None = Field(default=None, ge=1, le=CONTINUATION_MAX_SERVICES)
+    state: Literal["prepared", "reserved", "admitted", "returned", "excluded"]
+    mode: Literal["same_session", "side_session"]
+    expected_run_epoch: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
+    returned_writer_generation: StrictInt | None = Field(
+        default=None, ge=1, le=MAX_PORTABLE_JSON_INTEGER
+    )
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> ContinuationServiceReference:
+        if (self.state == "returned") != (self.returned_writer_generation is not None):
+            raise ValueError("Temporary service reference lacks exact return evidence.")
+        if (
+            len(canonical_durable_json_bytes(self.model_dump(mode="json"), "service reference"))
+            > CONTINUATION_MAX_SERVICE_REFERENCE_BYTES
+        ):
+            raise ValueError("Temporary service reference exceeds its reserved capacity.")
+        return self
+
+
 class ContinuationRecord(ContractValue):
     """One atomic aggregate for ticket, latch, consumption and retirement."""
 
@@ -416,10 +495,39 @@ class ContinuationRecord(ContractValue):
     latch: ContinuationLatch | None = None
     consumption: ContinuationConsumption | None = None
     retirement: ContinuationRetirement | None = None
+    released_retirement: ContinuationReleasedExecution | None = None
+    retirement_acknowledged: StrictBool = False
     events: tuple[ContinuationEvent, ...] = Field(default=(), max_length=CONTINUATION_MAX_EVENTS)
+    services: tuple[ContinuationServiceReference, ...] = Field(
+        default=(), max_length=CONTINUATION_MAX_SERVICES
+    )
 
     @model_validator(mode="after")
     def validate_aggregate(self) -> ContinuationRecord:
+        keys = {item.key for item in self.services}
+        if len(keys) != len(self.services) or any(
+            item.generation != index for index, item in enumerate(self.services, 1)
+        ):
+            raise ValueError("Temporary service history is incomplete or duplicated.")
+        active: list[int] = []
+        prepared = False
+        for item in self.services:
+            if item.parent_generation is not None and item.parent_generation >= item.generation:
+                raise ValueError("Temporary service parent is not retained.")
+            if item.state in {"reserved", "admitted"}:
+                if item.parent_generation != (active[-1] if active else None):
+                    raise ValueError("Temporary services do not form one active stack.")
+                active.append(item.generation)
+            if item.state == "prepared":
+                if prepared or item.generation != len(self.services):
+                    raise ValueError("Only one next service may reserve preparation capacity.")
+                if item.parent_generation != (active[-1] if active else None):
+                    raise ValueError("Temporary preparation has a different service parent.")
+                prepared = True
+        if bool(active) != (self.ticket.state == "SERVICING"):
+            raise ValueError("Temporary service ownership conflicts with ticket state.")
+        if active and (self.consumption is not None or self.retirement is not None):
+            raise ValueError("Temporary service must settle before final continuation.")
         if (
             len(
                 canonical_durable_json_bytes(
@@ -442,10 +550,7 @@ class ContinuationRecord(ContractValue):
                 raise ValueError("Continuation consumption lacks its exact latch.")
             require_ticket_identity(self.ticket, self.consumption.ticket)
             require_latch_identity(self.latch, self.consumption.latch)
-            if self.consumption.receipt_stage == "prepared" and self.ticket.state not in {
-                "WAITING",
-                "SERVICING",
-            }:
+            if self.consumption.receipt_stage == "prepared" and self.ticket.state != "WAITING":
                 raise ValueError("Prepared continuation must still be waiting.")
             if self.consumption.receipt_stage == "admitted" and self.ticket.state != "CONSUMED":
                 raise ValueError("Admitted continuation must have CONSUMED state.")
@@ -457,6 +562,10 @@ class ContinuationRecord(ContractValue):
             require_ticket_identity(self.ticket, self.retirement.ticket)
             if self.consumption is not None and self.consumption.receipt_stage != "excluded":
                 raise ValueError("A continuation cannot be consumed and retired together.")
+        if self.released_retirement is not None and self.retirement is None:
+            raise ValueError("Released retirement evidence requires a terminal retirement.")
+        if self.retirement_acknowledged and self.released_retirement is None:
+            raise ValueError("Retirement acknowledgement requires released execution evidence.")
         if self.ticket.state == "CONSUMED" and self.consumption is None:
             raise ValueError("Consumed continuation lacks its receipt.")
         if self.ticket.state == "RETIRED" and self.retirement is None:
@@ -598,6 +707,41 @@ def require_writer_generation(
         raise ContinuationConflict("Continuation ticket belongs to a stale writer generation.")
 
 
+def continuation_writer_frontier(record: ContinuationRecord) -> tuple[int, bool]:
+    """Return the authenticated writer and whether its release is already included."""
+    generation = record.ticket.writer_generation
+    already_released = False
+    for service in record.services:
+        if service.mode != "same_session":
+            continue
+        if service.state == "returned":
+            assert service.returned_writer_generation is not None
+            generation = service.returned_writer_generation
+            already_released = True
+        elif service.state == "admitted":
+            generation = service.expected_run_epoch + 1
+            already_released = False
+    return generation, already_released
+
+
+def require_record_writer_generation(
+    record: ContinuationRecord,
+    current_run_epoch: int,
+    *,
+    allow_post_admission: bool = False,
+    allow_released_next_generation: bool = False,
+) -> None:
+    """Use receiving-owner service succession without rewriting the original ticket."""
+    generation, already_released = continuation_writer_frontier(record)
+    allowed = {generation}
+    if allow_post_admission or (allow_released_next_generation and not already_released):
+        allowed.add(generation + 1)
+    if current_run_epoch not in allowed:
+        raise ContinuationConflict(
+            "Continuation belongs to a stale writer generation without receiving-owner succession."
+        )
+
+
 def record_from_json(raw: object) -> ContinuationRecord:
     return ContinuationRecord.model_validate(raw)
 
@@ -609,9 +753,32 @@ def require_operation_record_owner(key: str, record: object) -> None:
         return
     from cayu.runtime._session_continuation_scope import require_publication
 
-    require_publication(key)
     if type(record) is not dict:
         raise ContinuationConflict("Continuation operation record is not an object.")
+    from cayu.runtime._temporary_service_target import (
+        TARGET_PREFIX,
+        TemporaryServiceTarget,
+        target_service_key,
+    )
+
+    if key.startswith(TARGET_PREFIX):
+        require_publication(key)
+        target = TemporaryServiceTarget.model_validate(record)
+        if target_service_key(target.service.intent.operation) != key:
+            raise ContinuationConflict("Side-session target key conflicts with its operation.")
+        return
+    if key.startswith(CONTINUATION_SERVICE_PREFIX):
+        from cayu.runtime._temporary_continuation import (
+            TemporaryServiceRecord,
+            temporary_service_key,
+        )
+
+        parsed_service = TemporaryServiceRecord.model_validate(record)
+        require_publication(continuation_operation_key(parsed_service.intent.ticket))
+        if temporary_service_key(parsed_service.intent.operation) != key:
+            raise ContinuationConflict("Temporary service key conflicts with its operation.")
+        return
+    require_publication(key)
     if key == CONTINUATION_NAMESPACE_KEY:
         ContinuationNamespace.model_validate(record)
         return

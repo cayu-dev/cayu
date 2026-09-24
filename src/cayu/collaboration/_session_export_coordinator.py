@@ -58,6 +58,7 @@ from cayu.collaboration._session_export_store import (
     source_digest,
 )
 from cayu.collaboration.access import CollaborationAccessDenied
+from cayu.collaboration.clarifications import ClarificationSource
 from cayu.collaboration.exports import (
     ExportLimits,
     SessionExportAcceptance,
@@ -78,7 +79,7 @@ from cayu.collaboration.exports import (
     SessionExportUnavailable,
 )
 from cayu.collaboration.mandates import MandateDenied, MandateResolver, ResourceSelectorOwner
-from cayu.collaboration.participants import CollaborationCapacityExceeded
+from cayu.collaboration.participants import CollaborationCapacityExceeded, ParticipantRef
 from cayu.collaboration.peer_content import (
     PeerAppendKey,
     PeerContentExposureItem,
@@ -1316,6 +1317,43 @@ class SessionExportCoordinator:
             return outcome
 
         return await self.observed(operation, key=("read", uuid4().hex), expected=b"read")
+
+    async def inspect_clarification_source(
+        self,
+        request: SessionExportRequest,
+        *,
+        context: SessionExportAccessContext,
+        sender: ParticipantRef,
+        audience: ParticipantRef,
+        expected: ClarificationSource | None = None,
+    ) -> ClarificationSource:
+        """Read an authenticated historical selection, never a disclosure permit."""
+        from cayu.collaboration._clarification_export import acquire_clarification_source
+
+        self.ready(access="readback")
+        request = self.prepare(SessionExportRequest, request)
+        context = self.prepare(SessionExportAccessContext, context)
+        sender = self.prepare(ParticipantRef, sender)
+        audience = self.prepare(ParticipantRef, audience)
+        if expected is not None:
+            expected = self.prepare(ClarificationSource, expected)
+
+        async def operation():
+            async with acquire_clarification_source(
+                self,
+                request,
+                context=context,
+                sender=sender,
+                audience=audience,
+                expected=expected,
+            ) as projection:
+                return self.prepare(ClarificationSource, projection.source)
+            # A policy which suppresses a denied read cannot manufacture success.
+            raise SessionExportUnavailable()
+
+        return await self.observed(
+            operation, key=("clarification-source", uuid4().hex), expected=b"read"
+        )
 
     async def reconcile(
         self, request: SessionExportRequest, *, context: SessionExportAccessContext

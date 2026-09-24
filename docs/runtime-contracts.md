@@ -16483,6 +16483,16 @@ returns `ExactMatch`, `ExactNotFound`, `ExactConflict`, or `ExactUnavailable`;
 ordinary dependency-read failure is not interpreted as absence. Permission
 denial and caller cancellation remain separate from those lookup outcomes.
 
+Participant-root execution-to-wait additionally binds paired commitments for the
+complete execution admission and unbound collaboration wait into the native
+intent/ticket. The root execution owner compares the admission commitment before
+dispatch. Administrative cleanup compares both commitments and native writer
+release evidence; an expired or revoked disclosure mandate cannot prevent
+discharging this exact debt. If the foreign wait has been pruned, the registered
+receiver requires positive namespace-retirement evidence rather than inferring
+settlement from absence. Native retirement acknowledgement remains a deletion
+fence until that evidence has been authenticated and recorded.
+
 Consumption atomically validates the originating ticket writer before retaining
 one exact inline-or-queued responsibility: only that writer or its documented
 released successor is eligible,
@@ -16555,6 +16565,18 @@ without the original in-process invocation. The atomic store boundary requires
 the exact session incarnation, ticket identity and revision, no consumption
 handoff, and an epoch beyond the original writer's single release increment.
 This cleanup never admits execution, revives the wait, or settles uncertain
-consumption. Other retirement reasons still require the original invocation.
+consumption. Other retirement reasons require the original invocation or the
+authenticated `exclude_participant_session_wait()` released-execution handoff.
+That handoff also covers parked waits after temporary service: the native
+transaction verifies original permit consumption/release, current released writer
+succession, no final-consumption claim, and the exact complete terminal service
+history authenticated by the registered owner. Each service must have acknowledged
+foreign settlement; return or cancellation alone is not sufficient. Retirement
+and foreign exclusion acknowledgement remain separate exact receipts.
+The continuation checkpoint index uses schema version 2 and retains each ticket's
+originating writer epoch. Its admission/release receipts remain protected while
+the ticket is ARMING, WAITING or SERVICING. Terminal retirement freezes the release
+proof before that protection ends. Missing or incompatible index evidence fails
+closed; no legacy index reconstruction from guessed writer epochs is supported.
 Checkpoint-copying forks exclude the source continuation index and tickets,
 including settled history; ordinary checkpoint transformations preserve them.

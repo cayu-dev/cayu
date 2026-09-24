@@ -568,13 +568,13 @@ async def test_peer_schema_requires_explicit_migration(backend, tmp_path, reques
     path = tmp_path / "creation-fence.sqlite"
     if backend == "sqlite":
         with sqlite3.connect(path) as connection:
-            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 104")
+            connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 104")
     else:
         import psycopg
 
         dsn = request.getfixturevalue("postgres_dsn")
         async with await psycopg.AsyncConnection.connect(dsn) as connection:
-            await connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 104")
+            await connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 104")
     try:
         if backend == "sqlite":
             with pytest.raises(SchemaTooOld, match="requires >= 104"):

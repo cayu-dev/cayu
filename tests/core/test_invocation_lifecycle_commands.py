@@ -104,6 +104,21 @@ from cayu.tools.exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY, ToolCapabi
 from cayu.vaults.redaction import SecretRedactor
 
 
+def test_admission_checkpoint_digest_separates_export_owned_index() -> None:
+    from cayu.collaboration._session_export_store import ROOT_KEY as EXPORT_ROOT_KEY
+
+    checkpoint = {"runtime-owned-value": {"revision": 1}}
+    exported = {**checkpoint, EXPORT_ROOT_KEY: {"owner-index": "retained"}}
+    before = copy.deepcopy(exported)
+    assert invocation_checkpoint_state_sha256(exported) == invocation_checkpoint_state_sha256(
+        checkpoint
+    )
+    assert exported == before
+    assert invocation_checkpoint_state_sha256(exported) != invocation_checkpoint_state_sha256(
+        {**exported, "runtime-owned-value": {"revision": 2}}
+    )
+
+
 def test_session_store_lifecycle_command_runtime_annotations_are_resolvable() -> None:
     assert get_type_hints(SessionStore.apply_invocation_lifecycle_command) == {
         "command": object,

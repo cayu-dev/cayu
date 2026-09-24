@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from cayu.collaboration._clarification_commands import (
+    ClarificationCloseReceipt,
+    ClarificationOpenReceipt,
+    ClarificationReplyReceipt,
+)
 from cayu.collaboration._contracts import CollaborationContractError, OperationRef
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration.requests import (
@@ -17,13 +22,22 @@ from cayu.collaboration.requests import (
 from cayu.vaults.redaction import SecretRedactor
 
 RequestReceiptMode = Literal[
-    "request_admission", "request_progress", "request_outcome", "request_observation"
+    "request_admission",
+    "request_progress",
+    "request_outcome",
+    "request_observation",
+    "clarification_open",
+    "clarification_reply",
+    "clarification_close",
 ]
 RequestReceipt = (
     RequestAdmissionReceipt
     | RequestProgressReceipt
     | RequestOutcomeReceipt
     | RequestObservationReceipt
+    | ClarificationOpenReceipt
+    | ClarificationReplyReceipt
+    | ClarificationCloseReceipt
 )
 
 
@@ -42,6 +56,9 @@ _SCHEMAS: dict[RequestReceiptMode, type[RequestReceipt]] = {
     "request_progress": RequestProgressReceipt,
     "request_outcome": RequestOutcomeReceipt,
     "request_observation": RequestObservationReceipt,
+    "clarification_open": ClarificationOpenReceipt,
+    "clarification_reply": ClarificationReplyReceipt,
+    "clarification_close": ClarificationCloseReceipt,
 }
 
 
@@ -90,6 +107,12 @@ def record_operation(raw: object, *, redactor: SecretRedactor) -> OperationRef:
     if not isinstance(raw, dict):
         raise CollaborationContractError("Stored operation record is malformed.")
     document = cast("dict[str, object]", raw)
+    if document.get("mode") == "clarification_delivery":
+        from cayu.collaboration._clarification_deliveries import ClarificationDeliveryRecord
+
+        return prepare_contract(
+            ClarificationDeliveryRecord, document, redactor=redactor
+        ).intent.operation
     if document.get("mode") == "collaboration_wait":
         from cayu.collaboration.waits import WaitSnapshot
 

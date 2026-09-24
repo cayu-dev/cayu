@@ -33,6 +33,7 @@ from cayu.runtime._invocation_lifecycle import (
     InvocationMutationResult,
     PreparedInvocationBinding,
     copy_invocation_lifecycle_command,
+    invocation_admission_command_sha256,
 )
 from cayu.runtime._session_continuation import (
     ContinuationConflict,
@@ -42,6 +43,7 @@ from cayu.runtime._session_continuation import (
     ContinuationNamespace,
     ContinuationPreparation,
     ContinuationRecord,
+    ContinuationReleasedRetirement,
     ContinuationRetirement,
     ContinuationService,
     ContinuationTicket,
@@ -50,6 +52,7 @@ from cayu.runtime._session_continuation import (
     admit_continuation,
     continuation_admission_digest,
     continuation_admission_inputs,
+    continuation_digest,
     continuation_namespace_id,
     continuation_operation_key,
     continuation_registration_operation,
@@ -64,11 +67,27 @@ from cayu.runtime._session_continuation_scope import (
     require_ticket_invocation,
     retirement_scope,
 )
+from cayu.runtime._temporary_continuation import (
+    TemporaryServiceAdmission,
+    TemporaryServiceDispatch,
+    TemporaryServiceIntent,
+    TemporaryServicePreparation,
+    TemporaryServiceRecord,
+    require_temporary_service_command,
+    temporary_admission_payload_sha256,
+    temporary_service_key,
+)
+from cayu.runtime._temporary_continuation_permits import (
+    TemporaryServicePermitAuthority,
+    TemporaryServiceSettlementReader,
+)
+from cayu.runtime._temporary_continuation_scope import temporary_admission_scope
 from cayu.sessions.base import ResumeRequest, SessionStore, copy_resume_request
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
+    from cayu.collaboration.access import CollaborationAccessContext
 
 LATCH_FAMILY = FamilyVersion(family="session.continuation.latch", version=1)
 T = TypeVar("T")
@@ -122,6 +141,7 @@ class SessionContinuationOwner:
         receiver: ContinuationLatchReceiver,
         receiver_capability: CapabilityDescriptor,
         redactor: SecretRedactor,
+        temporary_permits: TemporaryServicePermitAuthority | None = None,
     ) -> None:
         if not store._supports_session_continuation_protocol():
             raise ContinuationUnavailable("Session store does not qualify continuation ownership.")
@@ -141,9 +161,15 @@ class SessionContinuationOwner:
             redactor=redactor,
         )
         self.owners = _MutationOwners()
+        self.temporary_permits = temporary_permits
 
     async def _observe(
-        self, operation: Callable[[], Awaitable[T]], *, key: tuple[object, ...], expected: bytes
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        key: tuple[object, ...],
+        expected: bytes,
+        wait_for_settlement: bool = False,
     ) -> T:
         async def run() -> T:
             failure: BaseException
@@ -187,6 +213,7 @@ class SessionContinuationOwner:
                 expectation=expected,
                 redactor=self.redactor,
                 failure_snapshot=lambda error: _failure_graph(error, self.redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         except CollaborationConflict:
             failure = ContinuationConflict("An owned continuation operation has different intent.")
@@ -386,6 +413,55 @@ class SessionContinuationOwner:
             raise ContinuationConflict("Continuation exclusion requires a refusal reason.")
         return await self.retire(retirement, invocation=invocation)
 
+    async def retire_released(
+        self, candidate: ContinuationReleasedRetirement
+    ) -> ContinuationRecord:
+        """Retire only through native release and acknowledged service evidence."""
+        from cayu.runtime._session_continuation_scope import released_retirement_scope
+        from cayu.runtime._temporary_continuation import (
+            TemporaryServiceRecord,
+            reference_for_service,
+        )
+
+        expected = prepare_contract(
+            ContinuationReleasedRetirement, candidate, redactor=self.redactor
+        )
+        ticket = expected.retirement.ticket
+        if ticket.owner != self.owner:
+            raise PermissionError("Released retirement belongs to another session owner.")
+        retained = await self.store.load_continuation_ticket(
+            ticket.session_id,
+            session_instance_id=ticket.session_instance_id,
+            registration_key=ticket.registration_key,
+        )
+        if retained is None:
+            raise ContinuationUnavailable("Released retirement responsibility is unavailable.")
+        settlements = []
+        for reference in retained.services:
+            raw = await self.store.load_session_operation(ticket.session_id, reference.key)
+            if raw is None:
+                raise ContinuationUnavailable("Service settlement evidence is unavailable.")
+            service = prepare_contract(TemporaryServiceRecord, raw, redactor=self.redactor)
+            require_ticket_identity(retained.ticket, service.intent.ticket)
+            if (
+                reference_for_service(service, retained.services) != reference
+                or service.state not in {"returned", "excluded"}
+                or not service.settlement_acknowledged
+            ):
+                raise ContinuationConflict("Temporary service settlement remains unresolved.")
+            settlements.append((reference.key, reference.record_sha256))
+        expected = expected.model_copy(update={"settled_services": tuple(settlements)})
+
+        async def retire():
+            with released_retirement_scope(expected):
+                return await self.store.retire_continuation(expected.retirement)
+
+        return await self._observe(
+            retire,
+            key=(ticket.session_id, continuation_operation_key(ticket), "released-retirement"),
+            expected=contract_bytes(expected, redactor=self.redactor),
+        )
+
     async def admit(
         self,
         candidate: ContinuationConsumption,
@@ -449,8 +525,455 @@ class SessionContinuationOwner:
             expected=contract_bytes(expected, redactor=self.redactor),
         )
 
+    async def prepare_temporary_admission(
+        self,
+        candidate: TemporaryServiceIntent,
+        command: AdmitInvocationCommand,
+        *,
+        invocation: InvocationContext,
+    ) -> tuple[InvocationMutationResult, TemporaryServiceRecord]:
+        """Join runtime preparation to durable registration, then native admission.
+
+        No public caller may supply this invocation authority. The configured
+        clarification coordinator must configure current source disclosure
+        authorization on the permit owner's admission guard. That guard belongs
+        to the durable registration task, not its cancellable observer.
+        """
+        if self.temporary_permits is None:
+            raise PermissionError("Temporary service permit owner is not registered.")
+        intent = prepare_contract(TemporaryServiceIntent, candidate, redactor=self.redactor)
+        copied = self._temporary_runtime_command(intent, command, invocation)
+        await self._require_temporary_participant_binding(intent)
+        copied = copied.model_copy(
+            update={"temporary_service_operation_key": temporary_service_key(intent.operation)}
+        )
+        dispatch = TemporaryServiceDispatch(
+            intent=intent,
+            admission_payload_sha256=temporary_admission_payload_sha256(copied),
+            expected_run_epoch=copied.expected_run_epoch,
+        )
+        preparation = await self.temporary_permits.prepare(dispatch)
+        if intent.mode == "side_session":
+            # Both native capacities precede the separate foreign permit handoff.
+            # A rejected target must not strand a source-only reservation.
+            await self.store._prepare_temporary_side_service(preparation)
+        else:
+            prepared = await self.store._load_temporary_continuation_service(preparation)
+            if prepared is None:
+                await self.store._publish_temporary_continuation_service(
+                    previous=None,
+                    proposed=TemporaryServiceRecord(admission=preparation, state="prepared"),
+                )
+            elif prepared.state != "prepared":
+                raise ContinuationConflict("Temporary service preparation was already decided.")
+        record = await self.temporary_permits.register(preparation)
+        receipt_digest = continuation_digest(record.permit)
+        copied = copied.model_copy(
+            update={
+                "participant_permit_operation": record.permit.expected.operation.caller_key,
+                "participant_permit_commitment": receipt_digest,
+            }
+        )
+        admission = TemporaryServiceAdmission(
+            dispatch=dispatch,
+            permit=record.permit.expected,
+            permit_receipt_sha256=receipt_digest,
+            admission_command_sha256=invocation_admission_command_sha256(copied),
+        )
+        # This is the runtime dependency, not the public observer. A committed
+        # admission must reach the driver even if its acknowledgement is slow;
+        # the surrounding service execution deadline still bounds the wait.
+        return await self.admit_temporary(
+            admission, copied, invocation=invocation, wait_for_settlement=True
+        )
+
+    def _temporary_runtime_command(
+        self,
+        intent: TemporaryServiceIntent,
+        command: AdmitInvocationCommand,
+        invocation: InvocationContext,
+    ) -> AdmitInvocationCommand:
+        if (
+            type(invocation) is not InvocationContext
+            or type(invocation.binding) is not PreparedInvocationBinding
+        ):
+            raise PermissionError("Temporary service requires runtime preparation authority.")
+        invocation.require_runtime_authority()
+        if type(command) is not AdmitInvocationCommand:
+            raise PermissionError("Temporary service requires the typed admission command.")
+        failure = None
+        try:
+            copied = copy_invocation_lifecycle_command(command)
+        except Exception as error:
+            failure = ContinuationConflict("Temporary service admission command is invalid.")
+            failure.__cause__ = _failure_graph(error, self.redactor)
+        if failure is not None:
+            raise failure
+        if type(copied) is not AdmitInvocationCommand:
+            raise PermissionError("Temporary service requires the typed admission command.")
+        binding = invocation.binding
+        if (
+            intent.ticket.owner != self.owner
+            or intent.target.owner != self.owner
+            or binding.session_id != intent.target.object_id
+            or binding.session_instance_id != intent.target.incarnation
+            or copied.session_id != binding.session_id
+            or copied.expected_session_instance_id != binding.session_instance_id
+            or binding.run_epoch != copied.expected_run_epoch + 1
+            or invocation.active_profile != copied.target_active_profile
+            or invocation.active_profile.interaction_id != intent.invocation_id
+            or copied.interaction_started_event is None
+            or copied.interaction_started_event.timestamp != intent.prepared_at
+            or invocation.active_profile.profile.fingerprint != intent.execution_profile_sha256
+            or invocation.tool_capability_ceiling != copied.tool_capability_ceiling
+        ):
+            raise PermissionError("Temporary service conflicts with runtime authority.")
+        return copied
+
+    async def _require_temporary_participant_binding(self, intent: TemporaryServiceIntent) -> None:
+        binding = await self.store.load_participant_session_binding(intent.target.object_id)
+        if (
+            binding is None
+            or binding.session_instance_id != intent.target.incarnation
+            or binding.participant != intent.question.responder
+            or continuation_digest(binding) != intent.participant_binding_sha256
+        ):
+            raise PermissionError("Temporary service participant binding conflicts.")
+
+    async def admit_temporary(
+        self,
+        candidate: TemporaryServiceAdmission,
+        command: AdmitInvocationCommand,
+        *,
+        invocation: InvocationContext,
+        wait_for_settlement: bool = False,
+    ) -> tuple[InvocationMutationResult, TemporaryServiceRecord]:
+        """Consume a registered permit after ordinary runtime preparation gates.
+
+        This is not a public caller receipt entrance. Both the runtime context
+        and the foreign durable permit must authenticate the complete command.
+        """
+        if self.temporary_permits is None:
+            raise PermissionError("Temporary service permit owner is not registered.")
+        expected = prepare_contract(TemporaryServiceAdmission, candidate, redactor=self.redactor)
+        intent = expected.dispatch.intent
+        copied = self._temporary_runtime_command(intent, command, invocation)
+        require_temporary_service_command(expected, copied)
+
+        async def dispatch() -> tuple[InvocationMutationResult, TemporaryServiceRecord]:
+            assert self.temporary_permits is not None
+            authenticated = await self.temporary_permits.authenticate(expected)
+            await self._require_temporary_participant_binding(intent)
+            if intent.mode == "side_session":
+                previous = await self.store._load_temporary_continuation_service(
+                    authenticated.preparation
+                )
+                if previous is None:
+                    raise ContinuationUnavailable("Side-session source responsibility is missing.")
+                if previous.state == "prepared":
+                    await self.store._publish_temporary_continuation_service(
+                        previous=previous,
+                        proposed=TemporaryServiceRecord(admission=authenticated, state="reserved"),
+                    )
+                elif previous.state != "reserved" or previous.admission != authenticated:
+                    raise ContinuationConflict(
+                        "Side-session source reservation was already decided."
+                    )
+            with temporary_admission_scope(authenticated, copied):
+                result = await self.store.apply_invocation_lifecycle_command(copied)
+            if intent.mode == "side_session":
+                await self.store._reconcile_temporary_continuation_service(authenticated)
+            retained = await self.store._load_temporary_continuation_service(authenticated)
+            if retained is None:
+                raise ContinuationUnavailable("Temporary service admission readback is pending.")
+            return result, retained
+
+        return await self._observe(
+            dispatch,
+            key=(intent.target.object_id, temporary_service_key(intent.operation), "admit"),
+            expected=contract_bytes(expected, redactor=self.redactor),
+            wait_for_settlement=wait_for_settlement,
+        )
+
+    async def exclude_temporary(
+        self, candidate: TemporaryServicePreparation
+    ) -> TemporaryServiceRecord:
+        """Fence a prepared native operation before settling foreign responsibility.
+
+        This is an explicit coordinator decision, never an inference from timeout
+        or cancellation. The native compare-and-publication races admission under
+        the same session transaction; admitted work cannot take this transition.
+        """
+        from cayu.collaboration._permits import ReceivingSettlementReceipt
+
+        if self.temporary_permits is None:
+            raise PermissionError("Temporary service permit owner is not registered.")
+        expected = prepare_contract(TemporaryServicePreparation, candidate, redactor=self.redactor)
+        intent = expected.dispatch.intent
+        if intent.ticket.owner != self.owner or intent.target.owner != self.owner:
+            raise PermissionError("Temporary service belongs to another receiving owner.")
+
+        async def exclude():
+            assert self.temporary_permits is not None
+            retained = await self.store._load_temporary_continuation_service(expected)
+            if retained is None:
+                raise ContinuationUnavailable("Temporary service has no reserved receiving fence.")
+            target_record = None
+            if intent.mode == "side_session":
+                from cayu.runtime._temporary_service_target import (
+                    exclude_side_target,
+                )
+
+                if retained.state == "excluded":
+                    target_session = await self.store.load(intent.target.object_id)
+                    if (
+                        target_session is None
+                        or target_session.instance_id != intent.target.incarnation
+                    ):
+                        # Positive exclusion is retained by the source; a missing
+                        # target is not being used to create exclusion evidence.
+                        await self.temporary_permits.exclude(
+                            expected,
+                            reader=TemporaryServiceSettlementReader(
+                                self.store, expected, redactor=self.redactor
+                            ),
+                        )
+                        return await self._acknowledge_temporary_settlement(retained)
+                target_record = await self.store._load_temporary_service_target(expected)
+                if target_record is None:
+                    raise ContinuationUnavailable(
+                        "Joint preparation is missing its exact receiving fence."
+                    )
+                target_record = await self.store._publish_temporary_service_target(
+                    previous=target_record,
+                    proposed=exclude_side_target(target_record, expected),
+                )
+            if retained.state == "prepared" or (
+                target_record is not None and retained.state == "reserved"
+            ):
+                excluded = TemporaryServiceRecord(
+                    admission=retained.admission,
+                    state="excluded",
+                    settlement=target_record.service.settlement
+                    if target_record is not None
+                    else ReceivingSettlementReceipt(
+                        expected=expected.permit,
+                        receiving_owner=self.owner,
+                        receipt_id="clarification-exclusion:" + continuation_digest(expected),
+                        outcome="quiescent",
+                        admission_excluded=True,
+                    ),
+                )
+                retained = await self.store._publish_temporary_continuation_service(
+                    previous=retained, proposed=excluded
+                )
+            elif retained.state != "excluded":
+                raise ContinuationConflict("Temporary service was admitted and cannot be excluded.")
+            if target_record is not None:
+                from cayu.runtime._temporary_service_target import acknowledge_side_target
+
+                await self.store._publish_temporary_service_target(
+                    previous=target_record,
+                    proposed=acknowledge_side_target(target_record, retained),
+                )
+            await self.temporary_permits.exclude(
+                expected,
+                reader=TemporaryServiceSettlementReader(
+                    self.store, expected, redactor=self.redactor
+                ),
+            )
+            return await self._acknowledge_temporary_settlement(retained)
+
+        return await self._observe(
+            exclude,
+            key=(intent.target.object_id, temporary_service_key(intent.operation), "exclude"),
+            expected=contract_bytes(expected, redactor=self.redactor),
+        )
+
+    async def _acknowledge_temporary_settlement(
+        self, retained: TemporaryServiceRecord
+    ) -> TemporaryServiceRecord:
+        """Retain foreign settlement acknowledgement before permitting erasure."""
+        if retained.settlement_acknowledged:
+            return retained
+        return await self.store._publish_temporary_continuation_service(
+            previous=retained,
+            proposed=retained.model_copy(update={"settlement_acknowledged": True}),
+        )
+
+    async def reconcile_temporary(
+        self, candidate: TemporaryServiceAdmission
+    ) -> TemporaryServiceRecord:
+        """Reconcile native return before discharging the foreign obligation.
+
+        If the foreign acknowledgement is lost, the source's exact returned
+        record remains available to the registered settlement reader. Neither
+        missing admission nor caller cancellation is an exclusion witness.
+        """
+        if self.temporary_permits is None:
+            raise PermissionError("Temporary service permit owner is not registered.")
+        expected = prepare_contract(TemporaryServiceAdmission, candidate, redactor=self.redactor)
+        intent = expected.dispatch.intent
+        if intent.ticket.owner != self.owner or intent.target.owner != self.owner:
+            raise PermissionError("Temporary service belongs to another receiving owner.")
+
+        async def reconcile() -> TemporaryServiceRecord:
+            assert self.temporary_permits is not None
+            retained = await self.store._load_temporary_continuation_service(expected)
+            if retained is None or retained.settlement is None:
+                authenticated = await self.temporary_permits.authenticate(expected)
+                retained = await self.store._reconcile_temporary_continuation_service(authenticated)
+            if retained.settlement is not None:
+                await self.temporary_permits.settle(
+                    expected,
+                    reader=TemporaryServiceSettlementReader(
+                        self.store, expected, redactor=self.redactor
+                    ),
+                )
+                retained = await self._acknowledge_temporary_settlement(retained)
+            return retained
+
+        return await self._observe(
+            reconcile,
+            key=(intent.target.object_id, temporary_service_key(intent.operation), "reconcile"),
+            expected=contract_bytes(expected, redactor=self.redactor),
+        )
+
+    async def service_temporary(
+        self,
+        app: CayuApp,
+        request: ResumeRequest,
+        candidate: TemporaryServiceIntent,
+        *,
+        participant_context: CollaborationAccessContext,
+        delivery: Callable[[InvocationContext], Awaitable[None]] | None = None,
+    ) -> TemporaryServiceRecord:
+        """Explicit internal service, with durable reconciliation before dispatch.
+
+        The registered clarification coordinator configures the permit owner's
+        admission guard to retain current source disclosure through registration.
+        The guard ends before provider serialization acquires its own disclosure
+        authority; holding a non-reentrant policy guard around this entire call
+        would deadlock. This is not an independently authorized SDK entrance.
+        Cancelling observation does not prove the owned service stopped.
+        """
+        from cayu.collaboration.access import CollaborationAccessContext
+        from cayu.runtime._temporary_continuation_resume import _TemporaryContinuationResumeHandoff
+        from cayu.runtime._temporary_service_execution import drive_temporary_service
+
+        if self.temporary_permits is None or app.session_store is not self.store:
+            raise PermissionError("Temporary service requires its registered application owner.")
+        intent = prepare_contract(TemporaryServiceIntent, candidate, redactor=self.redactor)
+        participant_context = prepare_contract(
+            CollaborationAccessContext, participant_context, redactor=self.redactor
+        )
+        if intent.ticket.owner != self.owner or intent.target.owner != self.owner:
+            raise PermissionError("Temporary service belongs to another receiving owner.")
+        failure = None
+        try:
+            copied = copy_resume_request(request)
+            # The source digest distinguishes omitted and explicitly supplied
+            # controls. Ordinary copying materializes defaults; preserve the
+            # validated caller field-presence tuple for this exact handoff.
+            fields = request.model_fields_set
+            if type(fields) is not set or any(
+                type(name) is not str or name not in ResumeRequest.model_fields for name in fields
+            ):
+                raise ValueError("Temporary resume field presence is invalid.")
+            object.__setattr__(copied, "__pydantic_fields_set__", set(fields))
+            digest = app._session_engine.work_attempt_source_request_sha256(
+                copied, kind="continuation"
+            )
+        except Exception as error:
+            failure = ContinuationConflict("Temporary service resume request is invalid.")
+            failure.__cause__ = _failure_graph(error, self.redactor)
+        if failure is not None:
+            raise failure
+        if copied.session_id != intent.target.object_id or digest != intent.resume_sha256:
+            raise ContinuationConflict(
+                "Temporary service resume request conflicts with its intent."
+            )
+
+        async def read_native() -> TemporaryServiceRecord | None:
+            parent = await self.store.load_continuation_ticket(
+                intent.ticket.session_id,
+                session_instance_id=intent.ticket.session_instance_id,
+                registration_key=intent.ticket.registration_key,
+            )
+            if parent is None:
+                raise ContinuationUnavailable("Temporary service source ticket is unavailable.")
+            require_ticket_identity(intent.ticket, parent.ticket)
+            raw = await self.store.load_session_operation(
+                intent.ticket.session_id, temporary_service_key(intent.operation)
+            )
+            if raw is None:
+                if any(
+                    item.key == temporary_service_key(intent.operation) for item in parent.services
+                ):
+                    raise ContinuationUnavailable(
+                        "Temporary service receiving index lost its record."
+                    )
+                return None
+            record = prepare_contract(TemporaryServiceRecord, raw, redactor=self.redactor)
+            if record.intent != intent:
+                raise ContinuationConflict("Temporary service receiving identity conflicts.")
+            # Re-read through the exact receiving owner to authenticate its parent
+            # index, incarnation and complete admission tuple, not just this JSON.
+            return await self.store._load_temporary_continuation_service(record.admission)
+
+        async def receive() -> TemporaryServiceRecord:
+            assert self.temporary_permits is not None
+            registered = await self.temporary_permits.lookup(intent)
+            retained = await read_native()
+            if retained is not None:
+                if retained.state == "excluded":
+                    preparation = (
+                        retained.admission.preparation
+                        if isinstance(retained.admission, TemporaryServiceAdmission)
+                        else retained.admission
+                    )
+                    return await self.exclude_temporary(preparation)
+                if registered is None or retained.admission.dispatch != registered.dispatch:
+                    raise ContinuationUnavailable(
+                        "Temporary service source registration conflicts."
+                    )
+                if retained.state == "prepared":
+                    raise ContinuationUnavailable(
+                        "Temporary service preparation requires exact admission or exclusion."
+                    )
+                return await self.reconcile_temporary(retained.acknowledged_admission)
+            if registered is not None:
+                raise ContinuationUnavailable(
+                    "Temporary service admission is unresolved; reconcile or obtain exact exclusion."
+                )
+            await self._require_temporary_participant_binding(intent)
+            boundary = await self.temporary_permits.execution_deadline(intent)
+            stream = app._resume_private(
+                copied,
+                store_resolved_session_id=intent.target.object_id,
+                continuation_handoff=_TemporaryContinuationResumeHandoff(self, intent, delivery),
+                participant_context=participant_context,
+            )
+            await drive_temporary_service(stream, boundary)
+            retained = await read_native()
+            if retained is None:
+                raise ContinuationUnavailable("Temporary service admission remains unacknowledged.")
+            return await self.reconcile_temporary(retained.acknowledged_admission)
+
+        return await self._observe(
+            receive,
+            key=(intent.target.object_id, temporary_service_key(intent.operation), "service"),
+            expected=contract_bytes(intent, redactor=self.redactor)
+            + contract_bytes(participant_context, redactor=self.redactor),
+        )
+
     async def service(
-        self, app: CayuApp, request: ResumeRequest, candidate: ContinuationService
+        self,
+        app: CayuApp,
+        request: ResumeRequest,
+        candidate: ContinuationService,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> ContinuationRecord:
         """Run the existing resume path, or reconcile its exact prior admission.
 
@@ -464,6 +987,19 @@ class SessionContinuationOwner:
         service = prepare_contract(ContinuationService, candidate, redactor=self.redactor)
         if app.session_store is not self.store or service.ticket.owner != self.owner:
             raise PermissionError("Continuation service belongs to another application owner.")
+        if participant_context is not None:
+            from cayu.collaboration.access import CollaborationAccessContext
+
+            participant_context = prepare_contract(
+                CollaborationAccessContext, participant_context, redactor=self.redactor
+            )
+        source = await self.store.load(service.ticket.session_id)
+        if source is None or source.instance_id != service.ticket.session_instance_id:
+            raise ContinuationConflict("Continuation session incarnation is unavailable.")
+        # A latch proves the wait decision, not current participant access.
+        # Authenticate each observer, including settled replay; normal resume
+        # rechecks execution authority before the receiving mutation.
+        await app._require_participant_execution(source, participant_context)
         failure = None
         try:
             copied_request = copy_resume_request(request)
@@ -553,6 +1089,7 @@ class SessionContinuationOwner:
                     copied_request,
                     store_resolved_session_id=service.ticket.session_id,
                     continuation_handoff=handoff,
+                    participant_context=participant_context,
                 )
                 try:
                     async for _ in stream:
@@ -577,6 +1114,7 @@ class SessionContinuationOwner:
                 copied_request,
                 store_resolved_session_id=service.ticket.session_id,
                 continuation_handoff=handoff,
+                participant_context=participant_context,
             )
             try:
                 async for _ in stream:
@@ -595,7 +1133,12 @@ class SessionContinuationOwner:
         return await self._observe(
             receive,
             key=(service.ticket.session_id, continuation_operation_key(service.ticket), "service"),
-            expected=service_digest.encode("ascii"),
+            expected=service_digest.encode("ascii")
+            + (
+                b""
+                if participant_context is None
+                else contract_bytes(participant_context, redactor=self.redactor)
+            ),
         )
 
     async def reconcile_admission(self, candidate: ContinuationConsumption) -> ContinuationRecord:

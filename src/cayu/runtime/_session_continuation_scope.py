@@ -17,14 +17,18 @@ if TYPE_CHECKING:
         ContinuationLatch,
         ContinuationNamespace,
         ContinuationPreparation,
+        ContinuationReleasedRetirement,
         ContinuationRetirement,
         ContinuationTicket,
     )
     from cayu.sessions.base import Session
 
 _PUBLICATION: ContextVar[str | None] = ContextVar("continuation_publication", default=None)
+_SERVICE_PUBLICATION: ContextVar[tuple[str, str] | None] = ContextVar(
+    "continuation_service_publication", default=None
+)
 _LATCH: ContextVar[bytes | None] = ContextVar("continuation_authenticated_latch", default=None)
-_RETIREMENT: ContextVar[tuple[bytes, bool] | None] = ContextVar(
+_RETIREMENT: ContextVar[tuple[bytes, bool | ContinuationReleasedRetirement] | None] = ContextVar(
     "continuation_retirement", default=None
 )
 _PARK: ContextVar[bytes | None] = ContextVar("continuation_park", default=None)
@@ -118,8 +122,21 @@ def publication_scope(key: str) -> Iterator[None]:
 
 
 def require_publication(key: str) -> None:
-    if _PUBLICATION.get() != key:
+    parent = _PUBLICATION.get()
+    child = _SERVICE_PUBLICATION.get()
+    if parent != key and (child is None or child != (parent, key)):
         raise PermissionError("Continuation evidence requires its session owner.")
+
+
+@contextmanager
+def service_publication_scope(parent_key: str, child_key: str) -> Iterator[None]:
+    """Permit exactly one native parent/child transaction, not arbitrary siblings."""
+    token = _SERVICE_PUBLICATION.set((parent_key, child_key))
+    try:
+        with publication_scope(parent_key):
+            yield
+    finally:
+        _SERVICE_PUBLICATION.reset(token)
 
 
 def current_publication_key() -> str | None:
@@ -178,7 +195,25 @@ def retirement_scope(
         _RETIREMENT.reset(token)
 
 
-def require_retirement(retirement: ContinuationRetirement) -> bool:
+@contextmanager
+def released_retirement_scope(expected: ContinuationReleasedRetirement) -> Iterator[None]:
+    """Enclose a receiving proof check, not a manufactured InvocationContext."""
+    from cayu.collaboration._preparation import prepare_contract
+    from cayu.runtime._session_continuation import ContinuationReleasedRetirement
+
+    expected = prepare_contract(ContinuationReleasedRetirement, expected, redactor=SecretRedactor())
+    token = _RETIREMENT.set(
+        (contract_bytes(expected.retirement, redactor=SecretRedactor()), expected)
+    )
+    try:
+        yield
+    finally:
+        _RETIREMENT.reset(token)
+
+
+def require_retirement(
+    retirement: ContinuationRetirement,
+) -> bool | ContinuationReleasedRetirement:
     authority = _RETIREMENT.get()
     if authority is None or authority[0] != contract_bytes(retirement, redactor=SecretRedactor()):
         raise PermissionError("Continuation retirement requires its registered runtime owner.")

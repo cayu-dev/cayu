@@ -7,6 +7,80 @@ from cayu.collaboration.peer_content import (
 )
 
 
+def parked_clarification_key(checkpoint, *, session_id: str, instance_id: str):
+    """Select a native waiting owner, never infer permission from interruption."""
+    from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
+    from cayu.sessions.checkpoints import decode_runtime_checkpoint
+
+    checkpoint = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+    raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
+    if raw is None:
+        return None
+    root = ContinuationRoot.model_validate(raw)
+    if (root.namespace.session_id, root.namespace.session_instance_id) != (session_id, instance_id):
+        raise PeerContentConflict("Peer target wait belongs to another incarnation.")
+    waiting = [entry for entry in root.entries if entry.state == "WAITING"]
+    if len(waiting) > 1:
+        raise PeerContentConflict("Peer target has conflicting waiting owners.")
+    return None if not waiting else waiting[0].ticket_key
+
+
+def permits_parked_clarification_append(
+    request, checkpoint, record, *, session_id: str, instance_id: str, run_epoch: int
+) -> bool:
+    """Called with the actual record under the peer append transaction/lock.
+
+    Only inert peer delivery is enabled. Execution still requires the exact
+    temporary-service permit and arbitration with the original final latch.
+    """
+    from cayu.runtime._invocation_lifecycle import _invocation_lifecycle_receipt_from_checkpoint
+    from cayu.runtime._session_continuation import (
+        ContinuationRecord,
+        continuation_digest,
+        continuation_operation_key,
+        require_record_writer_generation,
+    )
+    from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
+    from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+    from cayu.sessions.checkpoints import decode_runtime_checkpoint
+
+    if record is None or request.wake_policy != "none":
+        return False
+    checkpoint = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+    if checkpoint is None or PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint:
+        return False
+    record = ContinuationRecord.model_validate(record)
+    root = ContinuationRoot.model_validate(checkpoint[ROOT_KEY])
+    indexed = next(
+        (
+            entry
+            for entry in root.entries
+            if entry.ticket_key == continuation_operation_key(record.ticket)
+        ),
+        None,
+    )
+    if indexed is None or indexed.record_sha256 != continuation_digest(record):
+        raise PeerContentConflict("Peer target wait lost its exact native index.")
+    if (
+        record.ticket.state != "WAITING"
+        or record.ticket.service_policy != "clarification"
+        or record.latch is not None
+        or record.ticket.session_id != session_id
+        or record.ticket.session_instance_id != instance_id
+    ):
+        return False
+    require_record_writer_generation(record, run_epoch, allow_released_next_generation=True)
+    release = _invocation_lifecycle_receipt_from_checkpoint(
+        checkpoint, command_identity=f"release:{session_id}:{instance_id}:{run_epoch - 1}"
+    )
+    return release is not None and (
+        release.kind.value == "release"
+        and release.session_id == session_id
+        and release.session_instance_id == instance_id
+        and release.result_session.run_epoch == run_epoch
+    )
+
+
 def require_capacity(outstanding: int) -> None:
     from cayu.collaboration.peer_content import (
         PEER_CONTENT_MAX_OUTSTANDING_PER_CONSUMER,

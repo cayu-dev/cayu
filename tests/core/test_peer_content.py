@@ -138,11 +138,19 @@ class QualificationPeerExposurePolicy(SessionExportPolicy):
 
     @asynccontextmanager
     async def acquire_peer_exclusion(self, context, *, request, receipt, reason):
+        from cayu.collaboration._clarification_deliveries import ClarificationDeliveryRecord
+
+        if isinstance(receipt, ClarificationDeliveryRecord):
+            exact = receipt.intent.append == request
+        else:
+            exact = (
+                receipt.operation_key == request.operation_key
+                and receipt.append_key == request.append_key
+            )
         if (
             context.principal != "operator"
             or not self.allow_cleanup
-            or receipt.operation_key != request.operation_key
-            or receipt.append_key != request.append_key
+            or not exact
             or request.occurrence.producer_receipt_id not in self.allowed_receipts
         ):
             raise SessionExportDenied()

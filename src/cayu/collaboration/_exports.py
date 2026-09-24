@@ -1,11 +1,119 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ClarificationQuestionRecovery": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationQuestionRecovery",
+    ),
+    "ClarificationDueQuestion": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationDueQuestion",
+    ),
+    "ClarificationDueQuestionPage": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationDueQuestionPage",
+    ),
+    "ClarificationExpiryRequest": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationExpiryRequest",
+    ),
+    "ClarificationExpiryReceipt": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationExpiryReceipt",
+    ),
+    "ClarificationDeliveryRecovery": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationDeliveryRecovery",
+    ),
+    "ClarificationPendingDelivery": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationPendingDelivery",
+    ),
+    "ClarificationPendingDeliveryPage": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationPendingDeliveryPage",
+    ),
+    "ClarificationServiceInspection": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationServiceInspection",
+    ),
+    "ClarificationServiceInspectionPage": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationServiceInspectionPage",
+    ),
+    "ClarificationServiceRecovery": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationServiceRecovery",
+    ),
+    "ClarificationPendingService": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationPendingService",
+    ),
+    "ClarificationPendingServicePage": (
+        "cayu.collaboration._clarification_recovery_types",
+        "ClarificationPendingServicePage",
+    ),
+    "ClarificationDueCursor": ("cayu.collaboration.clarifications", "ClarificationDueCursor"),
+    "ClarificationReplyRequest": (
+        "cayu.collaboration._clarification_reply_api",
+        "ClarificationReplyRequest",
+    ),
+    "ClarificationReplyAcceptance": (
+        "cayu.collaboration._clarification_reply_api",
+        "ClarificationReplyAcceptance",
+    ),
+    "ClarificationServiceRequest": (
+        "cayu.collaboration._clarification_service_api",
+        "ClarificationServiceRequest",
+    ),
+    "ClarificationServiceReceipt": (
+        "cayu.collaboration._clarification_service_api",
+        "ClarificationServiceReceipt",
+    ),
+    "ClarificationDeliveryIntent": (
+        "cayu.collaboration._clarification_deliveries",
+        "ClarificationDeliveryIntent",
+    ),
+    "ClarificationDeliveryRecord": (
+        "cayu.collaboration._clarification_deliveries",
+        "ClarificationDeliveryRecord",
+    ),
+    "ClarificationDeliveryReceipt": (
+        "cayu.collaboration._clarification_deliveries",
+        "ClarificationDeliveryReceipt",
+    ),
+    "ClarificationQuestionState": (
+        "cayu.collaboration._clarification_state",
+        "ClarificationQuestionState",
+    ),
+    "ClarificationCloseCommand": (
+        "cayu.collaboration._clarification_commands",
+        "ClarificationCloseCommand",
+    ),
+    "ClarificationCloseReceipt": (
+        "cayu.collaboration._clarification_commands",
+        "ClarificationCloseReceipt",
+    ),
+    "ClarificationOpenCommand": (
+        "cayu.collaboration._clarification_commands",
+        "ClarificationOpenCommand",
+    ),
+    "ClarificationOpenReceipt": (
+        "cayu.collaboration._clarification_commands",
+        "ClarificationOpenReceipt",
+    ),
+    "ClarificationQuestion": ("cayu.collaboration.clarifications", "ClarificationQuestion"),
+    "ClarificationSource": ("cayu.collaboration.clarifications", "ClarificationSource"),
+    "ClarificationPolicy": ("cayu.collaboration.clarifications", "ClarificationPolicy"),
     "CollaborationWait": ("cayu.collaboration.waits", "CollaborationWait"),
     "WaitEvidence": ("cayu.collaboration.waits", "WaitEvidence"),
     "WaitElection": ("cayu.collaboration.waits", "WaitElection"),
     "WaitRegistration": ("cayu.collaboration.waits", "WaitRegistration"),
     "WaitSnapshot": ("cayu.collaboration.waits", "WaitSnapshot"),
+    "ParticipantSessionWaitExclusionReceipt": (
+        "cayu.collaboration.waits",
+        "ParticipantSessionWaitExclusionReceipt",
+    ),
     "WaitControl": ("cayu.collaboration.waits", "WaitControl"),
     "CollaborationWaitLatchReceiver": (
         "cayu.collaboration._wait_coordinator",

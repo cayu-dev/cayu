@@ -17,6 +17,93 @@ KEYS = {
     "permits": ("namespace", "generation", "caller_key"),
     "requests": ("namespace", "generation", "caller_key"),
     "request_events": ("sequence",),
+    "request_pruning": ("namespace", "generation", "caller_key"),
+    "clarification_questions": ("namespace", "generation", "caller_key"),
+    "clarification_inputs": ("request_id", "request_incarnation", "revision"),
+    "clarification_lineages": ("namespace", "generation", "caller_key"),
+    "clarification_services": ("namespace", "generation", "caller_key"),
+    "clarification_deliveries": ("namespace", "generation", "caller_key"),
+}
+_CLARIFICATION_TABLES = frozenset(
+    {
+        "request_pruning",
+        "clarification_questions",
+        "clarification_inputs",
+        "clarification_lineages",
+        "clarification_services",
+        "clarification_deliveries",
+    }
+)
+_CLARIFICATION_INDEXES = {
+    "cayu_collaboration_clarification_lineage_question_idx": (
+        "cayu_collaboration_clarification_questions",
+        (
+            "scope",
+            "lineage_namespace",
+            "lineage_generation",
+            "lineage_key",
+            "namespace",
+            "generation",
+            "caller_key",
+        ),
+        False,
+    ),
+    "cayu_collaboration_clarification_delivery_request_pending_idx": (
+        "cayu_collaboration_clarification_deliveries",
+        (
+            "scope",
+            "request_id",
+            "request_incarnation",
+            "state",
+            "namespace",
+            "generation",
+            "caller_key",
+        ),
+        False,
+    ),
+    "cayu_collaboration_clarification_service_request_pending_idx": (
+        "cayu_collaboration_clarification_services",
+        (
+            "scope",
+            "request_id",
+            "request_incarnation",
+            "state",
+            "namespace",
+            "generation",
+            "caller_key",
+        ),
+        False,
+    ),
+    "cayu_collaboration_clarification_delivery_request_idx": (
+        "cayu_collaboration_clarification_deliveries",
+        ("scope", "request_id", "request_incarnation", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_clarification_service_request_idx": (
+        "cayu_collaboration_clarification_services",
+        ("scope", "request_id", "request_incarnation", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_clarification_delivery_pending_idx": (
+        "cayu_collaboration_clarification_deliveries",
+        ("scope", "state", "next_due_at_ms", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_clarification_service_pending_idx": (
+        "cayu_collaboration_clarification_services",
+        ("scope", "state", "next_due_at_ms", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_clarification_due_idx": (
+        "cayu_collaboration_clarification_questions",
+        ("scope", "state", "next_due_at_ms", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_clarification_request_idx": (
+        "cayu_collaboration_clarification_questions",
+        ("scope", "request_id", "request_incarnation", "state"),
+        False,
+    ),
 }
 _REQUEST_TABLES = frozenset({"requests", "request_events"})
 _REQUEST_INDEXES = {
@@ -33,10 +120,36 @@ _REQUEST_INDEXES = {
 }
 _LIFECYCLE_TABLES = frozenset({"namespaces", "lifecycle_history", "participant_permits", "permits"})
 EXTRA_COLUMNS = {
+    "clarification_deliveries": (
+        "participant_id",
+        "state",
+        "next_due_at_ms",
+        "request_id",
+        "request_incarnation",
+    ),
+    "clarification_services": (
+        "participant_id",
+        "state",
+        "next_due_at_ms",
+        "request_id",
+        "request_incarnation",
+    ),
     "permits": ("participant_id", "position", "state"),
     "requests": ("participant_id", "position", "state", "next_due_at_ms"),
+    "clarification_questions": (
+        "request_id",
+        "request_incarnation",
+        "participant_id",
+        "state",
+        "next_due_at_ms",
+        "lineage_namespace",
+        "lineage_generation",
+        "lineage_key",
+    ),
 }
-_NUMERIC_COLUMNS = frozenset({"generation", "revision", "sequence", "position", "next_due_at_ms"})
+_NUMERIC_COLUMNS = frozenset(
+    {"generation", "revision", "sequence", "position", "next_due_at_ms", "lineage_generation"}
+)
 _LIFECYCLE_INDEXES = {
     "cayu_collaboration_permit_position_idx": (
         "cayu_collaboration_permits",
@@ -72,7 +185,11 @@ def _record_ddl(family: str, columns: tuple[str, ...], postgres: bool) -> str:
 def _ddl(postgres: bool) -> tuple[str, ...]:
     statements = []
     for family, columns in KEYS.items():
-        if family in _LIFECYCLE_TABLES or family in _REQUEST_TABLES:
+        if (
+            family in _LIFECYCLE_TABLES
+            or family in _REQUEST_TABLES
+            or family in _CLARIFICATION_TABLES
+        ):
             continue
         statements.append(_record_ddl(family, columns, postgres))
     statements.append("""CREATE TABLE IF NOT EXISTS cayu_collaboration_event_participants (
@@ -128,11 +245,31 @@ POSTGRES_COLLABORATION_REQUEST_DDL = _request_ddl(True)
 SQLITE_COLLABORATION_REQUEST_DDL = ";\n".join(_request_ddl(False)) + ";"
 
 
-def _tables(*, lifecycle: bool, requests: bool = False):
+def _clarification_ddl(postgres: bool) -> tuple[str, ...]:
+    return (
+        *(
+            _record_ddl(family, columns, postgres)
+            for family, columns in KEYS.items()
+            if family in _CLARIFICATION_TABLES
+        ),
+        *(
+            f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(columns)})"
+            for name, (table, columns, _) in _CLARIFICATION_INDEXES.items()
+        ),
+    )
+
+
+POSTGRES_COLLABORATION_CLARIFICATION_DDL = _clarification_ddl(True)
+SQLITE_COLLABORATION_CLARIFICATION_DDL = ";\n".join(_clarification_ddl(False)) + ";"
+
+
+def _tables(*, lifecycle: bool, requests: bool = False, clarifications: bool = False):
     for family, columns in KEYS.items():
         if family in _LIFECYCLE_TABLES and not lifecycle:
             continue
         if family in _REQUEST_TABLES and not requests:
+            continue
+        if family in _CLARIFICATION_TABLES and not clarifications:
             continue
         primary = ("scope", *columns)
         yield (
@@ -156,9 +293,15 @@ def _tables(*, lifecycle: bool, requests: bool = False):
 
 
 def validate_sqlite_collaboration_schema(
-    connection: Any, *, lifecycle: bool = False, requests: bool = False
+    connection: Any,
+    *,
+    lifecycle: bool = False,
+    requests: bool = False,
+    clarifications: bool = False,
 ) -> None:
-    for table, columns, primary in _tables(lifecycle=lifecycle, requests=requests):
+    for table, columns, primary in _tables(
+        lifecycle=lifecycle, requests=requests, clarifications=clarifications
+    ):
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
         expected = [
             (
@@ -176,10 +319,11 @@ def validate_sqlite_collaboration_schema(
     ).fetchall()
     if tuple(row[2] for row in rows) != ("scope", "participant_id", "sequence"):
         raise SchemaError("Collaboration event lookup index is unavailable.")
-    if lifecycle or requests:
+    if lifecycle or requests or clarifications:
         indexes_to_check = {
             **(_LIFECYCLE_INDEXES if lifecycle else {}),
             **(_REQUEST_INDEXES if requests else {}),
+            **(_CLARIFICATION_INDEXES if clarifications else {}),
         }
         for name, (table, columns, unique) in indexes_to_check.items():
             indexes = {row[1]: row for row in connection.execute(f"PRAGMA index_list({table})")}
@@ -194,9 +338,15 @@ def validate_sqlite_collaboration_schema(
 
 
 async def validate_postgres_collaboration_schema(
-    cursor: Any, *, lifecycle: bool = False, requests: bool = False
+    cursor: Any,
+    *,
+    lifecycle: bool = False,
+    requests: bool = False,
+    clarifications: bool = False,
 ) -> None:
-    for table, columns, primary in _tables(lifecycle=lifecycle, requests=requests):
+    for table, columns, primary in _tables(
+        lifecycle=lifecycle, requests=requests, clarifications=clarifications
+    ):
         await cursor.execute(
             """SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull
             FROM pg_attribute a WHERE a.attrelid=to_regclass(%s)
@@ -228,10 +378,11 @@ async def validate_postgres_collaboration_schema(
         AND i.indisvalid AND i.indpred IS NULL GROUP BY i.indexrelid""")
     if await cursor.fetchall() != [(["scope", "participant_id", "sequence"],)]:
         raise SchemaError("Collaboration event lookup index is unavailable.")
-    if lifecycle or requests:
+    if lifecycle or requests or clarifications:
         indexes_to_check = {
             **(_LIFECYCLE_INDEXES if lifecycle else {}),
             **(_REQUEST_INDEXES if requests else {}),
+            **(_CLARIFICATION_INDEXES if clarifications else {}),
         }
         for name, (table, columns, unique) in indexes_to_check.items():
             await cursor.execute(

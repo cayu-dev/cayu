@@ -29,6 +29,7 @@ class _MutationOwners:
         expectation: bytes,
         redactor: SecretRedactor,
         failure_snapshot: Callable[[BaseException], BaseException] | None = None,
+        wait_for_settlement: bool = False,
     ) -> T:
         cancelled = False
         try:
@@ -60,7 +61,12 @@ class _MutationOwners:
             self._keys[key] = (expectation, task)
             task.add_done_callback(lambda settled: self._settled(key, settled))
         try:
-            done, _ = await asyncio.wait((task,), timeout=self.observation_timeout)
+            # An enclosing runtime owner already has its execution deadline.
+            # It must not turn this public observation bound into a failure of
+            # the still-running mutation. Cancellation still leaves it owned.
+            done, _ = await asyncio.wait(
+                (task,), timeout=None if wait_for_settlement else self.observation_timeout
+            )
         except asyncio.CancelledError:
             cancelled = True
             done = set()

@@ -45,6 +45,20 @@ WaitResult = Literal["success", "settled", "failure", "unavailable"]
 MAX_WAIT_TARGETS = 64
 MAX_WAIT_EVIDENCE = 64
 MAX_WAIT_EVENTS = 128
+
+
+class ParticipantSessionWaitExclusionReceipt(ContractValue):
+    """Content-free native cleanup result; not a wait snapshot or execution grant."""
+
+    operation: OperationRef
+    session_id: Identifier
+    session_instance_id: Identifier
+    registration_key: Identifier
+    execution_admission_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    retirement_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    delivery: Literal["excluded"] = "excluded"
+
+
 # A wait embeds its bounded event/evidence history in one durable operation,
 # but its future terminal publication still needs capacity reserved at
 # registration.  The reservation is released only by terminal delivery or a

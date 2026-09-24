@@ -87,6 +87,36 @@ from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
 )
+from cayu.collaboration._clarification_commands import (
+    ClarificationCloseCommand,
+    ClarificationCloseReceipt,
+    ClarificationOpenCommand,
+    ClarificationOpenReceipt,
+)
+from cayu.collaboration._clarification_coordinator import ClarificationCoordinator
+from cayu.collaboration._clarification_deliveries import (
+    ClarificationDeliveryIntent,
+    ClarificationDeliveryReceipt,
+)
+from cayu.collaboration._clarification_recovery_types import (
+    ClarificationDeliveryRecovery,
+    ClarificationDueQuestionPage,
+    ClarificationExpiryReceipt,
+    ClarificationExpiryRequest,
+    ClarificationPendingDeliveryPage,
+    ClarificationPendingServicePage,
+    ClarificationServiceInspectionPage,
+    ClarificationServiceRecovery,
+)
+from cayu.collaboration._clarification_reply_api import (
+    ClarificationReplyAcceptance,
+    ClarificationReplyRequest,
+)
+from cayu.collaboration._clarification_service_api import (
+    ClarificationServiceReceipt,
+    ClarificationServiceRequest,
+)
+from cayu.collaboration._clarification_state import ClarificationQuestionState
 from cayu.collaboration._contracts import (
     CollaborationConflict,
     ExactLookup,
@@ -115,6 +145,7 @@ from cayu.collaboration.access import (
     CollaborationRegistration,
 )
 from cayu.collaboration.base import CollaborationStore
+from cayu.collaboration.clarifications import ClarificationDueCursor, ClarificationSource
 from cayu.collaboration.exports import (
     SessionExportAccessContext,
     SessionExportDenied,
@@ -189,7 +220,12 @@ from cayu.collaboration.requests import (
     RequestReceipt,
     RequestSnapshot,
 )
-from cayu.collaboration.waits import CollaborationWait, WaitRegistration, WaitSnapshot
+from cayu.collaboration.waits import (
+    CollaborationWait,
+    ParticipantSessionWaitExclusionReceipt,
+    WaitRegistration,
+    WaitSnapshot,
+)
 from cayu.configuration import (
     CayuConfig,
     CayuConfigSource,
@@ -319,6 +355,7 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._execution_to_wait import _ExecutionToWait
 from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
 from cayu.runtime._foreground_child_wait import ForegroundChildTerminal, ForegroundChildWait
 from cayu.runtime._fork_source_snapshot import (
@@ -378,6 +415,7 @@ from cayu.runtime._session_closure_projection import (
     project_closure_manifest,
     project_closure_report,
 )
+from cayu.runtime._session_continuation import ContinuationTicket
 from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
@@ -829,7 +867,7 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 if TYPE_CHECKING:
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
-    from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
+    from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
     from cayu.tasks.groups import (
         TaskGroupCreate,
         TaskGroupCreationReceipt,
@@ -1011,7 +1049,10 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
         session = await self.app.session_store.load(target.object_id)
         if session is None or session.instance_id != target.incarnation:
             return ExactUnavailable()
-        checkpoint = await self.app.session_store.load_checkpoint(session.id)
+        from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
+
+        with _invocation_lifecycle_authority_read_scope():
+            checkpoint = await self.app.session_store.load_checkpoint(session.id)
         ledger = None if checkpoint is None else checkpoint.get("invocation_lifecycle_receipt")
         consumed = any(
             isinstance(item, dict)
@@ -1650,6 +1691,13 @@ class CayuApp:
             redactor=self._secret_redactor,
             participants=self._participant_coordinator,
         )
+        self._clarification_coordinator = ClarificationCoordinator(
+            requests=self._request_coordinator,
+            exports=self._session_export_coordinator,
+            resolve_budget=self._run_limit_controller.inspect_budget_binding,
+            common_root_enabled=self.enable_common_root_budget_binding,
+            append_peer=self.append_peer_content,
+        )
 
     @asynccontextmanager
     async def _acquire_peer_exposure_for_model_attempt(
@@ -2011,6 +2059,197 @@ class CayuApp:
         context: SessionExportAccessContext,
     ) -> dict[str, Any]:
         return await self._session_export_coordinator.lookup(request, context=context, expose=True)
+
+    async def open_clarification(
+        self,
+        command: ClarificationOpenCommand,
+        *,
+        source: SessionExportRequest,
+        context: SessionExportAccessContext,
+    ) -> ClarificationOpenReceipt:
+        """Publish one exact question; never launch or implicitly deliver service."""
+        return await self._clarification_coordinator.open(command, source, context=context)
+
+    async def prepare_clarification_delivery(
+        self,
+        intent: ClarificationDeliveryIntent,
+        *,
+        context: SessionExportAccessContext,
+    ) -> ClarificationDeliveryReceipt:
+        """Retain an exact inert delivery intent without attempting peer append."""
+        return await self._clarification_coordinator.deliver(
+            intent, context=context, prepare_only=True
+        )
+
+    async def deliver_clarification(
+        self,
+        intent: ClarificationDeliveryIntent,
+        *,
+        context: SessionExportAccessContext,
+    ) -> ClarificationDeliveryReceipt:
+        """Deliver through the peer owner without starting a service or exposing a model."""
+        return await self._clarification_coordinator.deliver(intent, context=context)
+
+    async def service_clarification(
+        self,
+        request: ClarificationServiceRequest,
+        *,
+        context: SessionExportAccessContext,
+        delivery_context: SessionExportAccessContext | None = None,
+    ) -> ClarificationServiceReceipt:
+        """Explicitly service an authenticated question on its existing recipient."""
+        return await self._clarification_coordinator.service(
+            self, request, context=context, delivery_context=delivery_context
+        )
+
+    async def reconcile_clarification_service(
+        self,
+        request: ClarificationServiceRequest | ClarificationServiceRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ClarificationServiceReceipt:
+        """Reconcile exact receiving evidence without granting disclosure or execution."""
+        return await self._clarification_coordinator.reconcile_service(
+            self, request, context=context
+        )
+
+    async def list_due_clarification_questions(
+        self,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ClarificationDueCursor | None = None,
+        limit: int = 32,
+    ) -> ClarificationDueQuestionPage:
+        """Discover content-free due identities using the native owner's clock."""
+        return await self._clarification_coordinator.due_questions(
+            context=context, cursor=cursor, limit=limit
+        )
+
+    async def expire_clarification_question(
+        self, request: ClarificationExpiryRequest, *, context: CollaborationAccessContext
+    ) -> ClarificationExpiryReceipt:
+        """Expire an exact due question; pending service and delivery remain owned."""
+        return await self._clarification_coordinator.expire_question(request, context=context)
+
+    async def list_pending_clarification_deliveries(
+        self,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ClarificationDueCursor | None = None,
+        limit: int = 32,
+    ) -> ClarificationPendingDeliveryPage:
+        """Discover content-free exact delivery identities for administrative recovery."""
+        return await self._clarification_coordinator.pending_deliveries(
+            context=context, cursor=cursor, limit=limit
+        )
+
+    async def reconcile_clarification_delivery(
+        self,
+        recovery: ClarificationDeliveryRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ClarificationDeliveryReceipt:
+        """Read exact receiving evidence; never append, disclose payloads or infer exclusion."""
+        return await self._clarification_coordinator.reconcile_delivery(recovery, context=context)
+
+    async def list_pending_clarification_services(
+        self,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ClarificationDueCursor | None = None,
+        limit: int = 32,
+    ) -> ClarificationPendingServicePage:
+        """Discover bounded maintenance identities, never peer payloads or dispatch grants."""
+        return await self._clarification_coordinator.pending_services(
+            context=context, cursor=cursor, limit=limit
+        )
+
+    async def exclude_clarification_delivery(
+        self,
+        recovery: ClarificationDeliveryRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ClarificationDeliveryReceipt:
+        """Fence an exact prepared delivery under independent registered cleanup authority."""
+        return await self._clarification_coordinator.reconcile_delivery(
+            recovery, context=context, exclude=True
+        )
+
+    async def inspect_clarification_services(
+        self,
+        ticket: ContinuationTicket,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ClarificationDueCursor | None = None,
+        limit: int = 32,
+    ) -> ClarificationServiceInspectionPage:
+        """Inspect bounded native ticket history, including unregistered preparations."""
+        return await self._clarification_coordinator.inspect_services(
+            self, ticket, context=context, cursor=cursor, limit=limit
+        )
+
+    async def exclude_clarification_service(
+        self,
+        request: ClarificationServiceRequest | ClarificationServiceRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ClarificationServiceReceipt:
+        """Explicitly fence exact unadmitted service; never infer exclusion from interruption."""
+        return await self._clarification_coordinator.reconcile_service(
+            self, request, context=context, exclude=True
+        )
+
+    async def reply_to_clarification(
+        self, request: ClarificationReplyRequest, *, context: SessionExportAccessContext
+    ) -> ClarificationReplyAcceptance:
+        """Elect a source-authenticated service reply without dispatch or delivery."""
+        return await self._clarification_coordinator.reply(self, request, context=context)
+
+    async def close_clarification(
+        self,
+        command: ClarificationCloseCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> ClarificationCloseReceipt:
+        """Close a question, without cancelling or settling underlying service work."""
+        return await self._request_coordinator.close_clarification(command, context=context)
+
+    async def inspect_clarification(
+        self,
+        expected: ClarificationOpenCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> ExactLookup[ClarificationQuestionState]:
+        """Inspect current question state under exact historical request authority."""
+        return await self._request_coordinator.inspect_clarification(expected, context=context)
+
+    async def lookup_clarification(
+        self,
+        expected: ClarificationOpenCommand | ClarificationCloseCommand,
+        *,
+        context: MandateAccessContext,
+    ) -> ExactLookup[ClarificationOpenReceipt | ClarificationCloseReceipt]:
+        """Read exact historical question metadata without renewing authority."""
+        return await self._request_coordinator.lookup_clarification(expected, context=context)
+
+    async def inspect_clarification_source(
+        self,
+        request: SessionExportRequest,
+        *,
+        sender: ParticipantRef,
+        audience: ParticipantRef,
+        context: SessionExportAccessContext,
+        expected: ClarificationSource | None = None,
+    ) -> ClarificationSource:
+        """Resolve exact source evidence under current export authorization.
+
+        The immutable result contains identities and commitments, not text or
+        private provider state. It cannot authorize later question publication,
+        delivery or exposure; those operations acquire their own current guards.
+        """
+        return await self._session_export_coordinator.inspect_clarification_source(
+            request, sender=sender, audience=audience, context=context, expected=expected
+        )
 
     async def settle_session_export(
         self,
@@ -2852,6 +3091,70 @@ class CayuApp:
         participant: ParticipantRef,
         context: CollaborationAccessContext,
     ) -> AsyncIterator[Event]:
+        """Activate an inert participant root through authenticated durable admission."""
+        async with _close_delegated_event_stream(
+            self._execute_participant_session(execution, participant=participant, context=context)
+        ) as stream:
+            async for event in stream:
+                yield event
+
+    async def execute_participant_session_to_wait(
+        self,
+        execution: ParticipantSessionExecutionRequest,
+        wait: CollaborationWait,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+        wait_context: MandateAccessContext,
+    ) -> AsyncIterator[Event]:
+        """Execute an authenticated inert root to an explicit whole-turn wait.
+
+        Request targets are authenticated by the registered wait owner. Only the
+        engine's admitted context creates the delivery ticket; this entrance does
+        not create a recipient or automatically service a clarification.
+        """
+        from cayu.runtime._execution_to_wait import prepare_execution_wait
+
+        if type(execution) is not ParticipantSessionExecutionRequest:
+            raise TypeError("Participant session execution requires a typed request.")
+        handoff = await prepare_execution_wait(self, execution, wait, context=wait_context)
+        async with _close_delegated_event_stream(
+            self._execute_participant_session(
+                execution, participant=participant, context=context, execution_to_wait=handoff
+            )
+        ) as stream:
+            async for event in stream:
+                yield event
+
+    async def exclude_participant_session_wait(
+        self,
+        execution: ParticipantSessionExecutionRequest,
+        wait: CollaborationWait,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+        wait_context: MandateAccessContext,
+    ) -> ParticipantSessionWaitExclusionReceipt:
+        """Exclude released, unfinished wait preparation without restarting execution."""
+        from cayu.runtime._execution_to_wait import exclude_execution_wait
+
+        return await exclude_execution_wait(
+            self,
+            execution,
+            wait,
+            participant=participant,
+            context=context,
+            wait_context=wait_context,
+        )
+
+    async def _execute_participant_session(
+        self,
+        execution: ParticipantSessionExecutionRequest,
+        *,
+        participant: ParticipantRef,
+        context: CollaborationAccessContext,
+        execution_to_wait: _ExecutionToWait | None = None,
+    ) -> AsyncGenerator[Event, None]:
         """Activate one inert participant-owned root session exactly once.
 
         This is the sole execution entrance for sessions created by
@@ -2864,6 +3167,13 @@ class CayuApp:
             raise TypeError("Participant session execution requires a typed request.")
         if type(participant) is not ParticipantRef:
             raise TypeError("Participant session execution requires a ParticipantRef.")
+        if execution_to_wait is not None and (
+            type(execution_to_wait) is not _ExecutionToWait
+            or execution_to_wait.owner.store is not self.session_store
+            or execution_to_wait.session_id != execution.request.session_id
+            or execution_to_wait.session_instance_id != execution.session_instance_id
+        ):
+            raise PermissionError("Execution wait has a different registered receiving owner.")
         async with self._participant_session_authority_lock:
             inspection = await self._participant_coordinator.inspect(
                 participant,
@@ -2893,27 +3203,25 @@ class CayuApp:
                 raise ValueError(
                     "Participant session execution conflicts with its creation request."
                 )
-            operation_key = (
-                "participant-execution:"
-                + sha256(
-                    f"{session.id}:{session.instance_id}:{execution.execution_key}".encode()
-                ).hexdigest()
+            from cayu.sessions._participant_execution_identity import participant_execution_identity
+
+            expected_profile = execution_profile_from_session_metadata(session.metadata)
+            execution_identity = participant_execution_identity(
+                execution,
+                binding,
+                execution_profile_fingerprint=expected_profile.fingerprint,
+                wait_commitment=None if execution_to_wait is None else execution_to_wait.commitment,
             )
+            operation_key = execution_identity.operation_key
+            if (
+                execution_to_wait is not None
+                and execution_to_wait.intent.execution_admission_sha256
+                != execution_identity.admission_commitment
+            ):
+                raise ValueError("Execution wait does not match the admitted execution profile.")
             initialized = self._participant_coordinator._ready()[1]
             operation = initialized.operation(operation_key)
-            expected_profile = execution_profile_from_session_metadata(session.metadata)
-            admission_commitment = sha256(
-                canonical_durable_json_bytes(
-                    {
-                        "request": execution.request.model_dump(mode="json"),
-                        "binding": binding.model_dump(mode="json"),
-                        "session_instance_id": session.instance_id,
-                        "execution_key": execution.execution_key,
-                        "execution_profile_fingerprint": expected_profile.fingerprint,
-                    },
-                    "participant_execution_admission",
-                )
-            ).hexdigest()
+            admission_commitment = execution_identity.admission_commitment
             permit_receipt = await self._participant_coordinator._ready()[
                 0
             ]._lookup_registered_permit(initialized, operation, redactor=self._secret_redactor)
@@ -2975,19 +3283,21 @@ class CayuApp:
                 )
                 if not isinstance(permit_receipt, PermitReceipt):
                     raise RuntimeError("Participant execution permit receipt is unavailable.")
-            permit_commitment = sha256(
-                canonical_durable_json_bytes(
-                    {
-                        "permit": permit_receipt.model_dump(mode="json"),
-                        "request": execution.request.model_dump(mode="json"),
-                        "binding": binding.model_dump(mode="json"),
-                        "session_instance_id": session.instance_id,
-                        "execution_key": execution.execution_key,
-                        "execution_profile_fingerprint": expected_profile.fingerprint,
-                    },
-                    "participant_execution_admission",
+            permit_commitment = execution_identity.permit_commitment(permit_receipt)
+            if execution_to_wait is not None and await execution_to_wait.parked_replay(
+                permit_operation=operation.caller_key, permit_commitment=permit_commitment
+            ):
+                await self._participant_coordinator._store_result(
+                    self._participant_coordinator._ready()[0]._settle_permit(
+                        initialized,
+                        permit,
+                        reader=_ParticipantExecutionSettlementReader(
+                            self, permit, permit_commitment
+                        ),
+                        redactor=self._secret_redactor,
+                    )
                 )
-            ).hexdigest()
+                return
             stream = self._run_private(
                 request,
                 expected_execution_profile=expected_profile,
@@ -2996,6 +3306,7 @@ class CayuApp:
                 participant_context=context,
                 participant_permit_operation=operation.caller_key,
                 participant_permit_commitment=permit_commitment,
+                execution_to_wait=execution_to_wait,
             )
             async with self._participant_session_execution_lock_guard:
                 lock, users = self._participant_session_execution_locks.get(
@@ -7238,6 +7549,7 @@ class CayuApp:
         participant_context: CollaborationAccessContext | None = None,
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
+        execution_to_wait: _ExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
@@ -7266,6 +7578,7 @@ class CayuApp:
             participant_context=participant_context,
             participant_permit_operation=participant_permit_operation,
             participant_permit_commitment=participant_permit_commitment,
+            execution_to_wait=execution_to_wait,
         )
         del request
         if boundary.expires_at is not None:
@@ -7319,7 +7632,7 @@ class CayuApp:
         request: ResumeRequest,
         *,
         store_resolved_session_id: str | None = None,
-        continuation_handoff: _ContinuationResumeHandoff | None = None,
+        continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ResumeRequest:

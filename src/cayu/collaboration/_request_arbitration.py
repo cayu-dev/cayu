@@ -188,6 +188,15 @@ async def admit_in_transaction(
         raise CollaborationConflict("Request admission revision or state changed.")
     if command.generation != prior.admission_generation + 1:
         raise CollaborationConflict("Admission generation is not the next generation.")
+    input_commitment = (
+        prior.clarification.input_sha256
+        or sha256(contract_bytes(prior.receipt.expected, redactor=redactor)).hexdigest()
+    )
+    if (command.expected_input_revision, command.expected_input_sha256) != (
+        prior.clarification.input_revision,
+        input_commitment,
+    ):
+        raise CollaborationConflict("Request admission effective input changed.")
     now = await tx.now_ms()
     if now >= prior.receipt.expected.intent.selection.expires_at_ms:
         raise CollaborationConflict("Request expired before admission.")

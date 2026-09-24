@@ -248,7 +248,23 @@ async def terminalize_dispatched_model(
         if current is None:
             raise SessionRunFenced("Model terminalization session disappeared during replay.")
         return ModelCompletionManualRecoveryResult(session=current, settlement=prior, replayed=True)
-    active = await inspect_terminalization(store, session, checkpoint)
+    try:
+        active = await inspect_terminalization(store, session, checkpoint)
+    except ModelCompletionManualRecoveryRequired as error:
+        # These preflight reads are not a transaction. Another terminalizer
+        # can settle after our settlement lookup and before stage inspection.
+        # Positive owner advancement fences this attempt; it is not evidence
+        # that an unchanged invocation requires a different recovery policy.
+        current = await store.load(session.id)
+        if current is None or (
+            current.instance_id != session.instance_id
+            or current.run_epoch != session.run_epoch
+            or current.status != session.status
+        ):
+            raise SessionRunFenced(
+                "Model terminalization owner changed during preflight; reconcile exact state."
+            ) from error
+        raise
     if active.stage.stage_id != request.stage_id:
         raise SessionRunFenced("Model terminalization selected another active stage.")
     source_profile = require_terminalization_checkpoint(session, checkpoint)
