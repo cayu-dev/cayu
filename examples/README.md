@@ -1,8 +1,5 @@
 # Cayu examples
 
-The installed restartable order-support application runs with
-`python -m cayu.examples.order_support`; see `cayu guide order-support`.
-
 Start with the smallest example that matches the capability you need. Examples
 are references, not a checklist or a required project structure. Files ending
 in `_live.py` cross a real provider or infrastructure boundary and require the
@@ -10,6 +7,10 @@ corresponding credentials or service.
 
 ## Start here
 
+- [Build an agent that survives restarts and waits for approval](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/order-support.md)
+  — investigate an order, clarify the request, propose a replacement, and execute
+  only after verified external approval. Read `cayu guide order-support` and run
+  `python -m cayu.examples.order_support --help`; no checkout is required.
 - A model-only project: run `cayu new NAME`; the generated test and eval are
   credential-free.
 - [`echo_tool_runtime.py`](echo_tool_runtime.py) — credential-free model/tool loop.

@@ -16,6 +16,21 @@ python -m cayu.examples.order_support --help
 
 ## Shortest deterministic journey
 
+`investigate -> propose -> wait for approval -> execute -> verify`
+
+In this example, creating a bounded replacement proposal does **not** require
+representative approval. After clarifying the damaged item, create the proposal
+and request execution of that exact proposal; Cayu holds the execution tool call
+until verified approval arrives. Approval gates execution, not proposal creation.
+Customer prose is not an approval receipt, and resuming a conversation does not
+approve a protected tool call. Other applications may choose different proposal
+authorization rules.
+
+The application authenticates the external receipt and checks business authority.
+Cayu owns the pending tool approval and execution evidence; the downstream service
+owns its idempotency and effect contract. These responsibilities are separate even
+when the demo stores live in the same state directory.
+
 With Cayu installed, run these commands from an empty working directory. Every
 command starts and exits a separate OS process. No network or provider credentials
 are needed. Use the same interpreter throughout.

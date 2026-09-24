@@ -77,6 +77,19 @@ deployments.
 
 ## Quickstart
 
+Need a non-coding agent that survives restarts and waits for approval? Follow the
+[restartable support-agent example](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/order-support.md).
+It investigates an order, asks for clarification, proposes a replacement, and
+waits for verified representative approval before executing it. The guide and
+executable ship with Cayu:
+
+```bash
+cayu guide order-support
+python -m cayu.examples.order_support --help
+```
+
+For a model-only agent, start with the generated project below.
+
 ### Start a project
 
 The generated project is the recommended path for both humans and coding

@@ -144,7 +144,7 @@ class SupportTool(Tool):
         }
         descriptions = {
             "inspect_order": "Read order, tracking and replacement policy evidence.",
-            "propose_replacement": "After the customer clarifies the damaged item, persist an immutable bounded replacement proposal.",
+            "propose_replacement": "After the customer clarifies the damaged item, persist an immutable bounded replacement proposal. Creating this proposal does not require representative approval.",
             "execute_replacement": "Execute the exact proposal; Cayu requires representative approval first.",
             "verify_replacement": "Independently read replacement service receipts for this conversation.",
         }
@@ -172,7 +172,7 @@ class SupportTool(Tool):
                 row = db.execute("SELECT * FROM orders WHERE id = 'order-42'").fetchone()
                 result = {
                     "order": dict(row),
-                    "policy": "Replace one damaged item after customer clarification and representative approval. Ask which item: mug or plate.",
+                    "policy": "Ask which item is damaged: mug or plate. After clarification, propose replacing that item without waiting for representative approval. Execute the replacement only after verified representative approval of the exact proposal.",
                 }
             elif self.spec.name == "propose_replacement":
                 body = proposal_body(ctx.session_id, args["item"])
@@ -382,7 +382,7 @@ async def run(args: argparse.Namespace) -> None:
         AgentSpec(
             name="support",
             model=os.environ["SUPPORT_MODEL"] if args.live else "scripted",
-            system_prompt="Investigate the damaged order with inspect_order. Ask the user which item is damaged before proposing. After clarification propose_replacement, then execute_replacement with its proposal_id. After approval or rejection independently verify_replacement and explain the result. Never invent approval or receipts.",
+            system_prompt="Investigate the damaged order with inspect_order. Ask the user which item is damaged before proposing. After clarification call propose_replacement without waiting for representative approval, then request execute_replacement with its proposal_id. Cayu holds that execution call until verified representative approval; creating the proposal does not require approval. After approval or rejection independently verify_replacement and explain the result. Never invent approval or receipts.",
         ),
         tools=[
             SupportTool(state, name, args.version)

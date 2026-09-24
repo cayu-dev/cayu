@@ -87,6 +87,10 @@ async def prepare(tmp: Path, resources: SQLiteResourceScope) -> tuple[Path, Path
     invoke(tmp, "review", state, review)
     binding = json.loads(review.read_text())
     action = paused["pending"][0]
+    # Proposal creation is complete before any representative receipt is issued;
+    # execution alone is held for approval across the process restart.
+    assert action["tool_name"] == "execute_replacement"
+    assert not receipt.exists()
     assert binding["approval_id"] == action["approval_id"]
     assert binding["tool_round_id"] == action["round_id"]
     assert binding["tool_call_id"] == action["tool_call_id"]
