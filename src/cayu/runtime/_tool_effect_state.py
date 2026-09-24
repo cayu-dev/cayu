@@ -1162,6 +1162,6 @@ def _validate_selected_terminal(
                 result.get("content") != receipt.message
                 or result.get("structured") != receipt.structured
                 or result.get("is_error") is not (receipt.outcome == "failed")
-                or result.get("artifacts") != []
+                or result.get("artifacts") != receipt.artifacts
             ):
                 raise ToolEffectConflict("Effect terminal result differs from its receipt.")

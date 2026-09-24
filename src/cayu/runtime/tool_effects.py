@@ -88,6 +88,7 @@ class ToolEffectReceipt(BaseModel):
     outcome: Literal["completed", "failed"]
     message: StrictStr
     structured: dict[str, Any] | None = None
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
     resource_versions: dict[str, str] = Field(default_factory=dict)
     observed_at: AwareDatetime
     source: Literal["adapter", "reconciler", "operator"]
@@ -143,6 +144,19 @@ class ToolEffectReceipt(BaseModel):
             maximum_items=32 if info.field_name == "resource_versions" else 16,
         )
 
+    @field_validator("artifacts", mode="before")
+    @classmethod
+    def copy_artifacts(cls, value: object) -> list[dict[str, Any]]:
+        if type(value) is not list or any(type(item) is not dict for item in value):
+            raise ValueError("artifacts must be a bounded list of JSON objects.")
+        return copy_bounded_durable_json_value(
+            value,
+            "tool_effect_receipt.artifacts",
+            max_bytes=TOOL_EFFECT_RESULT_MAX_BYTES,
+            max_nodes=4096,
+            max_nesting=32,
+        )
+
     @field_validator("observed_at")
     @classmethod
     def normalize_observation(cls, value: AwareDatetime):
@@ -174,6 +188,9 @@ def tool_effect_receipt_digest(receipt: ToolEffectReceipt) -> str:
 
 def _receipt_bytes(receipt: ToolEffectReceipt) -> bytes:
     fields = {name: getattr(receipt, name) for name in ToolEffectReceipt.model_fields}
+    # Preserve existing receipt identities when no attachments were supplied.
+    if not fields["artifacts"]:
+        fields.pop("artifacts")
     fields["observed_at"] = receipt.observed_at.isoformat()
     return canonical_bounded_durable_json_bytes(
         fields,

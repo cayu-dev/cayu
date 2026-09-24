@@ -296,6 +296,14 @@ third-party response. This envelope is audit evidence, not an authorization toke
 or a replacement for application receipt validation. It is committed atomically
 with the receipt-bound terminal outcome and retained on exact replay.
 
+`ToolEffectReceipt.artifacts` preserves the original tool-result attachment
+references through settlement and continuation. An image-only result can use
+an empty `message`. The registered application validator must verify attachment
+ownership and content evidence along with the exact call; adding a reference
+does not authenticate it or grant artifact access. Attachment JSON is bounded
+to 64 KiB within the receipt's overall 96 KiB limit. Empty attachment lists
+preserve the content identity of existing receipts and reconciliation requests.
+
 `tool.effect.reconciliation.started` is versioned attempt evidence, emitted after
 exact request preflight and before application reconciliation. It records the
 logical call, dispatch identity, intent/request hashes, expected versions, and

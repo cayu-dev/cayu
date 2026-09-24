@@ -4,12 +4,16 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
+from tests.core.test_runtime import _valid_png_bytes
 from tests.core.test_tool_effect_reconciliation_registration import _spec
 from tests.core.test_tool_effect_runtime_dispatch import _ObservingSQLiteStore, _ObservingStore
 from tests.core.test_tool_round_execution_identities import _SequencedProvider
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION
+from cayu.artifacts.local import LocalArtifactStore
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._tool_effect_state import ToolEffectRecord
@@ -26,7 +30,12 @@ from cayu.tools.base import Tool, ToolEffect, ToolSpec
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_partial_round_receipt_selection_does_not_replay_siblings(backend, reverse, tmp_path):
+@pytest.mark.parametrize("image_only", [False, True])
+def test_partial_round_receipt_selection_does_not_replay_siblings(
+    backend, reverse, image_only, tmp_path
+):
+    artifacts = []
+
     async def scenario():
         store = (
             _ObservingStore()
@@ -68,7 +77,8 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(backend, rever
                         tool_name=context.tool_name,
                         idempotency_key=context.idempotency_key,
                         outcome="completed",
-                        message=f"verified {context.tool_call_id}",
+                        message="" if image_only else f"verified {context.tool_call_id}",
+                        artifacts=artifacts,
                         source="reconciler",
                         observed_at=datetime(2026, 9, 9, tzinfo=UTC),
                     ),
@@ -99,6 +109,20 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(backend, rever
 
         def build_app():
             app = CayuApp(session_store=store, enable_logging=False)
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="local",
+                        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                            name="tests:receipt-artifacts",
+                            behavior_version="1",
+                            implementation_version="1",
+                        ),
+                    ),
+                    artifact_store=LocalArtifactStore(tmp_path / "artifacts"),
+                ),
+                default=True,
+            )
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="agent", model="test"),
@@ -122,6 +146,11 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(backend, rever
 
         try:
             app = build_app()
+            if image_only:
+                part = await app.attach_file(
+                    _valid_png_bytes(), filename="screenshot.png", kind="image", session_id="multi"
+                )
+                artifacts.append(part.attachment)
             initial = [
                 event
                 async for event in app.run(
@@ -176,8 +205,11 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(backend, rever
                     assert len(provider.requests) == 1
                     assert (await records())[order[1]].state == "outcome_unknown"
                 else:
-                    assert events[-1].type.value == "session.completed"
+                    assert events[-1].type.value == "session.completed", events[-1].payload
                     assert len(provider.requests) == 2
+                    if image_only:
+                        resolved = provider.requests[-1].options[RESOLVED_FILE_ATTACHMENTS_OPTION]
+                        assert set(resolved) == {artifacts[0]["artifact_id"]}
             before_events = await store.load_events("multi")
             for request in requests:
                 assert [event async for event in app.reconcile_tool_effect(request)]
@@ -189,6 +221,22 @@ def test_partial_round_receipt_selection_does_not_replay_siblings(backend, rever
                 event for event in before_events if event.type.value == "tool.call.completed"
             ]
             assert len(terminals) == 2
+            for event in terminals:
+                assert event.payload["result"]["artifacts"] == artifacts
+                if image_only:
+                    assert event.payload["result"]["content"] == ""
+            transcript = await store.load_transcript("multi")
+            tool_results = [
+                block
+                for message in transcript
+                for block in message.content
+                if block.type == "tool_result"
+            ]
+            assert len(tool_results) == 2
+            for result in tool_results:
+                assert result.model_dump(mode="json")["artifacts"] == artifacts
+                if image_only:
+                    assert result.content == ""
         finally:
             if backend == "sqlite":
                 await store.close()

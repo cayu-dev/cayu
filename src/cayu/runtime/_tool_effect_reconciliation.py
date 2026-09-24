@@ -373,6 +373,8 @@ def reconciliation_request_digest(request: ToolEffectReconciliationRequest) -> s
     from cayu.approvals.user_input import user_input_resolution_request_digest
 
     document = copied.model_dump(mode="json", exclude={"user_input_response"})
+    if document["receipt"] is not None and not document["receipt"]["artifacts"]:
+        document["receipt"].pop("artifacts")
     document["user_input_response"] = (
         None
         if copied.user_input_response is None

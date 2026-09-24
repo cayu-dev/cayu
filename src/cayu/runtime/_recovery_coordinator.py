@@ -15063,6 +15063,7 @@ class RecoveryCoordinator:
             terminal_result = ToolResult(
                 content=receipt.message,
                 structured=receipt.structured,
+                artifacts=receipt.artifacts,
                 is_error=receipt.outcome == "failed",
             )
             event = Event(

@@ -699,7 +699,11 @@ def test_cancellation_waits_for_owned_commit_and_remains_cancellation(cancellati
     asyncio.run(scenario())
 
 
-def test_receipt_cannot_select_a_different_terminal_result():
+@pytest.mark.parametrize(
+    "changes",
+    [{"message": "a different result"}, {"artifacts": [{"artifact_id": "unbound"}]}],
+)
+def test_receipt_cannot_select_a_different_terminal_result(changes):
     async def scenario():
         store = InMemorySessionStore()
         intent = await _intent(store)
@@ -708,7 +712,7 @@ def test_receipt_cannot_select_a_different_terminal_result():
         executing = await owner.transition(prepared, state="executing", run_epoch=0)
         unknown = await owner.transition(executing, state="outcome_unknown", run_epoch=0)
         event = _event(intent)
-        receipt = _receipt(intent).model_copy(update={"message": "a different result"})
+        receipt = _receipt(intent).model_copy(update=changes)
         with pytest.raises(ToolEffectConflict, match="differs from its receipt"):
             await owner.transition(
                 unknown,

@@ -59,6 +59,10 @@ def test_receipt_detaches_nested_values_and_canonicalizes_identity() -> None:
         {"resource_versions": {str(n): "v" for n in range(33)}},
         {"integrity": {str(n): "v" for n in range(17)}},
         {"headers": {"authorization": "not allowed"}},
+        {"artifacts": ["not an object"]},
+        {"artifacts": {"id": "not a list"}},
+        {"artifacts": [{"raw": "x" * (64 * 1024)}]},
+        {"artifacts": [{"invalid": "\ud800"}]},
     ],
 )
 def test_receipt_rejects_invalid_or_unbounded_material(changes) -> None:
@@ -157,6 +161,7 @@ def test_mutated_valid_sibling_is_checked_even_when_another_field_is_invalid() -
         {"observed_at": datetime(2026, 9, 9, tzinfo=UTC)},
         {"source": "adapter"},
         {"integrity": {"signature": "different"}},
+        {"artifacts": [{"artifact_id": "different"}]},
     ],
 )
 def test_every_receipt_field_participates_in_content_identity(changes) -> None:
@@ -170,3 +175,55 @@ def test_individually_bounded_fields_cannot_exceed_total_envelope_bound() -> Non
             resource_versions={str(n): "v" * 1024 for n in range(32)},
             integrity={str(n): "v" * 1024 for n in range(16)},
         )
+
+
+def test_attachment_copy_and_existing_receipt_digest_compatibility() -> None:
+    from hashlib import sha256
+
+    from cayu._validation import canonical_bounded_durable_json_bytes
+
+    receipt = _receipt()
+    old_fields = receipt.model_dump(mode="python", exclude={"artifacts"})
+    old_fields["observed_at"] = receipt.observed_at.isoformat()
+    old_bytes = canonical_bounded_durable_json_bytes(
+        old_fields,
+        "tool_effect_receipt",
+        max_bytes=96 * 1024,
+        max_nodes=8192,
+        max_nesting=34,
+    )
+    assert tool_effect_receipt_digest(receipt) == sha256(old_bytes).hexdigest()
+    artifacts = [{"artifact_id": "original", "metadata": {"label": "screen"}}]
+    receipt = _receipt(message="", artifacts=artifacts)
+    copied = copy_tool_effect_receipt(receipt)
+    artifacts[0]["metadata"]["label"] = "changed"
+    receipt.artifacts[0]["metadata"]["label"] = "mutated"
+    assert copied.artifacts[0]["metadata"]["label"] == "screen"
+    assert copied.message == ""
+    with pytest.raises(ValueError):
+        copy_tool_effect_receipt(receipt.model_copy(update={"artifacts": [object()]}))
+
+
+def test_existing_request_digest_compatibility_and_attachment_binding() -> None:
+    from cayu.runtime._tool_effect_reconciliation import (
+        _reconciliation_digest,
+        reconciliation_request_digest,
+    )
+    from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
+
+    request = ToolEffectReconciliationRequest(
+        session_id="session",
+        session_instance_id="instance",
+        tool_round_id="round",
+        tool_call_id="call-1",
+        tool_name="deploy",
+        idempotency_key="key-1",
+        expected_run_epoch=1,
+        expected_revision=2,
+        receipt=_receipt(),
+    )
+    legacy = request.model_dump(mode="json")
+    legacy["receipt"].pop("artifacts")
+    assert reconciliation_request_digest(request) == _reconciliation_digest(legacy)
+    changed = request.model_copy(update={"receipt": _receipt(artifacts=[{"id": "image"}])})
+    assert reconciliation_request_digest(changed) != reconciliation_request_digest(request)
