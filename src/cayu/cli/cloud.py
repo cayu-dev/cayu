@@ -15,7 +15,7 @@ import time
 import webbrowser
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Never, TypedDict
+from typing import Any, Never
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_auth import (
@@ -25,6 +25,8 @@ from cayu.cli._cloud_auth import (
     WorkOSDeviceAuthClient,
     fresh_cloud_credentials,
 )
+from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
+from cayu.cli._cloud_diagnostics import parse_build_failure
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
@@ -65,15 +67,6 @@ _SOURCE_BUILD_FAILURE_DETAILS = frozenset(
 )
 
 
-class _CloudDeploymentFailure(TypedDict):
-    automatic_retryable: bool
-    code: str
-    detail: str
-    hint: str
-    message: str
-    phase: str
-
-
 class CloudCommandError(RuntimeError):
     """Stable customer-facing Cloud command failure."""
 
@@ -105,9 +98,17 @@ class _CloudDeploymentFailureError(CloudApiError):
         message: str,
         *,
         failure: _CloudDeploymentFailure,
+        details: dict[str, object],
     ) -> None:
         super().__init__(category, message)
         self.failure = failure.copy()
+        self.details = details.copy()
+
+
+class _CloudDeploymentDiagnosticUnavailableError(CloudApiError):
+    def __init__(self, details: dict[str, object]) -> None:
+        super().__init__("deployment_failed", "Deployment reached terminal status: failed")
+        self.details = details
 
 
 class _CloudDeploymentStillRunningError(CloudApiError):
@@ -260,6 +261,8 @@ def _cloud_failure(exc: Exception) -> int:
     error: dict[str, object] = {"category": category, "message": message}
     if isinstance(exc, CloudSourceInputsError):
         error.update({"path": exc.path, "reason": exc.reason, "hint": exc.hint})
+    if isinstance(exc, (_CloudDeploymentDiagnosticUnavailableError, _CloudDeploymentFailureError)):
+        error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
     if isinstance(exc, (_CloudDeploymentStillRunningError, _CloudServiceStillRunningError)):
@@ -404,6 +407,9 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         operation = deployment_commands.add_parser(action, description=description)
         operation.add_argument("deployment_id")
         operation.add_argument("--application", required=True)
+        if action == "logs":
+            operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
+            operation.add_argument("--diagnostic-limit", type=_diagnostic_limit, default=None)
         if action == "wait":
             operation.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
             operation.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
@@ -1002,6 +1008,42 @@ def _read_secret_value(path: Path) -> str:
     return value
 
 
+def _validated_deployment_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    result = dict(result)
+    failure = result.get("failure")
+    if isinstance(failure, dict) and "schema_version" in failure:
+        result["failure"] = parse_build_failure(failure)
+        if result["failure"] is None:
+            result["diagnostic_status"] = "unavailable_or_unsupported"
+    if "diagnostics" in result:
+        candidates = result["diagnostics"]
+        if not isinstance(candidates, list) or len(candidates) > 100:
+            candidates = []
+            result["diagnostic_status"] = "unavailable_or_unsupported"
+        diagnostics = [parse_build_failure(candidate) for candidate in candidates]
+        if any(diagnostic is None for diagnostic in diagnostics):
+            result["diagnostic_status"] = "unavailable_or_unsupported"
+        result["diagnostics"] = [item for item in diagnostics if item is not None]
+        offset = result.get("next_diagnostic_offset")
+        if offset is not None and (type(offset) is not int or offset < 0):
+            result["next_diagnostic_offset"] = None
+    return result
+
+
+def _diagnostic_offset(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("diagnostic offset must be nonnegative")
+    return number
+
+
+def _diagnostic_limit(value: str) -> int:
+    number = int(value)
+    if not 1 <= number <= 100:
+        raise argparse.ArgumentTypeError("diagnostic limit must be between 1 and 100")
+    return number
+
+
 def _deployment(
     arguments: argparse.Namespace,
     *,
@@ -1017,7 +1059,18 @@ def _deployment(
         result = client.request("GET", base)
         _deployment_status(result)
     elif arguments.deployment_command in {"logs", "timeline"}:
-        result = client.request("GET", f"{base}/{arguments.deployment_command}")
+        path = f"{base}/{arguments.deployment_command}"
+        query = []
+        if arguments.deployment_command == "logs":
+            for name in ("diagnostic_offset", "diagnostic_limit"):
+                value = getattr(arguments, name, None)
+                if value is not None:
+                    query.append(f"{name}={value}")
+        if query:
+            path += "?" + "&".join(query)
+        result = client.request("GET", path)
+        result = _validated_deployment_diagnostics(result)
+
     elif arguments.deployment_command == "wait":
         result = _wait_for_deployment(
             client,
@@ -1166,13 +1219,38 @@ def _wait_for_deployment(
             return deployment
         if status in _DEPLOYMENT_FAILURES:
             if status == "failed" and include_failure_diagnostics:
+                details: dict[str, object] = {}
+                app = _cloud_application_id(application_id)
+                deployment = _cloud_deployment_id(deployment_id)
+                if app is not None:
+                    details["application"] = app
+                if deployment is not None:
+                    details["deployment_id"] = deployment
+                if app is not None and deployment is not None:
+                    details["commands"] = {
+                        "logs": shlex.join(
+                            [
+                                "cayu",
+                                "cloud",
+                                *recovery_arguments,
+                                "deployment",
+                                "logs",
+                                deployment,
+                                "--application",
+                                app,
+                            ]
+                        )
+                    }
                 failure = _deployment_failure(client, path=path)
                 if failure is not None:
                     raise _CloudDeploymentFailureError(
                         failure["code"],
                         failure["message"],
                         failure=failure,
+                        details=details,
                     )
+                details["diagnostic_status"] = "unavailable_or_unsupported"
+                raise _CloudDeploymentDiagnosticUnavailableError(details)
             raise CloudApiError(
                 "deployment_failed",
                 f"Deployment reached terminal status: {status}",
@@ -1199,6 +1277,8 @@ def _deployment_failure(
     candidate = timeline.get("failure")
     if not isinstance(candidate, dict):
         return None
+    if "schema_version" in candidate:
+        return parse_build_failure(candidate)
     code = _deployment_failure_string(candidate.get("code"), max_bytes=64)
     phase = _deployment_failure_string(candidate.get("phase"), max_bytes=64)
     detail = _deployment_failure_string(candidate.get("detail"), max_bytes=4096)

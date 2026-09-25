@@ -68,7 +68,33 @@ timeline before exiting. If Cloud has a safe structured diagnostic, the nonzero 
 result uses its stable category and message and includes `error.failure` with the phase,
 bounded build detail, remediation hint, and automatic-retry decision. Coding agents do
 not need to make a second timeline request. Older Cloud deployments and failures without
-a safe diagnostic retain the generic `deployment_failed` result.
+a safe diagnostic retain the generic `deployment_failed` result. This fallback now includes
+`diagnostic_status=unavailable_or_unsupported` and, when identifiers are valid, the failed
+application/deployment and a ready-to-run `deployment logs` command. A failed diagnostic
+request does not change the original failed deployment result.
+
+Supported schema-version-1 failures preserve safe structured details without requiring
+specific English wording: code, phase, summary, repair hint, retry classification, attempt,
+and diagnostic reference. Structured failures also include the application/deployment
+identifiers and a logs command, including when evidence is unavailable or truncated.
+`failure.diagnostic` includes evidence status/reason, build stage,
+exit code, a bounded redacted excerpt, and a truncation flag. Invalid, unsupported, oversized,
+or unsafe payloads are withheld rather than printed. Older unversioned safe failures remain
+supported through the existing compatibility projection.
+
+Read explicit evidence noninteractively:
+
+```bash
+cayu cloud deployment timeline DEPLOYMENT_ID --application AGENT_SLUG
+cayu cloud deployment logs DEPLOYMENT_ID --application AGENT_SLUG
+cayu cloud deployment logs DEPLOYMENT_ID --application AGENT_SLUG --diagnostic-offset 20 --diagnostic-limit 20
+```
+
+The log response's `diagnostics` array and `next_diagnostic_offset` provide evidence pages.
+Offset/limit flags require a Cloud server implementing this contract; omit them for older
+servers. A source error generally requires repairing and uploading new source. Transient
+infrastructure failures may allow retrying the same source. Neither a new CLI nor a retry
+can recover diagnostic output that the server never recorded.
 
 `cayu cloud deploy` creates the 8-63 character application slug declared in
 `cayu-cloud.toml` when it does not exist, then updates it on later deploys. Slugs use

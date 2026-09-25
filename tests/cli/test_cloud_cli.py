@@ -1760,6 +1760,11 @@ def test_cloud_deploy_wait_reports_typed_deployment_failure(
     assert json.loads(capsys.readouterr().out) == {
         "error": {
             "category": "source_build_failed",
+            "application": "outbound-agent",
+            "deployment_id": "dep_failed",
+            "commands": {
+                "logs": "cayu cloud deployment logs dep_failed --application outbound-agent",
+            },
             "failure": failure,
             "message": "The Agent image could not be built.",
         },
@@ -2094,6 +2099,12 @@ def test_cloud_deploy_wait_rejects_unsafe_timeline_failure(
         "error": {
             "category": "deployment_failed",
             "message": "Deployment reached terminal status: failed",
+            "diagnostic_status": "unavailable_or_unsupported",
+            "application": "outbound-agent",
+            "deployment_id": "dep_failed",
+            "commands": {
+                "logs": "cayu cloud deployment logs dep_failed --application outbound-agent"
+            },
         },
         "ok": False,
     }

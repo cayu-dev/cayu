@@ -215,6 +215,28 @@ For `cayu cloud deploy`, run `uv lock` in the selected project root and include 
 including Git ignore rules; a local wheel build alone does not establish Cloud build
 readiness. The deploy command does not generate locks or modify the source for you.
 
+## Cloud build diagnostics
+
+When `cayu cloud deploy` fails, inspect the structured `error.failure`: its code,
+phase, repair hint, retry classification, and diagnostic evidence describe the
+failure. Supported versioned diagnostics include a bounded redacted build excerpt,
+attempt, exit code, and evidence availability. For example, missing build inputs
+require fixing the source bundle and submitting a new revision; a temporary
+infrastructure failure may permit retrying the same source.
+
+Retrieve deployment-scoped evidence without platform credentials:
+
+```console
+cayu cloud deployment timeline DEPLOYMENT_ID --application AGENT_SLUG
+cayu cloud deployment logs DEPLOYMENT_ID --application AGENT_SLUG
+```
+
+For servers supporting diagnostic pagination, use `--diagnostic-offset` with the
+returned `next_diagnostic_offset` and optionally `--diagnostic-limit 20`. If evidence
+is unavailable or unsupported, the deploy error retains the failed outcome and
+provides a logs command when possible. A CLI upgrade cannot recover evidence the
+server never recorded. Verify a later deployment succeeds before claiming recovery.
+
 ## Generator compatibility
 
 `cayu generate tool` and `cayu generate slice` inspect the declared scaffold
