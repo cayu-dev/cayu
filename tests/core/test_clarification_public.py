@@ -626,6 +626,9 @@ async def test_public_question_uses_real_assistant_export(
     service_clock_offset=None,
     terminal_wait=None,
     service_observation_loss=False,
+    planning_driver=None,
+    planning_journey=None,
+    journey_ttl_ms=300_000,
 ):
     if prune_history == "lost_native_ack":
         from cayu.runtime._session_continuation import ContinuationConflict
@@ -648,7 +651,7 @@ async def test_public_question_uses_real_assistant_export(
     registered = registration(scope="clarification-" + uuid4().hex)
     values = await setup(collaboration, reg=registered, session_store=store)
     _, initialized, first, second, original, _ = values
-    original = original.model_copy(update={"ttl_ms": 300_000})
+    original = original.model_copy(update={"ttl_ms": journey_ttl_ms})
     if finish_request:
         original = original.model_copy(
             update={
@@ -737,7 +740,7 @@ async def test_public_question_uses_real_assistant_export(
     reader = _PublicExportReader(owner, context)
     receiver = SessionExportRequestReceivingOwner(audience=owner, reader=reader)
     policy = finite_policy(
-        service_timeout_ms=90_000 if service_clock_offset is not None else 300_000,
+        service_timeout_ms=90_000 if service_clock_offset is not None else journey_ttl_ms,
         max_questions=2 if multiple_questions or nested_service else 32,
         max_service_turns=2 if multiple_questions or nested_service else 32,
         max_depth=2 if nested_service else 4,
@@ -903,7 +906,14 @@ async def test_public_question_uses_real_assistant_export(
         transport = HttpxOpenAITransport()
         transport._client._client = client
 
-        def application_for(collaboration_store, sessions):
+        def application_for(
+            collaboration_store,
+            sessions,
+            *,
+            planning_policies=(),
+            prepared_admission=None,
+            resource_owners=(),
+        ):
             ledger = None
             if budget_boundary is not None and backend != "memory":
                 if backend == "sqlite":
@@ -924,9 +934,12 @@ async def test_public_question_uses_real_assistant_export(
                 session_store=sessions,
                 collaboration_requests=RequestRegistration(
                     mandates=mandates,
-                    max_ttl_ms=300000,
+                    max_ttl_ms=journey_ttl_ms,
                     receiving_owner=receiver,
                     clarification_policies=(policy,),
+                    planning_policies=planning_policies,
+                    prepared_admission=prepared_admission,
+                    resource_owners=resource_owners,
                 ),
                 session_exports=SessionExportRegistration(
                     owner=owner,
@@ -1008,7 +1021,8 @@ async def test_public_question_uses_real_assistant_export(
                 evidence=(),
                 initiator=_initiator(actor_b.context),
             )
-            await current.admit_collaboration_request(admission, context=actor_b.context)
+            if planning_driver is None and planning_journey is None:
+                await current.admit_collaboration_request(admission, context=actor_b.context)
             creation = ParticipantSessionCreationRequest(
                 creation_key="question-source-" + owner.application_scope,
                 request=RunRequest(
@@ -1050,6 +1064,8 @@ async def test_public_question_uses_real_assistant_export(
             )
             resolution = actor_b.resolution
             actions = ("consult", "readback", "administer", "publish", "source", "expose")
+            if planning_driver is not None or planning_journey is not None:
+                actions = (*actions, "prepare")
             actor_b.resolution = resolution.model_copy(
                 update={
                     "principal": resolution.principal.model_copy(
@@ -1129,9 +1145,24 @@ async def test_public_question_uses_real_assistant_export(
             command = ClarificationOpenCommand(
                 operation=question.operation,
                 expected=accepted.expected,
-                expected_revision=snapshot.revision,
+                expected_revision=snapshot.revision
+                + (planning_driver is not None or planning_journey is not None),
                 question=question,
             )
+            if planning_driver is not None:
+                return await planning_driver(
+                    application_for=application_for,
+                    collaboration=collaboration,
+                    sessions=store,
+                    initialized=initialized,
+                    command=command,
+                    source=export,
+                    context=context,
+                    payloads=payloads,
+                    reopen_collaboration=collaboration_factory,
+                    backend=backend,
+                    export_policy=export_policy,
+                )
             if not one_slot:
                 target_creation, target, wait, parked = await create_target(
                     current,
@@ -1147,7 +1178,9 @@ async def test_public_question_uses_real_assistant_export(
                 snapshot = await current.inspect_collaboration_request(
                     accepted.expected, context=actor_a.context
                 )
-                command = command.model_copy(update={"expected_revision": snapshot.revision})
+                command = command.model_copy(
+                    update={"expected_revision": snapshot.revision + (planning_journey is not None)}
+                )
 
             original_target_creation = target_creation
             if side_session:
@@ -1224,7 +1257,21 @@ async def test_public_question_uses_real_assistant_export(
                     )
                 question = question.model_copy(update={"deadline_at_ms": deadline})
                 command = command.model_copy(update={"question": question})
-            opened = await current.open_clarification(command, source=export, context=context)
+            if planning_journey is None:
+                opened = await current.open_clarification(command, source=export, context=context)
+            else:
+                opened, after_planned_reply = await planning_journey(
+                    application_for=application_for,
+                    collaboration=collaboration,
+                    sessions=store,
+                    initialized=initialized,
+                    command=command,
+                    source=export,
+                    context=context,
+                    payloads=payloads,
+                    reopen_collaboration=collaboration_factory,
+                    backend=backend,
+                )
             assert opened.command == command
             payload = PeerContentPayload(
                 text="Which API version?",
@@ -2112,9 +2159,11 @@ async def test_public_question_uses_real_assistant_export(
                 ),
                 ExactConflict,
             )
-            assert (
-                await current.open_clarification(command, source=export, context=context) == opened
-            )
+            if planning_journey is None:
+                assert (
+                    await current.open_clarification(command, source=export, context=context)
+                    == opened
+                )
             assert len(payloads) == 2 + temporary_service + side_session
             assert "private-state" not in opened.model_dump_json()
             assert "private-thinking" not in opened.model_dump_json()
@@ -2266,6 +2315,14 @@ async def test_public_question_uses_real_assistant_export(
                     await current.reply_to_clarification(reply_request, context=service_context)
                     == accepted_reply
                 )
+                if planning_journey is not None:
+                    return await after_planned_reply(
+                        current=current,
+                        reply=accepted_reply,
+                        wait=wait,
+                        parked=parked,
+                        wait_context=actor_a.context,
+                    )
                 if multiple_questions:
                     from tests.core._clarification_final_flow import finish_original_wait
                     from tests.core._clarification_multiple_flow import second_question

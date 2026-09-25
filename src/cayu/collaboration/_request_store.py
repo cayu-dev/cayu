@@ -312,10 +312,21 @@ async def control_in_transaction(
         redactor=redactor,
     )
     # Undecided requests have no admitted producer responsibility. Once an
-    # admission decision exists, only the registered receiving owner may prove
-    # that the outstanding responsibility is quiescent before cancellation or
-    # expiry is committed.
-    if prior.admission == "undecided" and prior.delivery == "pending":
+    # admission decision exists, the registered receiving owner must prove
+    # quiescence. The native planner can supply that proof only for a complete
+    # defer/terminal-question history with no pending downstream responsibility
+    # or independent receiving-owner admissions.
+    from cayu.collaboration._planning_control import (
+        control_request_plans,
+        local_planning_quiescence,
+    )
+
+    local_responsibility = prior.admission == "undecided" and prior.delivery == "pending"
+    if not local_responsibility and settlement is None:
+        local_responsibility = await local_planning_quiescence(
+            store, tx, initialized, prior, redactor=redactor
+        )
+    if local_responsibility:
         settlement = ReceivingSettlementReceipt(
             expected=prior.permit,
             receiving_owner=initialized.owner,
@@ -353,6 +364,7 @@ async def control_in_transaction(
     await tx.put("requests", _key(original), updated_snapshot, insert=False)
     await tx.put("request_events", (event.sequence,), event, insert=True)
     await tx.put("anchors", (), updated, insert=False)
+    await control_request_plans(store, tx, initialized, receipt, redactor=redactor)
     return receipt
 
 

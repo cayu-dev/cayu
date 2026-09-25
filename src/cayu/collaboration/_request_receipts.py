@@ -107,6 +107,12 @@ def record_operation(raw: object, *, redactor: SecretRedactor) -> OperationRef:
     if not isinstance(raw, dict):
         raise CollaborationContractError("Stored operation record is malformed.")
     document = cast("dict[str, object]", raw)
+    if document.get("mode") == "request_plan_stage":
+        from cayu.collaboration._planning_records import RequestPlanningStageRecord
+
+        return prepare_contract(
+            RequestPlanningStageRecord, document, redactor=redactor
+        ).intent.operation
     if document.get("mode") == "clarification_delivery":
         from cayu.collaboration._clarification_deliveries import ClarificationDeliveryRecord
 

@@ -610,6 +610,24 @@ def require_erasure_quiescence(*, session: Session, checkpoint, records: dict[st
                 )
 
 
+def require_continuation_selection_quiescence(checkpoint, *, session: Session) -> None:
+    """Reject retained wait/service responsibility at ordinary recipient selection.
+
+    This reads the native index; it neither retires a ticket nor supplies the
+    stronger receiving evidence needed to discharge its obligations.
+    """
+    if checkpoint is None or ROOT_KEY not in checkpoint:
+        return
+    root = ContinuationRoot.model_validate(checkpoint[ROOT_KEY])
+    if (
+        root.namespace.session_id != session.id
+        or root.namespace.session_instance_id != session.instance_id
+        or any(entry.state not in {"CONSUMED", "RETIRED"} for entry in root.entries)
+        or any(not entry.source_acknowledged for entry in root.target_services)
+    ):
+        raise ContinuationConflict("Recipient still owns continuation responsibility.")
+
+
 def import_history_checkpoint(checkpoint, *, session: Session):
     if checkpoint is None or ROOT_KEY not in checkpoint:
         return checkpoint

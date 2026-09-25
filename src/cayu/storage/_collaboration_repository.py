@@ -24,6 +24,16 @@ from cayu.collaboration._contracts import (
 )
 from cayu.collaboration._history_references import history_references
 from cayu.collaboration._permits import PermitSnapshot
+from cayu.collaboration._planning_records import (
+    PENDING_PLANNING_STATES,
+    PLANNING_RECORD_FAMILIES,
+    RequestPlanningCursor,
+    RequestPlanningRecord,
+    RequestPlanningStageRecord,
+    planning_cursor_key,
+    planning_record_projection,
+    prepare_planning_scan,
+)
 from cayu.collaboration._request_receipts import record_operation
 from cayu.collaboration.base import Key, Table
 from cayu.collaboration.participants import ParticipantEvent
@@ -85,6 +95,104 @@ class _SQLRepository:
                 raise CollaborationContractError("Request event index contradicts its record.")
             result.append(value)
         return result
+
+    async def _planning_rows(self, where: str, args: tuple, order: str, limit: int) -> list[object]:
+        columns = EXTRA_COLUMNS["request_plans"]
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), {', '.join(columns)}, "
+                "namespace, generation, caller_key FROM cayu_collaboration_request_plans "
+                f"WHERE scope=? AND {where} ORDER BY {order} LIMIT ?",
+                (self.scope, *args, limit),
+            )
+        )
+        result = []
+        for row in rows:
+            value = self._decode(row[0])
+            record, projection = planning_record_projection(
+                "request_plans", value, scope=self.scope, key=tuple(row[1 + len(columns) :])
+            )
+            assert isinstance(record, RequestPlanningRecord)
+            if tuple(row[1 : 1 + len(columns)]) != projection:
+                raise CollaborationContractError("Planning scan index contradicts its record.")
+            result.append(value)
+        return result
+
+    async def scan_request_plans(self, request, *, limit):
+        from cayu.collaboration.requests import RequestRef
+
+        request = prepare_planning_scan(request, scope=self.scope, limit=limit, kind="request")
+        assert isinstance(request, RequestRef)
+        rows = await self._planning_rows(
+            "request_id=? AND request_incarnation=?",
+            (request.request_id, request.incarnation),
+            "planning_generation",
+            limit,
+        )
+        for raw in rows:
+            from cayu.collaboration._preparation import prepare_contract
+
+            record = prepare_contract(RequestPlanningRecord, raw, redactor=SecretRedactor())
+            if record.receipt.command.expected.intent.selection.reference != request:
+                raise CollaborationContractError("Planning request owner contradicts its index.")
+        return rows
+
+    async def _request_plan_stages(self, operation, *, limit, native):
+        operation = prepare_planning_scan(
+            operation, scope=self.scope, limit=limit, kind="native_stage" if native else "stages"
+        )
+        prefix = "native" if native else "plan"
+        columns = EXTRA_COLUMNS["request_plan_stages"]
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(document, 1, {MAX_ENVELOPE_BYTES + 1}), {', '.join(columns)}, "
+                "namespace, generation, caller_key FROM cayu_collaboration_request_plan_stages "
+                f"WHERE scope=? AND {prefix}_namespace=? AND {prefix}_generation=? "
+                f"AND {prefix}_key=? ORDER BY ordinal LIMIT ?",
+                (
+                    self.scope,
+                    operation.namespace_incarnation,
+                    operation.generation,
+                    operation.caller_key,
+                    2 if native else limit,
+                ),
+            )
+        )
+        if native and len(rows) > 1:
+            raise CollaborationContractError("Native operation has conflicting planning stages.")
+        result = []
+        for row in rows:
+            value = self._decode(row[0])
+            record, projection = planning_record_projection(
+                "request_plan_stages", value, scope=self.scope, key=tuple(row[1 + len(columns) :])
+            )
+            assert isinstance(record, RequestPlanningStageRecord)
+            target = record.intent.command.operation if native else record.intent.plan
+            if tuple(row[1 : 1 + len(columns)]) != projection or target != operation:
+                raise CollaborationContractError("Planning stage index contradicts its record.")
+            result.append(value)
+        return result
+
+    async def scan_request_plan_stages(self, plan, *, limit):
+        return await self._request_plan_stages(plan, limit=limit, native=False)
+
+    async def find_request_plan_stage(self, native_operation):
+        rows = await self._request_plan_stages(native_operation, limit=1, native=True)
+        return rows[0] if rows else None
+
+    async def scan_pending_request_plans(self, *, after, limit):
+        cursor = prepare_planning_scan(after, scope=self.scope, limit=limit, kind="pending")
+        assert cursor is None or isinstance(cursor, RequestPlanningCursor)
+        where = (
+            f"(state IN ({', '.join('?' for _ in PENDING_PLANNING_STATES)}) OR pending_stages>0)"
+        )
+        args = tuple(PENDING_PLANNING_STATES)
+        if cursor is not None:
+            where += " AND (next_due_at_ms, namespace, generation, caller_key) > (?, ?, ?, ?)"
+            args = (*args, *planning_cursor_key(cursor))
+        return await self._planning_rows(
+            where, args, "next_due_at_ms, namespace, generation, caller_key", limit
+        )
 
     async def scan_clarification_questions(self, request, *, limit: int) -> list[object]:
         request = prepare_question_scan(request, limit)
@@ -288,7 +396,13 @@ class _SQLRepository:
         if not rows:
             return None
         value = self._decode(rows[0][0])
-        if table == "permits":
+        if table in PLANNING_RECORD_FAMILIES:
+            _, expected_projection = planning_record_projection(
+                table, value, scope=self.scope, key=key
+            )
+            if tuple(rows[0][1:]) != expected_projection:
+                raise CollaborationContractError("Planning secondary index contradicts its record.")
+        elif table == "permits":
             self._require_permit_projection(value, tuple(rows[0][1:]), key)
         elif table == "requests":
             self._require_request_projection(value, tuple(rows[0][1:]), key)
@@ -354,7 +468,11 @@ class _SQLRepository:
         extra = EXTRA_COLUMNS.get(table, ())
         columns = ("scope", *KEYS[table], *extra)
         extra_values: tuple = ()
-        if table in CLARIFICATION_RECORD_FAMILIES:
+        if table in PLANNING_RECORD_FAMILIES:
+            value, extra_values = planning_record_projection(
+                table, value, scope=self.scope, key=key
+            )
+        elif table in CLARIFICATION_RECORD_FAMILIES:
             value, extra_values = clarification_record_projection(
                 table, value, scope=self.scope, key=key
             )

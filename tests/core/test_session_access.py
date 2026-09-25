@@ -247,6 +247,15 @@ async def conformance(store):
         assert own_source.session_id == prefix + "a"
         with pytest.raises(NotImplementedError, match="operator"):
             await store.load_state(prefix + "b")
+        # Recipient planning remains an explicitly authenticated operator
+        # surface, including methods inherited from a selection-fence mixin.
+        # Denial must happen before interpreting caller data or reading records.
+        for operation in (
+            store.capture_recipient_continuation,
+            store.read_context_view_selection_decision,
+        ):
+            with pytest.raises(NotImplementedError, match="operator"):
+                await operation(None)
 
     assert current_binding() is None
     shared = SessionAccessRule(allow_all=True)

@@ -428,7 +428,7 @@ the exact source export receipt. This is required for continue, fork, fresh,
 answer, cancellation, and failure paths; a source reference without its
 authenticated receipt is not enough to authorize or settle the request.
 
-### Prepared FRESH recipient admission
+### Prepared recipient admission
 
 `RequestRegistration.prepared_admission=PreparedAdmissionRegistration(receiver=...)`
 opts into the production native recipient receiver. Its `ObjectRef` must carry
@@ -437,16 +437,83 @@ common-root budget binding receiver as well. No permissive receiver is installed
 by default. An optional existing `receiving_owner` continues to handle export-backed
 operations; it does not authenticate the prepared branch.
 
-After `create_recipient_session` creates an inert resource-free FRESH child, call
+Before acquiring material or creating a FRESH child, an explicit driver can call
+`prepare_recipient_creation(creation, context=...)` to obtain a
+`FreshRecipientPreparation`. It freezes the original bounded request, exact native
+creation target, resolved profile, historical definition commitment and complete
+sponsor binding without creating a session, acquiring a permit or registering
+budget-ledger capacity. The requested session ID may be `None`; no future session
+incarnation is invented. This proposal is data, not execution or creation authority.
+Initial attachment references may be frozen in that input, but do not prove
+retention or access. A planning proposal containing attachments requires explicit
+resource recipes. Native creation checks complete transfer coverage and exact
+attachment metadata against the qualified static artifact environment before
+committing the child; preflight alone cannot bypass those checks.
+
+The existing registered budget receiver receives a preparation request with
+`kind="request_recipient_preparation"`, `schema_version=1`, `creation_target` and
+`execution_profile_fingerprint`. It must explicitly authenticate this future
+operation; it must not treat a requested public ID as a created incarnation.
+Passing the proposal as `create_recipient_session(..., preparation=proposal)`
+compares current preflight, definition, sponsor and the complete native creation
+target before the receiving handoff mutates either store. Changed expectations
+fail closed. Creation still uses its ordinary current authorization and native
+permit; the proposal does not replace either. Historical creation replay checks
+the original native material rather than resolving new application defaults.
+The request snapshot has the named finite ceiling
+`MAX_PREPARATION_REQUEST_BYTES` (16 KiB), in addition to profile, budget and
+complete contract envelope limits.
+
+After `create_recipient_session` creates an inert FRESH or FORK child, call
 `prepare_recipient_admission(creation, context=...)`. This read-only entrance
 reconstructs the exact native creation target and retains the full resolved
 profile and sponsor binding. The returned proposal is data, not authority.
-Submit it as `RequestAdmissionCommand.prepared` with `decision="fresh"`, empty
+Submit it as `RequestAdmissionCommand.prepared` with the matching `decision="fresh"`
+or `decision="fork"`, empty
 `evidence`, no source export, and the exact request revision, effective-input
 revision/commitment and next admission generation. The receiving owner checks
 the native creation decision, incarnation, immutable receipt and current mandate
-and budget receiver before admission. FORK, resources and live CONTINUE planning
-are not qualified by this branch.
+and budget receiver before admission. A FORK target additionally binds the exact
+historical selection commitment, manifest commitment, view ID and source session
+incarnation from the native child creation receipt. It does not renew source
+disclosure or require an already-transferred source pin to remain active. Changed
+selection evidence is rejected without admission mutation.
+
+For a child carrying qualified immutable local resources, register its exact
+destination `LocalArtifactResourceOwner` in `RequestRegistration.resource_owners`.
+The admission target carries bounded `ResourceMaterialReference` values binding
+the owner, operation, transfer template, accepted receipt and preparation receipt.
+The native child receipt proves adoption; the registered owner independently
+authenticates continued accepted retention and holds its existing mutation fence
+through the admission transaction. A missing/released pin, conflicting commitment
+or unavailable native owner refuses admission. This does not acquire new material,
+renew the original source's disclosure/preparation grant or expose resource bytes.
+Current receiving mandate, participant admission and sponsor checks still apply.
+Caller cancellation does not release that fence while the owned admission worker
+is still running; exact replay reconciles the original durable operation.
+
+For an existing participant-owned session, use
+`prepare_recipient_continuation(RecipientContinuationRequest(session_id=...,
+session_instance_id=..., participant=...), context=...)`. This authenticates
+participant administration and returns a CONTINUE proposal for one coherent,
+released completed whole-turn boundary. Submit it with `decision="continue"`
+and the same exact request/input/admission fields described above. The target
+binds the participant/session incarnations, current run epoch, binding/checkpoint
+commitments, release receipt, completed interaction/model step/event and transcript
+frontier, and complete profile. It never appends input, queues a turn or acquires
+a writer. Busy, human-paused, incomplete, queued-input and closure-owned sessions
+are refused; an arbitrary idle flag is not completion evidence.
+
+The registered receiver independently recaptures that exact selection. A newer
+turn cannot silently replace it. Receiver capability 2 qualifies FRESH and
+CONTINUE; capability 1 qualifies only FRESH. Capability 3 additionally qualifies
+resource-free FORK. Capability 4 also qualifies exact adopted-resource evidence
+for FRESH/FORK; earlier receivers cannot silently ignore those fields.
+Constructing an identical target
+does not authenticate it. Selection is a read, not a cross-store lease: later
+execution must still admit against the exact target and current native gates.
+An already-committed admission remains historically replayable after the session
+advances, without granting permission to execute the old boundary again.
 
 The existing participant permit protocol orders admission against disablement:
 registration and local settlement of the admission-only permit commit in the
@@ -480,6 +547,207 @@ within the existing 64 KiB contract envelope. Request capability version 2 and
 schema revision 106 fence writers that cannot preserve this evidence. The existing
 typed request, event and permit records remain the durable owners; there is no
 second admission database.
+
+## Explicit deterministic planning
+
+`RequestRegistration.planning_policies` registers immutable
+`ConfiguredRequestPlanningPolicy` values. The supported algorithm,
+`input_revision_rules_v1`, selects a typed decision for an exact effective-input
+revision, or its required default. Policies have a pinned reference, schema
+version and complete configuration commitment. Arbitrary callbacks and
+model-assisted evaluation are not supported. Configuration is strategy, not
+permission to execute or disclose content.
+
+See `examples/collaboration/planning.py` for an immutable decline policy and a
+single-call host driver. The host preserves operation keys; the example does
+not install permissive authority or launch a background retry loop.
+
+`app.plan_collaboration_request(request, context=mandate_context)` takes a
+`RequestPlanningRequest`. It binds the complete accepted request, request and
+effective-input revisions/commitment, planning and admission operations and
+generations, initiator, policy reference/commitment, finite limits, deadline and
+optional exact predecessor. Planning requires current `prepare` mandate
+authority and participant lifecycle/configuration checks. It does not replace
+the existing request admission or participant execution permit protocols.
+
+The native collaboration owner retains the resolved policy and exact intent
+before evaluating it. A retained decision is read on retry, not reevaluated
+against a replacement deployment policy. Same-key differences conflict. The
+returned `RequestPlanningRecord` separates its business state from pending
+receiving-stage responsibility; a proposal or record is never a launch permit.
+The record stores the selected decision's commitment alongside the immutable
+policy, rather than duplicating the complete proposal. Reconstruction checks
+that commitment against the policy's selection for the retained input revision.
+Similarly, a terminal control disposition binds the exact retained request by
+commitment; the record's `control` property reconstructs its complete expectation.
+
+The currently qualified decision families are:
+
+- `RequestPlanningDefer`: an absolute owner-time timer or an exact admission
+  prerequisite. Register prerequisite readers as `RequestPlanningAdmissionReader`
+  entries in `planning_readers`; they use the existing authenticated
+  `RequestAdmissionReader` contract. A positive receipt permits an explicit
+  successor, not automatic execution. Missing, unavailable or conflicting
+  prerequisite evidence cannot satisfy it.
+- `RequestPlanningDecline`: native request admission, terminal outcome and
+  permit settlement. The owner can prove local non-dispatch for an initial
+  request or a complete history of planner-owned, source-free deferrals.
+  Terminal planner-owned questions can also settle after the native owner
+  verifies complete question history and no pending delivery/service handoffs.
+  Earlier independent receiving responsibility still requires its settlement;
+  a later local deferral does not erase it.
+- `RequestPlanningClarify`: an exact existing question opening and export
+  selection. Planning retains a native stage before acquiring the existing
+  source/budget-authorized question owner. Question opening and stage settlement
+  commit together. A matching raw opening cannot consume a planner-owned stage.
+  Question delivery, service, reply acceptance and final-result continuation
+  remain separate operations with their existing authorization requirements.
+- `RequestPlanningContinue`: the exact prepared CONTINUE proposal from the
+  read-only entrance above. The frozen configuration selects this boundary, not
+  a mutable session-ID lookup performed inside policy evaluation. Planning
+  retains its exact admission stage before acquiring the registered receiver.
+  Native admission, stage settlement and the admitted planning record commit
+  together under CollaborationStore. Cancellation can fence an unopened local
+  admission but never cancels unrelated work in the selected session. Individual
+  stage settlement/exclusion sizes are checked before retention; aggregate
+  reserved bytes alone do not establish that a terminal record fits.
+- `RequestPlanningFresh`: a frozen `FreshRecipientPreparation` from the explicit
+  native preflight entrance above. Planning atomically registers the existing
+  creation permit and its exact pending stage in CollaborationStore before
+  handing off to SessionStore. Native creation remains inert and owns the actual
+  session incarnation. Exact receiving readback settles the same permit and
+  records the child in the first stage; a second local stage submits its prepared
+  admission to the existing receiver. Final admission rechecks current participant
+  and effective-input authority. A successful creation followed by rejection is
+  retained, not deleted or silently recreated. Cancellation seals new local
+  admission and reconciles creation versus native exclusion; a cancelled observer
+  or absent receiving receipt alone never releases that responsibility. These
+  are separate durable owner transactions, not a cross-store atomic transaction.
+  The maximal creation and final admission receipt envelopes are checked before
+  retaining permission to create. Neither stage launches recipient execution.
+- `RequestPlanningFork`: a frozen `ForkRecipientPreparation` from
+  `prepare_recipient_fork(base_creation, source_selection, source_participant=...,
+  context=..., deadline_at_ms=...)`. The base freezes explicit FRESH input and
+  preflight; its creation permit is not dispatched as a FORK. Attachment
+  references require the separately registered resource recipes described below.
+  The view stage retains the full selection and source/recipient permit tuple
+  before native acquisition. The native owner durably reserves selection-control
+  capacity before the stage atomically registers either permit. If reservation
+  fails, cancellation can exclude the still-unregistered stage in the same
+  CollaborationStore transaction that fences delayed permit registration. This
+  local non-admission proof does not claim that an admitted selection stopped.
+  After registration, cleanup requires native exclusion or release evidence and
+  uses the already-reserved control capacity. A lost reservation acknowledgement
+  is reconciled with the original target; an inert control record alone cannot
+  authorize a selection. The stage remains pending through selection, explicit
+  adoption and child creation. A separate creation stage binds the resolved
+  material to that exact blueprint; it is accepted only from the application-wired
+  native receiving owner, not caller-shaped resolution evidence. The original
+  view stage settles after native release/exclusion and both source permit
+  acknowledgements. A third stage performs final admission. Retained history is
+  historical data, not current disclosure or execution permission. This branch
+  does not execute the child or provision external resources.
+
+FRESH and FORK policies may include an ordered, bounded `resources` tuple of
+`RequestPlanningResource` values. Each recipe contains an exact acquisition
+permit, an immutable `ResourceTransferTemplate` (including its complete
+acquisition command), and the destination's exact transfer permit. Register the
+corresponding `LocalArtifactResourceOwner` instances in
+`RequestRegistration.resource_owners` and their concrete mandate preparation
+receivers before planning. The recipe is not a resource receipt or authorization.
+Each resource has a finite absolute deadline no later than the planning deadline.
+
+The planner retains an acquisition stage before calling the source owner, then a
+transfer stage bound to the authenticated acquisition receipt before calling the
+destination. Only after every transfer is accepted does it retain the exact
+material-bound creation stage. Creation adopts the destination pins; source
+acquisitions are discharged separately before final request admission. Cleanup
+first reconciles creation or its exact exclusion so it cannot release material
+that a delayed child creation may still adopt. Reconstructed recovery uses the
+same native operations and registered owners, never a new resource key. Partial
+preparation remains pending and capacity-counted until native adoption or
+independently authorized cleanup supplies positive settlement evidence.
+
+A successor uses a new explicit planning/admission identity and the exact
+predecessor operation/revision. Timer/prerequisite eligibility or an accepted
+clarification input is checked transactionally alongside the current request
+frontier. Reusing the old input after a reply is rejected. Successors cannot
+extend the original deadline, evade earlier generation ceilings, replace admitted
+work or abandon unresolved stages. Historical prerequisite receipts prove the
+decision's provenance; they do not grant current access.
+An absolute timer that is already due remains eligible; it does not renew the
+deadline or implicitly create another planning generation.
+An explicitly cancelled preparation may be replaced only after every foreign
+stage has positive terminal evidence, local admission is fenced, and no native
+request admission exists. A created child retains its native ownership: it is
+not an exclusion and is never implicitly adopted by a new generation.
+The prior cancellation receipt remains immutable; the new operation binds its
+exact predecessor revision and inherits the original finite deadline/ceilings.
+
+`lookup_collaboration_plan(expected, context=...)` compares the full expectation
+and returns current authenticated readback. `reconcile_collaboration_plan` makes
+one bounded progress pass for that same retained operation; it cannot create a
+missing intent or select replacement keys. Cancellation, an observation timeout
+and lost acknowledgement are not proof of exclusion. Preserve the complete
+original request and reconcile it after restart.
+FRESH/FORK recovery checks the planning deadline against CollaborationStore owner time,
+even if no explicit expiry control was submitted. An elapsed preparation is
+fenced through the existing expiry control under current administrative authority;
+without that authority recovery refuses rather than starting new preparation.
+Pending native creation, view and resource responsibilities remain retained until
+exact receiving evidence proves creation or exclusion and the corresponding
+retention settlement. A child already created before acknowledgement loss is
+reconciled, not discarded or created again. Read-only lookup does not expire plans.
+For FRESH recovery, `max_recovery_items` bounds stage progress per call. A limit
+of one can return `preparing` after adopting creation; the next exact call handles
+final admission. An already-settled creation stage is reconstructed from its
+authenticated retained receipt, not recreated or reselected.
+FORK recovery similarly bounds preparation, creation settlement and pin settlement
+as distinct progress items. It preserves the same native selection and creation
+identities; cleanup reconciles a late selection or creation before allowing a
+successor. A released source pin does not require the already-created child to be
+recreated. The creation-stage receipt derives admission data from its retained
+command and native child evidence instead of storing duplicate profile and budget
+authority. Complete typed records remain subject to the existing 64 KiB ceiling.
+
+`list_pending_collaboration_plans(context=..., after=None, limit=32)` requires
+scope-wide request-read authority. Its typed page contains at most 32 bounded
+records, including terminal records with unsettled stages. A cursor is a position,
+not a snapshot or ownership claim; begin a later sweep without one to discover
+new work behind it. Discovery starts no background worker.
+
+`control_collaboration_plan` accepts an exact `RequestPlanningControl` under
+current administrative authority. It can fence a not-yet-opened native question
+stage or close an existing question without renewing source disclosure. It does
+not settle separate delivery/service debt. Native root request cancellation and
+expiry also fence eligible local plans in their transaction, after the original
+request's receiving responsibility is proven settled. A failed plan-control write
+rolls back that request control rather than leaving contradictory terminal state.
+The complete control initiator has the same 8 KiB canonical-JSON ceiling as
+native request control. Before retaining or growing a plan, the owner checks
+that its maximum-shape bounded cleanup record fits the individual record limit,
+as well as reserving aggregate storage. A plan that fits initially but cannot
+retain its cleanup evidence is rejected before that responsibility is committed.
+
+Planning capability version 1 uses schema revision 107 and typed native plan,
+stage and event tables in Memory, SQLite and PostgreSQL. Named hard ceilings in
+`cayu.collaboration.planning` bound generations (32), stages (128), resource
+intents (32), page size (32), configured rules (32) and record bytes (64 KiB).
+Every request supplies explicit narrower `RequestPlanningLimits`; aggregate
+storage and reserved terminal evidence use the existing collaboration quotas.
+Pending responsibility blocks unsafe namespace retirement and pruning. Settled
+planning evidence is reclaimed before its original request history, not by a TTL
+that silently discards unresolved work.
+Retired-namespace maintenance may reclaim a settled plan in bounded ascending
+stage batches. Its native plan record retains the pruning cursor until the final
+batch; partially pruned plans are unavailable to ordinary planning readback or
+reconciliation. The same maintenance operation replays its durable receipt,
+including after restart. Later creation evidence remains retained until earlier
+resource-adoption stages that depend on it have been reclaimed.
+FORK selection/exclusion arbitration additionally requires native SessionStore
+revision 108. SQLite and PostgreSQL validate its decision table and exact owner
+index before accepting work; a damaged current schema is not silently repaired
+by inventing missing selection or exclusion history.
 
 ## State, receipts, and recovery
 

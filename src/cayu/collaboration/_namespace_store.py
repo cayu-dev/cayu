@@ -140,7 +140,9 @@ async def inspect_retirement(
 
 
 async def _has_wait_responsibility(
+    store: CollaborationStore,
     tx: _Repository,
+    initialized,
     namespace: NamespaceRef,
     *,
     current_generation: int,
@@ -149,6 +151,7 @@ async def _has_wait_responsibility(
 ) -> bool:
     """Treat wait and clarification responsibility as namespace debt."""
     from cayu.collaboration._clarification_retention import operation_retains_clarification
+    from cayu.collaboration._planning_retention import operation_retains_planning
     from cayu.collaboration.waits import WaitSnapshot, source_key
 
     for generation in range(1, current_generation + 1):
@@ -157,6 +160,8 @@ async def _has_wait_responsibility(
             generation,
             limit=limit,
         ):
+            if await operation_retains_planning(store, tx, initialized, raw, namespace, redactor):
+                return True
             if await operation_retains_clarification(tx, raw, namespace, redactor):
                 return True
             if _stored_mode(raw) != "collaboration_wait":
@@ -254,7 +259,9 @@ async def apply_lifecycle(
                 or namespace.state != "sealed"
                 or namespace.outstanding_obligations
                 or await _has_wait_responsibility(
+                    store,
                     tx,
+                    anchor.initialization,
                     request.namespace,
                     current_generation=anchor.current_generation,
                     limit=anchor.initialization.binding.limits.operations,

@@ -264,8 +264,14 @@ async def open_in_transaction(
     command: ClarificationOpenCommand,
     *,
     redactor: SecretRedactor,
+    _planned_stage=None,
 ) -> ClarificationOpenReceipt:
     command = prepare_contract(ClarificationOpenCommand, command, redactor=redactor)
+    from cayu.collaboration._planning_stages import finish_stage, require_receiving_stage
+
+    await require_receiving_stage(
+        store, tx, initialized, command, _planned_stage, redactor=redactor
+    )
     anchor = await store._anchor(tx, initialized, redactor)
     expected = command.expected
     prior = await retained_request(
@@ -432,6 +438,16 @@ async def open_in_transaction(
     await tx.put("request_events", (event.sequence,), event, insert=True)
     await tx.put("requests", operation_key(expected.operation), updated_request, insert=False)
     await tx.put("anchors", (), updated_anchor, insert=False)
+    if _planned_stage is not None:
+        await finish_stage(
+            store,
+            tx,
+            initialized,
+            _planned_stage.plan,
+            _planned_stage.intent,
+            receipt,
+            redactor=redactor,
+        )
     return receipt
 
 

@@ -111,8 +111,9 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","linux","x64","gcp-ci","gcp-ci-general"]' || '["ubuntu-latest"]') }}
-    # Loaded runners need collection/setup headroom beyond measured test calls.
-    timeout-minutes: 30
+    # Match general shards: PostgreSQL reconstruction also needs collection,
+    # database setup, and loaded-runner headroom beyond measured test calls.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

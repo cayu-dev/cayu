@@ -322,7 +322,7 @@ class RequestAdmissionCommand(ContractValue):
             raise ValueError("Admission operation conflicts with its request.")
         if self.prepared is not None:
             if (
-                self.decision != "fresh"
+                self.decision != self.prepared.target.kind
                 or self.source_export is not None
                 or self.source_receipt is not None
                 or self.evidence
@@ -375,8 +375,10 @@ class RequestAdmissionReceipt(ContractValue):
     def exact_receipt(self) -> RequestAdmissionReceipt:
         selected = self.command.expected.intent.selection
         expected_state = {
-            "continue": "admitted" if self.command.evidence else "preparing",
-            "fork": "admitted" if self.command.evidence else "preparing",
+            "continue": "admitted"
+            if self.command.evidence or self.command.prepared
+            else "preparing",
+            "fork": "admitted" if self.command.evidence or self.command.prepared else "preparing",
             "fresh": "admitted" if self.command.evidence or self.command.prepared else "preparing",
             "defer": "deferred",
             "clarify": "clarifying",

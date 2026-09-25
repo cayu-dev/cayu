@@ -102,6 +102,12 @@ def _require_raw_secret_free(
             if origin is ExactLookup
             else (annotation, *args)
         )
+        # Tagged union branches carry schema metadata, not another input shape.
+        # Inspect their underlying schema before applying literal/key exemptions.
+        candidates = tuple(
+            _structural_annotation(candidate) if get_origin(candidate) is Annotated else candidate
+            for candidate in candidates
+        )
         compatible = tuple(
             candidate
             for candidate in candidates

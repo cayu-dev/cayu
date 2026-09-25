@@ -5,14 +5,18 @@ import hashlib
 import json
 import multiprocessing
 import sqlite3
-from contextlib import asynccontextmanager
+import tempfile
+from contextlib import asynccontextmanager, closing
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Literal
 
 import pytest
+from tests.sqlite_resources import SQLiteResourceScope
 
 import cayu.memory.execution as memory_intervention_execution_module
 from cayu.agents import AgentSpec
@@ -169,11 +173,21 @@ from cayu.storage.memory import (
 )
 from cayu.storage.sqlite import SQLiteSessionStore
 
+_sqlite_scope: ContextVar[SQLiteResourceScope | None] = ContextVar("sqlite_scope", default=None)
+
 
 def _async_test(function):
     @wraps(function)
     def run(*args, **kwargs):
-        return asyncio.run(function(*args, **kwargs))
+        async def owned():
+            async with SQLiteResourceScope(Path(tempfile.gettempdir()), function.__name__) as scope:
+                token = _sqlite_scope.set(scope)
+                try:
+                    return await function(*args, **kwargs)
+                finally:
+                    _sqlite_scope.reset(token)
+
+        return asyncio.run(owned())
 
     return run
 
@@ -987,6 +1001,9 @@ class _CanonicalRuntimeApplicationFactory(MemoryInterventionRuntimeApplicationFa
         provider: ScriptedModelProvider,
     ) -> None:
         self.sessions = sessions
+        scope = _sqlite_scope.get()
+        if scope is not None and isinstance(sessions, SQLiteSessionStore):
+            scope.own(sessions)
         self.budgets = InMemoryBudgetLedger()
         self.provider = provider
         self.profile_by_policy: dict[str, str] = {}
@@ -2919,13 +2936,80 @@ async def test_runtime_result_publication_is_fenced_at_the_store_write_boundary(
     assert evaluator.recover_calls == 0
 
 
+@pytest.mark.parametrize("failure", [None, "PRAGMA journal_mode", "CREATE TABLE", "UPDATE"])
+@_async_test
+async def test_sqlite_execution_connections_close_on_success_and_failure(
+    tmp_path, monkeypatch, failure
+) -> None:
+    connections = []
+    native_connect = sqlite3.connect
+
+    class TrackedConnection(sqlite3.Connection):
+        closed = False
+
+        def execute(self, sql, *args, **kwargs):
+            if failure is not None and sql.strip().startswith(failure):
+                raise sqlite3.OperationalError("injected execution journal failure")
+            return super().execute(sql, *args, **kwargs)
+
+        def close(self):
+            super().close()
+            self.closed = True
+
+    def connect(*args, **kwargs):
+        connection = native_connect(*args, **kwargs, factory=TrackedConnection)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+    async def exercise():
+        store = SQLiteMemoryInterventionExecutionStore(tmp_path / "execution-connections.db")
+        bound = await _stored_session_bound_record(store)
+        assert await store.load(bound.execution_id) == bound
+        claimed = await store.transition_runtime_dispatch_ownership(
+            bound.execution_id,
+            DurableOperationOwnershipTransition(
+                operation_id=bound.execution_id,
+                claim_id="close-check",
+                owner_id="worker",
+                action=DurableOperationOwnershipAction.CLAIM,
+                lease_seconds=30,
+            ),
+        )
+        assert await store.load(bound.execution_id) == claimed.execution
+        assert (
+            await store.begin(_prepared_record(_request(_spec(_snapshot())))) == claimed.execution
+        )
+        with pytest.raises(MemoryInterventionExecutionConflict):
+            await store.compare_and_set(
+                bound,
+                _record_successor(
+                    bound,
+                    phase=bound.phase,
+                    status=MemoryInterventionExecutionStatus.CONFLICTING,
+                    failure_code="intervention_conflicting",
+                ),
+            )
+
+    try:
+        if failure is None:
+            await exercise()
+        else:
+            with pytest.raises(sqlite3.OperationalError, match="injected"):
+                await exercise()
+    finally:
+        assert connections
+        assert all(connection.closed for connection in connections)
+
+
 @_async_test
 async def test_sqlite_store_rejects_indexed_revision_document_disagreement(tmp_path) -> None:
     path = tmp_path / "executions.db"
     request = _request(_spec(_snapshot()))
     store = SQLiteMemoryInterventionExecutionStore(path)
     prepared = await store.begin(_prepared_record(request))
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             "UPDATE cayu_memory_intervention_executions SET revision = ? WHERE execution_id = ?",
             (prepared.revision + 1, prepared.execution_id),

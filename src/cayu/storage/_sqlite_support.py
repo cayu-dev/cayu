@@ -49,9 +49,11 @@ from cayu.storage._collaboration_schema import (
     SQLITE_COLLABORATION_CLARIFICATION_DDL,
     SQLITE_COLLABORATION_DDL,
     SQLITE_COLLABORATION_LIFECYCLE_DDL,
+    SQLITE_COLLABORATION_PLANNING_DDL,
     SQLITE_COLLABORATION_REQUEST_DDL,
     validate_sqlite_collaboration_schema,
 )
+from cayu.storage._context_selection_schema import validate_sqlite_context_selection_schema
 from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
@@ -985,6 +987,20 @@ _BASELINE_DDL += SQLITE_ACCOUNTING_DDL
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
 _MIGRATION_STEPS: dict[int, str] = {
+    108: """
+        CREATE TABLE IF NOT EXISTS cayu_context_selection_exclusions (
+            selection_key TEXT PRIMARY KEY,
+            owner_scope TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            owner_incarnation TEXT NOT NULL,
+            source_session_id TEXT NOT NULL,
+            source_session_instance_id TEXT NOT NULL,
+            request_commitment TEXT NOT NULL,
+            decision_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_selection_exclusions_owner
+            ON cayu_context_selection_exclusions(owner_scope, owner_id, owner_incarnation);
+    """,
     103: """
         CREATE TABLE IF NOT EXISTS cayu_session_creation_decisions (
             operation_key TEXT PRIMARY KEY,
@@ -1012,6 +1028,7 @@ _MIGRATION_STEPS: dict[int, str] = {
             registered_at TEXT NOT NULL
         );
     """,
+    107: SQLITE_COLLABORATION_PLANNING_DDL,
     106: "",  # Contract-only writer fence; existing typed request records own storage.
     105: SQLITE_COLLABORATION_CLARIFICATION_DDL,
     104: """
@@ -6378,6 +6395,8 @@ def reconcile_schema(
             app_min_supported=app_min_supported,
         )
     current = read_schema_state(connection)
+    if current.revision >= 108:
+        validate_sqlite_context_selection_schema(connection)
     if current.revision >= 96:
         validate_sqlite_participant_bindings(connection)
     if current.revision >= 17:
@@ -6447,6 +6466,7 @@ def reconcile_schema(
             lifecycle=current.revision >= 94,
             requests=current.revision >= 95,
             clarifications=current.revision >= 105,
+            planning=current.revision >= 107,
         )
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
@@ -11127,6 +11147,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             validate_sqlite_collaboration_schema(connection, lifecycle=True)
         if rev.revision == 102:
             validate_sqlite_participant_bindings(connection)
+        if rev.revision == 108:
+            validate_sqlite_context_selection_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -48,15 +48,13 @@ def _receiving_id(command: RequestAdmissionCommand, redactor: SecretRedactor) ->
     )
 
 
-async def register_prepared_admission(
-    store: CollaborationStore,
-    tx: _Repository,
+def prepared_admission_permit(
     initialized: CollaborationInitialization,
     command: RequestAdmissionCommand,
     *,
     redactor: SecretRedactor,
-) -> PermitReceipt:
-    """Called only by request arbitration inside its receiving-authorized transaction."""
+) -> PermitCommand:
+    """Construct the exact local authority tuple; construction is not registration."""
     prepared = command.prepared
     if prepared is None:
         raise CollaborationUnavailable("Prepared admission evidence is required.")
@@ -83,7 +81,7 @@ async def register_prepared_admission(
         required_settlement="quiescence",
         settlement_operation=settlement,
     )
-    expected = prepare_permit(
+    return prepare_permit(
         initialized,
         PermitCommand(
             operation=operation,
@@ -94,6 +92,19 @@ async def register_prepared_admission(
         ),
         redactor,
     )
+
+
+async def register_prepared_admission(
+    store: CollaborationStore,
+    tx: _Repository,
+    initialized: CollaborationInitialization,
+    command: RequestAdmissionCommand,
+    *,
+    redactor: SecretRedactor,
+) -> PermitReceipt:
+    """Called only by request arbitration inside its receiving-authorized transaction."""
+    expected = prepared_admission_permit(initialized, command, redactor=redactor)
+    identity = _receiving_id(command, redactor)
     receipt = await register_permit_in_transaction(store, tx, initialized, expected, redactor)
     # The same transaction either commits the request receipt as well, or rolls
     # back both operations. This is not settlement of a foreign child or producer.

@@ -493,6 +493,10 @@ REVISIONS: tuple[Revision, ...] = (
     # Prepared recipient admissions carry native target, profile, sponsor and
     # lifecycle evidence that prior request writers cannot preserve or settle.
     Revision(revision=106, kind=RevisionKind.BREAKING, compatible_from=106),
+    # Durable planning responsibilities must survive request control and pruning.
+    Revision(revision=107, kind=RevisionKind.BREAKING, compatible_from=107),
+    # Every context-view selector must honor exact native exclusion decisions.
+    Revision(revision=108, kind=RevisionKind.BREAKING, compatible_from=108),
 )
 
 #: The revision an empty database is initialized to.

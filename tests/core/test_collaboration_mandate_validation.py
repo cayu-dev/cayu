@@ -203,6 +203,68 @@ class ResourceOwner(ResourceSelectorOwner):
         return self.result if child.resource == ref("source") else False
 
 
+@pytest.mark.parametrize(
+    "kinds",
+    [
+        (),
+        [],
+        (True,),
+        ("",),
+        ("kind", "kind"),
+        ("x" * 513,),
+        ("artifact ",),
+        ("bad\nkind",),
+        tuple(f"kind{i}" for i in range(33)),
+    ],
+)
+def test_malformed_resource_kind_scope_is_denied_before_callbacks(kinds):
+    class ScopedOwner(ResourceOwner):
+        @property
+        def canonical_resource_kinds(self):
+            return kinds
+
+        def canonicalize(self, selector):
+            pytest.fail("Malformed configuration must not reach owner callbacks")
+
+    with pytest.raises(MandateDenied):
+        check(*evidence(), resource_owners={OWNER: ScopedOwner()})
+
+
+@pytest.mark.parametrize("kinds", [("artifact",), tuple(f"kind{i}" for i in range(32))])
+def test_kind_scoped_owner_does_not_claim_other_exact_references_or_subtrees(kinds):
+    class ScopedOwner(ResourceOwner):
+        @property
+        def canonical_resource_kinds(self):
+            return kinds
+
+        def canonicalize(self, selector):
+            pytest.fail("An unrelated resource kind must not reach artifact canonicalization")
+
+    resolution, context, use = evidence()
+    owner = ScopedOwner()
+    assert check(resolution, context, use, resource_owners={OWNER: owner}) == resolution
+    root, child = resolution.chain.entries
+    root = root.model_copy(
+        update={"resources": (ResourceSelector(resource=ref("namespace"), mode="subtree"),)}
+    )
+    changed = resolution.model_copy(update={"chain": MandateChain(entries=(root, child))})
+    with pytest.raises(MandateDenied):
+        check(changed, context, use, resource_owners={OWNER: owner})
+
+
+def test_declared_resource_kind_failure_never_falls_back_to_generic_identity():
+    class ScopedOwner(ResourceOwner):
+        @property
+        def canonical_resource_kinds(self):
+            return ("test",)
+
+        def canonicalize(self, selector):
+            raise MandateDenied()
+
+    with pytest.raises(MandateDenied):
+        check(*evidence(), resource_owners={OWNER: ScopedOwner()})
+
+
 def test_subtree_requires_positive_owner_evidence_not_prefix():
     resolution, context, use = evidence()
     root, child = resolution.chain.entries

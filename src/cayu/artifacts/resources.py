@@ -53,7 +53,9 @@ from cayu.collaboration._contracts import (
     ExpectedOperation,
     Generation,
     Identifier,
+    InitiatorBinding,
     ObjectRef,
+    OperationRef,
     OwnerRef,
 )
 from cayu.collaboration._mandate_validation import (
@@ -81,7 +83,7 @@ from cayu.vaults.redaction import SecretRedactor
 RESOURCE_KIND_ARTIFACT = "artifact"
 RESOURCE_KIND_FOLDER = "immutable_folder"
 RESOURCE_OPERATION_SCHEMA = 1
-RESOURCE_JOURNAL_SCHEMA = 1
+RESOURCE_JOURNAL_SCHEMA = 3
 RESOURCE_MAX_OPERATIONS = 256
 RESOURCE_EVENT_SLOTS_PER_OPERATION = 7
 RESOURCE_MAX_EVENTS = RESOURCE_MAX_OPERATIONS * RESOURCE_EVENT_SLOTS_PER_OPERATION
@@ -102,6 +104,8 @@ def _artifact_incarnation(metadata: ArtifactMetadata) -> str:
 
 
 def _event_usage(journal):
+    from cayu.artifacts._resource_cleanup_capacity import CLEANUP_EVENT_SLOTS, reservations
+
     events = journal["events"]
     if not isinstance(events, list):
         raise ResourceOwnerUnavailable("Invalid resource events.")
@@ -115,11 +119,19 @@ def _event_usage(journal):
             ):
                 raise ResourceOwnerUnavailable("Invalid resource event reservation.")
             reserved += remaining
+    reserved += sum(CLEANUP_EVENT_SLOTS for _, _, unused in reservations(journal) if unused)
     return len(events) + reserved
 
 
-def _reserve_events(journal):
-    if _event_usage(journal) + RESOURCE_EVENT_SLOTS_PER_OPERATION > RESOURCE_MAX_EVENTS:
+def _reserve_events(journal, *, operation_digest=None):
+    from cayu.artifacts._resource_cleanup_capacity import CLEANUP_EVENT_SLOTS, reservations
+
+    replaced = sum(
+        CLEANUP_EVENT_SLOTS
+        for digest, _, unused in reservations(journal)
+        if unused and digest == operation_digest
+    )
+    if _event_usage(journal) - replaced + RESOURCE_EVENT_SLOTS_PER_OPERATION > RESOURCE_MAX_EVENTS:
         raise ResourceOwnerError("Resource event reservation capacity exhausted.")
     return RESOURCE_EVENT_SLOTS_PER_OPERATION
 
@@ -333,6 +345,7 @@ class ResourceAcquisitionIntent(ContractValue):
     max_total_bytes: StrictInt = Field(ge=1, le=4 * 1024**3)
     cleanup_owner: OwnerRef
     policy: ObjectRef
+    deadline_at_ms: StrictInt | None = Field(default=None, ge=1, le=2**53 - 1)
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -417,6 +430,14 @@ class ResourcePreparationReader(ABC):
         """Authenticate current public cleanup authority independently of acquisition expiry."""
         ...
 
+    async def authorize_preparation_cleanup(self, command, permit: PermitCommand) -> None:
+        """Authenticate exact registered preparation cleanup, including pre-dispatch.
+
+        Releasing an existing receipt alone does not qualify exclusion of a
+        future operation. Unqualified receivers must refuse this extension.
+        """
+        raise ResourceOwnerUnsupported("Exact preparation cleanup is not qualified.")
+
     @abstractmethod
     async def register_responsibility(self, command, permit) -> None: ...
 
@@ -448,6 +469,7 @@ class MandateResourcePreparationReader(ResourcePreparationReader):
         initialized: CollaborationInitialization,
         responsibilities: tuple[tuple[ResourceAcquisitionCommand, PermitCommand], ...],
         transfers: tuple[tuple[ResourceTransferCommand, PermitCommand], ...] = (),
+        transfer_templates: tuple[tuple[ResourceTransferTemplate, PermitCommand], ...] = (),
     ) -> None:
         if not isinstance(owner, ResourceSelectorOwner) or not isinstance(
             resolver, MandateResolver
@@ -473,33 +495,70 @@ class MandateResourcePreparationReader(ResourcePreparationReader):
         self._initialized = prepare_contract(
             CollaborationInitialization, initialized, redactor=redactor
         )
-        self._responsibilities = tuple(
-            (
-                prepare_contract(ResourceAcquisitionCommand, command, redactor=redactor),
-                prepare_contract(PermitCommand, permit, redactor=redactor),
+        self._responsibilities = (
+            tuple(
+                (
+                    prepare_contract(ResourceAcquisitionCommand, command, redactor=redactor),
+                    prepare_contract(PermitCommand, permit, redactor=redactor),
+                )
+                for command, permit in responsibilities
             )
-            for command, permit in responsibilities
-        ) + tuple(
-            (
-                prepare_contract(ResourceTransferCommand, command, redactor=redactor),
-                prepare_contract(PermitCommand, permit, redactor=redactor),
+            + tuple(
+                (
+                    prepare_contract(ResourceTransferCommand, command, redactor=redactor),
+                    prepare_contract(PermitCommand, permit, redactor=redactor),
+                )
+                for command, permit in transfers
             )
-            for command, permit in transfers
+            + tuple(
+                (
+                    prepare_contract(ResourceTransferTemplate, template, redactor=redactor),
+                    prepare_contract(PermitCommand, permit, redactor=redactor),
+                )
+                for template, permit in transfer_templates
+            )
         )
         if len(self._responsibilities) > RESOURCE_MAX_OPERATIONS:
             raise ResourceOwnerUnsupported("Preparation registration is too large.")
-        if len(
-            {resource_operation_digest(command) for command, _ in self._responsibilities}
-        ) != len(self._responsibilities):
+        if len({command.operation for command, _ in self._responsibilities}) != len(
+            self._responsibilities
+        ):
             raise ResourceOwnerConflict("Preparation registration is ambiguous.")
 
     def _expected_permit(self, command):
         for expected, permit in self._responsibilities:
             if expected.operation == command.operation:
-                if expected != command:
+                if isinstance(expected, ResourceTransferTemplate):
+                    if type(command) is not ResourceTransferCommand:
+                        raise ResourceOwnerConflict("Registered transfer template conflicts.")
+                    expected_command = expected.bind(command.intent.receipt)
+                else:
+                    expected_command = expected
+                if expected_command != command:
                     raise ResourceOwnerConflict("Registered acquisition conflicts.")
                 return permit
         raise ResourceOwnerUnsupported("Acquisition has no registered responsibility.")
+
+    def _validate_planning_registration(self, command, permit):
+        """Pure qualification of frozen recipes before a planner retains debt."""
+        if not any(
+            expected == command and registered == permit
+            for expected, registered in self._responsibilities
+        ):
+            raise ResourceOwnerUnsupported(
+                "Planning recipe has no exact registered responsibility."
+            )
+        if isinstance(command, ResourceTransferTemplate):
+            if (
+                command.destination != self.owner
+                or command.acquisition.intent.policy != self._policy
+            ):
+                raise ResourceOwnerUnsupported(
+                    "Planning transfer conflicts with its registered receiver."
+                )
+        else:
+            self._check_command(command)
+        _validate_preparation_permit(self.owner, command, permit)
 
     def _authority_json(self):
         return canonical_durable_json_bytes(
@@ -590,6 +649,17 @@ class MandateResourcePreparationReader(ResourcePreparationReader):
                 redactor=self._redactor,
             )
 
+    async def authorize_preparation_cleanup(self, command, permit):
+        self._check_command(command)
+        if self._expected_permit(command) != permit:
+            raise ResourceOwnerConflict("Preparation cleanup permit conflicts.")
+        acquisition = (
+            command.intent.receipt.command
+            if isinstance(command, ResourceTransferCommand)
+            else command
+        )
+        await self.authorize_release(acquisition)
+
     @property
     def owner(self) -> OwnerRef:
         return self._owner.owner
@@ -637,6 +707,7 @@ class MandateResourcePreparationReader(ResourcePreparationReader):
                     expires_at_ms=min(
                         checked.principal.expires_at_ms,
                         *(entry.expires_at_ms for entry in checked.chain.entries),
+                        _preparation_deadline(command) or 2**53 - 1,
                     ),
                     nonce=uuid4().hex,
                     authority_sha256=hashlib.sha256(self._authority_json().encode()).hexdigest(),
@@ -765,6 +836,56 @@ class ResourceTransferCommand(ExpectedOperation[ResourceTransferIntent]):
         return self
 
 
+class ResourceTransferTemplate(ContractValue):
+    """Pinned registration before its exact acquisition produces a receipt.
+
+    Binding only constructs data. The destination's existing transfer owner
+    must authenticate the complete resulting receipt through the source owner
+    before acquiring any destination pin. A template never renews a mandate.
+    """
+
+    kind: Literal["resource_transfer_template"] = "resource_transfer_template"
+    schema_version: Literal[1] = 1
+    operation: OperationRef
+    source: OwnerRef
+    destination: OwnerRef
+    initiator: InitiatorBinding
+    acquisition: ResourceAcquisitionCommand
+    acceptance_generation: Generation
+
+    @model_validator(mode="after")
+    def exact_source(self) -> Self:
+        if (
+            self.operation == self.acquisition.operation
+            or self.source != self.acquisition.destination
+            or self.operation.application_scope != self.source.application_scope
+            or self.destination.application_scope != self.source.application_scope
+            or "transfer" not in self.acquisition.intent.allowed_operations
+        ):
+            raise ValueError("Transfer template conflicts with its exact acquisition.")
+        return self
+
+    def bind(self, receipt: ResourceAcquisitionReceipt) -> ResourceTransferCommand:
+        if type(receipt) is not ResourceAcquisitionReceipt:
+            raise ResourceOwnerConflict("Transfer requires an exact acquisition receipt.")
+        receipt = ResourceAcquisitionReceipt.model_validate(receipt)
+        if receipt.command != self.acquisition:
+            raise ResourceOwnerConflict("Transfer receipt differs from its registered acquisition.")
+        return ResourceTransferCommand(
+            operation=self.operation,
+            source=self.source,
+            destination=self.destination,
+            initiator=self.initiator,
+            intent=ResourceTransferIntent(
+                receipt=receipt,
+                destination=self.destination,
+                cleanup_owner=self.acquisition.intent.cleanup_owner,
+                acceptance_generation=self.acceptance_generation,
+                expected_material_commitment=receipt.content_commitment,
+            ),
+        )
+
+
 class ResourceTransferReceipt(ContractValue):
     command: ResourceTransferCommand
     receipt_id: Identifier
@@ -784,7 +905,9 @@ class ResourceTransferReceipt(ContractValue):
         return self
 
 
-def resource_operation_digest(command: ResourceAcquisitionCommand | ResourceTransferCommand) -> str:
+def resource_operation_digest(
+    command: ResourceAcquisitionCommand | ResourceTransferCommand | ResourceTransferTemplate,
+) -> str:
     return hashlib.sha256(
         canonical_durable_json_bytes(
             command.operation.model_dump(mode="json"), "resource_operation_identity"
@@ -801,16 +924,46 @@ def _preparation_selector(command):
     return command.intent.selector
 
 
+def _preparation_deadline(command):
+    acquisition = (
+        command.intent.receipt.command if isinstance(command, ResourceTransferCommand) else command
+    )
+    return acquisition.intent.deadline_at_ms
+
+
 def _preparation_target(command):
-    if isinstance(command, ResourceTransferCommand):
+    if isinstance(command, (ResourceTransferCommand, ResourceTransferTemplate)):
         return ObjectRef(
             owner=command.destination,
             kind="resource_transfer",
             object_id=resource_operation_digest(command),
             incarnation=command.destination.incarnation,
-            revision=command.intent.acceptance_generation,
+            revision=(
+                command.acceptance_generation
+                if isinstance(command, ResourceTransferTemplate)
+                else command.intent.acceptance_generation
+            ),
         )
     return command.intent.selector.resource
+
+
+def _validate_preparation_permit(owner, command, permit):
+    request = permit.intent.request
+    if (
+        permit.source != owner
+        or permit.destination != owner
+        or request.target != _preparation_target(command)
+        or request.source_operation != command.operation
+        or request.effect_scope
+        != (
+            "transfer"
+            if isinstance(command, (ResourceTransferCommand, ResourceTransferTemplate))
+            else "acquire"
+        )
+        or request.target.owner != owner
+        or permit.operation.application_scope != owner.application_scope
+    ):
+        raise ResourceOwnerUnsupported("Preparation responsibility conflicts with acquisition.")
 
 
 def _journal_capacity_envelope(value: Mapping[str, object]) -> dict[str, object]:
@@ -821,6 +974,8 @@ def _journal_capacity_envelope(value: Mapping[str, object]) -> dict[str, object]
     Receipt IDs, digests, stages and diagnostic codes are runtime-bounded here;
     command/member payloads use the exact persisted operation's full size.
     """
+    from cayu.artifacts._resource_cleanup_capacity import include_cleanup_envelope
+
     envelope = dict(value)
     raw_events = value["events"]
     if not isinstance(raw_events, list):
@@ -837,6 +992,16 @@ def _journal_capacity_envelope(value: Mapping[str, object]) -> dict[str, object]
             record = cast("dict[str, Any]", record)
             if record.get("responsibility_settled") is True:
                 records[digest] = record
+                continue
+            if "cleanup_permit" in record:
+                records[digest] = {**record, "responsibility_settled": False}
+                events.extend(
+                    {
+                        "operation" if family == "operations" else "transfer": digest,
+                        "stage": "responsibility_settled",
+                    }
+                    for _ in range(record["event_slots_remaining"])
+                )
                 continue
             command = json.loads(record["command"])
             receipt = {
@@ -880,7 +1045,7 @@ def _journal_capacity_envelope(value: Mapping[str, object]) -> dict[str, object]
                 )
         envelope[family] = records
     envelope["events"] = events
-    return envelope
+    return include_cleanup_envelope(value, envelope)
 
 
 class _ResourceJournal:
@@ -987,6 +1152,7 @@ class _ResourceJournal:
                 "transfers": {},
                 "manifests": {},
                 "authorizations": {},
+                "cleanup_reservations": {},
                 "events": [],
             }
         try:
@@ -1000,6 +1166,7 @@ class _ResourceJournal:
             or type(value.get("transfers")) is not dict
             or type(value.get("manifests")) is not dict
             or type(value.get("authorizations")) is not dict
+            or type(value.get("cleanup_reservations")) is not dict
             or type(value.get("events")) is not list
         ):
             raise ResourceOwnerUnavailable("Resource owner journal schema is invalid.")
@@ -1028,6 +1195,10 @@ class _ResourceJournal:
                 raise ResourceOwnerUnavailable("Resource owner journal identity conflicts.")
 
     def _write(self, value: Mapping[str, object]) -> None:
+        from cayu.artifacts._resource_cleanup_capacity import require_operation_capacity
+
+        for family in ("operations", "transfers"):
+            require_operation_capacity(value, family, RESOURCE_MAX_OPERATIONS)
         events = value["events"]
         if not isinstance(events, list) or _event_usage(value) > RESOURCE_MAX_EVENTS:
             raise ResourceOwnerError("Resource owner event capacity exhausted.")
@@ -1061,6 +1232,10 @@ class _ResourceJournal:
 class LocalArtifactResourceOwner(ResourceSelectorOwner):
     """Local durable artifact owner; only exact artifact and manifest selectors qualify."""
 
+    @property
+    def canonical_resource_kinds(self) -> tuple[str, ...]:
+        return (RESOURCE_KIND_ARTIFACT, RESOURCE_KIND_FOLDER)
+
     def __init__(
         self,
         root: str | os.PathLike[str],
@@ -1093,6 +1268,13 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
         ) and preparation_reader._store_binding != _registered_artifact_store(artifact_store):
             raise ResourceOwnerUnsupported("Artifact store differs from registered authority.")
         self._journal.bind_identity(owner=self.owner, store=artifact_store)
+        if type(preparation_reader) is MandateResourcePreparationReader:
+            from cayu.artifacts._resource_cleanup_capacity import bind_cleanup_capacity
+
+            with self._journal.locked() as journal:
+                bind_cleanup_capacity(
+                    journal, preparation_reader._responsibilities, redactor=self._redactor
+                )
         self._workers: set[asyncio.Task] = set()
 
     @contextmanager
@@ -1426,23 +1608,17 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
                 raise ResourceOwnerConflict("Preparation lease operation conflicts.")
             if evidence.lease.receiver != self.owner:
                 raise ResourceOwnerConflict("Preparation lease receiver conflicts.")
+            deadline = _preparation_deadline(command)
+            if deadline is not None and evidence.lease.expires_at_ms > deadline:
+                raise ResourceOwnerUnsupported(
+                    "Preparation lease exceeds the exact command deadline."
+                )
             if evidence.lease.expires_at_ms <= int(time.time() * 1000):
                 raise ResourceOwnerUnavailable("Preparation lease expired.")
             yield evidence
 
     async def _authorize(self, checked, permit, evidence, *, work):
-        request = permit.intent.request
-        if (
-            permit.source != self.owner
-            or permit.destination != self.owner
-            or request.target != _preparation_target(checked)
-            or request.source_operation != checked.operation
-            or request.effect_scope
-            != ("transfer" if isinstance(checked, ResourceTransferCommand) else "acquire")
-            or request.target.owner != self.owner
-            or permit.operation.application_scope != self.owner.application_scope
-        ):
-            raise ResourceOwnerUnsupported("Preparation responsibility conflicts with acquisition.")
+        _validate_preparation_permit(self.owner, checked, permit)
         digest = resource_operation_digest(checked)
         encoded = canonical_durable_json_bytes(checked.model_dump(mode="json"), "resource_command")
         receipt = ResourcePreparationReceipt(
@@ -1503,6 +1679,10 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
             or stored.lease.operation_digest != digest
             or stored.lease.receiver != self.owner
             or stored.lease.expires_at_ms <= int(time.time() * 1000)
+            or (
+                _preparation_deadline(command) is not None
+                and stored.lease.expires_at_ms > _preparation_deadline(command)
+            )
         ):
             raise ResourceOwnerUnavailable("Trusted preparation identity is invalid.")
         if preparation is not None and preparation != stored:
@@ -1531,7 +1711,7 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
             reserved = _reserved_bytes(journal)
             if reserved + command.intent.max_total_bytes > RESOURCE_MAX_RESERVED_BYTES:
                 raise ResourceOwnerError("Resource byte reservation capacity exhausted.")
-            event_slots = _reserve_events(journal)
+            event_slots = _reserve_events(journal, operation_digest=digest)
             operations[digest] = {
                 "command": encoded,
                 "stage": "pending",
@@ -1894,11 +2074,14 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
                 ResourceAcquisitionCommand if family == "operations" else ResourceTransferCommand
             )
             command = schema.model_validate_json(record["command"])
-            preparation = ResourcePreparationReceipt.model_validate(
-                journal["authorizations"][digest]["receipt"]
-            )
+            if "cleanup_permit" in record:
+                permit = PermitCommand.model_validate(record["cleanup_permit"])
+            else:
+                permit = ResourcePreparationReceipt.model_validate(
+                    journal["authorizations"][digest]["receipt"]
+                ).permit
         await self._preparation_reader.settle_responsibility(
-            command, preparation.permit, _ResourceSettlementReader(self, digest, family)
+            command, permit, _ResourceSettlementReader(self, digest, family)
         )
         async with self._journal.transaction() as journal:
             journal[family][digest]["responsibility_settled"] = True
@@ -2019,6 +2202,32 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
 
         await self._owned(admitted)
 
+    async def settle_preparation(
+        self,
+        command: ResourceAcquisitionCommand | ResourceTransferCommand,
+        *,
+        permit: PermitCommand,
+        source_owner: LocalArtifactResourceOwner | None = None,
+    ) -> ReceivingSettlementReceipt:
+        """Exclude or release one exact preparation under its native owner fence.
+
+        Cleanup requires independent registered authority. A missing operation
+        is fenced durably before acknowledging exclusion; cancellation or a
+        missing readback never establishes that outcome.
+        """
+        from cayu.artifacts._resource_preparation_cleanup import settle_preparation
+
+        if type(command) not in (ResourceAcquisitionCommand, ResourceTransferCommand):
+            raise TypeError("Preparation cleanup requires an exact resource command.")
+        command = prepare_contract(type(command), command, redactor=self._redactor)
+        permit = prepare_contract(PermitCommand, permit, redactor=self._redactor)
+        if source_owner is not None and not isinstance(source_owner, LocalArtifactResourceOwner):
+            raise TypeError("Preparation cleanup requires a qualified source owner.")
+        return await self._owned(
+            lambda: settle_preparation(self, command, permit, source_owner=source_owner),
+            *(() if source_owner is None else (source_owner,)),
+        )
+
     async def _release(self, receipt: ResourceAcquisitionReceipt) -> None:
         if type(receipt) is not ResourceAcquisitionReceipt:
             raise TypeError("release requires an owner-issued receipt.")
@@ -2074,22 +2283,33 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
         command: ResourceTransferCommand,
         *,
         source_owner: LocalArtifactResourceOwner,
+        expected_permit: PermitCommand | None = None,
     ) -> ResourceTransferReceipt:
         if not isinstance(source_owner, LocalArtifactResourceOwner):
             raise TypeError("source_owner must be a local resource owner.")
         # Detach before handing input to the worker/cleanup owner. Acquisition
         # and cancellation cleanup must use the same exact prepared command.
         command = prepare_contract(ResourceTransferCommand, command, redactor=self._redactor)
+        if expected_permit is not None:
+            expected_permit = prepare_contract(
+                PermitCommand, expected_permit, redactor=self._redactor
+            )
         work = _PreparationWork()
         return await self._owned(
-            lambda: self._accept_transfer(command, source_owner=source_owner, work=work),
+            lambda: self._accept_transfer(
+                command, source_owner=source_owner, work=work, expected_permit=expected_permit
+            ),
             source_owner,
             work=work,
         )
 
-    async def _accept_transfer(self, command, *, source_owner, work: _PreparationWork):
+    async def _accept_transfer(
+        self, command, *, source_owner, work: _PreparationWork, expected_permit=None
+    ):
         try:
-            return await self._accept_transfer_impl(command, source_owner=source_owner, work=work)
+            return await self._accept_transfer_impl(
+                command, source_owner=source_owner, work=work, expected_permit=expected_permit
+            )
         except BaseException as error:
             if work is not None and work.stop_requested():
                 await self._cleanup_stopped(command, "transfers", error)
@@ -2101,6 +2321,7 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
         *,
         source_owner: LocalArtifactResourceOwner,
         work: _PreparationWork,
+        expected_permit: PermitCommand | None = None,
     ) -> ResourceTransferReceipt:
         if work is not None:
             work.check()
@@ -2125,9 +2346,29 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
             self._preparation_reader.transfer_permit(command),
             redactor=self._redactor,
         )
+        if expected_permit is not None and permit != expected_permit:
+            raise ResourceOwnerConflict("Transfer differs from its exact expected responsibility.")
         async with self._preparation_guard(command, permit) as evidence:
             if work is not None:
                 work.check()
+        replay = await self._read_transfer(command)
+        if isinstance(replay, ExactMatch):
+            work.check()
+            return replay.receipt
+        if isinstance(replay, ExactConflict):
+            raise ResourceOwnerConflict("Transfer operation key conflicts.")
+        # A registered template fixes the source operation, not an arbitrary
+        # receipt supplied under that operation. Authenticate it while both
+        # native mutation owners are held, before retaining destination authority
+        # for this concrete command. This read has no receiving effect; a late
+        # read cannot proceed to authorization after the observer stops.
+        source_lookup = await source_owner._readback(command.intent.receipt.command)
+        if (
+            not isinstance(source_lookup, ExactMatch)
+            or source_lookup.receipt != command.intent.receipt
+        ):
+            raise ResourceOwnerUnavailable("Source owner did not authenticate the exact receipt.")
+        work.check()
         await self._authorize(command, permit, evidence, work=work)
         stored = await self._require_authorization(command, None)
         await self._revalidate_preparation(command, stored, work)
@@ -2158,7 +2399,7 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
             if reserved + additional > RESOURCE_MAX_RESERVED_BYTES:
                 raise ResourceOwnerError("Transfer byte reservation capacity exhausted.")
             if existing is None:
-                event_slots = _reserve_events(journal)
+                event_slots = _reserve_events(journal, operation_digest=transfer_digest)
                 transfers[transfer_digest] = {
                     "command": encoded_command,
                     "receipt": None,
@@ -2170,12 +2411,6 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
         await self._preparation_reader.register_responsibility(command, stored.permit)
         if work is not None:
             work.check()
-        source_lookup = await source_owner._readback(command.intent.receipt.command)
-        if (
-            not isinstance(source_lookup, ExactMatch)
-            or source_lookup.receipt != command.intent.receipt
-        ):
-            raise ResourceOwnerUnavailable("Source owner did not authenticate the exact receipt.")
         destination_pin = self._pin_owner(transfer_digest, transfer=True)
         transfer = ResourceTransferReceipt(
             command=command,
@@ -2253,6 +2488,13 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
                 return stored
 
         return await self._owned(operation)
+
+    async def read_material(self, expected):
+        """Reconstruct one exact accepted transfer under current native authority."""
+        from cayu.artifacts._resource_material import ResourceMaterialReference, read_material
+
+        expected = prepare_contract(ResourceMaterialReference, expected, redactor=self._redactor)
+        return await self._owned(lambda: read_material(self, expected))
 
     async def _read_transfer(self, command):
         found = await self._read_transfer_for_cleanup(command)
@@ -2653,6 +2895,60 @@ class LocalArtifactResourceOwner(ResourceSelectorOwner):
 
         return await self._owned(admitted)
 
+    @asynccontextmanager
+    async def _hold_adopted_recipient_material(self, references, *, recipient):
+        """Fence already-adopted pins for the trusted inert-admission owner.
+
+        The caller must first authenticate the exact native child receipt and
+        current receiving authority (or administration for handoff readback).
+        This private guard returns no content,
+        acquires no material and does not renew old preparation/disclosure grants.
+        It runs within the collaboration mutation owner's retained task, so an
+        observer cancellation cannot release pins while admission is in flight.
+        """
+        from cayu.artifacts._resource_material import retained_material
+        from cayu.artifacts._resource_material_types import ResourceMaterialReference
+
+        recipient = prepare_contract(ParticipantRef, recipient, redactor=self._redactor)
+        if type(references) is not tuple or not 1 <= len(references) <= 32:
+            raise ResourceOwnerUnsupported("Recipient retention requires bounded exact material.")
+        references = tuple(
+            prepare_contract(ResourceMaterialReference, item, redactor=self._redactor)
+            for item in references
+        )
+        if recipient.owner != self.owner or len(
+            {(item.owner, item.operation) for item in references}
+        ) != len(references):
+            raise ResourceOwnerConflict("Recipient retention identity conflicts.")
+        async with self._mutation_guard():
+            await _resource_io(self._validate_store_identity)
+            for reference in references:
+                material = await retained_material(self, reference)
+                if material.preparation.permit.intent.request.participant != recipient:
+                    raise ResourceOwnerConflict("Retained material belongs to another recipient.")
+            yield
+
+    def _validate_planning_registration(self, command, permit, *, source=None):
+        """Qualify the concrete registered receiver without admitting any work."""
+        if type(self._preparation_reader) is not MandateResourcePreparationReader:
+            raise ResourceOwnerUnsupported(
+                "Resource planning requires the qualified mandate receiver."
+            )
+        self._preparation_reader._validate_planning_registration(command, permit)
+        from cayu.artifacts._resource_cleanup_capacity import require_cleanup_capacity
+
+        with self._journal.locked() as journal:
+            require_cleanup_capacity(journal, command, permit)
+        if source is not None and (
+            not isinstance(source, LocalArtifactResourceOwner)
+            or self._store.id != source._store.id
+            or self._store.root != source._store.root
+            or self._store._root_identity != source._store._root_identity
+        ):
+            raise ResourceOwnerUnsupported(
+                "Planning transfer requires the same qualified physical store."
+            )
+
     async def _release_transferred_source(
         self,
         transfer: ResourceTransferReceipt,
@@ -2692,10 +2988,41 @@ class _ResourceSettlementReader(PermitSettlementReader):
         async with self._resource_owner._journal.transaction() as journal:
             record = journal[self._family].get(self._digest)
             authorization = journal["authorizations"].get(self._digest)
-            if not isinstance(record, dict) or not isinstance(authorization, dict):
+            if not isinstance(record, dict):
                 return ExactUnavailable()
-            preparation = ResourcePreparationReceipt.model_validate(authorization["receipt"])
-            if preparation.permit != expected or record.get("stage") != "released":
+            if "cleanup_permit" in record:
+                permit = PermitCommand.model_validate(record["cleanup_permit"])
+            elif isinstance(authorization, dict):
+                permit = ResourcePreparationReceipt.model_validate(authorization["receipt"]).permit
+            else:
+                return ExactUnavailable()
+            if permit != expected or record.get("stage") != "released":
+                return ExactUnavailable()
+            schema = (
+                ResourceAcquisitionCommand
+                if self._family == "operations"
+                else ResourceTransferCommand
+            )
+            command = schema.model_validate_json(record["command"])
+            if resource_operation_digest(command) != self._digest:
+                return ExactUnavailable()
+            _validate_preparation_permit(self.owner, command, permit)
+            if isinstance(authorization, dict):
+                preparation = ResourcePreparationReceipt.model_validate(authorization["receipt"])
+                if (
+                    authorization.get("command") != record["command"]
+                    or preparation.permit != permit
+                    or preparation.operation_digest != self._digest
+                    or preparation.owner != self.owner
+                    or preparation.command_bytes_sha256
+                    != hashlib.sha256(record["command"].encode()).hexdigest()
+                ):
+                    return ExactUnavailable()
+            event_key = "operation" if self._family == "operations" else "transfer"
+            if not any(
+                event.get(event_key) == self._digest and event.get("stage") == "released"
+                for event in journal["events"]
+            ):
                 return ExactUnavailable()
         return ExactMatch[ReceivingSettlementReceipt](
             receipt=ReceivingSettlementReceipt(
@@ -2728,5 +3055,6 @@ __all__ = [
     "ResourceTransferCommand",
     "ResourceTransferIntent",
     "ResourceTransferReceipt",
+    "ResourceTransferTemplate",
     "resource_operation_digest",
 ]

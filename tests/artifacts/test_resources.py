@@ -320,7 +320,7 @@ async def authorized(resource, cmd):
 
 
 def preparation_permit(cmd):
-    from cayu.artifacts.resources import _preparation_target
+    from cayu.artifacts.resources import ResourceTransferTemplate, _preparation_target
 
     receiving_owner = cmd.destination
     request = PermitRegistration(
@@ -335,7 +335,11 @@ def preparation_permit(cmd):
         source_operation=cmd.operation.model_copy(update={"caller_key": cmd.operation.caller_key}),
         target=_preparation_target(cmd),
         target_state="future",
-        effect_scope="transfer" if isinstance(cmd, ResourceTransferCommand) else "acquire",
+        effect_scope=(
+            "transfer"
+            if isinstance(cmd, (ResourceTransferCommand, ResourceTransferTemplate))
+            else "acquire"
+        ),
         required_settlement="exclusion",
         settlement_operation=cmd.operation.model_copy(
             update={"caller_key": cmd.operation.caller_key + "-settle"}
@@ -560,6 +564,8 @@ async def registered_resource(
     scope=None,
     folder_members=(),
     bounds=None,
+    configuration_revision=None,
+    participant_reference=None,
 ):
     from tests.core.test_participant_identity import app, create, registration
 
@@ -569,8 +575,11 @@ async def registered_resource(
     collaboration_store = collaboration_store or InMemoryCollaborationStore()
     application = app(collaboration_store, registration(scope=scope))
     initialized = await application.initialize_collaboration()
-    _, created = await create(application, initialized)
-    participant = created.participants[0].reference
+    if participant_reference is None:
+        _, created = await create(application, initialized)
+        participant = created.participants[0].reference
+    else:
+        participant = participant_reference
     base = LocalArtifactResourceOwner(
         tmp_path / "base", owner=initialized.owner, artifact_store=store
     )
@@ -632,6 +641,7 @@ async def registered_resource(
                         update={
                             "participant": participant,
                             "required_settlement": required_settlement,
+                            "expected_configuration_revision": configuration_revision,
                         }
                     ),
                 }
@@ -963,7 +973,7 @@ def test_delegated_mandate_generations_are_bound_individually(tmp_path, ancestor
             update={"initiator": cmd.initiator.model_copy(update={"mandate": child.reference})}
         )
         permit = permit.model_copy(update={"initiator": cmd.initiator})
-        resource._preparation_reader = MandateResourcePreparationReader(
+        delegated_reader = MandateResourcePreparationReader(
             owner=old._owner,
             resolver=resolver,
             context=context,
@@ -974,6 +984,14 @@ def test_delegated_mandate_generations_are_bound_individually(tmp_path, ancestor
             collaboration_store=collaboration,
             initialized=initialized,
             responsibilities=((cmd, permit),),
+        )
+        # The delegated tuple is a distinct fixed registration, not replacement
+        # of the original journal's exact command/permit cleanup reservation.
+        resource = LocalArtifactResourceOwner(
+            tmp_path / "delegated-resource-owner",
+            owner=resource.owner,
+            artifact_store=store,
+            preparation_reader=delegated_reader,
         )
         try:
             prep = await resource.authorize(cmd, permit=permit)
@@ -1376,7 +1394,7 @@ async def registered_transfer(tmp_path, store, artifact, source, receipt, *, inc
         }
     )
     old = destination._preparation_reader
-    destination._preparation_reader = MandateResourcePreparationReader(
+    reader = MandateResourcePreparationReader(
         owner=old._owner,
         resolver=resolver,
         context=old._context,
@@ -1388,6 +1406,12 @@ async def registered_transfer(tmp_path, store, artifact, source, receipt, *, inc
         initialized=initialized,
         responsibilities=(),
         transfers=((transfer, permit),) if include else (),
+    )
+    destination = type(destination)(
+        destination._journal.root,
+        owner=destination.owner,
+        artifact_store=store,
+        preparation_reader=reader,
     )
     return destination, transfer, permit, resolver, collaboration, initialized, participant
 

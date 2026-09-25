@@ -2453,7 +2453,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert retention_guard == ("cayu_protect_undelivered_event_side_effects",)
 
 
-def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -> None:
+def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "pre-profiled-dispatch.sqlite"
     store = SQLiteSessionStore(db_path)
     asyncio.run(_close(store))
@@ -2468,16 +2468,34 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -
     finally:
         connection.close()
 
-    with pytest.raises(
-        schema_migrations.SchemaTooOld,
-        match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
-    ):
-        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
-    with pytest.raises(
-        schema_migrations.SchemaTooOld,
-        match=rf"requires >= {sqlite_storage._SQLITE_TASK_MIN_REQUIRED_REVISION}",
-    ):
-        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+    opened = []
+    connect = sqlite_storage.sqlite_support.connect
+
+    def track_connection(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite_storage.sqlite_support, "connect", track_connection)
+    try:
+        for store_type, minimum_revision in (
+            (SQLiteSessionStore, sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION),
+            (SQLiteTaskStore, sqlite_storage._SQLITE_TASK_MIN_REQUIRED_REVISION),
+        ):
+            before = len(opened)
+            with pytest.raises(
+                schema_migrations.SchemaTooOld,
+                match=rf"requires >= {minimum_revision}",
+            ):
+                store_type(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+            assert len(opened) == before + 1
+            # Constructor rejection must release its connection immediately,
+            # not leak a ResourceWarning into a later test's GC/capture scope.
+            with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+                opened[-1].execute("SELECT 1")
+    finally:
+        for connection in opened:
+            connection.close()
 
 
 def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_path):
@@ -3467,6 +3485,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (104, 104),
         (105, 105),
         (106, 106),
+        (107, 107),
+        (108, 108),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

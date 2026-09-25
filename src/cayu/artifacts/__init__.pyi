@@ -70,6 +70,7 @@ from cayu.artifacts.resources import ResourcePreparationReceipt as ResourcePrepa
 from cayu.artifacts.resources import ResourceTransferCommand as ResourceTransferCommand
 from cayu.artifacts.resources import ResourceTransferIntent as ResourceTransferIntent
 from cayu.artifacts.resources import ResourceTransferReceipt as ResourceTransferReceipt
+from cayu.artifacts.resources import ResourceTransferTemplate as ResourceTransferTemplate
 from cayu.artifacts.resources import resource_operation_digest as resource_operation_digest
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementEvidence as ArtifactWriteSettlementEvidence,

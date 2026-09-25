@@ -519,9 +519,13 @@ async def native_stores(request, tmp_path):
         await sessions.close()
 
 
-async def prepared_scenario(native_stores, *, use_example=False):
+async def prepared_scenario(
+    native_stores, *, use_example=False, provider_events=(), request_ttl_ms=None
+):
     collaboration, sessions, *_ = native_stores
     original, initialized, _, recipient, request, _initiating = await setup(collaboration)
+    if request_ttl_ms is not None:
+        request = request.model_copy(update={"ttl_ms": request_ttl_ms})
     resolver = PreparationResolver(request, recipient.reference)
     binding = _binding(application_scope=initialized.owner.application_scope)
 
@@ -549,7 +553,7 @@ async def prepared_scenario(native_stores, *, use_example=False):
         budget_binding_receiver=BudgetReceiver(),
         enable_common_root_budget_binding=True,
     )
-    provider = ScriptedModelProvider([], name="provider")
+    provider = ScriptedModelProvider(provider_events, name="provider")
     application.register_provider(provider, default=True)
     application.register_agent(AgentSpec(name="reviewer", model="model", system_prompt="system"))
     await application.initialize_collaboration()

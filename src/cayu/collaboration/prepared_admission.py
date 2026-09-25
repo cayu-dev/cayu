@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import Field, StrictStr, field_validator, model_validator
 
 from cayu._validation import canonical_bounded_durable_json_bytes
+from cayu.artifacts._resource_material_types import ResourceMaterialReference
 from cayu.collaboration._contracts import (
     MAX_DEPTH,
     MAX_NODES,
@@ -23,6 +24,7 @@ from cayu.collaboration._contracts import (
     ObjectRef,
 )
 from cayu.collaboration.participants import ParticipantRef, VersionOne
+from cayu.sessions._recipient_continuation import RecipientContinuationSelection
 from cayu.sessions.creation_fence import SessionCreationTarget
 
 if TYPE_CHECKING:
@@ -33,6 +35,19 @@ if TYPE_CHECKING:
 MAX_PREPARED_PROFILE_BYTES = 16 * 1024
 MAX_PREPARED_BUDGET_BYTES = 8 * 1024
 MAX_PREPARED_ADMISSION_BYTES = 48 * 1024
+
+
+def require_prepared_budget_target(binding, *, provider_name, model, environment_name):
+    """One target restriction check for native preflight and final receiving admission."""
+    from cayu.collaboration.access import CollaborationAccessDenied
+
+    for expected, actual in (
+        (binding.provider_name, provider_name),
+        (binding.model, model),
+        (binding.environment_name, environment_name),
+    ):
+        if expected is not None and expected != actual:
+            raise CollaborationAccessDenied("Prepared budget target conflicts.")
 
 
 def prepared_budget_request(*, session_id: str, session_instance_id: str, profile: str):
@@ -148,32 +163,136 @@ def prepared_budget_snapshot(binding: BudgetBinding) -> str:
     return encoded
 
 
-class FreshRecipientAdmissionTarget(ContractValue):
+class _CreatedRecipientAdmissionTarget(ContractValue):
     """Exact native creation identity and its resolved inert child."""
 
-    kind: Literal["fresh"] = "fresh"
     creation: SessionCreationTarget
     session_id: Identifier
     session_instance_id: Identifier
     creation_receipt_commitment: NativeCommitment
     initial_input_commitment: NativeCommitment
     definition_commitment: NativeCommitment
+    resources: tuple[ResourceMaterialReference, ...] = Field(default=(), max_length=32)
 
     @model_validator(mode="after")
-    def requested_identity(self) -> FreshRecipientAdmissionTarget:
+    def requested_identity(self):
         if (
             self.creation.requested_session_id is not None
             and self.creation.requested_session_id != self.session_id
         ):
             raise CollaborationContractError("Prepared session identity conflicts.")
+        identities = tuple((item.owner, item.operation) for item in self.resources)
+        if len(set(identities)) != len(identities) or any(
+            item.owner != self.creation.receiving_owner for item in self.resources
+        ):
+            raise CollaborationContractError("Prepared resource identity conflicts.")
         return self
+
+
+class FreshRecipientAdmissionTarget(_CreatedRecipientAdmissionTarget):
+    kind: Literal["fresh"] = "fresh"
+
+
+class ForkRecipientAdmissionTarget(_CreatedRecipientAdmissionTarget):
+    """Exact native child and historical selection; never current disclosure rights."""
+
+    kind: Literal["fork"] = "fork"
+    selected_view_commitment: NativeCommitment
+    manifest_commitment: NativeCommitment
+    view_id: Identifier
+    source_session_id: Identifier
+    source_session_instance_id: Identifier
+
+
+def selected_view_commitment(selected):
+    from cayu.sessions.context_views import json_commitment
+
+    return json_commitment(
+        canonical_bounded_durable_json_bytes(
+            selected.model_dump(mode="json", warnings=False),
+            "selected view",
+            max_bytes=512 * 1024,
+            max_nodes=MAX_NODES,
+            max_nesting=MAX_DEPTH,
+        ).decode()
+    )
+
+
+def created_admission_target(creation, receipt):
+    """Project authenticated native creation data; this function grants no authority."""
+    from cayu.artifacts._resource_material import material_reference
+    from cayu.sessions.context_views import ContextViewSelectionReceipt
+
+    metadata = _snapshot_document(receipt.recipient_metadata_json, max_bytes=512 * 1024)
+    definition = _snapshot_document(
+        receipt.binding.historical_definition_json, max_bytes=256 * 1024
+    )
+    fields = dict(
+        creation=creation,
+        session_id=receipt.binding.session_id,
+        session_instance_id=receipt.binding.session_instance_id,
+        creation_receipt_commitment=receipt.receipt_commitment,
+        initial_input_commitment=receipt.initial_input_commitment,
+        definition_commitment=definition["agent_definition_commitment"],
+    )
+    from cayu.artifacts.resources import ResourcePreparationReceipt, ResourceTransferReceipt
+
+    transfers = metadata.get("resource_transfers")
+    preparations = metadata.get("preparation_receipts")
+    if (
+        type(transfers) is not list
+        or type(preparations) is not list
+        or len(transfers) != len(preparations)
+        or len(transfers) > 32
+    ):
+        raise CollaborationContractError("Recipient resource evidence is malformed.")
+    fields["resources"] = tuple(
+        material_reference(
+            ResourceTransferReceipt.model_validate(transfer),
+            ResourcePreparationReceipt.model_validate(preparation),
+        )
+        for transfer, preparation in zip(transfers, preparations, strict=True)
+    )
+    if metadata.get("mode") == "fresh" and metadata.get("selected_view") is None:
+        return FreshRecipientAdmissionTarget(**fields)
+    if metadata.get("mode") != "fork":
+        raise CollaborationContractError("Recipient admission mode is not qualified.")
+    selected = ContextViewSelectionReceipt.model_validate(metadata.get("selected_view"))
+    if (
+        selected.state not in {"adopted", "transferred"}
+        or selected.owner_participant != receipt.binding.participant
+    ):
+        raise CollaborationContractError("Historical selection contradicts its recipient.")
+    return ForkRecipientAdmissionTarget(
+        **fields,
+        selected_view_commitment=selected_view_commitment(selected),
+        manifest_commitment=selected.view.manifest_commitment,
+        view_id=selected.view.view_id,
+        source_session_id=selected.view.source_session_id,
+        source_session_instance_id=selected.view.source_session_instance_id,
+    )
+
+
+class RecipientContinuationRequest(ContractValue):
+    """Select one existing incarnation; neither a writer claim nor input append."""
+
+    session_id: Identifier
+    session_instance_id: Identifier
+    participant: ParticipantRef
+
+
+class ContinueRecipientAdmissionTarget(ContractValue):
+    """Exact native completed boundary, independently checked by its receiver."""
+
+    kind: Literal["continue"] = "continue"
+    selection: RecipientContinuationSelection
 
 
 class PreparedRecipientAdmission(ContractValue):
     """Immutable proposal authenticated only by a registered receiving owner.
 
-    Version one qualifies FRESH without resource/view preparation. Future target
-    families require explicit native qualification, not a permissive fallback.
+    Target families require explicit receiver qualification. The envelope carries
+    evidence, never a portable execution permit or writer lease.
     """
 
     schema_version: VersionOne = 1
@@ -182,7 +301,12 @@ class PreparedRecipientAdmission(ContractValue):
     lifecycle_revision: Generation
     configuration_revision: Generation
     admission_generation: Generation
-    target: FreshRecipientAdmissionTarget
+    target: Annotated[
+        FreshRecipientAdmissionTarget
+        | ForkRecipientAdmissionTarget
+        | ContinueRecipientAdmissionTarget,
+        Field(discriminator="kind"),
+    ]
     execution_profile_json: StrictStr
     budget_binding_json: StrictStr
 
@@ -200,17 +324,26 @@ class PreparedRecipientAdmission(ContractValue):
 
     @model_validator(mode="after")
     def exact_recipient(self) -> PreparedRecipientAdmission:
-        registration = self.target.creation.permit.intent.request
         binding = prepared_budget(self.budget_binding_json)
         if (
-            registration.participant != self.recipient
-            or self.receiver.owner != self.recipient.owner
+            self.receiver.owner != self.recipient.owner
             or self.receiver.revision is None
             or self.recipient.owner.application_scope != binding.application_scope
-            or self.target.creation.receiving_owner.application_scope
-            != self.recipient.owner.application_scope
         ):
             raise CollaborationContractError("Prepared recipient evidence conflicts.")
+        if isinstance(self.target, _CreatedRecipientAdmissionTarget):
+            registration = self.target.creation.permit.intent.request
+            if (
+                registration.participant != self.recipient
+                or self.target.creation.receiving_owner.application_scope
+                != self.recipient.owner.application_scope
+            ):
+                raise CollaborationContractError("Prepared recipient evidence conflicts.")
+        elif (
+            self.target.selection.participant != self.recipient
+            or self.target.selection.execution_profile_json != self.execution_profile_json
+        ):
+            raise CollaborationContractError("Prepared continuation evidence conflicts.")
         return self
 
 

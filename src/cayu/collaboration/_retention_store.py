@@ -139,6 +139,23 @@ async def prune_namespace(
             break
         mode = _stored_mode(raw)
         metadata = request_receipt_metadata(raw, redactor=redactor)
+        planning_parent = None
+        if mode in {"request_plan", "request_plan_stage"}:
+            from cayu.collaboration._planning_records import (
+                RequestPlanningReceipt,
+                RequestPlanningStageRecord,
+            )
+
+            planning = prepare_contract(
+                RequestPlanningReceipt if mode == "request_plan" else RequestPlanningStageRecord,
+                raw,
+                redactor=redactor,
+            )
+            planning_parent = (
+                planning.command.expected
+                if isinstance(planning, RequestPlanningReceipt)
+                else planning.intent.command.expected
+            )
         if (
             mode == "permit"
             and isinstance(raw, dict)
@@ -148,6 +165,16 @@ async def prune_namespace(
 
             permit_item = prepare_permit_record(raw, redactor)
             registration = permit_item.expected.intent.request
+            if registration.effect_scope in {
+                "recipient_session_creation",
+                "context_view_selection",
+                "context_view_retention",
+            }:
+                from cayu.collaboration._planning_retention import creation_permit_planning_parent
+
+                planning_parent = await creation_permit_planning_parent(
+                    tx, permit_item.expected, redactor=redactor
+                )
             if registration.effect_scope == "request_prepared_admission":
                 source = registration.source_operation
                 parent_raw = await tx.get(
@@ -170,9 +197,13 @@ async def prune_namespace(
                             "Prepared admission pruning evidence conflicts."
                         )
                     metadata = parent_metadata
-        if metadata is not None or mode in ("request", "request_control"):
-            command = metadata.expected if metadata is not None else None
-            if metadata is None:
+        if (
+            metadata is not None
+            or mode in ("request", "request_control")
+            or planning_parent is not None
+        ):
+            command = metadata.expected if metadata is not None else planning_parent
+            if metadata is None and planning_parent is None:
                 request_item = prepare_contract(
                     RequestReceipt if mode == "request" else RequestControlReceipt,
                     raw,

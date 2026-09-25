@@ -143,7 +143,13 @@ Exact `ResourceSelector` values require pinned owner revisions. A bounded tuple
 expresses a union. Subtree containment requires a registered
 `ResourceSelectorOwner`; aliases must already match its canonical result and
 `contains()` must return literal `True`. Textual prefixes, globs and regexes
-provide no containment authority. Selected transcript rows use source-owner
+provide no containment authority. An owner's immutable `canonical_resource_kinds`
+may narrow its canonicalization to a tuple of 1–32 unique kind codes; `None`
+covers all kinds.
+Kinds outside that declaration retain generic exact-identity checks and cannot
+gain subtree authority from that owner. A failure for a declared kind is never
+retried as an unowned exact reference. Changes to this declaration belong to the
+owner's pinned configuration identity. Selected transcript rows use source-owner
 references with kind `session_transcript_row` and revision equal to row index
 plus one. Reviewed exposure occurrences also undergo channel, resource and
 exclusion checks, including when no transcript rows are selected.

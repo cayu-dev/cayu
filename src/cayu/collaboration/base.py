@@ -101,11 +101,15 @@ Table = Literal[
     "clarification_lineages",
     "clarification_services",
     "clarification_deliveries",
+    "request_plans",
+    "request_plan_stages",
+    "request_plan_events",
 ]
 Key = tuple[str | int, ...]
 IDENTITY_FAMILY = FamilyVersion(family="participant.identity", version=1)
 LIFECYCLE_FAMILY = FamilyVersion(family="collaboration.lifecycle", version=1)
 REQUEST_FAMILY = FamilyVersion(family="collaboration.request.acceptance", version=2)
+PLANNING_FAMILY = FamilyVersion(family="collaboration.request.planning", version=1)
 # Reserve the maximum bounded anchor envelope once. Its counters can grow
 # without changing the admission decision that those same counters describe.
 _ANCHOR_BYTES = 64 * 1024
@@ -139,6 +143,14 @@ class _Repository(Protocol):
     ) -> list[object]: ...
 
     async def scan_due_requests(self, *, after: int, now_ms: int, limit: int) -> list[object]: ...
+
+    async def scan_request_plans(self, request: RequestRef, *, limit: int) -> list[object]: ...
+
+    async def scan_pending_request_plans(self, *, after: object, limit: int) -> list[object]: ...
+
+    async def scan_request_plan_stages(self, plan: object, *, limit: int) -> list[object]: ...
+
+    async def find_request_plan_stage(self, native_operation: object) -> object | None: ...
 
     async def scan_request_events(self, *, after: int, limit: int) -> list[object]: ...
 
@@ -257,6 +269,7 @@ class CollaborationStore(ABC):
 
     identity_contract_version: ClassVar[int] = 1
     request_contract_version: ClassVar[int] = 0
+    planning_contract_version: ClassVar[int] = 0
     _owners: _MutationOwners
 
     @abstractmethod
@@ -271,6 +284,9 @@ class CollaborationStore(ABC):
         families = (IDENTITY_FAMILY, LIFECYCLE_FAMILY)
         if type(self.request_contract_version) is int and self.request_contract_version == 2:
             families += (REQUEST_FAMILY,)
+        planning_version = type(self).__dict__.get("planning_contract_version", 0)
+        if type(planning_version) is int and planning_version == 1:
+            families += (PLANNING_FAMILY,)
         return CapabilityDescriptor(
             owner=owner,
             mutations=families,

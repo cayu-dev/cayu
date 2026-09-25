@@ -60,6 +60,7 @@ from cayu.sessions.base import (
     _validate_session_closure_detach_replay,
 )
 from cayu.storage import _creation_fence
+from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 
 if TYPE_CHECKING:
@@ -2003,7 +2004,7 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
 
 
 @model_store_surface("sessions")
-class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
+class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMixin, SessionStore):
     """SQLite-backed session store for durable local runtime state."""
 
     session_access_version: ClassVar[int | None] = 1
@@ -2103,6 +2104,8 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
     supports_session_closure_progress: ClassVar[bool] = True
     participant_session_binding_version: ClassVar[int | None] = 1
+    recipient_continuation_selection_version: ClassVar[int | None] = 1
+    context_view_selection_fence_version: ClassVar[int | None] = 1
     context_view_version: ClassVar[int | None] = 1
     peer_content_version: ClassVar[int | None] = 1
 
@@ -4269,7 +4272,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             return reconstruct(dict(row), session)
 
     async def capture_context_view_publication_source(self, session_id):
+        return (await self._capture_completed_turn_snapshot(session_id)).publication
+
+    async def _capture_completed_turn_snapshot(self, session_id):
         from cayu.sessions._context_view_source import (
+            CompletedTurnSnapshot,
             capture_source,
             closed_round_publication_id,
             completed_boundary,
@@ -4346,8 +4353,34 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     )
                     for row in rows
                 )
-                return capture_source(
+                publication = capture_source(
                     session, binding, checkpoint, pointer, completion, records, tool_receipt
+                )
+                queued = connection.execute(
+                    "SELECT 1 FROM cayu_session_message_queue "
+                    "WHERE session_id = ? AND status = 'queued' LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                closure = connection.execute(
+                    "SELECT 1 FROM cayu_session_closure_progress AS p "
+                    "WHERE root_session_id = ? OR EXISTS "
+                    "(SELECT 1 FROM json_each(p.progress_json, '$.descendants') AS child "
+                    "WHERE json_extract(child.value, '$.session_id') = ?) LIMIT 1",
+                    (session_id, session_id),
+                ).fetchone()
+                active = connection.execute(
+                    "SELECT 1 FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ? LIMIT 1",
+                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                ).fetchone()
+                return CompletedTurnSnapshot(
+                    publication=publication,
+                    current_session=session,
+                    checkpoint=checkpoint,
+                    has_queued_input=queued is not None,
+                    has_closure_owner=closure is not None,
+                    has_active_model_stage=active is not None,
+                    current_transcript_cursor=_transcript_cursor(connection, session_id),
                 )
 
         return await self._run_read(query)
@@ -4486,6 +4519,13 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         )
 
     async def select_context_view(self, request):
+        return await self._select_context_view(request)
+
+    async def _select_context_view(self, request, *, target=None):
+        from cayu.sessions._context_selection_fence import (
+            require_not_excluded,
+            require_selected_participant,
+        )
         from cayu.sessions.context_views import (
             CONTEXT_VIEW_EXPIRY_BATCH_SIZE,
             CONTEXT_VIEW_MAX_PUBLICATIONS_PER_OWNER,
@@ -4498,6 +4538,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             validate_context_view_manifest_storage,
             validate_context_view_receipt_storage,
         )
+        from cayu.storage._context_selection_fence import reconstruct_exclusion, sqlite_exclusion
 
         if type(request) is not ContextViewSelectionRequest:
             raise TypeError("Context-view selection requires a typed request.")
@@ -4514,6 +4555,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         )
         owner = request.source_owner
         async with self._context_view_transaction():
+            require_not_excluded(
+                request,
+                reconstruct_exclusion(sqlite_exclusion(self._connection, request.selection_key)),
+                target=target,
+            )
             now_ms = int(self._ownership_clock().timestamp() * 1000)
             expired_rows = self._connection.execute(
                 "SELECT selection_key, receipt_json FROM cayu_context_view_selections "
@@ -4621,6 +4667,18 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             source = _load_session(self._connection, request.source_session_id)
             if source is None or source.instance_id != request.source_session_instance_id:
                 raise LookupError("Context-view source session incarnation is unavailable.")
+            if target is not None:
+                from cayu.sessions._context_selection_fence import require_selection_source
+                from cayu.storage._participant_session_records import reconstruct
+
+                binding_row = self._connection.execute(
+                    "SELECT * FROM cayu_participant_session_bindings WHERE session_id = ?",
+                    (request.source_session_id,),
+                ).fetchone()
+                binding = (
+                    None if binding_row is None else reconstruct(dict(binding_row), source).binding
+                )
+                require_selection_source(target, binding, now_ms=now_ms)
             rows = self._connection.execute(
                 """
                 SELECT view_id FROM cayu_context_views
@@ -4735,6 +4793,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 owner_participant=selected.participant,
                 expires_at_ms=expires_at_ms,
             )
+            require_selected_participant(target, selected)
             self._connection.execute(
                 """
                 INSERT INTO cayu_context_view_selections (
@@ -4775,6 +4834,10 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         return ContextViewSelectionReceipt.model_validate_json(row[0])
 
     async def transition_context_view_ownership(self, request):
+        return await self._transition_context_view_ownership(request)
+
+    async def _transition_context_view_ownership(self, request, *, target=None):
+        from cayu.sessions._context_selection_fence import require_selection_adoption
         from cayu.sessions.context_views import (
             ContextViewLifecycleEvent,
             ContextViewOwnershipRequest,
@@ -4782,6 +4845,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             canonical_bounded_durable_json_bytes,
             json_commitment,
             validate_context_view_receipt_storage,
+        )
+        from cayu.storage._context_selection_fence import (
+            reconstruct_exclusion,
+            sqlite_decision,
+            sqlite_exclusion,
         )
 
         if type(request) is not ContextViewOwnershipRequest:
@@ -4798,6 +4866,14 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             "context view ownership request",
         )
         async with self._context_view_transaction():
+            control = reconstruct_exclusion(
+                sqlite_exclusion(self._connection, request.selection_key)
+            )
+            require_selection_adoption(
+                request,
+                sqlite_decision(self._connection, control.request) if control is not None else None,
+                target=target,
+            )
             operation = self._connection.execute(
                 "SELECT request_commitment, receipt_json "
                 "FROM cayu_context_view_ownership_operations "
@@ -4848,6 +4924,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     "The current participant does not control this context-view pin."
                 )
             now_ms = int(self._ownership_clock().timestamp() * 1000)
+            from cayu.sessions._context_selection_fence import require_adoption_deadline
+
+            require_adoption_deadline(target, now_ms)
             self._require_context_view_lifecycle_capacity(receipt.view.view_id)
             if receipt.state == "selected" and receipt.expires_at_ms <= now_ms:
                 expired = receipt.model_copy(update={"state": "expired"}, deep=True)
@@ -18586,9 +18665,13 @@ class SQLiteTaskStore(TaskStore):
         self._lock = asyncio.Lock()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
         self._connection = self._connect(effective_db_path)
-        self._initialize_schema()
-        if diagnostic_source_missing:
-            self._connection.execute("PRAGMA query_only = ON")
+        try:
+            self._initialize_schema()
+            if diagnostic_source_missing:
+                self._connection.execute("PRAGMA query_only = ON")
+        except BaseException:
+            self._connection.close()
+            raise
 
     def _verified_transaction_unlocked(self):
         return sqlite_support._transaction(self._connection)

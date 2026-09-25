@@ -39,6 +39,7 @@ class _SQLiteRepository(_SQLRepository):
 
 class SQLiteCollaborationStore(CollaborationStore):
     request_contract_version = 2
+    planning_contract_version = 1
 
     def __init__(self, path: str | Path, *, schema_mode: SchemaMode = SchemaMode.CREATE) -> None:
         self._lock = asyncio.Lock()
@@ -47,7 +48,7 @@ class SQLiteCollaborationStore(CollaborationStore):
         self._close_task: asyncio.Task[None] | None = None
         self._connection = sqlite.connect(Path(path))
         try:
-            sqlite.reconcile_schema(self._connection, schema_mode, app_min_supported=106)
+            sqlite.reconcile_schema(self._connection, schema_mode, app_min_supported=107)
         except BaseException:
             self._connection.close()
             raise

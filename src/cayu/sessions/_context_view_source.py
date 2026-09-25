@@ -41,6 +41,23 @@ class ContextViewPublicationSource:
     transcript_end_cursor: int
 
 
+@dataclass(frozen=True, slots=True)
+class CompletedTurnSnapshot:
+    """Internal coherent read; historical publication and current state are distinct.
+
+    Native owners detach this material before releasing their read boundary. It
+    must never be returned as a public session projection or execution permit.
+    """
+
+    publication: ContextViewPublicationSource
+    current_session: Session
+    checkpoint: dict[str, Any] | None
+    has_queued_input: bool
+    has_closure_owner: bool
+    has_active_model_stage: bool
+    current_transcript_cursor: int
+
+
 def completed_boundary(
     session: Session | None,
     binding: ParticipantSessionBinding | None,

@@ -136,6 +136,11 @@ from cayu.collaboration._permits import (
     PermitSettlementReader,
     ReceivingSettlementReceipt,
 )
+from cayu.collaboration._planning_records import (
+    RequestPlanningCursor,
+    RequestPlanningPage,
+    RequestPlanningRecord,
+)
 from cayu.collaboration._request_coordinator import RequestCoordinator
 from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
 from cayu.collaboration._wait_coordinator import WaitCoordinator
@@ -199,7 +204,17 @@ from cayu.collaboration.peer_content import (
     PeerContentUnavailable,
     PeerModelAttemptOrigin,
 )
-from cayu.collaboration.prepared_admission import PreparedRecipientAdmission
+from cayu.collaboration.planning import RequestPlanningControl, RequestPlanningRequest
+from cayu.collaboration.prepared_admission import (
+    PreparedRecipientAdmission,
+    RecipientContinuationRequest,
+)
+from cayu.collaboration.recipient_preparation import (
+    ForkRecipientCreationPreparation,
+    ForkRecipientPreparation,
+    FreshRecipientPreparation,
+    ResourceRecipientCreationPreparation,
+)
 from cayu.collaboration.request_access import RequestAdmissionReader, RequestRegistration
 from cayu.collaboration.requests import (
     CollaborationRequest,
@@ -1934,6 +1949,91 @@ class CayuApp:
         """Record a trusted receiving-owner admission decision; never launch work."""
         return await self._request_coordinator.admit(command, context=context)
 
+    async def plan_collaboration_request(
+        self, request: RequestPlanningRequest, *, context: MandateAccessContext
+    ) -> RequestPlanningRecord:
+        """Explicitly retain and prepare a registered decision without launching work."""
+        from cayu.collaboration._planning_coordinator import plan_request
+        from cayu.sessions._planning_creation_owner import NativePlanningCreationOwner
+        from cayu.sessions._planning_fork_owner import NativePlanningForkOwner
+        from cayu.sessions._planning_resource_owner import NativePlanningResourceOwner
+
+        return await plan_request(
+            self._request_coordinator,
+            request,
+            context=context,
+            clarifications=self._clarification_coordinator,
+            recipient_creation=NativePlanningCreationOwner(self),
+            recipient_fork=NativePlanningForkOwner(self),
+            recipient_resources=NativePlanningResourceOwner(self),
+        )
+
+    async def lookup_collaboration_plan(
+        self, expected: RequestPlanningRequest, *, context: MandateAccessContext
+    ) -> ExactLookup[RequestPlanningRecord]:
+        """Compare complete retained planning intent under current read authority."""
+        from cayu.collaboration._planning_coordinator import plan_request
+
+        return await plan_request(
+            self._request_coordinator, expected, context=context, read_only=True
+        )
+
+    async def reconcile_collaboration_plan(
+        self, expected: RequestPlanningRequest, *, context: MandateAccessContext
+    ) -> RequestPlanningRecord:
+        """Make one bounded recovery pass using only the retained operation keys."""
+        from cayu.collaboration._planning_coordinator import plan_request
+        from cayu.sessions._planning_creation_owner import NativePlanningCreationOwner
+        from cayu.sessions._planning_fork_owner import NativePlanningForkOwner
+        from cayu.sessions._planning_resource_owner import NativePlanningResourceOwner
+
+        return await plan_request(
+            self._request_coordinator,
+            expected,
+            context=context,
+            clarifications=self._clarification_coordinator,
+            require_retained=True,
+            recipient_creation=NativePlanningCreationOwner(self),
+            recipient_fork=NativePlanningForkOwner(self),
+            recipient_resources=NativePlanningResourceOwner(self),
+        )
+
+    async def control_collaboration_plan(
+        self, command: RequestPlanningControl, *, context: MandateAccessContext
+    ) -> RequestPlanningRecord:
+        """Fence exact local preparation under current administrative authority."""
+        from cayu.collaboration._planning_coordinator import plan_request
+        from cayu.collaboration._preparation import prepare_contract
+
+        checked = prepare_contract(RequestPlanningControl, command, redactor=self._secret_redactor)
+        from cayu.sessions._planning_creation_owner import NativePlanningCreationOwner
+        from cayu.sessions._planning_fork_owner import NativePlanningForkOwner
+        from cayu.sessions._planning_resource_owner import NativePlanningResourceOwner
+
+        return await plan_request(
+            self._request_coordinator,
+            checked.expected,
+            context=context,
+            control=checked,
+            recipient_creation=NativePlanningCreationOwner(self),
+            recipient_fork=NativePlanningForkOwner(self),
+            recipient_resources=NativePlanningResourceOwner(self),
+        )
+
+    async def list_pending_collaboration_plans(
+        self,
+        *,
+        context: MandateAccessContext,
+        after: RequestPlanningCursor | None = None,
+        limit: int = 32,
+    ) -> RequestPlanningPage:
+        """Discover durable plans under scope-wide maintenance read authority."""
+        from cayu.collaboration._planning_inspection import list_pending_plans
+
+        return await list_pending_plans(
+            self._request_coordinator, context=context, after=after, limit=limit
+        )
+
     async def record_collaboration_progress(
         self, command: RequestProgressCommand, *, context: MandateAccessContext
     ) -> RequestProgressReceipt:
@@ -1949,6 +2049,49 @@ class CayuApp:
         from cayu.sessions._recipient_admission import prepare_request_admission
 
         return await prepare_request_admission(self, creation, context=context)
+
+    async def prepare_recipient_creation(
+        self,
+        creation: RecipientSessionCreationRequest,
+        *,
+        context: CollaborationAccessContext,
+    ) -> FreshRecipientPreparation:
+        """Freeze an inert FRESH proposal without creating a session or permit."""
+        from cayu.sessions._recipient_preparation import prepare_fresh_recipient
+
+        return await prepare_fresh_recipient(self, creation, context=context)
+
+    async def prepare_recipient_continuation(
+        self,
+        request: RecipientContinuationRequest,
+        *,
+        context: CollaborationAccessContext,
+    ) -> PreparedRecipientAdmission:
+        """Propose one exact completed boundary; never append input or acquire a writer."""
+        from cayu.sessions._recipient_admission import prepare_continuation_admission
+
+        return await prepare_continuation_admission(self, request, context=context)
+
+    async def prepare_recipient_fork(
+        self,
+        creation: RecipientSessionCreationRequest,
+        source: ContextViewSelectionRequest,
+        *,
+        source_participant: ParticipantRef,
+        context: CollaborationAccessContext,
+        deadline_at_ms: int,
+    ) -> ForkRecipientPreparation:
+        """Freeze base preflight and exact historical selection without effects."""
+        from cayu.sessions._recipient_preparation import prepare_fork_recipient
+
+        return await prepare_fork_recipient(
+            self,
+            creation,
+            source,
+            source_participant=source_participant,
+            context=context,
+            deadline_at_ms=deadline_at_ms,
+        )
 
     def collaboration_admission_reader(self) -> RequestAdmissionReader:
         """Return this application's authenticated exact historical admission reader."""
@@ -2417,6 +2560,10 @@ class CayuApp:
         *,
         context: CollaborationAccessContext,
         resource_owner: LocalArtifactResourceOwner | None = None,
+        preparation: FreshRecipientPreparation
+        | ForkRecipientCreationPreparation
+        | ResourceRecipientCreationPreparation
+        | None = None,
     ) -> tuple[Session, RecipientSessionCreationReceipt]:
         """Create one inert recipient child from fresh or exact retained material.
 
@@ -2431,6 +2578,10 @@ class CayuApp:
         # admission checks and durable evidence must describe this one input.
         creation = replace(creation)
         participant = creation.recipient
+        if preparation is not None:
+            from cayu.sessions._recipient_preparation import checked_creation_preparation
+
+            preparation = checked_creation_preparation(self, creation, preparation, context=context)
         # Replay is resolved from the durable child record before touching the
         # source view. A committed child must remain recoverable even if the
         # source has since compacted or become unavailable.
@@ -2444,6 +2595,10 @@ class CayuApp:
             )
 
             previous = existing[1].participant_receipt
+            if preparation is not None:
+                from cayu.sessions._recipient_preparation import require_created_preparation
+
+                require_created_preparation(preparation, previous)
             target = await admit_recipient_creation(
                 self,
                 creation.participant_request,
@@ -2453,6 +2608,7 @@ class CayuApp:
                 previous.initial_input_commitment,
                 previous.binding.execution_profile_commitment,
                 recovery=True,
+                expected_target=None if preparation is None else preparation.creation,
             )
             await settle_recipient_creation(self, target)
             return existing
@@ -2465,12 +2621,12 @@ class CayuApp:
                 found = await resource_owner.read_transfer(transfer.command)
                 if not isinstance(found, ExactMatch) or found.receipt != transfer:
                     raise PermissionError("Resource transfer is not authenticated by its owner.")
-            for transfer, preparation in zip(
+            for transfer, resource_preparation in zip(
                 creation.resource_transfers, creation.preparation_receipts, strict=True
             ):
-                if await resource_owner.read_preparation(transfer.command) != preparation:
+                if await resource_owner.read_preparation(transfer.command) != resource_preparation:
                     raise PermissionError("Resource preparation authority is not authenticated.")
-                if preparation.permit.intent.request.participant != participant:
+                if resource_preparation.permit.intent.request.participant != participant:
                     raise PermissionError("Resource preparation belongs to another recipient.")
         input_artifact_ids = set(creation.input_artifact_ids)
         retained_artifact_ids = {
@@ -2597,6 +2753,7 @@ class CayuApp:
                     recipient_receipt_validator=build_receipt,
                     recipient_resource_owner=resource_owner,
                     recipient_attachments=creation.input_attachments,
+                    recipient_preparation=preparation,
                 )
 
         if creation.resource_transfers:
@@ -2843,6 +3000,10 @@ class CayuApp:
         recipient_receipt_validator=None,
         recipient_resource_owner: LocalArtifactResourceOwner | None = None,
         recipient_attachments: tuple[FileAttachment, ...] = (),
+        recipient_preparation: FreshRecipientPreparation
+        | ForkRecipientCreationPreparation
+        | ResourceRecipientCreationPreparation
+        | None = None,
     ) -> tuple[Session, ParticipantSessionCreationReceipt]:
         """Create one inert session bound to an active participant.
 
@@ -2891,44 +3052,25 @@ class CayuApp:
         if snapshot.lifecycle != "active" and recipient_metadata_json is None:
             raise PermissionError("Only active participants can own a new session.")
         requested_session_id = creation.request.session_id
-        prepared = await self._session_engine._prepare_initial_run(
-            self._with_application_run_defaults(creation.request),
-            admit_session=False,
+        from cayu.sessions._participant_creation_preflight import (
+            prepare_participant_creation_material,
         )
-        if prepared is None:
-            raise RuntimeError("Participant session preparation did not produce a profile.")
+
+        material = await prepare_participant_creation_material(
+            self,
+            creation,
+            resource_owner=recipient_resource_owner,
+            attachments=recipient_attachments,
+        )
+        if recipient_preparation is not None:
+            from cayu.sessions._recipient_preparation import require_prepared_creation_material
+
+            await require_prepared_creation_material(self, recipient_preparation, material)
+        prepared = material.initial_run
         prepared_request = prepared.request
-        if recipient_attachments:
-            environment = prepared.registered_environment
-            if (
-                recipient_resource_owner is None
-                or environment is None
-                or environment.factory is not None
-            ):
-                raise PermissionError(
-                    "Recipient attachments require a qualified static artifact environment."
-                )
-            # The caller is inside _run_recipient_commit's retained owner fence.
-            # Check the resolved profile's environment, not a caller-selected store.
-            await recipient_resource_owner._validate_context_artifacts(
-                recipient_attachments,
-                artifact_store=environment.environment.artifact_store,
-                environment_name=environment.spec.name,
-            )
-        profile_json = canonical_bounded_durable_json_bytes(
-            prepared.execution_profile.model_dump(mode="json"),
-            "execution_profile",
-            max_bytes=256 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
-        initial_input_json = canonical_bounded_durable_json_bytes(
-            [message.model_dump(mode="json") for message in prepared_request.messages],
-            "initial_input",
-            max_bytes=8 * 1024 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
+        profile_json = material.profile_json
+        initial_input_json = material.initial_input_json
+        historical_definition_json = material.historical_definition_json
         creator_material = {
             "application_scope": participant.owner.application_scope,
             "principal": context.principal,
@@ -2955,48 +3097,6 @@ class CayuApp:
         initial_input_commitment = json_commitment(initial_input_json, "initial_input")
         execution_profile_commitment = json_commitment(profile_json, "execution_profile")
         creation_target = None
-        # Retain data from the resolved preflight, never reconstruct it later
-        # from a potentially replaced registration. Arbitrary metadata/options
-        # remain excluded; the profile commits their execution identity.
-        # Literal secret matching must precede JSON escaping (quotes, slashes,
-        # and newlines are meaningful parts of a registered secret).
-        for field_name, value in (
-            ("agent_name", prepared.registered_agent.spec.name),
-            ("agent_system_prompt", prepared.registered_agent.spec.system_prompt),
-            ("rendered_system_prompt", prepared.rendered_system_prompt),
-        ):
-            session_request_boundary.require_secret_free_session_authority(
-                value,
-                field_name=field_name,
-                redactor=self._secret_redactor,
-            )
-        historical_definition_json = canonical_bounded_durable_json_bytes(
-            {
-                "historical_only": True,
-                "agent_name": prepared.registered_agent.spec.name,
-                "agent_system_prompt": prepared.registered_agent.spec.system_prompt,
-                "rendered_system_prompt": prepared.rendered_system_prompt,
-                "agent_definition_commitment": json_commitment(
-                    canonical_bounded_durable_json_bytes(
-                        prepared.registered_agent.spec.model_dump(mode="json"),
-                        "resolved agent definition",
-                        max_bytes=256 * 1024,
-                        max_nodes=8192,
-                        max_nesting=64,
-                    ).decode("utf-8")
-                ),
-                "execution_profile_commitment": execution_profile_commitment,
-            },
-            "historical definition",
-            max_bytes=256 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
-        session_request_boundary.require_secret_free_session_authority(
-            historical_definition_json,
-            field_name="historical_definition",
-            redactor=self._secret_redactor,
-        )
 
         if recipient_metadata_json is not None:
             from cayu.sessions._recipient_admission import admit_recipient_creation
@@ -3009,6 +3109,9 @@ class CayuApp:
                 snapshot,
                 initial_input_commitment,
                 execution_profile_commitment,
+                expected_target=(
+                    None if recipient_preparation is None else recipient_preparation.creation
+                ),
             )
             admitted = creation_target.permit.intent.request
             authorization_material.update(

@@ -73,11 +73,14 @@ def model_store_surface(kind):
             async def call(self, *args, **kwargs):
                 from cayu.resource_access import _active, _model_data_access
 
-                if _active.get() is not None and _model_data_access.get():
-                    raise NotImplementedError(
-                        f"{operation.__name__} requires the trusted operator interface."
-                    )
-                return await operation(self, *args, **kwargs)
+                try:
+                    if _active.get() is not None and _model_data_access.get():
+                        raise NotImplementedError(
+                            f"{operation.__name__} requires the trusted operator interface."
+                        )
+                    return await operation(self, *args, **kwargs)
+                finally:
+                    del args, kwargs
 
             return call
 

@@ -562,18 +562,33 @@ def runtime_stream_entrance(operation):
 
     @wraps(operation)
     async def stream(self, *args, **kwargs):
-        iterator = aiter(operation(self, *args, **kwargs))
         try:
+            iterator = aiter(operation(self, *args, **kwargs))
+        finally:
+            # The owning entrance sanitizes rejected inputs. Do not retain a
+            # second raw copy in this wrapper's propagated traceback.
+            del args, kwargs
+        try:
+            advance = anext(iterator)
             while True:
                 token = _model_data_access.set(False)
                 try:
                     try:
-                        event = await anext(iterator)
+                        event = await advance
                     except StopAsyncIteration:
                         return
                 finally:
                     _model_data_access.reset(token)
-                yield event
+                try:
+                    yield event
+                except GeneratorExit:
+                    raise
+                except BaseException as error:
+                    # Forward injected failures to the real stream owner so
+                    # its cleanup preserves the original signal and causes.
+                    advance = iterator.athrow(error)
+                else:
+                    advance = anext(iterator)
         finally:
             token = _model_data_access.set(False)
             try:

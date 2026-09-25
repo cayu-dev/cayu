@@ -1,6 +1,45 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ResourceMaterialReference": (
+        "cayu.artifacts._resource_material_types",
+        "ResourceMaterialReference",
+    ),
+    "ResourceRecipientCreationPreparation": (
+        "cayu.collaboration.recipient_preparation",
+        "ResourceRecipientCreationPreparation",
+    ),
+    "ForkRecipientPreparation": (
+        "cayu.collaboration.recipient_preparation",
+        "ForkRecipientPreparation",
+    ),
+    "ForkRecipientCreationPreparation": (
+        "cayu.collaboration.recipient_preparation",
+        "ForkRecipientCreationPreparation",
+    ),
+    "FreshRecipientPreparation": (
+        "cayu.collaboration.recipient_preparation",
+        "FreshRecipientPreparation",
+    ),
+    "RequestPlanningContinue": ("cayu.collaboration.planning", "RequestPlanningContinue"),
+    "RequestPlanningFresh": ("cayu.collaboration.planning", "RequestPlanningFresh"),
+    "RequestPlanningFork": ("cayu.collaboration.planning", "RequestPlanningFork"),
+    "RequestPlanningResource": (
+        "cayu.collaboration.resource_preparation",
+        "RequestPlanningResource",
+    ),
+    "ContinueRecipientAdmissionTarget": (
+        "cayu.collaboration.prepared_admission",
+        "ContinueRecipientAdmissionTarget",
+    ),
+    "RecipientContinuationRequest": (
+        "cayu.collaboration.prepared_admission",
+        "RecipientContinuationRequest",
+    ),
+    "RecipientContinuationSelection": (
+        "cayu.sessions._recipient_continuation",
+        "RecipientContinuationSelection",
+    ),
     "PreparedRecipientAdmission": (
         "cayu.collaboration.prepared_admission",
         "PreparedRecipientAdmission",
@@ -8,6 +47,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "FreshRecipientAdmissionTarget": (
         "cayu.collaboration.prepared_admission",
         "FreshRecipientAdmissionTarget",
+    ),
+    "ForkRecipientAdmissionTarget": (
+        "cayu.collaboration.prepared_admission",
+        "ForkRecipientAdmissionTarget",
     ),
     "PreparedAdmissionRegistration": (
         "cayu.collaboration.request_access",
@@ -171,6 +214,34 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RequestDueCursor": ("cayu.collaboration.requests", "RequestDueCursor"),
     "RequestDuePage": ("cayu.collaboration.requests", "RequestDuePage"),
     "RequestRegistration": ("cayu.collaboration.request_access", "RequestRegistration"),
+    "ConfiguredRequestPlanningPolicy": (
+        "cayu.collaboration.planning",
+        "ConfiguredRequestPlanningPolicy",
+    ),
+    "RequestPlanningLimits": ("cayu.collaboration.planning", "RequestPlanningLimits"),
+    "RequestPlanningTimer": ("cayu.collaboration.planning", "RequestPlanningTimer"),
+    "RequestPlanningPrerequisite": ("cayu.collaboration.planning", "RequestPlanningPrerequisite"),
+    "RequestPlanningDefer": ("cayu.collaboration.planning", "RequestPlanningDefer"),
+    "RequestPlanningDecline": ("cayu.collaboration.planning", "RequestPlanningDecline"),
+    "RequestPlanningClarify": ("cayu.collaboration.planning", "RequestPlanningClarify"),
+    "RequestPlanningRule": ("cayu.collaboration.planning", "RequestPlanningRule"),
+    "RequestPlanningPredecessor": ("cayu.collaboration.planning", "RequestPlanningPredecessor"),
+    "RequestPlanningRequest": ("cayu.collaboration.planning", "RequestPlanningRequest"),
+    "RequestPlanningControl": ("cayu.collaboration.planning", "RequestPlanningControl"),
+    "planning_policy_commitment": ("cayu.collaboration.planning", "planning_policy_commitment"),
+    "RequestPlanningEvent": ("cayu.collaboration._planning_records", "RequestPlanningEvent"),
+    "RequestPlanningReceipt": ("cayu.collaboration._planning_records", "RequestPlanningReceipt"),
+    "RequestPlanningSuccessor": (
+        "cayu.collaboration._planning_records",
+        "RequestPlanningSuccessor",
+    ),
+    "RequestPlanningRecord": ("cayu.collaboration._planning_records", "RequestPlanningRecord"),
+    "RequestPlanningCursor": ("cayu.collaboration._planning_records", "RequestPlanningCursor"),
+    "RequestPlanningPage": ("cayu.collaboration._planning_records", "RequestPlanningPage"),
+    "RequestPlanningAdmissionReader": (
+        "cayu.collaboration.request_access",
+        "RequestPlanningAdmissionReader",
+    ),
     "CollaborationRequest": ("cayu.collaboration.requests", "CollaborationRequest"),
     "RequestAlias": ("cayu.collaboration.requests", "RequestAlias"),
     "RequestRef": ("cayu.collaboration.requests", "RequestRef"),

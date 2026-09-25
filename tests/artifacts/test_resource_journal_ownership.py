@@ -20,6 +20,7 @@ from cayu.artifacts.resources import (
     ResourceAcquisitionCommand,
     ResourceOwnerUnavailable,
     ResourceTransferCommand,
+    ResourceTransferTemplate,
 )
 from cayu.collaboration._contracts import ExactMatch
 
@@ -53,6 +54,11 @@ def _reader_for_store(reader, store):
             pair
             for pair in reader._responsibilities
             if isinstance(pair[0], ResourceTransferCommand)
+        ),
+        transfer_templates=tuple(
+            pair
+            for pair in reader._responsibilities
+            if isinstance(pair[0], ResourceTransferTemplate)
         ),
     )
 

@@ -242,6 +242,8 @@ class RequestCoordinator:
         self._resolver_ref = None
         self._receiving_ref = None
         self._clarification_policies: dict[ObjectRef, ClarificationPolicy] = {}
+        self._planning_policies = {}
+        self._planning_readers = {}
         if registration is not None:
             if (
                 type(registration) is not RequestRegistration
@@ -252,11 +254,22 @@ class RequestCoordinator:
                 or len(registration.resource_owners) > 32
                 or type(registration.clarification_policies) is not tuple
                 or len(registration.clarification_policies) > MAX_CLARIFICATION_POLICIES
+                or type(registration.planning_policies) is not tuple
+                or len(registration.planning_policies) > 32
+                or type(registration.planning_readers) is not tuple
+                or len(registration.planning_readers) > 32
             ):
                 raise CollaborationContractError("Invalid request owner registration.")
             self._resolver_ref = prepare_contract(
                 ObjectRef, registration.mandates.ref, redactor=redactor
             )
+            for owner in registration.resource_owners:
+                if (
+                    not isinstance(owner, ResourceSelectorOwner)
+                    or owner.owner in self._resource_owners
+                ):
+                    raise CollaborationContractError("Invalid request resource owner registration.")
+                self._resource_owners[owner.owner] = owner
             if registration.prepared_admission is not None:
                 from cayu.collaboration._recipient_admission_receiver import (
                     RecipientAdmissionReceivingOwner,
@@ -285,6 +298,7 @@ class RequestCoordinator:
                         read_admission=self._prepared_read_admission,
                         delegate=registration.receiving_owner,
                         redactor=redactor,
+                        resource_owners=self._resource_owners,
                     ),
                 )
                 self._registration = registration
@@ -298,6 +312,64 @@ class RequestCoordinator:
                 ):
                     raise CollaborationContractError("Invalid clarification policy registration.")
                 self._clarification_policies[policy.reference] = policy
+            from cayu.collaboration.planning import (
+                ConfiguredRequestPlanningPolicy,
+                planning_policy_commitment,
+            )
+
+            for candidate in registration.planning_policies:
+                policy = prepare_contract(
+                    ConfiguredRequestPlanningPolicy, candidate, redactor=redactor
+                )
+                planning_policy_commitment(policy, redactor=redactor)
+                from cayu.artifacts.resources import LocalArtifactResourceOwner
+                from cayu.collaboration.planning import RequestPlanningFork, RequestPlanningFresh
+
+                for proposal in (policy.default, *(rule.proposal for rule in policy.rules)):
+                    if isinstance(proposal, (RequestPlanningFresh, RequestPlanningFork)):
+                        for resource in proposal.resources:
+                            source = self._resource_owners.get(resource.acquisition.source)
+                            destination = self._resource_owners.get(resource.transfer.destination)
+                            if (
+                                type(source) is not LocalArtifactResourceOwner
+                                or type(destination) is not LocalArtifactResourceOwner
+                            ):
+                                raise CollaborationContractError(
+                                    "Planning resource owners are not qualified."
+                                )
+                            source._validate_planning_registration(
+                                resource.acquisition, resource.acquisition_permit
+                            )
+                            destination._validate_planning_registration(
+                                resource.transfer, resource.transfer_permit, source=source
+                            )
+                if (
+                    policy.reference.owner.application_scope
+                    != self._resolver_ref.owner.application_scope
+                    or policy.reference in self._planning_policies
+                ):
+                    raise CollaborationContractError("Invalid planning policy registration.")
+                self._planning_policies[policy.reference] = policy
+            from cayu.collaboration.request_access import (
+                RequestAdmissionReader,
+                RequestPlanningAdmissionReader,
+            )
+
+            for candidate in registration.planning_readers:
+                if type(candidate) is not RequestPlanningAdmissionReader or not isinstance(
+                    candidate.reader, RequestAdmissionReader
+                ):
+                    raise CollaborationContractError("Invalid planning prerequisite reader.")
+                ref = prepare_contract(ObjectRef, candidate.reference, redactor=redactor)
+                if (
+                    ref.revision is None
+                    or ref.owner.application_scope != self._resolver_ref.owner.application_scope
+                    or ref in self._planning_readers
+                ):
+                    raise CollaborationContractError(
+                        "Invalid planning prerequisite reader identity."
+                    )
+                self._planning_readers[ref] = candidate.reader
             if registration.receiving_owner is not None:
                 if not isinstance(registration.receiving_owner, RequestReceivingOwner):
                     raise CollaborationContractError("Invalid receiving owner registration.")
@@ -306,13 +378,6 @@ class RequestCoordinator:
                 )
                 if self._receiving_ref.revision is None:
                     raise CollaborationContractError("Receiving owner must have a pinned revision.")
-            for owner in registration.resource_owners:
-                if (
-                    not isinstance(owner, ResourceSelectorOwner)
-                    or owner.owner in self._resource_owners
-                ):
-                    raise CollaborationContractError("Invalid request resource owner registration.")
-                self._resource_owners[owner.owner] = owner
 
     async def _prepared_owner_time(self) -> int:
         store, initialized = self._participants._ready()
@@ -780,7 +845,9 @@ class RequestCoordinator:
             raise CollaborationUnavailable("Observation source read is unavailable.")
         return result
 
-    async def _trusted_mutation(self, command, *, context, operation):
+    async def _trusted_mutation(
+        self, command, *, context, operation, wait_for_settlement: bool = False
+    ):
         if self._registration is None:
             raise CollaborationNotInitialized("No collaboration request owner is registered.")
         value = prepare_contract(
@@ -799,6 +866,7 @@ class RequestCoordinator:
                 expectation=contract_bytes(value, redactor=self._redactor),
                 redactor=self._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, self._redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         )
 
@@ -844,9 +912,27 @@ class RequestCoordinator:
             redactor=self._redactor,
         )
         if isinstance(command, RequestAdmissionCommand) and command.prepared is not None:
+            from cayu.collaboration.prepared_admission import (
+                ForkRecipientAdmissionTarget,
+                FreshRecipientAdmissionTarget,
+            )
+
+            supported_versions = {
+                "fresh": {1, 2, 3, 4},
+                "continue": {2, 3, 4},
+                "fork": {3, 4},
+            }[command.prepared.target.kind]
+            if (
+                isinstance(
+                    command.prepared.target,
+                    (FreshRecipientAdmissionTarget, ForkRecipientAdmissionTarget),
+                )
+                and command.prepared.target.resources
+            ):
+                supported_versions = {4}
             if (
                 type(receiver.prepared_admission_version) is not int
-                or receiver.prepared_admission_version != 1
+                or receiver.prepared_admission_version not in supported_versions
             ):
                 raise CollaborationUnavailable(
                     "Receiving owner does not qualify prepared admission."
@@ -1352,6 +1438,26 @@ class RequestCoordinator:
                     grant, (chosen.sender.reference, chosen.recipient.reference)
                 )
                 if found.admission != "undecided" or found.delivery != "pending":
+                    from cayu.collaboration._planning_control import local_planning_quiescence
+
+                    # Local planning can retain native quiescence evidence.
+                    # Prove it and settle under the same owner transaction; a
+                    # prior read or a missing foreign receipt is not authority.
+                    async with store._transaction(
+                        initialized.binding.application_scope, write=True
+                    ) as tx:
+                        await self._require_retained_read_grant(tx, control.operation, read_grant)
+                        if await local_planning_quiescence(
+                            store, tx, initialized, found, redactor=self._redactor
+                        ):
+                            return await control_in_transaction(
+                                store,
+                                tx,
+                                initialized,
+                                control,
+                                authority_expires_at_ms=permission_deadline,
+                                redactor=self._redactor,
+                            )
                     receiver = registration.receiving_owner
                     if receiver is None or self._receiving_ref is None:
                         raise CollaborationUnavailable(

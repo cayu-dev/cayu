@@ -8,7 +8,7 @@ import warnings
 from typing import Annotated, Literal
 
 import pytest
-from pydantic import StrictBool, StrictStr, ValidationError, field_validator
+from pydantic import Field, StrictBool, StrictStr, Tag, ValidationError, field_validator
 from tests.core._collaboration_fixture import ProbeCommand, ProbeIntent, ProbeReceipt, command, slot
 
 from cayu._exception_groups import iter_exception_tree
@@ -33,9 +33,33 @@ from cayu.collaboration._contracts import (
     HandoffIntent,
     OperationRef,
     TransportClaimRef,
+    snapshot_input,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
 from cayu.vaults.redaction import SecretRedactor
+
+
+def test_snapshot_checks_one_complete_envelope(monkeypatch) -> None:
+    from cayu.collaboration import _contracts
+
+    inspected = []
+    original = _contracts.inspect_bounded_durable_json
+
+    def inspect(value, *args, **kwargs):
+        inspected.append(value)
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(_contracts, "inspect_bounded_durable_json", inspect)
+    raw = {"items": [None, True, 17, 1.5, "visible", {"nested": "text"}]}
+    copied = snapshot_input(raw)
+    assert copied == raw and copied is not raw and copied["items"] is not raw["items"]
+    assert inspected == [copied]
+
+
+@pytest.mark.parametrize("scalar", ["\ud800", float("nan"), float("inf"), "x" * MAX_ENVELOPE_BYTES])
+def test_snapshot_aggregate_rejects_invalid_scalar(scalar) -> None:
+    with pytest.raises(ValueError):
+        snapshot_input({"valid_prefix": "text", "nested": [scalar]})
 
 
 def test_reference_roundtrip_and_detachment() -> None:
@@ -371,6 +395,35 @@ def test_composed_controls_check_validator_output(field: str) -> None:
 
 class LookupEnvelope(ContractValue):
     result: ExactLookup[ProbeReceipt]
+
+
+def test_tagged_branches_preserve_only_schema_control_secret_exemptions() -> None:
+    class First(ContractValue):
+        mode: Literal["first"]
+        payload: StrictStr
+
+    class Second(ContractValue):
+        mode: Literal["second"]
+        payload: StrictStr
+
+    class Envelope(ContractValue):
+        result: Annotated[
+            Annotated[First, Tag("first")] | Annotated[Second, Tag("second")],
+            Field(discriminator="mode"),
+        ]
+
+    redactor = SecretRedactor(["first", "mode"])
+    raw = {"result": {"mode": "first", "payload": "safe"}}
+    checked = prepare_contract(Envelope, raw, redactor=redactor)
+    assert type(checked.result) is First
+    assert (
+        prepare_contract(Envelope, json.loads(checked.model_dump_json()), redactor=redactor)
+        == checked
+    )
+    for canary in ("first", "mode"):
+        raw["result"]["payload"] = canary
+        with pytest.raises(CollaborationContractError):
+            prepare_contract(Envelope, raw, redactor=redactor)
 
 
 @pytest.mark.parametrize("status", ["match", "not_found", "conflict", "unavailable"])

@@ -1,4 +1,4 @@
-"""Explicit host driver for one already-created, inert FRESH recipient.
+"""Explicit driver for inert FRESH/FORK or released whole-turn CONTINUE selection.
 
 The host supplies authenticated contexts and an exact decision from its request
 owner. This is not a planner, worker, recipient launcher or permissive policy.
@@ -11,6 +11,7 @@ from cayu import (
     CayuApp,
     CollaborationAccessContext,
     MandateAccessContext,
+    RecipientContinuationRequest,
     RequestAdmissionCommand,
     RequestAdmissionReceipt,
 )
@@ -20,7 +21,7 @@ from cayu.sessions import RecipientSessionCreationRequest
 
 async def admit_prepared_recipient(
     app: CayuApp,
-    creation: RecipientSessionCreationRequest,
+    creation: RecipientSessionCreationRequest | RecipientContinuationRequest,
     decision: RequestAdmissionCommand,
     *,
     creation_context: CollaborationAccessContext,
@@ -32,7 +33,11 @@ async def admit_prepared_recipient(
     before preparing a replacement. Repeating preparation below is appropriate
     for a new decision, not required for historical acknowledgement recovery.
     """
-    proposed = await app.prepare_recipient_admission(creation, context=creation_context)
+    proposed = (
+        await app.prepare_recipient_continuation(creation, context=creation_context)
+        if isinstance(creation, RecipientContinuationRequest)
+        else await app.prepare_recipient_admission(creation, context=creation_context)
+    )
     if decision.prepared != proposed:
         raise ValueError("Decision does not name this exact prepared recipient.")
     receipt = await app.admit_collaboration_request(decision, context=receiving_context)

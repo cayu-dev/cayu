@@ -38,6 +38,7 @@ from cayu.collaboration.access import (
 from cayu.collaboration.base import (
     IDENTITY_FAMILY,
     LIFECYCLE_FAMILY,
+    PLANNING_FAMILY,
     REQUEST_FAMILY,
     CollaborationStore,
 )
@@ -261,7 +262,7 @@ class ParticipantCoordinator:
             store.capabilities(initialized.owner),
             expected_owner=initialized.owner,
             required=family,
-            supported=(IDENTITY_FAMILY, LIFECYCLE_FAMILY, REQUEST_FAMILY),
+            supported=(IDENTITY_FAMILY, LIFECYCLE_FAMILY, REQUEST_FAMILY, PLANNING_FAMILY),
             access="mutation" if mutation else "readback",
             redactor=self._redactor,
         )

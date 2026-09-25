@@ -23,6 +23,37 @@ KEYS = {
     "clarification_lineages": ("namespace", "generation", "caller_key"),
     "clarification_services": ("namespace", "generation", "caller_key"),
     "clarification_deliveries": ("namespace", "generation", "caller_key"),
+    "request_plans": ("namespace", "generation", "caller_key"),
+    "request_plan_stages": ("namespace", "generation", "caller_key"),
+    "request_plan_events": ("sequence",),
+}
+_PLANNING_TABLES = frozenset({"request_plans", "request_plan_stages", "request_plan_events"})
+_PLANNING_INDEXES = {
+    "cayu_collaboration_plan_request_generation_idx": (
+        "cayu_collaboration_request_plans",
+        ("scope", "request_id", "request_incarnation", "planning_generation"),
+        True,
+    ),
+    "cayu_collaboration_plan_due_idx": (
+        "cayu_collaboration_request_plans",
+        ("scope", "state", "next_due_at_ms", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_plan_pending_idx": (
+        "cayu_collaboration_request_plans",
+        ("scope", "pending_stages", "next_due_at_ms", "namespace", "generation", "caller_key"),
+        False,
+    ),
+    "cayu_collaboration_plan_stage_ordinal_idx": (
+        "cayu_collaboration_request_plan_stages",
+        ("scope", "plan_namespace", "plan_generation", "plan_key", "ordinal"),
+        True,
+    ),
+    "cayu_collaboration_plan_stage_native_idx": (
+        "cayu_collaboration_request_plan_stages",
+        ("scope", "native_namespace", "native_generation", "native_key"),
+        True,
+    ),
 }
 _CLARIFICATION_TABLES = frozenset(
     {
@@ -120,6 +151,25 @@ _REQUEST_INDEXES = {
 }
 _LIFECYCLE_TABLES = frozenset({"namespaces", "lifecycle_history", "participant_permits", "permits"})
 EXTRA_COLUMNS = {
+    "request_plans": (
+        "request_id",
+        "request_incarnation",
+        "participant_id",
+        "planning_generation",
+        "state",
+        "pending_stages",
+        "next_due_at_ms",
+    ),
+    "request_plan_stages": (
+        "plan_namespace",
+        "plan_generation",
+        "plan_key",
+        "ordinal",
+        "native_namespace",
+        "native_generation",
+        "native_key",
+        "state",
+    ),
     "clarification_deliveries": (
         "participant_id",
         "state",
@@ -148,7 +198,19 @@ EXTRA_COLUMNS = {
     ),
 }
 _NUMERIC_COLUMNS = frozenset(
-    {"generation", "revision", "sequence", "position", "next_due_at_ms", "lineage_generation"}
+    {
+        "generation",
+        "revision",
+        "sequence",
+        "position",
+        "next_due_at_ms",
+        "lineage_generation",
+        "planning_generation",
+        "pending_stages",
+        "plan_generation",
+        "native_generation",
+        "ordinal",
+    }
 )
 _LIFECYCLE_INDEXES = {
     "cayu_collaboration_permit_position_idx": (
@@ -189,6 +251,7 @@ def _ddl(postgres: bool) -> tuple[str, ...]:
             family in _LIFECYCLE_TABLES
             or family in _REQUEST_TABLES
             or family in _CLARIFICATION_TABLES
+            or family in _PLANNING_TABLES
         ):
             continue
         statements.append(_record_ddl(family, columns, postgres))
@@ -263,13 +326,31 @@ POSTGRES_COLLABORATION_CLARIFICATION_DDL = _clarification_ddl(True)
 SQLITE_COLLABORATION_CLARIFICATION_DDL = ";\n".join(_clarification_ddl(False)) + ";"
 
 
-def _tables(*, lifecycle: bool, requests: bool = False, clarifications: bool = False):
+def _planning_ddl(postgres: bool) -> tuple[str, ...]:
+    return (
+        *(_record_ddl(family, KEYS[family], postgres) for family in sorted(_PLANNING_TABLES)),
+        *(
+            f"CREATE {'UNIQUE ' if unique else ''}INDEX IF NOT EXISTS {name} ON {table} ({', '.join(columns)})"
+            for name, (table, columns, unique) in _PLANNING_INDEXES.items()
+        ),
+    )
+
+
+POSTGRES_COLLABORATION_PLANNING_DDL = _planning_ddl(True)
+SQLITE_COLLABORATION_PLANNING_DDL = ";\n".join(_planning_ddl(False)) + ";"
+
+
+def _tables(
+    *, lifecycle: bool, requests: bool = False, clarifications: bool = False, planning: bool = False
+):
     for family, columns in KEYS.items():
         if family in _LIFECYCLE_TABLES and not lifecycle:
             continue
         if family in _REQUEST_TABLES and not requests:
             continue
         if family in _CLARIFICATION_TABLES and not clarifications:
+            continue
+        if family in _PLANNING_TABLES and not planning:
             continue
         primary = ("scope", *columns)
         yield (
@@ -298,9 +379,10 @@ def validate_sqlite_collaboration_schema(
     lifecycle: bool = False,
     requests: bool = False,
     clarifications: bool = False,
+    planning: bool = False,
 ) -> None:
     for table, columns, primary in _tables(
-        lifecycle=lifecycle, requests=requests, clarifications=clarifications
+        lifecycle=lifecycle, requests=requests, clarifications=clarifications, planning=planning
     ):
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
         expected = [
@@ -319,11 +401,12 @@ def validate_sqlite_collaboration_schema(
     ).fetchall()
     if tuple(row[2] for row in rows) != ("scope", "participant_id", "sequence"):
         raise SchemaError("Collaboration event lookup index is unavailable.")
-    if lifecycle or requests or clarifications:
+    if lifecycle or requests or clarifications or planning:
         indexes_to_check = {
             **(_LIFECYCLE_INDEXES if lifecycle else {}),
             **(_REQUEST_INDEXES if requests else {}),
             **(_CLARIFICATION_INDEXES if clarifications else {}),
+            **(_PLANNING_INDEXES if planning else {}),
         }
         for name, (table, columns, unique) in indexes_to_check.items():
             indexes = {row[1]: row for row in connection.execute(f"PRAGMA index_list({table})")}
@@ -343,9 +426,10 @@ async def validate_postgres_collaboration_schema(
     lifecycle: bool = False,
     requests: bool = False,
     clarifications: bool = False,
+    planning: bool = False,
 ) -> None:
     for table, columns, primary in _tables(
-        lifecycle=lifecycle, requests=requests, clarifications=clarifications
+        lifecycle=lifecycle, requests=requests, clarifications=clarifications, planning=planning
     ):
         await cursor.execute(
             """SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull
@@ -378,11 +462,12 @@ async def validate_postgres_collaboration_schema(
         AND i.indisvalid AND i.indpred IS NULL GROUP BY i.indexrelid""")
     if await cursor.fetchall() != [(["scope", "participant_id", "sequence"],)]:
         raise SchemaError("Collaboration event lookup index is unavailable.")
-    if lifecycle or requests or clarifications:
+    if lifecycle or requests or clarifications or planning:
         indexes_to_check = {
             **(_LIFECYCLE_INDEXES if lifecycle else {}),
             **(_REQUEST_INDEXES if requests else {}),
             **(_CLARIFICATION_INDEXES if clarifications else {}),
+            **(_PLANNING_INDEXES if planning else {}),
         }
         for name, (table, columns, unique) in indexes_to_check.items():
             await cursor.execute(

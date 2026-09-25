@@ -9,6 +9,7 @@ from cayu.collaboration._contracts import ContractValue, ExactLookup, ObjectRef
 from cayu.collaboration._permits import PermitCommand, ReceivingSettlementReceipt
 from cayu.collaboration.clarifications import ClarificationPolicy
 from cayu.collaboration.mandates import MandateAccessContext, MandateResolver, ResourceSelectorOwner
+from cayu.collaboration.planning import ConfiguredRequestPlanningPolicy
 from cayu.collaboration.requests import (
     Millis,
     RequestAdmissionCommand,
@@ -57,6 +58,9 @@ class RequestReceivingOwner(ABC):
     """
 
     # Explicit qualification, not inherited from the existing export contract.
+    # 1: inert FRESH; 2: FRESH and exact released whole-turn CONTINUE selection.
+    # 3: those families plus inert FORK with native historical-selection evidence.
+    # 4: also authenticate exact adopted resource material through admission.
     prepared_admission_version: ClassVar[int] = 0
 
     @property
@@ -91,6 +95,14 @@ class PreparedAdmissionRegistration:
 
 
 @dataclass(frozen=True)
+class RequestPlanningAdmissionReader:
+    """Pin an existing authenticated admission reader for planning prerequisites."""
+
+    reference: ObjectRef
+    reader: RequestAdmissionReader
+
+
+@dataclass(frozen=True)
 class RequestRegistration:
     mandates: MandateResolver
     max_ttl_ms: int
@@ -98,3 +110,5 @@ class RequestRegistration:
     receiving_owner: RequestReceivingOwner | None = None
     clarification_policies: tuple[ClarificationPolicy, ...] = ()
     prepared_admission: PreparedAdmissionRegistration | None = None
+    planning_policies: tuple[ConfiguredRequestPlanningPolicy, ...] = ()
+    planning_readers: tuple[RequestPlanningAdmissionReader, ...] = ()

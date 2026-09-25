@@ -29,6 +29,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Human review](human-review.md)
 - [Host-owned tool execution](host-owned-tool-execution.md)
 - [Exact immutable input resources](immutable-resources.md)
+- [Application-owned resource access](resource-access.md)
 - [Memory foundation](memory-foundation.md)
 - [Search when automatic recall is insufficient](knowledge-search-fallback.md)
 - [Opt-in knowledge offers](knowledge-offers.md)

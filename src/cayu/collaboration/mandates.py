@@ -67,6 +67,15 @@ class ResourceSelector(ContractValue):
 
 class ResourceSelectorOwner(ABC):
     @property
+    def canonical_resource_kinds(self) -> tuple[str, ...] | None:
+        """Immutable owner-configuration scope; None explicitly covers all kinds.
+
+        Other kinds retain generic exact-identity semantics, not subtree or
+        resource-effect authority. Bind changes to the owner's configuration.
+        """
+        return None
+
+    @property
     @abstractmethod
     def owner(self) -> OwnerRef:
         """Exact registered resource owner/configuration incarnation."""

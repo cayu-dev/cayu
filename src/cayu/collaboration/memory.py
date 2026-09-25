@@ -20,6 +20,16 @@ from cayu.collaboration._clarification_state import ClarificationQuestionState
 from cayu.collaboration._contracts import CollaborationContractError, ContractValue, snapshot_input
 from cayu.collaboration._history_references import history_references
 from cayu.collaboration._ownership import _MutationOwners
+from cayu.collaboration._planning_records import (
+    PENDING_PLANNING_STATES,
+    PLANNING_RECORD_FAMILIES,
+    RequestPlanningCursor,
+    RequestPlanningRecord,
+    RequestPlanningStageRecord,
+    planning_cursor_key,
+    planning_record_projection,
+    prepare_planning_scan,
+)
 from cayu.collaboration.base import CollaborationStore, Key, Table
 from cayu.collaboration.participants import CollaborationUnavailable
 
@@ -34,6 +44,9 @@ class _MemoryRepository:
 
     async def get(self, table: Table, key: Key) -> object | None:
         value = deepcopy(self.rows.get((table, key)))
+        if value is not None and table in PLANNING_RECORD_FAMILIES:
+            record, _ = planning_record_projection(table, value, scope=self.scope, key=key)
+            return snapshot_input(record)
         if value is not None and table in CLARIFICATION_RECORD_FAMILIES:
             record, _ = clarification_record_projection(table, value, scope=self.scope, key=key)
             return snapshot_input(record)
@@ -42,6 +55,26 @@ class _MemoryRepository:
     async def put(self, table: Table, key: Key, value: ContractValue, *, insert: bool) -> None:
         if insert and (table, key) in self.rows:
             raise CollaborationUnavailable("Collaboration unique record already exists.")
+        if table in PLANNING_RECORD_FAMILIES:
+            value, projection = planning_record_projection(table, value, scope=self.scope, key=key)
+            for (family, prior_key), prior in self.rows.items():
+                if family != table or prior_key == key:
+                    continue
+                _, prior_projection = planning_record_projection(
+                    table, prior, scope=self.scope, key=prior_key
+                )
+                if (
+                    table == "request_plans"
+                    and (projection[0], projection[1], projection[3])
+                    == (prior_projection[0], prior_projection[1], prior_projection[3])
+                ) or (
+                    table == "request_plan_stages"
+                    and (
+                        projection[:4] == prior_projection[:4]
+                        or projection[4:7] == prior_projection[4:7]
+                    )
+                ):
+                    raise CollaborationUnavailable("Planning unique index already exists.")
         if table in CLARIFICATION_RECORD_FAMILIES:
             value, _ = clarification_record_projection(table, value, scope=self.scope, key=key)
         self.rows[table, key] = snapshot_input(value)
@@ -70,6 +103,70 @@ class _MemoryRepository:
         ]
         records.sort(key=lambda item: item[0])
         return [deepcopy(value) for _, value in records[:limit]]
+
+    async def scan_request_plans(self, request, *, limit):
+        from cayu.collaboration.requests import RequestRef
+
+        request = prepare_planning_scan(request, scope=self.scope, limit=limit, kind="request")
+        assert isinstance(request, RequestRef)
+        records = []
+        for (table, key), raw in self.rows.items():
+            if table != "request_plans":
+                continue
+            record, _ = planning_record_projection(table, raw, scope=self.scope, key=key)
+            assert isinstance(record, RequestPlanningRecord)
+            if record.receipt.command.expected.intent.selection.reference == request:
+                records.append(record)
+        records.sort(key=lambda record: record.receipt.command.planning_generation)
+        return [snapshot_input(record) for record in records[:limit]]
+
+    async def _request_plan_stages(self, operation, *, limit, native):
+        operation = prepare_planning_scan(
+            operation, scope=self.scope, limit=limit, kind="native_stage" if native else "stages"
+        )
+        records = []
+        for (table, key), raw in self.rows.items():
+            if table != "request_plan_stages":
+                continue
+            record, _ = planning_record_projection(table, raw, scope=self.scope, key=key)
+            assert isinstance(record, RequestPlanningStageRecord)
+            target = record.intent.command.operation if native else record.intent.plan
+            if target == operation:
+                records.append(record)
+        records.sort(key=lambda record: record.intent.ordinal)
+        if native and len(records) > 1:
+            raise CollaborationContractError("Native operation has conflicting planning stages.")
+        return [snapshot_input(record) for record in records[:limit]]
+
+    async def scan_request_plan_stages(self, plan, *, limit):
+        return await self._request_plan_stages(plan, limit=limit, native=False)
+
+    async def find_request_plan_stage(self, native_operation):
+        rows = await self._request_plan_stages(native_operation, limit=1, native=True)
+        return rows[0] if rows else None
+
+    async def scan_pending_request_plans(self, *, after, limit):
+        cursor = prepare_planning_scan(after, scope=self.scope, limit=limit, kind="pending")
+        assert cursor is None or isinstance(cursor, RequestPlanningCursor)
+        records = []
+        for (table, key), raw in self.rows.items():
+            if table != "request_plans":
+                continue
+            record, _ = planning_record_projection(table, raw, scope=self.scope, key=key)
+            assert isinstance(record, RequestPlanningRecord)
+            operation = record.receipt.command.operation
+            identity = (
+                record.next_due_at_ms,
+                operation.namespace_incarnation,
+                operation.generation,
+                operation.caller_key,
+            )
+            if (record.state in PENDING_PLANNING_STATES or record.pending_stages > 0) and (
+                cursor is None or identity > planning_cursor_key(cursor)
+            ):
+                records.append((identity, record))
+        records.sort(key=lambda item: item[0])
+        return [snapshot_input(record) for _, record in records[:limit]]
 
     async def scan(self, table, *, after, limit, allowed):
         rows: list[tuple[Any, dict[str, Any]]] = []
@@ -264,6 +361,7 @@ class _MemoryRepository:
 
 class InMemoryCollaborationStore(CollaborationStore):
     request_contract_version = 2
+    planning_contract_version = 1
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()

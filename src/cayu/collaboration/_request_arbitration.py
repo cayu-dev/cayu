@@ -172,6 +172,7 @@ async def admit_in_transaction(
     *,
     settlement: ReceivingSettlementReceipt | None = None,
     redactor: SecretRedactor,
+    _planned_stage=None,
 ) -> RequestAdmissionReceipt:
     from cayu.collaboration._prepared_admission_store import (
         register_prepared_admission,
@@ -179,6 +180,11 @@ async def admit_in_transaction(
     )
 
     command = prepare_contract(RequestAdmissionCommand, command, redactor=redactor)
+    from cayu.collaboration._planning_stages import finish_stage, require_receiving_stage
+
+    await require_receiving_stage(
+        store, tx, initialized, command, _planned_stage, redactor=redactor
+    )
     anchor = await store._anchor(tx, initialized, redactor)
     prior = await _expected_prior(store, tx, initialized, command, redactor)
     raw = await tx.get("operations", _record_key(command))
@@ -215,8 +221,8 @@ async def admit_in_transaction(
     state = cast(
         "AdmissionState",
         {
-            "continue": "admitted" if command.evidence else "preparing",
-            "fork": "admitted" if command.evidence else "preparing",
+            "continue": "admitted" if command.evidence or command.prepared else "preparing",
+            "fork": "admitted" if command.evidence or command.prepared else "preparing",
             "fresh": "admitted" if command.evidence or command.prepared else "preparing",
             "defer": "deferred",
             "clarify": "clarifying",
@@ -338,6 +344,16 @@ async def admit_in_transaction(
         consume_reserved=outcome_receipt is not None,
         redactor=redactor,
     )
+    if _planned_stage is not None:
+        await finish_stage(
+            store,
+            tx,
+            initialized,
+            _planned_stage.plan,
+            _planned_stage.intent,
+            receipt,
+            redactor=redactor,
+        )
     return receipt
 
 

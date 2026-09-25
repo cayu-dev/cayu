@@ -131,7 +131,7 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     assert "COVERAGE_FILE" not in runner
 
     assert "github.event_name == 'pull_request'" not in specialists
-    assert "timeout-minutes: 30" in specialists
+    assert "timeout-minutes: 45" in specialists
     assert "stress-process" not in specialists
     assert "postgres-conformance-8" in specialists
     assert "scripts/run_ci.py --lane specialist" in specialists

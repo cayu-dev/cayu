@@ -56,7 +56,11 @@ does not satisfy the old selector. Acquisition rechecks the identity after
 pinning, closing the selector-to-pin replacement window. Folder members use
 these same artifact identities.
 Synchronous mandate canonicalization validates the exact identity format, not
-live artifact existence. Acquisition observes live publication metadata in its
+live artifact existence. The native owner declares only artifact and folder
+canonicalization kinds; other exact references sharing its owner identity, such
+as session transcript references, are not interpreted as artifacts. This routing
+does not authorize acquisition or disclosure of any additional resource type.
+Acquisition observes live publication metadata in its
 retained asynchronous worker before dispatch; blocked filesystem observation
 does not block the event loop or release the operation fence on caller timeout
 or cancellation. The synchronous host discovery/manifest-registration APIs
@@ -94,12 +98,42 @@ registers that exact obligation with the collaboration store. Registration
 failure or a lost acknowledgement retains the original operation for recovery.
 Cleanup publishes local quiescence before collaboration settlement; a failed
 settlement remains capacity-counted and is retried by `reconcile()`.
+`settle_preparation(command, permit=...)` discharges an exact registered
+acquisition or transfer even when no acquisition receipt reached the caller.
+The concrete mandate receiver requires separate current `release` authority
+and compares the complete registered command/permit pair. Other preparation
+receivers fail closed unless they implement `authorize_preparation_cleanup`.
+If dispatch has not started, the native owner records a bounded released
+tombstone before acknowledging exclusion; it never manufactures an acquisition
+receipt or preparation lease. If work was already acquired or partially pinned,
+the same native mutation fence owns its normal release first. Lost settlement
+acknowledgements retain that terminal record for exact retry after reconstruction.
+Observer cancellation does not release the fence or authorize a late acquisition.
+Excluding a transfer before its receiving record exists additionally requires
+`source_owner=...`; the owner authenticates the original acquisition receipt
+under both native mutation fences. A template and a caller-shaped source receipt
+are insufficient. This historical cleanup check does not renew source disclosure
+rights; an already-retained transfer can replay without the source owner.
+These records use resource-journal schema version 3; unsupported journal versions
+are refused, not silently interpreted as current authority.
+An optional `ResourceAcquisitionIntent.deadline_at_ms` narrows preparation expiry.
+The registered receiver bounds both acquisition and transfer leases by this
+absolute deadline, and the native owner rejects leases that exceed it. Changing
+the deadline changes the exact command. Independent release authority remains
+usable after preparation expires.
 Acquisitions and transfers share one event budget. Admission reserves seven
 stage-event slots before dispatch, including cleanup and responsibility settlement.
 Each operation stage has one immutable event; retry diagnostics update the
 retained snapshot without spending more stage slots. Unused slots are released
 only after responsibility settlement, so retries cannot consume another
 operation's mandatory cleanup capacity.
+The concrete mandate receiver's fixed command/template and permit registrations
+also reserve native operation capacity and two terminal-event slots before they
+qualify for planning. These inert reservations authorize no resource operation.
+They preserve exclusion and responsibility-settlement capacity if optional
+acquisition or transfer admission is refused. Exact reconstruction reuses the
+reservation; changing its registered tuple conflicts. Admitted operations replace
+their own unused reservation, never another operation's cleanup space.
 Every journal publication also preserves a worst-case byte and JSON-node
 envelope for each unsettled operation's receipts, diagnostics and remaining
 events. Pending admission reserves this space before responsibility registration
@@ -197,6 +231,17 @@ publication. Partial transfers retain their pins and capacity until owner-intern
 cleanup and collaboration settlement; definite mandate denial triggers cleanup
 without waiting for lease expiry. Reopening uses the same registered transfer
 tuple and operation identity, never a new allocation key.
+For a preparation sequence registered before acquisition completes, the receiver
+may instead register an exact `(ResourceTransferTemplate, permit)` pair through
+`transfer_templates`. The template pins the full acquisition command, transfer
+operation, source/destination, initiator and acceptance generation. Its `bind()`
+method constructs transfer data from the resulting receipt; it grants no access.
+The existing transfer owner still authenticates that complete receipt through
+the source owner before any destination pin. Current mandate authorization and
+revocation checks remain mandatory. The template is part of the immutable lease
+registration, so reopening uses the same template rather than changing the
+registration after acquisition. Explicit command registrations remain supported;
+an operation cannot appear in both forms.
 Only after the destination receipt is read back by the registered destination
 owner may the source release its pin. S3, Docker mounts, mutable workspaces,
 and transformed or unqualified artifact-store adapters are not advertised by

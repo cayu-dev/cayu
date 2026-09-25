@@ -18,6 +18,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Future
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -1322,8 +1323,12 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("PRAGMA journal_mode = WAL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def _ensure_schema(self) -> None:
@@ -1333,7 +1338,7 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
             if self._schema_ready:
                 return
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS cayu_memory_intervention_executions (
@@ -1359,7 +1364,7 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
         document: str,
     ) -> MemoryInterventionExecutionRecord:
         self._ensure_schema()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT revision, document FROM cayu_memory_intervention_executions "
@@ -1390,7 +1395,7 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
 
     def _load_sync(self, execution_id: str) -> MemoryInterventionExecutionRecord | None:
         self._ensure_schema()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT revision, document FROM cayu_memory_intervention_executions "
                 "WHERE execution_id = ?",
@@ -1421,7 +1426,7 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
         desired: MemoryInterventionExecutionRecord,
     ) -> MemoryInterventionExecutionRecord:
         self._ensure_schema()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT revision, document FROM cayu_memory_intervention_executions "
@@ -1474,7 +1479,7 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
         request: DurableOperationOwnershipTransition,
     ) -> MemoryInterventionRuntimeOwnershipResult:
         self._ensure_schema()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT revision, document FROM cayu_memory_intervention_executions "

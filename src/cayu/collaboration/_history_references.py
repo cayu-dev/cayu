@@ -25,8 +25,21 @@ HistoryKey = tuple[HistoryFamily, str, int]
 
 
 def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
+    from cayu.collaboration._planning_records import (
+        RequestPlanningReceipt,
+        RequestPlanningStageRecord,
+    )
+
     snapshots = ()
-    if isinstance(value, ParticipantReceipt):
+    if isinstance(value, (RequestPlanningReceipt, RequestPlanningStageRecord)):
+        expected = (
+            value.command.expected
+            if isinstance(value, RequestPlanningReceipt)
+            else value.intent.command.expected
+        )
+        selected = expected.intent.selection
+        snapshots = (selected.sender, selected.recipient)
+    elif isinstance(value, ParticipantReceipt):
         snapshots = value.participants
     elif isinstance(value, LifecycleReceipt) and value.participant is not None:
         snapshots = (value.participant,)

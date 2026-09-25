@@ -190,6 +190,34 @@ async def registered_receipt(
     return receipt
 
 
+async def require_terminal_permit_receipt(
+    tx: _Repository, expected: PermitCommand, *, redactor: SecretRedactor
+) -> PermitExclusion | PermitSettlement:
+    """Read exact terminal source evidence without granting receiving authority.
+
+    Exclusion occupies the original operation; registered work settles in its
+    reserved slot. Callers must still corroborate the receiving owner's identity
+    and domain-specific disposition against their own authenticated readback.
+    """
+    retained = prepare_permit_record(await tx.get("operations", _key(expected)), redactor)
+    if not isinstance(retained, PermitExclusion):
+        if await registered_receipt(tx, expected, redactor) is None:
+            raise CollaborationUnavailable("Permit source registration is missing.")
+        operation = expected.intent.request.settlement_operation
+        retained = prepare_permit_record(
+            await tx.get(
+                "operations",
+                (operation.namespace_incarnation, operation.generation, operation.caller_key),
+            ),
+            redactor,
+        )
+    if not isinstance(retained, (PermitExclusion, PermitSettlement)):
+        raise CollaborationUnavailable("Permit source settlement is unavailable.")
+    require_exact_contract(expected, retained.expected, redactor=redactor)
+    await require_event(tx, retained.event, redactor)
+    return retained
+
+
 async def register_permit(
     store: CollaborationStore,
     initialized: CollaborationInitialization,
@@ -206,12 +234,17 @@ async def register_permit_in_transaction(
     initialized: CollaborationInitialization,
     expected: PermitCommand,
     redactor: SecretRedactor,
+    *,
+    _view_reservation=None,
 ) -> PermitReceipt:
     """Compose permit admission with the receiving owner's atomic mutation."""
     anchor = await store._anchor(tx, initialized, redactor)
     replay = await registered_receipt(tx, expected, redactor)
     if replay is not None:
         return replay
+    from cayu.collaboration._planning_view_reservation import require_view_reservation
+
+    await require_view_reservation(tx, expected, _view_reservation, redactor=redactor)
     namespace = await require_open_namespace(tx, anchor, expected.operation, redactor)
     request = expected.intent.request
     participant = await store._participant(tx, request.participant, initialized.owner, redactor)
@@ -366,6 +399,12 @@ async def exclude_permit(
             # Fully validate all existing registration/settlement representations.
             await registered_receipt(tx, expected, redactor)
         else:
+            from cayu.collaboration._planning_view_reservation import view_permit_stage
+
+            if await view_permit_stage(tx, expected, redactor=redactor) is not None:
+                raise CollaborationConflict(
+                    "Unregistered view permits must be excluded by their planning stage."
+                )
             if expected.operation.generation <= anchor.retired_through:
                 # Retirement is permanent admission rejection, including after
                 # exact history pruning. It is not fabricated receipt matching.

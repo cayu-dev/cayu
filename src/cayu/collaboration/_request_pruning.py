@@ -107,6 +107,14 @@ async def prune_request_batch(
         start = prior.next_event_index
     if snapshot is None or snapshot.state == "open" or snapshot.receipt.expected != command:
         raise CollaborationUnavailable("Retired request lacks exact terminal evidence.")
+    if raw_progress is None:
+        from cayu.collaboration._planning_retention import prune_request_plans
+
+        planning = await prune_request_plans(
+            store, tx, anchor.initialization, command, limit=limit, redactor=redactor
+        )
+        if planning is not None:
+            return planning
     questions, question_digest = await question_pruning_material(tx, snapshot, redactor)
     if prior is not None and prior.clarification_sha256 != question_digest:
         raise CollaborationUnavailable("Clarification pruning material changed between batches.")

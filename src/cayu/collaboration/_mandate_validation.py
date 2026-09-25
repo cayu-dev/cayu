@@ -8,7 +8,7 @@ from itertools import pairwise
 from pydantic import Field
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
-from cayu.collaboration._contracts import ContractValue, Identifier, ObjectRef, OwnerRef
+from cayu.collaboration._contracts import ContractValue, Identifier, ObjectRef, OwnerRef, _code
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration.mandates import (
     CollaborationMandate,
@@ -80,8 +80,35 @@ def validate_mandate_resolution(
     ):
         raise MandateDenied()
 
-    def canonical(selector: ResourceSelector) -> None:
+    def selector_owner(selector: ResourceSelector):
         owner = resource_owners.get(selector.resource.owner)
+        if owner is None:
+            return None
+        if (
+            not isinstance(owner, ResourceSelectorOwner)
+            or prepare_contract(OwnerRef, owner.owner, redactor=redactor) != selector.resource.owner
+        ):
+            raise MandateDenied()
+        kinds = owner.canonical_resource_kinds
+        if kinds is not None:
+            if (
+                type(kinds) is not tuple
+                or not 1 <= len(kinds) <= 32
+                or any(type(kind) is not str for kind in kinds)
+                or len(set(kinds)) != len(kinds)
+            ):
+                raise MandateDenied()
+            try:
+                for kind in kinds:
+                    _code(kind)
+            except ValueError:
+                raise MandateDenied() from None
+            if selector.resource.kind not in kinds:
+                return None
+        return owner
+
+    def canonical(selector: ResourceSelector) -> None:
+        owner = selector_owner(selector)
         if owner is None:
             # Exact IDs have no alias/path interpretation. Subtrees always need
             # positive registered-owner evidence, even for identical values.
@@ -89,9 +116,7 @@ def validate_mandate_resolution(
                 raise MandateDenied()
             return
         if (
-            not isinstance(owner, ResourceSelectorOwner)
-            or prepare_contract(OwnerRef, owner.owner, redactor=redactor) != selector.resource.owner
-            or prepare_contract(
+            prepare_contract(
                 ResourceSelector,
                 owner.canonicalize(selector.model_copy(deep=True)),
                 redactor=redactor,
@@ -105,8 +130,8 @@ def validate_mandate_resolution(
             return False
         if parent.mode == "exact":
             return parent == child
-        owner = resource_owners.get(parent.resource.owner)
-        if owner is None:
+        owner = selector_owner(parent)
+        if owner is None or selector_owner(child) is not owner:
             return False
         parent_input = parent.model_copy(deep=True)
         child_input = child.model_copy(deep=True)

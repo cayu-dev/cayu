@@ -94,7 +94,11 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.runtime.evidence_spool import EvidenceSpool
-    from cayu.sessions._context_view_source import ContextViewPublicationSource
+    from cayu.sessions._context_view_source import (
+        CompletedTurnSnapshot,
+        ContextViewPublicationSource,
+    )
+    from cayu.sessions._recipient_continuation import RecipientContinuationSelection
     from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.context_views import (
         ContextViewLifecycleEvent as _ContextViewLifecycleEvent,
@@ -10298,6 +10302,8 @@ class SessionStore(ABC):
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     participant_session_binding_version: ClassVar[int | None] = None
+    recipient_continuation_selection_version: ClassVar[int | None] = None
+    context_view_selection_fence_version: ClassVar[int | None] = None
     context_view_version: ClassVar[int | None] = None
     # Versioned proof for authenticated peer-content append/readback.  Stores
     # must implement the exact append-key CAS before advertising this value.
@@ -10363,6 +10369,26 @@ class SessionStore(ABC):
         """Capture a bounded completed-turn snapshot under one native read boundary."""
         raise NotImplementedError("This SessionStore cannot capture context-view publication.")
 
+    async def _capture_completed_turn_snapshot(self, session_id: str) -> CompletedTurnSnapshot:
+        raise NotImplementedError("This SessionStore cannot capture a current completed turn.")
+
+    async def capture_recipient_continuation(
+        self, session_id: str
+    ) -> RecipientContinuationSelection:
+        """Select exact identity without acquiring a writer or execution authority.
+
+        Wrappers must independently qualify this coherent native read. Inheriting
+        an implementation is not evidence that wrapper-specific state is covered.
+        """
+        from cayu.sessions._recipient_continuation import (
+            require_continuation_selection_store,
+            select_continuation,
+        )
+
+        require_continuation_selection_store(self)
+        session_id = require_clean_nonblank(session_id, "session_id")
+        return select_continuation(await self._capture_completed_turn_snapshot(session_id))
+
     async def publish_context_view(
         self, manifest: _ContextViewManifest, *, publication_key: str
     ) -> _ContextViewManifest:
@@ -10386,6 +10412,85 @@ class SessionStore(ABC):
         self, request: _ContextViewSelectionRequest
     ) -> _ContextViewSelectionReceipt:
         raise NotImplementedError("This SessionStore does not support context-view selection.")
+
+    async def _exclude_context_view_selection(self, request, *, authority):
+        """Atomically decide exclusion or return positive prior selection evidence."""
+        raise NotImplementedError("This SessionStore cannot exclude context-view selection.")
+
+    async def _reserve_context_view_selection_control(self, request, *, authority):
+        """Reserve exact mandatory exclusion capacity before acquiring a view."""
+        raise NotImplementedError("This SessionStore cannot reserve selection cleanup capacity.")
+
+    async def read_context_view_selection_decision(self, request):
+        """Exact receiving readback, not current disclosure or ownership authority."""
+        raise NotImplementedError("This SessionStore cannot read selection decisions.")
+
+    async def _prepare_context_view_selection_target(self, target, *, authority):
+        return await self._context_selection_target_control(target, authority=authority)
+
+    async def _register_context_view_selection_target(self, target, *, authority):
+        return await self._context_selection_target_control(
+            target, authority=authority, register=True
+        )
+
+    async def _exclude_context_view_selection_target(self, target, *, authority):
+        return await self._context_selection_target_control(
+            target, authority=authority, exclude=True
+        )
+
+    async def _context_selection_target_control(
+        self, target, *, authority, register=False, exclude=False
+    ):
+        from cayu.sessions._context_selection_fence import (
+            ContextViewSelectionTarget,
+            require_authority,
+            require_selection_fence_store,
+        )
+
+        require_authority(authority)
+        require_selection_fence_store(self)
+        target = ContextViewSelectionTarget.model_validate(target)
+        return await self._context_selection_control(
+            target.request, authority=authority, exclude=exclude, target=target, register=register
+        )
+
+    async def _context_selection_control(
+        self, request, *, authority, exclude, target=None, register=False
+    ):
+        raise NotImplementedError("This SessionStore cannot own selection responsibility.")
+
+    async def _select_context_view_target(self, target, *, authority):
+        from cayu.sessions._context_selection_fence import (
+            ContextViewSelectionTarget,
+            require_authority,
+            require_selection_fence_store,
+        )
+
+        require_authority(authority)
+        require_selection_fence_store(self)
+        target = ContextViewSelectionTarget.model_validate(target)
+        return await self._select_context_view(target.request, target=target)
+
+    async def _select_context_view(self, request, *, target=None):
+        raise NotImplementedError("This SessionStore cannot consume selection responsibility.")
+
+    async def _read_context_view_retention(self, target):
+        raise NotImplementedError("This SessionStore cannot authenticate retention settlement.")
+
+    async def _adopt_context_view_target(self, target, request, *, authority):
+        from cayu.sessions._context_selection_fence import (
+            ContextViewSelectionTarget,
+            require_authority,
+            require_selection_fence_store,
+        )
+
+        require_authority(authority)
+        require_selection_fence_store(self)
+        target = ContextViewSelectionTarget.model_validate(target)
+        return await self._transition_context_view_ownership(request, target=target)
+
+    async def _transition_context_view_ownership(self, request, *, target=None):
+        raise NotImplementedError("This SessionStore cannot consume retention responsibility.")
 
     async def read_context_view(
         self, view_id: str, *, source_session_id: str
@@ -15481,6 +15586,8 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
     participant_session_binding_version: ClassVar[int | None] = 1
+    recipient_continuation_selection_version: ClassVar[int | None] = 1
+    context_view_selection_fence_version: ClassVar[int | None] = 1
     context_view_version: ClassVar[int | None] = 1
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
@@ -15526,6 +15633,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         self._context_publication_keys: dict[str, str] = {}
         self._context_selection_receipts: dict[str, Any] = {}
         self._context_selection_request_commitments: dict[str, str] = {}
+        self._context_selection_exclusions: dict[str, Any] = {}
         self._context_ownership_operation_commitments: dict[str, str] = {}
         self._context_ownership_operation_receipts: dict[str, Any] = {}
         self._context_lifecycle_events: dict[str, Any] = {}
@@ -17435,7 +17543,11 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     async def capture_context_view_publication_source(
         self, session_id: str
     ) -> ContextViewPublicationSource:
+        return (await self._capture_completed_turn_snapshot(session_id)).publication
+
+    async def _capture_completed_turn_snapshot(self, session_id: str) -> CompletedTurnSnapshot:
         from cayu.sessions._context_view_source import (
+            CompletedTurnSnapshot,
             capture_source,
             closed_round_publication_id,
             completed_boundary,
@@ -17501,7 +17613,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                     min(end, len(messages)),
                 )
             )
-            return capture_source(
+            publication = capture_source(
                 session,
                 binding,
                 checkpoint,
@@ -17509,6 +17621,22 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 None if event is None else event.event,
                 records,
                 tool_receipt,
+            )
+            return CompletedTurnSnapshot(
+                publication=publication,
+                current_session=copy_session(session),
+                checkpoint=deepcopy(checkpoint),
+                has_queued_input=any(
+                    (session_id, mode) in self._pending_session_messages
+                    for mode in SessionMessageDeliveryMode
+                ),
+                has_closure_owner=any(
+                    session_id in _closure_progress_targets(owner)
+                    for owner in self._session_closure_progress.values()
+                ),
+                has_active_model_stage=MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
+                in self._session_operation_records.get(session_id, {}),
+                current_transcript_cursor=len(messages),
             )
 
     async def publish_context_view(
@@ -17583,6 +17711,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     async def select_context_view(
         self, request: _ContextViewSelectionRequest
     ) -> _ContextViewSelectionReceipt:
+        return await self._select_context_view(request)
+
+    async def _select_context_view(self, request, *, target=None):
         from cayu.sessions.context_views import (
             CONTEXT_VIEW_EXPIRY_BATCH_SIZE,
             CONTEXT_VIEW_MAX_SELECTIONS_PER_OWNER,
@@ -17611,6 +17742,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             "context view selection request",
         )
         async with _InMemoryContextViewSelectionTransaction(self):
+            from cayu.sessions._context_selection_fence import require_not_excluded
+
+            require_not_excluded(
+                request,
+                self._context_selection_exclusions.get(request.selection_key),
+                target=target,
+            )
             now_ms = int(self._ownership_clock().timestamp() * 1000)
             expired_count = 0
             for selection_key, receipt in sorted(
@@ -17674,6 +17812,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             source = self._sessions.get(request.source_session_id)
             if source is None or source.instance_id != request.source_session_instance_id:
                 raise LookupError("Context-view source session incarnation is unavailable.")
+            from cayu.sessions._context_selection_fence import require_selection_source
+
+            require_selection_source(
+                target,
+                self._participant_session_bindings.get(request.source_session_id),
+                now_ms=now_ms,
+            )
             candidates = [
                 view
                 for view in self._context_views.values()
@@ -17708,6 +17853,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             if active_pins >= request.limits.max_pins:
                 raise OverflowError("Context-view pin count exceeds the requested limit.")
             selected = max(candidates, key=lambda view: (view.transcript_cursor, view.view_id))
+            from cayu.sessions._context_selection_fence import require_selected_participant
+
+            require_selected_participant(target, selected)
             self._require_context_view_lifecycle_capacity(selected.view_id, additional_slots=1)
             selected_bytes = context_view_manifest_bytes(selected)
             if selected_bytes > request.limits.max_view_bytes:
@@ -17747,6 +17895,136 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             self._context_selection_request_commitments[request.selection_key] = request_commitment
             return receipt.model_copy(deep=True)
 
+    async def _exclude_context_view_selection(self, request, *, authority):
+        return await self._context_selection_control(request, authority=authority, exclude=True)
+
+    async def _reserve_context_view_selection_control(self, request, *, authority):
+        return await self._context_selection_control(request, authority=authority, exclude=False)
+
+    async def _context_selection_control(
+        self, request, *, authority, exclude, target=None, register=False
+    ):
+        from cayu.sessions._context_selection_fence import (
+            CONTEXT_SELECTION_MAX_CONTROLS_PER_OWNER,
+            ContextViewSelectionDecision,
+            control_transition,
+            require_authority,
+            snapshot_request,
+        )
+
+        require_authority(authority)
+        request = snapshot_request(request)
+        async with self._lock:
+            existing = self._context_selection_decision_unlocked(request)
+            decision = control_transition(
+                request, existing, exclude=exclude, target=target, register=register
+            )
+            if decision == existing:
+                return decision
+            if (
+                existing is None
+                and sum(
+                    value.request.source_owner == request.source_owner
+                    for value in self._context_selection_exclusions.values()
+                )
+                >= CONTEXT_SELECTION_MAX_CONTROLS_PER_OWNER
+            ):
+                raise OverflowError("Context-view selection control quota exceeded.")
+            self._context_selection_exclusions[request.selection_key] = decision
+            return ContextViewSelectionDecision.model_validate(decision)
+
+    def _context_selection_decision_unlocked(self, request):
+        from cayu.sessions._context_selection_fence import (
+            ContextViewSelectionConflict,
+            ContextViewSelectionDecision,
+            selected_decision,
+        )
+
+        excluded = self._context_selection_exclusions.get(request.selection_key)
+        receipt = self._context_selection_receipts.get(request.selection_key)
+        if excluded is not None:
+            excluded = ContextViewSelectionDecision.model_validate(excluded)
+            if (
+                excluded.request.selection_key != request.selection_key
+                or (receipt is not None and excluded.state != "reserved")
+                or excluded.state not in {"reserved", "excluded"}
+            ):
+                raise ValueError("Context-view exclusion indexes conflict.")
+            if excluded.request != request:
+                raise ContextViewSelectionConflict("Context-view exclusion evidence conflicts.")
+            if receipt is None:
+                return excluded
+        if receipt is None:
+            return None
+        return selected_decision(
+            request,
+            receipt,
+            self._context_selection_request_commitments.get(request.selection_key),
+            excluded,
+        )
+
+    async def _read_context_view_retention(self, target):
+        from cayu.collaboration._contracts import (
+            ExactConflict,
+            ExactMatch,
+            ExactNotFound,
+            ExactUnavailable,
+        )
+        from cayu.sessions._context_selection_fence import (
+            ContextViewRetentionEvidence,
+            ContextViewSelectionConflict,
+            ContextViewSelectionTarget,
+            retention_evidence,
+        )
+
+        target = ContextViewSelectionTarget.model_validate(target)
+        async with self._lock:
+            try:
+                decision = self._context_selection_decision_unlocked(target.request)
+                if decision is not None and decision.target != target:
+                    return ExactConflict()
+                result = retention_evidence(
+                    target,
+                    decision,
+                    self._context_selection_receipts.get(target.request.selection_key),
+                )
+            except ContextViewSelectionConflict:
+                return ExactConflict()
+            except (TypeError, ValueError):
+                return ExactUnavailable()
+            return (
+                ExactNotFound()
+                if result is None
+                else ExactMatch[ContextViewRetentionEvidence](receipt=result)
+            )
+
+    async def read_context_view_selection_decision(self, request):
+        from cayu.collaboration._contracts import (
+            ExactConflict,
+            ExactMatch,
+            ExactNotFound,
+            ExactUnavailable,
+        )
+        from cayu.sessions._context_selection_fence import (
+            ContextViewSelectionConflict,
+            ContextViewSelectionDecision,
+            snapshot_request,
+        )
+
+        request = snapshot_request(request)
+        async with self._lock:
+            try:
+                decision = self._context_selection_decision_unlocked(request)
+            except ContextViewSelectionConflict:
+                return ExactConflict()
+            except (TypeError, ValueError):
+                return ExactUnavailable()
+            return (
+                ExactNotFound()
+                if decision is None
+                else ExactMatch[ContextViewSelectionDecision](receipt=decision)
+            )
+
     async def lookup_context_view_selection(self, selection_key: str):
         from cayu.sessions.context_views import ContextViewSelectionReceipt
 
@@ -17759,6 +18037,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     async def transition_context_view_ownership(
         self, request: _ContextViewOwnershipRequest
     ) -> _ContextViewSelectionReceipt:
+        return await self._transition_context_view_ownership(request)
+
+    async def _transition_context_view_ownership(self, request, *, target=None):
         from cayu.sessions.context_views import (
             ContextViewOwnershipRequest as ContextViewOwnershipRequestType,
         )
@@ -17780,6 +18061,16 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             "context view ownership request",
         )
         async with self._lock:
+            from cayu.sessions._context_selection_fence import require_selection_adoption
+
+            control = self._context_selection_exclusions.get(request.selection_key)
+            require_selection_adoption(
+                request,
+                self._context_selection_decision_unlocked(control.request)
+                if control is not None
+                else None,
+                target=target,
+            )
             prior_commitment = self._context_ownership_operation_commitments.get(
                 request.operation_key
             )
@@ -17808,6 +18099,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                     "The current participant does not control this context-view pin."
                 )
             now_ms = int(self._ownership_clock().timestamp() * 1000)
+            from cayu.sessions._context_selection_fence import require_adoption_deadline
+
+            require_adoption_deadline(target, now_ms)
             self._require_context_view_lifecycle_capacity(receipt.view.view_id)
             if receipt.state == "selected" and receipt.expires_at_ms <= now_ms:
                 expired = receipt.model_copy(update={"state": "expired"}, deep=True)

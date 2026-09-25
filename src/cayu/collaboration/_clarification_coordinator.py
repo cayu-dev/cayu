@@ -562,7 +562,25 @@ class ClarificationCoordinator:
             )
         )
 
-    async def _open_held(self, value: _Opening) -> ClarificationOpenReceipt:
+    async def _open_planned(self, command, source, *, context, planned):
+        """Called only inside the planning coordinator's owned mutation task."""
+        from cayu.collaboration._planning_stages import _PlannedStage
+
+        if type(planned) is not _PlannedStage:
+            raise CollaborationAccessDenied("Planning opening lacks its internal owner.")
+        value = prepare_contract(
+            _Opening,
+            {"command": command, "source": source, "context": context},
+            redactor=self.requests._redactor,
+        )
+        try:
+            return await self._open_held(value, _planned_stage=planned)
+        except SessionExportDenied as error:
+            failure = CollaborationAccessDenied("Clarification source disclosure was denied.")
+            failure.__cause__ = _safe_request_failure(error, self.requests._redactor)
+        raise failure
+
+    async def _open_held(self, value: _Opening, *, _planned_stage=None) -> ClarificationOpenReceipt:
         requests, exports = self.requests, self.exports
         redactor = requests._redactor
         command, context = value.command, value.context
@@ -677,5 +695,12 @@ class ClarificationCoordinator:
                             raise CollaborationAccessDenied(
                                 "Clarification participant authority changed."
                             )
-                return await open_in_transaction(store, tx, initialized, command, redactor=redactor)
+                return await open_in_transaction(
+                    store,
+                    tx,
+                    initialized,
+                    command,
+                    redactor=redactor,
+                    _planned_stage=_planned_stage,
+                )
         raise CollaborationUnavailable("Clarification authorization did not produce a decision.")

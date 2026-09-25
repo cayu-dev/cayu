@@ -63,6 +63,7 @@ from cayu.sessions.base import (
     _validate_session_closure_detach_replay,
 )
 from cayu.storage import _creation_fence
+from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 
 if TYPE_CHECKING:
@@ -628,9 +629,11 @@ from cayu.storage._collaboration_schema import (
     POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     POSTGRES_COLLABORATION_DDL,
     POSTGRES_COLLABORATION_LIFECYCLE_DDL,
+    POSTGRES_COLLABORATION_PLANNING_DDL,
     POSTGRES_COLLABORATION_REQUEST_DDL,
     validate_postgres_collaboration_schema,
 )
+from cayu.storage._context_selection_schema import validate_postgres_context_selection_schema
 from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
 )
@@ -1457,6 +1460,20 @@ def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
 _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    108: (
+        """CREATE TABLE IF NOT EXISTS cayu_context_selection_exclusions (
+            selection_key TEXT PRIMARY KEY,
+            owner_scope TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            owner_incarnation TEXT NOT NULL,
+            source_session_id TEXT NOT NULL,
+            source_session_instance_id TEXT NOT NULL,
+            request_commitment TEXT NOT NULL,
+            decision_json TEXT NOT NULL
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_context_selection_exclusions_owner
+            ON cayu_context_selection_exclusions(owner_scope, owner_id, owner_incarnation)""",
+    ),
     103: (
         """CREATE TABLE IF NOT EXISTS cayu_session_creation_decisions (
             operation_key TEXT PRIMARY KEY,
@@ -1490,6 +1507,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    107: POSTGRES_COLLABORATION_PLANNING_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
@@ -6756,6 +6774,8 @@ class _PostgresStoreBase:
                             app_min_supported=self._min_required_revision,
                         )
                         self._validate_postgres_revision(current_state)
+                        if current_state.revision >= 108:
+                            await validate_postgres_context_selection_schema(cur)
                         if current_state.revision >= 96:
                             await validate_postgres_participant_bindings(cur)
                         if self._min_required_revision >= 36:
@@ -7071,6 +7091,8 @@ class _PostgresStoreBase:
 
     async def _validate_postgres_schema(self, cur: Any, state: schema.SchemaState) -> None:
         self._validate_postgres_revision(state)
+        if state.revision >= 108:
+            await validate_postgres_context_selection_schema(cur)
         if state.revision >= 96:
             await validate_postgres_participant_bindings(cur)
         if state.revision >= 93:
@@ -7079,6 +7101,7 @@ class _PostgresStoreBase:
                 lifecycle=state.revision >= 94,
                 requests=state.revision >= 95,
                 clarifications=state.revision >= 105,
+                planning=state.revision >= 107,
             )
         if self._min_required_revision >= 36:
             await self._validate_session_invocation_column(cur)
@@ -7236,6 +7259,8 @@ class _PostgresStoreBase:
     ) -> None:
         """Validate non-index objects before recording their owning revision."""
 
+        if revision.revision == 108:
+            await validate_postgres_context_selection_schema(cur)
         if revision.revision == 102:
             await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:
@@ -25533,7 +25558,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
 
 @model_store_surface("sessions")
-class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, SessionStore):
+class PostgresSessionStore(
+    PostgresContextSelectionFenceMixin, PostgresCreationFenceMixin, _PostgresStoreBase, SessionStore
+):
     """Postgres-backed session store for shared durable runtime state."""
 
     session_access_version: ClassVar[int | None] = 1
@@ -25624,6 +25651,8 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
     supports_session_closure_progress: ClassVar[bool] = True
     participant_session_binding_version: ClassVar[int | None] = 1
+    recipient_continuation_selection_version: ClassVar[int | None] = 1
+    context_view_selection_fence_version: ClassVar[int | None] = 1
     context_view_version: ClassVar[int | None] = 1
     peer_content_version: ClassVar[int | None] = 1
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
@@ -27766,7 +27795,11 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             return reconstruct(row, session)
 
     async def capture_context_view_publication_source(self, session_id):
+        return (await self._capture_completed_turn_snapshot(session_id)).publication
+
+    async def _capture_completed_turn_snapshot(self, session_id):
         from cayu.sessions._context_view_source import (
+            CompletedTurnSnapshot,
             capture_source,
             closed_round_publication_id,
             completed_boundary,
@@ -27848,8 +27881,37 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 )
                 for row in rows
             )
-            return capture_source(
+            publication = capture_source(
                 session, binding, checkpoint, pointer, completion, records, tool_receipt
+            )
+            await cur.execute(
+                "SELECT 1 FROM cayu_session_message_queue "
+                "WHERE session_id = %s AND status = 'queued' LIMIT 1",
+                (session_id,),
+            )
+            queued = await cur.fetchone()
+            await cur.execute(
+                "SELECT 1 FROM cayu_session_closure_progress AS p "
+                "WHERE root_session_id = %s OR EXISTS "
+                "(SELECT 1 FROM jsonb_array_elements(p.progress_json->'descendants') AS child "
+                "WHERE child->>'session_id' = %s) LIMIT 1",
+                (session_id, session_id),
+            )
+            closure = await cur.fetchone()
+            await cur.execute(
+                "SELECT 1 FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s LIMIT 1",
+                (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+            )
+            active = await cur.fetchone()
+            return CompletedTurnSnapshot(
+                publication=publication,
+                current_session=session,
+                checkpoint=checkpoint,
+                has_queued_input=queued is not None,
+                has_closure_owner=closure is not None,
+                has_active_model_stage=active is not None,
+                current_transcript_cursor=await _transcript_cursor(cur, session_id),
             )
 
     async def _lock_context_view_admission(
@@ -28056,6 +28118,13 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         )
 
     async def select_context_view(self, request):
+        return await self._select_context_view(request)
+
+    async def _select_context_view(self, request, *, target=None):
+        from cayu.sessions._context_selection_fence import (
+            require_not_excluded,
+            require_selected_participant,
+        )
         from cayu.sessions.context_views import (
             CONTEXT_VIEW_EXPIRY_BATCH_SIZE,
             CONTEXT_VIEW_MAX_PUBLICATIONS_PER_OWNER,
@@ -28067,6 +28136,11 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             json_commitment,
             validate_context_view_manifest_storage,
             validate_context_view_receipt_storage,
+        )
+        from cayu.storage._context_selection_fence import (
+            lock_selection_key,
+            postgres_exclusion,
+            reconstruct_exclusion,
         )
 
         if type(request) is not ContextViewSelectionRequest:
@@ -28085,11 +28159,17 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         )
         owner = request.source_owner
         async with self._connection() as conn, conn.cursor() as cur:
+            await lock_selection_key(cur, request.selection_key)
             await self._lock_context_view_admission(
                 cur,
                 owner=owner,
                 lifecycle=True,
                 session_id=request.source_session_id,
+            )
+            require_not_excluded(
+                request,
+                reconstruct_exclusion(await postgres_exclusion(cur, request.selection_key)),
+                target=target,
             )
             now_ms = int(self._clock().timestamp() * 1000)
             await cur.execute(
@@ -28202,6 +28282,21 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             source = await self._load_for_update(cur, request.source_session_id)
             if source is None or source.instance_id != request.source_session_instance_id:
                 raise LookupError("Context-view source session incarnation is unavailable.")
+            if target is not None:
+                from cayu.sessions._context_selection_fence import require_selection_source
+                from cayu.storage._participant_session_records import reconstruct, row_mapping
+
+                await cur.execute(
+                    f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE session_id = %s",
+                    (request.source_session_id,),
+                )
+                binding_row = await cur.fetchone()
+                binding = (
+                    None
+                    if binding_row is None
+                    else reconstruct(row_mapping(binding_row), source).binding
+                )
+                require_selection_source(target, binding, now_ms=now_ms)
             await cur.execute(
                 """
                 SELECT view_id FROM cayu_context_views
@@ -28321,6 +28416,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 owner_participant=selected.participant,
                 expires_at_ms=expires_at_ms,
             )
+            require_selected_participant(target, selected)
             await cur.execute(
                 """
                 INSERT INTO cayu_context_view_selections (
@@ -28366,6 +28462,10 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         return ContextViewSelectionReceipt.model_validate(value)
 
     async def transition_context_view_ownership(self, request):
+        return await self._transition_context_view_ownership(request)
+
+    async def _transition_context_view_ownership(self, request, *, target=None):
+        from cayu.sessions._context_selection_fence import require_selection_adoption
         from cayu.sessions.context_views import (
             ContextViewLifecycleEvent,
             ContextViewOwnershipRequest,
@@ -28373,6 +28473,12 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             canonical_bounded_durable_json_bytes,
             json_commitment,
             validate_context_view_receipt_storage,
+        )
+        from cayu.storage._context_selection_fence import (
+            lock_selection_key,
+            postgres_decision,
+            postgres_exclusion,
+            reconstruct_exclusion,
         )
 
         if type(request) is not ContextViewOwnershipRequest:
@@ -28392,9 +28498,16 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         async with self._connection() as conn, conn.cursor() as cur:
             # Serialize before replay lookup, including concurrent identical
             # requests that would otherwise observe a stale post-transition row.
+            await lock_selection_key(cur, request.selection_key)
             await cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 ("context-view-lifecycle",),
+            )
+            control = reconstruct_exclusion(await postgres_exclusion(cur, request.selection_key))
+            require_selection_adoption(
+                request,
+                await postgres_decision(cur, control.request) if control is not None else None,
+                target=target,
             )
             await cur.execute(
                 "SELECT request_commitment, receipt_json "
@@ -28446,6 +28559,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                     "The current participant does not control this context-view pin."
                 )
             now_ms = int(self._clock().timestamp() * 1000)
+            from cayu.sessions._context_selection_fence import require_adoption_deadline
+
+            require_adoption_deadline(target, now_ms)
             await self._require_context_view_lifecycle_capacity(cur, receipt.view.view_id)
             if receipt.state == "selected" and receipt.expires_at_ms <= now_ms:
                 expired = receipt.model_copy(update={"state": "expired"}, deep=True)

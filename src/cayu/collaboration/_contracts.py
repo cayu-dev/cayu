@@ -75,13 +75,12 @@ def snapshot_input(value: object) -> Any:
         if remaining < 0 or depth > MAX_DEPTH:
             raise CollaborationContractError("Contract traversal limit exceeded.")
         if item is None or type(item) in (bool, int, float, str):
-            inspect_bounded_durable_json(
-                item,
-                "contract",
-                max_bytes=MAX_ENVELOPE_BYTES,
-                max_nodes=1,
-                canonical_numbers=False,
-            )
+            # Exact immutable scalars are borrowed, never serialized or copied.
+            # The aggregate walk below validates every scalar and the complete
+            # envelope before this snapshot escapes. A second standalone JSON
+            # walk per scalar adds no validation, but multiplies nested receipt
+            # reconstruction cost. Container allocation remains bounded here by
+            # remaining/depth/entry limits, independently of scalar byte size.
             return item
         if isinstance(item, ContractValue):
             # Fields excluded by serializers are still comparison inputs.

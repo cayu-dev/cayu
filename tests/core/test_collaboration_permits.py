@@ -145,6 +145,11 @@ async def test_receiving_exclusion_fences_or_settles_concurrent_registration(
     await reader.entered.wait()
     if registration_wins:
         await stores()._register_permit(initialized, expected, redactor=REDACTOR)
+        from cayu.collaboration._permit_store import require_terminal_permit_receipt
+
+        async with store._transaction(initialized.owner.application_scope, write=False) as tx:
+            with pytest.raises(CollaborationUnavailable, match="source settlement"):
+                await require_terminal_permit_receipt(tx, expected, redactor=REDACTOR)
     reader.release.set()
     result = await exclusion
     assert isinstance(result, PermitSettlement if registration_wins else PermitExclusion)
@@ -157,6 +162,24 @@ async def test_receiving_exclusion_fences_or_settles_concurrent_registration(
         await reopened._exclude_permit(initialized, expected, reader=reader, redactor=REDACTOR)
         == result
     )
+    from cayu.collaboration._permit_store import require_terminal_permit_receipt
+
+    scope = initialized.owner.application_scope
+    async with reopened._transaction(scope, write=False) as tx:
+        assert await require_terminal_permit_receipt(tx, expected, redactor=REDACTOR) == result
+        changed = expected.model_copy(
+            update={"initiator": expected.initiator.model_copy(update={"principal": "different"})}
+        )
+        with pytest.raises(CollaborationConflict):
+            await require_terminal_permit_receipt(tx, changed, redactor=REDACTOR)
+    # Both terminal paths require the durable event, not just a matching receipt.
+    # The failed transaction must leave ordinary replay intact.
+    with pytest.raises(CollaborationUnavailable, match="event evidence"):
+        async with reopened._transaction(scope, write=True) as tx:
+            await tx.delete("events", (result.event.sequence,))
+            await require_terminal_permit_receipt(tx, expected, redactor=REDACTOR)
+    async with reopened._transaction(scope, write=False) as tx:
+        assert await require_terminal_permit_receipt(tx, expected, redactor=REDACTOR) == result
     if not registration_wins:
         with pytest.raises(CollaborationConflict):
             await reopened._register_permit(initialized, expected, redactor=REDACTOR)
