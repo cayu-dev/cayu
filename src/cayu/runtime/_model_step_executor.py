@@ -7246,6 +7246,9 @@ class ModelStepExecutor:
                     )
                     token = bind_provider_deadline_admission(deadline_admission)
                     try:
+                        from cayu.resource_access import require_dispatch
+
+                        await require_dispatch()
                         background_dispatch_invoked = True
                         return await provider_operation_adapter.start(start_request)
                     finally:
@@ -15172,6 +15175,14 @@ async def _build_context(
     list[ContextRecallTelemetry],
     MemoryEvidenceReference | None,
 ]:
+    from cayu.resource_access import current_binding
+
+    if (
+        current_binding() is not None
+        and knowledge_store is not None
+        and type(knowledge_store).__dict__.get("resource_knowledge_access_version") != 1
+    ):
+        raise NotImplementedError("Knowledge store cannot enforce scoped context retrieval.")
     context_usage = await _context_usage_state_for_session(
         session_store=session_store,
         session_id=session.id,
@@ -15541,6 +15552,14 @@ async def _resolved_file_attachments(
     )
     if artifact_store is None:
         raise RuntimeError("File attachments require an artifact store.")
+
+    from cayu.resource_access import current_binding
+
+    if (
+        current_binding() is not None
+        and type(artifact_store).__dict__.get("artifact_access_version") != 1
+    ):
+        raise NotImplementedError("Artifact store cannot enforce attachment access.")
 
     environment_name = None if registered_environment is None else registered_environment.spec.name
     resolved: dict[str, dict[str, Any]] = {}

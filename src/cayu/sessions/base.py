@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast, overload
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu._resource_store_surface import model_store_surface
 from cayu.collaboration.peer_content import (
     PeerAppendKey,
     PeerContentAppendRequest,
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
     )
     from cayu.runtime.evidence_spool import EvidenceSpool
     from cayu.sessions._context_view_source import ContextViewPublicationSource
+    from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.context_views import (
         ContextViewLifecycleEvent as _ContextViewLifecycleEvent,
     )
@@ -10221,6 +10223,34 @@ class SessionStore(ABC):
     caller or worker clock is never durable ownership authority.
     """
 
+    # Scoped access is an explicit backend protocol, not a filtering wrapper.
+    session_access_version: ClassVar[int | None] = None
+
+    async def _access_create_session(self, bounds, request, identity):
+        raise NotImplementedError("Atomic scoped session creation is unsupported.")
+
+    async def _access_update_metadata(self, bounds, session_id, metadata):
+        raise NotImplementedError("Atomic scoped metadata mutation is unsupported.")
+
+    async def _access_delete_session(self, bounds, session_id):
+        raise NotImplementedError("Atomic scoped session deletion is unsupported.")
+
+    async def _access_read_records(self, bounds, session_id, kind, offset, limit, max_bytes):
+        raise NotImplementedError("Atomic scoped record reads are unsupported.")
+
+    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+        raise NotImplementedError("Atomic scoped session access is unsupported.")
+
+    async def _access_list_sessions(
+        self, bounds: _SessionAccessBounds, query: SessionQuery
+    ) -> SessionListResult:
+        raise NotImplementedError("Atomic scoped session access is unsupported.")
+
+    async def _access_update_labels(
+        self, bounds: _SessionAccessBounds, session_id: str, labels: dict[str, str]
+    ) -> Session:
+        raise NotImplementedError("Atomic scoped session access is unsupported.")
+
     # Custom stores must opt into optional capabilities explicitly. Conservative
     # defaults keep discovery truthful for inherited methods that fail closed.
     session_export_version: ClassVar[int] = 0
@@ -15041,8 +15071,78 @@ class _InMemoryContextViewSelectionTransaction:
         self._store._lock.release()
 
 
+def runtime_session_mutation(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    async def guarded(self, *args, **kwargs):
+        from cayu.sessions.access import runtime_session_mutation as wrap
+
+        return await wrap(operation)(self, *args, **kwargs)
+
+    return guarded
+
+
+def require_resource_session(session, action="read"):
+    from cayu.sessions.access import require_resource_session as require
+
+    require(session, action)
+
+
+def runtime_session_query(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    async def guarded(self, *args, **kwargs):
+        from cayu.sessions.access import runtime_session_query as wrap
+
+        return await wrap(operation)(self, *args, **kwargs)
+
+    return guarded
+
+
+@model_store_surface("sessions")
 class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     """In-process session store for tests, local development, and examples."""
+
+    session_access_version: ClassVar[int | None] = 1
+
+    async def _access_create_session(self, bounds, request, identity):
+        from cayu.sessions.access import _creation_bounds
+
+        token = _creation_bounds.set(bounds)
+        try:
+            return await self.create(request, identity=identity)
+        finally:
+            _creation_bounds.reset(token)
+
+    async def _access_update_metadata(self, bounds, session_id, metadata):
+        return await self.update_metadata(session_id, metadata, _access_bounds=bounds)
+
+    async def _access_delete_session(self, bounds, session_id):
+        await self.delete_session(session_id, _access_bounds=bounds)
+
+    async def _access_read_records(self, bounds, session_id, kind, offset, limit, max_bytes):
+        from cayu.storage._session_access_records import memory_read
+
+        return await memory_read(self, bounds, session_id, kind, offset, limit, max_bytes)
+
+    async def _access_list_sessions(
+        self, bounds: _SessionAccessBounds, query: SessionQuery
+    ) -> SessionListResult:
+        return await self._list_sessions(
+            query, pending_interruption_cascade_only=False, access_bounds=bounds
+        )
+
+    async def _access_update_labels(
+        self, bounds: _SessionAccessBounds, session_id: str, labels: dict[str, str]
+    ) -> Session:
+        return await self.update_labels(session_id, labels, _access_bounds=bounds)
+
+    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            return bounds.require_read(self._sessions.get(session_id)).model_copy(deep=True)
 
     peer_content_version: ClassVar[int | None] = 1
 
@@ -18136,6 +18236,16 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             return self._sessions[fork.id].model_copy(deep=True)
 
     async def load(self, session_id: str) -> Session | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
+        if access_bounds is not None:
+            from cayu._resource_access_errors import ResourceAccessDenied
+
+            try:
+                return await self._access_load_session(access_bounds, session_id)
+            except ResourceAccessDenied:
+                return None
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -18348,11 +18458,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 raise ValueError("Closure target is unavailable.")
             self._require_session_erasure_quiescence_unlocked(session)
 
+    @runtime_session_mutation
     async def delete_session(
         self,
         session_id: str,
         *,
         closure_receipt: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
     ) -> None:
         # Participant creation/replay acquires this lock before the store lock.
         # Deletion follows the same order so a committed session cannot lose
@@ -18362,6 +18474,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             await self._delete_session_unserialized(
                 session_id,
                 closure_receipt=closure_receipt,
+                _access_bounds=_access_bounds,
             )
         finally:
             self._participant_creation_lock.release()
@@ -18371,10 +18484,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         session_id: str,
         *,
         closure_receipt: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             session = self._sessions.get(session_id)
+            if _access_bounds is not None:
+                _access_bounds.require_action(session, "delete")
             if session is None:
                 return  # idempotent: deleting a missing session is a no-op
             for owner in self._session_closure_progress.values():
@@ -18403,7 +18519,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                     raise RuntimeError("Inconsistent in-memory session topology index.")
                 for owner in self._session_closure_progress.values():
                     _check_closure_lineage_owner(owner, (child_id,))
-                if closure_receipt is not None:
+                if closure_receipt is not None or _access_bounds is not None:
                     raise ValueError("Closure deletion requires no remaining child edges.")
                 if _is_durable_subagent_child(child):
                     raise ValueError(_durable_subagent_parent_delete_block_reason(child.id))
@@ -18621,11 +18737,20 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                     raise ValueError("Session closure receipt identity conflict.")
                 self._session_closure_receipts[receipt_key] = deepcopy(closure_receipt)
 
-    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+    @runtime_session_mutation
+    async def update_labels(
+        self,
+        session_id: str,
+        labels: dict[str, str],
+        *,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
         async with self._lock:
             session = self._sessions.get(session_id)
+            if _access_bounds is not None:
+                _access_bounds.require_label_update(session, new_labels)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
@@ -18641,14 +18766,28 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 self._checkpoints.get(session_id),
                 updated,
             )
+            if _access_bounds is not None:
+                audit = _access_bounds.label_audit(session, new_labels, now)
+                if audit is not None:
+                    key, record = audit
+                    self._session_operation_records.setdefault(session_id, {})[key] = record
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
-    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+    @runtime_session_mutation
+    async def update_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+        *,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         user_metadata = copy_session_user_metadata(metadata)
         async with self._lock:
             session = self._sessions.get(session_id)
+            if _access_bounds is not None:
+                _access_bounds.require_action(session, "modify")
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
@@ -20905,6 +21044,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             ),
         )
 
+    @runtime_session_query
     async def inspect_session_messages(
         self,
         query: SessionMessageQuery,
@@ -20922,6 +21062,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         query = copy_inspection_query(query)
         async with self._lock:
             session = self._sessions.get(query.session_id)
+            require_resource_session(session, "read")
             if session is None:
                 raise KeyError("Session-message target not found.")
             require_authorized_session_instance(session, expected_authorized_session_instance_id)
@@ -20966,6 +21107,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 ),
             )
 
+    @runtime_session_query
     async def apply_session_message_action(
         self, request: SessionMessageActionRequest
     ) -> SessionMessageActionResult:
@@ -20979,6 +21121,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         request = copy_session_message_action(request)
         async with self._lock:
             session = self._sessions.get(request.session_id)
+            require_resource_session(session, "modify")
             if session is None or session.instance_id != request.session_instance_id:
                 raise SessionMessageConflict()
             messages = self._queued_session_messages_by_idempotency.get(session.id, {})
@@ -21051,6 +21194,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 record=self._inspect_session_message_unlocked(updated), event=event
             )
 
+    @runtime_session_query
     async def snapshot_session_message_source(
         self,
         session_id: str,
@@ -21069,6 +21213,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             raise TypeError("Source snapshot digest flags must be bools.")
         async with self._lock:
             session = self._sessions.get(session_id)
+            require_resource_session(session, "read")
             if session is None:
                 raise KeyError("Session-message source not found.")
             require_authorized_session_instance(session, expected_authorized_session_instance_id)
@@ -21078,6 +21223,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 include_checkpoint_digest=include_checkpoint_digest,
             )
 
+    @runtime_session_query
     async def append_peer_content(
         self,
         request: PeerContentAppendRequest,
@@ -21100,6 +21246,15 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 request.append_key,
                 None if creation is None else self._session_creation_decisions.get(creation.key),
             )
+            from cayu.sessions.access import _query_bounds
+
+            if _query_bounds.get() is not None:
+                require_resource_session(
+                    self._sessions.get(request.occurrence.sender_session_id), "read"
+                )
+                require_resource_session(
+                    None if target_id is None else self._sessions.get(target_id), "modify"
+                )
             from cayu.storage._peer_attempts import historical_replay, replay_or_advance
 
             historical = historical_replay(
@@ -21609,6 +21764,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             )
         return tuple(results)
 
+    @runtime_session_query
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
@@ -21618,6 +21774,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         request = copy_enqueue_session_message_request(request)
         async with self._lock:
             session = self._sessions.get(request.session_id)
+            require_resource_session(session, "modify")
             if session is None:
                 raise KeyError(f"Session not found: {request.session_id}")
             if expected_authorized_target_instance_id is not None and (
@@ -21627,6 +21784,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 raise SessionMessageConflict()
             if request.conditions.source is not None:
                 source_session = self._sessions.get(request.conditions.source.session_id)
+                require_resource_session(source_session, "read")
                 if (
                     source_session is None
                     or source_session.instance_id != request.conditions.source.session_instance_id
@@ -22313,6 +22471,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         *,
         checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
@@ -22321,6 +22482,8 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         )
         _require_session_export_target(session_id, idempotency_key)
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             if checkpoint_root_guard is not None:
@@ -23617,8 +23780,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             )
 
     async def load_events(self, session_id: str) -> list[Event]:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return [event.model_copy(deep=True) for event in self._events.get(session_id, [])]
@@ -23697,11 +23865,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [copy_event(record.event) for record in records]
 
+    @runtime_session_query
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
         async with self._lock:
             return self._query_events_unlocked(query, max_bytes=None)
 
+    @runtime_session_query
     async def event_exists(self, query: EventQuery) -> bool:
         query = copy_event_query(query)
         event_types = frozenset(
@@ -23727,6 +23897,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                     return True
             return False
 
+    @runtime_session_query
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:
@@ -23768,6 +23939,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 reducer.add_page(page)
         return reducer.snapshot().model_copy(update={"generation": generation})
 
+    @runtime_session_query
     async def read_cost_accounting(
         self,
         query: EventQuery,
@@ -23855,6 +24027,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                             reducer.add(record.sequence, record.event)
             return reducer.snapshot()
 
+    @runtime_session_query
     async def query_events_bounded(
         self,
         query: EventQuery,
@@ -24221,8 +24394,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         return self._event_records
 
     async def summarize_events(self, session_id: str) -> EventSummary:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
 
@@ -24230,8 +24408,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             return event_summary_from_records(session_id, records)
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -24240,6 +24423,11 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             return session_outcome_from_records(session, records)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
+        if access_bounds is not None:
+            return await self._access_list_sessions(access_bounds, copy_session_query(query))
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
 
     async def query_session_topology(
@@ -24754,6 +24942,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         query: SessionQuery | None,
         *,
         pending_interruption_cascade_only: bool,
+        access_bounds: _SessionAccessBounds | None = None,
     ) -> SessionListResult:
         query = copy_session_query(query)
         async with self._lock:
@@ -24790,7 +24979,8 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 else [
                     session
                     for session in candidates
-                    if _session_matches(session, base_query)
+                    if (access_bounds is None or access_bounds.matches(session.labels))
+                    and _session_matches(session, base_query)
                     and _session_matches_debug_state(
                         session,
                         self._session_event_records.get(session.id, []),
@@ -25065,15 +25255,25 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             )
 
     async def load_transcript(self, session_id: str) -> list[Message]:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return [detach_message(message) for message in self._transcripts.get(session_id, [])]
 
     async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             messages = self._transcripts.get(session_id, [])
@@ -25127,6 +25327,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         role: MessageRole,
         max_chars: int,
     ) -> tuple[str, bool] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(role, MessageRole):
             raise TypeError("role must be a MessageRole.")
@@ -25135,6 +25338,8 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
             raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(session_id))
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             index = self._latest_transcript_indexes_by_role.get(session_id, {}).get(role)
@@ -25146,8 +25351,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         query = copy_transcript_query(query)
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_read(self._sessions.get(query.session_id))
             if query.session_id not in self._sessions:
                 raise KeyError(f"Session not found: {query.session_id}")
 
@@ -25772,8 +25982,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             )
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
+            if access_bounds is not None:
+                access_bounds.require_action(self._sessions.get(session_id), "inspect_state")
             checkpoint = self._checkpoints.get(session_id)
             if checkpoint is None:
                 return None
@@ -27199,6 +27414,9 @@ def session_invocation_for_run_request(
     if type(request) is not RunRequest:
         raise TypeError("Session invocation derivation requires a RunRequest.")
     session_id = _require_bounded_session_id(session_id, "session_id")
+    from cayu.sessions.access import _require_scoped_session_creation
+
+    _require_scoped_session_creation(request, parent_session)
     source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
     verified_origin = request._verified_invocation_origin
     task_invocation = request._runtime_task_invocation
@@ -27261,7 +27479,11 @@ def session_invocation_for_run_request(
         )
     else:
         origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    from cayu.resource_access import current_binding
+    from cayu.sessions.access import scoped_creation_binding
+
     return SessionInvocation(
+        resource_access=current_binding() or scoped_creation_binding(),
         origin=origin,
         root_invocation_id=str(uuid4()),
         root_session_id=session_id,
@@ -28358,6 +28580,18 @@ def _validate_session_fork_source(
     expected_source_run_epoch: int,
     profile_relationship: SessionForkProfileRelationship | None = None,
 ) -> Session:
+    from cayu._resource_access_errors import ResourceAccessDenied
+    from cayu.resource_access import current_binding, current_creation_bounds
+
+    access_bounds = current_creation_bounds()
+    if access_bounds is not None:
+        source_session = access_bounds.require_read(source_session)
+        if not access_bounds.matches(fork.labels, "create") or not access_bounds.matches(
+            fork.labels
+        ):
+            raise ResourceAccessDenied()
+        if source_session.invocation.resource_access != current_binding():
+            raise ResourceAccessDenied()
     if source_session is None:
         raise SessionForkSourceNotFound("Fork source session was not found.")
     if source_session.status not in allowed_statuses:
@@ -38728,6 +38962,13 @@ def _event_record_matches_session(
     query: EventQuery,
     sessions: dict[str, Session],
 ) -> bool:
+    from cayu.sessions.access import _query_bounds
+
+    bounds = _query_bounds.get()
+    if bounds is not None:
+        owner = sessions.get(record.event.session_id)
+        if owner is None or not bounds.matches(owner.labels):
+            return False
     if query.causal_budget_id is None:
         return True
     session = sessions.get(record.event.session_id)

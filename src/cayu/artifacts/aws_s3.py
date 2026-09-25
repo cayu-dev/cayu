@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
+from cayu._resource_store_surface import model_store_surface
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_metadata,
@@ -37,6 +38,7 @@ from cayu.artifacts._settlement import (
     _settle_artifact_write,
     _unsettled_artifact_write,
 )
+from cayu.artifacts.access import runtime_artifact_operation
 from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactMetadata,
@@ -57,6 +59,7 @@ _ARTIFACT_ID_PATTERN = re.compile(r"\Aart_[0-9a-f]{32}\Z")
 _NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
 
+@model_store_surface("artifacts")
 class S3ArtifactStore(ArtifactStore):
     """Direct S3 object implementation of ArtifactStore.
 
@@ -102,6 +105,9 @@ class S3ArtifactStore(ArtifactStore):
         value = default_id if store_id is None else require_clean_nonblank(store_id, "store_id")
         self.id = require_unicode_scalar_text(value, "store_id")
 
+    artifact_access_version = 1
+
+    @runtime_artifact_operation("create")
     async def put_bytes(
         self,
         content: bytes,
@@ -134,7 +140,10 @@ class S3ArtifactStore(ArtifactStore):
         resolved_artifact_id = (
             f"art_{uuid4().hex}" if artifact_id is None else _validate_artifact_id(artifact_id)
         )
+        from cayu.artifacts.access import creation_labels
+
         artifact = ArtifactMetadata(
+            labels=creation_labels(),
             id=resolved_artifact_id,
             filename=filename,
             content_type=resolved_content_type,
@@ -596,6 +605,7 @@ class S3ArtifactStore(ArtifactStore):
             failure_codes=reconciled_failure_codes,
         )
 
+    @runtime_artifact_operation("read")
     async def read_bytes(
         self,
         artifact_id: str,
@@ -636,6 +646,7 @@ class S3ArtifactStore(ArtifactStore):
             truncated=len(content) < metadata.size_bytes,
         )
 
+    @runtime_artifact_operation("read")
     async def read_range(
         self, artifact_id: str, *, offset: int, max_bytes: int
     ) -> ArtifactReadResult:
@@ -687,6 +698,7 @@ class S3ArtifactStore(ArtifactStore):
             offset=offset,
         )
 
+    @runtime_artifact_operation("list")
     async def list(
         self,
         *,
@@ -718,7 +730,10 @@ class S3ArtifactStore(ArtifactStore):
                     continue
                 if environment_name is not None and artifact.environment_name != environment_name:
                     continue
-                inventory.add(artifact)
+                from cayu.artifacts.access import visible
+
+                if visible(artifact):
+                    inventory.add(artifact)
         except ArtifactStoreUnavailableError:
             raise
         except Exception as exc:
@@ -727,9 +742,14 @@ class S3ArtifactStore(ArtifactStore):
             ) from exc
         return inventory.result()
 
+    @runtime_artifact_operation("delete")
     async def delete(self, artifact_id: str) -> None:
         artifact_id = _validate_artifact_id(artifact_id)
         client = await self._get_client()
+        from cayu.artifacts.access import _active
+
+        if _active.get() is not None:
+            await self._read_metadata(client, artifact_id)
         keys = (
             self._artifact_key(artifact_id, "content"),
             self._artifact_key(artifact_id, "metadata.json"),
@@ -770,6 +790,9 @@ class S3ArtifactStore(ArtifactStore):
             raise ValueError(f"S3 artifact metadata is invalid: {artifact_id}") from exc
         if metadata.id != artifact_id:
             raise ValueError("S3 artifact metadata id did not match its object key.")
+        from cayu.artifacts.access import require_artifact
+
+        require_artifact(metadata)
         return metadata
 
     async def _read_object_bytes(

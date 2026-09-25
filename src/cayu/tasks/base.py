@@ -17,6 +17,8 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
+from cayu._resource_store_surface import model_store_surface
+
 if TYPE_CHECKING:
     from cayu.tasks._group_maintenance import TaskGroupMaintenance
     from cayu.tasks.graphs import (
@@ -4094,7 +4096,7 @@ class TaskStore(ABC):
         """
 
     @abstractmethod
-    async def load_task(self, task_id: str) -> Task | None:
+    async def load_task(self, task_id: str, *, _access_bounds=None) -> Task | None:
         """Load a task by id."""
 
     async def load_active_attached_task_worker(
@@ -4152,7 +4154,9 @@ class TaskStore(ABC):
         """Load bounded immutable provenance without task payloads or metadata."""
 
     @abstractmethod
-    async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
+    async def list_tasks(
+        self, query: TaskQuery | None = None, *, _access_bounds=None
+    ) -> list[Task]:
         """List tasks for dashboards, queues, and orchestration."""
 
     async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
@@ -4619,8 +4623,47 @@ class _PreparedMemoryTaskWrite(NamedTuple):
     events: tuple[TaskScheduleEvent, ...]
 
 
+def runtime_task_creation(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    async def guarded(self, *args, **kwargs):
+        from cayu.tasks.access import runtime_task_creation as wrap
+
+        return await wrap(operation)(self, *args, **kwargs)
+
+    return guarded
+
+
+def runtime_collection_read(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    async def guarded(self, *args, **kwargs):
+        from cayu.tasks.access import runtime_collection_read as wrap
+
+        return await wrap(operation)(self, *args, **kwargs)
+
+    return guarded
+
+
+def runtime_task_mutation(operation):
+    from functools import wraps
+
+    @wraps(operation)
+    async def guarded(self, *args, **kwargs):
+        from cayu.tasks.access import runtime_task_mutation as wrap
+
+        return await wrap(operation)(self, *args, **kwargs)
+
+    return guarded
+
+
+@model_store_surface("tasks")
 class InMemoryTaskStore(TaskStore):
     """In-process task store for tests, local development, and examples."""
+
+    task_access_version: ClassVar[int | None] = 1
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
@@ -4679,16 +4722,19 @@ class InMemoryTaskStore(TaskStore):
 
         return await reconcile(self, request.group_id, resolution=request)
 
+    @runtime_task_creation
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         from cayu.tasks._memory_groups import create_group
 
         return await create_group(self, request, submitted_digest=request._submitted_request_sha256)
 
+    @runtime_collection_read
     async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
         from cayu.tasks._memory_groups import load_group
 
         return await load_group(self, group_id)
 
+    @runtime_collection_read
     async def list_task_group_events(
         self, group_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGroupEvent]:
@@ -4782,16 +4828,19 @@ class InMemoryTaskStore(TaskStore):
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
 
+    @runtime_task_creation
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         from cayu.tasks._memory_graphs import create_graph
 
         return await create_graph(self, request)
 
+    @runtime_collection_read
     async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
         from cayu.tasks._memory_graphs import load_graph
 
         return await load_graph(self, graph_id)
 
+    @runtime_collection_read
     async def list_task_graph_events(
         self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGraphEvent]:
@@ -6298,6 +6347,7 @@ class InMemoryTaskStore(TaskStore):
                 receipt.model_dump(mode="python", warnings=False)
             )
 
+    @runtime_task_creation
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         async with self._lock:
@@ -6482,6 +6532,7 @@ class InMemoryTaskStore(TaskStore):
                 maintenance_required=maintenance,
             )
 
+    @runtime_task_creation
     async def create_running_task(
         self,
         request: TaskCreate,
@@ -6512,10 +6563,18 @@ class InMemoryTaskStore(TaskStore):
             self._store_task(task)
             return task.model_copy(deep=True)
 
-    async def load_task(self, task_id: str) -> Task | None:
+    async def load_task(self, task_id: str, *, _access_bounds=None) -> Task | None:
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             task = self._tasks.get(task_id)
+            if _access_bounds is not None:
+                from cayu.tasks.access import require_read
+
+                require_read(task, _access_bounds)
             if task is None:
                 return None
             return task.model_copy(deep=True)
@@ -6581,10 +6640,23 @@ class InMemoryTaskStore(TaskStore):
                 invocation=task.invocation,
             )
 
-    async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
+    async def list_tasks(
+        self, query: TaskQuery | None = None, *, _access_bounds=None
+    ) -> list[Task]:
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
         async with self._lock:
-            tasks = [task for task in self._tasks.values() if _task_matches(task, query)]
+            from cayu.tasks.access import visible
+
+            tasks = [
+                task
+                for task in self._tasks.values()
+                if _task_matches(task, query)
+                and (_access_bounds is None or visible(task, _access_bounds))
+            ]
             tasks = _sort_tasks(tasks, query.order_by)
             page = tasks[query.offset : query.offset + query.limit]
             return [task.model_copy(deep=True) for task in page]
@@ -7795,6 +7867,7 @@ class InMemoryTaskStore(TaskStore):
             self._retry_settlements[receipt_key] = receipt
             return receipt.model_copy(deep=True)
 
+    @runtime_task_mutation
     async def cancel_task(
         self,
         task_id: str,
@@ -7882,6 +7955,7 @@ class InMemoryTaskStore(TaskStore):
             self._store_task(started)
             return self._require_task(task_id).model_copy(deep=True)
 
+    @runtime_task_mutation
     async def pause_task(
         self,
         task_id: str,
@@ -7896,6 +7970,7 @@ class InMemoryTaskStore(TaskStore):
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def block_task(
         self,
         task_id: str,
@@ -7910,6 +7985,7 @@ class InMemoryTaskStore(TaskStore):
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def mark_task_needs_attention(
         self,
         task_id: str,
@@ -7924,6 +8000,7 @@ class InMemoryTaskStore(TaskStore):
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def resume_task(self, task_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
@@ -8382,6 +8459,9 @@ class InMemoryTaskStore(TaskStore):
 
     def _require_task(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)
+        from cayu.tasks.access import require_mutation
+
+        require_mutation(task)
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
         return task
@@ -12350,7 +12430,16 @@ def task_create_with_execution_source(
     return task_create_with_runtime_invocation(request, source=source)
 
 
-def task_invocation_for_create(
+def task_invocation_for_create(request, *, task_id, parent_task, session_invocation=None):
+    from cayu.tasks.access import creation_invocation
+
+    invocation = _task_invocation_for_create_unscoped(
+        request, task_id=task_id, parent_task=parent_task, session_invocation=session_invocation
+    )
+    return creation_invocation(invocation, request, parent_task)
+
+
+def _task_invocation_for_create_unscoped(
     request: TaskCreate,
     *,
     task_id: str,
@@ -12438,7 +12527,10 @@ def task_invocation_for_create(
         }:
             raise ValueError(f"{source.value} task provenance requires a trusted origin.")
         origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    from cayu.resource_access import current_binding
+
     return TaskInvocation(
+        resource_access=current_binding(),
         origin=origin,
         root_invocation_id=str(uuid4()),
         root_session_id=request.session_id,

@@ -4422,6 +4422,15 @@ class ToolRoundExecutor:
 
         raw_workspace = _workspace(registered_environment)
         raw_artifact_store = _artifact_store(registered_environment)
+        from cayu.resource_access import current_binding
+
+        if current_binding() is not None:
+            for store, capability in (
+                (raw_artifact_store, "artifact_access_version"),
+                (_knowledge_store(registered_environment), "resource_knowledge_access_version"),
+            ):
+                if store is not None and type(store).__dict__.get(capability) != 1:
+                    raise NotImplementedError("Environment store cannot enforce resource access.")
         direct_workspace_mutations = DirectWorkspaceMutationCollector()
         workspace_mutation_owner = (
             InvocationWorkspaceMutationOwner(
@@ -5521,6 +5530,9 @@ class ToolRoundExecutor:
             # protected effect. The exact dispatch seam below still performs
             # main's independent freshness check after durable preparation.
             await require_live_environment_exposure()
+            from cayu.resource_access import require_dispatch
+
+            await require_dispatch()
             inference_scope = None
             if registered_tool.auxiliary_inference is not None:
                 if invocation_context is None or auxiliary_invocation_policy is None:
@@ -5645,6 +5657,10 @@ class ToolRoundExecutor:
                     arguments=effective_tool_call.arguments,
                 )
 
+            async def require_resource_dispatch():
+                await require_live_environment_exposure()
+                await require_dispatch()
+
             execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,
                 effect=registered_tool.effect,
@@ -5655,7 +5671,7 @@ class ToolRoundExecutor:
                 registered_execution_contract=registered_tool.execution_contract,
                 finalize_publication=invocation_secret_scope.seal_for_publication,
                 timeout_seconds=self._tool_timeout_seconds,
-                before_dispatch=require_live_environment_exposure,
+                before_dispatch=require_resource_dispatch,
                 reconcile_result=reconcile_child_result,
                 inference_scope=inference_scope,
             )

@@ -153,6 +153,7 @@ from cayu.providers.operations import (
     ProviderOperationSnapshot,
     ProviderOperationStatus,
 )
+from cayu.resource_access import ResourceAccessPolicy, resource_recovery
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -2002,10 +2003,12 @@ class RecoveryCoordinator:
         cancel_provider_operation: CancelProviderOperation,
         interaction_transition_replay_failures: InteractionTransitionReplayFailures,
         recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
+        resource_access_policy: ResourceAccessPolicy | None = None,
         human_review_policy: HumanReviewPolicy | None = None,
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
         loop_policies: tuple[LoopPolicy, ...] = (),
     ) -> None:
+        self._resource_access_policy = resource_access_policy
         self._human_review_policy = human_review_policy
         self._session_store = session_store
         self._require_participant_execution = require_participant_execution
@@ -18580,6 +18583,7 @@ class RecoveryCoordinator:
                 ),
             )
 
+    @resource_recovery
     async def _recover_incomplete_session_scoped(
         self,
         *,

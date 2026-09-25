@@ -59,6 +59,9 @@ async def create_graph(
             ).fetchone()
             if row is not None:
                 receipt = TaskGraphCreationReceipt.model_validate_json(row[0])
+                from cayu.tasks.access import require_collection
+
+                require_collection(receipt)
                 if receipt.graph_id != request.graph_id or receipt.task_ids != tuple(
                     node.task.task_id for node in request.nodes
                 ):
@@ -363,6 +366,9 @@ async def load_graph(store: SQLiteTaskStore, graph_id: str) -> TaskGraphSnapshot
             if row is None:
                 return None
             receipt = TaskGraphCreationReceipt.model_validate_json(row[0])
+            from cayu.tasks.access import require_collection
+
+            require_collection(receipt)
             rows = store._connection.execute(
                 "SELECT task_id, prerequisites_json, terminal_json FROM cayu_task_graph_members "
                 "WHERE graph_id = ? ORDER BY task_id LIMIT 129",
@@ -409,6 +415,17 @@ async def list_events(
         raise ValueError("Invalid graph event page size.")
     async with store._lock:
         with sql._transaction(store._connection, begin_immediate=False):
+            from cayu.tasks.access import require_collection
+
+            access_row = store._connection.execute(
+                "SELECT receipt_json FROM cayu_task_graphs WHERE graph_id = ?",
+                (graph_id,),
+            ).fetchone()
+            require_collection(
+                None
+                if access_row is None
+                else TaskGraphCreationReceipt.model_validate_json(access_row[0])
+            )
             if (
                 store._connection.execute(
                     "SELECT 1 FROM cayu_task_graphs WHERE graph_id = ?", (graph_id,)

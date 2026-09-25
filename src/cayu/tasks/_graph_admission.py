@@ -111,7 +111,10 @@ def prepare_graph_admission(
             progressed = True
         if not progressed:
             raise TaskGraphConflict("Graph parent lineage contains a cycle.")
+    from cayu.tasks.access import graph_access_invocation
+
     receipt = TaskGraphCreationReceipt(
+        access_invocation=graph_access_invocation(prepared.values()),
         graph_id=request.graph_id,
         request_sha256=digest,
         submitted_request_sha256=request._submitted_request_sha256 or digest,

@@ -40,6 +40,7 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     copy_text_embedding_result,
 )
+from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.storage._knowledge_closure import (
     KnowledgeClosureInventory,
     KnowledgeClosureQuery,
@@ -454,6 +455,15 @@ class KnowledgeAccessScope(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    resource_constraints: tuple[str, ...] = Field(default=(), exclude_if=lambda v: not v)
+
+    @field_validator("resource_constraints")
+    @classmethod
+    def validate_resource_constraints(cls, values):
+        from cayu.knowledge.access import validate_constraints
+
+        return validate_constraints(values)
 
     allowed_namespaces: list[str] = Field(default_factory=list)
     allow_all_namespaces: bool = False
@@ -4027,6 +4037,12 @@ class KnowledgeChangeConsumerState(BaseModel):
         return self
 
 
+def _intersect_resource_knowledge_scope(scope):
+    from cayu.knowledge.access import intersect_scope
+
+    return intersect_scope(scope)
+
+
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
@@ -4056,11 +4072,11 @@ class KnowledgeStore(ABC):
         if access_scope is None:
             if default_scope is None:
                 raise TypeError("knowledge operation requires `access_scope`.")
-            return copy_knowledge_access_scope(default_scope)
+            return _intersect_resource_knowledge_scope(copy_knowledge_access_scope(default_scope))
         explicit_scope = copy_knowledge_access_scope(access_scope)
         if default_scope is not None and explicit_scope != default_scope:
             raise KnowledgeAccessDenied("access_scope_override")
-        return explicit_scope
+        return _intersect_resource_knowledge_scope(explicit_scope)
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
         """Return search modes this store can execute directly."""
@@ -4611,6 +4627,8 @@ class KnowledgeStore(ABC):
 class InMemoryKnowledgeStore(KnowledgeStore):
     """In-memory knowledge store for tests, demos, and single-process apps."""
 
+    resource_knowledge_access_version = 1
+
     async def inspect_closure_sources(self, query: KnowledgeClosureQuery) -> dict[str, object]:
         query = copy_knowledge_closure_query(query)
         inventory = KnowledgeClosureInventory(query)
@@ -4767,6 +4785,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 change = self._prepare_change(copied, kind=KnowledgeChangeKind.CREATED)
                 self._record_change(change, before_entry=None, after_entry=copied)
 
+    @runtime_knowledge_operation("create")
     async def create_entry(
         self,
         entry: KnowledgeEntry,
@@ -4822,6 +4841,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._record_change(change, before_entry=None, after_entry=entry)
         return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("modify")
     async def append_entry_revision(
         self,
         entry: KnowledgeEntry,
@@ -4844,6 +4864,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             inherit_evidence=False,
         )
 
+    @runtime_knowledge_operation("read")
     async def get_entry(
         self,
         entry_id: str,
@@ -4879,6 +4900,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 )
         return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("modify")
     async def transition_entry_status(
         self,
         entry_id: str,
@@ -4945,6 +4967,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             inherit_evidence=True,
         )
 
+    @runtime_knowledge_operation("delete")
     async def delete_entry(
         self,
         entry_id: str,
@@ -5029,6 +5052,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             to_status=KnowledgeStatus.DELETED,
         )
 
+    @runtime_knowledge_operation("modify")
     async def prune_expired(
         self,
         *,
@@ -5081,6 +5105,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             self._record_change(change, before_entry=entry, after_entry=None)
         return len(expired_entries)
 
+    @runtime_knowledge_operation("modify")
     async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
@@ -5262,6 +5287,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
         return copy_knowledge_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("modify")
     async def publish_maintenance_proposal(
         self,
         entry: KnowledgeEntry,
@@ -5404,6 +5430,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._record_change(change, before_entry=None, after_entry=copied_entry)
         return copy_knowledge_maintenance_proposal_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_proposal_publication(
         self,
         proposal_id: str,
@@ -5838,6 +5865,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return receipt
 
+    @runtime_knowledge_operation("read")
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
@@ -5854,6 +5882,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_activation_receipt(
         self,
         operation_id: str,
@@ -5871,6 +5900,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_activation_receipt(receipt)
 
+    @runtime_knowledge_operation("modify")
     async def approve_pending_entry(
         self,
         authority: KnowledgeActivationAuthority,
@@ -6007,6 +6037,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             receipt=copy_knowledge_activation_receipt(receipt),
         )
 
+    @runtime_knowledge_operation("modify")
     async def publish_relations(
         self,
         relations: list[KnowledgeRelation],
@@ -6134,6 +6165,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._relation_publication_access[operation_id] = publication_access
         return copy_knowledge_relation_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_relation_publication_receipt(
         self,
         operation_id: str,
@@ -6153,6 +6185,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_relation_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def read_relations(
         self,
         query: KnowledgeRelationQuery,
@@ -6440,6 +6473,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             relation_id=relation.id,
         )
 
+    @runtime_knowledge_operation("modify")
     async def record_maintenance_governance_route(
         self,
         authority: KnowledgeMaintenanceGovernanceAuthority,
@@ -6531,6 +6565,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._maintenance_governance_route_by_proposal[proposal.id] = copied.request.operation_id
         return copy_knowledge_maintenance_governance_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_governance_route(
         self,
         operation_id: str,
@@ -6558,6 +6593,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_maintenance_governance_receipt(receipt)
 
+    @runtime_knowledge_operation("modify")
     async def record_semantic_watch_outcome(
         self,
         authority: KnowledgeSemanticWatchAuthority,
@@ -6630,6 +6666,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._semantic_watch_receipt_access[operation_id] = copy_knowledge_access_scope(scope)
         return copy_knowledge_semantic_watch_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_semantic_watch_receipt(
         self,
         operation_id: str,
@@ -6663,6 +6700,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return receipt
 
+    @runtime_knowledge_operation("modify")
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -7012,6 +7050,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._maintenance_access[decision.operation_id] = maintenance_access
         return copy_knowledge_maintenance_decision_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_proposal(
         self,
         proposal_id: str,
@@ -7044,6 +7083,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_maintenance_proposal(proposal)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_decision(
         self,
         operation_id: str,
@@ -7062,6 +7102,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_maintenance_decision(decision)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_decision_receipt(
         self,
         operation_id: str,
@@ -7080,6 +7121,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_maintenance_decision_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def read_evidence(
         self,
         entry_id: str,
@@ -7127,6 +7169,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             total_evidence_known=len(stored),
         )
 
+    @runtime_knowledge_operation("read")
     async def read_changes(
         self,
         *,
@@ -7163,6 +7206,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             limit=limit,
         )
 
+    @runtime_knowledge_operation("modify")
     async def claim_change(
         self,
         consumer_id: str,
@@ -7260,6 +7304,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             lease_expires_at=lease_expires_at,
         )
 
+    @runtime_knowledge_operation("modify")
     async def initialize_change_consumer(
         self,
         consumer_id: str,
@@ -7286,6 +7331,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._change_consumers[consumer_id] = state
         return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def acknowledge_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -7327,6 +7373,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
         return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def release_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -7353,6 +7400,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._change_consumers[claim.consumer_id] = state
         return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("read")
     async def load_change_consumer_state(
         self,
         consumer_id: str,
@@ -7368,6 +7416,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def publish_index_readiness(
         self,
         update: KnowledgeIndexReadinessUpdate,
@@ -7426,6 +7475,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._index_readiness_operations[operation_id] = (update_sha256, readiness)
         return copy_knowledge_index_readiness(readiness)
 
+    @runtime_knowledge_operation("read")
     async def load_index_readiness(
         self,
         identity: KnowledgeEmbeddingIdentity,
@@ -7443,6 +7493,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_index_readiness(readiness)
 
+    @runtime_knowledge_operation("read")
     async def read_index_readiness(
         self,
         *,
@@ -7537,6 +7588,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if state.lease_expires_at is None or state.lease_expires_at <= now:
             raise KnowledgeChangeConsumerConflict("expired_claim")
 
+    @runtime_knowledge_operation("read")
     async def read_chunks(
         self,
         entry_id: str,
@@ -7579,6 +7631,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             max_bytes=max_bytes,
         )
 
+    @runtime_knowledge_operation("read")
     async def search(
         self,
         query: KnowledgeQuery,
@@ -7594,6 +7647,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             through_change_sequence=None,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_at_frontier(
         self,
         query: KnowledgeQuery,
@@ -7616,6 +7670,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             through_change_sequence=knowledge_sequence,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_revisions(
         self,
         query: KnowledgeQuery,
@@ -7700,6 +7755,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             ),
         )
 
+    @runtime_knowledge_operation("read")
     async def list_entries(
         self,
         query: KnowledgeListQuery,
@@ -7771,6 +7827,8 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
     search should use a store with a real vector index.
     """
 
+    resource_knowledge_access_version = 1
+
     def _add_closure_projections(
         self, inventory: KnowledgeClosureInventory, revisions: set[tuple[str, int]]
     ) -> None:
@@ -7829,6 +7887,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             KnowledgeSearchMode.HYBRID,
         )
 
+    @runtime_knowledge_operation("modify")
     async def process_embedding_changes(
         self,
         consumer_id: str,
@@ -7964,6 +8023,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 break
         return candidates[:limit], len(candidates) > limit
 
+    @runtime_knowledge_operation("modify")
     async def backfill_embeddings(
         self,
         query: KnowledgeListQuery | None = None,
@@ -8084,6 +8144,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             next_cursor=next_cursor,
         )
 
+    @runtime_knowledge_operation("modify")
     async def store_embedding_projections(
         self,
         projections: list[KnowledgeEmbeddingProjection],
@@ -8140,6 +8201,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             stored_identities=[projection.identity for _, projection, _ in accepted],
         )
 
+    @runtime_knowledge_operation("read")
     async def search(
         self,
         query: KnowledgeQuery,
@@ -8156,6 +8218,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             index_readiness_sequence=None,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_at_frontier(
         self,
         query: KnowledgeQuery,
@@ -8179,6 +8242,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             index_readiness_sequence=index_readiness_sequence,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_revisions(
         self,
         query: KnowledgeQuery,
@@ -8433,6 +8497,9 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             return indexed, 0
 
         try:
+            from cayu.resource_access import require_dispatch
+
+            await require_dispatch()
             result = copy_text_embedding_result(
                 await self.embedding_provider.embed_texts(
                     TextEmbeddingRequest(
@@ -8611,6 +8678,9 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         return None if position == 0 else history[position - 1]
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
+        from cayu.resource_access import require_dispatch
+
+        await require_dispatch()
         result = copy_text_embedding_result(
             await self.embedding_provider.embed_texts(
                 TextEmbeddingRequest(
@@ -8750,6 +8820,7 @@ def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessS
     if type(scope) is not KnowledgeAccessScope:
         raise TypeError("KnowledgeAccessScope instances must not be subclasses.")
     return KnowledgeAccessScope(
+        resource_constraints=scope.resource_constraints,
         allowed_namespaces=list(scope.allowed_namespaces),
         allow_all_namespaces=scope.allow_all_namespaces,
         required_labels=copy_label_map(scope.required_labels, "required_labels"),
@@ -8989,6 +9060,10 @@ def _knowledge_scope_allows_snapshot_dimensions(
     scope: KnowledgeAccessScope,
     snapshot: _KnowledgeAccessSnapshot,
 ) -> bool:
+    from cayu.knowledge.access import matches
+
+    if not matches(scope, snapshot.labels):
+        return False
     if not scope.allow_all_namespaces and snapshot.namespace not in scope.allowed_namespaces:
         return False
     for key, value in scope.required_labels.items():
@@ -10801,6 +10876,9 @@ def _validate_revision_successor(
     current: KnowledgeEntry,
     successor: KnowledgeEntry,
 ) -> None:
+    from cayu.knowledge.access import require_relabel
+
+    require_relabel(current.labels, successor.labels)
     if successor.id != current.id:
         raise ValueError("Knowledge revision must preserve the logical entry id.")
     if successor.namespace != current.namespace:

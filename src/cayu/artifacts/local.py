@@ -23,6 +23,8 @@ from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._filesystem_lock import cooperative_path_lock
+from cayu._resource_access_errors import ResourceAccessDenied
+from cayu._resource_store_surface import model_store_surface
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu._validation import (
     copy_durable_metadata,
@@ -48,6 +50,7 @@ from cayu.artifacts._settlement import (
     _settle_artifact_write,
     _unsettled_artifact_write,
 )
+from cayu.artifacts.access import runtime_artifact_operation
 from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactMetadata,
@@ -119,6 +122,7 @@ def _detach_redundant_cleanup_context(
         set_exception_context(cleanup_error, None)
 
 
+@model_store_surface("artifacts")
 class LocalArtifactStore(ArtifactStore):
     """Local filesystem implementation of ArtifactStore."""
 
@@ -162,6 +166,9 @@ class LocalArtifactStore(ArtifactStore):
         self._root_identity = _stat_identity(root_stat)
         self._write_registry = _ArtifactWriteRegistry()
 
+    artifact_access_version = 1
+
+    @runtime_artifact_operation("create")
     async def put_bytes(
         self,
         content: bytes,
@@ -191,7 +198,10 @@ class LocalArtifactStore(ArtifactStore):
         resolved_artifact_id = (
             _new_artifact_id() if artifact_id is None else _validate_artifact_id(artifact_id)
         )
+        from cayu.artifacts.access import creation_labels
+
         artifact = ArtifactMetadata(
+            labels=creation_labels(),
             id=resolved_artifact_id,
             filename=filename,
             content_type=content_type,
@@ -219,6 +229,7 @@ class LocalArtifactStore(ArtifactStore):
             ),
         )
 
+    @runtime_artifact_operation("read")
     async def read_bytes(
         self,
         artifact_id: str,
@@ -236,6 +247,7 @@ class LocalArtifactStore(ArtifactStore):
             )
         except (
             ArtifactStoreUnavailableError,
+            ResourceAccessDenied,
             FileNotFoundError,
             InvalidArtifactIdError,
             TypeError,
@@ -247,6 +259,7 @@ class LocalArtifactStore(ArtifactStore):
                 "Local artifact store could not read artifact content."
             ) from exc
 
+    @runtime_artifact_operation("read")
     async def read_range(
         self, artifact_id: str, *, offset: int, max_bytes: int
     ) -> ArtifactReadResult:
@@ -260,10 +273,11 @@ class LocalArtifactStore(ArtifactStore):
                 _read_artifact, self.root, self._root_identity, artifact_id, limit, offset
             )
         except OSError as exc:
-            if isinstance(exc, FileNotFoundError):
+            if isinstance(exc, FileNotFoundError | ResourceAccessDenied):
                 raise
             raise ArtifactStoreUnavailableError("Local artifact range read failed.") from exc
 
+    @runtime_artifact_operation("list")
     async def list(
         self,
         *,
@@ -401,6 +415,7 @@ class LocalArtifactStore(ArtifactStore):
         if outcome.error is not None:
             raise outcome.error
 
+    @runtime_artifact_operation("delete")
     async def delete(self, artifact_id: str) -> None:
         try:
             await asyncio.to_thread(
@@ -409,7 +424,13 @@ class LocalArtifactStore(ArtifactStore):
                 self._root_identity,
                 artifact_id,
             )
-        except (ArtifactStoreUnavailableError, InvalidArtifactIdError, TypeError, ValueError):
+        except (
+            ArtifactStoreUnavailableError,
+            ResourceAccessDenied,
+            InvalidArtifactIdError,
+            TypeError,
+            ValueError,
+        ):
             raise
         except OSError as exc:
             raise ArtifactStoreUnavailableError(
@@ -1227,6 +1248,9 @@ def _read_artifact(
             directory_fd,
             directory_identity,
         )
+        from cayu.artifacts.access import require_artifact
+
+        require_artifact(metadata)
         content_fd = _open_artifact_file(
             directory_fd,
             target,
@@ -1323,6 +1347,10 @@ def _list_artifacts(
                 continue
             if environment_name is not None and artifact.environment_name != environment_name:
                 continue
+            from cayu.artifacts.access import visible
+
+            if not visible(artifact):
+                continue
             inventory.add(artifact)
     return inventory.result()
 
@@ -1350,12 +1378,21 @@ def _delete_artifact(
                 directory_fd,
                 directory_identity,
             ):
+                from cayu.artifacts.access import require_artifact
+
+                require_artifact(
+                    _load_metadata_from_directory(target, directory_fd, directory_identity)
+                )
                 if any(
                     name.startswith("pin_")
                     for name in os.listdir(directory_fd if directory_fd is not None else target)
                 ):
                     raise ValueError("Artifact is retained by a durable pin.")
         except FileNotFoundError:
+            from cayu.artifacts.access import _active
+
+            if _active.get() is not None:
+                raise
             return
         _remove_artifact_directory_if_unchanged(
             target,

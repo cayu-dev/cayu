@@ -143,6 +143,9 @@ async def _receipt(cur: Any, graph_id: str) -> TaskGraphCreationReceipt | None:
     if row is None:
         return None
     receipt = TaskGraphCreationReceipt.model_validate(pg._loads(row[0]))
+    from cayu.tasks.access import require_collection
+
+    require_collection(receipt)
     if receipt.graph_id != graph_id:
         raise TaskGraphUnavailable("Graph receipt index contradicts its authority.")
     return receipt

@@ -3,6 +3,12 @@
 **Goal:** embed one Cayu-backed application in a multi-tenant product without
 mistaking authenticated tenant provenance for data authorization.
 
+For an application-owned shared database boundary, use the opt-in
+[resource access API and product router](../resource-access.md). It enforces
+application-defined predicates and durable execution bounds without adding
+organizations, membership, or RBAC to Runtime. The packaged server discussed
+below remains an operator interface.
+
 ## The contract
 
 `AuthenticatedAccess(dependency=...)` configures `create_server()` or

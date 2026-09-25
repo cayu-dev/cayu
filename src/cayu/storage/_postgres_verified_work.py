@@ -553,9 +553,13 @@ class PostgresVerifiedWorkMixin:
             (task_id,),
         )
         row = await cur.fetchone()
-        if row is None:
+        task = None if row is None else pg_support.task_from_row(row)
+        from cayu.tasks.access import require_mutation
+
+        require_mutation(task)
+        if task is None:
             raise KeyError(f"Task not found: {task_id}")
-        return pg_support.task_from_row(row)
+        return task
 
     async def _load_attempt_row(
         self,

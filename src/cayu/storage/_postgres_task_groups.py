@@ -33,6 +33,9 @@ async def read_group(cur: Any, group_id: str) -> TaskGroupSnapshot | None:
     if row is None:
         return None
     snapshot = TaskGroupSnapshot.model_validate(pg._loads(row[1]))
+    from cayu.tasks.access import require_collection
+
+    require_collection(snapshot.receipt.graph)
     if snapshot.receipt.group_id != group_id or snapshot.receipt.graph.graph_id != row[0]:
         raise TaskGroupUnavailable("Group index contradicts its authority.")
     return snapshot

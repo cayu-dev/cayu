@@ -28,6 +28,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
+from cayu.sessions.invocation import TaskInvocation
 from cayu.tasks.base import TaskCreate, TaskInvocationSnapshot, TaskStatus, copy_task_create
 
 TASK_GRAPH_MAX_NODES = 128
@@ -238,6 +239,7 @@ def task_graph_request_sha256(request: TaskGraphCreate) -> str:
 class TaskGraphCreationReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
+    access_invocation: TaskInvocation | None = Field(default=None, exclude_if=lambda v: v is None)
     graph_id: GraphIdentifier
     request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     submitted_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

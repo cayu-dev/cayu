@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
 
+from cayu._resource_store_surface import model_store_surface
 from cayu.budgets.pricing import PriceBook
 from cayu.collaboration.peer_content import (
     PeerAppendKey,
@@ -44,6 +45,11 @@ from cayu.runtime.session_message_lifecycle import (
     session_message_rejection,
 )
 from cayu.sessions import creation_fence
+from cayu.sessions.access import (
+    require_resource_session,
+    runtime_session_mutation,
+    runtime_session_query,
+)
 from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageDeliveryMode,
@@ -62,6 +68,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.tasks.groups import (
         TaskGroupCreate,
@@ -549,6 +556,7 @@ from cayu.tasks._scheduling import (
     schedule_revision_after,
     schedule_transition_events,
 )
+from cayu.tasks.access import runtime_collection_read, runtime_task_creation, runtime_task_mutation
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -1994,8 +2002,70 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
     )
 
 
+@model_store_surface("sessions")
 class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
     """SQLite-backed session store for durable local runtime state."""
+
+    session_access_version: ClassVar[int | None] = 1
+
+    async def _access_create_session(self, bounds, request, identity):
+        from cayu.sessions.access import _creation_bounds
+
+        token = _creation_bounds.set(bounds)
+        try:
+            return await self.create(request, identity=identity)
+        finally:
+            _creation_bounds.reset(token)
+
+    async def _access_update_metadata(self, bounds, session_id, metadata):
+        return await self.update_metadata(session_id, metadata, _access_bounds=bounds)
+
+    async def _access_delete_session(self, bounds, session_id):
+        await self.delete_session(session_id, _access_bounds=bounds)
+
+    async def _access_read_records(self, bounds, session_id, kind, offset, limit, max_bytes):
+        from cayu.storage._session_access_records import sqlite_read
+
+        return await sqlite_read(self, bounds, session_id, kind, offset, limit, max_bytes)
+
+    async def _access_list_sessions(
+        self, bounds: _SessionAccessBounds, query: SessionQuery
+    ) -> SessionListResult:
+        return await self._list_sessions(
+            query, pending_interruption_cascade_only=False, access_bounds=bounds
+        )
+
+    async def _access_update_labels(
+        self, bounds: _SessionAccessBounds, session_id: str, labels: dict[str, str]
+    ) -> Session:
+        return await self.update_labels(session_id, labels, _access_bounds=bounds)
+
+    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+        from cayu.sessions.access import SessionAccessDenied
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        clause = session_store_sql.session_access_clause(bounds, dialect=_SQL_DIALECT)
+
+        def read(connection):
+            row = connection.execute(
+                f"SELECT * FROM cayu_sessions WHERE id = ? AND ({clause.sql})",
+                (session_id, *clause.params),
+            ).fetchone()
+            if row is None:
+                raise SessionAccessDenied()
+            labels = self._load_labels_for_sessions_unlocked([session_id], connection=connection)
+            return bounds.require_read(
+                sqlite_support.session_from_row(row, labels=labels[session_id])
+            )
+
+        def snapshot(connection):
+            connection.execute("BEGIN")
+            try:
+                return read(connection)
+            finally:
+                connection.rollback()
+
+        return await self._run_read(snapshot)
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
@@ -5452,6 +5522,16 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             return loaded
 
     async def load(self, session_id: str) -> Session | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
+        if access_bounds is not None:
+            from cayu._resource_access_errors import ResourceAccessDenied
+
+            try:
+                return await self._access_load_session(access_bounds, session_id)
+            except ResourceAccessDenied:
+                return None
         session_id = require_clean_nonblank(session_id, "session_id")
         return await self._run_read(lambda connection: _load_session(connection, session_id))
 
@@ -6487,17 +6567,20 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             finally:
                 self._connection.rollback()
 
+    @runtime_session_mutation
     async def delete_session(
         self,
         session_id: str,
         *,
         closure_receipt: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
     ) -> None:
         await self._participant_creation_lock.acquire()
         try:
             await self._delete_session_unserialized(
                 session_id,
                 closure_receipt=closure_receipt,
+                _access_bounds=_access_bounds,
             )
         finally:
             self._participant_creation_lock.release()
@@ -6507,12 +6590,15 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         session_id: str,
         *,
         closure_receipt: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 session = self._load_unlocked(session_id)
+                if _access_bounds is not None:
+                    _access_bounds.require_action(session, "delete")
                 if session is None:
                     self._connection.rollback()
                     return
@@ -6561,13 +6647,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     (session_id, "durable"),
                 ).fetchone()
                 if (
-                    closure_receipt is not None
-                    and self._connection.execute(
-                        "SELECT 1 FROM cayu_sessions WHERE parent_session_id = ? LIMIT 1",
-                        (session_id,),
-                    ).fetchone()
-                    is not None
-                ):
+                    closure_receipt is not None or _access_bounds is not None
+                ) and self._connection.execute(
+                    "SELECT 1 FROM cayu_sessions WHERE parent_session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone() is not None:
                     raise ValueError("Closure deletion requires no remaining child edges.")
                 if durable_child is not None:
                     raise ValueError(
@@ -6607,7 +6691,14 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 self._connection.rollback()
                 raise
 
-    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+    @runtime_session_mutation
+    async def update_labels(
+        self,
+        session_id: str,
+        labels: dict[str, str],
+        *,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
         updated_at = self._ownership_clock()
@@ -6615,6 +6706,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         async with self._lock:
             with self._connection:
                 self._connection.execute("BEGIN IMMEDIATE")
+                if _access_bounds is not None:
+                    access_session = self._load_unlocked(session_id)
+                    _access_bounds.require_label_update(access_session, new_labels)
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
                 epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
@@ -6646,6 +6740,19 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                         """,
                         [(session_id, key, value) for key, value in new_labels.items()],
                     )
+                if _access_bounds is not None:
+                    audit = _access_bounds.label_audit(access_session, new_labels, updated_at)
+                    if audit is not None:
+                        key, record = audit
+                        self._connection.execute(
+                            "INSERT INTO cayu_session_operations (session_id, idempotency_key, record_json, updated_at) VALUES (?, ?, ?, ?)",
+                            (
+                                session_id,
+                                key,
+                                sqlite_support.json_dumps(record),
+                                sqlite_support.format_datetime(updated_at),
+                            ),
+                        )
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -6659,12 +6766,21 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 )
             return loaded
 
-    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+    @runtime_session_mutation
+    async def update_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+        *,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         user_metadata = copy_session_user_metadata(metadata)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                if _access_bounds is not None:
+                    _access_bounds.require_action(self._load_unlocked(session_id), "modify")
                 updated_at = self._ownership_clock()
                 row = self._connection.execute(
                     "SELECT run_epoch, metadata_json FROM cayu_sessions WHERE id = ?",
@@ -9503,6 +9619,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             include_checkpoint_digest=include_checkpoint_digest,
         )
 
+    @runtime_session_query
     async def snapshot_session_message_source(
         self,
         session_id: str,
@@ -9522,6 +9639,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             connection.execute("BEGIN")
             try:
                 session = _load_session(connection, session_id)
+                require_resource_session(session, "read")
                 if session is None:
                     raise KeyError("Session not found.")
                 message_queue.require_authorized_session_instance(
@@ -9541,6 +9659,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(query)
 
+    @runtime_session_query
     async def inspect_session_messages(
         self,
         query: SessionMessageQuery,
@@ -9553,6 +9672,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             connection.execute("BEGIN")
             try:
                 session = _load_session(connection, query.session_id)
+                require_resource_session(session, "read")
                 if session is None:
                     raise KeyError("Session not found.")
                 message_queue.require_authorized_session_instance(
@@ -9614,6 +9734,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(read)
 
+    @runtime_session_query
     async def apply_session_message_action(
         self,
         request: SessionMessageActionRequest,
@@ -9624,6 +9745,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 session = self._load_unlocked(request.session_id)
+                require_resource_session(session, "modify")
                 if session is None or session.instance_id != request.session_instance_id:
                     raise SessionMessageConflict()
                 raw = _session_message_raw_bounded(connection, session.id, request.queue_id)
@@ -9711,6 +9833,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_write(statement)
 
+    @runtime_session_query
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
@@ -9725,6 +9848,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 loaded = self._load_unlocked(request.session_id)
+                require_resource_session(loaded, "modify")
                 if loaded is None:
                     raise KeyError(f"Session not found: {request.session_id}")
                 if expected_authorized_target_instance_id is not None and (
@@ -9734,6 +9858,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     raise SessionMessageConflict()
                 if request.conditions.source is not None:
                     source = self._load_unlocked(request.conditions.source.session_id)
+                    require_resource_session(source, "read")
                     if (
                         source is None
                         or source.instance_id != request.conditions.source.session_instance_id
@@ -9769,6 +9894,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 if request.conditions.source is not None:
                     expected_source = request.conditions.source
                     source = self._load_unlocked(expected_source.session_id)
+                    require_resource_session(source, "read")
                     if (
                         source is None
                         or self._session_message_source_unlocked(
@@ -10716,6 +10842,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         *,
         checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
@@ -10778,7 +10907,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             record_json = row["record_json"]
             return None if record_json is None else json.loads(record_json)
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def _load_runtime_publication_receipt_record(
         self,
@@ -13213,6 +13346,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         return await self._run_read(query)
 
     async def load_events(self, session_id: str) -> list[Event]:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> list[Event]:
@@ -13229,7 +13365,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             ).fetchall()
             return [_event_from_row(row) for row in rows]
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def load_user_input_supersession_events(
         self,
@@ -13358,6 +13498,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(query)
 
+    @runtime_session_query
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
         if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
@@ -13385,6 +13526,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(run_query)
 
+    @runtime_session_query
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:
@@ -13432,6 +13574,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(read)
 
+    @runtime_session_query
     async def read_cost_accounting(
         self,
         query: EventQuery,
@@ -13562,6 +13705,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(read)
 
+    @runtime_session_query
     async def event_exists(self, query: EventQuery) -> bool:
         plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
 
@@ -13578,6 +13722,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         return await self._run_read(read)
 
+    @runtime_session_query
     async def query_events_bounded(
         self,
         query: EventQuery,
@@ -14366,6 +14511,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         return records[: query.limit]
 
     async def summarize_events(self, session_id: str) -> EventSummary:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> EventSummary:
@@ -14408,9 +14556,16 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 latest_event=_event_record_from_row(latest_row),
             )
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> SessionOutcome:
@@ -14465,7 +14620,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 latest_retry_event=_event_record_from_row(retry_row),
             )
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def prune_events(
         self,
@@ -14806,6 +14965,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         return await self._run_write(statement)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
+        if access_bounds is not None:
+            return await self._access_list_sessions(access_bounds, copy_session_query(query))
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
 
     async def query_session_topology(
@@ -16301,6 +16465,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         query: SessionQuery | None,
         *,
         pending_interruption_cascade_only: bool,
+        access_bounds: _SessionAccessBounds | None = None,
     ) -> SessionListResult:
         query = copy_session_query(query)
         session_source_sql = (
@@ -16345,6 +16510,13 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             plan = session_store_sql.build_session_query_sql(
                 resolved_query,
                 dialect=_SQL_DIALECT,
+                access_clause=(
+                    None
+                    if access_bounds is None
+                    else session_store_sql.session_access_clause(
+                        access_bounds, dialect=_SQL_DIALECT
+                    )
+                ),
             )
             total_count: int | None = None
             if query.include_total_count:
@@ -16385,7 +16557,16 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 total_count=total_count,
             )
 
-        return await self._run_read(run_query)
+        def snapshot(connection):
+            if access_bounds is None:
+                return run_query(connection)
+            connection.execute("BEGIN")
+            try:
+                return run_query(connection)
+            finally:
+                connection.rollback()
+
+        return await self._run_read(snapshot)
 
     async def append_transcript_messages(
         self,
@@ -16440,6 +16621,7 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
 
         await self._run_write(statement)
 
+    @runtime_session_query
     async def append_peer_content(
         self,
         request: PeerContentAppendRequest,
@@ -16463,6 +16645,15 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                     request.append_key,
                     None if creation is None else _creation_fence.sqlite_read(connection, creation),
                 )
+                from cayu.sessions.access import _query_bounds
+
+                if _query_bounds.get() is not None:
+                    require_resource_session(
+                        self._load_unlocked(request.occurrence.sender_session_id), "read"
+                    )
+                    require_resource_session(
+                        None if target_id is None else self._load_unlocked(target_id), "modify"
+                    )
                 row = connection.execute(
                     "SELECT commitment_json, receipt_json FROM cayu_peer_content_receipts "
                     "WHERE append_key_json = ? OR operation_key = ?",
@@ -17474,6 +17665,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         await self._run_write(statement)
 
     async def load_transcript(self, session_id: str) -> list[Message]:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> list[Message]:
@@ -17490,9 +17684,16 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
             ).fetchall()
             return [Message(**json.loads(row["message_json"])) for row in rows]
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> TranscriptSnapshot:
@@ -17525,7 +17726,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 cursor=int(rows[0]["transcript_seq"]),
             )
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def load_transcript_cursor(self, session_id: str) -> int:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -17574,6 +17779,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         role: MessageRole,
         max_chars: int,
     ) -> tuple[str, bool] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(role, MessageRole):
             raise TypeError("role must be a MessageRole.")
@@ -17676,7 +17884,13 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 )
             return text_value[:max_chars], len(text_value) > max_chars
 
-        return await self._run_read(query_latest)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(
+                connection, access_bounds, session_id, query_latest
+            )
+        )
 
     async def load_transcript_window(
         self,
@@ -17685,6 +17899,9 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         start_index: int,
         limit: int,
     ) -> TranscriptSnapshot:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         if type(start_index) is not int:
             raise TypeError("start_index must be an integer.")
@@ -17727,9 +17944,16 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 cursor=int(rows[0]["transcript_seq"]),
             )
 
-        return await self._run_read(query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
+        )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         query = copy_transcript_query(query)
         filters: list[str] = []
         filter_params: list[object] = []
@@ -17786,7 +18010,13 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
                 total_records=total_records,
             )
 
-        return await self._run_read(run_query)
+        from cayu.storage._session_access_records import sqlite_owner_read
+
+        return await self._run_read(
+            lambda connection: sqlite_owner_read(
+                connection, access_bounds, query.session_id, run_query
+            )
+        )
 
     async def search_transcript(
         self,
@@ -18099,9 +18329,20 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         await self._run_write(statement)
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
+        from cayu.storage._session_access_records import sqlite_owner_read
+
         return await self._run_read(
-            lambda connection: _load_checkpoint_state(connection, session_id)
+            lambda connection: sqlite_owner_read(
+                connection,
+                access_bounds,
+                session_id,
+                lambda conn: _load_checkpoint_state(conn, session_id),
+                action="inspect_state",
+            )
         )
 
     async def load_interruption_cascade_marker(
@@ -18194,8 +18435,11 @@ class SQLiteSessionStore(SQLiteCreationFenceMixin, SessionStore):
         return _first_existing_event_id(self._connection, session_id, event_ids)
 
 
+@model_store_surface("tasks")
 class SQLiteTaskStore(TaskStore):
     """SQLite-backed task store for durable local work items."""
+
+    task_access_version: ClassVar[int | None] = 1
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
@@ -18254,16 +18498,19 @@ class SQLiteTaskStore(TaskStore):
 
         return await reconcile(self, request.group_id, resolution=request)
 
+    @runtime_task_creation
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         from cayu.storage._sqlite_task_groups import create_group
 
         return await create_group(self, request)
 
+    @runtime_collection_read
     async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
         from cayu.storage._sqlite_task_groups import load_group
 
         return await load_group(self, group_id)
 
+    @runtime_collection_read
     async def list_task_group_events(
         self, group_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGroupEvent]:
@@ -18271,16 +18518,19 @@ class SQLiteTaskStore(TaskStore):
 
         return await list_events(self, group_id, after_sequence=after_sequence, limit=limit)
 
+    @runtime_task_creation
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         from cayu.storage._sqlite_task_graphs import create_graph
 
         return await create_graph(self, request)
 
+    @runtime_collection_read
     async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
         from cayu.storage._sqlite_task_graphs import load_graph
 
         return await load_graph(self, graph_id)
 
+    @runtime_collection_read
     async def list_task_graph_events(
         self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGraphEvent]:
@@ -21088,6 +21338,7 @@ class SQLiteTaskStore(TaskStore):
             )
             return None if receipt is None else receipt.model_copy(deep=True)
 
+    @runtime_task_creation
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         if request.schedule_policy is not None and not self.supports_task_scheduling:
@@ -21369,6 +21620,7 @@ class SQLiteTaskStore(TaskStore):
                     maintenance_required=bool(maintenance),
                 )
 
+    @runtime_task_creation
     async def create_running_task(
         self,
         request: TaskCreate,
@@ -21448,10 +21700,19 @@ class SQLiteTaskStore(TaskStore):
                 raise ValueError(f"Task already exists: {task.id}") from exc
             raise
 
-    async def load_task(self, task_id: str) -> Task | None:
+    async def load_task(self, task_id: str, *, _access_bounds=None) -> Task | None:
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
-            return self._load_task_unlocked(task_id)
+            task = self._load_task_unlocked(task_id)
+            if _access_bounds is not None:
+                from cayu.tasks.access import require_read
+
+                require_read(task, _access_bounds)
+            return task
 
     async def load_active_attached_task_worker(
         self,
@@ -21517,10 +21778,22 @@ class SQLiteTaskStore(TaskStore):
                 invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
             )
 
-    async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
+    async def list_tasks(
+        self, query: TaskQuery | None = None, *, _access_bounds=None
+    ) -> list[Task]:
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
         clauses: list[str] = []
         params: list[object] = []
+        if _access_bounds is not None:
+            from cayu.tasks.access import sql_predicate
+
+            access_sql, access_params = sql_predicate(_access_bounds, postgres=False)
+            clauses.append(access_sql)
+            params.extend(access_params)
 
         if query.q is not None:
             like = _like_contains_pattern(query.q)
@@ -23426,6 +23699,7 @@ class SQLiteTaskStore(TaskStore):
                 self._connection.rollback()
                 raise
 
+    @runtime_task_mutation
     async def cancel_task(
         self,
         task_id: str,
@@ -23523,6 +23797,7 @@ class SQLiteTaskStore(TaskStore):
                 self._record_task_transition_unlocked(current, started)
                 return self._require_task_unlocked(task_id).model_copy(deep=True)
 
+    @runtime_task_mutation
     async def pause_task(
         self,
         task_id: str,
@@ -23537,6 +23812,7 @@ class SQLiteTaskStore(TaskStore):
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def block_task(
         self,
         task_id: str,
@@ -23551,6 +23827,7 @@ class SQLiteTaskStore(TaskStore):
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def mark_task_needs_attention(
         self,
         task_id: str,
@@ -23565,6 +23842,7 @@ class SQLiteTaskStore(TaskStore):
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def resume_task(self, task_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
@@ -24223,6 +24501,9 @@ class SQLiteTaskStore(TaskStore):
 
     def _require_task_unlocked(self, task_id: str) -> Task:
         task = self._load_task_unlocked(task_id)
+        from cayu.tasks.access import require_mutation
+
+        require_mutation(task)
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
         return task

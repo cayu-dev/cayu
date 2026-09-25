@@ -153,6 +153,9 @@ async def _admitted_model_provider_events(
 ) -> AsyncGenerator[ModelStreamEvent, None]:
     """Transfer one pre-dispatch deadline admission into the provider stream."""
 
+    from cayu.resource_access import require_dispatch
+
+    await require_dispatch()
     await refresh_live_model_semantics()
     deadline = current_execution_deadline()
     try:

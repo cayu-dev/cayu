@@ -60,7 +60,24 @@ class ArtifactMetadata(BaseModel):
     agent_name: str | None = None
     environment_name: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    labels: Mapping[str, str] = Field(default_factory=dict, exclude_if=lambda value: not value)
     metadata: Mapping[str, Any] = Field(default_factory=dict)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_access_labels(cls, value):
+        from cayu._validation import copy_label_map
+
+        return copy_label_map(value, "artifact labels")
+
+    @field_validator("labels")
+    @classmethod
+    def freeze_access_labels(cls, value):
+        return freeze_json_value(value)
+
+    @field_serializer("labels")
+    def serialize_access_labels(self, value):
+        return dict(value)
 
     @field_validator("metadata", mode="before")
     @classmethod

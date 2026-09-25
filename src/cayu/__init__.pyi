@@ -2,6 +2,7 @@
 
 from cayu._browser_recording_store import BrowserRecordingStore as BrowserRecordingStore
 from cayu._browser_recording_store import BrowserRecordingUnavailable as BrowserRecordingUnavailable
+from cayu._resource_access_errors import ResourceAccessDenied as ResourceAccessDenied
 from cayu._validation import DurableValueError as DurableValueError
 from cayu._validation import extract_durable_value_error as extract_durable_value_error
 from cayu._version import __version__ as __version__
@@ -2991,6 +2992,10 @@ from cayu.proxies.base import CredentialProxy as CredentialProxy
 from cayu.proxies.base import ProxyAuthorizationResult as ProxyAuthorizationResult
 from cayu.proxies.passthrough import AllowlistProxy as AllowlistProxy
 from cayu.proxies.passthrough import PassthroughProxy as PassthroughProxy
+from cayu.resource_access import ResourceAccessDecision as ResourceAccessDecision
+from cayu.resource_access import ResourceAccessGrant as ResourceAccessGrant
+from cayu.resource_access import ResourceAccessPolicy as ResourceAccessPolicy
+from cayu.resource_access import ScopedCayuAccess as ScopedCayuAccess
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY as DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
 )
@@ -3554,6 +3559,9 @@ from cayu.runtime.verified_task_worker import VerifiedTaskWorker as VerifiedTask
 from cayu.runtime.verified_task_worker import (
     VerifiedTaskWorkerDraining as VerifiedTaskWorkerDraining,
 )
+from cayu.sessions.access import SessionAccessRule as SessionAccessRule
+from cayu.sessions.access import SessionAccessScope as SessionAccessScope
+from cayu.sessions.access import SessionAccessSelector as SessionAccessSelector
 from cayu.sessions.base import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES as DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
 )

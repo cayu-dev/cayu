@@ -2687,6 +2687,10 @@ class EnvironmentLifecycle:
                 await self._validate_completion_recovery(
                     completion_recovery, session=session, invocation_context=invocation_context
                 )
+            if completion_recovery is None:
+                from cayu.resource_access import require_dispatch
+
+                await require_dispatch()
             resolved = await _await_with_environment_lifecycle_reporter(
                 progress_reporter,
                 lambda: environment_operation_boundary.await_environment_operation(

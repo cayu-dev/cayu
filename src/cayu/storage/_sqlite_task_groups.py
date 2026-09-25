@@ -31,6 +31,9 @@ def read_group(store: SQLiteTaskStore, group_id: str) -> TaskGroupSnapshot | Non
     if row is None:
         return None
     snapshot = TaskGroupSnapshot.model_validate_json(row[1])
+    from cayu.tasks.access import require_collection
+
+    require_collection(snapshot.receipt.graph)
     if snapshot.receipt.group_id != group_id or snapshot.receipt.graph.graph_id != row[0]:
         raise TaskGroupUnavailable("Group index contradicts its authority.")
     return snapshot

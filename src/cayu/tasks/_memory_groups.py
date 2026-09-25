@@ -37,6 +37,9 @@ async def load_group(store: InMemoryTaskStore, group_id: str) -> TaskGroupSnapsh
     group_id = graph_identifier(group_id)
     async with store._lock:
         snapshot = store._task_groups.get(group_id)
+        from cayu.tasks.access import require_collection
+
+        require_collection(None if snapshot is None else snapshot.receipt.graph)
         return None if snapshot is None else snapshot.model_copy(deep=True)
 
 
@@ -98,6 +101,10 @@ async def list_events(
     group_id = graph_identifier(group_id)
     validate_group_cursor(after_sequence, limit)
     async with store._lock:
+        from cayu.tasks.access import require_collection
+
+        snapshot = store._task_groups.get(group_id)
+        require_collection(None if snapshot is None else snapshot.receipt.graph)
         if group_id not in store._task_groups:
             raise KeyError("Task group not found.")
         return [

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, NoRetur
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from cayu._resource_store_surface import model_store_surface
 from cayu.budgets.pricing import PriceBook
 from cayu.collaboration.peer_content import (
     PeerAppendKey,
@@ -28,6 +29,7 @@ from cayu.collaboration.peer_content import (
     PeerContentReceipt,
     PeerContentUnavailable,
 )
+from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.runtime import event_side_effect_health as side_effect_health
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
@@ -46,6 +48,11 @@ from cayu.runtime.session_message_lifecycle import (
     session_message_rejection,
 )
 from cayu.sessions import creation_fence
+from cayu.sessions.access import (
+    require_resource_session,
+    runtime_session_mutation,
+    runtime_session_query,
+)
 from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageDeliveryMode,
@@ -77,6 +84,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.tasks.groups import (
         TaskGroupCreate,
@@ -858,6 +866,7 @@ from cayu.tasks._scheduling import (
     schedule_revision_after,
     schedule_transition_events,
 )
+from cayu.tasks.access import runtime_collection_read, runtime_task_creation, runtime_task_mutation
 from cayu.tasks.admission import WorkAttemptExecutionClaimLost
 from cayu.tasks.base import (
     _TASK_CANCELLATION_REQUESTED_REASON,
@@ -17062,6 +17071,8 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
+    resource_knowledge_access_version = 1
+
     _min_required_revision = 78
 
     def __init__(
@@ -17090,6 +17101,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             read_only=read_only,
         )
 
+    @runtime_knowledge_operation("create")
     async def create_entry(
         self,
         entry: KnowledgeEntry,
@@ -17177,6 +17189,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("modify")
     async def append_entry_revision(
         self,
         entry: KnowledgeEntry,
@@ -17211,6 +17224,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("read")
     async def get_entry(
         self,
         entry_id: str,
@@ -17270,6 +17284,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 )
             return entry
 
+    @runtime_knowledge_operation("modify")
     async def transition_entry_status(
         self,
         entry_id: str,
@@ -17361,6 +17376,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
         return loaded
 
+    @runtime_knowledge_operation("delete")
     async def delete_entry(
         self,
         entry_id: str,
@@ -17479,6 +17495,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
         return loaded
 
+    @runtime_knowledge_operation("modify")
     async def prune_expired(
         self,
         *,
@@ -17568,6 +17585,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return pruned
 
+    @runtime_knowledge_operation("modify")
     async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
@@ -17788,6 +17806,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
@@ -17801,6 +17820,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_activation_receipt(
         self,
         operation_id: str,
@@ -17820,6 +17840,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
         return None if receipt is None else copy_knowledge_activation_receipt(receipt)
 
+    @runtime_knowledge_operation("modify")
     async def approve_pending_entry(
         self,
         authority: KnowledgeActivationAuthority,
@@ -17984,6 +18005,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("modify")
     async def publish_relations(
         self,
         relations: list[KnowledgeRelation],
@@ -18156,6 +18178,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_relation_publication_receipt(
         self,
         operation_id: str,
@@ -18174,6 +18197,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
         return None if receipt is None else copy_knowledge_relation_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def read_relations(
         self,
         query: KnowledgeRelationQuery,
@@ -18461,6 +18485,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             fingerprint=fingerprint,
         )
 
+    @runtime_knowledge_operation("modify")
     async def publish_maintenance_proposal(
         self,
         entry: KnowledgeEntry,
@@ -18654,6 +18679,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_proposal_publication(
         self,
         proposal_id: str,
@@ -18736,6 +18762,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             ),
         )
 
+    @runtime_knowledge_operation("modify")
     async def record_maintenance_governance_route(
         self,
         authority: KnowledgeMaintenanceGovernanceAuthority,
@@ -18887,6 +18914,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_governance_route(
         self,
         operation_id: str,
@@ -18904,6 +18932,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 deny_inaccessible=False,
             )
 
+    @runtime_knowledge_operation("modify")
     async def record_semantic_watch_outcome(
         self,
         authority: KnowledgeSemanticWatchAuthority,
@@ -19012,6 +19041,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_semantic_watch_receipt(
         self,
         operation_id: str,
@@ -19029,6 +19059,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 deny_inaccessible=False,
             )
 
+    @runtime_knowledge_operation("modify")
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -19342,6 +19373,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_proposal(
         self,
         proposal_id: str,
@@ -19387,6 +19419,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
         return None if record is None else copy_knowledge_maintenance_proposal(record[0])
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_decision(
         self,
         operation_id: str,
@@ -19405,6 +19438,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
         return None if record is None else copy_knowledge_maintenance_decision(record[1])
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_decision_receipt(
         self,
         operation_id: str,
@@ -19587,6 +19621,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             )
             return inventory.document()
 
+    @runtime_knowledge_operation("read")
     async def read_evidence(
         self,
         entry_id: str,
@@ -19644,6 +19679,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             total_evidence_known=total_evidence_known,
         )
 
+    @runtime_knowledge_operation("read")
     async def read_changes(
         self,
         *,
@@ -19716,6 +19752,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             limit=limit,
         )
 
+    @runtime_knowledge_operation("modify")
     async def claim_change(
         self,
         consumer_id: str,
@@ -19856,6 +19893,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("modify")
     async def initialize_change_consumer(
         self,
         consumer_id: str,
@@ -19901,6 +19939,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("modify")
     async def acknowledge_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -19969,6 +20008,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("modify")
     async def release_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -20013,6 +20053,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_change_consumer_state(
         self,
         consumer_id: str,
@@ -20033,6 +20074,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return None
         return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def publish_index_readiness(
         self,
         update: KnowledgeIndexReadinessUpdate,
@@ -20203,6 +20245,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 await conn.rollback()
                 raise
 
+    @runtime_knowledge_operation("read")
     async def load_index_readiness(
         self,
         identity: KnowledgeEmbeddingIdentity,
@@ -20235,6 +20278,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             raise RuntimeError("Knowledge index readiness identity digest collision.")
         return readiness
 
+    @runtime_knowledge_operation("read")
     async def read_index_readiness(
         self,
         *,
@@ -20352,6 +20396,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             return identity.projection_content_hash == _knowledge_chunk_content_hash(chunk)
         return True
 
+    @runtime_knowledge_operation("read")
     async def read_chunks(
         self,
         entry_id: str,
@@ -20402,6 +20447,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             max_bytes=max_bytes,
         )
 
+    @runtime_knowledge_operation("read")
     async def search(
         self,
         query: KnowledgeQuery,
@@ -20423,6 +20469,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 through_change_sequence=None,
             )
 
+    @runtime_knowledge_operation("read")
     async def search_at_frontier(
         self,
         query: KnowledgeQuery,
@@ -20451,6 +20498,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 through_change_sequence=knowledge_sequence,
             )
 
+    @runtime_knowledge_operation("read")
     async def search_revisions(
         self,
         query: KnowledgeQuery,
@@ -20535,6 +20583,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             total_hits_known=total_hits_known,
         )
 
+    @runtime_knowledge_operation("read")
     async def list_entries(
         self,
         query: KnowledgeListQuery,
@@ -23087,6 +23136,8 @@ def _warn_if_embedding_dims_exceed_hnsw(dimensions: int) -> None:
 class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     """Postgres knowledge store with pgvector-backed semantic chunk search."""
 
+    resource_knowledge_access_version = 1
+
     def __init__(
         self,
         conninfo: str | None = None,
@@ -23147,6 +23198,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             await self._reconcile_embedding_schema()
             self._embedding_schema_ready = True
 
+    @runtime_knowledge_operation("modify")
     async def process_embedding_changes(
         self,
         consumer_id: str,
@@ -23258,6 +23310,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             record_limit=record_limit,
         )
 
+    @runtime_knowledge_operation("modify")
     async def backfill_embeddings(
         self,
         query: KnowledgeListQuery | None = None,
@@ -23305,6 +23358,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             next_cursor=next_cursor,
         )
 
+    @runtime_knowledge_operation("read")
     async def search(
         self,
         query: KnowledgeQuery,
@@ -23321,6 +23375,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             index_readiness_sequence=None,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_at_frontier(
         self,
         query: KnowledgeQuery,
@@ -23344,6 +23399,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             index_readiness_sequence=index_readiness_sequence,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_revisions(
         self,
         query: KnowledgeQuery,
@@ -23381,23 +23437,19 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         if query.mode is KnowledgeSearchMode.KEYWORD or (
             query.mode is KnowledgeSearchMode.AUTO and not _query_terms_have_positive_terms(terms)
         ):
-            if revision_refs is not None:
-                return await super().search_revisions(
+            # The public entry point already resolved and intersected the scope.
+            # Re-entering it would treat resource constraints as a caller override
+            # of a store's bound default scope.
+            await self._ensure_ready()
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                await _begin_knowledge_read_snapshot(cur)
+                return await self._keyword_search_in_snapshot(
+                    cur,
                     query,
-                    revision_refs,
-                    knowledge_sequence=knowledge_sequence,
-                    index_readiness_sequence=index_readiness_sequence,
                     access_scope=scope,
+                    revision_refs=revision_refs,
+                    through_change_sequence=knowledge_sequence,
                 )
-            if knowledge_sequence is not None:
-                assert index_readiness_sequence is not None
-                return await super().search_at_frontier(
-                    query,
-                    knowledge_sequence=knowledge_sequence,
-                    index_readiness_sequence=index_readiness_sequence,
-                    access_scope=scope,
-                )
-            return await super().search(query, access_scope=scope)
         if query.mode not in {
             KnowledgeSearchMode.AUTO,
             KnowledgeSearchMode.SEMANTIC,
@@ -24890,6 +24942,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             return indexed, 0
 
         try:
+            from cayu.resource_access import require_dispatch
+
+            await require_dispatch()
             result = copy_text_embedding_result(
                 await self.embedding_provider.embed_texts(
                     TextEmbeddingRequest(
@@ -24974,6 +25029,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             indexed += 1
         return indexed, 0
 
+    @runtime_knowledge_operation("modify")
     async def store_embedding_projections(
         self,
         projections: list[KnowledgeEmbeddingProjection],
@@ -25304,6 +25360,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         return content_hash == identity.projection_content_hash
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
+        from cayu.resource_access import require_dispatch
+
+        await require_dispatch()
         result = copy_text_embedding_result(
             await self.embedding_provider.embed_texts(
                 TextEmbeddingRequest(
@@ -25473,8 +25532,61 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         return removed, len(stale_ids) > limit
 
 
+@model_store_surface("sessions")
 class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, SessionStore):
-    """Postgres-backed session store for durable multi-tenant runtime state."""
+    """Postgres-backed session store for shared durable runtime state."""
+
+    session_access_version: ClassVar[int | None] = 1
+
+    async def _access_create_session(self, bounds, request, identity):
+        from cayu.sessions.access import _creation_bounds
+
+        token = _creation_bounds.set(bounds)
+        try:
+            return await self.create(request, identity=identity)
+        finally:
+            _creation_bounds.reset(token)
+
+    async def _access_update_metadata(self, bounds, session_id, metadata):
+        return await self.update_metadata(session_id, metadata, _access_bounds=bounds)
+
+    async def _access_delete_session(self, bounds, session_id):
+        await self.delete_session(session_id, _access_bounds=bounds)
+
+    async def _access_read_records(self, bounds, session_id, kind, offset, limit, max_bytes):
+        from cayu.storage._session_access_records import postgres_read
+
+        return await postgres_read(self, bounds, session_id, kind, offset, limit, max_bytes)
+
+    async def _access_list_sessions(
+        self, bounds: _SessionAccessBounds, query: SessionQuery
+    ) -> SessionListResult:
+        return await self._list_sessions(
+            query, pending_interruption_cascade_only=False, access_bounds=bounds
+        )
+
+    async def _access_update_labels(
+        self, bounds: _SessionAccessBounds, session_id: str, labels: dict[str, str]
+    ) -> Session:
+        return await self.update_labels(session_id, labels, _access_bounds=bounds)
+
+    async def _access_load_session(self, bounds: _SessionAccessBounds, session_id: str) -> Session:
+        from cayu.sessions.access import SessionAccessDenied
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        clause = session_store_sql.session_access_clause(bounds, dialect=_SQL_DIALECT)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            await cur.execute(
+                f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s AND ({clause.sql})",
+                (session_id, *clause.params),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise SessionAccessDenied()
+            labels = await self._load_labels(cur, session_id)
+            return bounds.require_read(pg_support.session_from_row(row, labels=labels))
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_private_argument_continuity: ClassVar[bool] = True
@@ -29046,6 +29158,16 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             return loaded
 
     async def load(self, session_id: str) -> Session | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
+        if access_bounds is not None:
+            from cayu._resource_access_errors import ResourceAccessDenied
+
+            try:
+                return await self._access_load_session(access_bounds, session_id)
+            except ResourceAccessDenied:
+                return None
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
@@ -30118,11 +30240,13 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 raise ValueError("Closure target is unavailable.")
             await self._require_session_erasure_quiescence(cur, session)
 
+    @runtime_session_mutation
     async def delete_session(
         self,
         session_id: str,
         *,
         closure_receipt: dict[str, Any] | None = None,
+        _access_bounds: _SessionAccessBounds | None = None,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
@@ -30135,6 +30259,8 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                         (f"context-view-session:{session_id}",),
                     )
                     session = await self._load_for_update(cur, session_id)
+                    if _access_bounds is not None:
+                        _access_bounds.require_action(session, "delete")
                     if session is None:
                         await conn.rollback()
                         return
@@ -30184,7 +30310,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                         (session_id, "durable"),
                     )
                     durable_child = await cur.fetchone()
-                    if closure_receipt is not None:
+                    if closure_receipt is not None or _access_bounds is not None:
                         await cur.execute(
                             "SELECT 1 FROM cayu_sessions WHERE parent_session_id = %s LIMIT 1",
                             (session_id,),
@@ -30225,14 +30351,24 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 await conn.rollback()
                 raise
 
-    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+    @runtime_session_mutation
+    async def update_labels(
+        self,
+        session_id: str,
+        labels: dict[str, str],
+        *,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
         await self._ensure_ready()
         expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._connection() as conn:
             async with conn.cursor() as cur:
-                if await self._load_for_update(cur, session_id) is None:
+                access_session = await self._load_for_update(cur, session_id)
+                if _access_bounds is not None:
+                    _access_bounds.require_label_update(access_session, new_labels)
+                if access_session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 for owner in await self._closure_lineage_owners(cur, (session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
@@ -30263,6 +30399,14 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                         """,
                         [(session_id, key, value) for key, value in new_labels.items()],
                     )
+                if _access_bounds is not None:
+                    audit = _access_bounds.label_audit(access_session, new_labels, updated_at)
+                    if audit is not None:
+                        key, record = audit
+                        await cur.execute(
+                            "INSERT INTO cayu_session_operations (session_id, idempotency_key, record, updated_at) VALUES (%s, %s, %s, %s)",
+                            (session_id, key, Jsonb(record), updated_at),
+                        )
                 loaded = await self._load(cur, session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -30277,13 +30421,24 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             await conn.commit()
             return loaded
 
-    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+    @runtime_session_mutation
+    async def update_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+        *,
+        _access_bounds: _SessionAccessBounds | None = None,
+    ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         user_metadata = copy_session_user_metadata(metadata)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
+                    if _access_bounds is not None:
+                        _access_bounds.require_action(
+                            await self._load_for_update(cur, session_id), "modify"
+                        )
                     await cur.execute(
                         "SELECT run_epoch, metadata FROM cayu_sessions WHERE id = %s FOR UPDATE",
                         (session_id,),
@@ -33469,9 +33624,11 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         )
         row = await cur.fetchone()
         if row is None:
+            require_resource_session(None)
             raise KeyError("Session not found.")
         return pg_support.session_from_row(row, labels=await self._load_labels(cur, session_id))
 
+    @runtime_session_query
     async def snapshot_session_message_source(
         self,
         session_id: str,
@@ -33489,6 +33646,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             session = await self._session_message_read_session(cur, session_id)
+            require_resource_session(session, "read")
             message_queue.require_authorized_session_instance(
                 session, expected_authorized_session_instance_id
             )
@@ -33575,6 +33733,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             for row in events
         }
 
+    @runtime_session_query
     async def inspect_session_messages(
         self,
         query: SessionMessageQuery,
@@ -33585,6 +33744,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             session = await self._session_message_read_session(cur, query.session_id)
+            require_resource_session(session, "read")
             message_queue.require_authorized_session_instance(
                 session, expected_authorized_session_instance_id
             )
@@ -33639,6 +33799,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 ),
             )
 
+    @runtime_session_query
     async def apply_session_message_action(
         self,
         request: SessionMessageActionRequest,
@@ -33649,6 +33810,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             try:
                 async with conn.cursor() as cur:
                     session = await self._load_for_update(cur, request.session_id)
+                    require_resource_session(session, "modify")
                     if session is None or session.instance_id != request.session_instance_id:
                         raise SessionMessageConflict()
                     await cur.execute(
@@ -33749,6 +33911,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 await conn.rollback()
                 raise
 
+    @runtime_session_query
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
@@ -33775,6 +33938,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                         )
                     }
                     loaded = locked[request.session_id]
+                    require_resource_session(loaded, "modify")
                     if loaded is None:
                         raise KeyError(f"Session not found: {request.session_id}")
                     if expected_authorized_target_instance_id is not None and (
@@ -33784,6 +33948,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                         raise SessionMessageConflict()
                     if request.conditions.source is not None:
                         source = locked[request.conditions.source.session_id]
+                        require_resource_session(source, "read")
                         if (
                             source is None
                             or source.instance_id != request.conditions.source.session_instance_id
@@ -33821,6 +33986,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                     if request.conditions.source is not None:
                         expected_source = request.conditions.source
                         source = locked[expected_source.session_id]
+                        require_resource_session(source, "read")
                         if (
                             source is None
                             or await self._session_message_source_locked(
@@ -34764,6 +34930,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         *,
         checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
@@ -34778,6 +34947,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             else checkpoint_root_guard.key
         )
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute(
                 f"""
                 SELECT
@@ -37232,9 +37404,15 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             )
 
     async def load_events(self, session_id: str) -> list[Event]:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute(
                 "SELECT 1 FROM cayu_sessions WHERE id = %s",
                 (session_id,),
@@ -37384,6 +37562,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [Event(**_json_obj(row[0])) for row in rows]
 
+    @runtime_session_query
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
         if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
@@ -37392,6 +37571,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         async with self._connection() as conn, conn.cursor() as cur:
             return await self._query_events(cur, query, safe_insert_xid=None)
 
+    @runtime_session_query
     async def event_exists(self, query: EventQuery) -> bool:
         plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
         await self._ensure_ready()
@@ -37410,6 +37590,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 raise RuntimeError("Failed to read event existence result.")
             return bool(row[0])
 
+    @runtime_session_query
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:
@@ -37455,6 +37636,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                     )
             return reducer.snapshot().model_copy(update={"generation": generation})
 
+    @runtime_session_query
     async def read_cost_accounting(
         self,
         query: EventQuery,
@@ -37590,6 +37772,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 result = result.model_copy(update={"cursor": None})
             return result
 
+    @runtime_session_query
     async def query_events_bounded(
         self,
         query: EventQuery,
@@ -38479,9 +38662,15 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         return records[: query.limit]
 
     async def summarize_events(self, session_id: str) -> EventSummary:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
             if await cur.fetchone() is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -38525,9 +38714,15 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             )
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             session = await self._load(cur, session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -38586,6 +38781,11 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             )
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
+        if access_bounds is not None:
+            return await self._access_list_sessions(access_bounds, copy_session_query(query))
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
 
     async def query_session_topology(
@@ -39968,6 +40168,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         query: SessionQuery | None,
         *,
         pending_interruption_cascade_only: bool,
+        access_bounds: _SessionAccessBounds | None = None,
     ) -> SessionListResult:
         query = copy_session_query(query)
         session_source_sql = (
@@ -39985,6 +40186,8 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         )
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             inactive_before = query.last_activity_before
             if query.inactive_for_seconds is not None:
                 await cur.execute("SELECT clock_timestamp()")
@@ -40010,6 +40213,13 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             plan = session_store_sql.build_session_query_sql(
                 resolved_query,
                 dialect=_SQL_DIALECT,
+                access_clause=(
+                    None
+                    if access_bounds is None
+                    else session_store_sql.session_access_clause(
+                        access_bounds, dialect=_SQL_DIALECT
+                    )
+                ),
             )
             # Interpolations are trusted: SESSION_COLUMNS is a constant, order_sql is
             # an enum-derived literal, the clauses are hard-coded; values bind via %s.
@@ -40056,6 +40266,7 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             sessions=sessions, next_cursor=next_cursor, total_count=total_count
         )
 
+    @runtime_session_query
     async def append_peer_content(
         self,
         request: PeerContentAppendRequest,
@@ -40082,6 +40293,20 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                     if creation is None
                     else await _creation_fence.postgres_read(cur, creation),
                 )
+                from cayu.sessions.access import _query_bounds
+
+                if _query_bounds.get() is not None:
+                    resource_owners = {
+                        sid: await self._load_for_update(cur, sid)
+                        for sid in sorted(
+                            {request.occurrence.sender_session_id}
+                            | ({target_id} if target_id else set())
+                        )
+                    }
+                    require_resource_session(
+                        resource_owners.get(request.occurrence.sender_session_id), "read"
+                    )
+                    require_resource_session(resource_owners.get(target_id), "modify")
                 for lock_key in sorted(
                     (
                         f"peer-append:{key}",
@@ -41091,9 +41316,15 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 raise
 
     async def load_transcript(self, session_id: str) -> list[Message]:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
             if await cur.fetchone() is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -41110,9 +41341,15 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             return [Message(**_json_obj(row[0])) for row in rows]
 
     async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute(
                 """
                 SELECT session.transcript_seq,
@@ -41204,6 +41441,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         role: MessageRole,
         max_chars: int,
     ) -> tuple[str, bool] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(role, MessageRole):
             raise TypeError("role must be a MessageRole.")
@@ -41213,6 +41453,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             raise ValueError(f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}.")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute(
                 """
                 SELECT session.id,
@@ -41306,6 +41549,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         start_index: int,
         limit: int,
     ) -> TranscriptSnapshot:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         if type(start_index) is not int:
             raise TypeError("start_index must be an integer.")
@@ -41318,6 +41564,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
 
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, session_id))
             await cur.execute(
                 """
                 SELECT session.transcript_seq,
@@ -41351,6 +41600,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
             )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         query = copy_transcript_query(query)
         filters: list[str] = []
         filter_params: list[object] = []
@@ -41364,6 +41616,9 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
 
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_read(await self._load(cur, query.session_id))
             await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (query.session_id,))
             if await cur.fetchone() is None:
                 raise KeyError(f"Session not found: {query.session_id}")
@@ -41650,9 +41905,15 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
                 raise
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        from cayu.resource_access import current_data_bounds
+
+        access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            if access_bounds is not None:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                access_bounds.require_action(await self._load(cur, session_id), "inspect_state")
             return await self._load_checkpoint(cur, session_id)
 
     async def load_interruption_cascade_marker(
@@ -41896,8 +42157,11 @@ class PostgresSessionStore(PostgresCreationFenceMixin, _PostgresStoreBase, Sessi
         return None
 
 
+@model_store_surface("tasks")
 class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore):
     """Postgres-backed task store for durable multi-tenant work items."""
+
+    task_access_version: ClassVar[int | None] = 1
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_graphs: ClassVar[bool] = True
@@ -41956,16 +42220,19 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
         return await reconcile(self, request.group_id, resolution=request)
 
+    @runtime_task_creation
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         from cayu.storage._postgres_task_groups import create_group
 
         return await create_group(self, request)
 
+    @runtime_collection_read
     async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
         from cayu.storage._postgres_task_groups import load_group
 
         return await load_group(self, group_id)
 
+    @runtime_collection_read
     async def list_task_group_events(
         self, group_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGroupEvent]:
@@ -41991,16 +42258,19 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
 
+    @runtime_task_creation
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         from cayu.storage._postgres_task_graphs import create_graph
 
         return await create_graph(self, request)
 
+    @runtime_collection_read
     async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
         from cayu.storage._postgres_task_graphs import load_graph
 
         return await load_graph(self, graph_id)
 
+    @runtime_collection_read
     async def list_task_graph_events(
         self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGraphEvent]:
@@ -42590,6 +42860,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
         return await self._run_verified_work_mutation(mutation)
 
+    @runtime_task_creation
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         if request.schedule_policy is not None and not self.supports_task_scheduling:
@@ -42598,6 +42869,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         task = await self._insert_task(request, running=False)
         return task.model_copy(deep=True)
 
+    @runtime_task_creation
     async def create_running_task(
         self,
         request: TaskCreate,
@@ -42997,11 +43269,20 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 maintenance_required=maintenance,
             )
 
-    async def load_task(self, task_id: str) -> Task | None:
+    async def load_task(self, task_id: str, *, _access_bounds=None) -> Task | None:
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            return await self._load_task(cur, task_id)
+            task = await self._load_task(cur, task_id)
+            if _access_bounds is not None:
+                from cayu.tasks.access import require_read
+
+                require_read(task, _access_bounds)
+            return task
 
     async def load_active_attached_task_worker(
         self,
@@ -43081,10 +43362,22 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 invocation=TaskInvocation.model_validate(invocation_value),
             )
 
-    async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
+    async def list_tasks(
+        self, query: TaskQuery | None = None, *, _access_bounds=None
+    ) -> list[Task]:
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
         clauses: list[str] = []
         params: list[object] = []
+        if _access_bounds is not None:
+            from cayu.tasks.access import sql_predicate
+
+            access_sql, access_params = sql_predicate(_access_bounds, postgres=True)
+            clauses.append(access_sql)
+            params.extend(access_params)
 
         if query.q is not None:
             like = _ilike_contains_pattern(query.q)
@@ -45316,6 +45609,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 await conn.rollback()
                 raise
 
+    @runtime_task_mutation
     async def cancel_task(
         self,
         task_id: str,
@@ -45387,6 +45681,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
         return await self._run_verified_work_mutation(operation)
 
+    @runtime_task_mutation
     async def pause_task(
         self,
         task_id: str,
@@ -45401,6 +45696,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def block_task(
         self,
         task_id: str,
@@ -45415,6 +45711,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def mark_task_needs_attention(
         self,
         task_id: str,
@@ -45429,6 +45726,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             payload=payload,
         )
 
+    @runtime_task_mutation
     async def resume_task(self, task_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
@@ -46679,6 +46977,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
     async def _require_task(self, cur: Any, task_id: str) -> Task:
         task = await self._load_task(cur, task_id)
+        from cayu.tasks.access import require_mutation
+
+        require_mutation(task)
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
         return task
@@ -47208,6 +47509,16 @@ def _postgres_knowledge_access_scope_filter_sql(
         raise ValueError("Unsupported knowledge access-filter alias.")
     clauses: list[str] = []
     params: list[object] = []
+    from cayu.knowledge.access import predicate_sql
+
+    resource_sql, resource_params = predicate_sql(
+        scope,
+        postgres=True,
+        table="cayu_knowledge_labels",
+        correlation=f"resource_label.entry_id = {entry_alias}.id AND resource_label.entry_revision = {entry_alias}.revision",
+    )
+    clauses.append(resource_sql)
+    params.extend(resource_params)
     if not scope.allow_all_namespaces:
         clauses.append(f"{entry_alias}.namespace = ANY(%s)")
         params.append(list(scope.allowed_namespaces))
@@ -47438,6 +47749,16 @@ def _postgres_knowledge_change_access_scope_filter_sql(
     audience_alias = "access_audience"
     clauses: list[str] = []
     params: list[object] = []
+    from cayu.knowledge.access import predicate_sql
+
+    resource_sql, resource_params = predicate_sql(
+        scope,
+        postgres=True,
+        table="cayu_knowledge_change_labels",
+        correlation=f"resource_label.change_sequence = {alias}.sequence AND resource_label.audience_kind = {audience_alias}.audience_kind",
+    )
+    clauses.append(resource_sql)
+    params.extend(resource_params)
     if not scope.allow_all_namespaces:
         clauses.append(f"{audience_alias}.namespace = ANY(%s)")
         params.append(list(scope.allowed_namespaces))

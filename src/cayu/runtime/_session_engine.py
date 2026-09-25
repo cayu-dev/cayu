@@ -22,6 +22,8 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from cayu.resource_access import ResourceAccessPolicy, restore_session_stream
+
 if TYPE_CHECKING:
     from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
 
@@ -5224,8 +5226,10 @@ class SessionEngine:
         execution_profile_policy: ExecutionProfilePolicy | None,
         execution_profile_policy_identity: str | None,
         execution_profile_process_identity: str,
+        resource_access_policy: ResourceAccessPolicy | None = None,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
     ) -> None:
+        self._resource_access_policy = resource_access_policy
         self.session_store = session_store
         self._require_participant_execution = require_participant_execution
         self.task_store = task_store
@@ -24254,6 +24258,14 @@ class SessionEngine:
         # durable boundary. Preserve the unconfigured stream's existing owner.
         boundary = effective_deadline(current_execution_deadline(), session.execution_deadline)
         stream = self._run_session_with_deadline(session=session, **kwargs)
+        if session.invocation.resource_access is not None:
+            stream = restore_session_stream(
+                stream,
+                session=session,
+                policy=self._resource_access_policy,
+                store=self.session_store,
+            )
+
         context = kwargs.get("invocation_context")
         work_attempt = context.work_attempt if isinstance(context, InvocationContext) else None
         task_id = kwargs.get("task_id")

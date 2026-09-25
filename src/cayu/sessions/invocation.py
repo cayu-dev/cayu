@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
-from cayu._validation import require_durable_clean_nonblank
+from cayu._resource_access_binding import ResourceExecutionBinding
+from cayu._validation import copy_label_map, freeze_json_value, require_durable_clean_nonblank
 
 INVOCATION_PROVENANCE_SCHEMA_VERSION = 1
 INVOCATION_IDENTITY_MAX_CHARS = 512
@@ -102,6 +111,9 @@ class SessionInvocation(BaseModel):
     )
     root_session_id: str
     source: SessionExecutionSource
+    resource_access: ResourceExecutionBinding | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @field_validator("root_invocation_id")
     @classmethod
@@ -182,6 +194,24 @@ class TaskInvocation(BaseModel):
     )
     root_session_id: str | None = None
     source: TaskExecutionSource
+    resource_access: ResourceExecutionBinding | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    access_labels: Mapping[str, str] = Field(default_factory=dict, exclude_if=lambda v: not v)
+
+    @field_validator("access_labels", mode="before")
+    @classmethod
+    def validate_access_labels(cls, value):
+        return copy_label_map(value, "task access labels")
+
+    @field_validator("access_labels")
+    @classmethod
+    def freeze_access_labels(cls, value):
+        return freeze_json_value(value)
+
+    @field_serializer("access_labels")
+    def serialize_access_labels(self, value):
+        return dict(value)
 
     @field_validator("root_invocation_id")
     @classmethod
@@ -217,6 +247,7 @@ def copy_session_invocation(value: SessionInvocation) -> SessionInvocation:
         raise TypeError("Session invocation provenance must be a SessionInvocation instance.")
     return SessionInvocation(
         schema_version=value.schema_version,
+        resource_access=value.resource_access,
         origin=copy_invocation_origin(value.origin),
         root_invocation_id=value.root_invocation_id,
         root_session_id=value.root_session_id,
@@ -240,7 +271,9 @@ def copy_task_invocation(value: TaskInvocation) -> TaskInvocation:
     if type(value) is not TaskInvocation:
         raise TypeError("Task invocation provenance must be a TaskInvocation instance.")
     return TaskInvocation(
+        access_labels=value.access_labels,
         schema_version=value.schema_version,
+        resource_access=value.resource_access,
         origin=copy_invocation_origin(value.origin),
         root_invocation_id=value.root_invocation_id,
         root_session_id=value.root_session_id,
@@ -263,6 +296,7 @@ def inherited_session_invocation(
         raise ValueError("Derived sessions cannot claim a root HTTP run source.")
     return SessionInvocation(
         origin=copy_invocation_origin(parent.origin),
+        resource_access=parent.resource_access,
         root_invocation_id=parent.root_invocation_id,
         root_session_id=parent.root_session_id,
         source=source,
@@ -291,7 +325,9 @@ def inherited_task_invocation(
             raise ValueError("Task invocation root session conflicts with its parent.")
         inherited_root_session_id = root_session_id
     return TaskInvocation(
+        access_labels=parent.access_labels if isinstance(parent, TaskInvocation) else {},
         origin=copy_invocation_origin(parent.origin),
+        resource_access=parent.resource_access,
         root_invocation_id=parent.root_invocation_id,
         root_session_id=inherited_root_session_id,
         source=source,
@@ -317,6 +353,7 @@ def session_invocation_from_task(
         raise ValueError("Task invocation belongs to a different root session.")
     return SessionInvocation(
         origin=copy_invocation_origin(task.origin),
+        resource_access=task.resource_access,
         root_invocation_id=task.root_invocation_id,
         root_session_id=session_id,
         source=source,

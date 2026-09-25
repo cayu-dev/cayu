@@ -307,6 +307,7 @@ from cayu.observability.watchers import (
 from cayu.providers.base import ModelProvider, ModelRequest, copy_usage_dialect
 from cayu.providers.hosted import OpenAIWebSearch, copy_openai_web_search
 from cayu.providers.operations import ProviderOperationSnapshot
+from cayu.resource_access import ResourceAccessPolicy, runtime_stream_entrance
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
@@ -1085,6 +1086,7 @@ class CayuApp:
         *,
         config: CayuConfig | None = None,
         session_store: SessionStore | None = None,
+        resource_access_policy: ResourceAccessPolicy | None = None,
         task_store: TaskStore | None = None,
         knowledge_store: KnowledgeStore | None = None,
         knowledge_access_scope: KnowledgeAccessScope | None = None,
@@ -1131,6 +1133,11 @@ class CayuApp:
                 guest_endpoint=browser_control.guest_endpoint,
                 purpose=browser_control.purpose,
             )
+        if resource_access_policy is not None and not isinstance(
+            resource_access_policy, ResourceAccessPolicy
+        ):
+            raise TypeError("resource_access_policy must be ResourceAccessPolicy.")
+        self.resource_access_policy = resource_access_policy
         current_runtime_build_provenance()
         resolved_config, config_sources = _resolve_cayu_app_config(config)
         self._config = resolved_config
@@ -1500,6 +1507,7 @@ class CayuApp:
             strict_common_budget_admission=self.enable_common_root_budget_binding,
         )
         self._recovery_coordinator = RecoveryCoordinator(
+            resource_access_policy=resource_access_policy,
             require_participant_execution=self._require_participant_execution,
             human_review_policy=human_review_policy,
             session_store=self._runtime_session_store,
@@ -1565,6 +1573,7 @@ class CayuApp:
         )
 
         self._session_engine = SessionEngine(
+            resource_access_policy=resource_access_policy,
             session_store=self._runtime_session_store,
             require_participant_execution=self._require_participant_execution,
             task_store=self.task_store,
@@ -6200,6 +6209,7 @@ class CayuApp:
         object.__setattr__(resolved, "__pydantic_fields_set__", set(fields_set))
         return resolved
 
+    @runtime_stream_entrance
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         stream = self._run_with_public_projection(request)
         del request
@@ -7566,6 +7576,12 @@ class CayuApp:
             raise RuntimeError("Admitted completion proposal returned no receipt.")
         return proposal
 
+    async def access(self, subject: str):
+        """Bind a subject already authenticated by trusted application code."""
+        from cayu.resource_access import admit_access
+
+        return await admit_access(self, subject)
+
     async def _run_private(
         self,
         request: RunRequest,
@@ -7597,6 +7613,29 @@ class CayuApp:
         )
         boundary.require_admission("child_run" if parent is not None else "run")
         request = request.model_copy(update={"execution_deadline": boundary})
+        from cayu.resource_access import current_binding, current_execution_labels, guard_stream
+
+        binding = (
+            parent.invocation.resource_access
+            if parent is not None
+            else request._runtime_task_invocation.invocation.resource_access
+            if request._runtime_task_invocation is not None
+            else current_binding()
+        )
+        if binding is not None:
+            request = request.model_copy(
+                update={
+                    "session_id": request.session_id or str(uuid4()),
+                    "labels": request.labels
+                    or (
+                        dict(parent.labels)
+                        if parent is not None
+                        else dict(request._runtime_task_invocation.invocation.access_labels)
+                        if request._runtime_task_invocation is not None
+                        else current_execution_labels()
+                    ),
+                }
+            )
         stream = self._session_engine.run(
             request=request,
             expected_execution_profile=expected_execution_profile,
@@ -7610,6 +7649,15 @@ class CayuApp:
             participant_permit_commitment=participant_permit_commitment,
             execution_to_wait=execution_to_wait,
         )
+        if binding is not None:
+            stream = guard_stream(
+                stream,
+                binding=binding,
+                policy=self.resource_access_policy,
+                labels=request.labels,
+                store=self.session_store,
+                session_id=request.session_id,
+            )
         del request
         if boundary.expires_at is not None:
             stream = deadline_stream(stream, boundary)
@@ -7620,6 +7668,13 @@ class CayuApp:
     async def _require_participant_execution(
         self, session: Session, context: CollaborationAccessContext | None
     ) -> None:
+        if session.invocation.resource_access is not None:
+            from cayu.resource_access import effective_bounds
+
+            bounds = await effective_bounds(
+                session.invocation.resource_access, self.resource_access_policy
+            )
+            bounds.require_action(session, "execute")
         if self.session_store.participant_session_binding_version is None:
             return
         binding = await self.session_store.load_participant_session_binding(session.id)
@@ -7637,6 +7692,7 @@ class CayuApp:
         if inspection.participant.lifecycle != "active":
             raise PermissionError("Only active participants can execute a session.")
 
+    @runtime_stream_entrance
     async def resume(
         self, request: ResumeRequest, *, context: CollaborationAccessContext | None = None
     ) -> AsyncIterator[Event]:
@@ -7681,12 +7737,32 @@ class CayuApp:
             participant_context=participant_context,
         )
         del request
+        from cayu.resource_access import current_binding
+
+        if current_binding() is not None and (
+            stored is None or stored.invocation.resource_access is None
+        ):
+            from cayu._resource_access_errors import ResourceAccessDenied
+
+            raise ResourceAccessDenied()
+        if stored is not None and stored.invocation.resource_access is not None:
+            from cayu.resource_access import guard_stream
+
+            stream = guard_stream(
+                stream,
+                binding=stored.invocation.resource_access,
+                policy=self.resource_access_policy,
+                labels=stored.labels,
+                store=self.session_store,
+                session_id=stored.id,
+            )
         if boundary.expires_at is not None:
             stream = deadline_stream(stream, boundary)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
 
+    @runtime_stream_entrance
     async def compact_session(
         self,
         request: CompactSessionRequest,
@@ -7739,6 +7815,25 @@ class CayuApp:
             store_resolved_session_id=store_resolved_session_id,
             participant_context=participant_context,
         )
+        from cayu.resource_access import current_binding
+
+        if current_binding() is not None and (
+            stored is None or stored.invocation.resource_access is None
+        ):
+            from cayu._resource_access_errors import ResourceAccessDenied
+
+            raise ResourceAccessDenied()
+        if stored is not None and stored.invocation.resource_access is not None:
+            from cayu.resource_access import guard_stream
+
+            stream = guard_stream(
+                stream,
+                binding=stored.invocation.resource_access,
+                policy=self.resource_access_policy,
+                labels=stored.labels,
+                store=self.session_store,
+                session_id=stored.id,
+            )
         if boundary.expires_at is not None:
             stream = deadline_stream(stream, boundary)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -8207,12 +8302,20 @@ class CayuApp:
         from cayu.runtime._foreground_child_continuation import deliver_foreground_child_terminal
 
         async def resume(terminal: ForegroundChildTerminal) -> None:
-            await self._foreground_child_delivery_owner.run(
-                claim,
-                lambda before_mutation: self._session_engine.resume_foreground_child(
-                    terminal, before_mutation=before_mutation
-                ),
-            )
+            from cayu.resource_access import recovery_access
+
+            parent = await self._runtime_session_store.load(terminal.wait.parent_effect.session_id)
+            if parent is None:
+                raise KeyError("Foreground parent is missing.")
+            async with recovery_access(
+                parent, self.resource_access_policy, self._runtime_session_store
+            ):
+                await self._foreground_child_delivery_owner.run(
+                    claim,
+                    lambda before_mutation: self._session_engine.resume_foreground_child(
+                        terminal, before_mutation=before_mutation
+                    ),
+                )
             # The resumed parent may itself be a foreground child. Its terminal
             # fan-out was deferred while that run was still active. Deliver only
             # this exact session's latest outcome after its owner has settled,
@@ -10058,6 +10161,7 @@ class CayuApp:
         emitted = await self._event_writer.emit(event)
         return await self._project_emitted_event_for_public_api(emitted)
 
+    @runtime_stream_entrance
     async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
@@ -10322,6 +10426,9 @@ class CayuApp:
             accepted_request_sha256s=prepared.accepted_request_sha256s,
             store_resolved_source_session_id=store_resolved_source_session_id,
         )
+        stream = await self._guard_resource_session_stream(
+            stream, prepared.request.source_session_id
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -10455,6 +10562,27 @@ class CayuApp:
             admit_session=admit_session,
         )
 
+    async def _guard_resource_session_stream(self, stream, session_id):
+        from cayu._resource_access_errors import ResourceAccessDenied
+        from cayu.resource_access import current_binding, guard_stream
+
+        session = await self.session_store.load(session_id)
+        binding = None if session is None else session.invocation.resource_access
+        if binding is None:
+            if current_binding() is not None:
+                await stream.aclose()
+                raise ResourceAccessDenied()
+            return stream
+        assert session is not None
+        return guard_stream(
+            stream,
+            binding=binding,
+            policy=self.resource_access_policy,
+            labels=session.labels,
+            store=self.session_store,
+            session_id=session.id,
+        )
+
     async def _run_recovery_session(
         self,
         request: RecoverySessionRunRequest,
@@ -10485,6 +10613,7 @@ class CayuApp:
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
         stream = self._session_engine._run_recovery_session(request)
+        stream = await self._guard_resource_session_stream(stream, request.session.id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -10764,6 +10893,7 @@ class CayuApp:
             ),
         )
         del response
+        stream = await self._guard_resource_session_stream(stream, session_id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -10863,6 +10993,7 @@ class CayuApp:
             ),
         )
         del request
+        stream = await self._guard_resource_session_stream(stream, session_id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -11043,6 +11174,7 @@ class CayuApp:
             ),
         )
         del request
+        stream = await self._guard_resource_session_stream(stream, session_id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -11139,6 +11271,7 @@ class CayuApp:
             ),
         )
         del request
+        stream = await self._guard_resource_session_stream(stream, session_id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
@@ -11390,6 +11523,7 @@ class CayuApp:
             ),
         )
         del request
+        stream = await self._guard_resource_session_stream(stream, session_id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event

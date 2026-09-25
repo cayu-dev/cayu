@@ -57,6 +57,9 @@ async def create_graph(
                 raise TaskGroupConflict("A group requires a newly admitted graph.")
         existing = store._task_graph_receipts.get(request.graph_id)
         if existing is not None:
+            from cayu.tasks.access import require_collection
+
+            require_collection(existing)
             require_graph_membership(
                 request.graph_id, existing, store._task_graph_members[request.graph_id]
             )
@@ -261,6 +264,9 @@ async def load_graph(store: InMemoryTaskStore, graph_id: str) -> TaskGraphSnapsh
     graph_id = graph_identifier(graph_id)
     async with store._lock:
         receipt = store._task_graph_receipts.get(graph_id)
+        from cayu.tasks.access import require_collection
+
+        require_collection(receipt)
         if receipt is None:
             return None
         require_graph_membership(graph_id, receipt, store._task_graph_members[graph_id])
@@ -318,6 +324,9 @@ async def list_graph_events(
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError("Graph event page size must be between 1 and 1000.")
     async with store._lock:
+        from cayu.tasks.access import require_collection
+
+        require_collection(store._task_graph_receipts.get(graph_id))
         if graph_id not in store._task_graph_receipts:
             raise KeyError("Task graph not found.")
         return [

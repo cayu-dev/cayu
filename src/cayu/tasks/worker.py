@@ -1168,7 +1168,19 @@ async def _await_task_handler(
     settlement_authority = copy_task(task)
 
     async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
-        result = await handler(app, handler_view, worker_id)
+        from cayu.resource_access import execution_access
+
+        if task.invocation.access_labels and task.invocation.resource_access is None:
+            from cayu._resource_access_errors import ResourceAccessDenied
+
+            raise ResourceAccessDenied()
+        async with execution_access(
+            task.invocation.resource_access,
+            app.resource_access_policy,
+            task.invocation.access_labels,
+            kind="tasks",
+        ):
+            result = await handler(app, handler_view, worker_id)
         settlement.observe(settlement_authority, result)
         # Storage acknowledgement is not part of the callback outcome. Ordinary
         # settlement failures stay owned until after result disposition.

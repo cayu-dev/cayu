@@ -4,13 +4,14 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from cayu.events import EventType
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     LabelSelectorOperator,
+    LabelSelectorRequirement,
     SessionDebugState,
     SessionOrder,
     SessionQuery,
@@ -22,6 +23,9 @@ from cayu.sessions.base import (
     session_sort_column,
 )
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
+
+if TYPE_CHECKING:
+    from cayu.sessions.access import _SessionAccessBounds
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,17 @@ def build_event_query_sql(
     query = copy_event_query(query)
     clauses: list[str] = []
     params: list[object] = []
+    from cayu.sessions.access import _query_bounds
+
+    access_bounds = _query_bounds.get()
+    if access_bounds is not None:
+        clause = session_access_clause(access_bounds, dialect=dialect)
+        clauses.append(
+            "EXISTS (SELECT 1 FROM cayu_sessions WHERE cayu_sessions.id = cayu_events.session_id AND ("
+            + clause.sql
+            + "))"
+        )
+        params.extend(clause.params)
 
     if query.after_sequence is not None:
         clauses.append(f"cayu_events.sequence > {dialect.placeholder}")
@@ -242,10 +257,15 @@ def build_session_query_sql(
     query: SessionQuery | None,
     *,
     dialect: SessionStoreSqlDialect,
+    access_clause: SqlClause | None = None,
 ) -> SessionQuerySqlPlan:
     query = copy_session_query(query)
     clauses: list[str] = []
     params: list[object] = []
+
+    if access_clause is not None:
+        clauses.append(access_clause.sql)
+        params.extend(access_clause.params)
 
     if query.q is not None:
         like = _contains_pattern(query.q)
@@ -482,3 +502,34 @@ def _label_in_clause(dialect: SessionStoreSqlDialect, *, value_count: int) -> st
               AND cayu_session_labels.value IN ({dialect.placeholders(value_count)})
         )
         """
+
+
+def session_access_clause(
+    bounds: _SessionAccessBounds, *, dialect: SessionStoreSqlDialect
+) -> SqlClause:
+    """Compile admitted AND current authority; alternatives stay inside each scope."""
+    scopes = []
+    params: list[object] = []
+    for scope in (bounds.admitted, bounds.current):
+        alternatives = []
+        for rule in scope.read:
+            if rule.allow_all:
+                alternatives.append("1 = 1")
+                continue
+            query = SessionQuery(
+                label_selectors=tuple(
+                    LabelSelectorRequirement(
+                        key=item.key, operator=item.operator, values=item.values
+                    )
+                    for item in rule.selectors
+                )
+            )
+            plan = build_session_query_sql(query, dialect=dialect)
+            alternatives.append(plan.filter_where_sql.removeprefix("WHERE "))
+            params.extend(plan.filter_params)
+        scopes.append(
+            "(" + " OR ".join("(" + item + ")" for item in alternatives) + ")"
+            if alternatives
+            else "(1 = 0)"
+        )
+    return SqlClause(" AND ".join(scopes), tuple(params))

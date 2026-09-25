@@ -34,6 +34,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._knowledge_closure import (
@@ -230,6 +231,8 @@ _SQLITE_MIN_REQUIRED_REVISION = 78
 class SQLiteKnowledgeStore(KnowledgeStore):
     """SQLite-backed durable knowledge store with FTS5 keyword search."""
 
+    resource_knowledge_access_version = 1
+
     def __init__(
         self,
         path: str | Path,
@@ -277,6 +280,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             self._connection.close()
             raise
 
+    @runtime_knowledge_operation("create")
     async def create_entry(
         self,
         entry: KnowledgeEntry,
@@ -342,6 +346,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
             return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("modify")
     async def append_entry_revision(
         self,
         entry: KnowledgeEntry,
@@ -368,6 +373,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
         return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("read")
     async def get_entry(
         self,
         entry_id: str,
@@ -429,6 +435,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     )
                 return copy_knowledge_entry(entry)
 
+    @runtime_knowledge_operation("modify")
     async def transition_entry_status(
         self,
         entry_id: str,
@@ -510,6 +517,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 return copy_knowledge_entry(target)
 
+    @runtime_knowledge_operation("delete")
     async def delete_entry(
         self,
         entry_id: str,
@@ -614,6 +622,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 return copy_knowledge_entry(target)
 
+    @runtime_knowledge_operation("modify")
     async def prune_expired(
         self,
         *,
@@ -676,6 +685,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
             return len(expired_ids)
 
+    @runtime_knowledge_operation("modify")
     async def publish_entry_revision(
         self,
         entry: KnowledgeEntry,
@@ -865,6 +875,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     )
             return copy_knowledge_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
@@ -877,6 +888,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             receipt = self._load_publication_receipt_in_scope_unlocked(operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_activation_receipt(
         self,
         operation_id: str,
@@ -897,6 +909,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
         return None if receipt is None else copy_knowledge_activation_receipt(receipt)
 
+    @runtime_knowledge_operation("modify")
     async def approve_pending_entry(
         self,
         authority: KnowledgeActivationAuthority,
@@ -1035,6 +1048,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 return KnowledgeReviewApproval(entry=activated, receipt=receipt)
 
+    @runtime_knowledge_operation("modify")
     async def publish_relations(
         self,
         relations: list[KnowledgeRelation],
@@ -1175,6 +1189,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     raise KnowledgeRelationConflict("relation_exists") from None
             return copy_knowledge_relation_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_relation_publication_receipt(
         self,
         operation_id: str,
@@ -1191,6 +1206,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         return None if receipt is None else copy_knowledge_relation_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def read_relations(
         self,
         query: KnowledgeRelationQuery,
@@ -1472,6 +1488,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             fingerprint=fingerprint,
         )
 
+    @runtime_knowledge_operation("modify")
     async def publish_maintenance_proposal(
         self,
         entry: KnowledgeEntry,
@@ -1617,6 +1634,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
             return copy_knowledge_maintenance_proposal_publication_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_proposal_publication(
         self,
         proposal_id: str,
@@ -1693,6 +1711,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             ),
         )
 
+    @runtime_knowledge_operation("modify")
     async def record_maintenance_governance_route(
         self,
         authority: KnowledgeMaintenanceGovernanceAuthority,
@@ -1821,6 +1840,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 return copy_knowledge_maintenance_governance_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_governance_route(
         self,
         operation_id: str,
@@ -1836,6 +1856,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 deny_inaccessible=False,
             )
 
+    @runtime_knowledge_operation("modify")
     async def record_semantic_watch_outcome(
         self,
         authority: KnowledgeSemanticWatchAuthority,
@@ -1928,6 +1949,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     raise KnowledgeSemanticWatchConflict("operation_reuse") from None
                 return copy_knowledge_semantic_watch_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_semantic_watch_receipt(
         self,
         operation_id: str,
@@ -1943,6 +1965,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 deny_inaccessible=False,
             )
 
+    @runtime_knowledge_operation("modify")
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -2207,6 +2230,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 return copy_knowledge_maintenance_decision_receipt(receipt)
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_proposal(
         self,
         proposal_id: str,
@@ -2247,6 +2271,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
         return None if record is None else copy_knowledge_maintenance_proposal(record[0])
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_decision(
         self,
         operation_id: str,
@@ -2263,6 +2288,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         return None if record is None else copy_knowledge_maintenance_decision(record[1])
 
+    @runtime_knowledge_operation("read")
     async def load_maintenance_decision_receipt(
         self,
         operation_id: str,
@@ -2349,6 +2375,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         cursor.close()
                 return inventory.document()
 
+    @runtime_knowledge_operation("read")
     async def read_evidence(
         self,
         entry_id: str,
@@ -2397,6 +2424,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             total_evidence_known=total_evidence_known,
         )
 
+    @runtime_knowledge_operation("read")
     async def read_changes(
         self,
         *,
@@ -2438,6 +2466,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             limit=limit,
         )
 
+    @runtime_knowledge_operation("modify")
     async def claim_change(
         self,
         consumer_id: str,
@@ -2531,6 +2560,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     lease_expires_at=lease_expires_at,
                 )
 
+    @runtime_knowledge_operation("modify")
     async def initialize_change_consumer(
         self,
         consumer_id: str,
@@ -2563,6 +2593,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 self._save_change_consumer_unlocked(state)
                 return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def acknowledge_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -2613,6 +2644,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
                 return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def release_change(
         self,
         claim: KnowledgeChangeClaim,
@@ -2646,6 +2678,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 self._save_change_consumer_unlocked(state)
                 return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("read")
     async def load_change_consumer_state(
         self,
         consumer_id: str,
@@ -2661,6 +2694,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             return None
         return copy_knowledge_change_consumer_state(state)
 
+    @runtime_knowledge_operation("modify")
     async def publish_index_readiness(
         self,
         update: KnowledgeIndexReadinessUpdate,
@@ -2793,6 +2827,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     published_at=published_at,
                 )
 
+    @runtime_knowledge_operation("read")
     async def load_index_readiness(
         self,
         identity: KnowledgeEmbeddingIdentity,
@@ -2823,6 +2858,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             raise RuntimeError("Knowledge index readiness identity digest collision.")
         return readiness
 
+    @runtime_knowledge_operation("read")
     async def read_index_readiness(
         self,
         *,
@@ -2937,6 +2973,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         return True
 
+    @runtime_knowledge_operation("read")
     async def read_chunks(
         self,
         entry_id: str,
@@ -2984,6 +3021,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             max_bytes=max_bytes,
         )
 
+    @runtime_knowledge_operation("read")
     async def search(
         self,
         query: KnowledgeQuery,
@@ -2999,6 +3037,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             through_change_sequence=None,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_at_frontier(
         self,
         query: KnowledgeQuery,
@@ -3021,6 +3060,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             through_change_sequence=knowledge_sequence,
         )
 
+    @runtime_knowledge_operation("read")
     async def search_revisions(
         self,
         query: KnowledgeQuery,
@@ -3259,6 +3299,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             temporary_fts=True,
         )
 
+    @runtime_knowledge_operation("read")
     async def list_entries(
         self,
         query: KnowledgeListQuery,
@@ -5808,6 +5849,16 @@ def _knowledge_access_scope_filter_sql(
         raise ValueError("Unsupported knowledge access-filter alias.")
     clauses: list[str] = []
     params: list[object] = []
+    from cayu.knowledge.access import predicate_sql
+
+    resource_sql, resource_params = predicate_sql(
+        scope,
+        postgres=False,
+        table="cayu_knowledge_labels",
+        correlation=f"resource_label.entry_id = {entry_alias}.id AND resource_label.entry_revision = {entry_alias}.revision",
+    )
+    clauses.append(resource_sql)
+    params.extend(resource_params)
     if not scope.allow_all_namespaces:
         placeholders = ", ".join("?" for _ in scope.allowed_namespaces)
         clauses.append(f"{entry_alias}.namespace IN ({placeholders})")
@@ -6597,6 +6648,16 @@ def _sqlite_change_access_scope_filter_sql(
     audience_alias = "access_audience"
     clauses: list[str] = []
     params: list[object] = []
+    from cayu.knowledge.access import predicate_sql
+
+    resource_sql, resource_params = predicate_sql(
+        scope,
+        postgres=False,
+        table="cayu_knowledge_change_labels",
+        correlation=f"resource_label.change_sequence = {alias}.sequence AND resource_label.audience_kind = {audience_alias}.audience_kind",
+    )
+    clauses.append(resource_sql)
+    params.extend(resource_params)
     if not scope.allow_all_namespaces:
         placeholders = ", ".join("?" for _ in scope.allowed_namespaces)
         clauses.append(f"{audience_alias}.namespace IN ({placeholders})")
