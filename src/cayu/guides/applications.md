@@ -210,6 +210,11 @@ a tool family is incomplete. Source ownership, import safety, and maintained
 service/authentication checks still run. Metadata neither changes runtime objects
 nor grants model exposure, execution authority, or provider access.
 
+For `cayu cloud deploy`, run `uv lock` in the selected project root and include both
+`pyproject.toml` and `uv.lock` in the uploaded source. Preflight checks the actual bundle,
+including Git ignore rules; a local wheel build alone does not establish Cloud build
+readiness. The deploy command does not generate locks or modify the source for you.
+
 ## Generator compatibility
 
 `cayu generate tool` and `cayu generate slice` inspect the declared scaffold

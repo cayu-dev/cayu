@@ -28,6 +28,7 @@ from cayu.cli._cloud_auth import (
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
+    CloudSourceInputsError,
     ResolvedCloudProject,
     initialize_project,
     is_application_slug,
@@ -257,6 +258,8 @@ def _cloud_failure(exc: Exception) -> int:
     else:
         category, message = "invalid_input", str(exc)
     error: dict[str, object] = {"category": category, "message": message}
+    if isinstance(exc, CloudSourceInputsError):
+        error.update({"path": exc.path, "reason": exc.reason, "hint": exc.hint})
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
     if isinstance(exc, (_CloudDeploymentStillRunningError, _CloudServiceStillRunningError)):

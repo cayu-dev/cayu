@@ -76,6 +76,18 @@ lowercase letters, numbers, and interior hyphens. `--application SLUG`
 selects a different create-or-update slug; check it carefully because a valid typo
 creates a separate application.
 
+Local Python deployments require usable `pyproject.toml` and `uv.lock` files at the
+root of the actual upload. Run `uv lock` in the directory you intend to deploy.
+The CLI rejects missing, empty, excluded, or unusable linked inputs before uploading;
+its `source_build_inputs_invalid` error includes the relative `path`, `reason`, and
+repair `hint`. Git ignore rules can omit an untracked lockfile even when it exists
+on disk. Include the file in the selected source rather than bypassing preflight.
+The CLI does not generate locks or change ignore rules during deployment.
+
+A successful wheel build does not prove the lockfile was uploaded or that the frozen
+Linux dependency installation will succeed. Remote Git sources are validated by Cloud
+after resolving the immutable revision; local preflight does not inspect remote content.
+
 Deploy verifies that the local evidence directory is writable before authentication or
 Cloud mutation. Deploy output and stored evidence replace every runtime `environment`
 value with `[redacted]`, including values whose variable names do not look secret.

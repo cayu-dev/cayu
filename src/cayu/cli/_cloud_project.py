@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import stat
 import subprocess
@@ -525,6 +526,48 @@ def resolve_project(
     )
 
 
+class CloudSourceInputsError(CloudApiError):
+    """A required hosted Python input is absent from the selected upload."""
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        self.hint = (
+            "Run uv lock in the deployment root and include pyproject.toml and uv.lock "
+            "in the uploaded source. Check the selected directory and Git ignore rules."
+        )
+        super().__init__(
+            "source_build_inputs_invalid", f"Required build input {path} is {reason}. {self.hint}"
+        )
+
+
+def _validate_python_build_inputs(root: Path, bundle: bytes) -> None:
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive:
+        files = {member.name.removeprefix("source/"): member for member in archive}
+    for name in ("pyproject.toml", "uv.lock"):
+        if name not in files:
+            reason = "excluded from the upload" if os.path.lexists(root / name) else "missing"
+            raise CloudSourceInputsError(name, reason)
+        target = name
+        seen: set[str] = set()
+        while target not in seen:
+            seen.add(target)
+            member = files.get(target)
+            if member is None:
+                break
+            if member.isfile() and member.size > 0:
+                break
+            if not member.issym() or member.linkname.startswith("/"):
+                break
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(target), member.linkname))
+            if target == ".." or target.startswith("../"):
+                break
+        else:
+            member = None
+        if member is None or not member.isfile() or member.size <= 0:
+            raise CloudSourceInputsError(name, "not a usable file in the upload")
+
+
 def _archive_project(root: Path, *, required_file: Path) -> bytes:
     files = set(_listed_project_files(root))
     files.add(required_file.relative_to(root))
@@ -570,7 +613,9 @@ def _archive_project(root: Path, *, required_file: Path) -> bytes:
                     "source_invalid",
                     f"Local deployment source contains an unsupported file: {relative.as_posix()}",
                 )
-    return buffer.getvalue()
+    bundle = buffer.getvalue()
+    _validate_python_build_inputs(root, bundle)
+    return bundle
 
 
 def _listed_project_files(root: Path) -> tuple[Path, ...]:

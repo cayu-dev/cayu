@@ -23,6 +23,11 @@ from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_evidence import EvidenceRecorder
 
 
+def _write_build_inputs(root: Path) -> None:
+    (root / "pyproject.toml").write_text('[project]\nname = "research-agent"\nversion = "1.0"\n')
+    (root / "uv.lock").write_text("version = 1\n")
+
+
 def _write_ready_context(
     path: Path,
     *,
@@ -194,6 +199,7 @@ def test_cloud_deploy_rejects_invalid_manifest_application_before_authentication
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _write_build_inputs(tmp_path)
     (tmp_path / "cayu-cloud.toml").write_text(
         f"""
 schema_version = 1
@@ -1036,6 +1042,7 @@ EOF
 def test_local_project_bundle_is_deterministic_and_contains_the_working_directory(
     tmp_path: Path,
 ) -> None:
+    _write_build_inputs(tmp_path)
     (tmp_path / "cayu-cloud.toml").write_text(
         """
 schema_version = 1
@@ -1068,7 +1075,13 @@ policy_version = "v1"
     assert first.revision == first.content_digest.removeprefix("sha256:")[:40]
     with tarfile.open(fileobj=io.BytesIO(first.bundle), mode="r:gz") as archive:
         names = archive.getnames()
-        assert names == ["source/agent.py", "source/cayu-cloud.toml", "source/notes.txt"]
+        assert names == [
+            "source/agent.py",
+            "source/cayu-cloud.toml",
+            "source/notes.txt",
+            "source/pyproject.toml",
+            "source/uv.lock",
+        ]
         extracted = archive.extractfile("source/agent.py")
         assert extracted is not None
         assert extracted.read() == b"print('patched locally')\n"
@@ -1076,6 +1089,7 @@ policy_version = "v1"
 
 
 def test_local_project_bundle_reflects_deleted_tracked_files(tmp_path: Path) -> None:
+    _write_build_inputs(tmp_path)
     (tmp_path / "cayu-cloud.toml").write_text(
         """
 schema_version = 1
@@ -1103,13 +1117,19 @@ policy_version = "v1"
 
     assert project.bundle is not None
     with tarfile.open(fileobj=io.BytesIO(project.bundle), mode="r:gz") as archive:
-        assert archive.getnames() == ["source/agent.py", "source/cayu-cloud.toml"]
+        assert archive.getnames() == [
+            "source/agent.py",
+            "source/cayu-cloud.toml",
+            "source/pyproject.toml",
+            "source/uv.lock",
+        ]
 
 
 def test_local_project_bundle_fails_closed_when_git_listing_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    _write_build_inputs(tmp_path)
     (tmp_path / "cayu-cloud.toml").write_text(
         """
 schema_version = 1
@@ -1206,6 +1226,7 @@ def test_cloud_deploy_uploads_a_local_bundle_before_creating_the_release(
         def log_message(self, format: str, *args: object) -> None:
             return
 
+    _write_build_inputs(tmp_path)
     (tmp_path / "cayu-cloud.toml").write_text(
         """
 schema_version = 1
