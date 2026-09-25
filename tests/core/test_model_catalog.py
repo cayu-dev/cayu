@@ -436,3 +436,61 @@ def test_price_book_dump_is_deterministic_and_round_trips(tmp_path) -> None:
     path = tmp_path / "prices.json"
     path.write_text(dump_price_book(unsorted))
     assert load_price_book(path) == sorted_book
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "when", "tokens", "cached", "written", "output", "expected"),
+    [
+        ("openai", "gpt-6-astra", "2026-09-24", 272000, 0, 0, 1000, "2.77"),
+        ("openai", "gpt-6-astra", "2026-09-24", 272001, 0, 0, 1000, "5.51502"),
+        ("openai", "gpt-6-sol", "2026-09-24", 272000, 1000, 1000, 1000, "0.5527"),
+        ("openai", "gpt-6-sol", "2026-09-24", 272001, 1000, 1000, 1000, "1.100404"),
+        ("openai", "gpt-6-luna", "2026-09-24", 100000, 0, 0, 1000, "0.0105"),
+        ("anthropic", "claude-fable-5-1", "2026-09-24", 100000, 10000, 0, 1000, "0.9525"),
+        ("anthropic", "claude-opus-5-5", "2026-09-24", 100000, 10000, 0, 1000, "0.382"),
+        ("google", "gemini-3.5-flash-lite", "2026-09-24", 100000, 0, 0, 1000, "0.0325"),
+        ("google", "gemini-3.8-flash", "2026-12-31", 100000, 0, 0, 1000, "0.07875"),
+        ("google", "gemini-3.8-flash", "2027-01-01", 100000, 0, 0, 1000, "0.1575"),
+    ],
+)
+def test_september_catalog_prices_new_models_at_context_and_date_boundaries(
+    provider, model, when, tokens, cached, written, output, expected
+):
+    info = default_model_catalog().resolve(provider_name=provider, model=model)
+    assert info is not None and info.tool_calling
+    event = _completed(
+        provider_name=provider,
+        model=model,
+        input_tokens=tokens,
+        cache_read_input_tokens=cached,
+        cache_write_input_tokens=written,
+        output_tokens=output,
+    ).model_copy(update={"timestamp": datetime.fromisoformat(when).replace(tzinfo=UTC)})
+    summary = estimate_session_cost(
+        session_id="session-1", events=[event], pricing=default_price_book()
+    )
+    assert summary.priced_model_steps == 1
+    assert summary.line_items[0].total_cost == Decimal(expected)
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [("gpt-6-astra", "0.025"), ("gpt-6-sol", "0.013"), ("gpt-6-luna", "0.01015")],
+)
+def test_gpt6_hosted_search_prices_tokens_and_search_calls(model, expected):
+    event = _completed(provider_name="openai", model=model, input_tokens=1000, output_tokens=100)
+    payload = dict(event.payload)
+    payload["usage_metrics"] = {
+        **payload["usage_metrics"],
+        "hosted_tools": {"web_search_calls": 1},
+    }
+    event = event.model_copy(
+        update={"timestamp": datetime(2026, 9, 24, tzinfo=UTC), "payload": payload}
+    )
+    summary = estimate_session_cost(
+        session_id="session-1", events=[event], pricing=default_price_book()
+    )
+    assert summary.priced_model_steps == 1
+    assert summary.unpriced_model_steps == 0
+    assert summary.line_items[0].web_search_cost == Decimal("0.01")
+    assert summary.total_cost == Decimal(expected)

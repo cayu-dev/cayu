@@ -79,43 +79,6 @@ def test_bedrock_provider_wide_recommendation_audit_is_disabled() -> None:
 
 
 @pytest.mark.parametrize("operation", ["verify", "recommendations"])
-@pytest.mark.parametrize("cleanup_fails", [False, True])
-def test_browser_verifier_closes_host_session_and_reports_cleanup(
-    operation, cleanup_fails, monkeypatch
-) -> None:
-    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
-    closed: list[str] = []
-    cleanup_error = RuntimeError("close failed")
-
-    async def fake_verify(model, price, *, session_id):
-        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
-        return VerifyOutcome(verified=True)
-
-    async def fake_recommendations(provider_name, existing_models, *, session_id):
-        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
-        return RecommendationOutcome(verified=True, provider_name=provider_name)
-
-    async def close(session_id):
-        closed.append(session_id)
-        catalog_tools._HOST_BROWSER_SESSIONS.discard(session_id)
-        if cleanup_fails:
-            raise cleanup_error
-
-    monkeypatch.setattr(verifier, "_averify", fake_verify)
-    monkeypatch.setattr(verifier, "_adiscover_recommendations", fake_recommendations)
-    monkeypatch.setattr(browser_verifier_module, "close_host_session", close)
-
-    outcome = asyncio.run(
-        verifier.averify(_provider_model("openai"), _provider_price("openai"))
-        if operation == "verify"
-        else verifier.adiscover_recommendations("openai", ())
-    )
-
-    assert len(closed) == 1
-    assert outcome.cleanup_error is (cleanup_error if cleanup_fails else None)
-
-
-@pytest.mark.parametrize("operation", ["verify", "recommendations"])
 def test_browser_verifier_uses_compact_external_safe_session_ids(operation, monkeypatch) -> None:
     class CapturingApp:
         def __init__(self) -> None:
@@ -133,13 +96,6 @@ def test_browser_verifier_uses_compact_external_safe_session_ids(operation, monk
         app=app,
         max_cost_usd=None,
     )
-    closed: list[str] = []
-
-    async def close(session_id):
-        closed.append(session_id)
-
-    monkeypatch.setattr(browser_verifier_module, "close_host_session", close)
-
     asyncio.run(
         verifier.averify(_provider_model("openai"), _provider_price("openai"))
         if operation == "verify"
@@ -149,7 +105,6 @@ def test_browser_verifier_uses_compact_external_safe_session_ids(operation, monk
     assert len(app.requests) == 1
     session_id = app.requests[0].session_id
     assert re.fullmatch(r"[0-9a-f]{32}", session_id)
-    assert closed == [session_id]
 
 
 def test_refresh_import_does_not_require_unreleased_exception_helper(monkeypatch) -> None:
@@ -173,143 +128,6 @@ def test_refresh_import_does_not_require_unreleased_exception_helper(monkeypatch
         raising=False,
     )
     assert importlib.reload(refresh) is refresh
-
-
-def test_browser_verifier_preserves_primary_and_cleanup_failures(monkeypatch) -> None:
-    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
-    primary = ValueError("verification failed")
-    cleanup = RuntimeError("close failed")
-
-    async def fail_verify(model, price, *, session_id):
-        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
-        raise primary
-
-    async def fail_close(session_id):
-        catalog_tools._HOST_BROWSER_SESSIONS.discard(session_id)
-        raise cleanup
-
-    monkeypatch.setattr(verifier, "_averify", fail_verify)
-    monkeypatch.setattr(browser_verifier_module, "close_host_session", fail_close)
-
-    with pytest.raises(BaseExceptionGroup) as raised:
-        asyncio.run(verifier.averify(_provider_model("openai"), _provider_price("openai")))
-
-    assert raised.value.exceptions == (primary, cleanup)
-
-
-def test_browser_verifier_cancellation_waits_for_host_cleanup(monkeypatch) -> None:
-    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
-    primary_started = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-
-    async def blocked_verify(model, price, *, session_id):
-        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
-        primary_started.set()
-        await asyncio.Event().wait()
-
-    async def close(session_id):
-        await asyncio.sleep(0)
-        catalog_tools._HOST_BROWSER_SESSIONS.discard(session_id)
-        cleanup_finished.set()
-
-    monkeypatch.setattr(verifier, "_averify", blocked_verify)
-    monkeypatch.setattr(browser_verifier_module, "close_host_session", close)
-
-    async def exercise() -> None:
-        task = asyncio.create_task(
-            verifier.averify(_provider_model("openai"), _provider_price("openai"))
-        )
-        await primary_started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert task.cancelled()
-        assert task.cancelling() == 1
-        assert cleanup_finished.is_set()
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("operation", ["verify", "recommendations"])
-def test_browser_verifier_cancellation_preserves_runtime_and_browser_cleanup_failures(
-    operation, monkeypatch
-) -> None:
-    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
-    primary_started = asyncio.Event()
-    runtime_cleanup = RuntimeError("runtime cleanup failed")
-    browser_cleanup = RuntimeError("browser cleanup failed")
-    delivered: list[asyncio.CancelledError] = []
-
-    async def blocked_primary() -> None:
-        primary_started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError as cancellation:
-            cancellation.__cause__ = runtime_cleanup
-            delivered.append(cancellation)
-            raise
-
-    async def blocked_verify(model, price, *, session_id):
-        await blocked_primary()
-
-    async def blocked_recommendations(provider_name, existing_models, *, session_id):
-        await blocked_primary()
-
-    async def fail_close(session_id):
-        raise browser_cleanup
-
-    monkeypatch.setattr(verifier, "_averify", blocked_verify)
-    monkeypatch.setattr(verifier, "_adiscover_recommendations", blocked_recommendations)
-    monkeypatch.setattr(browser_verifier_module, "close_host_session", fail_close)
-
-    async def exercise() -> None:
-        task = asyncio.create_task(
-            verifier.averify(_provider_model("openai"), _provider_price("openai"))
-            if operation == "verify"
-            else verifier.adiscover_recommendations("openai", ())
-        )
-        await primary_started.wait()
-        task.cancel("stop")
-        with pytest.raises(asyncio.CancelledError) as raised:
-            await task
-        assert raised.value is delivered[0]
-        assert task.cancelled()
-        assert task.cancelling() == 1
-        combined = raised.value.__cause__
-        assert isinstance(combined, BaseExceptionGroup)
-        assert combined.exceptions == (runtime_cleanup, browser_cleanup)
-
-    asyncio.run(exercise())
-
-
-def test_browser_verifier_retains_primary_when_cancelled_during_cleanup(monkeypatch) -> None:
-    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
-    primary = RuntimeError("verification failed")
-    cleanup_started = asyncio.Event()
-
-    async def fail_verify(model, price, *, session_id):
-        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
-        raise primary
-
-    async def blocked_close(session_id):
-        cleanup_started.set()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(verifier, "_averify", fail_verify)
-    monkeypatch.setattr(browser_verifier_module, "close_host_session", blocked_close)
-
-    async def exercise() -> None:
-        task = asyncio.create_task(
-            verifier.averify(_provider_model("openai"), _provider_price("openai"))
-        )
-        await cleanup_started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError) as raised:
-            await task
-        assert raised.value.__cause__ is primary
-        assert task.cancelled()
-
-    asyncio.run(exercise())
 
 
 def test_direct_bedrock_recommendation_audit_fails_closed() -> None:
@@ -1465,11 +1283,13 @@ def test_browser_verifier_supplies_pricing_guidance_without_environment(monkeypa
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     verifier = BrowserVerifier(as_of="2026-07-13", max_cost_usd=None)
     prompt = verifier.app.get_agent("model-verifier").spec.system_prompt
-    environment = verifier.app.get_environment()
+    factory = verifier.app.get_environment_factory()
 
     assert prompt is not None
     assert WORKSPACE_GUIDANCE in prompt
-    assert environment.environment.artifact_store is not None
+    assert factory.configured_artifact_store is not None
+    assert set(verifier.app.get_agent("model-verifier").tools) == {"browser_session"}
+    assert verifier._env_name == "model-verifier-docker"
 
 
 def test_browser_verifier_records_only_page_reading_urls() -> None:
@@ -1573,6 +1393,103 @@ def test_browser_verifier_records_every_mode_verified_by_all_mode_read() -> None
     ]
 
     assert browsed_pricing_modes(events) == {url: {"standard", "batch"}}
+
+
+@pytest.mark.parametrize("tool_count,fail_first", [(1, False), (2, False), (2, True)])
+def test_browser_verifier_reads_current_runtime_terminal_arguments(
+    monkeypatch, tool_count, fail_first
+) -> None:
+    from cayu import RunRequest
+    from cayu.messages import Message, MessageRole, TextPart
+
+    requested_url = "https://openai.com/api/pricing/"
+    effective_url = "https://developers.openai.com/api/docs/pricing"
+
+    class PageProvider(ModelProvider):
+        name = "test"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def stream(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                for index in range(tool_count):
+                    yield ModelStreamEvent.tool_call(
+                        id=f"read-{index}",
+                        name="read_page",
+                        arguments={
+                            "url": requested_url
+                            + ("#unavailable" if fail_first and index == 0 else "")
+                        },
+                    )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            else:
+                yield ModelStreamEvent.text_delta("done")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def read_page(self, ctx, args):
+        if args["url"].endswith("#unavailable"):
+            raise RuntimeError("browser navigation failed")
+        return catalog_tools.ToolResult(
+            content="Official prices",
+            structured={
+                "effective_url": effective_url,
+                "pricing_mode": "standard",
+                "pricing_mode_verified": True,
+            },
+        )
+
+    monkeypatch.setattr(ReadPageTool, "run", read_page)
+
+    async def exercise():
+        app = CayuApp(session_store=InMemorySessionStore())
+        app.register_provider(PageProvider(), default=True)
+        app.register_agent(AgentSpec(name="reader", model="test"), tools=[ReadPageTool()])
+        request = RunRequest(
+            agent_name="reader",
+            messages=[Message(role=MessageRole.USER, content=(TextPart(text="Read pricing"),))],
+        )
+        return [event async for event in app.run(request)]
+
+    events = asyncio.run(exercise())
+    started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
+    assert started.payload["arguments_state"] == "quarantined"
+    assert "arguments" not in started.payload
+    assert browsed_urls(events) == {effective_url}, [
+        (event.type, event.payload) for event in events if event.tool_name
+    ]
+    assert browsed_pricing_modes(events) == {effective_url: {"standard"}}
+    assert any(event.type == EventType.SESSION_COMPLETED for event in events)
+    assert not any(event.type == EventType.SESSION_INTERRUPTED for event in events)
+    if fail_first:
+        assert any(event.type == EventType.TOOL_CALL_FAILED for event in events)
+
+
+@pytest.mark.parametrize("terminal_state", ["finalized", "unavailable"])
+def test_browser_verifier_does_not_reuse_quarantined_start_arguments(terminal_state) -> None:
+    identity = {"tool_call_id": "read", "tool_round_id": "round"}
+    url = "https://openai.com/api/pricing/"
+    events = [
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="test",
+            tool_name="read_page",
+            payload={**identity, "arguments_state": "quarantined"},
+        ),
+        Event(
+            type=EventType.TOOL_CALL_COMPLETED,
+            session_id="test",
+            tool_name="read_page",
+            payload={
+                **identity,
+                "arguments_state": terminal_state,
+                "arguments": {"url": url},
+                "result": {"is_error": False},
+            },
+        ),
+    ]
+    assert browsed_urls(events) == ({url} if terminal_state == "finalized" else set())
 
 
 def test_host_browser_subprocess_scrubs_secrets_and_uses_non_login_shell(monkeypatch) -> None:
@@ -2118,7 +2035,11 @@ def test_browser_verifier_prompt_requires_reading_committed_official_sources() -
     prompt = app.requests[0].messages[0].content[0].text
     assert model.provenance.url in prompt
     assert schedule.provenance.url in prompt
-    assert "call read_page on every source URL you return" in prompt
+    assert "Navigate every source URL you cite with browser_session" in prompt
+    deadline = app.requests[0].execution_deadline
+    assert deadline.source == "model-catalog"
+    assert deadline.scope == "verification"
+    assert 0 < deadline.remaining_seconds() <= browser_verifier_module.VERIFY_TIMEOUT_SECONDS
 
 
 def test_refresh_cli_selects_local_openai_subscription(monkeypatch) -> None:
@@ -2290,6 +2211,8 @@ def test_browser_verifier_stops_after_unknown_resolved_model() -> None:
     assert limit_event.payload["limit"] == "estimated_cost"
     assert "no matching pricing" in limit_event.payload["message"]
     assert not any(event.type == EventType.TOOL_CALL_STARTED for event in events)
+    assert "session.limit_reached" in outcome.note
+    assert "no matching pricing" in outcome.note
 
 
 def test_refresh_paths_are_repository_relative_after_chdir(tmp_path, monkeypatch) -> None:
@@ -2301,6 +2224,32 @@ def test_refresh_paths_are_repository_relative_after_chdir(tmp_path, monkeypatch
     assert repository_root / "src/cayu/data/default_price_book.json" == refresh.PRICE_BOOK_PATH
     assert repository_root / "model-catalog-refresh.md" == refresh.REPORT_PATH
     assert refresh.CATALOG_PATH.is_file()
+
+
+def test_refresh_preserves_progress_report_when_later_check_is_cancelled(tmp_path, monkeypatch):
+    class InterruptedVerifier:
+        def __init__(self, **kwargs):
+            self.calls = 0
+
+        async def averify(self, model, price):
+            self.calls += 1
+            if self.calls == 2:
+                raise asyncio.CancelledError()
+            return VerifyOutcome(verified=False, note="first check retained for review")
+
+    report = tmp_path / "report.md"
+    catalog = tmp_path / "catalog.json"
+    prices = tmp_path / "prices.json"
+    monkeypatch.setattr(refresh, "BrowserVerifier", InterruptedVerifier)
+    monkeypatch.setattr(refresh, "REPORT_PATH", report)
+    monkeypatch.setattr(refresh, "CATALOG_PATH", catalog)
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", prices)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(refresh._run(force_all=True, max_age_days=30))
+    assert "Refresh in progress: 1/" in report.read_text()
+    assert "first check retained for review" in report.read_text()
+    assert not catalog.exists()
+    assert not prices.exists()
 
 
 def test_refresh_report_escapes_and_bounds_untrusted_verifier_text() -> None:
@@ -2766,3 +2715,120 @@ def test_refresh_invalid_cost_limit_still_writes_report(tmp_path, monkeypatch) -
         asyncio.run(refresh._run(force_all=False, max_age_days=10_000))
 
     assert "invalid cost limit" in report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        ('- row "Model Input Output":\n  - cell "1 5"', {"standard"}),
+        ('- heading "Batch pricing"\n- row "Model 0.5 2.5"', {"standard", "batch"}),
+        ('- tab "Standard" [selected]\n- tab "Batch"', {"standard"}),
+        ('- radio "Standard"\n- radio "Batch" [checked]', {"batch"}),
+        ('- tab "Batch" [selected]\n- tab "Batch"', set()),
+        ('- switch "Batch API price" [checked=false]', {"standard"}),
+        ('- switch "Batch API price"', {"standard"}),
+        ('- switch "Batch API price" [checked=true]', {"batch"}),
+        ('- switch "Batch API price" [checked]', {"batch"}),
+        ('- switch "Batch API price" [checked=mixed]', set()),
+        (
+            '- switch "Batch API price" [checked]\n- switch "Batch API price"',
+            set(),
+        ),
+        ("", set()),
+    ],
+)
+def test_native_browser_observations_ground_pricing_modes(snapshot, expected):
+    url = "https://openai.com/api/pricing/"
+    event = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="verification",
+        tool_name="browser_session",
+        payload={
+            "result": {
+                "structured": {
+                    "url": url,
+                    "snapshot": snapshot,
+                    "load_state": "loaded",
+                    "access_state": "available",
+                }
+            }
+        },
+    )
+    assert browsed_urls([event]) == {url}
+    assert browsed_pricing_modes([event]).get(url, set()) == expected
+
+
+@pytest.mark.parametrize(
+    ("load", "access", "error"),
+    [
+        ("failed", "available", False),
+        ("loaded", "blocked", False),
+        ("loaded", "available", True),
+    ],
+)
+def test_native_browser_rejects_failed_or_blocked_observations(load, access, error):
+    event = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="verification",
+        tool_name="browser_session",
+        payload={
+            "arguments": {"url": "https://openai.com/api/pricing/"},
+            "result": {
+                "is_error": error,
+                "structured": {
+                    "url": "https://openai.com/api/pricing/",
+                    "snapshot": "Batch pricing",
+                    "load_state": load,
+                    "access_state": access,
+                },
+            },
+        },
+    )
+    assert not browsed_urls([event])
+    assert not browsed_pricing_modes([event])
+
+
+@pytest.mark.parametrize(
+    ("requested", "destination", "state", "load", "access", "error", "accepted"),
+    [
+        ("fixed", "official", "finalized", "loaded", "available", False, True),
+        ("unrelated", "official", "finalized", "loaded", "available", False, False),
+        ("fixed", "unofficial", "finalized", "loaded", "available", False, False),
+        ("fixed", "official", "quarantined", "loaded", "available", False, False),
+        ("fixed", "official", "finalized", "failed", "available", False, False),
+        ("fixed", "official", "finalized", "loaded", "blocked", False, False),
+        ("fixed", "official", "finalized", "loaded", "available", True, False),
+    ],
+)
+def test_recommendation_redirect_requires_successful_fixed_page_navigation(
+    requested, destination, state, load, access, error, accepted
+):
+    from maintenance.model_catalog.browser_verifier import (
+        RECOMMENDATION_PAGES,
+        _selection_page_sources,
+    )
+
+    target = (
+        "https://platform.claude.com/docs/en/models/overview"
+        if destination == "official"
+        else "https://example.com/models"
+    )
+    event = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="verification",
+        tool_name="browser_session",
+        payload={
+            "arguments_state": state,
+            "arguments": {
+                "operation": "navigate",
+                "url": RECOMMENDATION_PAGES["anthropic"]
+                if requested == "fixed"
+                else "https://platform.claude.com/docs/en/unrelated",
+            },
+            "result": {
+                "is_error": error,
+                "structured": {"url": target, "load_state": load, "access_state": access},
+            },
+        },
+    )
+    assert (target in _selection_page_sources([event], "anthropic")) is accepted

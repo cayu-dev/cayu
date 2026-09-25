@@ -247,6 +247,28 @@ async def _run(
     input_tokens = output_tokens = 0
     attempted = verified = 0
     discovery_attempted = discovery_verified = missing_recommendations = 0
+
+    def write_progress(next_model_index: int) -> None:
+        partial = original.model_copy(
+            update={"models": tuple(kept) + original.models[next_model_index:]}
+        )
+        partial_prices = original_price_book.model_copy(
+            update={"prices": tuple(price_updates.values())}
+        )
+        REPORT_PATH.write_text(
+            f"Refresh in progress: {next_model_index}/{len(original.models)} model records "
+            "processed. Candidates are not yet validated or written.\n\n"
+            + _format_report(
+                original,
+                partial,
+                original_price_book,
+                partial_prices,
+                flagged=flagged,
+                evidence=evidence,
+            ),
+            encoding="utf-8",
+        )
+
     try:
         max_cost = _max_verify_cost()
     except ValueError as exc:
@@ -270,7 +292,8 @@ async def _run(
         )
         raise
 
-    for model in original.models:
+    for model_index, model in enumerate(original.models):
+        write_progress(model_index)
         identity = f"{model.provider_name}/{model.model}"
         current_price = _price_for_model(original_price_book, model)
         if requested and identity not in requested:
@@ -290,6 +313,7 @@ async def _run(
             kept.append(model)
             continue
         attempted += 1
+        print(f"Verifying {identity} ({attempted})", flush=True)
         if verifier is None:
             try:
                 verifier = BrowserVerifier(
@@ -324,6 +348,10 @@ async def _run(
             outcome = await verifier.averify(model, current_price)
         except Exception as exc:
             kept.append(model)
+            print(
+                f"Verification failed: {identity}: {_safe_report_text(_exception_diagnostic(exc))}",
+                flush=True,
+            )
             flagged.append(
                 _VerificationFlag(
                     identity=identity,
@@ -332,6 +360,11 @@ async def _run(
                 )
             )
             continue
+        print(
+            f"Verification returned: {identity}: verified={outcome.verified}"
+            + (f"; {_safe_report_text(outcome.note)}" if outcome.note else ""),
+            flush=True,
+        )
         if outcome.usage:
             input_tokens += outcome.usage.get("input_tokens", 0)
             output_tokens += outcome.usage.get("output_tokens", 0)
@@ -466,6 +499,7 @@ async def _run(
                 )
             )
 
+    write_progress(len(original.models))
     if audit_recommendations:
         selected_providers = (
             {identity.split("/", 1)[0] for identity in requested}
@@ -473,7 +507,9 @@ async def _run(
             else {item.provider_name for item in original.models}
         )
         for provider_name in sorted(selected_providers):
+            write_progress(len(original.models))
             discovery_attempted += 1
+            print(f"Auditing {provider_name} recommendations", flush=True)
             if provider_name not in RECOMMENDATION_PAGES:
                 flagged.append(
                     _VerificationFlag(
@@ -520,6 +556,10 @@ async def _run(
                     provider_name, existing_models
                 )
             except Exception as exc:
+                print(
+                    f"Recommendation audit failed: {provider_name}: {_safe_report_text(_exception_diagnostic(exc))}",
+                    flush=True,
+                )
                 flagged.append(
                     _VerificationFlag(
                         identity=f"{provider_name} recommendation audit",
@@ -528,6 +568,11 @@ async def _run(
                     )
                 )
                 continue
+            print(
+                f"Recommendation audit returned: {provider_name}: verified={discovered.verified}"
+                + (f"; {_safe_report_text(discovered.note)}" if discovered.note else ""),
+                flush=True,
+            )
             if discovered.usage:
                 input_tokens += discovered.usage.get("input_tokens", 0)
                 output_tokens += discovered.usage.get("output_tokens", 0)

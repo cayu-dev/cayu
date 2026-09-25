@@ -65,8 +65,8 @@ def main(argv: list[str] | None = None) -> None:
     uv_executable = shutil.which("uv")
     if uv_executable is None:
         raise RuntimeError("uv is required to create the disposable refresh environment")
-    if shutil.which("agent-browser") is None:
-        raise RuntimeError("agent-browser is required for model-catalog verification")
+    if shutil.which("docker") is None:
+        raise RuntimeError("Docker is required for model-catalog verification")
 
     clean_env = os.environ.copy()
     clean_env.pop("PYTHONHOME", None)

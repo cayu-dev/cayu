@@ -226,6 +226,29 @@ The bootstrapper creates a disposable environment, installs the latest public `c
 PyPI, and runs Luna at maximum reasoning against the checkout's catalog data. This makes the
 maintenance run exercise the currently published runtime instead of the editable checkout.
 
+The refresh prints progress for each model and recommendation audit and saves an interim
+report before each check, retaining earlier evidence if a later check is interrupted. Each verification has
+a five-minute runtime deadline; inconclusive checks retain the committed record and include
+runtime limit or structured-output diagnostics in `model-catalog-refresh.md`. Browser evidence
+comes from successful tool completion events, including finalized arguments and the effective
+URL after redirects; public start events do not expose arguments or stable cross-event call IDs.
+The verifier uses Cayu's native `WebBridge.sandboxed_browser(interactive=True)` with a
+Docker-backed virtual-egress environment and the runtime's pinned browser image. Docker must
+be running and that image must be installed (see [browser setup](browser-session.md)).
+Credentialless public HTTPS GET/HEAD access supports provider pages and their assets; catalog
+validation still accepts only official provider source URLs. Cayu owns browser effects,
+artifacts, cancellation, and allocation cleanup. There is no host-browser fallback.
+
+While developing against an unreleased runtime change, run the verifier from the checkout
+so it uses that change and its matching pinned browser image:
+
+```bash
+uv run python -m maintenance.model_catalog.refresh --openai-subscription --all --audit-recommendations
+```
+
+The `local_refresh` bootstrap above deliberately uses the latest published package; it does
+not include an unreleased fix merely because the checkout contains that fix.
+
 ## Pre-v0.1 migration
 
 The pre-v0.1 interface intentionally removed the overlapping pricing paths:

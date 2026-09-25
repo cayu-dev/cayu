@@ -19,7 +19,7 @@ from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from cayu.artifacts.attachments import file_attachment
 from cayu.runners.base import ExecCommand
-from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from maintenance.model_catalog import browser, search
 from maintenance.model_catalog.security import (
     allowed_hosts,
@@ -330,6 +330,7 @@ async def _read_bytes(ctx: ToolContext, path: str) -> bytes:
 class SearchWebTool(Tool):
     spec = ToolSpec(
         name="search_web",
+        effect=ToolEffect.NONE,
         description="Search the web; returns the top result URLs for a query.",
         input_schema={
             "type": "object",
@@ -353,6 +354,7 @@ class SearchWebTool(Tool):
 class ReadPageTool(Tool):
     spec = ToolSpec(
         name="read_page",
+        effect=ToolEffect.NONE,
         description=(
             "Open a URL in a real browser and return its ACCESSIBILITY TREE: "
             "table rows/cells with their columns intact. Keep pricing_mode=all (the default) to "
@@ -463,6 +465,7 @@ async def _read_page_mode(ctx: ToolContext, url: str, mode: str) -> ToolResult:
 class ScreenshotTool(Tool):
     spec = ToolSpec(
         name="screenshot",
+        effect=ToolEffect.EXTERNAL,
         description=(
             "Open a URL in a real browser, select and verify the requested pricing_mode, and "
             "capture a FULL-PAGE screenshot. Use this when read_page returns empty or unreadable "
