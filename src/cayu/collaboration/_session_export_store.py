@@ -16,10 +16,16 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, StrictBool, StrictInt, model_validator
 
-from cayu._validation import canonical_bounded_durable_json_bytes
-from cayu.collaboration._contracts import ContractValue, InitiatorBinding
+from cayu._validation import canonical_bounded_durable_json_bytes, canonical_durable_json_bytes
+from cayu.collaboration._contracts import (
+    MAX_ENVELOPE_BYTES,
+    ContractValue,
+    InitiatorBinding,
+    OperationRef,
+)
 from cayu.collaboration._permits import PermitCommand
 from cayu.collaboration._preparation import contract_bytes
+from cayu.collaboration._producer_bounds import MAX_OUTPUT_DESTINATIONS
 from cayu.collaboration._session_export_bounds import initiator_bytes
 from cayu.collaboration.exports import (
     ExportDigest,
@@ -52,7 +58,15 @@ def digest(value: object) -> str:
 
 
 def source_digest(records: Sequence[TranscriptRecord]) -> str:
-    return digest([record.model_dump(mode="json", warnings=False) for record in records])
+    # Native rows have their own durable bounds. The smaller export envelope
+    # must not prevent committing evidence of a source-envelope rejection.
+    return sha256(source_bytes(records)).hexdigest()
+
+
+def source_bytes(records: Sequence[TranscriptRecord]) -> bytes:
+    return canonical_durable_json_bytes(
+        [record.model_dump(mode="json", warnings=False) for record in records], "export source"
+    )
 
 
 def operation_key(operation: ContractValue) -> str:
@@ -67,6 +81,27 @@ class ExportRoot(ContractValue):
     pending_count: StrictInt = Field(ge=0, le=64)
     retained_bytes: StrictInt = Field(ge=0, le=64 * 1024 * 1024)
     admission_count: StrictInt = Field(default=0, ge=0, le=64)
+    # Mandatory negative control is reserved by the producer registration's
+    # finite destination set, separately from optional content-export capacity.
+    producer_exclusion_count: StrictInt = Field(default=0, ge=0, le=MAX_OUTPUT_DESTINATIONS)
+    producer_exclusion_bytes: StrictInt = Field(
+        default=0, ge=0, le=MAX_OUTPUT_DESTINATIONS * MAX_ENVELOPE_BYTES
+    )
+
+
+class ExportFutureExclusion(ContractValue):
+    """Exact no-late-publication fence; no export or participant permit was admitted."""
+
+    mode: Literal["producer_export_exclusion"] = "producer_export_exclusion"
+    state: Literal["excluded"] = "excluded"
+    request: SessionExportRequest
+    registration: OperationRef
+    registration_commitment: ExportDigest
+    closure_commitment: ExportDigest
+    initiator: InitiatorBinding
+    reserved_bytes: StrictInt = Field(
+        default=MAX_ENVELOPE_BYTES, ge=MAX_ENVELOPE_BYTES, le=MAX_ENVELOPE_BYTES
+    )
 
 
 class ExportAdmission(ContractValue):
@@ -101,15 +136,29 @@ class ExportAdmission(ContractValue):
         return self
 
 
+class ExportValidationFailure(ContractValue):
+    """Exact deterministic projection rejection; neither authorization nor retry evidence."""
+
+    request: SessionExportRequest
+    source_commitment: ExportDigest
+    reason: Literal["validator_rejected", "projection_too_large", "source_too_large"]
+
+
 class ExportPreparation(ContractValue):
     admission: ExportAdmission
     state: Literal["prepared", "excluded"] = "prepared"
     reserved_bytes: StrictInt = Field(ge=1, le=64 * 1024 * 1024)
     excluded_by: InitiatorBinding | None = None
     exclusion_mandate_commitment: ExportDigest | None = None
+    validation_failure: ExportValidationFailure | None = None
 
     @model_validator(mode="after")
     def exact_exclusion(self) -> ExportPreparation:
+        if self.validation_failure is not None and (
+            self.validation_failure.request != self.admission.request
+            or self.validation_failure.source_commitment != self.admission.source_commitment
+        ):
+            raise ValueError("Export validation failure conflicts with its source admission.")
         if (self.state == "excluded") != (self.excluded_by is not None):
             raise ValueError("Export preparation exclusion authority conflicts.")
         if self.state == "prepared" and self.admission.settled:
@@ -396,10 +445,24 @@ def require_erasure_quiescence(
         for key, raw in owned.items()
         if key != NAMESPACE_KEY and "admission" in raw and "receipt" not in raw
     ]
-    if len(records) + len(settlements) + len(preparations) + 1 != len(owned):
+    exclusions = [
+        ExportFutureExclusion.model_validate(raw)
+        for key, raw in owned.items()
+        if raw.get("mode") == "producer_export_exclusion"
+    ]
+    if len(records) + len(settlements) + len(preparations) + len(exclusions) + 1 != len(owned):
         raise SessionExportConflict()
     if (
         len(records) + len(preparations) != root.export_count
+        or len(exclusions) != root.producer_exclusion_count
+        or sum(record.reserved_bytes for record in exclusions) != root.producer_exclusion_bytes
+        or any(
+            record.request.ref.session_id != session.id
+            or record.request.ref.session_instance_id != session.instance_id
+            or owned.get(operation_key(record.request.ref.operation))
+            != record.model_dump(mode="json")
+            for record in exclusions
+        )
         or sum(record.state == "pending" for record in records)
         + sum(record.state == "prepared" for record in preparations)
         != root.pending_count

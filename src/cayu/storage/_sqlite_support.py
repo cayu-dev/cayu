@@ -1029,6 +1029,27 @@ _MIGRATION_STEPS: dict[int, str] = {
         );
     """,
     107: SQLITE_COLLABORATION_PLANNING_DDL,
+    110: """
+        CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
+            operation_key TEXT PRIMARY KEY NOT NULL,
+            namespace_key TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation BETWEEN 1 AND 9007199254740991),
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+                AND length(CAST(receipt_json AS BLOB)) BETWEEN 1 AND 65536
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_producer_cleanup_namespace
+        ON cayu_producer_cleanup_receipts(namespace_key, generation, operation_key);
+        CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_retirements (
+            namespace_key TEXT PRIMARY KEY NOT NULL,
+            through_generation INTEGER NOT NULL CHECK (through_generation BETWEEN 1 AND 9007199254740991)
+        );
+    """,
+    109: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_session_identity
+        ON cayu_budget_reservations(session_id, reservation_id);
+    """,
     106: "",  # Contract-only writer fence; existing typed request records own storage.
     105: SQLITE_COLLABORATION_CLARIFICATION_DDL,
     104: """
@@ -6100,6 +6121,45 @@ def _reservation_event_index_definition() -> str:
     return statements[0]
 
 
+def _validate_producer_cleanup_receipts(connection: sqlite3.Connection) -> None:
+    names = (
+        ("cayu_producer_cleanup_receipts", "table"),
+        ("idx_cayu_producer_cleanup_namespace", "index"),
+        ("cayu_producer_cleanup_retirements", "table"),
+    )
+    for (name, kind), expected in zip(names, _iter_statements(_MIGRATION_STEPS[110]), strict=True):
+        row = connection.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone()
+        if (
+            row is None
+            or row[0] != kind
+            or row[1] is None
+            or _normalize_sqlite_schema_definition(row[1])
+            != _normalize_sqlite_schema_definition(expected)
+        ):
+            raise RuntimeError(
+                "Required Cayu producer cleanup receipt table or fence is missing or conflicting."
+            )
+
+
+def _validate_reservation_inventory_index(connection: sqlite3.Connection) -> None:
+    name = "idx_cayu_budget_reservations_session_identity"
+    row = connection.execute(
+        "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?", (name,)
+    ).fetchone()
+    expected = next(_iter_statements(_MIGRATION_STEPS[109]))
+    if (
+        row is None
+        or row[0] != "index"
+        or row[1] != "cayu_budget_reservations"
+        or row[2] is None
+        or _normalize_sqlite_schema_definition(row[2])
+        != _normalize_sqlite_schema_definition(expected)
+    ):
+        raise RuntimeError("Required Cayu reservation inventory index is missing or conflicting.")
+
+
 def _validate_reservation_event_index(
     connection: sqlite3.Connection,
     *,
@@ -6474,6 +6534,10 @@ def reconcile_schema(
         _validate_interrupted_task_handoff_schema(connection)
     if current.revision >= 76:
         _validate_interrupted_handoff_generation_column(connection)
+    if current.revision >= 109:
+        _validate_reservation_inventory_index(connection)
+    if current.revision >= 110:
+        _validate_producer_cleanup_receipts(connection)
     if app_min_supported >= 39:
         _validate_task_invocation_column(connection)
     if app_min_supported >= 41:

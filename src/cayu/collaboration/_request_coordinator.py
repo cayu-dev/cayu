@@ -229,6 +229,8 @@ class RequestCoordinator:
         redactor: SecretRedactor,
         prepared_sessions: SessionStore | None = None,
         resolve_prepared_budget: Callable[..., Awaitable[BudgetBinding]] | None = None,
+        read_prepared_budget: Callable[[BudgetBinding], Awaitable[None]] | None = None,
+        read_producer_budget: Callable[..., Awaitable[object]] | None = None,
     ):
         self._participants = participants
         self._registration = registration
@@ -294,6 +296,8 @@ class RequestCoordinator:
                         sessions=prepared_sessions,
                         mandates=registration.mandates,
                         resolve_budget=resolve_prepared_budget,
+                        read_budget=read_prepared_budget,
+                        read_producer_budget=read_producer_budget,
                         now_ms=self._prepared_owner_time,
                         read_admission=self._prepared_read_admission,
                         delegate=registration.receiving_owner,
@@ -717,6 +721,102 @@ class RequestCoordinator:
         result = await self._run(value, mode="control")
         assert isinstance(result, RequestControlReceipt)
         return result
+
+    async def _reconcile_producer_control(self, receipt: RequestControlReceipt):
+        """Close native launch after source election, before acknowledging control."""
+        from cayu.collaboration._producer_store import (
+            acknowledge_native_exclusion,
+            read_request_output,
+        )
+        from cayu.collaboration._recipient_admission_receiver import (
+            RecipientAdmissionReceivingOwner,
+        )
+
+        store, initialized = self._participants._ready()
+        async with store._transaction(initialized.owner.application_scope, write=False) as tx:
+            record = await read_request_output(
+                tx, receipt.expected.intent.expected, redactor=self._redactor
+            )
+            if record is not None and record.cleanup_ack is not None:
+                from cayu.collaboration._producer_cleanup_finalization import read_finalization
+                from cayu.collaboration._producer_contracts import (
+                    ProducerAdmittedCleanup,
+                    ProducerCleanupRecord,
+                )
+
+                final = await read_finalization(tx, record, redactor=self._redactor)
+                if final is None or not (
+                    (
+                        isinstance(record.cleanup, ProducerAdmittedCleanup)
+                        and record.cleanup.evidence.terminal_kind == "closure"
+                        and record.cleanup.evidence.terminal == receipt.expected.operation
+                    )
+                    or (
+                        isinstance(record.cleanup, ProducerCleanupRecord)
+                        and record.cleanup.exclusion.control_operation == receipt.expected.operation
+                    )
+                ):
+                    raise CollaborationUnavailable("Producer closure finalization conflicts.")
+                # This source acceptance includes the exact native cleanup ACK.
+                # Replay must not address a deleted or reused public session ID.
+                return receipt
+        if record is None:
+            return receipt
+        registration = self._registration
+        receiver = None if registration is None else registration.receiving_owner
+        if type(receiver) is not RecipientAdmissionReceivingOwner:
+            raise CollaborationUnavailable("Producer closure requires its registered native owner.")
+        from cayu.collaboration._producer_contracts import ProducerCleanupRecord
+        from cayu.runtime._producer_output_store import NativeProducerAdmissionWon
+
+        try:
+            # Source acceptance already authenticates exclusion. Repeating the
+            # native exclusion after a lost cleanup ACK would address a deleted
+            # or reused public session ID instead of its independent ACK record.
+            exclusion = (
+                record.cleanup.exclusion
+                if isinstance(record.cleanup, ProducerCleanupRecord)
+                else await receiver._exclude_producer_after_control(record, receipt)
+            )
+        except NativeProducerAdmissionWon:
+            # Closure is durable, but a won launch cannot be described as an
+            # inert exclusion. This qualified request-only capability requires
+            # stop, not continued execution under an inferred independent duty.
+            # Stop acceptance settles neither the output permit nor accounting.
+            from cayu.collaboration._producer_disposition import _service_native_stop
+
+            await _service_native_stop(receiver, record, receipt, redactor=self._redactor)
+            return receipt
+        # No source transaction is held over this foreign owner call. If native
+        # dispatch already won, source closure remains durable with pending stop
+        # responsibility; no inert settlement is fabricated.
+        async with store._transaction(initialized.owner.application_scope, write=True) as tx:
+            cleanup = await acknowledge_native_exclusion(
+                store, tx, initialized, record.command, receipt, exclusion, redactor=self._redactor
+            )
+            acknowledged = await read_request_output(
+                tx, receipt.expected.intent.expected, redactor=self._redactor
+            )
+            if acknowledged is None:
+                raise CollaborationUnavailable("Producer cleanup acknowledgement is unavailable.")
+        native = await receiver._acknowledge_producer_cleanup(acknowledged, receipt, cleanup)
+        from cayu.collaboration._producer_cleanup_finalization import (
+            _received_native_cleanup,
+            finalize_cleanup,
+        )
+
+        authority = _received_native_cleanup(record.command, native, self._redactor)
+        async with store._transaction(initialized.owner.application_scope, write=True) as tx:
+            await finalize_cleanup(
+                store,
+                tx,
+                initialized,
+                record.command,
+                native,
+                authority=authority,
+                redactor=self._redactor,
+            )
+        return receipt
 
     async def admit(
         self, command: RequestAdmissionCommand, *, context: MandateAccessContext
@@ -1425,7 +1525,8 @@ class RequestCoordinator:
                         await require_request_event(tx, replay.event, self._redactor)
                         if await tx.now_ms() >= permission_deadline:
                             raise CollaborationAccessDenied("Read authority expired during replay.")
-                        return replay
+                if raw is not None:
+                    return await self._reconcile_producer_control(replay)
                 self._participants._capability(
                     store, initialized, mutation=True, family=REQUEST_FAMILY
                 )
@@ -1480,7 +1581,7 @@ class RequestCoordinator:
                             self._receiving_ref, authority.receiver, redactor=self._redactor
                         )
                         settlement = authority.settlement
-                        if settlement is None:
+                        if settlement is None and found.producer_operation is None:
                             settlement = await receiver.settlement(
                                 control, found.permit, context=context
                             )
@@ -1490,7 +1591,7 @@ class RequestCoordinator:
                             await self._require_retained_read_grant(
                                 tx, control.operation, read_grant
                             )
-                            return await control_in_transaction(
+                            controlled = await control_in_transaction(
                                 store,
                                 tx,
                                 initialized,
@@ -1501,6 +1602,7 @@ class RequestCoordinator:
                                 settlement=settlement,
                                 redactor=self._redactor,
                             )
+                        return await self._reconcile_producer_control(controlled)
                 expiry = min(
                     resolution.principal.expires_at_ms,
                     *(item.expires_at_ms for item in resolution.chain.entries),
@@ -1509,7 +1611,7 @@ class RequestCoordinator:
                     initialized.binding.application_scope, write=True
                 ) as tx:
                     await self._require_retained_read_grant(tx, control.operation, read_grant)
-                    return await control_in_transaction(
+                    controlled = await control_in_transaction(
                         store,
                         tx,
                         initialized,
@@ -1517,6 +1619,7 @@ class RequestCoordinator:
                         authority_expires_at_ms=expiry,
                         redactor=self._redactor,
                     )
+                return await self._reconcile_producer_control(controlled)
             self._participants._capability(store, initialized, mutation=True, family=REQUEST_FAMILY)
             if context.participant != request.sender:
                 raise CollaborationAccessDenied(

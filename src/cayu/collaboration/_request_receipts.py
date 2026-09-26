@@ -25,6 +25,7 @@ RequestReceiptMode = Literal[
     "request_admission",
     "request_progress",
     "request_outcome",
+    "producer_outcome",
     "request_observation",
     "clarification_open",
     "clarification_reply",
@@ -55,6 +56,7 @@ _SCHEMAS: dict[RequestReceiptMode, type[RequestReceipt]] = {
     "request_admission": RequestAdmissionReceipt,
     "request_progress": RequestProgressReceipt,
     "request_outcome": RequestOutcomeReceipt,
+    "producer_outcome": RequestOutcomeReceipt,
     "request_observation": RequestObservationReceipt,
     "clarification_open": ClarificationOpenReceipt,
     "clarification_reply": ClarificationReplyReceipt,
@@ -113,6 +115,70 @@ def record_operation(raw: object, *, redactor: SecretRedactor) -> OperationRef:
         return prepare_contract(
             RequestPlanningStageRecord, document, redactor=redactor
         ).intent.operation
+    if document.get("mode") in {"producer_destination_exclusion", "producer_export_rejected"}:
+        from cayu.collaboration._producer_pruning import producer_record
+
+        record = producer_record(document, redactor=redactor)
+        assert record is not None
+        return record.operation
+    if document.get("mode") in {
+        "producer_output_record",
+        "producer_request_index",
+        "producer_output_registered",
+        "producer_launch_decision",
+        "producer_cleanup",
+        "producer_admitted_cleanup",
+        "producer_completion",
+        "producer_export",
+        "producer_export_published",
+        "producer_delivery",
+        "producer_delivery_accepted",
+        "producer_delivery_index",
+    }:
+        from cayu.collaboration._producer_contracts import (
+            ProducerAdmittedCleanup,
+            ProducerCleanupRecord,
+            ProducerCompletionRecord,
+            ProducerDeliveryAccepted,
+            ProducerDeliveryIndex,
+            ProducerDeliveryRecord,
+            ProducerExportPublished,
+            ProducerExportRecord,
+            ProducerLaunchDecision,
+            ProducerOutputRecord,
+            ProducerRegistrationEvent,
+            ProducerRequestIndex,
+        )
+
+        if document.get("mode") == "producer_delivery_index":
+            return prepare_contract(ProducerDeliveryIndex, document, redactor=redactor).operation
+        if document.get("mode") == "producer_delivery":
+            return prepare_contract(ProducerDeliveryRecord, document, redactor=redactor).operation
+        if document.get("mode") == "producer_delivery_accepted":
+            return prepare_contract(ProducerDeliveryAccepted, document, redactor=redactor).operation
+        if document.get("mode") == "producer_export":
+            return prepare_contract(ProducerExportRecord, document, redactor=redactor).operation
+        if document.get("mode") == "producer_export_published":
+            return prepare_contract(ProducerExportPublished, document, redactor=redactor).operation
+        if document.get("mode") == "producer_completion":
+            return prepare_contract(ProducerCompletionRecord, document, redactor=redactor).operation
+        if document.get("mode") == "producer_cleanup":
+            return prepare_contract(ProducerCleanupRecord, document, redactor=redactor).operation
+        if document.get("mode") == "producer_admitted_cleanup":
+            return prepare_contract(ProducerAdmittedCleanup, document, redactor=redactor).operation
+        if document.get("mode") == "producer_launch_decision":
+            return prepare_contract(ProducerLaunchDecision, document, redactor=redactor).operation
+        if document.get("mode") == "producer_output_record":
+            return prepare_contract(
+                ProducerOutputRecord, document, redactor=redactor
+            ).command.operation
+        if document.get("mode") == "producer_request_index":
+            return prepare_contract(ProducerRequestIndex, document, redactor=redactor).operation
+        return prepare_contract(ProducerRegistrationEvent, document, redactor=redactor).operation
+    if document.get("mode") == "producer_cleanup_finalized":
+        from cayu.collaboration._producer_cleanup_finalization import ProducerCleanupFinalized
+
+        return prepare_contract(ProducerCleanupFinalized, document, redactor=redactor).operation
     if document.get("mode") == "clarification_delivery":
         from cayu.collaboration._clarification_deliveries import ClarificationDeliveryRecord
 

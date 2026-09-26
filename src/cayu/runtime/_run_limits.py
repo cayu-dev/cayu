@@ -572,6 +572,9 @@ def _validate_ledger_settlement_record(
     ]
     if "execution_profile_fingerprint" in event.payload:
         payload_fields.append("execution_profile_fingerprint")
+    # The incarnation is optional reservation metadata, not a field bound by
+    # BudgetSettlementRecord. Only the session-store publication boundary can
+    # authenticate it; an outbox value alone must not acquire that provenance.
     if event.interaction_id is not None:
         if event.payload.get("interaction_id") != event.interaction_id:
             raise RuntimeError("Budget ledger settlement event changed its interaction identity.")
@@ -1416,6 +1419,27 @@ class RunLimitController:
         )
         self._global_settlement_recovery_lock = asyncio.Lock()
         self._global_settlement_recovery_after: BudgetSettlementCursor | None = None
+
+    async def _verify_retained_budget_binding(self, binding: BudgetBinding) -> None:
+        """Cleanup-only read through the original frozen runtime ledger.
+
+        Never call the receiver: revocation or configuration changes must not
+        manufacture a new sponsor or make historical accounting look settled.
+        """
+        binding = copy_budget_binding(binding)
+        await self._budget_ledger._require_registered_budget_binding(
+            binding_id=binding.binding_id,
+            authority_digest=binding.authority_digest,
+            allowance=binding.allowance,
+        )
+
+    def _supports_producer_budget_readback(self) -> bool:
+        return self._budget_ledger._supports_producer_budget_readback()
+
+    async def _read_producer_budget_settlement(self, command):
+        from cayu.runtime._producer_budget import read_producer_budget_settlement
+
+        return await read_producer_budget_settlement(self, command)
 
     async def inspect_budget_binding(self, *, request: object) -> BudgetBinding:
         """Resolve configured authority without consuming/registering ledger capacity.
@@ -2558,6 +2582,7 @@ class RunLimitController:
             operation = await self.reserve_operation_budgets(
                 budget_limits=tuple(base_limits),
                 session_id=session.id,
+                session_instance_id=session.instance_id,
                 agent_name=agent_name,
                 provider_name=provider_name,
                 model=effective_model,
@@ -2648,11 +2673,14 @@ class RunLimitController:
             session_id=session.id,
             agent_name=agent_name,
             environment_name=environment_name,
-            payload=(
-                {}
-                if execution_profile_fingerprint is None
-                else {"execution_profile_fingerprint": execution_profile_fingerprint}
-            ),
+            payload={
+                "session_instance_id": session.instance_id,
+                **(
+                    {}
+                    if execution_profile_fingerprint is None
+                    else {"execution_profile_fingerprint": execution_profile_fingerprint}
+                ),
+            },
         )
         if binding is not None:
             settlement_event_payload.update(
@@ -3608,13 +3636,31 @@ class RunLimitController:
             )
         return events
 
+    async def _authenticate_settlement_session(
+        self, settlement: BudgetSettlementRecord
+    ) -> BudgetSettlementRecord:
+        settlement = _validate_ledger_settlement_record(settlement)
+        if "session_instance_id" not in settlement.event.payload:
+            return settlement
+        owner = await self._session_store.load(settlement.session_id)
+        if owner is None or settlement.event.payload["session_instance_id"] != owner.instance_id:
+            raise RuntimeError("Budget settlement conflicts with its owning session incarnation.")
+        return settlement.model_copy(
+            update={
+                "event": event_with_runtime_payload_authority(
+                    settlement.event, "session_instance_id"
+                )
+            },
+            deep=True,
+        )
+
     async def publish_budget_settlement(
         self,
         settlement: BudgetSettlementRecord,
     ) -> Event:
         """Publish one ledger-owned audit event and acknowledge its exact handoff."""
 
-        settlement = _validate_ledger_settlement_record(settlement)
+        settlement = await self._authenticate_settlement_session(settlement)
         prepared_event = self._event_writer.prepare_exact_replay(settlement.event)
         persisted = await self._event_writer.persist_exact_replay(prepared_event)
         if persisted != settlement.event:
@@ -3693,6 +3739,7 @@ class RunLimitController:
                         after = next_cursor
                         self._global_settlement_recovery_after = after
                         continue
+                    settlement = await self._authenticate_settlement_session(settlement)
                     try:
                         self._event_writer.prepare_exact_replay(settlement.event)
                     except ValueError:
@@ -3996,6 +4043,7 @@ class RunLimitController:
         """Return the exact audit event material committed beside a settlement."""
 
         settlement = await self._load_committed_settlement(reconciliation)
+        settlement = await self._authenticate_settlement_session(settlement)
         return settlement.event.model_copy(deep=True)
 
     async def acknowledge_budget_settlement_events(
@@ -4399,6 +4447,7 @@ class RunLimitController:
             setup = await self.reserve_operation_budgets(
                 budget_limits=budget_limits,
                 session_id=session.id,
+                session_instance_id=session.instance_id,
                 agent_name=agent_name,
                 provider_name=provider_name,
                 model=model,
@@ -4793,6 +4842,7 @@ class RunLimitController:
         provider_name: str | None,
         model: str | None,
         model_attempt_identity: ModelAttemptIdentity,
+        session_instance_id: str | None = None,
         environment_name: str | None = None,
         settlement_event_payload: dict[str, object] | None = None,
         execution_profile_fingerprint: str | None = None,
@@ -4838,6 +4888,13 @@ class RunLimitController:
             settlement_event_payload or {},
             "settlement_event_payload",
         )
+        if session_instance_id is not None:
+            if type(session_instance_id) is not str or not session_instance_id:
+                raise ValueError("Budget reservation requires an exact session incarnation.")
+            existing_instance = profile_settlement_payload.get("session_instance_id")
+            if existing_instance not in {None, session_instance_id}:
+                raise ValueError("Settlement payload conflicts with its session incarnation.")
+            profile_settlement_payload["session_instance_id"] = session_instance_id
         if execution_profile_fingerprint is not None:
             existing_fingerprint = profile_settlement_payload.get("execution_profile_fingerprint")
             if existing_fingerprint not in {None, execution_profile_fingerprint}:

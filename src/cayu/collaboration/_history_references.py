@@ -9,6 +9,7 @@ from cayu.collaboration._clarification_commands import (
 )
 from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration._permits import PermitReceipt
+from cayu.collaboration._producer_contracts import ProducerCompletionRecord, ProducerOutputRecord
 from cayu.collaboration.lifecycle import LifecycleReceipt
 from cayu.collaboration.participants import ParticipantReceipt
 from cayu.collaboration.requests import (
@@ -41,6 +42,12 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
         snapshots = (selected.sender, selected.recipient)
     elif isinstance(value, ParticipantReceipt):
         snapshots = value.participants
+    elif isinstance(value, ProducerOutputRecord):
+        selected = value.command.admission.expected.intent.selection
+        snapshots = (selected.sender, selected.recipient)
+    elif isinstance(value, ProducerCompletionRecord):
+        selected = value.output.registration.admission.expected.intent.selection
+        snapshots = (selected.sender, selected.recipient)
     elif isinstance(value, LifecycleReceipt) and value.participant is not None:
         snapshots = (value.participant,)
     elif isinstance(
@@ -97,6 +104,18 @@ def history_references(value: ContractValue) -> tuple[HistoryKey, ...]:
         )
     if isinstance(value, RequestAdmissionReceipt) and value.command.prepared is not None:
         prepared = value.command.prepared
+        refs.add(
+            ("configurations", prepared.recipient.participant_id, prepared.configuration_revision)
+        )
+        refs.add(
+            ("lifecycle_history", prepared.recipient.participant_id, prepared.lifecycle_revision)
+        )
+    if isinstance(value, (ProducerOutputRecord, ProducerCompletionRecord)):
+        command = (
+            value.command if isinstance(value, ProducerOutputRecord) else value.output.registration
+        )
+        prepared = command.admission.prepared
+        assert prepared is not None
         refs.add(
             ("configurations", prepared.recipient.participant_id, prepared.configuration_revision)
         )

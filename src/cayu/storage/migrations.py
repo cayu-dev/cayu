@@ -497,6 +497,10 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=107, kind=RevisionKind.BREAKING, compatible_from=107),
     # Every context-view selector must honor exact native exclusion decisions.
     Revision(revision=108, kind=RevisionKind.BREAKING, compatible_from=108),
+    # Session-scoped producer accounting recovery uses a bounded indexed scan.
+    Revision(revision=109, kind=RevisionKind.ADDITIVE, compatible_from=108),
+    # Native producer cleanup receipts outlive the producing session.
+    Revision(revision=110, kind=RevisionKind.BREAKING, compatible_from=110),
 )
 
 #: The revision an empty database is initialized to.

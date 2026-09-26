@@ -4990,10 +4990,12 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     """Replace caller state while retaining decoded runtime-owned checkpoint authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
+    from cayu.runtime import _producer_output_store as producers
 
     # Validate before decoding can normalize caller-controlled authority.
     from cayu.runtime import _session_continuation_store as continuations
 
+    producer_root = producers.project_checkpoint_root(current, replacement, session_id=session_id)
     continuation_root = (
         continuations.project_checkpoint_root(current, replacement, session_id=session_id)
         if preserve_session_continuations
@@ -5108,6 +5110,9 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     updated.pop(continuations.ROOT_KEY, None)
     if continuation_root is not None:
         updated[continuations.ROOT_KEY] = continuation_root
+    updated.pop(producers.ROOT_KEY, None)
+    if producer_root is not None:
+        updated[producers.ROOT_KEY] = producer_root
     # Restored private authority counts toward the same complete document
     # ceiling as the callback's ordinary state, before either side is written.
     return copy_durable_json_object(updated, "checkpoint")
@@ -5121,6 +5126,7 @@ def _copy_checkpoint_for_transform(
     """Validate and detach callback-visible state from store-owned authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
+    from cayu.runtime import _producer_output_store as producers
     from cayu.runtime import _session_continuation_store as continuations
 
     if checkpoint is None:
@@ -5153,6 +5159,8 @@ def _copy_checkpoint_for_transform(
     # project_checkpoint_root still requires the continuation owner's scope.
     if not continuations.checkpoint_visible() and not lifecycle_authority_allowed:
         copied.pop(continuations.ROOT_KEY, None)
+    if not producers.checkpoint_visible(session_id=session_id) and not lifecycle_authority_allowed:
+        copied.pop(producers.ROOT_KEY, None)
     return copied
 
 
@@ -5180,10 +5188,12 @@ class SessionInvocationAdmission:
     compares ``expected_active_invocation_profile`` with checkpoint authority.
     The store binds either profile to the newly claimed run epoch in the same
     transaction as status and interaction admission.
+    Exactly one checkpoint callback is required; the store-time callback receives
+    the receiving owner's time inside that transaction for deadline validation.
     """
 
     from_statuses: frozenset[SessionStatus]
-    checkpoint_transform: CheckpointTransform
+    checkpoint_transform: CheckpointTransform | None
     execution_profile: ExecutionProfileIdentity
     interaction_source_messages: tuple[Message, ...]
     tool_capability_ceiling: ToolCapabilityCeiling
@@ -5197,6 +5207,7 @@ class SessionInvocationAdmission:
     expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None
     allow_pending_initial_interaction: bool = False
     temporary_service_admission: TemporaryServiceAdmission | None = None
+    store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None
 
     def __post_init__(self) -> None:
         if self.temporary_service_admission is not None:
@@ -5216,8 +5227,15 @@ class SessionInvocationAdmission:
             raise ValueError("from_statuses must be a non-empty frozenset.")
         if any(not isinstance(status, SessionStatus) for status in self.from_statuses):
             raise TypeError("from_statuses must contain only SessionStatus values.")
-        if not callable(self.checkpoint_transform):
-            raise TypeError("checkpoint_transform must be callable.")
+        if (self.checkpoint_transform is None) == (self.store_time_checkpoint_transform is None):
+            raise TypeError("Exactly one admission checkpoint transform is required.")
+        selected_transform = (
+            self.checkpoint_transform
+            if self.checkpoint_transform is not None
+            else self.store_time_checkpoint_transform
+        )
+        if not callable(selected_transform):
+            raise TypeError("Admission checkpoint transform must be callable.")
         if self.result_checkpoint_transform is not None and not callable(
             self.result_checkpoint_transform
         ):
@@ -10259,6 +10277,7 @@ class SessionStore(ABC):
     # defaults keep discovery truthful for inherited methods that fail closed.
     session_export_version: ClassVar[int] = 0
     session_continuation_version: ClassVar[int] = 0
+    _producer_attachment_version: ClassVar[int] = 0
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False
@@ -10869,7 +10888,8 @@ class SessionStore(ABC):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         execution_profile: ExecutionProfileIdentity,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
@@ -10906,6 +10926,8 @@ class SessionStore(ABC):
             transition_kwargs["adopted_runtime_identity"] = adopted_runtime_identity
         if temporary_service_admission is not None:
             transition_kwargs["temporary_service_admission"] = temporary_service_admission
+        if store_time_checkpoint_transform is not None:
+            transition_kwargs["store_time_checkpoint_transform"] = store_time_checkpoint_transform
         return await self.transition_status_and_checkpoint(session_id, **transition_kwargs)
 
     async def admit_session_invocation(
@@ -10945,6 +10967,7 @@ class SessionStore(ABC):
         def bind_active_invocation_profile(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime | None = None,
         ) -> dict[str, Any]:
             current_active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
             if current_active_profile is not None and not (
@@ -10957,7 +10980,14 @@ class SessionStore(ABC):
                 raise SessionRunFenced(
                     "The previous invocation still owns terminal hooks or trailing cleanup."
                 )
-            updated = admission.checkpoint_transform(current_session, checkpoint)
+            if admission.store_time_checkpoint_transform is not None:
+                assert now is not None
+                updated = admission.store_time_checkpoint_transform(
+                    current_session, checkpoint, now
+                )
+            else:
+                assert admission.checkpoint_transform is not None
+                updated = admission.checkpoint_transform(current_session, checkpoint)
             return checkpoint_with_active_invocation_execution_profile(
                 updated,
                 session_id=current_session.id,
@@ -10979,6 +11009,9 @@ class SessionStore(ABC):
             "execution_profile_decision": admission.execution_profile_decision,
             "tool_capability_ceiling": admission.tool_capability_ceiling,
         }
+        if admission.store_time_checkpoint_transform is not None:
+            del transition_kwargs["checkpoint_transform"]
+            transition_kwargs["store_time_checkpoint_transform"] = bind_active_invocation_profile
         if admission.adopted_runtime_identity is not None:
             transition_kwargs["adopted_runtime_identity"] = admission.adopted_runtime_identity
         if active_profile is not None and admission.interaction_started_event is not None:
@@ -12025,6 +12058,101 @@ class SessionStore(ABC):
             and self.session_continuation_version == 1
             and _session_continuation_methods_owned(self)
         )
+
+    def _supports_producer_attachment_protocol(self) -> bool:
+        return (
+            type(self._producer_attachment_version) is int
+            and self._producer_attachment_version == 1
+            and self._supports_session_steering_protocol() is True
+            and _session_owner_methods_owned(
+                self,
+                "_producer_attachment_version",
+                (
+                    *_SESSION_EXPORT_OWNER_METHODS,
+                    "_attach_native_producer",
+                    "_admit_native_producer",
+                    "_exclude_native_producer",
+                    "_read_native_producer_exclusion",
+                    "_acknowledge_native_producer_cleanup",
+                    "_retain_native_producer_output",
+                    "_read_retained_native_producer_output",
+                    "_read_native_producer_release",
+                    "_read_native_producer_progress",
+                    "_complete_native_producer_cleanup",
+                    "_read_completed_native_producer_cleanup",
+                    "_retire_native_producer_cleanup",
+                    "query_events",
+                    "load_historical_interaction_settlement",
+                    "_load_historical_interaction_settlement_record",
+                    "_load_interaction_transition_receipt_by_event_id",
+                    "apply_invocation_lifecycle_command",
+                ),
+            )
+        )
+
+    async def _attach_native_producer(self, registration):
+        """Registered runtime handoff, not a caller-provided publication callback."""
+        from cayu.runtime._producer_output_store import attach_native_producer
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("This store does not qualify native producer attachment.")
+        return await attach_native_producer(self, registration)
+
+    async def _admit_native_producer(self, registration, command):
+        from cayu.runtime._producer_output_store import admit_native_producer
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("This store does not qualify native producer admission.")
+        return await admit_native_producer(self, registration, command)
+
+    async def _exclude_native_producer(self, registration, control):
+        """Cleanup-only registered handoff; never accept a public receipt as authority."""
+        from cayu.runtime._producer_output_store import exclude_native_producer
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("This store does not qualify native producer exclusion.")
+        return await exclude_native_producer(self, registration, control)
+
+    async def _read_native_producer_exclusion(self, registration, control):
+        from cayu.runtime._producer_output_store import read_native_exclusion
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("This store does not qualify native producer exclusion.")
+        return await read_native_exclusion(self, registration, control)
+
+    async def _retain_native_producer_output(self, session_id, *, invocation, stage_id):
+        from cayu.runtime._producer_output_store import retain_native_output
+
+        return await retain_native_output(
+            self, session_id, invocation=invocation, stage_id=stage_id
+        )
+
+    async def _read_retained_native_producer_output(self, command):
+        from cayu.runtime._producer_output_store import read_retained_native_output
+
+        return await read_retained_native_output(self, command)
+
+    async def _read_native_producer_release(self, command):
+        raise NotImplementedError("Atomic native producer release readback is not qualified.")
+
+    async def _read_native_producer_progress(self, command, *, kind):
+        raise NotImplementedError("Atomic native producer progress readback is not qualified.")
+
+    async def _complete_native_producer_cleanup(self, registration, *, authority):
+        raise NotImplementedError("Durable native producer cleanup is not qualified.")
+
+    async def _read_completed_native_producer_cleanup(self, registration):
+        raise NotImplementedError("Durable native producer cleanup readback is not qualified.")
+
+    async def _retire_native_producer_cleanup(self, retirement, *, authority, limit):
+        raise NotImplementedError("Native producer cleanup retirement is not qualified.")
+
+    async def _acknowledge_native_producer_cleanup(self, registration, control, cleanup):
+        from cayu.runtime._producer_output_store import acknowledge_native_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup is not qualified.")
+        return await acknowledge_native_cleanup(self, registration, control, cleanup)
 
     def _supports_owned_off_thread_session_commit_guard_protocol(self) -> bool:
         """Return whether this exact guarded-publication override owns its capability."""
@@ -15253,6 +15381,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
 
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
+    _producer_attachment_version: ClassVar[int] = 1
     supports_session_closure_receipts: ClassVar[bool] = True
     supports_session_closure_detachment: ClassVar[bool] = True
     supports_session_closure_recursive_deletion: ClassVar[bool] = True
@@ -15624,6 +15753,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         self._lock = asyncio.Lock()
         self._participant_creation_lock = asyncio.Lock()
         self._session_creation_decisions = {}
+        self._producer_cleanup_receipts = {}
+        self._producer_cleanup_index = {}
+        self._producer_cleanup_retirements = {}
         self._sessions: dict[str, Session] = {}
         self._participant_session_bindings: dict[str, ParticipantSessionBinding] = {}
         self._participant_session_receipts: dict[str, ParticipantSessionCreationReceipt] = {}
@@ -18640,6 +18772,17 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 if key.startswith(session_exports.OPERATION_PREFIX)
             },
         )
+        from cayu.runtime._producer_output_store import OPERATION_PREFIX, require_erasure_quiescence
+
+        require_erasure_quiescence(
+            session=session,
+            checkpoint=self._checkpoints.get(session_id),
+            records={
+                key: value
+                for key, value in self._session_operation_records.get(session_id, {}).items()
+                if key.startswith(OPERATION_PREFIX)
+            },
+        )
         for key, raw in self._session_operation_records.get(session_id, {}).items():
             if key.startswith("tool-effect:"):
                 require_terminal_protected_effect(session_id, session.instance_id, key, raw)
@@ -19322,6 +19465,17 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 model_transition=prepared_model_transition,
                 decision=prepared_execution_profile_decision,
             )
+
+            if session.status == SessionStatus.PENDING and admission is not None and admission[3]:
+                receipt = self._participant_session_receipts.get(session_id)
+                if receipt is not None:
+                    from cayu.sessions._participant_execution_identity import (
+                        require_initial_execution_input,
+                    )
+
+                    require_initial_execution_input(
+                        session, receipt, self._transcripts.get(session_id, []), admission[2]
+                    )
 
             if prepared_model_transition is not None:
                 _validate_session_model_transition(
@@ -23045,6 +23199,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 idempotency_key
             )
             from cayu.collaboration import _session_export_store as session_exports
+            from cayu.runtime import _producer_output_store as producers
             from cayu.runtime import _session_continuation_store as continuations
 
             callback_session = session.model_copy(deep=True)
@@ -23059,6 +23214,10 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 callback_checkpoint.pop(session_exports.ROOT_KEY, None)
             if callback_checkpoint is not None and not continuations.checkpoint_visible():
                 callback_checkpoint.pop(continuations.ROOT_KEY, None)
+            if callback_checkpoint is not None and not producers.checkpoint_visible(
+                session_id=session_id
+            ):
+                callback_checkpoint.pop(producers.ROOT_KEY, None)
             callback_record = (
                 None
                 if current_record is None
@@ -24072,6 +24231,41 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 grants_charged=True,
                 grants=TargetedToolGrantStateSnapshot(records=tuple(records), uses=tuple(uses)),
             )
+
+    async def _complete_native_producer_cleanup(self, registration, *, authority):
+        from cayu.storage._producer_cleanup import memory_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup is not qualified.")
+        return await memory_cleanup(self, registration, authority=authority, commit=True)
+
+    async def _retire_native_producer_cleanup(self, retirement, *, authority, limit):
+        from cayu.storage._producer_retirement import memory_retirement
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer retirement is not qualified.")
+        return await memory_retirement(self, retirement, authority=authority, limit=limit)
+
+    async def _read_completed_native_producer_cleanup(self, registration):
+        from cayu.storage._producer_cleanup import memory_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup readback is not qualified.")
+        return await memory_cleanup(self, registration)
+
+    async def _read_native_producer_release(self, command):
+        from cayu.storage._producer_observation import memory_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer release readback is not qualified.")
+        return await memory_observation(self, command)
+
+    async def _read_native_producer_progress(self, command, *, kind):
+        from cayu.storage._producer_observation import memory_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer progress readback is not qualified.")
+        return await memory_observation(self, command, kind=kind)
 
     async def load_events(self, session_id: str) -> list[Event]:
         from cayu.resource_access import current_data_bounds
@@ -25407,7 +25601,16 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 scope_session_id=session_id,
             )
             if self._transcripts.get(session_id):
-                raise RuntimeError("Initial transcript changed before finalization.")
+                from cayu.sessions._participant_execution_identity import (
+                    require_initial_execution_input,
+                )
+
+                require_initial_execution_input(
+                    session,
+                    self._participant_session_receipts.get(session_id),
+                    self._transcripts[session_id],
+                    expected,
+                )
             prefix_count = _initial_transcript_prefix_count(
                 expected,
                 replacement,
@@ -29275,6 +29478,9 @@ def _reject_reserved_runtime_publication_key(
     from cayu.collaboration._session_export_store import require_operation_key_access
     from cayu.runtime._argument_continuity import require_private_key_access
     from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.runtime._producer_output_store import (
+        require_operation_key_access as require_producer_key_access,
+    )
     from cayu.runtime._session_continuation_scope import (
         require_operation_key_access as require_continuation_key_access,
     )
@@ -29282,6 +29488,7 @@ def _reject_reserved_runtime_publication_key(
     value = require_clean_nonblank(value, field_name)
     require_operation_key_access(value, read=browser_control_read)
     require_continuation_key_access(value, read=browser_control_read)
+    require_producer_key_access(value, read=browser_control_read)
     require_private_key_access(value, read=browser_control_read)
     if not browser_control_read:
         require_browser_control_operation_owner(value)
@@ -35998,6 +36205,11 @@ def _checkpoint_after_queued_interaction_profile_handoff(
     stage_dispatch: ModelCompletionStageDispatch | None = None,
 ) -> dict[str, Any]:
     """CAS A to B only from the exact queue-conditional settlement receipt."""
+
+    from cayu.runtime._producer_output_store import producer_owns_invocation
+
+    if producer_owns_invocation(checkpoint):
+        raise SessionRunFenced("Queued successor requires settled producer responsibility.")
 
     expected = handoff.expected_active_profile
     target = handoff.target_active_profile

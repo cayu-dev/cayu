@@ -5,11 +5,11 @@ from tests.core.test_clarification_contracts import OWNER, operation
 
 from cayu.collaboration._clarification_records import clarification_record_projection
 from cayu.collaboration._contracts import CollaborationContractError
-from cayu.collaboration._request_pruning import RequestPruningProgress
+from cayu.collaboration._request_pruning import MAX_REQUEST_PRUNING_EVENTS, RequestPruningProgress
 from cayu.collaboration.requests import RequestRef
 
 
-@pytest.mark.parametrize("position", [1, 32, 127])
+@pytest.mark.parametrize("position", [1, 32, 127, MAX_REQUEST_PRUNING_EVENTS])
 def test_pruning_cursor_reconstruction_binds_native_key_and_scope(position):
     cursor = RequestPruningProgress(
         operation=operation("request"),
@@ -34,7 +34,7 @@ def test_pruning_cursor_reconstruction_binds_native_key_and_scope(position):
         {"schema_version": 2},
         {"next_event_index": True},
         {"next_event_index": 0},
-        {"next_event_index": 128},
+        {"next_event_index": MAX_REQUEST_PRUNING_EVENTS + 1},
         {"clarification_events": (True,)},
         {"clarification_events": (0,)},
         {"clarification_events": (2, 1)},

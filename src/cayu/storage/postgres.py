@@ -1127,7 +1127,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
     }
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 104
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 110
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 96
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -1473,6 +1473,23 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )""",
         """CREATE INDEX IF NOT EXISTS idx_context_selection_exclusions_owner
             ON cayu_context_selection_exclusions(owner_scope, owner_id, owner_incarnation)""",
+    ),
+    110: (
+        """CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
+            operation_key TEXT PRIMARY KEY,
+            namespace_key TEXT NOT NULL,
+            generation BIGINT NOT NULL CHECK (generation BETWEEN 1 AND 9007199254740991),
+            receipt_json JSONB NOT NULL CHECK (
+                jsonb_typeof(receipt_json) = 'object'
+                AND octet_length(receipt_json::text) BETWEEN 1 AND 65536
+            )
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_cayu_producer_cleanup_namespace
+        ON cayu_producer_cleanup_receipts(namespace_key, generation, operation_key)""",
+        """CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_retirements (
+            namespace_key TEXT PRIMARY KEY,
+            through_generation BIGINT NOT NULL CHECK (through_generation BETWEEN 1 AND 9007199254740991)
+        )""",
     ),
     103: (
         """CREATE TABLE IF NOT EXISTS cayu_session_creation_decisions (
@@ -5261,6 +5278,22 @@ class _ConcurrentIndexMigration:
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
+    109: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_budget_reservations_session_identity",
+            table_name="cayu_budget_reservations",
+            key_definitions=("session_id", "reservation_id"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_budget_reservations_session_identity "
+                "ON cayu_budget_reservations(session_id, reservation_id)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_budget_reservations_session_identity"
+            ),
+        ),
+    ),
     16: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_events_session_sequence",
@@ -6776,6 +6809,8 @@ class _PostgresStoreBase:
                         self._validate_postgres_revision(current_state)
                         if current_state.revision >= 108:
                             await validate_postgres_context_selection_schema(cur)
+                        if current_state.revision >= 110:
+                            await self._validate_producer_cleanup_receipts(cur)
                         if current_state.revision >= 96:
                             await validate_postgres_participant_bindings(cur)
                         if self._min_required_revision >= 36:
@@ -7081,6 +7116,66 @@ class _PostgresStoreBase:
             after_sequence = 0
             await asyncio.sleep(0.05)
 
+    async def _validate_producer_cleanup_receipts(self, cur: Any) -> None:
+        await cur.execute(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "WHERE c.oid = to_regclass('cayu_producer_cleanup_receipts') "
+            "AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname"
+        )
+        if list(await cur.fetchall()) != [
+            ("generation", "bigint", True),
+            ("namespace_key", "text", True),
+            ("operation_key", "text", True),
+            ("receipt_json", "jsonb", True),
+        ]:
+            raise RuntimeError(
+                "Required Cayu producer cleanup receipt table is missing or conflicting."
+            )
+        await cur.execute(
+            "SELECT contype, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = to_regclass('cayu_producer_cleanup_receipts') AND contype IN ('p', 'f')"
+        )
+        if list(await cur.fetchall()) != [("p", "PRIMARY KEY (operation_key)")]:
+            raise RuntimeError(
+                "Producer cleanup receipts require an independent exact primary key."
+            )
+        await cur.execute(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "WHERE c.oid = to_regclass('cayu_producer_cleanup_retirements') "
+            "AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname"
+        )
+        if list(await cur.fetchall()) != [
+            ("namespace_key", "text", True),
+            ("through_generation", "bigint", True),
+        ]:
+            raise RuntimeError("Producer cleanup retirement fence is missing or conflicting.")
+        await cur.execute(
+            "SELECT contype, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = to_regclass('cayu_producer_cleanup_retirements') AND contype IN ('p', 'f')"
+        )
+        if list(await cur.fetchall()) != [("p", "PRIMARY KEY (namespace_key)")]:
+            raise RuntimeError("Producer cleanup retirement fence requires an independent key.")
+        await cur.execute(
+            "SELECT i.indisvalid, i.indisready, i.indisunique, i.indpred IS NULL, i.indexprs IS NULL, "
+            "ARRAY(SELECT a.attname FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinal) "
+            "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum ORDER BY k.ordinal) "
+            "FROM pg_index i WHERE i.indexrelid = to_regclass('idx_cayu_producer_cleanup_namespace') "
+            "AND i.indrelid = to_regclass('cayu_producer_cleanup_receipts')"
+        )
+        if await cur.fetchone() != (
+            True,
+            True,
+            False,
+            True,
+            True,
+            ["namespace_key", "generation", "operation_key"],
+        ):
+            raise RuntimeError(
+                "Producer cleanup receipt namespace index is missing or conflicting."
+            )
+
     def _validate_postgres_revision(self, state: schema.SchemaState) -> None:
         if state.revision < self._min_required_revision:
             raise schema.SchemaTooOld(
@@ -7093,6 +7188,8 @@ class _PostgresStoreBase:
         self._validate_postgres_revision(state)
         if state.revision >= 108:
             await validate_postgres_context_selection_schema(cur)
+        if state.revision >= 110:
+            await self._validate_producer_cleanup_receipts(cur)
         if state.revision >= 96:
             await validate_postgres_participant_bindings(cur)
         if state.revision >= 93:
@@ -7261,6 +7358,8 @@ class _PostgresStoreBase:
 
         if revision.revision == 108:
             await validate_postgres_context_selection_schema(cur)
+        if revision.revision == 110:
+            await self._validate_producer_cleanup_receipts(cur)
         if revision.revision == 102:
             await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:
@@ -13580,7 +13679,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     machinery (ADR 0001 revision 8).
     """
 
-    _min_required_revision = 25
+    _min_required_revision = 109
+    _producer_budget_readback_version = 1
 
     def __init__(
         self,
@@ -13607,6 +13707,25 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     @property
     def reservation_ttl_seconds(self) -> int | None:
         return self._reservation_ttl_seconds
+
+    async def _require_registered_budget_binding(
+        self, *, binding_id: str, authority_digest: str, allowance: int
+    ) -> None:
+        from cayu.budgets._reservation_scan import (
+            binding_read_expectation,
+            require_binding_readback,
+        )
+
+        binding_id, digest, allowance = binding_read_expectation(
+            binding_id, authority_digest, allowance
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT authority_digest, allowance FROM cayu_budget_bindings WHERE binding_id = %s",
+                (binding_id,),
+            )
+            require_binding_readback(await cur.fetchone(), (digest, allowance))
 
     async def register_budget_binding(
         self,
@@ -14212,6 +14331,24 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             except KeyError:
                 return None
             return record.model_copy(deep=True)
+
+    async def _scan_reservation_records(
+        self, *, session_id: str, after: str | None = None, limit: int = 128
+    ) -> tuple[BudgetReservationRecord, ...]:
+        from cayu.budgets._reservation_scan import reservation_scan_bounds
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        after, limit = reservation_scan_bounds(after, limit)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            await cur.execute(
+                "SELECT reservation_id FROM cayu_budget_reservations "
+                "WHERE session_id = %s AND reservation_id > %s ORDER BY reservation_id LIMIT %s",
+                (session_id, after or "", limit),
+            )
+            rows = await cur.fetchall()
+            return tuple([await self._load_record(cur, row[0], for_update=False) for row in rows])
 
     async def list_pending_settlements(
         self,
@@ -25642,6 +25779,7 @@ class PostgresSessionStore(
     session_steering_version: ClassVar[int | None] = 1
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
+    _producer_attachment_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -30204,6 +30342,7 @@ class PostgresSessionStore(
         session_id = session.id
         export_records: dict[str, dict[str, Any]] = {}
         continuation_records: dict[str, dict[str, Any]] = {}
+        producer_records = {}
         after_key = ""
         while True:
             # Read one bounded document at a time, allowing JSON text overhead.
@@ -30213,6 +30352,7 @@ class PostgresSessionStore(
                 "THEN record END FROM cayu_session_operations "
                 "WHERE session_id = %s AND (idempotency_key LIKE 'tool-effect:%%' "
                 "OR idempotency_key LIKE 'session-export:%%' "
+                "OR idempotency_key LIKE 'producer-output:%%' "
                 "OR idempotency_key LIKE 'session-continuation:%%') "
                 "AND idempotency_key > %s ORDER BY idempotency_key LIMIT 1",
                 (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id, after_key),
@@ -30221,6 +30361,8 @@ class PostgresSessionStore(
             for key, raw in effects:
                 if key.startswith(continuations.CONTINUATION_OPERATION_PREFIX):
                     continuations.collect_retained_record(continuation_records, key, raw)
+                elif key.startswith("producer-output:"):
+                    producer_records[key] = raw
                 elif key.startswith(session_exports.OPERATION_PREFIX):
                     if type(raw) is not dict:
                         raise ValueError("Session export retention evidence is malformed.")
@@ -30241,6 +30383,9 @@ class PostgresSessionStore(
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = await self._load_checkpoint(cur, session_id)
         deletion_now = await self._session_store_now(cur)
+        from cayu.runtime._producer_output_store import require_erasure_quiescence
+
+        require_erasure_quiescence(session=session, checkpoint=checkpoint, records=producer_records)
         continuations.require_erasure_quiescence(
             session=session, checkpoint=checkpoint, records=continuation_records
         )
@@ -30789,6 +30934,36 @@ class PostgresSessionStore(
                         model_transition=prepared_model_transition,
                         decision=prepared_execution_profile_decision,
                     )
+                    if (
+                        loaded.status == SessionStatus.PENDING
+                        and admission is not None
+                        and admission[3]
+                    ):
+                        await cur.execute(
+                            f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE session_id = %s",
+                            (session_id,),
+                        )
+                        binding_row = await cur.fetchone()
+                        if binding_row is not None:
+                            from cayu.sessions._participant_execution_identity import (
+                                require_initial_execution_input,
+                            )
+                            from cayu.storage._participant_session_records import reconstruct
+
+                            await cur.execute(
+                                "SELECT message FROM cayu_transcript_messages WHERE session_id = %s ORDER BY session_order",
+                                (session_id,),
+                            )
+                            transcript_rows = await cur.fetchall()
+                            require_initial_execution_input(
+                                loaded,
+                                reconstruct(binding_row, loaded),
+                                [
+                                    Message.model_validate(_json_obj(row[0]))
+                                    for row in transcript_rows
+                                ],
+                                admission[2],
+                            )
                     transition_metadata = transition_profile_metadata
                     if prepared_model_transition is not None:
                         await cur.execute(
@@ -30832,6 +31007,10 @@ class PostgresSessionStore(
                         session_id=session_id,
                     )
                     if store_time_checkpoint_transform is not None:
+                        # Reads after acquiring the row lock may themselves wait.
+                        # Deadline checks consume fresh receiving-owner time at
+                        # the final synchronous admission callback.
+                        updated_at = await self._session_store_now(cur)
                         transformed_checkpoint = store_time_checkpoint_transform(
                             loaded,
                             checkpoint_copy,
@@ -37416,6 +37595,41 @@ class PostgresSessionStore(
                     builder.add_record(name, convert(row))
         return builder.finish()
 
+    async def _complete_native_producer_cleanup(self, registration, *, authority):
+        from cayu.storage._producer_cleanup import postgres_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup is not qualified.")
+        return await postgres_cleanup(self, registration, authority=authority, commit=True)
+
+    async def _retire_native_producer_cleanup(self, retirement, *, authority, limit):
+        from cayu.storage._producer_retirement import postgres_retirement
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer retirement is not qualified.")
+        return await postgres_retirement(self, retirement, authority=authority, limit=limit)
+
+    async def _read_completed_native_producer_cleanup(self, registration):
+        from cayu.storage._producer_cleanup import postgres_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup readback is not qualified.")
+        return await postgres_cleanup(self, registration)
+
+    async def _read_native_producer_release(self, command):
+        from cayu.storage._producer_observation import postgres_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer release readback is not qualified.")
+        return await postgres_observation(self, command)
+
+    async def _read_native_producer_progress(self, command, *, kind):
+        from cayu.storage._producer_observation import postgres_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer progress readback is not qualified.")
+        return await postgres_observation(self, command, kind=kind)
+
     async def load_session_export_snapshot(
         self,
         session_id: str,
@@ -41210,7 +41424,35 @@ class PostgresSessionStore(
                         (session_id,),
                     )
                     if await cur.fetchone() is not None:
-                        raise RuntimeError("Initial transcript changed before finalization.")
+                        from cayu.sessions._participant_execution_identity import (
+                            require_initial_execution_input,
+                        )
+                        from cayu.storage._participant_session_records import reconstruct
+
+                        await cur.execute(
+                            f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE session_id = %s",
+                            (session_id,),
+                        )
+                        binding_row = await cur.fetchone()
+                        await cur.execute(
+                            "SELECT message FROM cayu_transcript_messages WHERE session_id = %s ORDER BY session_order",
+                            (session_id,),
+                        )
+                        current_rows = await cur.fetchall()
+                        require_initial_execution_input(
+                            session,
+                            None if binding_row is None else reconstruct(binding_row, session),
+                            [Message.model_validate(_json_obj(row[0])) for row in current_rows],
+                            expected,
+                        )
+                        await cur.execute(
+                            "DELETE FROM cayu_transcript_messages WHERE session_id = %s",
+                            (session_id,),
+                        )
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET transcript_seq = 0 WHERE id = %s",
+                            (session_id,),
+                        )
                     prefix_count = _initial_transcript_prefix_count(
                         expected,
                         replacement,

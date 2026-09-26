@@ -12,7 +12,12 @@ from cayu.collaboration._mandate_validation import MandateUse, validate_mandate_
 from cayu.collaboration._permits import ReceivingSettlementReceipt
 from cayu.collaboration._preparation import prepare_contract, require_exact_contract
 from cayu.collaboration.access import CollaborationAccessDenied
-from cayu.collaboration.mandates import MandateResolution, MandateResolver, ResourceSelectorOwner
+from cayu.collaboration.mandates import (
+    MandateAction,
+    MandateResolution,
+    MandateResolver,
+    ResourceSelectorOwner,
+)
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.prepared_admission import (
     ContinueRecipientAdmissionTarget,
@@ -63,6 +68,8 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
         delegate: RequestReceivingOwner | None,
         redactor: SecretRedactor,
         resource_owners: Mapping[OwnerRef, ResourceSelectorOwner],
+        read_budget: Callable[[BudgetBinding], Awaitable[None]] | None = None,
+        read_producer_budget: Callable[..., Awaitable[object]] | None = None,
     ):
         self._ref = prepare_contract(ObjectRef, ref, redactor=redactor)
         if self._ref.revision is None:
@@ -71,6 +78,8 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
         self._mandates = mandates
         self._resolver_ref = prepare_contract(ObjectRef, mandates.ref, redactor=redactor)
         self._resolve_budget = resolve_budget
+        self._read_budget = read_budget
+        self._read_producer_budget = read_producer_budget
         self._now_ms = now_ms
         self._read_admission = read_admission
         self._delegate = delegate
@@ -213,8 +222,11 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
         )
 
     @asynccontextmanager
-    async def acquire(self, command, *, context):
-        if isinstance(command, RequestAdmissionCommand) and command.prepared is not None:
+    async def _acquire_prepared(self, command, *, context, actions: tuple[MandateAction, ...]):
+        command = prepare_contract(RequestAdmissionCommand, command, redactor=self._redactor)
+        if command.prepared is None:
+            raise CollaborationUnavailable("Native preparation evidence is required.")
+        if command.prepared is not None:
             require_exact_contract(self._ref, command.prepared.receiver, redactor=self._redactor)
             if context.participant != command.prepared.recipient:
                 raise CollaborationAccessDenied("Prepared admission requires its recipient.")
@@ -228,7 +240,7 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
                     use=MandateUse(
                         audience=self._ref.owner,
                         scope=self._ref.owner.application_scope,
-                        actions=("readback", "prepare"),
+                        actions=actions,
                         resources=(),
                         inputs=(),
                     ),
@@ -249,6 +261,31 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
                             *(entry.expires_at_ms for entry in resolution.chain.entries),
                         ),
                     )
+
+    @asynccontextmanager
+    async def _acquire_producer_execution(self, command, *, context):
+        """Private live guard; historical admission and preparation are not execution grants."""
+        command = prepare_contract(RequestAdmissionCommand, command, redactor=self._redactor)
+        if (
+            command.prepared is None
+            or type(command.prepared.target) is not FreshRecipientAdmissionTarget
+            or command.prepared.target.resources
+        ):
+            raise CollaborationUnavailable(
+                "Producer execution requires resource-free FRESH admission."
+            )
+        async with self._acquire_prepared(
+            command, context=context, actions=("readback", "execute")
+        ) as authorization:
+            yield authorization
+
+    @asynccontextmanager
+    async def acquire(self, command, *, context):
+        if isinstance(command, RequestAdmissionCommand) and command.prepared is not None:
+            async with self._acquire_prepared(
+                command, context=context, actions=("readback", "prepare")
+            ) as authorization:
+                yield authorization
             return
         if isinstance(command, RequestControlCommand):
             prior, admitted = await self._read_admission(command.intent.expected)
@@ -261,7 +298,9 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
                     receiver=self.ref,
                     command=command,
                     expires_at_ms=2**53 - 1,
-                    settlement=ReceivingSettlementReceipt(
+                    settlement=None
+                    if prior.producer_operation is not None
+                    else ReceivingSettlementReceipt(
                         expected=prior.permit,
                         receiving_owner=self._ref.owner,
                         receipt_id="inert-admission:" + admitted.event.id,
@@ -278,6 +317,138 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
             require_exact_contract(command, checked.command, redactor=self._redactor)
             require_exact_contract(self._delegate_ref, checked.receiver, redactor=self._redactor)
             yield checked.model_copy(update={"receiver": self.ref})
+
+    async def _exclude_producer_after_control(self, registration, receipt):
+        """Cleanup-only handoff from authenticated source closure, not disclosure."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._exclude_native_producer(registration, receipt)
+
+    async def _read_producer_budget_registration(self, registration):
+        """Original accounting registration only, never new execution authority."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        prepared = registration.command.admission.prepared
+        if prepared is None or self._read_budget is None:
+            raise CollaborationUnavailable("Original producer budget reader is unavailable.")
+        await self._read_budget(prepared_budget(prepared.budget_binding_json))
+
+    async def _read_producer_budget_settlement(self, registration):
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        if self._read_producer_budget is None:
+            raise CollaborationUnavailable("Original producer accounting reader is unavailable.")
+        return await self._read_producer_budget(registration.command)
+
+    async def _read_producer_output(self, registration):
+        """Fixed native readback for mandatory retention, not caller disclosure."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._read_retained_native_producer_output(registration.command)
+
+    async def _read_producer_release(self, registration):
+        """Exact release from the fixed native owner, not mutable session status."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._read_native_producer_release(registration.command)
+
+    async def _read_producer_progress(self, registration, *, kind):
+        """Atomic content-free observation from the registered native owner."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._read_native_producer_progress(registration.command, kind=kind)
+
+    async def _complete_producer_cleanup(self, registration, *, authority):
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._complete_native_producer_cleanup(
+            registration, authority=authority
+        )
+
+    async def _retire_producer_cleanup(self, retirement, *, authority, limit):
+        require_exact_contract(retirement.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._retire_native_producer_cleanup(
+            retirement, authority=authority, limit=limit
+        )
+
+    async def _request_producer_stop(self, registration, closure, *, authority):
+        """Fixed native stop owner; source closure never renews execution rights."""
+        from cayu.runtime._producer_stop import accept_native_producer_stop
+
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await accept_native_producer_stop(
+            self._sessions, registration, closure, authority=authority
+        )
+
+    async def _read_producer_export_settlement(self, registration, delivery):
+        """Read a committed export settlement without renewing content permission."""
+        from cayu.collaboration._session_export_store import (
+            ExportRecord,
+            SettlementRecord,
+            operation_key,
+            read_scope,
+        )
+
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        prepared = registration.command.admission.prepared
+        if prepared is None or delivery.registration != registration.command.operation:
+            raise CollaborationUnavailable("Producer export settlement authority conflicts.")
+        expected = delivery.source_receipt
+        request = expected.expected.intent.request
+        if (request.ref.session_id, request.ref.session_instance_id) != (
+            prepared.target.session_id,
+            prepared.target.session_instance_id,
+        ):
+            raise CollaborationUnavailable("Producer export belongs to another invocation.")
+        # These owner records are append-only terminal evidence. Separate reads
+        # may refuse concurrent deletion, but cannot turn missing evidence into
+        # successful release. No payload is returned to the cleanup caller.
+        with read_scope(request.ref.session_id):
+            raw = await self._sessions.load_session_operation(
+                request.ref.session_id, operation_key(request.ref.operation)
+            )
+        record = prepare_contract(ExportRecord, raw, redactor=self._redactor)
+        require_exact_contract(expected, record.receipt, redactor=self._redactor)
+        if record.state not in ("released", "retired") or record.settlement is None:
+            raise CollaborationUnavailable("Producer export responsibility remains pending.")
+        with read_scope(request.ref.session_id):
+            raw = await self._sessions.load_session_operation(
+                request.ref.session_id, operation_key(record.settlement.request.operation)
+            )
+        settled = prepare_contract(SettlementRecord, raw, redactor=self._redactor)
+        require_exact_contract(record.settlement, settled.settlement, redactor=self._redactor)
+        return settled.settlement
+
+    async def _retire_producer_export(self, registration, closure, intent, *, exports, authority):
+        """Cleanup stays with the registered native session/export owner."""
+        from cayu.collaboration._producer_export_retirement import retire_producer_export_native
+
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        if exports.store is not self._sessions:
+            raise CollaborationUnavailable("Producer export cleanup native owner conflicts.")
+        return await retire_producer_export_native(
+            exports, registration.command, closure, intent, authority=authority
+        )
+
+    async def _read_producer_validation_failure(self, command, intent, *, exports):
+        from cayu.collaboration._producer_output_failure import read_native_validation_failure
+
+        require_exact_contract(command.receiver, self.ref, redactor=self._redactor)
+        if (
+            exports.store is not self._sessions
+            or not self._sessions._supports_producer_attachment_protocol()
+        ):
+            raise CollaborationUnavailable("Producer validation owner conflicts.")
+        return await read_native_validation_failure(
+            self._sessions, command, intent, redactor=self._redactor
+        )
+
+    async def _read_producer_export_retirement(self, registration, closure, intent):
+        from cayu.collaboration._producer_export_retirement import read_retired_export_native
+
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await read_retired_export_native(
+            self._sessions, registration.command, closure, intent, redactor=self._redactor
+        )
+
+    async def _acknowledge_producer_cleanup(self, registration, control, cleanup):
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._acknowledge_native_producer_cleanup(
+            registration, control, cleanup
+        )
 
     async def settlement(self, command, expected, *, context):
         if self._delegate is None:

@@ -79,6 +79,10 @@ class _MemoryRepository:
             value, _ = clarification_record_projection(table, value, scope=self.scope, key=key)
         self.rows[table, key] = snapshot_input(value)
         if table == "operations":
+            if not insert:
+                for entry in tuple(self.rows):
+                    if entry[0] == "history_uses" and entry[1][3:] == key:
+                        del self.rows[entry]
             for history in history_references(value):
                 self.rows["history_uses", (*history, *key)] = True
 

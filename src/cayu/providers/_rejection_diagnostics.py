@@ -119,6 +119,10 @@ def project_rejection_response(response: httpx.Response) -> dict[str, str]:
         return unavailable("body_unavailable")
     except (ValueError, RecursionError):
         return unavailable("malformed_body")
+    # Compatible streaming endpoints may wrap one rejection in a JSON array.
+    # Do not select one authoritative error from an ambiguous multi-error body.
+    if type(decoded) is list and len(decoded) == 1:
+        decoded = decoded[0]
     if type(decoded) is not dict:
         return unavailable("malformed_body")
     error = decoded.get("error", decoded)

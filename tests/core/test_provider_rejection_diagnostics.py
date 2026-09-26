@@ -139,20 +139,50 @@ def test_known_credential_overlaps_parameter():
     assert event.payload["provider_rejection_unavailable_reason"] == "credential_overlap"
 
 
+@pytest.mark.parametrize("recognized", [False, True])
+def test_chat_array_rejection_is_safe(recognized, capsys, caplog, recwarn):
+    secret = "private-array-error-canary"
+    error = {"message": secret, "details": secret}
+    if recognized:
+        error.update(code="unsupported_parameter", param="temperature")
+    exc = _chat_api_error_from_response(httpx.Response(400, json=[{"error": error}]), "safe", None)
+    event = credential_safe_error_event(
+        exc,
+        provider_label="chat_completions",
+        provider_name="provider",
+        credential_values=(secret,),
+    )
+    if recognized:
+        assert event.payload["provider_rejection_parameter"] == "temperature"
+    else:
+        assert event.payload["provider_rejection_unavailable_reason"] == "unrecognized_details"
+    assert secret not in json.dumps(event.payload) + str(exc) + repr(exc)
+    assert not recwarn
+    assert secret not in caplog.text + str(capsys.readouterr())
+
+
+@pytest.mark.parametrize("body", [[], [{}, {}], [None]])
+def test_ambiguous_array_rejection_is_not_projected(body):
+    result = project_rejection_response(httpx.Response(400, json=body))
+    assert result["provider_rejection_unavailable_reason"] == "malformed_body"
+
+
 @pytest.mark.parametrize("workflow", [False, True])
-def test_http_400_is_durable_and_never_redispatched(tmp_path, capsys, workflow):
+@pytest.mark.parametrize("array_envelope", [False, True])
+def test_http_400_is_durable_and_never_redispatched(tmp_path, capsys, workflow, array_envelope):
     calls = []
 
     def handle(request):
         calls.append(request)
+        body = {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Unsupported parameter: 'temperature'.",
+            }
+        }
         return httpx.Response(
             400,
-            json={
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "Unsupported parameter: 'temperature'.",
-                }
-            },
+            json=[body] if array_envelope else body,
             headers={"x-request-id": "secret-request"},
         )
 
@@ -202,8 +232,11 @@ def test_http_400_is_durable_and_never_redispatched(tmp_path, capsys, workflow):
                 payload = errors[0].payload
                 assert payload["provider_rejection_parameter"] == "temperature"
                 assert payload["status_code"] == 400
-                assert payload["retry_disposition"] == "explicit_nonretryable"
-                assert payload["retryable"] is False
+                # Diagnostic array support must not grant retry authority.
+                assert payload["retry_disposition"] == (
+                    "policy_disallowed" if array_envelope else "explicit_nonretryable"
+                )
+                assert payload.get("retryable") is (None if array_envelope else False)
                 assert payload["model_attempt_id"]
                 assert collection[-1].type is EventType.SESSION_FAILED
                 assert not any(event.type is EventType.MODEL_RETRY for event in collection)

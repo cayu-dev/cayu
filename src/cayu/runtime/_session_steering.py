@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from hashlib import sha256
 from typing import Any
 
@@ -79,6 +80,7 @@ async def accept_session_steering(
     *,
     session_store: SessionStore,
     redactor: SecretRedactor,
+    invocation_guard: Callable[[Session, dict[str, Any] | None], None] | None = None,
 ) -> SessionSteeringReceipt:
     """Persist acceptance without cancelling work or changing session status.
 
@@ -114,6 +116,8 @@ async def accept_session_steering(
     ) -> SessionOperationPublication:
         if session.instance_id != owned.session_instance_id:
             raise SessionSteeringConflict()
+        if invocation_guard is not None:
+            invocation_guard(session, checkpoint)
         if existing is not None:
             receipt = SessionSteeringReceipt.model_validate(existing)
             if receipt.request != owned:

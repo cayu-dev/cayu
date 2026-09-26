@@ -16,6 +16,7 @@ from cayu.collaboration._contracts import (
 from cayu.collaboration._permit_store import settle_permit_in_transaction
 from cayu.collaboration._permits import ReceivingSettlementReceipt
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
+from cayu.collaboration._producer_progress_contracts import ProducerProgressReference
 from cayu.collaboration._request_store import (
     observation_operation,
     preflight_control,
@@ -26,6 +27,8 @@ from cayu.collaboration.base import CollaborationStore, _Anchor, _key, _Reposito
 from cayu.collaboration.participants import CollaborationInitialization, CollaborationUnavailable
 from cayu.collaboration.requests import (
     AdmissionState,
+    ProducerOutcomeCommand,
+    ProducerProgressCommand,
     RequestAdmissionCommand,
     RequestAdmissionReceipt,
     RequestEvent,
@@ -137,7 +140,7 @@ async def _write_snapshot(
         ),
         redactor=redactor,
     )
-    require_capacity(updated, ordinary=True)
+    require_capacity(updated, ordinary=not consume_reserved)
     for receipt in receipts:
         await tx.put("operations", _record_key(receipt), receipt, insert=True)
     await tx.put("requests", _key(prior.receipt.expected), snapshot, insert=False)
@@ -361,13 +364,30 @@ async def progress_in_transaction(
     store: CollaborationStore,
     tx: _Repository,
     initialized: CollaborationInitialization,
-    command: RequestProgressCommand,
+    command: RequestProgressCommand | ProducerProgressCommand,
     *,
+    producer_authority=None,
     redactor: SecretRedactor,
 ) -> RequestProgressReceipt:
-    command = prepare_contract(RequestProgressCommand, command, redactor=redactor)
+    from cayu.collaboration._producer_progress_store import (
+        _ProducerProgressAuthority,
+        require_producer_progress,
+    )
+
+    producer = isinstance(command, ProducerProgressCommand)
+    command = prepare_contract(
+        ProducerProgressCommand if producer else RequestProgressCommand, command, redactor=redactor
+    )
+    if producer:
+        if type(producer_authority) is not _ProducerProgressAuthority:
+            raise CollaborationConflict("Producer progress requires its registered native owner.")
+        producer_authority.require(command, now_ms=await tx.now_ms(), redactor=redactor)
+    elif producer_authority is not None:
+        raise CollaborationConflict("Native progress authority cannot authorize ordinary progress.")
     anchor = await store._anchor(tx, initialized, redactor)
     prior = await _expected_prior(store, tx, initialized, command, redactor)
+    if producer:
+        await require_producer_progress(tx, prior, command, redactor=redactor)
     raw = await tx.get("operations", _record_key(command))
     if raw is not None:
         receipt = prepare_contract(RequestProgressReceipt, raw, redactor=redactor)
@@ -386,7 +406,7 @@ async def progress_in_transaction(
     admission = prepare_contract(RequestAdmissionReceipt, raw_admission, redactor=redactor)
     require_exact_contract(prior.receipt.expected, admission.command.expected, redactor=redactor)
     await require_request_event(tx, admission.event, redactor)
-    if (
+    if not producer and (
         admission.command.source_export is None
         or command.source_receipt is None
         or command.source_receipt.expected.intent.request.ref != admission.command.source_export
@@ -397,13 +417,19 @@ async def progress_in_transaction(
         )
     ):
         raise CollaborationConflict("Progress source does not match the admitted export.")
+    if await tx.now_ms() >= prior.receipt.expected.intent.selection.expires_at_ms:
+        raise CollaborationConflict("Request deadline won before progress publication.")
     if prior.revision != command.expected_revision:
         raise CollaborationConflict("Progress revision changed.")
     if prior.state != "open":
         raise CollaborationConflict("Terminal request cannot receive progress.")
     if command.sequence != len(prior.progress) + 1:
         raise CollaborationConflict("Progress sequence is not the next occurrence.")
-    if any(item.command.sequence == command.sequence for item in prior.progress):
+    if any(
+        (item.sequence if isinstance(item, ProducerProgressReference) else item.command.sequence)
+        == command.sequence
+        for item in prior.progress
+    ):
         raise CollaborationConflict("Progress sequence is already occupied.")
     event = _event(
         anchor,
@@ -421,7 +447,15 @@ async def progress_in_transaction(
     snapshot = prepare_contract(
         RequestSnapshot,
         prior.model_copy(
-            update={"revision": receipt.revision, "progress": (*prior.progress, receipt)}
+            update={
+                "revision": receipt.revision,
+                "progress": (
+                    *prior.progress,
+                    ProducerProgressReference.from_receipt(receipt, redactor=redactor)
+                    if producer
+                    else receipt,
+                ),
+            }
         ),
         redactor=redactor,
     )
@@ -444,14 +478,33 @@ async def outcome_in_transaction(
     store: CollaborationStore,
     tx: _Repository,
     initialized: CollaborationInitialization,
-    command: RequestOutcomeCommand,
+    command: RequestOutcomeCommand | ProducerOutcomeCommand,
     *,
     settlement: ReceivingSettlementReceipt | None = None,
+    producer_authority=None,
     redactor: SecretRedactor,
 ) -> RequestOutcomeReceipt:
-    command = prepare_contract(RequestOutcomeCommand, command, redactor=redactor)
+    from cayu.collaboration._producer_outcome_store import (
+        _ProducerOutcomeAuthority,
+        require_producer_outcome,
+    )
+
+    producer = isinstance(command, ProducerOutcomeCommand)
+    if producer:
+        command = prepare_contract(ProducerOutcomeCommand, command, redactor=redactor)
+        if type(producer_authority) is not _ProducerOutcomeAuthority:
+            raise CollaborationConflict("Producer election requires its registered output owner.")
+        producer_authority.require(command, now_ms=await tx.now_ms(), redactor=redactor)
+        if settlement is not None:
+            raise CollaborationConflict("Producer election cannot claim execution quiescence.")
+    else:
+        command = prepare_contract(RequestOutcomeCommand, command, redactor=redactor)
+        if producer_authority is not None:
+            raise CollaborationConflict("Producer authority cannot authorize an ordinary outcome.")
     anchor = await store._anchor(tx, initialized, redactor)
     prior = await _expected_prior(store, tx, initialized, command, redactor)
+    if producer:
+        await require_producer_outcome(tx, prior, command, redactor=redactor)
     raw = await tx.get("operations", _record_key(command))
     if raw is not None:
         receipt = prepare_contract(RequestOutcomeReceipt, raw, redactor=redactor)
@@ -475,11 +528,11 @@ async def outcome_in_transaction(
             await tx.get("operations", _operation_key(prior.admission_operation)),
             redactor=redactor,
         )
-        if retained_admission.command.prepared is not None:
+        if retained_admission.command.prepared is not None and not producer:
             raise CollaborationConflict(
                 "Prepared recipient outcomes require a qualified attached output owner."
             )
-    if command.outcome == "answered":
+    if isinstance(command, RequestOutcomeCommand) and command.outcome == "answered":
         if prior.admission_operation is None:
             raise CollaborationConflict("Answer lacks its admitted export identity.")
         raw_admission = await tx.get("operations", _operation_key(prior.admission_operation))
@@ -502,9 +555,14 @@ async def outcome_in_transaction(
             )
         ):
             raise CollaborationConflict("Answer source does not match the admitted export.")
-    if settlement is None:
-        raise CollaborationUnavailable("Terminal outcome lacks authenticated settlement evidence.")
-    await settle_permit_in_transaction(store, tx, initialized, prior.permit, settlement, redactor)
+    if not producer:
+        if settlement is None:
+            raise CollaborationUnavailable(
+                "Terminal outcome lacks authenticated settlement evidence."
+            )
+        await settle_permit_in_transaction(
+            store, tx, initialized, prior.permit, settlement, redactor
+        )
     anchor = await store._anchor(tx, initialized, redactor)
     now = await tx.now_ms()
     if now >= prior.receipt.expected.intent.selection.expires_at_ms:
@@ -532,7 +590,11 @@ async def outcome_in_transaction(
                 "state": command.outcome,
                 "outcome": receipt,
                 "admission": "closed",
-                "delivery": "published" if command.outcome == "answered" else "excluded",
+                "delivery": "pending"
+                if producer
+                else "published"
+                if command.outcome == "answered"
+                else "excluded",
                 "next_due_at_ms": 0,
             }
         ),

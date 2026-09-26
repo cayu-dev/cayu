@@ -57,7 +57,10 @@ def test_committed_recovery_survives_bounded_public_linkage_lookup_miss() -> Non
 
         async def committed_recovery(
             request: IncompleteSessionRecoveryRequest,
+            *,
+            participant_context=None,
         ) -> IncompleteSessionRecoveryResult:
+            assert participant_context is None
             assert request.session_id == "recovered-session"
             return IncompleteSessionRecoveryResult(
                 session_id="recovered-session",
@@ -97,7 +100,10 @@ def test_committed_recovery_survives_public_linkage_lookup_failure() -> None:
 
         async def committed_recovery(
             request: IncompleteSessionRecoveryRequest,
+            *,
+            participant_context=None,
         ) -> IncompleteSessionRecoveryResult:
+            assert participant_context is None
             return IncompleteSessionRecoveryResult(
                 session_id=request.session_id,
                 previous_status=SessionStatus.RUNNING,

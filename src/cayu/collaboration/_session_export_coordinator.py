@@ -8,9 +8,10 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 from uuid import uuid4
 
+from cayu._validation import DurableValueError
 from cayu.collaboration._capabilities import (
     CapabilityDescriptor,
     CollaborationCapabilityUnavailable,
@@ -41,18 +42,18 @@ from cayu.collaboration._session_export_bounds import (
     probe_initiator,
 )
 from cayu.collaboration._session_export_participant import ExportParticipantAdapter
+from cayu.collaboration._session_export_publication import publish_export_mutation
 from cayu.collaboration._session_export_runtime import capture_runtime_export
 from cayu.collaboration._session_export_store import (
     NAMESPACE_KEY,
     ROOT_KEY,
-    ExportMutation,
+    ExportFutureExclusion,
     ExportPreparation,
     ExportRecord,
     ExportRoot,
     SettlementRecord,
     digest,
     encoded,
-    mutation_scope,
     operation_key,
     read_scope,
     source_digest,
@@ -96,7 +97,7 @@ from cayu.collaboration.releases import (
 )
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import TextPart
-from cayu.sessions.base import Session, SessionOperationPublication, SessionStore
+from cayu.sessions.base import Session, SessionStore
 from cayu.vaults.redaction import SecretRedactor
 
 T = TypeVar("T")
@@ -224,9 +225,20 @@ class SessionExportCoordinator:
         return prepare_contract(schema, value, redactor=self.redactor)
 
     def output(self, value: object) -> dict[str, Any]:
-        plain = snapshot_input(value)
+        try:
+            plain = snapshot_input(value)
+            canonical = encoded(plain)
+        except DurableValueError as error:
+            # The bounded snapshot/encoder can reject bytes before the smaller
+            # export limit. Keep that positive size evidence distinct from
+            # malformed values, secrets, authorization, and callback failures.
+            if error.code != "json_value_too_large":
+                raise
+            raise SessionExportCapacityExceeded() from None
         if type(plain) is not dict:
             raise SessionExportDenied()
+        if len(canonical) > 8192:
+            raise SessionExportCapacityExceeded()
 
         def check(item: object) -> None:
             if type(item) is str:
@@ -240,9 +252,6 @@ class SessionExportCoordinator:
                     check(child)
 
         check(plain)
-        canonical = encoded(plain)
-        if len(canonical) > 8192:
-            raise SessionExportCapacityExceeded()
         prepared = self.prepare(_Output, {"payload_json": canonical.decode()})
         return json.loads(prepared.payload_json)
 
@@ -709,6 +718,12 @@ class SessionExportCoordinator:
         try:
             return self.prepare(schema, raw)
         except CollaborationContractError:
+            if (
+                type(raw) is dict
+                and cast("dict[str, object]", raw).get("mode") == "producer_export_exclusion"
+            ):
+                self.prepare(ExportFutureExclusion, raw)
+                raise SessionExportConflict() from None
             if type(raw) is dict and "admission" in raw and "receipt" not in raw:
                 self.prepare(ExportPreparation, raw)
                 raise SessionExportConflict() from None
@@ -736,6 +751,10 @@ class SessionExportCoordinator:
                 )
                 self.require_replay_identity(previous, authorization)
             if isinstance(result, ExportPreparation):
+                if replay and result.validation_failure is not None:
+                    from cayu.collaboration._export_validation_failure import validation_error
+
+                    raise validation_error(result.validation_failure.reason)
                 if not allow_prepared or result.state != "prepared":
                     raise SessionExportUnavailable()
                 result = None
@@ -791,6 +810,11 @@ class SessionExportCoordinator:
             )
         if raw is None:
             return None
+        if type(raw) is dict and raw.get("mode") == "producer_export_exclusion":
+            exclusion = self.prepare(ExportFutureExclusion, raw)
+            if exclusion.request != request:
+                raise SessionExportConflict()
+            raise SessionExportUnavailable()
         if type(raw) is dict and "admission" in raw and "receipt" not in raw:
             preparation = self.prepare(ExportPreparation, raw)
             if (
@@ -921,8 +945,6 @@ class SessionExportCoordinator:
                 # Public evidence commits only approved source text and attribution.
                 # publish() independently validates the complete original rows.
                 source_commitment = source_digest(selected_tuple)
-                if len(encoded([r.model_dump(mode="json") for r in source_tuple])) > 32 * 1024:
-                    raise SessionExportCapacityExceeded()
                 preparation = None
                 historical_authorization = authorization
                 if self.initiator(authorization).participant is not None:
@@ -944,14 +966,38 @@ class SessionExportCoordinator:
                     historical_authorization = preparation.admission.authorization
                     await self.check_current_time(session, historical_authorization)
 
+                from cayu.collaboration._session_export_store import source_bytes
+
+                if len(source_bytes(source_tuple)) > 32 * 1024:
+                    from cayu.collaboration._export_validation_failure import (
+                        _SourceTooLarge,
+                        retain_validation_failure,
+                    )
+
+                    await retain_validation_failure(
+                        self, session, preparation, "source_too_large", authorization, source_tuple
+                    )
+                    raise _SourceTooLarge()
+
                 def project():
                     projector = self.projectors[request.projector]
                     # Detach callback values from the retained source commitment and output.
                     selected = tuple(record.model_copy(deep=True) for record in selected_tuple)
                     raw_output = projector.project(selected)
-                    output = self.output(raw_output)
+                    try:
+                        output = self.output(raw_output)
+                    except SessionExportCapacityExceeded:
+                        from cayu.collaboration._export_validation_failure import (
+                            _ProjectionTooLarge,
+                        )
+
+                        raise _ProjectionTooLarge() from None
                     if len(encoded(output)) > 8192:
-                        raise SessionExportCapacityExceeded()
+                        from cayu.collaboration._export_validation_failure import (
+                            _ProjectionTooLarge,
+                        )
+
+                        raise _ProjectionTooLarge()
                     checked = self.output(output)
                     if (
                         projector.validate(
@@ -961,7 +1007,11 @@ class SessionExportCoordinator:
                         )
                         is not True
                     ):
-                        raise SessionExportDenied()
+                        from cayu.collaboration._export_validation_failure import (
+                            _ProjectionRejected,
+                        )
+
+                        raise _ProjectionRejected("validator_rejected")
                     if encoded(checked) != encoded(output):
                         raise SessionExportConflict()
                     return output
@@ -973,7 +1023,19 @@ class SessionExportCoordinator:
                     )
                     await self.check_current_time(session, authorization, release_receipt)
                 else:
-                    output = await asyncio.to_thread(project)
+                    from cayu.collaboration._export_validation_failure import (
+                        _ProjectionRejected,
+                        _ProjectionTooLarge,
+                        retain_validation_failure,
+                    )
+
+                    try:
+                        output = await asyncio.to_thread(project)
+                    except (_ProjectionRejected, _ProjectionTooLarge) as error:
+                        await retain_validation_failure(
+                            self, session, preparation, error.reason, authorization, source_tuple
+                        )
+                        raise
                 assert self.owner is not None and self.limits is not None
                 expected = self.prepare(
                     ExpectedOperation[SessionExportIntent],
@@ -1172,6 +1234,8 @@ class SessionExportCoordinator:
             raise SessionExportCapacityExceeded()
 
     def preflight_preparation(self, preparation: ExportPreparation) -> None:
+        from cayu.collaboration._session_export_store import ExportValidationFailure
+
         future = prepare_contract(
             ExportPreparation,
             {
@@ -1179,6 +1243,13 @@ class SessionExportCoordinator:
                 "state": "excluded",
                 "excluded_by": probe_initiator(),
                 "exclusion_mandate_commitment": "f" * 64,
+                "validation_failure": snapshot_input(
+                    ExportValidationFailure(
+                        request=preparation.admission.request,
+                        source_commitment=preparation.admission.source_commitment,
+                        reason="projection_too_large",
+                    )
+                ),
             },
             redactor=SecretRedactor(),
         )
@@ -1203,35 +1274,19 @@ class SessionExportCoordinator:
         release_receipt=None,
         expected_old=None,
     ):
-        records = {key: record, **(additional_records or {})}
-        mutation = ExportMutation(
-            session.id,
-            session.instance_id,
-            None if before is None else encoded(before.model_dump(mode="json")),
-            encoded(after.model_dump(mode="json")),
-            tuple((k, encoded(v)) for k, v in records.items()),
-            tuple(r.index for r in source),
-            source_digest(source) if source else None,
-            tuple(encoded(e.model_dump(mode="json")) for e in events),
+        await publish_export_mutation(
+            self.store,
+            session,
+            before,
+            after,
+            key,
+            record,
+            events,
+            commit_guard=lambda now: self.check_time(authorization, now, release_receipt),
+            source=source,
+            additional_records=additional_records,
+            expected_old=expected_old,
         )
-
-        def transform(current, checkpoint, old, now):
-            if current.instance_id != session.instance_id or old != expected_old:
-                raise SessionExportConflict()
-            self.check_time(authorization, now, release_receipt)
-            updated = {} if checkpoint is None else dict(checkpoint)
-            updated[ROOT_KEY] = after.model_dump(mode="json")
-            return SessionOperationPublication(checkpoint=updated, operation_records=records)
-
-        with mutation_scope(mutation):
-            await self.store.publish_session_operation_guarded_with_store_time(
-                session.id,
-                idempotency_key=key,
-                operation_transform=transform,
-                commit_guard=lambda: None,
-                commit_time_guard=lambda now: self.check_time(authorization, now, release_receipt),
-                events=events,
-            )
 
     async def lookup(
         self,

@@ -44,6 +44,7 @@ from cayu.sessions.invocation import SessionInvocation
 
 if TYPE_CHECKING:
     from cayu.collaboration._clarification_deliveries import ClarificationDeliveryRecord
+    from cayu.collaboration._producer_contracts import ProducerDeliveryRecord
     from cayu.collaboration.access import CollaborationAccessContext
     from cayu.collaboration.peer_content import (
         PeerAppendKey,
@@ -410,7 +411,7 @@ class SessionExportPolicy(ABC):
         context: CollaborationAccessContext,
         *,
         request: PeerContentAppendRequest,
-        receipt: PeerContentReceipt | ClarificationDeliveryRecord,
+        receipt: PeerContentReceipt | ClarificationDeliveryRecord | ProducerDeliveryRecord,
         reason: str,
     ) -> AbstractAsyncContextManager[None]:
         """Authorize discharge of an exact retained delivery, not new disclosure.
@@ -423,6 +424,9 @@ class SessionExportPolicy(ABC):
         owner supplies the exact durable ClarificationDeliveryRecord instead.
         Policies must authenticate that preparation independently; it grants
         cleanup only, never source read, append, or provider exposure authority.
+        A producer owner supplies its exact durable ProducerDeliveryRecord by
+        the same rule; its registration and export tuple must be authenticated,
+        not inferred from a matching payload or a caller-supplied receipt.
         The default denies; no unregistered cleanup authority is inferred.
         """
         raise SessionExportDenied()

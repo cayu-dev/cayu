@@ -196,6 +196,15 @@ def test_revision_seventy_builds_handoff_recovery_index_concurrently() -> None:
     assert postgres_storage._required_concurrent_indexes(70)[-1] == index
 
 
+def test_revision_109_indexes_session_budget_inventory_concurrently() -> None:
+    (index,) = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[109]
+    assert index.table_name == "cayu_budget_reservations"
+    assert index.key_definitions == ("session_id", "reservation_id")
+    assert index.predicate_definition is None
+    assert "CREATE INDEX CONCURRENTLY" in index.create_statement
+    assert postgres_storage._required_concurrent_indexes(109)[-1] == index
+
+
 def test_revision_seventy_six_builds_bounded_continuation_index_concurrently() -> None:
     indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[76]
 

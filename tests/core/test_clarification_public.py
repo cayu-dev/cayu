@@ -1221,7 +1221,6 @@ async def test_public_question_uses_real_assistant_export(
             async def reject_ledger_registration(**kwargs):
                 pytest.fail("Question publication mutated the dispatch budget ledger")
 
-            register_budget_binding = current.budget_ledger.register_budget_binding
             monkeypatch.setattr(
                 current.budget_ledger, "register_budget_binding", reject_ledger_registration
             )
@@ -1604,9 +1603,9 @@ async def test_public_question_uses_real_assistant_export(
                 execution_key="question-recipient-run",
             )
             with monkeypatch.context() as patch:
-                patch.setattr(
-                    current.budget_ledger, "register_budget_binding", register_budget_binding
-                )
+                # Restore class-owned admission, not an instance-bound alias:
+                # producer qualification deliberately rejects overridden ledgers.
+                patch.delattr(current.budget_ledger, "register_budget_binding")
                 if temporary_service:
                     assert parked is not None
                     if maintenance_recovery:
@@ -2328,9 +2327,7 @@ async def test_public_question_uses_real_assistant_export(
                     from tests.core._clarification_multiple_flow import second_question
                     from tests.core._clarification_public_flow import continue_with_reply
 
-                    monkeypatch.setattr(
-                        current.budget_ledger, "register_budget_binding", register_budget_binding
-                    )
+                    monkeypatch.delattr(current.budget_ledger, "register_budget_binding")
                     (
                         second_opening,
                         second_export,
@@ -2392,9 +2389,7 @@ async def test_public_question_uses_real_assistant_export(
 
                     # Publication is inert; this next phase is real execution
                     # and must use the normal causal budget ledger admission.
-                    monkeypatch.setattr(
-                        current.budget_ledger, "register_budget_binding", register_budget_binding
-                    )
+                    monkeypatch.delattr(current.budget_ledger, "register_budget_binding")
                     reply_delivery, delivered_reply = await continue_with_reply(
                         current,
                         opening=command,

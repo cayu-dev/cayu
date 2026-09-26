@@ -577,12 +577,20 @@ async def test_peer_schema_requires_explicit_migration(backend, tmp_path, reques
             await connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 104")
     try:
         if backend == "sqlite":
-            with pytest.raises(SchemaTooOld, match="requires >= 104"):
+            from cayu.storage.sqlite import _SQLITE_SESSION_MIN_REQUIRED_REVISION
+
+            with pytest.raises(
+                SchemaTooOld, match=f"requires >= {_SQLITE_SESSION_MIN_REQUIRED_REVISION}"
+            ):
                 SQLiteSessionStore(path, schema_mode=SchemaMode.VALIDATE)
         else:
             validator = PostgresSessionStore(dsn, schema_mode=SchemaMode.VALIDATE)
             try:
-                with pytest.raises(SchemaTooOld, match="requires >= 104"):
+                from cayu.storage.postgres import _POSTGRES_SESSION_MIN_REQUIRED_REVISION
+
+                with pytest.raises(
+                    SchemaTooOld, match=f"requires >= {_POSTGRES_SESSION_MIN_REQUIRED_REVISION}"
+                ):
                     await validator.ensure_schema()
             finally:
                 await validator.close()

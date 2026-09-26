@@ -520,55 +520,168 @@ async def native_stores(request, tmp_path):
 
 
 async def prepared_scenario(
-    native_stores, *, use_example=False, provider_events=(), request_ttl_ms=None
+    native_stores,
+    *,
+    use_example=False,
+    provider_events=(),
+    request_ttl_ms=None,
+    session_exports_factory=None,
+    provider_factory=ScriptedModelProvider,
+    tools=(),
+    tool_policy=None,
+    loop_policies=(),
+    config=None,
+    budget_ledger=None,
+    budget_binding_factory=None,
+    operation_prefix="",
+    planned=False,
+    request_cancellation=None,
+    requested_session_id=None,
 ):
     collaboration, sessions, *_ = native_stores
     original, initialized, _, recipient, request, _initiating = await setup(collaboration)
+    if request_cancellation is not None:
+        request = request.model_copy(update={"cancellation": request_cancellation})
+    if operation_prefix:
+        request = request.model_copy(
+            update={
+                "operation": initialized.operation(operation_prefix + request.operation.caller_key)
+            }
+        )
+    if session_exports_factory is not None:
+        request = request.model_copy(update={"ttl_ms": 300_000})
     if request_ttl_ms is not None:
         request = request.model_copy(update={"ttl_ms": request_ttl_ms})
     resolver = PreparationResolver(request, recipient.reference)
-    binding = _binding(application_scope=initialized.owner.application_scope)
+    binding = (
+        _binding(application_scope=initialized.owner.application_scope)
+        if budget_binding_factory is None
+        else budget_binding_factory(initialized.owner.application_scope)
+    )
 
     class BudgetReceiver:
         async def resolve_budget_binding(self, *, request):
             return binding
 
-    application = app(
-        collaboration,
-        original._participant_coordinator._registration,
-        session_store=sessions,
-        collaboration_requests=RequestRegistration(
-            mandates=resolver,
-            max_ttl_ms=300_000,
-            prepared_admission=PreparedAdmissionRegistration(
-                receiver=ObjectRef(
-                    owner=initialized.owner,
-                    kind="request_receiver",
-                    object_id="native-fresh",
-                    incarnation="one",
-                    revision=1,
-                )
-            ),
-        ),
-        budget_binding_receiver=BudgetReceiver(),
-        enable_common_root_budget_binding=True,
+    exports = (
+        None
+        if session_exports_factory is None
+        else session_exports_factory(initialized, request, resolver)
     )
-    provider = ScriptedModelProvider(provider_events, name="provider")
-    application.register_provider(provider, default=True)
-    application.register_agent(AgentSpec(name="reviewer", model="model", system_prompt="system"))
+
+    def build_application(planning_policies=()):
+        return app(
+            collaboration,
+            original._participant_coordinator._registration,
+            config=config,
+            session_store=sessions,
+            collaboration_requests=RequestRegistration(
+                mandates=resolver,
+                planning_policies=planning_policies,
+                max_ttl_ms=300_000,
+                prepared_admission=PreparedAdmissionRegistration(
+                    receiver=ObjectRef(
+                        owner=initialized.owner,
+                        kind="request_receiver",
+                        object_id="native-fresh",
+                        incarnation="one",
+                        revision=1,
+                    )
+                ),
+            ),
+            budget_binding_receiver=BudgetReceiver(),
+            budget_ledger=budget_ledger,
+            enable_common_root_budget_binding=True,
+            session_exports=exports,
+        )
+
+    application = build_application()
+    if planned:
+        from tests.core._execution_profile_fixtures import versioned_test_provider_identity
+
+        class PlannedProvider(provider_factory):
+            @property
+            def execution_profile_identity(self):
+                return versioned_test_provider_identity(self)
+
+        provider_factory = PlannedProvider
+    provider = provider_factory(provider_events, name="provider")
+
+    def register_execution(application):
+        application.register_provider(provider, default=True)
+        application.register_agent(
+            AgentSpec(name="reviewer", model="model", system_prompt="system"),
+            tools=tools,
+            tool_policy=tool_policy,
+            loop_policies=loop_policies,
+        )
+
+    register_execution(application)
     await application.initialize_collaboration()
     accepted = await application.accept_collaboration_request(
         request, context=resolver.sender.context
     )
     creation = RecipientSessionCreationRequest(
-        request=RunRequest(agent_name="reviewer", messages=[Message.text("user", "input")]),
-        creation_key="prepared-child:" + initialized.owner.application_scope,
+        request=RunRequest(
+            agent_name="reviewer",
+            session_id=requested_session_id,
+            messages=[Message.text("user", "input")],
+        ),
+        creation_key="prepared-child:" + operation_prefix + initialized.owner.application_scope,
         recipient=recipient.reference,
     )
+    if planned:
+        from examples.collaboration.planning import fresh_policy
+        from tests.core.test_request_planning_contracts import _policy
+        from tests.core.test_request_planning_public import complete_plan
+
+        from cayu.collaboration._planning_store import admission_command
+        from cayu.collaboration.planning import RequestPlanningRequest, planning_policy_commitment
+
+        preparation = await application.prepare_recipient_creation(creation, context=CONTEXT)
+        policy = fresh_policy(
+            _policy().reference.model_copy(update={"owner": initialized.owner}),
+            _policy().limits,
+            preparation,
+        )
+        application = build_application((policy,))
+        register_execution(application)
+        await application.initialize_collaboration()
+        planning = RequestPlanningRequest(
+            operation=initialized.operation(operation_prefix + "producer-plan"),
+            expected=accepted.expected,
+            expected_revision=1,
+            expected_input_revision=0,
+            expected_input_sha256=clarification_commitment(accepted.expected, SecretRedactor()),
+            planning_generation=1,
+            admission_operation=initialized.operation(operation_prefix + "prepared-admission"),
+            admission_generation=1,
+            initiator=_initiator(resolver.recipient.context),
+            policy=policy.reference,
+            policy_sha256=planning_policy_commitment(policy, redactor=SecretRedactor()),
+            limits=policy.limits,
+            deadline_at_ms=accepted.expected.intent.selection.expires_at_ms,
+            predecessor=None,
+        )
+        retained = await complete_plan(application, planning, resolver.recipient.context)
+        assert retained.state == "admitted" and retained.pending_stages == 0
+        assert provider.requests == []
+        child = await application.lookup_recipient_session(creation, context=CONTEXT)
+        assert child is not None
+        session, _ = child
+        evidence = await application.prepare_recipient_admission(creation, context=CONTEXT)
+        command = admission_command(retained, SecretRedactor(), prepared=evidence)
+        found = await application.lookup_collaboration_admission(
+            command, context=resolver.recipient.context
+        )
+        assert isinstance(found, ExactMatch) and found.receipt.state == "admitted"
+        assert await complete_plan(application, planning, resolver.recipient.context) == retained
+        return application, resolver, command, provider, session, initialized
+
     session, _ = await application.create_recipient_session(creation, context=CONTEXT)
     evidence = await application.prepare_recipient_admission(creation, context=CONTEXT)
     command = RequestAdmissionCommand(
-        operation=initialized.operation("prepared-admission"),
+        operation=initialized.operation(operation_prefix + "prepared-admission"),
         expected=accepted.expected,
         expected_revision=1,
         expected_input_revision=0,

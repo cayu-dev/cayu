@@ -536,9 +536,10 @@ New admission still requires the exact currently qualified receiver.
 An inert prepared admission can be cancelled or expired through the existing
 request control entrance, including after participant disablement. That settles
 the request's unstarted obligation, not child deletion or unrelated execution.
-Prepared producer progress and outcomes require a later qualified output-owner
-attachment and are refused here. Receipt and proposal data never grant launch
-authority. This shared-contract slice does not implement the complete admission
+Prepared producer progress and outcomes require the qualified output-owner
+attachment described under [Retained producer output](#retained-producer-output);
+admission alone does not authorize them. Receipt and proposal data never grant
+launch authority. Prepared admission does not implement the complete admission
 planner.
 
 Prepared profile and budget snapshots have canonical JSON ceilings of 16 KiB
@@ -801,6 +802,213 @@ registration, or after a previous read is returned at the next current
 frontier; the registration event itself is metadata and is not reported as
 request work. Missing frontier evidence returns unavailable rather than
 silently reporting a complete page.
+
+## Retained producer output
+
+Producer output is a separate responsibility from request admission. Start with
+a genuine resource-free FRESH admission from the configured prepared-admission
+receiver. Historical admission readback is not permission to execute.
+
+This request-only producer capability requires the request's `stop` cancellation
+disposition. `detach` is refused before producer registration or dispatch: an
+independent work obligation and its continuation authority are not inferred from
+an existing invocation, a budget binding, or a policy string.
+The native store must qualify exact stop acceptance and new-stage exclusion;
+unsupported stop owners are refused before preparation, registration, or launch.
+The runtime ledger must qualify exact producer-accounting readback before
+registration and launch, not merely ordinary reservation operations.
+
+`ProducerOutputProposal` contains the exact admission, stable registration
+operation and binding incarnation, finite destinations, and output/progress/
+deadline limits. `prepare_producer_output(proposal, execution, context=...)`
+derives the native execution commitment from the registered SessionStore's
+creation, binding, input and execution profile. It performs no registration or
+dispatch. Preserve the returned `ProducerOutputRegistration` before proceeding;
+do not calculate native commitments or substitute a new operation after an
+ambiguous result.
+
+The host explicitly calls `register_producer_output()` and then consumes
+`execute_producer_output()`. Registration retains collaboration responsibility
+and attaches the native output owner. Execution checks current authority again
+and orders its launch against request closure. Closing the event stream is not
+proof that all dispatched effects stopped. See the explicit host steps in
+[`retained_producer_output.py`](../examples/collaboration/retained_producer_output.py).
+
+Exact registration retries acknowledge the same attachment after native execution
+or exclusion has advanced it; they cannot reset it to prepared or authorize
+another launch. Native admission also checks the retained launch expiry inside
+its receiving transaction using owner-store time, not the worker clock.
+A completed producer does not consume queued successor
+input while its responsibility remains unsettled: the original interaction is
+retained for cleanup and the successor stays queued for separate authorization.
+After authenticated cleanup settlement, a separately authorized new interaction
+may resume the session and consume queued input. The native cleanup receipt
+releases only the original producer's ownership; it does not grant execution or
+disclosure authority. Later interactions cannot replace the producer's retained
+output, original release evidence, or exact cleanup replay, including after restart.
+An authenticated approval/input continuation may produce output in a later native
+epoch. Retention and readback require the durable rebind lineage back to the
+original interaction and profile; the output reference records its producing epoch.
+
+These states are distinct:
+
+- Native completion retains an immutable output reference or bounded failure
+  evidence, not a new successful answer synthesized from an exception.
+- `export_producer_output()` authorizes one registered destination's projection.
+  Private reasoning and provider state are not answer content.
+  A deterministic validator rejection, oversized source envelope, or oversized
+  serialized projection retains bounded native contract-failure evidence.
+  Publishing without a destination then
+  elects `failed` from that exact evidence, without rerunning production or the
+  projector. Authorization denial and transient export failures do not qualify.
+  Authorized export-receipt lookup reports unavailable for retained rejection;
+  it does not misclassify historical validation failure as current access denial.
+- `publish_producer_outcome()` uses the existing request election; it does not
+  prove delivery or settle native effects.
+- `deliver_producer_output()` services an exact peer append. Provider exposure
+  still requires the receiving runtime's per-attempt authorization and receipt.
+- `settle_producer_output()` requires the retained delivery/exclusion, native
+  release and original budget evidence; a terminal session status is insufficient.
+  Reservation evidence binds the native session incarnation. Settled history for
+  another incarnation of the same public ID does not belong to the replacement
+  producer; missing identity or conflicting settlement evidence remains a refusal.
+
+For optional content-free progress, pass a `ProducerProgressOccurrence` to
+`record_producer_progress()`. Preserve its operation, expected request revision,
+sequence and kind for exact retry. `prepared` observes the native attachment;
+`started` requires actual native invocation admission; `producing` additionally
+observes that exact invocation running; `published` requires retained native
+output or failure publication. These are historical observations, not promises
+that an invocation is still running, new execution permission, or proof of
+export, delivery or quiescence. The owner derives their commitments from native
+invocation snapshots and exact retained output/failure readback, rather than
+accepting caller-supplied native receipts. Running progress and safe stop follow
+authenticated rebind lineage; neither may substitute an unrelated invocation.
+
+New occurrences require current publish authority. Gaps and occurrences beyond
+the registered `progress_occurrences` limit are rejected. The common request
+election records progress once and fixes its accepted frontier at terminal
+publication. An exact duplicate retains its original receipt; a late new
+occurrence cannot replace the answer or reopen the request. Optional progress
+cannot consume the request's reserved terminal frontier or control capacity.
+The request snapshot retains compact `ProducerProgressReference` entries with
+exact receipt commitments. Full receipts remain separately retained under their
+operation keys; readback validates every reference and the contiguous sequence.
+
+`lookup_producer_registration()` and `lookup_producer_completion()` accept a
+complete original command or an exact indexed recovery token. They authenticate
+current request-readback access and participant scope, and return the shared
+match/not-found/conflict/unavailable result. Readback grants neither execution
+nor renewed content disclosure. `pending_producer_outputs()` supplies bounded
+indexed pages, including outstanding responsibility after request closure.
+
+Use `reconcile_producer_delivery()` for an exact registered destination.
+With `exclude=True`, a destination that has no prepared delivery receives a
+durable source-owner exclusion, atomically fenced against first preparation.
+It requires current request-control access, not content-disclosure permission;
+it neither rewrites an answered request nor claims receiving-owner acceptance.
+Already prepared deliveries still require the receiving owner's exact exclusion.
+Requesting exclusion cannot turn an already appended delivery into an exclusion.
+`retire_producer_export()` handles a closed request's export when no delivery was
+prepared, an unprepared destination with source-owner exclusion, or a prepared
+delivery with exact receiving-owner exclusion. The native
+owner rechecks that exclusion; missing or conflicting evidence does not authorize
+retirement. This cleanup requires current request-control access but not renewed
+content disclosure, and does not change the historical request outcome. Its
+retained result remains replayable after native cleanup and deletion. It cannot
+authorize new projection. `service_producer_disposition()`
+services the frozen stop disposition, without substituting another invocation.
+Public completion retention and settlement require current request-control
+access. Mandatory owner-internal cleanup remains separate so disclosure or
+public-control revocation does not discard previously retained responsibility.
+
+Pre-launch exclusion follows the same source/native/source cleanup handshake.
+The request and producer permits remain pending and discoverable until the native
+owner has durably acknowledged retention release. That acknowledgement survives
+session deletion; exact settlement retry does not address a replacement session
+with the same public ID. Exclusion acceptance alone cannot authorize pruning.
+
+Native cleanup can follow a durable recovery rebind of the original invocation.
+Every epoch hop must retain the original interaction and execution profile and
+be authenticated by the native lifecycle ledger. Cleanup records the exact
+released epoch; an unrelated new admission is not recovery of the producer.
+
+A producer refused before its first reservation can still finish mandatory
+cleanup. Zero-reservation accounting requires the original registered binding,
+an authenticated failed or stopped native invocation, its exact release, and a
+complete inventory from the qualified accounting owner. Missing native evidence,
+an unavailable ledger, or an empty event query does not establish settlement.
+Successful native output still requires original reservation evidence. Accounting
+readback rejects an empty inventory contradicted by retained reservation or model
+dispatch events, and does not replace the separate external-work quiescence checks.
+
+If a resource-free FRESH producer loses its process after final model publication
+but before output retention, use `recover_incomplete_session(request, context=...)`
+with current participant execution access and the original registered execution
+profile. The native owner authenticates the committed publication and every
+recovery rebind before replaying the result through the normal post-model gates.
+Historical admission alone cannot authorize this replay. Recovery does not make
+another provider request or consume queued successor input. A policy requiring
+another model round interrupts completion-only recovery instead of electing an
+answer or silently dropping the policy.
+
+When current participant execution access has been revoked, answer replay is
+refused without changing the invocation. Explicit operator interruption remains
+a separate cleanup path: `interrupt_session()` records the interruption. If a
+crashed RUNNING process cannot acknowledge it before the observation timeout,
+`recover_incomplete_session()` can finish that recorded interruption without
+restoring execution access. Retain the resulting stopped completion and settle
+the producer normally; neither the interruption request nor its timeout alone
+proves that resources or budget responsibility have been released.
+
+Cancellation of a recovery observer does not prove that its finalizer stopped.
+Unsettled workers keep their exact cleanup ownership and claim; closing a stream
+may report a cleanup deadline while that work remains retained.
+`drain_recovery_cleanups()` waits boundedly for this process's retained work.
+It does not replace durable recovery after process loss or the separate producer
+settlement checks.
+
+Closing a producer event stream can retain an interrupted native completion only
+when the store authenticates both the terminal interaction transition and the
+original invocation's release. A human-action pause or interrupted status alone
+does not qualify. This completion is not a successful answer and does not settle
+external effects or original budget responsibility; those remain separate checks.
+
+For request-only `stop` disposition, closure of a released approval/input pause
+atomically seals that exact producer against later continuation. The retained
+closure fence and native release, together with the authenticated pause receipt,
+support stopped-completion readback without answering or approving the gate.
+Historical gate data is not new execution authority. A concurrent continuation
+that wins first remains subject to the existing running-producer stop protocol;
+an unresolved race retains cleanup responsibility for exact retry.
+
+The supported native stores are Memory, SQLite and PostgreSQL. Unsupported
+attachment or receiving adapters fail closed. Keep the original namespace,
+incarnations, operation keys, admission and destination identities across retry
+and restart. Do not prune producer records while settlement or its exact
+acknowledgement remains unresolved. This interface is an explicit host protocol,
+not a scheduler, subscription, shared-producer service or business-acceptance API.
+
+After namespace retirement and final producer settlement, ordinary namespace
+maintenance reclaims the request and its producer records in bounded batches.
+The first batch authenticates the complete source inventory; later batches use
+an exact durable cursor and retain the parent until its dependent records are
+removed. Partial history is unavailable for replay, not evidence of a new request
+or an excluded delivery. Lost maintenance acknowledgements reconcile with the
+same maintenance operation. Native cleanup acknowledgement retention is separate
+from this source-record reclamation. After the complete source generation has
+been pruned, call `reclaim_producer_cleanup(namespace, context=..., limit=32)` on
+the registered native owner to drain its acknowledgement rows. This requires
+current namespace-maintenance access and positive source pruned-through evidence;
+an absent request or a caller-supplied receipt is insufficient.
+
+Reclamation is state-based: each call removes at most `limit` rows and returns
+`ProducerCleanupReclamation`, including whether more remain in that retired range.
+After cancellation or a lost acknowledgement, repeat the drain; its removed count
+describes that call, not an immutable per-batch receipt. A monotonic native fence
+prevents delayed cleanup from recreating retired history. The fence covers the
+exact source owner and namespace across receiving-configuration changes on the
+same native store, without granting new execution or disclosure authority.
 
 ## Finite collaboration waits
 

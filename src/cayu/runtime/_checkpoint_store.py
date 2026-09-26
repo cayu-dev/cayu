@@ -152,6 +152,7 @@ def _versioned_store_time_checkpoint_transform(
     session_id: str,
     checkpoint_transform: StoreTimeCheckpointTransform,
     *,
+    stamp_empty: bool = False,
     preserve_completion_result_publications: bool = False,
 ) -> StoreTimeCheckpointTransform:
     if checkpoint_transform is None:
@@ -176,6 +177,7 @@ def _versioned_store_time_checkpoint_transform(
         return _versioned_checkpoint_transform(
             session_id,
             apply_store_time,
+            stamp_empty=stamp_empty,
             preserve_completion_result_publications=(preserve_completion_result_publications),
         )(session, checkpoint)
 
@@ -335,6 +337,14 @@ class _RuntimeCheckpointSessionStore:
             None,
         )
         return callable(checker) and checker() is True
+
+    async def _admit_native_producer(self, registration, command):
+        checker = getattr(self._store, "_supports_producer_attachment_protocol", None)
+        if not callable(checker) or checker() is not True:
+            raise NotImplementedError("Native producer admission is not qualified.")
+        from cayu.runtime._producer_output_store import admit_native_producer
+
+        return await admit_native_producer(self, registration, command)
 
     @overload
     async def apply_invocation_lifecycle_command(
@@ -631,16 +641,26 @@ class _RuntimeCheckpointSessionStore:
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         execution_profile: ExecutionProfileIdentity,
         **kwargs: Any,
     ) -> Session:
         return await self._store.admit_execution_profile_resume(
             session_id,
-            checkpoint_transform=_versioned_checkpoint_transform(
+            checkpoint_transform=None
+            if checkpoint_transform is None
+            else _versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
+            ),
+            store_time_checkpoint_transform=None
+            if store_time_checkpoint_transform is None
+            else _versioned_store_time_checkpoint_transform(
+                session_id,
+                store_time_checkpoint_transform,
                 preserve_completion_result_publications=True,
             ),
             result_checkpoint_transform=_optional_versioned_checkpoint_transform(
@@ -661,9 +681,19 @@ class _RuntimeCheckpointSessionStore:
             session_id,
             admission=replace(
                 admission,
-                checkpoint_transform=_versioned_checkpoint_transform(
+                checkpoint_transform=None
+                if admission.checkpoint_transform is None
+                else _versioned_checkpoint_transform(
                     session_id,
                     admission.checkpoint_transform,
+                    stamp_empty=True,
+                    preserve_completion_result_publications=True,
+                ),
+                store_time_checkpoint_transform=None
+                if admission.store_time_checkpoint_transform is None
+                else _versioned_store_time_checkpoint_transform(
+                    session_id,
+                    admission.store_time_checkpoint_transform,
                     stamp_empty=True,
                     preserve_completion_result_publications=True,
                 ),

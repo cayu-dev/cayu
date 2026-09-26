@@ -1,5 +1,6 @@
 """Original final wait settlement through source-owned export and real latch delivery."""
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -12,7 +13,11 @@ from cayu.collaboration.exports import SessionExportRef
 from cayu.collaboration.mandates import ResourceSelector
 from cayu.collaboration.requests import RequestAdmissionCommand, RequestOutcomeCommand
 from cayu.messages import Message
-from cayu.runtime._session_continuation import ContinuationConflict, ContinuationService
+from cayu.runtime._session_continuation import (
+    ContinuationConflict,
+    ContinuationService,
+    ContinuationUnavailable,
+)
 from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
 from cayu.sessions.base import ResumeRequest
 from cayu.vaults.redaction import SecretRedactor
@@ -163,6 +168,22 @@ async def finish_original_wait(
     )
     outcome = await app.publish_collaboration_outcome(terminal, context=actor_b.context)
     assert await app.publish_collaboration_outcome(terminal, context=actor_b.context) == outcome
+    return await deliver_original_final_wait(
+        app,
+        initialized=initialized,
+        actor_a=actor_a,
+        wait=wait,
+        parked=parked,
+        payloads=payloads,
+        context=context,
+        consume=consume,
+    )
+
+
+async def deliver_original_final_wait(
+    app, *, initialized, actor_a, wait, parked, payloads, context, consume
+):
+    """Deliver an already elected final result through the existing latch owner."""
     bound_wait = wait.model_copy(update={"delivery_ticket": parked.preparation.intent})
     elected = await app.observe_collaboration_wait(bound_wait, context=actor_a.context)
     assert elected.state == "elected"
@@ -244,7 +265,17 @@ async def consume_original_latch(
                 == latched
             )
             return
-        settled = await owner.service(app, resume, service, participant_context=context)
+        try:
+            settled = await owner.service(app, resume, service, participant_context=context)
+        except ContinuationUnavailable:
+            pending = tuple(owner.owners.pending)
+            if not pending:
+                raise
+            # The foreground deadline is not a failed continuation. Observe the
+            # actual retained owner (including any real error), then reconcile
+            # the identical service without admitting another continuation.
+            await asyncio.wait_for(asyncio.gather(*pending), 60)
+            settled = await owner.service(app, resume, service, participant_context=context)
         assert settled.ticket.state == "CONSUMED"
         assert len(payloads) == count + 1
         assert await owner.service(app, resume, service, participant_context=context) == settled

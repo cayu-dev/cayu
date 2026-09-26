@@ -64,6 +64,10 @@ async def database(request, tmp_path):
 async def test_revision_107_upgrade_preserves_view_and_exact_decision(database, monkeypatch, first):
     create, _ = database
     with monkeypatch.context() as historical:
+        # Build a genuine historical fixture; restore today's startup floor
+        # before exercising migration and subsequent validation.
+        historical.setattr("cayu.storage.sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION", 107)
+        historical.setattr("cayu.storage.postgres.PostgresSessionStore._min_required_revision", 107)
         historical.setattr(
             schema, "REVISIONS", tuple(rev for rev in schema.REVISIONS if rev.revision <= 107)
         )

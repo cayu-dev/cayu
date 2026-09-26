@@ -22,8 +22,11 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
+
+if TYPE_CHECKING:
+    from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
 
 import cayu.sessions.pending_actions as pending_actions
 from cayu._exception_groups import (
@@ -1316,6 +1319,7 @@ class RecoverySessionRunRequest:
     previous_tool_exposure_profile_id: str | None = None
     preserve_failure_until_initial_provider_dispatch: bool = False
     participant_context: CollaborationAccessContext | None = None
+    producer_replay: _ProducerCompletionReplay | None = None
 
     def __post_init__(self) -> None:
         if type(self.invocation_context) is not InvocationContext:
@@ -1504,7 +1508,41 @@ class RecoveryAbandonedSessionRequest:
     retain_terminal_publication_repair: bool = False
 
 
-class _IncompleteRecoveryClaimAuthority:
+class _RecoveryWorkerSettlement:
+    """Process-local work lifetime, never authority to acquire an invocation."""
+
+    __slots__ = ("_workers",)
+
+    def __init__(self) -> None:
+        self._workers: tuple[asyncio.Task[Any], ...] = ()
+
+    @property
+    def settled(self) -> bool:
+        return all(task.done() for task in self._workers)
+
+    def owns_current_worker(self) -> bool:
+        return bool(self._workers) and self._workers[0] is asyncio.current_task()
+
+    def own_workers(self, *workers: asyncio.Task[Any]) -> None:
+        if not self.settled:
+            raise RuntimeError("Recovery claim already owns unsettled workers.")
+        self._workers = workers
+
+    async def await_worker_settlement(self) -> None:
+        """Quiescence dependency; the worker supervisor owns failure propagation."""
+        if any(task is asyncio.current_task() for task in self._workers):
+            raise RuntimeError("A recovery worker cannot release its own live claim.")
+        pending = {task for task in self._workers if not task.done()}
+        while pending:
+            try:
+                _, pending = await asyncio.wait(pending)
+            except asyncio.CancelledError:
+                # Only supervised cleanup waits here. Its cancellation probe
+                # cannot establish worker quiescence or authorize claim release.
+                continue
+
+
+class _IncompleteRecoveryClaimAuthority(_RecoveryWorkerSettlement):
     """Exact durable claim and transferable process-local fence authority."""
 
     __slots__ = (
@@ -1522,6 +1560,7 @@ class _IncompleteRecoveryClaimAuthority:
         claim_id: str,
         run_fence: _SessionRunFenceOwnership,
     ) -> None:
+        super().__init__()
         if run_fence.session_id != session_id:
             raise ValueError("Recovery claim and run-fence session identities differ.")
         self.session_id = session_id
@@ -1529,6 +1568,12 @@ class _IncompleteRecoveryClaimAuthority:
         self.run_fence = run_fence
         self._finalization_lock = asyncio.Lock()
         self._finalized = False
+
+    def own_workers(self, *workers: asyncio.Task[Any]) -> None:
+        """Keep the exact recovery work and heartbeat ahead of claim release."""
+        if self._finalized:
+            raise RuntimeError("Recovery claim already owns unsettled workers.")
+        super().own_workers(*workers)
 
     @property
     def run_epoch(self) -> int:
@@ -2045,6 +2090,7 @@ class RecoveryCoordinator:
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
+        self._recovery_claim_workers: dict[tuple[str, str], _RecoveryWorkerSettlement] = {}
         self._runtime_hooks = runtime_hooks
         self._loop_policies = loop_policies
         self._committed_runtime_task_failure_recovery: (
@@ -17971,6 +18017,7 @@ class RecoveryCoordinator:
         request: IncompleteSessionRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
+        participant_context: CollaborationAccessContext | None = None,
         retain_open_interaction_invocation: bool = False,
         retain_invocation_context: Callable[[InvocationContext], None] | None = None,
         preserve_interaction_id: str | None = None,
@@ -18026,6 +18073,7 @@ class RecoveryCoordinator:
             ):
                 raise ValueError("Governed recovery session authority changed before admission.")
         recovered = await self._recover_incomplete_session_scoped(
+            participant_context=participant_context,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
             session=session,
@@ -18705,6 +18753,16 @@ class RecoveryCoordinator:
             )
             if recovered_runtime_failure is not None:
                 return recovered_runtime_failure
+        from cayu.runtime._producer_completion_replay import producer_completion_requires_execution
+
+        if session.status is SessionStatus.RUNNING and producer_completion_requires_execution(
+            checkpoint
+        ):
+            # Historical model publication permits neither policy execution nor
+            # destructive fallback cleanup under an unauthenticated caller.
+            # Refuse before claiming a replacement epoch; explicit stop/cleanup
+            # retains its separate owner and does not require answer replay.
+            await self._require_participant_execution(session, participant_context)
         pending_completion_finalization = pending_completion_finalization_from_checkpoint(
             checkpoint
         )
@@ -19688,6 +19746,60 @@ class RecoveryCoordinator:
             ),
         )
 
+    async def has_completed_queued_predecessor(self, session: Session, event: Event) -> bool:
+        """Authenticate a completed interaction in an interrupted queue-bearing run."""
+        if (
+            session.status is not SessionStatus.INTERRUPTED
+            or event.type is not EventType.INTERACTION_COMPLETED
+        ):
+            return False
+        with _invocation_lifecycle_authority_read_scope():
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            active is None
+            or active.session_id != session.id
+            or active.interaction_id != event.interaction_id
+        ):
+            return False
+        receipt = await self._session_store.load_historical_interaction_settlement(
+            session.id,
+            expected_session_instance_id=session.instance_id,
+            expected_event=event,
+            expected_profile=active.profile,
+        )
+        if (
+            receipt is None
+            or receipt.status_changed
+            or not receipt.transition.only_if_no_queued_messages
+            or receipt.transition.to_status is not SessionStatus.COMPLETED
+            or receipt.session.status is not SessionStatus.RUNNING
+            or receipt.session.run_epoch != active.run_epoch
+        ):
+            return False
+        from cayu.runtime._invocation_lifecycle import (
+            _require_released_invocation_command_receipt,
+        )
+
+        # Session terminal events are session-scoped, not interaction-scoped.
+        # The native release receipt binds this terminal session to the exact
+        # predecessor interaction/profile/epoch instead.
+        _require_released_invocation_command_receipt(
+            session,
+            checkpoint,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            active_profile=active,
+        )
+        inspection = await self._inspect_terminal_evidence(session=session, checkpoint=checkpoint)
+        return (
+            inspection.event is not None
+            and inspection.event.type is EventType.SESSION_INTERRUPTED
+            and inspection.event.interaction_id is None
+            and inspection.pending_interrupt_payload is None
+            and inspection.run_operation is None
+        )
+
     async def _repair_terminal_evidence_owned(
         self,
         *,
@@ -20141,7 +20253,21 @@ class RecoveryCoordinator:
                     # release under its exact claim only after the existing
                     # quiescence and terminal-evidence checks below; do not reuse
                     # that predecessor as proof of session completion.
-                    settlement = None
+                    completed_receipt = (
+                        await self._session_store._load_interaction_transition_receipt_by_event_id(
+                            session.id,
+                            event_id=settlement.event.id,
+                            expected_session_instance_id=session.instance_id,
+                            expected_active_invocation_profile=active_profile,
+                        )
+                    )
+                    if (
+                        completed_receipt is None
+                        or not completed_receipt.status_changed
+                        or completed_receipt.transition != settlement
+                        or completed_receipt.session.run_epoch != active_profile.run_epoch
+                    ):
+                        settlement = None
                 if settlement is None:
                     if authoritative_failure is not None and not (
                         claim_has_not_dispatched_work or recovery_work_quiescent
@@ -20282,6 +20408,7 @@ class RecoveryCoordinator:
             await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
+                    ("recovery worker settlement", authority.await_worker_settlement),
                     (
                         "run fence release",
                         release_recovery_run_fence,
@@ -20790,11 +20917,13 @@ class RecoveryCoordinator:
         """Stream a live finalizer while retaining its durable lease."""
 
         events: asyncio.Queue[_RecoveryResultT] = asyncio.Queue(maxsize=1)
+        observer_closed = False
 
         async def collect_finalization() -> bool:
             try:
                 async for item in finalization:
-                    await events.put(item)
+                    if not observer_closed:
+                        await events.put(item)
                 return True
             finally:
                 close = getattr(finalization, "aclose", None)
@@ -20872,6 +21001,14 @@ class RecoveryCoordinator:
             authoritative_failure = exc
             raise
         finally:
+            # Delivery backpressure belongs to the observer, not the durable
+            # finalizer. Once abandoned, drain the one bounded slot to unblock
+            # an already-waiting put; later items must not queue for a consumer
+            # that no longer exists. Native publication/cleanup still runs under
+            # the retained worker and claim until positive settlement.
+            observer_closed = True
+            while not events.empty():
+                events.get_nowait()
             await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(("terminal evidence stream owner shutdown", stop_owner),),
@@ -21186,6 +21323,13 @@ class RecoveryCoordinator:
                 raise RuntimeError("Owned terminal operation returned no result.")
             return captured.result
 
+        # A preclaimed terminal finalizer borrows its caller's invocation and
+        # owns only its claim/work lifetime, not another run fence.
+        workers = claim.authority or _RecoveryWorkerSettlement()
+        worker_key = (claim.session.id, claim.claim_id)
+        prior_workers = self._recovery_claim_workers.get(worker_key)
+        if prior_workers is not None and not prior_workers.settled:
+            raise RuntimeError("Recovery claim already has active workers.")
         recovery_task = asyncio.create_task(run_recovery())
         heartbeat_task = asyncio.create_task(
             self._heartbeat_incomplete_recovery_claim(
@@ -21196,6 +21340,8 @@ class RecoveryCoordinator:
             )
         )
         recovery_task.add_done_callback(lambda _completed: stop_heartbeat.set())
+        workers.own_workers(recovery_task, heartbeat_task)
+        self._recovery_claim_workers[worker_key] = workers
         authoritative_failure: BaseException | None = None
 
         async def stop_workers() -> None:
@@ -21478,11 +21624,23 @@ class RecoveryCoordinator:
         )
         return renewed_until
 
+    def _owns_current_recovery_worker(self, session_id: str, claim_id: str) -> bool:
+        """Positive in-process ownership, not authority inferred from a durable ID."""
+        workers = self._recovery_claim_workers.get((session_id, claim_id))
+        return workers is not None and workers.owns_current_worker()
+
     async def _release_incomplete_recovery_claim(
         self,
         session_id: str,
         claim_id: str,
     ) -> None:
+        worker_key = (session_id, claim_id)
+        workers = self._recovery_claim_workers.get(worker_key)
+        if workers is not None:
+            # Covers both the inner finalizer and outer stream/interrupt cleanup
+            # callbacks. A bounded observer may leave before its work finishes;
+            # none of those callbacks may remove the live worker's durable claim.
+            await workers.await_worker_settlement()
         no_owned_claim = _IncompleteRecoveryClaimLost("Recovery claim is no longer retained.")
 
         def release_claim(
@@ -21505,6 +21663,8 @@ class RecoveryCoordinator:
                 raise
             # Returning an unchanged checkpoint can still update last_activity_at.
             # A stale owner must abort the transaction, not touch its successor.
+        if self._recovery_claim_workers.get(worker_key) is workers:
+            self._recovery_claim_workers.pop(worker_key, None)
 
     async def _recover_workspace_observations(
         self,
@@ -23723,6 +23883,78 @@ class RecoveryCoordinator:
             session.id
         ):
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
+
+        if (
+            session.status is SessionStatus.RUNNING
+            and invocation_context is not None
+            and invocation_context.work_attempt is None
+            and pending_tool_round is None
+            and pending_approval is None
+            and pending_user_input is None
+        ):
+            from cayu.runtime._producer_completion_replay import prepare_producer_completion_replay
+
+            producer_replay = await prepare_producer_completion_replay(
+                self._session_store, session, checkpoint, invocation_context, model_boundary
+            )
+            if producer_replay is not None:
+                stage = model_boundary.completed_stage
+                assert stage is not None
+                semantics = model_completion_recovery_context_from_stage(stage)
+                if (
+                    semantics is None
+                    or semantics.execution_profile_fingerprint
+                    != invocation_context.profile.fingerprint
+                    or semantics.interaction_id != invocation_context.binding.interaction_id
+                    or semantics.task_id is not None
+                ):
+                    raise ModelCompletionManualRecoveryRequired(
+                        "Producer completion lacks its original native run semantics."
+                    )
+                stream = self._run_session(
+                    RecoverySessionRunRequest(
+                        session=session,
+                        invocation_context=invocation_context,
+                        participant_context=participant_context,
+                        messages=await self._session_store.load_transcript(session.id),
+                        messages_to_append=[],
+                        max_steps=semantics.max_steps,
+                        limits=semantics.limits,
+                        budget_limits=semantics.budget_limits,
+                        retry_policy=semantics.retry_policy,
+                        structured_output=semantics.structured_output,
+                        thinking=semantics.thinking,
+                        request_metadata=semantics.request_metadata,
+                        task_id=None,
+                        task_worker_id=None,
+                        task_handoff_id=None,
+                        start_event_type=None,
+                        start_event_payload={},
+                        start_task_on_enter=False,
+                        release_run_fence_on_exit=False,
+                        run_limit_accounting=semantics.run_limit_accounting,
+                        producer_replay=producer_replay,
+                    )
+                )
+                async with _close_delegated_event_stream(stream) as owned:
+                    async for event in owned:
+                        events.append(event)
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(
+                        *actions,
+                        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE
+                        if current.status is SessionStatus.COMPLETED
+                        else IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
+                        if current.status is SessionStatus.INTERRUPTED
+                        else IncompleteSessionRecoveryAction.FAILED,
+                    ),
+                    events=tuple(events),
+                    message="Replayed the retained producer model result without provider redispatch.",
+                )
 
         if (
             session.status is SessionStatus.RUNNING

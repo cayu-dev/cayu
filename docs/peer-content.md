@@ -43,6 +43,13 @@ Authoritative `exposed` receipts are minted only by the runtime model-step
 owner after provider serialization; the public facade rejects caller-authored
 positive or negative exposure claims through `CayuApp.expose_peer_content`.
 
+Peer content is historical context, not a user instruction. When executing a
+recipient against an endpoint that requires user input, supply an explicit user
+request to process that context. For participant-session execution, include that
+input in the authorized creation request and use the same input for execution.
+The adapter does not silently invent a user instruction or promote peer content
+to user authority.
+
 Peer content does not create recipient sessions, wake a model, grant tools,
 transfer budgets/resources, or replace human/approval gates.
 

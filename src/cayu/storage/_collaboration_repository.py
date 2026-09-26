@@ -502,6 +502,14 @@ class _SQLRepository:
             sql += "".join(f", {column} = excluded.{column}" for column in extra)
         await self._execute(sql, (self.scope, *key, *extra_values, document))
         if table == "operations":
+            if not insert:
+                # Replacing an owner record and its exact history projection is
+                # one transaction. Re-inserting the old pins either conflicts or
+                # accumulates stale references across lifecycle transitions.
+                await self._execute(
+                    "DELETE FROM cayu_collaboration_history_uses WHERE scope=? AND namespace=? AND generation=? AND caller_key=?",
+                    (self.scope, *key),
+                )
             for family, participant_id, revision in history_references(value):
                 await self._execute(
                     "INSERT INTO cayu_collaboration_history_uses (scope, family, participant_id, revision, namespace, generation, caller_key) VALUES (?, ?, ?, ?, ?, ?, ?)",

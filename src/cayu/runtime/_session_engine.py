@@ -25,6 +25,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from cayu.resource_access import ResourceAccessPolicy, restore_session_stream
 
 if TYPE_CHECKING:
+    from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
     from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
 
 from pydantic import (
@@ -429,6 +430,7 @@ from cayu.runtime._model_step_executor import (
     preflight_portable_model_material,
     reconstruct_assistant_step_result,
 )
+from cayu.runtime._producer_execution import _ProducerExecution
 from cayu.runtime._recovery_coordinator import (
     _INCOMPLETE_RECOVERY_CLAIM_LEASE,
     ModelCompletionManualRecoveryRequired,
@@ -6873,6 +6875,8 @@ class SessionEngine:
     async def recover_incomplete_session(
         self,
         request: IncompleteSessionRecoveryRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
         (
@@ -6927,6 +6931,7 @@ class SessionEngine:
                 interaction_id=interaction_id,
                 active_through=active_through,
                 before_mutation=admit_before_mutation,
+                participant_context=participant_context,
             )
         finally:
             if interaction_id is not None:
@@ -7177,6 +7182,7 @@ class SessionEngine:
         interaction_id: str | None,
         active_through: datetime | None,
         before_mutation: Callable[[], Awaitable[None]],
+        participant_context: CollaborationAccessContext | None = None,
     ) -> IncompleteSessionRecoveryResult:
         retained_invocation_context: InvocationContext | None = None
 
@@ -7194,6 +7200,7 @@ class SessionEngine:
         result = await self._recovery_coordinator.recover_incomplete_session(
             request,
             before_mutation=before_mutation,
+            participant_context=participant_context,
             retain_open_interaction_invocation=(interaction_id is not None),
             retain_invocation_context=(
                 retain_invocation_context if interaction_id is not None else None
@@ -7971,6 +7978,10 @@ class SessionEngine:
                 SessionStatus.INTERRUPTED: EventType.INTERACTION_INTERRUPTED,
             }[result.status]
             if latest_records[0].event.type is not expected_terminal_type:
+                if await self._recovery_coordinator.has_completed_queued_predecessor(
+                    session, latest_records[0].event
+                ):
+                    return result
                 raise RuntimeError(
                     "Recovered interaction terminal evidence conflicts with session status."
                 )
@@ -9127,6 +9138,18 @@ class SessionEngine:
         completion_pending_finalization = (
             to_status is SessionStatus.RUNNING and checkpoint_mutation is not None
         )
+        if to_status is SessionStatus.COMPLETED or completion_pending_finalization:
+            producer_publication = (
+                model_completion_publication.model_step_publication_from_checkpoint(
+                    await self.session_store.load_checkpoint(session.id)
+                )
+            )
+            if producer_publication is not None:
+                await self.session_store._retain_native_producer_output(
+                    session.id,
+                    invocation=invocation_context,
+                    stage_id=producer_publication.stage_id,
+                )
         if to_status is SessionStatus.COMPLETED or completion_pending_finalization:
             event_type = EventType.INTERACTION_COMPLETED
             interaction_status = InteractionStatus.COMPLETED
@@ -13136,9 +13159,17 @@ class SessionEngine:
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
         execution_to_wait: _ExecutionToWait | None = None,
+        producer_output: _ProducerExecution | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(pause_after_initial_transcript) is not bool:
             raise TypeError("pause_after_initial_transcript must be a bool.")
+        if producer_output is not None and (
+            type(producer_output) is not _ProducerExecution
+            or producer_output.app._runtime_session_store is not self.session_store
+            or participant_execution_key is None
+            or execution_to_wait is not None
+        ):
+            raise PermissionError("Producer execution requires the exact native handoff.")
         if (participant_execution_key is None) != (participant_session_instance_id is None):
             raise ValueError(
                 "Participant execution requires both an execution key and session incarnation."
@@ -13234,9 +13265,13 @@ class SessionEngine:
                 or participant_session.instance_id != participant_session_instance_id
             ):
                 raise SessionStatusConflict("Participant session incarnation is unavailable.")
-            participant_checkpoint = await self.session_store.load_checkpoint(session_id)
+            participant_checkpoint = (
+                await self.session_store.load_checkpoint(session_id)
+                if producer_output is None
+                else await producer_output.checkpoint(self.session_store, session_id)
+            )
             if participant_session.status is SessionStatus.PENDING:
-                if participant_checkpoint is not None:
+                if participant_checkpoint is not None and producer_output is None:
                     raise SessionRunFenced(
                         "Participant session has unexpected checkpoint authority."
                     )
@@ -13293,8 +13328,10 @@ class SessionEngine:
                     participant_permit_operation=participant_permit_operation,
                     participant_permit_commitment=participant_permit_commitment,
                 )
-                admission_result = await self.session_store.apply_invocation_lifecycle_command(
-                    admission_command
+                admission_result = (
+                    await self.session_store.apply_invocation_lifecycle_command(admission_command)
+                    if producer_output is None
+                    else await producer_output.admit(admission_command)
                 )
                 if type(admission_result) is not InvocationMutationResult:
                     raise RuntimeError(
@@ -17711,7 +17748,15 @@ class SessionEngine:
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event | _QueuedCompletionResult, None]:
         async def admit_successor() -> None:
+            from cayu.runtime._producer_output_store import producer_owns_invocation
+
             try:
+                with _invocation_lifecycle_authority_read_scope():
+                    producer_checkpoint = await self.session_store.load_checkpoint(session.id)
+                if producer_owns_invocation(producer_checkpoint):
+                    # Preserve the completed producer's identity and leave queued
+                    # input for separately authorized work after owner settlement.
+                    raise SessionInterruptedByRequest(session.id)
                 await self._require_participant_execution(session, participant_context)
             except asyncio.CancelledError as cancellation:
                 # This read cannot dispatch a successor. The predecessor has
@@ -18716,6 +18761,7 @@ class SessionEngine:
         setup = await self._run_limit_controller.reserve_operation_budgets(
             budget_limits=budget_limits,
             session_id=session.id,
+            session_instance_id=session.instance_id,
             agent_name=registered_agent.spec.name,
             provider_name=provider_name,
             model=model,
@@ -20237,8 +20283,9 @@ class SessionEngine:
                     if terminal_finalization_transfer_cancellation is not None:
 
                         async def settle_cancelled_finalization() -> bool:
-                            async for _event in owned_finalization:
-                                pass
+                            async with _close_delegated_event_stream(owned_finalization) as owned:
+                                async for _event in owned:
+                                    pass
                             return True
 
                         settlement = await await_shielded_task_outcome(
@@ -20269,8 +20316,9 @@ class SessionEngine:
                     if terminal_finalization_transfer_process_control is not None:
 
                         async def settle_process_control_finalization() -> bool:
-                            async for _event in owned_finalization:
-                                pass
+                            async with _close_delegated_event_stream(owned_finalization) as owned:
+                                async for _event in owned:
+                                    pass
                             return True
 
                         settlement = await await_shielded_task_outcome(
@@ -20290,8 +20338,9 @@ class SessionEngine:
                             terminal_finalization_transfer_process_control,
                             secondary_failures,
                         )
-                    async for event in owned_finalization:
-                        yield event
+                    async with _close_delegated_event_stream(owned_finalization) as owned:
+                        async for event in owned:
+                            yield event
             else:
                 async for event in finalize_terminal_interruption():
                     yield event
@@ -24122,6 +24171,7 @@ class SessionEngine:
             preserve_failure_until_initial_provider_dispatch=(
                 request.preserve_failure_until_initial_provider_dispatch
             ),
+            producer_replay=request.producer_replay,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
@@ -24158,6 +24208,7 @@ class SessionEngine:
         preserve_failure_until_initial_provider_dispatch: bool = False,
         messages_deferred: bool = False,
         participant_context: CollaborationAccessContext | None = None,
+        producer_replay: _ProducerCompletionReplay | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -24246,6 +24297,7 @@ class SessionEngine:
             preserve_failure_until_initial_provider_dispatch=(
                 preserve_failure_until_initial_provider_dispatch
             ),
+            producer_replay=producer_replay,
         )
         for grant_event in targeted_tool_grant_events:
             yield grant_event
@@ -24377,6 +24429,7 @@ class SessionEngine:
         model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None,
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExecutionToWait | None = None,
+        producer_replay: _ProducerCompletionReplay | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -24996,7 +25049,25 @@ class SessionEngine:
                 and model_boundary.pending_tool_round is None
                 and model_boundary.transcript_cursor > model_boundary.pointer.transcript_end_cursor
             )
-            if (
+            if producer_replay is not None:
+                from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
+
+                if type(producer_replay) is not _ProducerCompletionReplay:
+                    raise PermissionError("Producer replay requires its native recovery owner.")
+                producer_replay.require(invocation_context, model_boundary)
+                stage = model_boundary.completed_stage
+                assert stage is not None and model_boundary.pointer is not None
+                recovered_assistant_step = reconstruct_assistant_step_result(
+                    stage=stage,
+                    pointer=model_boundary.pointer,
+                    pending_round=None,
+                    session_id=session.id,
+                    interaction_id=invocation_context.binding.interaction_id,
+                    source_run_epoch=stage.source_run_epoch,
+                )
+                if recovered_assistant_step is None:
+                    raise RuntimeError("Producer recovery has no committed assistant result.")
+            elif (
                 model_boundary.blocks_provider_dispatch or governed_closed_tool_round
             ) and not messages_to_append:
                 work_attempt = invocation_context.work_attempt
@@ -25417,6 +25488,8 @@ class SessionEngine:
                 if interaction_completed_event is not None:
                     yield interaction_completed_event
                 if not session_completed:
+                    if producer_replay is not None:
+                        raise SessionInterruptedByRequest(session.id)
                     recovered_step = recovered_structured_outcome.payload.get("step")
                     if type(recovered_step) is not int:
                         raise RuntimeError(
@@ -25804,6 +25877,10 @@ class SessionEngine:
             step = first_model_step - 1
             for step in model_steps:
                 replayed_step = recovered_assistant_step if step == first_model_step else None
+                if producer_replay is not None and replayed_step is None:
+                    # Completion recovery is not a new execution grant. A policy
+                    # asking for further work must leave this recovery boundary.
+                    raise SessionInterruptedByRequest(session.id)
                 model_step_identity = (
                     ModelStepIdentity(model_step_id=replayed_step.model_step_id)
                     if replayed_step is not None
@@ -26302,6 +26379,8 @@ class SessionEngine:
                         if interaction_completed_event is not None:
                             yield interaction_completed_event
                         if not session_completed:
+                            if producer_replay is not None:
+                                raise SessionInterruptedByRequest(session.id)
                             queued_completion = None
                             async with contextlib.aclosing(
                                 self._handle_queued_messages_before_completion(
@@ -26423,6 +26502,8 @@ class SessionEngine:
                                 if interaction_completed_event is not None:
                                     yield interaction_completed_event
                                 if not session_completed:
+                                    if producer_replay is not None:
+                                        raise SessionInterruptedByRequest(session.id)
                                     queued_completion = None
                                     async with contextlib.aclosing(
                                         self._handle_queued_messages_before_completion(
@@ -26677,6 +26758,10 @@ class SessionEngine:
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
                     if not session_completed:
+                        if producer_replay is not None:
+                            # A retained result may complete its own interaction,
+                            # but cannot consume a queue or admit its successor.
+                            raise SessionInterruptedByRequest(session.id)
                         queued_completion = None
                         async with contextlib.aclosing(
                             self._handle_queued_messages_before_completion(
@@ -31135,6 +31220,7 @@ class SessionEngine:
         self._session_control.begin_emitting_interrupted(session.id)
         terminal_finalization_claim_id: str | None = None
         terminal_finalization_handoff: TerminalFinalizationClaimHandoff | None = None
+        borrowed_terminal_finalization = False
         if current_task is not None:
             terminal_finalization_handoff = (
                 self._session_control.take_terminal_finalization_claim_handoff(
@@ -31261,6 +31347,11 @@ class SessionEngine:
                             )
                         )
                         terminal_finalization_claim_id = shared_claim[0]
+                        borrowed_terminal_finalization = (
+                            self._recovery_coordinator._owns_current_recovery_worker(
+                                session.id, shared_claim[0]
+                            )
+                        )
                         terminal_finalization_handoff = TerminalFinalizationClaimHandoff(
                             session_instance_id=loaded_interrupted.instance_id,
                             run_epoch=loaded_interrupted.run_epoch,
@@ -31792,16 +31883,22 @@ class SessionEngine:
                 await stop_terminal_finalization_handoff(
                     superseded_by_exact_renewal=True,
                 )
+                # Recovery already supervises this exact worker and claim. Run
+                # its nested finalizer inline; another worker/claim supervisor
+                # would depend on the outer worker that is awaiting this stream.
                 owned_finalization = (
-                    self._recovery_coordinator._stream_preclaimed_terminal_evidence_finalization(
+                    finalize_interrupted_session()
+                    if borrowed_terminal_finalization
+                    else self._recovery_coordinator._stream_preclaimed_terminal_evidence_finalization(
                         session=loaded_interrupted,
                         claim_id=terminal_finalization_claim_id,
                         expected_payload=payload,
                         finalization=finalize_interrupted_session(),
                     )
                 )
-                async for event in owned_finalization:
-                    yield event
+                async with _close_delegated_event_stream(owned_finalization) as owned:
+                    async for event in owned:
+                        yield event
             else:
                 async for event in finalize_interrupted_session():
                     yield event
@@ -31815,14 +31912,21 @@ class SessionEngine:
                                 "terminal evidence finalization handoff shutdown",
                                 stop_terminal_finalization_handoff,
                             ),
-                            (
-                                "terminal evidence finalization claim release",
-                                lambda: (
-                                    self._recovery_coordinator._release_incomplete_recovery_claim(
-                                        session.id,
-                                        terminal_finalization_claim_id,
-                                    )
-                                ),
+                            # A borrower cannot release its supervisor's claim.
+                            *(
+                                ()
+                                if borrowed_terminal_finalization
+                                else (
+                                    (
+                                        "terminal evidence finalization claim release",
+                                        lambda: (
+                                            self._recovery_coordinator._release_incomplete_recovery_claim(
+                                                session.id,
+                                                terminal_finalization_claim_id,
+                                            )
+                                        ),
+                                    ),
+                                )
                             ),
                         ),
                     )

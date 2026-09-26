@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass
 from dataclasses import field as dataclass_field
+from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Annotated, Any, Literal, Never, SupportsIndex, TypeAlias, cast
@@ -2516,10 +2517,11 @@ def require_invocation_rebind_lineage(
     original: ActiveInvocationExecutionProfile,
     current: ActiveInvocationExecutionProfile,
 ) -> None:
-    """Prove cleanup-only epoch transfers from retained store-owned receipts.
+    """Prove same-invocation epoch transfers from retained store-owned receipts.
 
     Rebinding preserves an invocation's complete profile and interaction. A new
     admission is not a rebind, even if it happens to use identical values.
+    This is provenance for retained output/cleanup, not current execution authority.
     """
 
     if (
@@ -2969,6 +2971,7 @@ def invocation_checkpoint_state_sha256(
     if checkpoint is not None:
         checkpoint = copy_durable_json_object(checkpoint, "invocation lifecycle checkpoint")
         from cayu.collaboration._session_export_store import ROOT_KEY as EXPORT_ROOT_KEY
+        from cayu.runtime._producer_output_store import ROOT_KEY as PRODUCER_ROOT_KEY
         from cayu.runtime._session_continuation_store import ROOT_KEY
 
         checkpoint.pop(ROOT_KEY, None)
@@ -2977,6 +2980,9 @@ def invocation_checkpoint_state_sha256(
         # preparation read makes an unchanged exported session falsely stale.
         # The export owner still validates/preserves its root independently.
         checkpoint.pop(EXPORT_ROOT_KEY, None)
+        # Producer ownership has its own exact native CAS transition. Ordinary
+        # runtime reads hide this root; it cannot change their lifecycle digest.
+        checkpoint.pop(PRODUCER_ROOT_KEY, None)
     return sha256(
         canonical_durable_json_bytes(
             checkpoint,
@@ -3192,9 +3198,11 @@ async def apply_invocation_lifecycle_command(
 
     if type(copied) is AdmitInvocationCommand:
 
-        def admit_checkpoint(session: Session, checkpoint: dict[str, Any] | None):
+        def admit_checkpoint(session: Session, checkpoint: dict[str, Any] | None, now: datetime):
+            from cayu.runtime._producer_output_store import require_native_admission
             from cayu.runtime._session_continuation_store import require_admission_claim
 
+            require_native_admission(checkpoint, copied, now=now)
             require_admission_claim(session, checkpoint, copied)
             require_invocation_admission_source_authority(
                 session,
@@ -3249,7 +3257,8 @@ async def apply_invocation_lifecycle_command(
                     copied.session_id,
                     admission=SessionInvocationAdmission(
                         from_statuses=frozenset(copied.expected_statuses),
-                        checkpoint_transform=admit_checkpoint,
+                        checkpoint_transform=None,
+                        store_time_checkpoint_transform=admit_checkpoint,
                         result_checkpoint_transform=record_admit_result,
                         execution_profile=copied.target_active_profile.profile,
                         interaction_source_messages=copied.interaction_source_messages,
@@ -3280,6 +3289,16 @@ async def apply_invocation_lifecycle_command(
     if type(copied) is RebindInvocationCommand:
 
         def rebind_checkpoint(session: Session, checkpoint: dict[str, Any] | None):
+            from cayu.runtime._producer_output_store import ROOT_KEY, NativeProducerIndex
+
+            if checkpoint is not None and ROOT_KEY in checkpoint:
+                producer = NativeProducerIndex.model_validate(checkpoint[ROOT_KEY])
+                if producer.cleanup_receipt is not None:
+                    from cayu.runtime._producer_output_store import require_successor_invocation
+
+                    require_successor_invocation(producer, copied.target_active_profile)
+                elif producer.paused_stop is not None:
+                    raise SessionRunFenced("The exact paused producer was durably stopped.")
             require_invocation_command_authority(
                 session,
                 checkpoint,

@@ -797,7 +797,7 @@ from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 104
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 110
 _SQLITE_TASK_MIN_REQUIRED_REVISION = 96
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -2095,6 +2095,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
     session_steering_version: ClassVar[int | None] = 1
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
+    _producer_attachment_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
@@ -6486,6 +6487,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         session_id = session.id
         export_records: dict[str, dict[str, Any]] = {}
         continuation_records: dict[str, dict[str, Any]] = {}
+        producer_records = {}
         # Allow JSON escaping/whitespace overhead; the shared validator applies
         # the durable document limit before model reconstruction.
         rows = self._connection.execute(
@@ -6493,6 +6495,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
             "THEN record_json END FROM cayu_session_operations "
             "WHERE session_id = ? AND (idempotency_key GLOB 'tool-effect:*' "
             "OR idempotency_key GLOB 'session-export:*' "
+            "OR idempotency_key GLOB 'producer-output:*' "
             "OR idempotency_key GLOB 'session-continuation:*')",
             (8 * DURABLE_DOCUMENT_LIMITS.max_bytes, session_id),
         )
@@ -6506,6 +6509,8 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                     ) from None
                 if key.startswith(continuations.CONTINUATION_OPERATION_PREFIX):
                     continuations.collect_retained_record(continuation_records, key, value)
+                elif key.startswith("producer-output:"):
+                    producer_records[key] = value
                 elif key.startswith(session_exports.OPERATION_PREFIX):
                     if type(value) is not dict:
                         raise ValueError("Session export retention evidence is malformed.")
@@ -6527,6 +6532,9 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = self._load_checkpoint_unlocked(session_id)
         deletion_now = self._ownership_clock()
+        from cayu.runtime._producer_output_store import require_erasure_quiescence
+
+        require_erasure_quiescence(session=session, checkpoint=checkpoint, records=producer_records)
         continuations.require_erasure_quiescence(
             session=session, checkpoint=checkpoint, records=continuation_records
         )
@@ -7103,6 +7111,31 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                     model_transition=prepared_model_transition,
                     decision=prepared_execution_profile_decision,
                 )
+                if (
+                    loaded.status == SessionStatus.PENDING
+                    and admission is not None
+                    and admission[3]
+                ):
+                    binding_row = self._connection.execute(
+                        "SELECT * FROM cayu_participant_session_bindings WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if binding_row is not None:
+                        from cayu.sessions._participant_execution_identity import (
+                            require_initial_execution_input,
+                        )
+                        from cayu.storage._participant_session_records import reconstruct
+
+                        transcript_rows = self._connection.execute(
+                            "SELECT message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY session_order",
+                            (session_id,),
+                        ).fetchall()
+                        require_initial_execution_input(
+                            loaded,
+                            reconstruct(dict(binding_row), loaded),
+                            [Message.model_validate_json(row[0]) for row in transcript_rows],
+                            admission[2],
+                        )
                 transition_metadata = transition_profile_metadata
                 if prepared_model_transition is not None:
                     transcript_rows = self._connection.execute(
@@ -7148,6 +7181,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                     session_id=session_id,
                 )
                 if store_time_checkpoint_transform is not None:
+                    updated_at = self._ownership_clock()
                     transformed_checkpoint = store_time_checkpoint_transform(
                         loaded,
                         checkpoint_copy,
@@ -13326,6 +13360,41 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         )
         return builder.finish()
 
+    async def _complete_native_producer_cleanup(self, registration, *, authority):
+        from cayu.storage._producer_cleanup import sqlite_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup is not qualified.")
+        return await sqlite_cleanup(self, registration, authority=authority, commit=True)
+
+    async def _retire_native_producer_cleanup(self, retirement, *, authority, limit):
+        from cayu.storage._producer_retirement import sqlite_retirement
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer retirement is not qualified.")
+        return await sqlite_retirement(self, retirement, authority=authority, limit=limit)
+
+    async def _read_completed_native_producer_cleanup(self, registration):
+        from cayu.storage._producer_cleanup import sqlite_cleanup
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer cleanup readback is not qualified.")
+        return await sqlite_cleanup(self, registration)
+
+    async def _read_native_producer_release(self, command):
+        from cayu.storage._producer_observation import sqlite_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer release readback is not qualified.")
+        return await sqlite_observation(self, command)
+
+    async def _read_native_producer_progress(self, command, *, kind):
+        from cayu.storage._producer_observation import sqlite_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer progress readback is not qualified.")
+        return await sqlite_observation(self, command, kind=kind)
+
     async def load_session_export_snapshot(
         self,
         session_id: str,
@@ -17475,7 +17544,31 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                     (session_id,),
                 ).fetchone()
                 if existing is not None:
-                    raise RuntimeError("Initial transcript changed before finalization.")
+                    from cayu.sessions._participant_execution_identity import (
+                        require_initial_execution_input,
+                    )
+                    from cayu.storage._participant_session_records import reconstruct
+
+                    binding_row = connection.execute(
+                        "SELECT * FROM cayu_participant_session_bindings WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    current_rows = connection.execute(
+                        "SELECT message_json FROM cayu_transcript_messages WHERE session_id = ? ORDER BY session_order",
+                        (session_id,),
+                    ).fetchall()
+                    require_initial_execution_input(
+                        session,
+                        None if binding_row is None else reconstruct(dict(binding_row), session),
+                        [Message.model_validate_json(row[0]) for row in current_rows],
+                        expected,
+                    )
+                    connection.execute(
+                        "DELETE FROM cayu_transcript_messages WHERE session_id = ?", (session_id,)
+                    )
+                    connection.execute(
+                        "UPDATE cayu_sessions SET transcript_seq = 0 WHERE id = ?", (session_id,)
+                    )
                 prefix_count = _initial_transcript_prefix_count(
                     expected,
                     replacement,

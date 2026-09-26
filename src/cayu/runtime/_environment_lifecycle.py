@@ -2056,7 +2056,11 @@ class EnvironmentLifecycle:
             and session.status is SessionStatus.COMPLETED
         ):
             receipt = await self._session_store.load_interaction_transition_receipt(
-                session_id, transition=transition
+                session_id,
+                transition=transition,
+                expected_recovery_claim_id=(
+                    None if invocation_context is None else invocation_context.recovery_claim_id
+                ),
             )
             if (
                 receipt is not None

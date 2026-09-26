@@ -3710,7 +3710,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "actor actual_amount attempt_id billing_identity budget_limit_id compactor execution_profile_fingerprint "
         "instruction_digest instruction_present interaction_id mode model_attempt_id "
         "model_step_id operation_id pricing reason released_amount request_id reservation_id "
-        "reserved_amount settled_at_unix_us settlement_id settlement_kind source_run_epoch "
+        "reserved_amount session_instance_id settled_at_unix_us settlement_id settlement_kind source_run_epoch "
         "source_transcript_cursor status",
         owned_nested_paths=(
             _resolution_actor_nested_paths("actor") | _BUDGET_RECONCILIATION_NESTED_PATHS

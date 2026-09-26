@@ -293,6 +293,22 @@ class _MutatedSettlementProfileLedger(InMemoryBudgetLedger):
         return settlement
 
 
+class _MutatedSettlementIncarnationLedger(InMemoryBudgetLedger):
+    async def load_settlement(self, settlement_id):
+        settlement = await super().load_settlement(settlement_id)
+        if settlement is not None:
+            settlement.event.payload["session_instance_id"] = "prefix-incarnation-canary"
+        return settlement
+
+
+class _MutatedSettlementPageIncarnationLedger(InMemoryBudgetLedger):
+    async def list_pending_settlements(self, **kwargs):
+        settlements = await super().list_pending_settlements(**kwargs)
+        if settlements:
+            settlements[0].event.payload["session_instance_id"] = "prefix-incarnation-canary"
+        return settlements
+
+
 def _budget_policy(
     *,
     provenance: Provenance | None = None,
@@ -623,12 +639,26 @@ def test_short_secret_collision_publishes_interaction_bound_settlement() -> None
         settlement = next(iter(ledger._settlements.values()))
         assert settlement.event.interaction_id is not None
         assert settlement.event.payload["interaction_id"] == settlement.event.interaction_id
+        session = await store.load(session_id)
+        assert session is not None
+        assert settlement.event.payload["session_instance_id"] == session.instance_id
         assert settlement.event_published is True
         durable = await store.query_events(
             EventQuery(session_id=session_id, event_id=settlement.event.id, limit=1)
         )
         assert len(durable) == 1
         assert durable[0].event == settlement.event
+
+        # An identical caller-shaped event does not inherit the ledger owner's
+        # in-process identity attestation merely by containing the same UUID.
+        from cayu.runtime._event_projection import prepare_new_runtime_event
+
+        raw = Event.model_validate_json(settlement.event.model_dump_json())
+        with pytest.raises(
+            ValueError, match="session_instance_id contains a workload secret"
+        ) as failure:
+            prepare_new_runtime_event(raw, redactor=SecretRedactor(session.instance_id))
+        assert session.instance_id not in str(failure.value)
 
     asyncio.run(scenario())
 
@@ -1492,6 +1522,46 @@ def test_runtime_revalidates_custom_ledger_pending_pages_before_publication() ->
         assert committed.event.payload["actual_amount"] is None
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("pending_page", [False, True])
+def test_runtime_authenticates_settlement_incarnation_before_publication(
+    pending_page: bool, caplog, capsys, recwarn
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        ledger = (
+            _MutatedSettlementPageIncarnationLedger()
+            if pending_page
+            else _MutatedSettlementIncarnationLedger()
+        )
+        owner_id = "sess_incarnation_outbox_owner"
+        if pending_page:
+            await _seed_pending_release(store, ledger, session_id=owner_id)
+        provider = _CompletedProvider()
+        app = _app(store, ledger, provider, secret_redactor=SecretRedactor("incarnation-canary"))
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_incarnation_trigger" if pending_page else owner_id,
+                    messages=[Message.text("user", "validate the outbox owner")],
+                )
+            )
+        ]
+        assert len(provider.requests) == (0 if pending_page else 1)
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert await _budget_events(store, owner_id) == []
+        committed = next(iter(ledger._settlements.values()))
+        assert not committed.event_published
+        assert "incarnation-canary" not in committed.model_dump_json()
+        assert all("incarnation-canary" not in event.model_dump_json() for event in events)
+
+    asyncio.run(scenario())
+    captured = capsys.readouterr()
+    assert "incarnation-canary" not in captured.out + captured.err + caplog.text
+    assert all("incarnation-canary" not in str(warning.message) for warning in recwarn)
 
 
 def test_session_deletion_waits_for_reachable_budget_outbox_publication() -> None:

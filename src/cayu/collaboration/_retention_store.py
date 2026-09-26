@@ -28,7 +28,7 @@ from cayu.collaboration._permits import (
     ReservedPermitSettlement,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract
-from cayu.collaboration._request_receipts import request_receipt_metadata
+from cayu.collaboration._request_receipts import record_operation, request_receipt_metadata
 from cayu.collaboration.base import CollaborationStore, _Anchor, _key, _Repository, _stored_mode
 from cayu.collaboration.lifecycle import LifecycleCommand, LifecycleReceipt, NamespacePrune
 from cayu.collaboration.participants import (
@@ -137,6 +137,21 @@ async def prune_namespace(
     for raw in records:
         if removed >= request.max_records:
             break
+        scanned_operation = record_operation(raw, redactor=redactor)
+        if (
+            await tx.get(
+                "operations",
+                (
+                    scanned_operation.namespace_incarnation,
+                    scanned_operation.generation,
+                    scanned_operation.caller_key,
+                ),
+            )
+            is None
+        ):
+            # An earlier request batch in this transaction may already have
+            # removed a later row from this same bounded scan.
+            continue
         mode = _stored_mode(raw)
         metadata = request_receipt_metadata(raw, redactor=redactor)
         planning_parent = None
@@ -156,6 +171,9 @@ async def prune_namespace(
                 if isinstance(planning, RequestPlanningReceipt)
                 else planning.intent.command.expected
             )
+        from cayu.collaboration._producer_pruning import producer_pruning_request
+
+        producer_request = await producer_pruning_request(tx, raw, redactor=redactor)
         if (
             mode == "permit"
             and isinstance(raw, dict)
@@ -175,6 +193,37 @@ async def prune_namespace(
                 planning_parent = await creation_permit_planning_parent(
                     tx, permit_item.expected, redactor=redactor
                 )
+            if registration.effect_scope == "request_acceptance":
+                from cayu.collaboration.requests import RequestSnapshot
+
+                source = registration.source_operation
+                snapshot_raw = await tx.get(
+                    "requests", (source.namespace_incarnation, source.generation, source.caller_key)
+                )
+                if snapshot_raw is not None:
+                    snapshot = prepare_contract(RequestSnapshot, snapshot_raw, redactor=redactor)
+                    if (
+                        snapshot.permit != permit_item.expected
+                        or snapshot.receipt.expected.operation != source
+                    ):
+                        raise CollaborationUnavailable(
+                            "Request permit pruning authority conflicts."
+                        )
+                    # The acceptance permit can sort before the first request
+                    # row. Retain it until the request's entire cursor completes.
+                    producer_request = snapshot.receipt.expected
+            if registration.effect_scope == "producer_output":
+                source = registration.source_operation
+                parent_raw = await tx.get(
+                    "operations",
+                    (source.namespace_incarnation, source.generation, source.caller_key),
+                )
+                if parent_raw is not None:
+                    producer_request = await producer_pruning_request(
+                        tx, parent_raw, redactor=redactor
+                    )
+                    if producer_request is None:
+                        raise CollaborationUnavailable("Producer permit pruning root conflicts.")
             if registration.effect_scope == "request_prepared_admission":
                 source = registration.source_operation
                 parent_raw = await tx.get(
@@ -198,12 +247,15 @@ async def prune_namespace(
                         )
                     metadata = parent_metadata
         if (
-            metadata is not None
+            producer_request is not None
+            or metadata is not None
             or mode in ("request", "request_control")
             or planning_parent is not None
         ):
-            command = metadata.expected if metadata is not None else planning_parent
-            if metadata is None and planning_parent is None:
+            command = producer_request or (
+                metadata.expected if metadata is not None else planning_parent
+            )
+            if command is None:
                 request_item = prepare_contract(
                     RequestReceipt if mode == "request" else RequestControlReceipt,
                     raw,

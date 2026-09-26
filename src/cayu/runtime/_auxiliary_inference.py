@@ -553,6 +553,7 @@ class AuxiliaryInferenceOwner:
         return await self._run_limit_controller.reserve_operation_budgets(
             budget_limits=budget_limits,
             session_id=session.id,
+            session_instance_id=session.instance_id,
             agent_name=binding.agent_name,
             environment_name=binding.environment_name,
             provider_name=provider.billing_provider_name or binding.provider_name,

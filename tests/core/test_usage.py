@@ -2868,7 +2868,11 @@ def test_sqlite_budget_ledger_revisions_21_through_25_add_settlement_schema(
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 25"):
+    from cayu.storage.budget_ledger import _SQLITE_MIN_REQUIRED_REVISION
+
+    with pytest.raises(
+        schema_migrations.SchemaTooOld, match=f"requires >= {_SQLITE_MIN_REQUIRED_REVISION}"
+    ):
         SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     async def migrate() -> None:

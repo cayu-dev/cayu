@@ -59,7 +59,7 @@ from cayu.runtime.execution_units import (
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
-_SQLITE_MIN_REQUIRED_REVISION = 25
+_SQLITE_MIN_REQUIRED_REVISION = 109
 
 
 class SQLiteBudgetLedger(BudgetLedger):
@@ -68,6 +68,8 @@ class SQLiteBudgetLedger(BudgetLedger):
     The ``cayu_budget_reservations`` table is owned by the shared migration
     machinery (ADR 0001 revision 8), not created ad hoc by this class.
     """
+
+    _producer_budget_readback_version = 1
 
     def __init__(
         self,
@@ -144,6 +146,24 @@ class SQLiteBudgetLedger(BudgetLedger):
             except BaseException:
                 self._connection.rollback()
                 raise
+
+    async def _require_registered_budget_binding(
+        self, *, binding_id: str, authority_digest: str, allowance: int
+    ) -> None:
+        from cayu.budgets._reservation_scan import (
+            binding_read_expectation,
+            require_binding_readback,
+        )
+
+        binding_id, digest, allowance = binding_read_expectation(
+            binding_id, authority_digest, allowance
+        )
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT authority_digest, allowance FROM cayu_budget_bindings WHERE binding_id = ?",
+                (binding_id,),
+            ).fetchone()
+            require_binding_readback(row, (digest, allowance))
 
     async def reserve_batch(
         self,
@@ -656,6 +676,23 @@ class SQLiteBudgetLedger(BudgetLedger):
             except KeyError:
                 return None
             return record.model_copy(deep=True)
+
+    async def _scan_reservation_records(
+        self, *, session_id: str, after: str | None = None, limit: int = 128
+    ) -> tuple[BudgetReservationRecord, ...]:
+        from cayu.budgets._reservation_scan import reservation_scan_bounds
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        after, limit = reservation_scan_bounds(after, limit)
+        async with self._lock:
+            with self._connection:
+                self._connection.execute("BEGIN")
+                rows = self._connection.execute(
+                    "SELECT reservation_id FROM cayu_budget_reservations "
+                    "WHERE session_id = ? AND reservation_id > ? ORDER BY reservation_id LIMIT ?",
+                    (session_id, after or "", limit),
+                ).fetchall()
+                return tuple(self._load_record_unlocked(row[0]) for row in rows)
 
     async def list_pending_settlements(
         self,

@@ -242,6 +242,24 @@ class ExportParticipantAdapter:
         return proposal
 
     async def complete(self, session, record: ExportRecord, authorization) -> ExportRecord:
+        exports = self.exports
+
+        async def publish(root, desired, current, updated):
+            await exports.publish(
+                session,
+                root,
+                desired,
+                operation_key(record.receipt.expected.intent.request.ref.operation),
+                updated.model_dump(mode="json"),
+                authorization,
+                [],
+                expected_old=current.model_dump(mode="json"),
+            )
+
+        return await self._complete_admission(session, record, publish=publish)
+
+    async def _complete_admission(self, session, record: ExportRecord, *, publish) -> ExportRecord:
+        """Settle the exact original permit before publishing native acceptance."""
         if record.admission is None or record.admission.settled:
             return record
         await self.settle(record.admission)
@@ -270,16 +288,7 @@ class ExportParticipantAdapter:
             )
             desired = root.model_copy(update={"admission_count": root.admission_count - 1})
             try:
-                await exports.publish(
-                    session,
-                    root,
-                    desired,
-                    operation_key(request.ref.operation),
-                    updated.model_dump(mode="json"),
-                    authorization,
-                    [],
-                    expected_old=current.model_dump(mode="json"),
-                )
+                await publish(root, desired, current, updated)
                 return updated
             except Exception as error:
                 settled = await exports._record(session, request)
@@ -297,11 +306,43 @@ class ExportParticipantAdapter:
     async def exclude(self, session, request, authorization) -> ExportPreparation | ExportRecord:
         """Exclude publication before discharging, even if registration is still in flight."""
         exports = self.exports
+
+        async def publish(root, desired, current, updated):
+            await exports.publish(
+                session,
+                root,
+                desired,
+                operation_key(request.ref.operation),
+                updated.model_dump(mode="json"),
+                authorization,
+                [],
+                expected_old=current.model_dump(mode="json"),
+            )
+
+        return await self._exclude_preparation(
+            session,
+            request,
+            excluded_by=exports.initiator(authorization),
+            mandate_commitment=exports.mandate_commitment(authorization),
+            publish=publish,
+            complete=lambda current: self.complete(session, current, authorization),
+        )
+
+    async def _exclude_preparation(
+        self, session, request, *, excluded_by, mandate_commitment, publish, complete
+    ) -> ExportPreparation | ExportRecord:
+        """Single exclusion/permit-settlement algorithm for trusted owner entrances.
+
+        The supplied publication and completion functions are native-owner
+        closures, never caller callbacks. They retain their own exact authority
+        and commit guard; this routine neither creates nor renews a grant.
+        """
+        exports = self.exports
         for _ in range(4):
             root = await exports.root(session)
             current = await exports._record(session, request)
             if isinstance(current, ExportRecord):
-                return await self.complete(session, current, authorization)
+                return await complete(current)
             if root is None or not isinstance(current, ExportPreparation):
                 raise SessionExportUnavailable()
             if current.state == "excluded":
@@ -313,23 +354,14 @@ class ExportParticipantAdapter:
                 current.model_copy(
                     update={
                         "state": "excluded",
-                        "excluded_by": exports.initiator(authorization),
-                        "exclusion_mandate_commitment": exports.mandate_commitment(authorization),
+                        "excluded_by": excluded_by,
+                        "exclusion_mandate_commitment": mandate_commitment,
                     }
                 ),
             )
             desired = root.model_copy(update={"pending_count": root.pending_count - 1})
             try:
-                await exports.publish(
-                    session,
-                    root,
-                    desired,
-                    operation_key(request.ref.operation),
-                    excluded.model_dump(mode="json"),
-                    authorization,
-                    [],
-                    expected_old=current.model_dump(mode="json"),
-                )
+                await publish(root, desired, current, excluded)
                 current = excluded
                 break
             except Exception as error:
@@ -373,16 +405,7 @@ class ExportParticipantAdapter:
             )
             desired = root.model_copy(update={"admission_count": root.admission_count - 1})
             try:
-                await exports.publish(
-                    session,
-                    root,
-                    desired,
-                    operation_key(request.ref.operation),
-                    updated.model_dump(mode="json"),
-                    authorization,
-                    [],
-                    expected_old=current.model_dump(mode="json"),
-                )
+                await publish(root, desired, current, updated)
                 return updated
             except Exception as error:
                 reconciled = await exports._record(session, request)

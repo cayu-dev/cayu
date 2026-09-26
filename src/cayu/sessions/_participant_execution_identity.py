@@ -11,10 +11,80 @@ from cayu._validation import canonical_durable_json_bytes
 
 if TYPE_CHECKING:
     from cayu.collaboration._permits import PermitReceipt
+    from cayu.messages import Message
+    from cayu.sessions.base import Session
     from cayu.sessions.context_views import (
         ParticipantSessionBinding,
+        ParticipantSessionCreationReceipt,
         ParticipantSessionExecutionRequest,
     )
+
+
+def require_execution_creation(
+    execution: ParticipantSessionExecutionRequest,
+    receipt: ParticipantSessionCreationReceipt,
+) -> None:
+    """Compare against native creation, including its store-retained provenance.
+
+    The caller must load the receipt from its registered SessionStore. Recipient
+    metadata is not accepted from the execution request or replaced on replay.
+    """
+    from cayu.sessions.context_views import ParticipantSessionCreationRequest
+
+    binding = receipt.binding
+    if (
+        execution.request.session_id != binding.session_id
+        or execution.session_instance_id != binding.session_instance_id
+    ):
+        raise ValueError("Participant execution conflicts with its creation identity.")
+    request = execution.request
+    if receipt.requested_session_id is None:
+        request = request.model_copy(update={"session_id": None}, deep=True)
+    expected = ParticipantSessionCreationRequest(
+        request=request,
+        creation_key=binding.creation_key,
+        metadata_json=receipt.recipient_metadata_json,
+    )
+    if expected.request_commitment != binding.request_commitment:
+        raise ValueError("Participant execution conflicts with its creation request.")
+
+
+def require_initial_execution_input(
+    session: Session,
+    receipt: ParticipantSessionCreationReceipt | None,
+    current: list[Message],
+    expected: list[Message],
+) -> None:
+    """Allow native first-activation adoption of exactly the retained inert input.
+
+    Called under the store mutation lock alongside deferred-input validation.
+    It does not authorize arbitrary nonempty transcript replacement.
+
+    Ordinary participant creation can leave the transcript empty and defer the
+    request's first input to runtime admission. Recipient creation can instead
+    retain that input immediately. The receipt commits the prepared input in
+    either case. Only ordinary creation may defer materialization; a recipient
+    transcript must still match even when it has become empty.
+    """
+    from cayu.sessions.context_views import json_commitment
+
+    deferred = receipt is not None and receipt.recipient_metadata_json is None and not current
+    committed_input = expected if deferred else current
+    if (
+        receipt is None
+        or (session.status, session.run_epoch) not in {("pending", 0), ("running", 1)}
+        or receipt.binding.session_id != session.id
+        or receipt.binding.session_instance_id != session.instance_id
+        or (not deferred and current != expected)
+        or receipt.initial_input_commitment
+        != json_commitment(
+            canonical_durable_json_bytes(
+                [message.model_dump(mode="json") for message in committed_input], "initial_input"
+            ).decode(),
+            "initial_input",
+        )
+    ):
+        raise RuntimeError("Initial transcript changed before finalization.")
 
 
 @dataclass(frozen=True, slots=True)

@@ -40,6 +40,64 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions._recipient_continuation",
         "RecipientContinuationSelection",
     ),
+    "ProducerCleanupReclamation": (
+        "cayu.runtime._producer_retirement",
+        "ProducerCleanupReclamation",
+    ),
+    "ProducerCleanupRetirement": ("cayu.runtime._producer_retirement", "ProducerCleanupRetirement"),
+    "ProducerProgressReference": (
+        "cayu.collaboration._producer_progress_contracts",
+        "ProducerProgressReference",
+    ),
+    "ProducerProgressOccurrence": (
+        "cayu.collaboration._producer_progress_contracts",
+        "ProducerProgressOccurrence",
+    ),
+    "ProducerProgressCommand": ("cayu.collaboration.requests", "ProducerProgressCommand"),
+    "ProducerOutputProposal": ("cayu.collaboration._producer_contracts", "ProducerOutputProposal"),
+    "ProducerCompletionRecord": (
+        "cayu.collaboration._producer_contracts",
+        "ProducerCompletionRecord",
+    ),
+    "ProducerCleanupFinalized": (
+        "cayu.collaboration._producer_cleanup_finalization",
+        "ProducerCleanupFinalized",
+    ),
+    "ProducerDeliveryRecovery": (
+        "cayu.collaboration._producer_delivery_recovery",
+        "ProducerDeliveryRecovery",
+    ),
+    "ProducerDeliveryStatus": (
+        "cayu.collaboration._producer_delivery_recovery",
+        "ProducerDeliveryStatus",
+    ),
+    "ProducerDispositionStatus": (
+        "cayu.collaboration._producer_disposition",
+        "ProducerDispositionStatus",
+    ),
+    "ProducerExportCleanupStatus": (
+        "cayu.collaboration._producer_export_cleanup",
+        "ProducerExportCleanupStatus",
+    ),
+    "ProducerOutputAcceptanceReader": (
+        "cayu.collaboration._producer_acceptance",
+        "ProducerOutputAcceptanceReader",
+    ),
+    "ProducerExportRecord": ("cayu.collaboration._producer_contracts", "ProducerExportRecord"),
+    "ProducerDeliveryRecord": ("cayu.collaboration._producer_contracts", "ProducerDeliveryRecord"),
+    "ProducerOutputRegistration": (
+        "cayu.collaboration._producer_contracts",
+        "ProducerOutputRegistration",
+    ),
+    "ProducerOutputRecord": ("cayu.collaboration._producer_contracts", "ProducerOutputRecord"),
+    "ProducerOutputLimits": ("cayu.collaboration._producer_contracts", "ProducerOutputLimits"),
+    "ProducerDeliveryDestination": (
+        "cayu.collaboration._producer_contracts",
+        "ProducerDeliveryDestination",
+    ),
+    "ProducerOutputRecovery": ("cayu.collaboration._producer_recovery", "ProducerOutputRecovery"),
+    "ProducerPendingOutput": ("cayu.collaboration._producer_recovery", "ProducerPendingOutput"),
+    "ProducerPendingPage": ("cayu.collaboration._producer_recovery", "ProducerPendingPage"),
     "ClarificationQuestionRecovery": (
         "cayu.collaboration._clarification_recovery_types",
         "ClarificationQuestionRecovery",
@@ -6217,6 +6275,28 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "ProducerCompletionRecord",
+    "ProducerCleanupFinalized",
+    "ProducerDeliveryRecovery",
+    "ProducerDeliveryStatus",
+    "ProducerDispositionStatus",
+    "ProducerExportCleanupStatus",
+    "ProducerOutputAcceptanceReader",
+    "ProducerExportRecord",
+    "ProducerDeliveryRecord",
+    "ProducerOutputRegistration",
+    "ProducerOutputProposal",
+    "ProducerProgressOccurrence",
+    "ProducerProgressReference",
+    "ProducerCleanupReclamation",
+    "ProducerCleanupRetirement",
+    "ProducerProgressCommand",
+    "ProducerOutputRecord",
+    "ProducerOutputLimits",
+    "ProducerDeliveryDestination",
+    "ProducerOutputRecovery",
+    "ProducerPendingOutput",
+    "ProducerPendingPage",
     "ClarificationDeliveryRecovery",
     "ClarificationQuestionRecovery",
     "ClarificationDueQuestion",

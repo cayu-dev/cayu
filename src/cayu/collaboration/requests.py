@@ -22,6 +22,10 @@ from cayu.collaboration._contracts import (
     snapshot_input,
 )
 from cayu.collaboration._permits import PermitCommand, PermitReceipt
+from cayu.collaboration._producer_progress_contracts import (
+    ProducerProgressEvidence,
+    ProducerProgressReference,
+)
 from cayu.collaboration.exports import SessionExportReceipt, SessionExportRef
 from cayu.collaboration.mandates import MandateResolution
 from cayu.collaboration.participants import (
@@ -33,6 +37,7 @@ from cayu.collaboration.participants import (
 )
 from cayu.collaboration.prepared_admission import (
     MAX_PREPARED_ADMISSION_BYTES,
+    NativeCommitment,
     PreparedRecipientAdmission,
 )
 
@@ -490,8 +495,26 @@ class RequestProgressCommand(ContractValue):
         return self
 
 
+class ProducerProgressCommand(RequestProgressCommand):
+    """Owner-produced native milestone, distinct from a caller's export receipt."""
+
+    producer: OperationRef
+    evidence: ProducerProgressEvidence
+
+    @model_validator(mode="after")
+    def native_progress(self):
+        if (
+            self.source_receipt is not None
+            or self.producer != self.evidence.registration
+            or self.kind != self.evidence.kind
+            or self.commitment != self.evidence.native_commitment
+        ):
+            raise ValueError("Producer progress native evidence conflicts.")
+        return self
+
+
 class RequestProgressReceipt(ContractValue):
-    command: RequestProgressCommand
+    command: ProducerProgressCommand | RequestProgressCommand
     revision: Generation
     event: RequestEvent
 
@@ -552,8 +575,53 @@ class RequestOutcomeCommand(ContractValue):
         return self
 
 
+class ProducerOutcomeCommand(ContractValue):
+    """Store-minted election tuple; data is not attached-producer authority."""
+
+    operation: OperationRef
+    mode: Literal["producer_outcome"] = "producer_outcome"
+    expected: RequestCommand
+    expected_revision: Generation
+    outcome: Literal["answered", "failed"]
+    initiator: InitiatorBinding
+    producer: OperationRef
+    completion: OperationRef
+    publisher_generation: Generation
+    terminal_frontier: Counter
+    native_commitment: NativeCommitment
+    commitment: NativeCommitment
+    export: OperationRef | None = None
+    destination: OperationRef | None = None
+    output_failure: OperationRef | None = None
+
+    @model_validator(mode="after")
+    def exact_producer_outcome(self):
+        original = self.expected.operation
+        if (
+            self.operation == original
+            or any(
+                (item.application_scope, item.namespace_incarnation, item.generation)
+                != (original.application_scope, original.namespace_incarnation, original.generation)
+                for item in (
+                    self.operation,
+                    self.producer,
+                    self.completion,
+                    *(() if self.export is None else (self.export,)),
+                    *(() if self.destination is None else (self.destination,)),
+                    *(() if self.output_failure is None else (self.output_failure,)),
+                )
+            )
+            or (self.outcome == "answered") != (self.export is not None)
+            or (self.export is None) != (self.destination is None)
+            or (self.output_failure is not None and self.outcome != "failed")
+            or self.terminal_frontier > 64
+        ):
+            raise ValueError("Producer outcome identity is inconsistent.")
+        return self
+
+
 class RequestOutcomeReceipt(ContractValue):
-    command: RequestOutcomeCommand
+    command: RequestOutcomeCommand | ProducerOutcomeCommand
     revision: Generation
     elected_at_ms: Millis
     event: RequestEvent
@@ -685,16 +753,37 @@ class RequestSnapshot(ContractValue):
     admission_generation: Annotated[Generation, Field(ge=0)] = 0
     admission_decision: AdmissionDecision | None = None
     admission_operation: OperationRef | None = None
-    progress: tuple[RequestProgressReceipt, ...] = Field(default=(), max_length=64)
+    progress: tuple[ProducerProgressReference | RequestProgressReceipt, ...] = Field(
+        default=(), max_length=64
+    )
     outcome: RequestOutcomeReceipt | None = None
     observations: tuple[RequestObservation, ...] = Field(default=(), max_length=32)
     observation_revision: Annotated[Generation, Field(ge=0)] = 0
     event_sequences: tuple[Generation, ...] = Field(default=(), max_length=64)
+    producer_operation: OperationRef | None = None
+    producer_settlement: OperationRef | None = None
     clarification: ClarificationFrontier = Field(default_factory=ClarificationFrontier)
 
     @model_validator(mode="after")
     def coherent_state(self) -> RequestSnapshot:
         reference = self.receipt.expected.intent.selection.reference
+        if self.producer_settlement is not None and (
+            self.producer_operation is None
+            or self.producer_settlement.application_scope
+            != self.producer_operation.application_scope
+            or self.producer_settlement.namespace_incarnation
+            != self.producer_operation.namespace_incarnation
+            or self.producer_settlement.generation != self.producer_operation.generation
+        ):
+            raise ValueError("Producer settlement identity is inconsistent.")
+        if self.producer_operation is not None and (
+            self.producer_operation.application_scope
+            != self.receipt.expected.operation.application_scope
+            or self.producer_operation.namespace_incarnation
+            != self.receipt.expected.operation.namespace_incarnation
+            or self.producer_operation.generation != self.receipt.expected.operation.generation
+        ):
+            raise ValueError("Producer responsibility belongs to another request namespace.")
         if (
             self.clarification.lineage is not None
             and self.clarification.lineage.application_scope != reference.owner.application_scope
@@ -745,7 +834,14 @@ class RequestSnapshot(ContractValue):
             or self.terminal.state != self.state
             or self.terminal.revision != self.revision
             or self.admission != "closed"
-            or self.delivery != "excluded"
+            or self.delivery
+            not in (
+                ("excluded",)
+                if self.producer_operation is None
+                else ("excluded", "published")
+                if self.producer_settlement is not None
+                else ("pending",)
+            )
             or self.next_due_at_ms != 0
         ):
             raise ValueError("Terminal request evidence is inconsistent.")

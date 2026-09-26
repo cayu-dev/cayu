@@ -132,17 +132,34 @@ async def retained_request(
         redactor=redactor,
     )
     require_exact_contract(receipt, snapshot.receipt, redactor=redactor)
+    if snapshot.producer_operation is not None:
+        from cayu.collaboration._producer_store import read_request_output
+
+        producer = await read_request_output(tx, receipt.expected, redactor=redactor)
+        if producer is None or producer.command.operation != snapshot.producer_operation:
+            raise CollaborationUnavailable("Request producer responsibility is unavailable.")
+        if snapshot.producer_settlement != producer.cleanup_ack:
+            raise CollaborationUnavailable("Request producer settlement is inconsistent.")
+        if producer.cleanup_ack is not None:
+            from cayu.collaboration._producer_cleanup_finalization import read_finalization
+
+            final = await read_finalization(tx, producer, redactor=redactor)
+            if final is None or snapshot.delivery != final.delivery:
+                raise CollaborationUnavailable("Request producer delivery summary is inconsistent.")
     if snapshot.clarification.generation:
         from cayu.collaboration._clarification_store import validate_request_frontier
 
         await validate_request_frontier(tx, snapshot, redactor)
     await require_request_event(tx, receipt.event, redactor)
+    progress_events = []
     for sequence in snapshot.event_sequences:
         event = prepare_contract(
             RequestEvent, await tx.get("request_events", (sequence,)), redactor=redactor
         )
         if event.sequence != sequence or event.request != receipt.event.request:
             raise CollaborationUnavailable("Request event frontier has conflicting evidence.")
+        if event.type == "request_progress":
+            progress_events.append((event.operation, event.sequence))
     if snapshot.terminal is not None:
         terminal = prepare_contract(
             RequestControlReceipt,
@@ -173,15 +190,48 @@ async def retained_request(
         await require_prepared_admission_evidence(tx, admission, redactor=redactor)
     elif snapshot.admission_generation:
         raise CollaborationUnavailable("Request lacks its admission receipt identity.")
-    for progress in snapshot.progress:
+    from cayu.collaboration._producer_progress_contracts import ProducerProgressReference
+    from cayu.collaboration.requests import ProducerProgressCommand
+
+    accepted_progress = []
+    for position, progress in enumerate(snapshot.progress, 1):
+        operation = (
+            progress.operation
+            if isinstance(progress, ProducerProgressReference)
+            else progress.command.operation
+        )
         retained = prepare_contract(
             RequestProgressReceipt,
-            await tx.get("operations", operation_key(progress.command.operation)),
+            await tx.get("operations", operation_key(operation)),
             redactor=redactor,
         )
-        require_exact_contract(progress, retained, redactor=redactor)
+        if isinstance(progress, ProducerProgressReference):
+            if not isinstance(retained.command, ProducerProgressCommand):
+                raise CollaborationUnavailable(
+                    "Native progress frontier lacks its producer receipt."
+                )
+            require_exact_contract(
+                progress,
+                ProducerProgressReference.from_receipt(retained, redactor=redactor),
+                redactor=redactor,
+            )
+        else:
+            require_exact_contract(progress, retained, redactor=redactor)
         require_exact_contract(receipt.expected, retained.command.expected, redactor=redactor)
+        if (
+            retained.command.sequence != position
+            or retained.revision > snapshot.revision
+            or retained.event.sequence not in snapshot.event_sequences
+        ):
+            raise CollaborationUnavailable(
+                "Request progress frontier is incomplete or conflicting."
+            )
         await require_request_event(tx, retained.event, redactor)
+        accepted_progress.append((retained.command.operation, retained.event.sequence))
+    if accepted_progress != progress_events:
+        raise CollaborationUnavailable(
+            "Request progress evidence does not cover its event frontier."
+        )
     if snapshot.outcome is not None:
         outcome = prepare_contract(
             RequestOutcomeReceipt,
@@ -189,7 +239,13 @@ async def retained_request(
             redactor=redactor,
         )
         require_exact_contract(snapshot.outcome, outcome, redactor=redactor)
-        if outcome.command.outcome == "answered" and (
+        from cayu.collaboration.requests import ProducerOutcomeCommand
+
+        if isinstance(outcome.command, ProducerOutcomeCommand):
+            from cayu.collaboration._producer_outcome_store import require_producer_outcome
+
+            await require_producer_outcome(tx, snapshot, outcome.command, redactor=redactor)
+        elif outcome.command.outcome == "answered" and (
             admission is None
             or admission.command.source_export is None
             or outcome.command.source_receipt is None
@@ -279,7 +335,7 @@ async def control_in_transaction(
     state = "expired" if expired else "cancelled"
     event = RequestEvent(
         id=uuid4().hex,
-        sequence=anchor.event_sequence + 2,
+        sequence=anchor.event_sequence + (2 if prior.producer_operation is None else 1),
         operation=expected.operation,
         request=original.intent.selection.reference,
         type="request_expired" if expired else "request_cancelled",
@@ -304,7 +360,7 @@ async def control_in_transaction(
                 "state": state,
                 "terminal": receipt,
                 "admission": "closed",
-                "delivery": "excluded",
+                "delivery": "excluded" if prior.producer_operation is None else "pending",
                 "next_due_at_ms": 0,
                 "event_sequences": (*prior.event_sequences, event.sequence),
             }
@@ -333,9 +389,16 @@ async def control_in_transaction(
             receipt_id=event.id,
             outcome="quiescent",
         )
-    if settlement is None:
-        raise CollaborationUnavailable("Request responsibility needs receiving-owner settlement.")
-    await settle_permit_in_transaction(store, tx, initialized, prior.permit, settlement, redactor)
+    if prior.producer_operation is None:
+        if settlement is None:
+            raise CollaborationUnavailable(
+                "Request responsibility needs receiving-owner settlement."
+            )
+        await settle_permit_in_transaction(
+            store, tx, initialized, prior.permit, settlement, redactor
+        )
+    # Producer closure is an election, not quiescence. Both request and producer
+    # permits remain owned until the exact native cleanup handoff is acknowledged.
     anchor = await store._anchor(tx, initialized, redactor)
     if not anchor.reserved_operations or not anchor.reserved_events:
         raise CollaborationUnavailable("Request lacks reserved terminal responsibility.")
@@ -475,7 +538,12 @@ def preflight_control(snapshot: RequestSnapshot, redactor: SecretRedactor) -> No
                     "revision": 2,
                     "state": candidate.state,
                     "admission": "closed",
-                    "delivery": "excluded",
+                    "delivery": (
+                        "excluded"
+                        if snapshot.producer_operation is None
+                        or snapshot.producer_settlement is not None
+                        else "pending"
+                    ),
                     "terminal": candidate,
                     "next_due_at_ms": 0,
                     "event_sequences": (*snapshot.event_sequences, candidate.event.sequence),

@@ -95,6 +95,18 @@ def test_additive_revision_inherits_floor_breaking_raises_it():
     assert breaking.compatible_from == breaking.revision  # breaking floors at itself
 
 
+def test_revision_110_fences_writers_without_producer_retention() -> None:
+    revision = m.revision(110)
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 110
+    state = m.SchemaState(revision=110, compatible_from=110)
+    # An older writer can delete a producing session without authenticating
+    # its retained output or cleanup handoff, even if it understands the tables.
+    with pytest.raises(m.SchemaTooNew):
+        m.validate(state, app_latest=109, app_min_supported=108)
+    m.validate(state, app_latest=110, app_min_supported=110)
+
+
 def test_revision_thirty_one_rejects_pre_input_contract_readers() -> None:
     state = m.SchemaState(revision=31, compatible_from=31)
 

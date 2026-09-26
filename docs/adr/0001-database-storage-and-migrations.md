@@ -49,6 +49,20 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
 
 ## Decisions
 
+Revision 109 adds the session/record-identity index used by bounded budget
+reservation recovery. Budget ledgers require this revision; PostgreSQL builds
+the index concurrently during migration. Recovery inventory includes unpublished
+reservations and remains distinct from proof of invocation or effect quiescence.
+
+Revision 110 retains exact native producer cleanup acknowledgements independently
+of session rows. Session stores require this revision so deletion cannot erase
+the evidence needed to reconcile a lost cleanup acknowledgement. A source-namespace
+index supports bounded reclamation after source history is pruned. A separate
+monotonic namespace fence prevents late cleanup from recreating retired receipts,
+including after receiving-configuration changes. This is a
+breaking writer boundary: older writers lack the producer-retention guards and
+must not mutate the upgraded store, even if they recognize its other tables.
+
 1. **Database stays the canonical runtime store.** Keep SQLite for local
    durability; keep Postgres for production. JSONL is an **export/replay/backup**
    format only — never the hot path.

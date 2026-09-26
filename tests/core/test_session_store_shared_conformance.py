@@ -8,7 +8,6 @@ import hashlib
 import io
 import json
 import threading
-import time
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -10683,13 +10682,14 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
             await asyncio.sleep(0)
             return True
 
-        claim = recovery_coordinator_module._IncompleteRecoveryClaim(
-            claim_id="simultaneous-claim",
-            local_lease_deadline=time.monotonic() + 300,
-            claim_expires_at=datetime.now(UTC) + timedelta(minutes=5),
-            session_before_fence=session,
+        claim = await recovery._claim_incomplete_recovery(
             session=session,
+            inactive_for_seconds=None,
+            execution_profile_snapshot=active_invocation_execution_profile_from_checkpoint(
+                await store.load_checkpoint(session.id)
+            ),
         )
+        assert claim is not None
         with pytest.raises(
             recovery_coordinator_module._IncompleteRecoveryClaimLost,
             match="peer replaced",

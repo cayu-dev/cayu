@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from bisect import bisect_right, insort
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, DecimalException, Inexact, localcontext
@@ -1931,6 +1932,42 @@ class BudgetLedger(ABC):
     a store-owned injectable clock.
     """
 
+    _producer_budget_readback_version = 0
+
+    def _supports_producer_budget_readback(self) -> bool:
+        if (
+            "_producer_budget_readback_version" in vars(self)
+            or type(self._producer_budget_readback_version) is not int
+            or self._producer_budget_readback_version != 1
+        ):
+            return False
+        owners = type(self).__mro__
+        capability = next(
+            i
+            for i, owner in enumerate(owners)
+            if "_producer_budget_readback_version" in owner.__dict__
+        )
+        methods = (
+            "register_budget_binding",
+            "reserve",
+            "reserve_batch",
+            "mark_dispatched",
+            "release_pre_provider_dispatch",
+            "reconcile",
+            "release",
+            "heartbeat",
+            "load_reservation",
+            "load_settlement",
+            "_scan_reservation_records",
+            "_require_registered_budget_binding",
+            "mark_settlement_event_published",
+        )
+        return all(
+            name not in vars(self)
+            and next(i for i, owner in enumerate(owners) if name in owner.__dict__) >= capability
+            for name in methods
+        )
+
     async def reserve_batch(
         self,
         *,
@@ -1976,6 +2013,12 @@ class BudgetLedger(ABC):
                 raise BudgetBindingRegistrationConflict(
                     "Budget binding id is already registered with different authority."
                 )
+
+    async def _require_registered_budget_binding(
+        self, *, binding_id: str, authority_digest: str, allowance: int
+    ) -> None:
+        """Verify retained registration without resolving or registering authority."""
+        raise NotImplementedError("Original budget registration readback is not qualified.")
 
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return local files that hold this ledger's durable state."""
@@ -2152,6 +2195,19 @@ class BudgetLedger(ABC):
         raise NotImplementedError(
             "This budget ledger does not support provider-operation reservation recovery."
         )
+
+    async def _scan_reservation_records(
+        self, *, session_id: str, after: str | None = None, limit: int = 128
+    ) -> tuple[BudgetReservationRecord, ...]:
+        """Read a session-scoped identity-ordered page, including unpublished work.
+
+        This is not a quiescence proof: a registered owner must independently
+        fence new dispatch before interpreting a completed scan. Cursor reuse
+        while insertions remain possible cannot prove inventory completeness.
+        Session filtering does not authenticate invocation or sponsor identity;
+        the receiving owner must compare each record's original authority.
+        """
+        raise NotImplementedError("Budget reservation inventory is not qualified.")
 
     @abstractmethod
     async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
@@ -2406,6 +2462,8 @@ def _budget_cost_query(
 class InMemoryBudgetLedger(BudgetLedger):
     """In-memory reservation ledger for single-process apps and tests."""
 
+    _producer_budget_readback_version = 1
+
     def __init__(
         self,
         *,
@@ -2413,10 +2471,27 @@ class InMemoryBudgetLedger(BudgetLedger):
         reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
     ) -> None:
         self._records: dict[str, BudgetReservationRecord] = {}
+        self._reservation_ids_by_session: dict[str, list[str]] = {}
         self._settlements: dict[str, BudgetSettlementRecord] = {}
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
+
+    async def _require_registered_budget_binding(
+        self, *, binding_id: str, authority_digest: str, allowance: int
+    ) -> None:
+        from cayu.budgets._reservation_scan import (
+            binding_read_expectation,
+            require_binding_readback,
+        )
+
+        binding_id, digest, allowance = binding_read_expectation(
+            binding_id, authority_digest, allowance
+        )
+        state = _budget_ledger_binding_registration_state(self)
+        with state.lock:
+            found = state.bindings.get(binding_id)
+            require_binding_readback(None if found is None else found[:2], (digest, allowance))
 
     async def reserve_batch(
         self,
@@ -2490,6 +2565,11 @@ class InMemoryBudgetLedger(BudgetLedger):
             self._records.update(
                 {r.reservation_id: r.model_copy(deep=True) for r in result.records}
             )
+            for record in result.records:
+                insort(
+                    self._reservation_ids_by_session.setdefault(record.session_id, []),
+                    record.reservation_id,
+                )
             return result
 
     @property
@@ -2607,6 +2687,10 @@ class InMemoryBudgetLedger(BudgetLedger):
                     "Budget ledger reused a reservation identity."
                 )
             self._records[record.reservation_id] = record.model_copy(deep=True)
+            insort(
+                self._reservation_ids_by_session.setdefault(record.session_id, []),
+                record.reservation_id,
+            )
             return _reservation_result(
                 limit=limit,
                 model_attempt_identity=model_attempt_identity,
@@ -2807,6 +2891,19 @@ class InMemoryBudgetLedger(BudgetLedger):
         async with self._lock:
             record = self._records.get(reservation_id)
             return None if record is None else record.model_copy(deep=True)
+
+    async def _scan_reservation_records(
+        self, *, session_id: str, after: str | None = None, limit: int = 128
+    ) -> tuple[BudgetReservationRecord, ...]:
+        from cayu.budgets._reservation_scan import reservation_scan_bounds
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        after, limit = reservation_scan_bounds(after, limit)
+        async with self._lock:
+            indexed = self._reservation_ids_by_session.get(session_id, [])
+            start = 0 if after is None else bisect_right(indexed, after)
+            keys = indexed[start : start + limit]
+            return tuple(self._records[key].model_copy(deep=True) for key in keys)
 
     async def list_pending_settlements(
         self,
@@ -4412,6 +4509,8 @@ def _budget_settlement_record(
     ]
     if "execution_profile_fingerprint" in event.payload:
         payload_fields.append("execution_profile_fingerprint")
+    if "session_instance_id" in event.payload:
+        payload_fields.append("session_instance_id")
     if event.interaction_id is not None:
         if event.payload.get("interaction_id") != event.interaction_id:
             raise RuntimeError("Budget settlement event changed its interaction identity.")

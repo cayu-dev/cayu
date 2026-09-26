@@ -10,6 +10,12 @@ from pydantic import Field, StrictInt, model_validator
 from cayu.collaboration._contracts import ContractValue, OperationRef
 from cayu.collaboration._history_references import history_references
 from cayu.collaboration._preparation import contract_bytes, prepare_contract
+from cayu.collaboration._producer_pruning import (
+    MAX_PRODUCER_PRUNING_RECORDS,
+    ProducerPruningItem,
+    producer_pruning_inventory,
+    prune_producer_items,
+)
 from cayu.collaboration._request_receipts import request_receipt_metadata
 from cayu.collaboration._request_store import operation_key, retained_request
 from cayu.collaboration.clarifications import MAX_CLARIFICATION_QUESTIONS, Commitment
@@ -41,7 +47,11 @@ class RequestPruningProgress(ContractValue):
     snapshot_sha256: Commitment
     clarification_sha256: Commitment
     clarification_events: tuple[StrictInt, ...] = Field(max_length=2 * MAX_CLARIFICATION_QUESTIONS)
-    next_event_index: StrictInt = Field(ge=1, lt=MAX_REQUEST_PRUNING_EVENTS)
+    next_event_index: StrictInt = Field(ge=1, le=MAX_REQUEST_PRUNING_EVENTS)
+    producer_items: tuple[ProducerPruningItem, ...] = Field(
+        default=(), max_length=MAX_PRODUCER_PRUNING_RECORDS
+    )
+    next_producer_index: StrictInt = Field(default=0, ge=0, le=MAX_PRODUCER_PRUNING_RECORDS)
 
     @model_validator(mode="after")
     def coherent(self) -> RequestPruningProgress:
@@ -52,6 +62,10 @@ class RequestPruningProgress(ContractValue):
             or tuple(sorted(set(self.clarification_events))) != self.clarification_events
         ):
             raise ValueError("Clarification pruning events must be ordered and unique.")
+        if self.next_producer_index > len(self.producer_items) or len(
+            {item.caller_key for item in self.producer_items}
+        ) != len(self.producer_items):
+            raise ValueError("Producer pruning inventory is not unique and bounded.")
         return self
 
 
@@ -115,6 +129,17 @@ async def prune_request_batch(
         )
         if planning is not None:
             return planning
+    if prior is None:
+        producer_items = (
+            await producer_pruning_inventory(tx, snapshot, redactor=redactor)
+            if snapshot.producer_operation is not None
+            else ()
+        )
+        producer_start = 0
+    else:
+        producer_items, producer_start = prior.producer_items, prior.next_producer_index
+        if bool(producer_items) != (snapshot.producer_operation is not None):
+            raise CollaborationUnavailable("Producer pruning cursor omits its responsibility.")
     questions, question_digest = await question_pruning_material(tx, snapshot, redactor)
     if prior is not None and prior.clarification_sha256 != question_digest:
         raise CollaborationUnavailable("Clarification pruning material changed between batches.")
@@ -158,12 +183,17 @@ async def prune_request_batch(
     if (
         len(frontier) > MAX_REQUEST_PRUNING_EVENTS
         or len(set(frontier)) != len(frontier)
-        or not start < len(frontier)
+        or start > len(frontier)
+        or (start == len(frontier) and producer_start == len(producer_items))
     ):
         raise CollaborationUnavailable("Request pruning frontier is incomplete or unbounded.")
     for sequence in frontier[:start]:
         if await tx.get("request_events", (sequence,)) is not None:
             raise CollaborationUnavailable("Pruning cursor skipped retained event evidence.")
+    for item in producer_items[:producer_start]:
+        operation = command.operation.model_copy(update={"caller_key": item.caller_key})
+        if await tx.get("operations", operation_key(operation)) is not None:
+            raise CollaborationUnavailable("Pruning cursor skipped retained producer evidence.")
 
     stop = min(start + limit, len(frontier))
     related = []
@@ -190,11 +220,21 @@ async def prune_request_batch(
             raise CollaborationUnavailable("Request pruning receipt contradicts its event.")
         related.append((receipt, event))
         references.extend(history_references(receipt))
-    if not related or (start == 0 and related[0][0] != snapshot.receipt):
+    if (start < len(frontier) and not related) or (
+        start == 0 and related[0][0] != snapshot.receipt
+    ):
         raise CollaborationUnavailable("Request pruning lost its ordered frontier.")
 
     released = 0 if prior is None else len(contract_bytes(prior, redactor=redactor))
-    if stop < len(frontier):
+    producer_stop = min(producer_start + limit - len(related), len(producer_items))
+    # Producer inventory was authenticated before the first deletion. Request
+    # receipts may already be gone, so later batches verify exact retained bytes
+    # against the durable cursor instead of reconstructing partial authority.
+    producer_bytes, producer_events = await prune_producer_items(
+        tx, command, producer_items[producer_start:producer_stop], redactor=redactor
+    )
+    released += producer_bytes
+    if stop < len(frontier) or producer_stop < len(producer_items):
         progress = RequestPruningProgress(
             operation=command.operation,
             request=command.intent.selection.reference,
@@ -202,6 +242,8 @@ async def prune_request_batch(
             clarification_sha256=question_digest,
             clarification_events=question_events,
             next_event_index=stop,
+            producer_items=producer_items,
+            next_producer_index=producer_stop,
         )
         released -= len(contract_bytes(progress, redactor=redactor))
         await tx.put("request_pruning", key, progress, insert=prior is None)
@@ -219,4 +261,6 @@ async def prune_request_batch(
     released += await release_unused_history(tx, tuple(references), redactor)
     # The enclosing owner accounts for this exact signed byte delta and commits
     # its maintenance receipt atomically; failure rolls back cursor and deletions.
-    return RequestPruningResult(released, len(related), len(related))
+    return RequestPruningResult(
+        released, len(related) + producer_stop - producer_start, len(related) + producer_events
+    )

@@ -407,6 +407,7 @@ from cayu.runtime._model_step_executor import (
     ModelStepLimitEvaluationRequest,
     model_completion_recovery_context_from_stage,
 )
+from cayu.runtime._producer_execution import _ProducerExecution
 from cayu.runtime._public_task_scheduling import (
     create_scheduled_task,
     inspect_task_schedule_events,
@@ -883,7 +884,26 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 
 if TYPE_CHECKING:
+    from cayu.collaboration._contracts import OperationRef
+    from cayu.collaboration._producer_cleanup_finalization import ProducerCleanupFinalized
+    from cayu.collaboration._producer_contracts import (
+        ProducerCompletionRecord,
+        ProducerDeliveryRecord,
+        ProducerExportRecord,
+        ProducerOutputProposal,
+        ProducerOutputRecord,
+        ProducerOutputRegistration,
+    )
+    from cayu.collaboration._producer_delivery_recovery import (
+        ProducerDeliveryRecovery,
+        ProducerDeliveryStatus,
+    )
+    from cayu.collaboration._producer_disposition import ProducerDispositionStatus
+    from cayu.collaboration._producer_export_cleanup import ProducerExportCleanupStatus
+    from cayu.collaboration._producer_progress_contracts import ProducerProgressOccurrence
+    from cayu.collaboration._producer_recovery import ProducerOutputRecovery, ProducerPendingPage
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
+    from cayu.runtime._producer_retirement import ProducerCleanupReclamation
     from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
     from cayu.tasks.groups import (
         TaskGroupCreate,
@@ -1070,6 +1090,13 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
 
         with _invocation_lifecycle_authority_read_scope():
             checkpoint = await self.app.session_store.load_checkpoint(session.id)
+        from cayu.runtime._producer_release import producer_participant_settlement
+
+        producer = await producer_participant_settlement(
+            self.app.session_store, checkpoint, expected, self.commitment
+        )
+        if producer is not None:
+            return producer
         ledger = None if checkpoint is None else checkpoint.get("invocation_lifecycle_receipt")
         consumed = any(
             isinstance(item, dict)
@@ -1710,6 +1737,16 @@ class CayuApp:
                 if self.enable_common_root_budget_binding
                 else None
             ),
+            read_prepared_budget=(
+                self._run_limit_controller._verify_retained_budget_binding
+                if self.enable_common_root_budget_binding
+                else None
+            ),
+            read_producer_budget=(
+                self._run_limit_controller._read_producer_budget_settlement
+                if self.enable_common_root_budget_binding
+                else None
+            ),
         )
         self._wait_coordinator = WaitCoordinator(
             participants=self._participant_coordinator,
@@ -2098,6 +2135,199 @@ class CayuApp:
         from cayu.collaboration._admission_reader import RegisteredRequestAdmissionReader
 
         return RegisteredRequestAdmissionReader(self._request_coordinator)
+
+    async def prepare_producer_output(
+        self,
+        proposal: ProducerOutputProposal,
+        execution: ParticipantSessionExecutionRequest,
+        *,
+        context: MandateAccessContext,
+    ) -> ProducerOutputRegistration:
+        """Derive an inert producer command from exact admitted native preparation."""
+        from cayu.collaboration._producer_preparation import prepare_producer_output
+
+        return await prepare_producer_output(self, proposal, execution, context=context)
+
+    async def register_producer_output(
+        self,
+        command: ProducerOutputRegistration,
+        execution: ParticipantSessionExecutionRequest,
+        *,
+        context: MandateAccessContext,
+    ) -> ProducerOutputRecord:
+        """Retain exact producer responsibility; registration never dispatches work."""
+        from cayu.collaboration._producer_registration import register_producer_output
+
+        return await register_producer_output(self, command, execution, context=context)
+
+    async def lookup_producer_registration(
+        self,
+        expected: ProducerOutputRegistration | ProducerOutputRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ExactLookup[ProducerOutputRegistration]:
+        """Read authenticated historical registration, not new execution authority."""
+        from cayu.collaboration._producer_readback import lookup_producer_registration
+
+        return await lookup_producer_registration(self, expected, context=context)
+
+    async def pending_producer_outputs(
+        self,
+        participant: ParticipantRef,
+        *,
+        context: CollaborationAccessContext,
+        after: int = 0,
+        limit: int = 32,
+    ) -> ProducerPendingPage:
+        """Discover bounded unsettled responsibility, including closed requests."""
+        from cayu.collaboration._producer_recovery import pending_producer_outputs
+
+        return await pending_producer_outputs(
+            self, participant, context=context, after=after, limit=limit
+        )
+
+    async def lookup_producer_completion(
+        self,
+        expected: ProducerOutputRegistration | ProducerOutputRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ExactLookup[ProducerCompletionRecord]:
+        """Read exact retained completion references; do not disclose output content."""
+        from cayu.collaboration._producer_readback import lookup_producer_completion
+
+        return await lookup_producer_completion(self, expected, context=context)
+
+    async def retain_producer_completion(
+        self, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
+    ) -> ProducerCompletionRecord:
+        """Retain authenticated native completion without restarting production."""
+        from cayu.collaboration._producer_public_control import retain_public_producer_completion
+
+        return await retain_public_producer_completion(self, command, context=context)
+
+    async def settle_producer_output(
+        self, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
+    ) -> ProducerCleanupFinalized:
+        """Release and settle only after exact output, effect and accounting evidence."""
+        from cayu.collaboration._producer_public_control import settle_public_producer_output
+
+        return await settle_public_producer_output(self, command, context=context)
+
+    async def reclaim_producer_cleanup(
+        self, namespace: NamespaceRef, *, context: CollaborationAccessContext, limit: int = 32
+    ) -> ProducerCleanupReclamation:
+        """Drain bounded native cleanup receipts after positive source-history retirement."""
+        from cayu.collaboration._producer_reclamation import reclaim_producer_cleanup
+
+        return await reclaim_producer_cleanup(self, namespace, context=context, limit=limit)
+
+    async def reconcile_producer_delivery(
+        self,
+        recovery: ProducerDeliveryRecovery,
+        *,
+        context: CollaborationAccessContext,
+        exclude: bool = False,
+    ) -> ProducerDeliveryStatus:
+        """Read an exact receiving outcome or request its authenticated exclusion."""
+        from cayu.collaboration._producer_delivery_recovery import reconcile_producer_delivery
+
+        return await reconcile_producer_delivery(self, recovery, context=context, exclude=exclude)
+
+    async def retire_producer_export(
+        self,
+        command: ProducerOutputRegistration,
+        destination: OperationRef,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ProducerExportCleanupStatus:
+        """Retire an export after request closure or authenticated delivery exclusion."""
+        from cayu.collaboration._producer_export_cleanup import retire_unneeded_producer_export
+
+        return await retire_unneeded_producer_export(self, command, destination, context=context)
+
+    async def service_producer_disposition(
+        self, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
+    ) -> ProducerDispositionStatus:
+        """Service retained closure using the producer's frozen stop scope."""
+        from cayu.collaboration._producer_disposition import service_closed_producer
+
+        return await service_closed_producer(self, command, context=context)
+
+    async def execute_producer_output(
+        self,
+        command: ProducerOutputRegistration,
+        execution: ParticipantSessionExecutionRequest,
+        *,
+        context: CollaborationAccessContext,
+        producer_context: MandateAccessContext,
+    ) -> AsyncGenerator[Event, None]:
+        """Execute a registered producer through current native admission exactly once."""
+        handoff = _ProducerExecution(self, command, producer_context)
+        prepared = handoff.command.admission.prepared
+        assert prepared is not None
+        async with _close_delegated_event_stream(
+            self._execute_participant_session(
+                execution,
+                participant=prepared.recipient,
+                context=context,
+                producer_output=handoff,
+            )
+        ) as stream:
+            async for event in stream:
+                yield event
+
+    async def export_producer_output(
+        self,
+        command: ProducerOutputRegistration,
+        destination: OperationRef,
+        *,
+        context: SessionExportAccessContext,
+    ) -> ProducerExportRecord:
+        """Service one retained output export with current disclosure authorization."""
+        from cayu.collaboration._producer_export import export_producer_output
+
+        return await export_producer_output(self, command, destination, context=context)
+
+    async def record_producer_progress(
+        self,
+        command: ProducerOutputRegistration,
+        occurrence: ProducerProgressOccurrence,
+        *,
+        context: MandateAccessContext,
+    ) -> RequestProgressReceipt:
+        """Publish an exact content-free native milestone, not execution authority."""
+        from cayu.collaboration._producer_progress import record_producer_progress
+
+        return await record_producer_progress(self, command, occurrence, context=context)
+
+    async def publish_producer_outcome(
+        self,
+        command: ProducerOutputRegistration,
+        *,
+        destination: OperationRef | None = None,
+        context: SessionExportAccessContext,
+    ) -> RequestOutcomeReceipt:
+        """Elect the retained answer/failure; do not imply delivery or quiescence."""
+        from cayu.collaboration._producer_outcome import publish_producer_outcome
+
+        return await publish_producer_outcome(
+            self, command, destination_operation=destination, context=context
+        )
+
+    async def deliver_producer_output(
+        self,
+        command: ProducerOutputRegistration,
+        destination: OperationRef,
+        *,
+        context: SessionExportAccessContext,
+        prepare_only: bool = False,
+    ) -> ProducerDeliveryRecord:
+        """Prepare or service one exact peer append; never imply provider exposure."""
+        from cayu.collaboration._producer_delivery import deliver_producer_output
+
+        return await deliver_producer_output(
+            self, command, destination, context=context, prepare_only=prepare_only
+        )
 
     async def lookup_collaboration_admission(
         self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
@@ -3296,6 +3526,7 @@ class CayuApp:
         participant: ParticipantRef,
         context: CollaborationAccessContext,
         execution_to_wait: _ExecutionToWait | None = None,
+        producer_output: _ProducerExecution | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Activate one inert participant-owned root session exactly once.
 
@@ -3309,6 +3540,12 @@ class CayuApp:
             raise TypeError("Participant session execution requires a typed request.")
         if type(participant) is not ParticipantRef:
             raise TypeError("Participant session execution requires a ParticipantRef.")
+        if producer_output is not None and (
+            type(producer_output) is not _ProducerExecution
+            or producer_output.app is not self
+            or execution_to_wait is not None
+        ):
+            raise PermissionError("Producer execution requires its exact registered owner.")
         if execution_to_wait is not None and (
             type(execution_to_wait) is not _ExecutionToWait
             or execution_to_wait.owner.store is not self.session_store
@@ -3336,16 +3573,12 @@ class CayuApp:
             )
             if creation_receipt is None or creation_receipt.binding != binding:
                 raise RuntimeError("Participant session receipt is inconsistent with its binding.")
-            expected_request_commitment = (
-                execution.request_commitment
-                if creation_receipt.requested_session_id is not None
-                else execution.creation_request_commitment
+            from cayu.sessions._participant_execution_identity import (
+                participant_execution_identity,
+                require_execution_creation,
             )
-            if binding.request_commitment != expected_request_commitment:
-                raise ValueError(
-                    "Participant session execution conflicts with its creation request."
-                )
-            from cayu.sessions._participant_execution_identity import participant_execution_identity
+
+            require_execution_creation(execution, creation_receipt)
 
             expected_profile = execution_profile_from_session_metadata(session.metadata)
             execution_identity = participant_execution_identity(
@@ -3354,6 +3587,13 @@ class CayuApp:
                 execution_profile_fingerprint=expected_profile.fingerprint,
                 wait_commitment=None if execution_to_wait is None else execution_to_wait.commitment,
             )
+            if producer_output is not None and (
+                producer_output.command.execution_commitment
+                != "sha256:" + execution_identity.admission_commitment
+                or producer_output.command.admission.prepared is None
+                or producer_output.command.admission.prepared.recipient != participant
+            ):
+                raise PermissionError("Producer handoff conflicts with native execution.")
             operation_key = execution_identity.operation_key
             if (
                 execution_to_wait is not None
@@ -3449,6 +3689,7 @@ class CayuApp:
                 participant_permit_operation=operation.caller_key,
                 participant_permit_commitment=permit_commitment,
                 execution_to_wait=execution_to_wait,
+                producer_output=producer_output,
             )
             async with self._participant_session_execution_lock_guard:
                 lock, users = self._participant_session_execution_locks.get(
@@ -7699,6 +7940,7 @@ class CayuApp:
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
         execution_to_wait: _ExecutionToWait | None = None,
+        producer_output: _ProducerExecution | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
@@ -7751,6 +7993,7 @@ class CayuApp:
             participant_permit_operation=participant_permit_operation,
             participant_permit_commitment=participant_permit_commitment,
             execution_to_wait=execution_to_wait,
+            producer_output=producer_output,
         )
         if binding is not None:
             stream = guard_stream(
@@ -8325,16 +8568,34 @@ class CayuApp:
     async def recover_incomplete_session(
         self,
         request: IncompleteSessionRecoveryRequest,
+        *,
+        context: CollaborationAccessContext | None = None,
     ) -> IncompleteSessionRecoveryResult:
         if type(request) is not IncompleteSessionRecoveryRequest:
             raise TypeError(
                 "Runtime incomplete-session recovery requires an IncompleteSessionRecoveryRequest."
             )
+        from cayu.collaboration._preparation import prepare_contract
+
+        context = (
+            None
+            if context is None
+            else prepare_contract(
+                CollaborationAccessContext, context, redactor=self._secret_redactor
+            )
+        )
         request = request.model_copy(
             update={"session_id": await self._resolve_public_session_id(request.session_id)},
             deep=True,
         )
-        recovery = self._recover_incomplete_session_private(request)
+        if context is not None:
+            session = await self._runtime_session_store.load(request.session_id)
+            if session is None:
+                raise KeyError("Recovery session is unavailable.")
+            # Authenticate before recovery can claim a new epoch. The execution
+            # callback checks again immediately before any native continuation.
+            await self._require_participant_execution(session, context)
+        recovery = self._recover_incomplete_session_private(request, participant_context=context)
         del request
         result = await recovery
         return await self._project_incomplete_recovery_result_for_public_api(result)
@@ -8395,9 +8656,13 @@ class CayuApp:
     async def _recover_incomplete_session_private(
         self,
         request: IncompleteSessionRecoveryRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
-        recovery = self._session_engine.recover_incomplete_session(request)
+        recovery = self._session_engine.recover_incomplete_session(
+            request, participant_context=participant_context
+        )
         del request
         return await recovery
 
