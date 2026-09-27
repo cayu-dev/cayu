@@ -160,6 +160,35 @@ _DURABLE_ERROR_MESSAGES = {
     "json_value_too_large": "must not exceed the configured encoded JSON byte limit.",
     "too_many_json_entries": "must not exceed the configured JSON container entry limit.",
 }
+# JSON string sizing in C-level operations. Characters escaped as a two-byte
+# sequence, other control characters escaped as \\u00XX, and characters that a
+# durable value must never contain.
+_JSON_SHORT_ESCAPES = ('"', "\\", "\b", "\f", "\n", "\r", "\t")
+_JSON_OTHER_CONTROL_RE = re.compile(r"[\x00-\x07\x0b\x0e-\x1f]")
+_NONPORTABLE_STRING_RE = re.compile(r"[\x00\ud800-\udfff]")
+_ASCII_ESCAPED_BMP_RE = re.compile(r"[\x7f-\uffff]")
+_ASTRAL_RE = re.compile(r"[\U00010000-\U0010ffff]")
+
+
+def _json_string_body_size(text: str, *, ensure_ascii: bool = False) -> int:
+    """Return the escaped JSON size of ``text`` without quotes, one pass per rule.
+
+    Matches the per-character accounting used for durable bounds: short escapes
+    cost 2, other control characters 6, and other characters their UTF-8 size
+    (or 6/12 for escaped non-ASCII when ``ensure_ascii``).
+    """
+
+    size = len(text)
+    size += sum(text.count(character) for character in _JSON_SHORT_ESCAPES)
+    size += 5 * len(_JSON_OTHER_CONTROL_RE.findall(text))
+    if ensure_ascii:
+        size += 5 * len(_ASCII_ESCAPED_BMP_RE.findall(text))
+        size += 11 * len(_ASTRAL_RE.findall(text))
+    elif not text.isascii():
+        size += len(text.encode("utf-8", "surrogatepass")) - len(text)
+    return size
+
+
 _DURABLE_ERROR_PATH_RE = re.compile(
     r"\$(?:/(?:[0-9]+|#[0-9]+)(?:/key)?)*",
     flags=re.ASCII,
@@ -722,24 +751,32 @@ class JsonUtf8SizeCounter:
     def _string(self, value: str) -> bool:
         if not self._consume(2):  # opening and closing quotes
             return False
-        for character in value:
-            codepoint = ord(character)
-            if character in {'"', "\\"} or character in "\b\f\n\r\t":
-                size = 2
-            elif codepoint < 0x20 or (self.ensure_ascii and 0x7F <= codepoint < 0x10000):
-                size = 6
-            elif self.ensure_ascii and codepoint >= 0x10000:
-                size = 12
-            elif codepoint < 0x80:
-                size = 1
-            elif codepoint < 0x800:
-                size = 2
-            elif codepoint < 0x10000:
-                size = 3
-            else:
-                size = 4
-            if not self._consume(size):
-                return False
+        # Bound temporary allocation and stop sizing after the budget is spent.
+        # Keep scalar accounting for the crossing chunk so remaining stays exact.
+        for offset in range(0, len(value), 4096):
+            chunk = value[offset : offset + 4096]
+            size = _json_string_body_size(chunk, ensure_ascii=self.ensure_ascii)
+            if size <= self.remaining:
+                self._consume(size)
+                continue
+            for character in chunk:
+                codepoint = ord(character)
+                if character in {'"', "\\"} or character in "\b\f\n\r\t":
+                    size = 2
+                elif codepoint < 0x20 or (self.ensure_ascii and 0x7F <= codepoint < 0x10000):
+                    size = 6
+                elif self.ensure_ascii and codepoint >= 0x10000:
+                    size = 12
+                elif codepoint < 0x80:
+                    size = 1
+                elif codepoint < 0x800:
+                    size = 2
+                elif codepoint < 0x10000:
+                    size = 3
+                else:
+                    size = 4
+                if not self._consume(size):
+                    return False
         return True
 
     def value(self, value: Any) -> bool:
@@ -924,6 +961,14 @@ def _walk_bounded_durable_json(
             if re.search(r'[\x00-\x1f"\\\ud800-\udfff]', chunk) is None:
                 consume(len(chunk.encode("utf-8")), path)
                 continue
+            # Ordinary escapes (newlines, quotes) are sized in C. Only a chunk
+            # holding a rejected character or crossing the byte bound takes the
+            # ordered per-character path, which keeps error codes and order.
+            if _NONPORTABLE_STRING_RE.search(chunk) is None:
+                size = _json_string_body_size(chunk)
+                if size <= remaining:
+                    consume(size, path)
+                    continue
             consume_special_string(chunk, path)
 
     def consume_special_string(text: str, path: str) -> None:

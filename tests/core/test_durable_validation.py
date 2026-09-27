@@ -315,3 +315,88 @@ def test_diagnostic_label_does_not_scan_omitted_suffix(monkeypatch):
         == "?" * 9 + "..."
     )
     assert len(calls) == 9
+
+
+def _reference_json_string_body_size(text: str, *, ensure_ascii: bool) -> int:
+    size = 0
+    for character in text:
+        codepoint = ord(character)
+        if character in {'"', "\\"} or character in "\b\f\n\r\t":
+            size += 2
+        elif codepoint < 0x20 or (ensure_ascii and 0x7F <= codepoint < 0x10000):
+            size += 6
+        elif ensure_ascii and codepoint >= 0x10000:
+            size += 12
+        else:
+            size += len(character.encode("utf-8", "surrogatepass"))
+    return size
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    text=st.text(
+        alphabet=st.one_of(
+            st.characters(),
+            st.sampled_from(list('"\\\b\f\n\r\t\x00\x01\x1f\x7f\x80߿ࠀ\ud800\U0001f600')),
+        ),
+        max_size=64,
+    ),
+    ensure_ascii=st.booleans(),
+)
+def test_escaped_string_size_matches_per_character_accounting(
+    text: str, ensure_ascii: bool
+) -> None:
+    from cayu._validation import _json_string_body_size
+
+    assert _json_string_body_size(text, ensure_ascii=ensure_ascii) == (
+        _reference_json_string_body_size(text, ensure_ascii=ensure_ascii)
+    )
+
+
+def test_escape_heavy_strings_keep_exact_byte_bound_errors() -> None:
+    text = 'line "one"\n' * 400
+    expected = copy_durable_json_value(text, "record")
+    size = len(canonical_durable_json_bytes(expected, "record"))
+    assert copy_bounded_durable_json_value(text, "record", max_bytes=size, max_nodes=1) == text
+    with pytest.raises(DurableValueError) as caught:
+        copy_bounded_durable_json_value(text, "record", max_bytes=size - 1, max_nodes=1)
+    assert caught.value.code == "json_value_too_large"
+    assert caught.value.observed_lower_bound == size
+
+
+@pytest.mark.parametrize("character", ["\x01", "é", "😀"])
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+def test_json_size_counter_bounds_temporary_memory_on_oversized_strings(
+    character: str, ensure_ascii: bool
+) -> None:
+    import tracemalloc
+
+    text = character * 1_000_000
+    counter = JsonUtf8SizeCounter(64, ensure_ascii=ensure_ascii)
+    tracemalloc.start()
+    try:
+        assert counter.value(text) is False
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert counter.exceeded_limit
+    assert peak < 1_000_000
+
+
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+@pytest.mark.parametrize("length", [4095, 4096, 4097, 8193])
+def test_json_size_counter_preserves_accounting_across_chunks(
+    ensure_ascii: bool, length: int
+) -> None:
+    text = ('a"\n\x01é😀\ud800' * length)[:length]
+    body_size = _reference_json_string_body_size(text, ensure_ascii=ensure_ascii)
+    for limit in (2, 64, 4096, body_size + 1, body_size + 2):
+        remaining = limit - 2
+        for character in text:
+            remaining -= _reference_json_string_body_size(character, ensure_ascii=ensure_ascii)
+            if remaining < 0:
+                break
+        counter = JsonUtf8SizeCounter(limit, ensure_ascii=ensure_ascii)
+        assert counter.value(text) is (remaining >= 0)
+        assert counter.remaining == remaining
+        assert counter.exceeded_limit is (remaining < 0)
