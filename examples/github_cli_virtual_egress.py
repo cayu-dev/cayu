@@ -4,6 +4,8 @@ Builds a checksum-pinned Linux ``gh`` image, then runs ``gh api user`` inside
 the explicitly selected Docker egress topology. The runner receives only a
 virtual ``GH_TOKEN``. A fake upstream keeps the example credential-free while
 proving that the broker injects the real token only after authorization.
+It also checks denied writes, denied destinations, direct network bypass,
+and credential-grant revocation at cleanup. No GitHub account is required.
 
     python examples/github_cli_virtual_egress.py  # needs Docker + cayu[egress]
 
@@ -18,6 +20,8 @@ import subprocess
 
 from cayu import (
     EnvironmentFactoryRequest,
+    Event,
+    EventType,
     HttpEgressPolicy,
     SecretRef,
     StaticVault,
@@ -62,6 +66,7 @@ RUN set -eu; \\
 class _FakeGitHub:
     def __init__(self) -> None:
         self.request: CapturedRequest | None = None
+        self.request_count = 0
 
     def prepare(
         self,
@@ -73,6 +78,7 @@ class _FakeGitHub:
 
         async def send() -> CapturedResponse:
             self.request = request
+            self.request_count += 1
             return CapturedResponse(
                 status_code=200,
                 headers={"Content-Type": "application/json"},
@@ -128,6 +134,12 @@ async def main() -> None:
     _ensure_image()
 
     upstream = _FakeGitHub()
+    events: list[Event] = []
+
+    async def emit(event: Event) -> Event:
+        events.append(event)
+        return event
+
     factory = VirtualEgressEnvironmentFactory(
         resolver=StaticVault({"github_cli_token": DEMO_REAL_TOKEN}),
         policies={
@@ -149,6 +161,7 @@ async def main() -> None:
         runner_kind="docker",
         image=IMAGE,
         upstream=upstream,
+        event_emitter=emit,
     )
     request = EnvironmentFactoryRequest(
         session_id="github-cli-demo",
@@ -206,6 +219,64 @@ async def main() -> None:
             raise RuntimeError("virtual GitHub token was forwarded upstream")
         if real_leaked_to_output:
             raise RuntimeError("real GitHub token leaked to CLI output")
+        if output != "cayu-probe" or upstream.request_count != 1:
+            raise RuntimeError("GitHub CLI did not return the expected fake upstream result")
+
+        environment = await runner.exec(ExecCommand.process("env"), timeout_s=10)
+        if environment.exit_code != 0 or DEMO_REAL_TOKEN in environment.stdout:
+            raise RuntimeError(
+                "could not verify that the runner environment excludes the real token"
+            )
+
+        denied_write = await runner.exec(
+            ExecCommand.process("gh", "api", "user/repos", "--method", "POST"),
+            env={"GH_NO_UPDATE_NOTIFIER": "1", "GH_PROMPT_DISABLED": "1"},
+            timeout_s=30,
+        )
+        # Exit status alone does not prove policy enforcement. Check the response,
+        # the broker event, and that no additional request reached the upstream.
+        if (
+            "not in the allowlist" not in denied_write.stdout + denied_write.stderr
+            or not any(event.type == EventType.EGRESS_REQUEST_DENIED for event in events)
+            or upstream.request_count != 1
+        ):
+            raise RuntimeError("write request was not demonstrably denied by the broker")
+
+        denied_host = await runner.exec(
+            ExecCommand.process(
+                "curl", "--silent", "--show-error", "--max-time", "10", "https://example.com"
+            ),
+            timeout_s=15,
+        )
+        if denied_host.exit_code != 56 or "403" not in denied_host.stderr:
+            raise RuntimeError("unapproved destination was not denied at the proxy tunnel")
+
+        direct = await runner.exec(
+            ExecCommand.process(
+                "curl",
+                "--silent",
+                "--show-error",
+                "--noproxy",
+                "*",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "8",
+                "https://1.1.1.1",
+            ),
+            timeout_s=15,
+        )
+        # curl 7 = connection failed; 28 = timed out. TLS/HTTP errors would mean
+        # the direct connection got further than this boundary permits.
+        if direct.exit_code not in (7, 28):
+            raise RuntimeError("direct public-IP network bypass was not blocked")
+        if upstream.request_count != 1:
+            raise RuntimeError("a denied probe reached the upstream")
+        if any(
+            DEMO_REAL_TOKEN in probe.stdout + probe.stderr
+            for probe in (environment, denied_write, denied_host, direct)
+        ):
+            raise RuntimeError("real GitHub token leaked to probe output")
 
         print("runner GH_TOKEN shape:", virtual_check.stdout.strip())
         print("gh api user:", output)
@@ -213,9 +284,17 @@ async def main() -> None:
         print("broker injected real token upstream:", upstream_received_real)
         print("virtual token forwarded upstream:", upstream_received_virtual)
         print("real token leaked to CLI output:", real_leaked_to_output)
+        print("real token present in runner environment: False")
+        print("write request blocked before upstream: True")
+        print("unapproved destination blocked: True")
+        print("direct public-IP network bypass blocked: True")
         outcome = "completed"
     finally:
         await binding.finalize(bound, outcome=outcome)
+
+    if not any(event.type == EventType.EGRESS_GRANT_REVOKED for event in events):
+        raise RuntimeError("cleanup did not emit credential-grant revocation")
+    print("credential grant revoked on cleanup: True")
 
 
 if __name__ == "__main__":
