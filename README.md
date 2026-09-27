@@ -75,6 +75,14 @@ deployments.
 | Behavioral proof | Runtime tests, production-session promotion, durable evals, comparison, and CI reports |
 | Operations | FastAPI control plane and a packaged dashboard for sessions, workflows, usage, and evals |
 
+## Verify the runtime
+
+Want executable evidence before adopting Cayu? The [runtime qualification guide](https://github.com/cayu-tech/cayu/blob/main/docs/runtime-qualification.md)
+maps tool roundtrips, durable continuation, approval gating, and reviewed-proposal
+binding to existing tests. It provides a pinned installed-wheel setup, a small
+credential-free acceptance plan, the restartable support integration, and broader
+release qualification, with report interpretation and coverage limits.
+
 ## Quickstart
 
 Need a non-coding agent that survives restarts and waits for approval? Follow the

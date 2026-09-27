@@ -1502,6 +1502,9 @@ the unconstrained Python runner cannot accept a caller-supplied publication cont
 
 ## First-party runtime acceptance suite
 
+For a clean installed-wheel setup and the companion approval/restart checks, see
+[runtime qualification](runtime-qualification.md#choose-the-evidence-for-your-question).
+
 Cayu ships an importable, hermetic target for exercising runtime-native evals
 without relying on the caller's current working directory:
 

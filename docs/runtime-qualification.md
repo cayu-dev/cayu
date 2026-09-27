@@ -5,15 +5,138 @@ fixtures against an **installed Cayu wheel**. It is release qualification, not a
 agent-quality benchmark. The repository supplies the versioned fixture registry;
 fixtures and their private fault harness are not installed as Runtime APIs.
 
-From a checkout matching the candidate build:
+## Choose the evidence for your question
+
+Start with the small acceptance plan, then the application integration tests.
+Neither is the broader registered release qualification suite below.
+
+| Evaluator question | Existing command / owning evidence | Expected observation and limits |
+| --- | --- | --- |
+| Does a model-requested tool receive the intended arguments and return its result? | [Deterministic acceptance](#deterministic-acceptance): `tool_roundtrip` in [runtime_acceptance.py](../src/cayu/evals/internal/runtime_acceptance.py); [Evals reference](evals.md#first-party-runtime-acceptance-suite). | Seven cases pass; inspect the JSON case and assertion results. Scripted providers establish runtime mechanics, not model quality or live-provider conformance. |
+| Does durable state survive a fresh process and support continuation? | [Support integration](#support-integration): `test_restart_approval_repeat_and_independent_verification` in [test_order_support.py](../tests/examples/test_order_support.py); [canonical journey](../src/cayu/guides/order-support.md). For abrupt death, run [focused crash qualification](#focused-crash-and-release-qualification). | Separate CLI processes reopen SQLite sessions and service records after normal exit. Transcripts, pending approval, and effects survive. The example does not simulate a crash; the `fresh-process` registry scenario adds real SIGKILL boundaries. |
+| Does approval prevent effects before resolution and after denial? | The same support test, parameterized for approve and deny. | Independent service-database queries find no replacement before delivery or after denial, one after approval, and no additional effect or events after repeated receipt delivery. |
+| Is execution bound to the reviewed proposal? | Support integration: `test_invalid_receipts_and_changed_version_never_execute`; [approval responsibilities](../src/cayu/guides/order-support.md). | Altered signatures, unknown signed receipts, wrong conversation, changed execution version, and mismatched native call identity are rejected without effects. Application code authenticates and binds the receipt; Runtime owns pending approval and execution. The local signing fixture is not a production authentication service. |
+
+## Pin a clean installed artifact and matching fixtures
+
+Requirements: Git, uv, Python 3.11+, a writable temporary directory, and a POSIX
+host for the crash qualification. Dependency installation and building may need
+network access; the selected scenarios require no credentials or network calls.
+Docker, PostgreSQL, and live-provider lanes are separate and are not exercised by
+these commands. The integration example uses SQLite; the acceptance plan uses
+its own temporary stores/workspaces.
+
+Use a full commit SHA for `REV` (or resolve a release tag to its commit first).
+Build from a clean checkout of that revision so the wheel and repository-owned
+fixtures match. A package version alone cannot identify an unreleased build.
+Do not pair an arbitrary published wheel with current-main fixtures. Fixtures,
+pytest tests, and qualification scripts do **not** ship in the installed package.
 
 ```sh
-uv build --wheel
-uv venv /tmp/cayu-qualification-env
-uv pip install --python /tmp/cayu-qualification-env/bin/python 'dist/cayu-0.6.1-py3-none-any.whl[dev]'
-python scripts/run_runtime_qualification.py \
-  --python /tmp/cayu-qualification-env/bin/python \
-  --report runtime-qualification.json
+REV=<full-cayu-commit-sha>
+RUN=$(mktemp -d)
+git clone https://github.com/cayu-tech/cayu.git "$RUN/checkout"
+git -C "$RUN/checkout" checkout --detach "$REV"
+cd "$RUN/checkout"
+git rev-parse HEAD > "$RUN/fixture-commit.txt"
+uv build --out-dir "$RUN/dist"
+# A new output directory ensures there is exactly one candidate wheel.
+set -- "$RUN"/dist/cayu-*.whl
+test "$#" -eq 1 && test -f "$1"
+WHEEL=$1
+uv venv "$RUN/env"
+PY="$RUN/env/bin/python"
+uv pip install --python "$PY" "$WHEEL[dev]"
+uv pip freeze --python "$PY" > "$RUN/installed-requirements.txt"
+"$PY" -c 'import hashlib, pathlib, sys; p=pathlib.Path(sys.argv[1]); print(hashlib.sha256(p.read_bytes()).hexdigest(), p.name)' "$WHEEL" > "$RUN/wheel-sha256.txt"
+mkdir "$RUN/evidence"
+cd "$RUN/evidence"
+unset PYTHONPATH PYTEST_ADDOPTS
+export PYTHONNOUSERSITE=1
+"$PY" - <<'PYTHON' > "$RUN/import-identity.txt"
+import importlib.metadata
+from pathlib import Path
+import cayu
+from cayu.build_provenance import current_runtime_build_provenance
+package = Path(cayu.__file__).resolve()
+dist = importlib.metadata.distribution("cayu")
+assert package == Path(dist.locate_file("cayu/__init__.py")).resolve()
+build = current_runtime_build_provenance()
+assert build.origin.value != "development_source_tree"
+print("version:", dist.version)
+print("package:", package)
+print("build:", build)
+PYTHON
+```
+
+Keep the wheel, fixture commit, wheel SHA-256, dependency freeze, import identity,
+and reports together. The freeze records resolved dependencies; reuse those
+versions when repeating this environment. The qualification report independently
+records installed build and fixture fingerprints.
+
+### Deterministic acceptance
+
+From the empty evidence directory, use the installed executable explicitly:
+
+```sh
+"$RUN/env/bin/cayu" eval run cayu.evals.internal.runtime_acceptance:build \
+  --case-timeout-seconds 30 --output "$RUN/evidence/runtime-acceptance.json"
+```
+
+Expect seven passing cases. Inspect each case's status and assertions in the
+existing eval JSON report; this plan does not cover multi-phase approval resume,
+SIGKILL, live providers, or full release gating. See [Evals](
+evals.md#first-party-runtime-acceptance-suite) for the case inventory.
+
+### Support integration
+
+Stage the matching repository tests without `src`, then run pytest with the
+installed interpreter. `CAYU_EXAMPLE_PYTHON` alone selects only the child CLI
+processes: the parent test process also imports Cayu to inspect durable records.
+Running ordinary checkout pytest can import checkout source via `pythonpath`.
+This staging recipe makes both parent and children use the wheel.
+
+```sh
+cp -R "$RUN/checkout/tests" "$RUN/evidence/tests"
+cp "$RUN/checkout/pyproject.toml" "$RUN/evidence/pyproject.toml"
+cd "$RUN/evidence"
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 CAYU_EXAMPLE_PYTHON="$PY" \
+  "$PY" -m pytest -q tests/examples/test_order_support.py \
+  --junitxml="$RUN/evidence/order-support.xml"
+"$RUN/env/bin/cayu" guide order-support > "$RUN/evidence/order-support-guide.md"
+"$PY" -m cayu.examples.order_support --help
+```
+
+Expect three passed tests, zero skips, and exit status 0. The JUnit report records
+individual test results; pytest assertion output diagnoses failures. The tests
+inspect session events/transcripts and service SQLite rows independently of CLI
+prose. For inspectable application state, follow the installed guide's commands
+in a fresh directory; it identifies the databases and review/receipt files.
+Normal process exits between commands are the restart boundary, with a 90-second
+subprocess timeout. This route does not claim PostgreSQL or Windows verification.
+
+### Focused crash and release qualification
+
+For a bounded first crash check using existing report semantics:
+
+```sh
+"$PY" "$RUN/checkout/scripts/run_runtime_qualification.py" \
+  --python "$PY" --scenario fresh-process --repeat 1 \
+  --report "$RUN/evidence/runtime-qualification-focused.json"
+```
+
+Expect `status: passed`, `scope: focused`, and successful selected case results.
+The [registry](../tests/qualification/registry.py) selects
+[real SIGKILL recovery tests](../tests/recovery/test_sigkill_recovery.py) at model
+dispatch, tool effect, approval, task-claim, and attachment boundaries, plus the
+pending-approval terminal-publication invariant. Read the report's case/phase
+dispositions; a skip, failure, or unavailable prerequisite is not evidence of success.
+
+For the full default release profile, omit the scenario and repeat overrides:
+
+```sh
+"$PY" "$RUN/checkout/scripts/run_runtime_qualification.py" \
+  --python "$PY" --report "$RUN/evidence/runtime-qualification.json"
 ```
 
 The runner copies repository fixtures to a temporary directory **without `src`**,
@@ -41,8 +164,8 @@ coding image (no image build or pull is performed):
 
 ```sh
 CAYU_DOCKER_CODING_IMAGE=<existing-coding-image> \
-python scripts/run_runtime_qualification.py \
-  --python /tmp/cayu-qualification-env/bin/python --docker \
+"$PY" "$RUN/checkout/scripts/run_runtime_qualification.py" \
+  --python "$PY" --docker \
   --scenario docker-allocation-live --repeat 1 \
   --report runtime-qualification-docker.json
 ```
@@ -57,8 +180,8 @@ The explicit stress profile adds 100 concurrent durable sessions/task workers,
 and 200 empty workers:
 
 ```sh
-python scripts/run_runtime_qualification.py \
-  --python /tmp/cayu-qualification-env/bin/python --profile stress \
+"$PY" "$RUN/checkout/scripts/run_runtime_qualification.py" \
+  --python "$PY" --profile stress \
   --report runtime-qualification-stress.json
 ```
 
