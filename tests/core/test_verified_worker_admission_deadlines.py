@@ -176,7 +176,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
             # transaction. A wall-clock assertion before awaited PostgreSQL locks
             # races expiry and can legitimately allow the settlement instead.
             from cayu.runtime import _work_attempt_lifecycle_policy as lifecycle_policy
-            from cayu.storage import _postgres_verified_work, sqlite
+            from cayu.storage import _postgres_verified_work, tasks_sqlite
 
             original_plan = lifecycle_policy.plan_work_attempt_lifecycle_settlement
             probe_observed = False
@@ -189,7 +189,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
                 return original_plan(request, **values)
 
             with monkeypatch.context() as clock_patch:
-                for owner in (lifecycle_policy, sqlite, _postgres_verified_work):
+                for owner in (lifecycle_policy, tasks_sqlite, _postgres_verified_work):
                     clock_patch.setattr(
                         owner, "plan_work_attempt_lifecycle_settlement", unexpired_plan
                     )

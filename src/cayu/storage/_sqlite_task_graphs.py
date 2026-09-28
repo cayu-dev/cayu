@@ -39,7 +39,7 @@ from cayu.tasks.groups import TaskGroupCreate, TaskGroupInvocationObligation
 from cayu.tasks.records import Task
 
 if TYPE_CHECKING:
-    from cayu.storage.sqlite import SQLiteTaskStore
+    from cayu.storage.tasks_sqlite import SQLiteTaskStore
 
 
 async def create_graph(

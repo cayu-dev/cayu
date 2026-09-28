@@ -223,7 +223,7 @@ from cayu.storage.postgres import PostgresKnowledgeStore as PostgresKnowledgeSto
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore
 from cayu.storage.postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
-from cayu.storage.sqlite import SQLiteTaskStore as SQLiteTaskStore
+from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
 from cayu.storage.work_context_sqlite import (
     SQLiteAgentWorkContextStore as SQLiteAgentWorkContextStore,
 )

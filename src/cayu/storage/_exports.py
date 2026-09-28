@@ -241,7 +241,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SQLiteEventWatcherStore": ("cayu.storage.event_watchers", "SQLiteEventWatcherStore"),
     "SQLiteKnowledgeStore": ("cayu.storage.knowledge_sqlite", "SQLiteKnowledgeStore"),
     "SQLiteSessionStore": ("cayu.storage.sqlite", "SQLiteSessionStore"),
-    "SQLiteTaskStore": ("cayu.storage.sqlite", "SQLiteTaskStore"),
+    "SQLiteTaskStore": ("cayu.storage.tasks_sqlite", "SQLiteTaskStore"),
     "assess_knowledge_revision_transition": (
         "cayu.storage.knowledge_transition",
         "assess_knowledge_revision_transition",

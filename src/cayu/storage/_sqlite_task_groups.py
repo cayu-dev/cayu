@@ -20,7 +20,7 @@ from cayu.tasks.groups import (
 )
 
 if TYPE_CHECKING:
-    from cayu.storage.sqlite import SQLiteTaskStore
+    from cayu.storage.tasks_sqlite import SQLiteTaskStore
     from cayu.tasks.records import Task
 
 

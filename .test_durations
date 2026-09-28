@@ -40535,5 +40535,11 @@
     "tests/egress/test_aws_lambda_microvm_browser_control.py::test_relay_configuration_validates_its_target[options5-PEM CA]": 0.00023891706950962543,
     "tests/egress/test_aws_lambda_microvm_browser_control.py::test_relay_endpoint_is_reachable_only_after_a_verified_handshake": 0.0034477910958230495,
     "tests/egress/test_aws_lambda_microvm_browser_control.py::test_runner_declarations_cross_the_invocation_handle": 0.00018941715825349092,
-    "tests/egress/test_aws_lambda_microvm_browser_control.py::test_sidecar_control_relay_endpoint_is_owner_fenced": 0.10407770902384073
+    "tests/egress/test_aws_lambda_microvm_browser_control.py::test_sidecar_control_relay_endpoint_is_owner_fenced": 0.10407770902384073,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_backends_share_one_connection_ownership_implementation": 1.7715675430372357,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_store_keeps_support_bundle_schema_readiness": 1.6185493329539895,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_store_operates_without_loading_session_adapter[cayu.storage.tasks_sqlite]": 1.2812322503887117,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_store_operates_without_loading_session_adapter[cayu.storage]": 1.221176875056699,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_store_operates_without_loading_session_adapter[cayu]": 1.3931627089623362,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_store_preserves_public_and_legacy_identity": 0.8034773338586092
 }

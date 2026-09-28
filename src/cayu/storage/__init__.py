@@ -1,4 +1,8 @@
-"""Storage contracts."""
+"""Storage contracts.
+
+The SQLite task backend can also be imported directly from
+``cayu.storage.tasks_sqlite`` without loading the SQLite session adapter.
+"""
 
 from typing import Any as _Any
 

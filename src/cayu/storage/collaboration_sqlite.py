@@ -15,8 +15,8 @@ from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.storage import _sqlite_support as sqlite
 from cayu.storage._collaboration_repository import _SQLRepository
+from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
 T = TypeVar("T")
 

@@ -4617,7 +4617,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "SQLiteMemoryInterventionExecutionStore",
     ),
     "SQLiteSessionStore": ("cayu.storage.sqlite", "SQLiteSessionStore"),
-    "SQLiteTaskStore": ("cayu.storage.sqlite", "SQLiteTaskStore"),
+    "SQLiteTaskStore": ("cayu.storage.tasks_sqlite", "SQLiteTaskStore"),
     "STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA": (
         "cayu.tools.structured_commands",
         "STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA",

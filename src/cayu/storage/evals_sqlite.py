@@ -148,7 +148,7 @@ from cayu.evals.suite_authoring import (
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
-from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
+from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 
 _SQLITE_EVAL_MIN_REQUIRED_REVISION = 80
 

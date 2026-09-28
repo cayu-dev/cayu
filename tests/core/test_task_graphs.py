@@ -1215,7 +1215,7 @@ async def test_late_member_event_failure_leaves_no_partial_admission(
     store: TaskStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cayu.storage import postgres, sqlite
+    from cayu.storage import postgres, tasks_sqlite
     from cayu.tasks import base
 
     module = (
@@ -1223,7 +1223,7 @@ async def test_late_member_event_failure_leaves_no_partial_admission(
         if isinstance(store, InMemoryTaskStore)
         else postgres
         if isinstance(store, PostgresTaskStore)
-        else sqlite
+        else tasks_sqlite
     )
     original = module.schedule_transition_events
 

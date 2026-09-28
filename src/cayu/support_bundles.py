@@ -149,7 +149,7 @@ _SQLITE_SCHEMA_STORE_IDENTITIES = frozenset(
         ("cayu.storage.event_watchers", "SQLiteEventWatcherStore"),
         ("cayu.storage.knowledge_sqlite", "SQLiteKnowledgeStore"),
         ("cayu.storage.sqlite", "SQLiteSessionStore"),
-        ("cayu.storage.sqlite", "SQLiteTaskStore"),
+        ("cayu.storage.tasks_sqlite", "SQLiteTaskStore"),
     }
 )
 _POSTGRES_SCHEMA_STORE_IDENTITIES = frozenset(

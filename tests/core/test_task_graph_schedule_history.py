@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from cayu import CayuApp
-from cayu.storage import postgres, sqlite
+from cayu.storage import postgres, tasks_sqlite
 from cayu.storage.migrations import SchemaMode
 from cayu.tasks import base
 from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
@@ -27,7 +27,7 @@ def store_factory(request, tmp_path):
         if backend == "memory":
             return InMemoryTaskStore(clock=lambda: now, ownership_clock=lambda: now)
         if backend == "sqlite":
-            return sqlite.SQLiteTaskStore(
+            return tasks_sqlite.SQLiteTaskStore(
                 tmp_path / "graph-schedules.sqlite",
                 clock=lambda: now,
                 ownership_clock=lambda: now,
@@ -184,8 +184,8 @@ def test_dependency_skip_schedule_publication_failure_rolls_back(
             module = (
                 base
                 if isinstance(store, InMemoryTaskStore)
-                else sqlite
-                if isinstance(store, sqlite.SQLiteTaskStore)
+                else tasks_sqlite
+                if isinstance(store, tasks_sqlite.SQLiteTaskStore)
                 else postgres
             )
             original = module.schedule_transition_events
@@ -383,7 +383,7 @@ def test_held_graph_member_publishes_readiness_once(
                             return event
 
                         patch.setattr(_graphs, "TaskGraphEvent", fail_preparation)
-                    elif isinstance(store, sqlite.SQLiteTaskStore):
+                    elif isinstance(store, tasks_sqlite.SQLiteTaskStore):
                         original = _sqlite_task_graphs.insert_events
 
                         def fail_sqlite(owner, events):
