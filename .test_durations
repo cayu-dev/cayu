@@ -39145,5 +39145,7 @@
     "tests/core/test_size_report.py::test_inventory_counts_physical_lines_in_source_tests_and_stubs[lf]": 0.00019350089132785797,
     "tests/core/test_size_report.py::test_inventory_counts_physical_lines_in_source_tests_and_stubs[mixed]": 0.00020020757801830769,
     "tests/core/test_size_report.py::test_inventory_counts_physical_lines_in_source_tests_and_stubs[unterminated]": 0.00019900081679224968,
-    "tests/core/test_size_report.py::test_string_separators_do_not_make_a_test_module_oversized": 0.0006192498840391636
+    "tests/core/test_size_report.py::test_string_separators_do_not_make_a_test_module_oversized": 0.0006192498840391636,
+    "tests/server/test_server_evaluation_promotion.py::test_promotion_routes_preserve_prefix_order_and_shared_auth_dependency[/api-api]": 1.3016778752207756,
+    "tests/server/test_server_evaluation_promotion.py::test_promotion_routes_preserve_prefix_order_and_shared_auth_dependency[/custom/v2-custom_v2]": 1.3682813339401037
 }

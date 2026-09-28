@@ -10,6 +10,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
 from fastapi import HTTPException, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -31,6 +32,7 @@ from cayu.server import (
     DashboardConfig,
     EvaluationPromotionConfig,
     OpenAccess,
+    ServerApiConfig,
     ServerConfig,
     create_server,
 )
@@ -223,6 +225,56 @@ def test_promotion_capability_and_routes_require_authentication() -> None:
         "state": "gated",
         "reason_code": "eval_store_not_configured",
     }
+
+
+@pytest.mark.parametrize(
+    ("prefix", "operation_prefix"), [("/api", "api"), ("/custom/v2", "custom_v2")]
+)
+def test_promotion_routes_preserve_prefix_order_and_shared_auth_dependency(
+    prefix: str, operation_prefix: str
+) -> None:
+    server = create_server(
+        asyncio.run(_seed_app()),
+        config=ServerConfig.protected(
+            _authenticate,
+            api=ServerApiConfig(path=prefix),
+            dashboard=DashboardConfig(enabled=False),
+            evaluation_promotion=_promotion_config(),
+        ),
+    )
+    routes = [route for route in server.routes if isinstance(route, APIRoute)]
+    promotion_routes = [route for route in routes if "/evals/promotion/" in route.path]
+    assert [route.path for route in promotion_routes] == [
+        f"{prefix}/evals/promotion/sessions/{{session_id}}/preview",
+        f"{prefix}/evals/promotion/sessions/{{session_id}}/export",
+    ]
+    session_route = next(route for route in routes if route.path == f"{prefix}/sessions")
+    auth_dependency = session_route.dependencies[0].dependency
+    schema = server.openapi()
+    for action, route in zip(("preview", "export"), promotion_routes, strict=True):
+        assert route.dependencies[0].dependency is auth_dependency
+        assert schema["paths"][route.path]["post"]["operationId"] == (
+            f"{action}_evaluation_promotion_{operation_prefix}"
+            f"_evals_promotion_sessions__session_id__{action}_post"
+        )
+
+    calls = []
+
+    def deny_access() -> None:
+        calls.append("denied")
+        raise HTTPException(status_code=403, detail="operator access revoked")
+
+    server.dependency_overrides[auth_dependency] = deny_access
+    with TestClient(server) as client:
+        for action in ("preview", "export"):
+            response = client.post(
+                f"{prefix}/evals/promotion/sessions/{_SESSION_ID}/{action}",
+                headers=_AUTH_HEADERS,
+                json={},
+            )
+            assert response.status_code == 403
+            assert response.json() == {"detail": "operator access revoked"}
+    assert calls == ["denied", "denied"]
 
 
 @pytest.mark.parametrize(
