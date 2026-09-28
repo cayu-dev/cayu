@@ -65,6 +65,7 @@ authoritative only where a maintained guide points to the implementation or the
 
 ## Operations and verification
 
+- [Structural measurements](refactoring-baseline.md)
 - [Citation offset diagnostics](citation-offset-diagnostics.md)
 - [Diagnostic support bundles](diagnostic-support-bundles.md)
 - [Persisted event side-effect health](event-side-effect-health.md)
