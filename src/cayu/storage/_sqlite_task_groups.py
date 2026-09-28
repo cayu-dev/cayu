@@ -21,7 +21,7 @@ from cayu.tasks.groups import (
 
 if TYPE_CHECKING:
     from cayu.storage.sqlite import SQLiteTaskStore
-    from cayu.tasks.base import Task
+    from cayu.tasks.records import Task
 
 
 def read_group(store: SQLiteTaskStore, group_id: str) -> TaskGroupSnapshot | None:

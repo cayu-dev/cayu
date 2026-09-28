@@ -205,7 +205,9 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
-from cayu.tasks.base import (
+from cayu.tasks.base import TaskAggregateFilter, TaskOperationalSnapshot
+from cayu.tasks.scheduling import TaskScheduleEventType
+from cayu.tasks.topology import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
     TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
     TASK_TOPOLOGY_MAX_CURSOR_BYTES,
@@ -214,11 +216,8 @@ from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     TASK_TOPOLOGY_MAX_NODES,
-    TaskAggregateFilter,
-    TaskOperationalSnapshot,
     TaskTopologyTruncatedField,
 )
-from cayu.tasks.scheduling import TaskScheduleEventType
 
 SERVER_API_PREFIX = "/api"
 SSE_CONTENT_TYPE = "text/event-stream"

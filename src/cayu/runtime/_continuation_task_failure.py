@@ -20,14 +20,13 @@ from cayu._validation import (
     require_durable_clean_nonblank,
 )
 from cayu.tasks.base import (
-    Task,
-    TaskStatus,
     TaskStore,
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
     TaskTerminalKind,
     prepare_task_terminalization,
 )
+from cayu.tasks.records import Task, TaskStatus
 
 _RUNTIME_TASK_FAILURE_MARKER_KEY = "runtime_task_failure"
 _RUNTIME_TASK_FAILURE_SCHEMA = "cayu.runtime-task-failure.v2"

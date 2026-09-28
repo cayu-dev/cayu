@@ -39152,5 +39152,11 @@
     "tests/core/test_knowledge_package_layout.py::test_record_contracts_do_not_load_storage_implementations[cayu.knowledge.records-cayu.knowledge.scopes]": 0.11709666601382196,
     "tests/core/test_knowledge_package_layout.py::test_record_contracts_do_not_load_storage_implementations[cayu.storage-cayu.storage]": 0.11033608322031796,
     "tests/core/test_knowledge_package_layout.py::test_record_contracts_preserve_public_and_legacy_class_identity": 0.0004687919281423092,
-    "tests/core/test_knowledge_package_layout.py::test_record_values_support_pickle_round_trips": 0.0012264580000191927
+    "tests/core/test_knowledge_package_layout.py::test_record_values_support_pickle_round_trips": 0.0012264580000191927,
+    "tests/core/test_task_package_layout.py::test_task_contracts_do_not_load_store_implementations[cayu-cayu]": 0.14392287493683398,
+    "tests/core/test_task_package_layout.py::test_task_contracts_do_not_load_store_implementations[cayu.runtime-cayu.runtime]": 0.19334433414041996,
+    "tests/core/test_task_package_layout.py::test_task_contracts_do_not_load_store_implementations[cayu.tasks-cayu.tasks]": 0.15106000122614205,
+    "tests/core/test_task_package_layout.py::test_task_contracts_do_not_load_store_implementations[cayu.tasks.records-cayu.tasks.topology]": 0.21824124874547124,
+    "tests/core/test_task_package_layout.py::test_task_contracts_preserve_public_and_legacy_identity": 0.00047508301213383675,
+    "tests/core/test_task_package_layout.py::test_task_records_and_topology_support_detached_pickle_round_trips": 0.0023015406914055347
 }

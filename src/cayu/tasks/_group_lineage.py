@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from cayu.tasks.base import Task, _task_retry_successor_id, copy_task
+from cayu.tasks.base import _task_retry_successor_id
 from cayu.tasks.groups import TaskGroupSnapshot, TaskGroupUnavailable
+from cayu.tasks.records import Task, copy_task
 
 
 def validate_lineage(

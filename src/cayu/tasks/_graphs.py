@@ -8,13 +8,9 @@ from datetime import datetime
 from typing import Any
 
 from cayu.tasks.base import (
-    Task,
     TaskRetryAttemptDisposition,
-    TaskRetrySeriesDisposition,
     TaskRetrySettlementResult,
-    TaskStatus,
     _runtime_task_retry_terminal_settlement,
-    copy_task,
 )
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -24,6 +20,7 @@ from cayu.tasks.graphs import (
     TaskGraphMember,
     TaskGraphUnavailable,
 )
+from cayu.tasks.records import Task, TaskRetrySeriesDisposition, TaskStatus, copy_task
 
 GRAPH_TERMINAL_STATUSES = frozenset(
     {

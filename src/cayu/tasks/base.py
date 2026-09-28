@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import math
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -216,13 +214,42 @@ from cayu.tasks.contracts import (
     copy_work_attempt_create,
     copy_work_contract,
     copy_work_contract_ref,
-    preflight_work_completion_document,
     require_bounded_work_completion_document,
     validate_completion_decision_contract,
     validate_work_completion_idempotency_key,
     validate_work_completion_linked_id,
     work_attempt_request_sha256,
 )
+from cayu.tasks.records import _CONTRACT_TASK_JSON_FIELDS as _CONTRACT_TASK_JSON_FIELDS
+from cayu.tasks.records import (
+    _TASK_RETRY_COST_MAX_DECIMAL_PLACES as _TASK_RETRY_COST_MAX_DECIMAL_PLACES,
+)
+from cayu.tasks.records import _TASK_RETRY_COST_MAX_DIGITS as _TASK_RETRY_COST_MAX_DIGITS
+from cayu.tasks.records import (
+    _TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES as _TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES,
+)
+from cayu.tasks.records import (
+    _TASK_RETRY_TOTAL_COST_MAX_DIGITS as _TASK_RETRY_TOTAL_COST_MAX_DIGITS,
+)
+from cayu.tasks.records import Task as Task
+from cayu.tasks.records import TaskRetryPolicy as TaskRetryPolicy
+from cayu.tasks.records import TaskRetrySeriesDisposition as TaskRetrySeriesDisposition
+from cayu.tasks.records import TaskRetrySeriesSnapshot as TaskRetrySeriesSnapshot
+from cayu.tasks.records import TaskStatus as TaskStatus
+from cayu.tasks.records import _bounded_task_retry_decimal as _bounded_task_retry_decimal
+from cayu.tasks.records import _copy_task_retry_policy as _copy_task_retry_policy
+from cayu.tasks.records import _copy_task_retry_series_snapshot as _copy_task_retry_series_snapshot
+from cayu.tasks.records import _preflight_bounded_task_payloads as _preflight_bounded_task_payloads
+from cayu.tasks.records import (
+    _task_retry_attempt_authority_sha256 as _task_retry_attempt_authority_sha256,
+)
+from cayu.tasks.records import (
+    _validate_task_retry_cost_currency as _validate_task_retry_cost_currency,
+)
+from cayu.tasks.records import (
+    _validate_task_retry_reconciliation_identity as _validate_task_retry_reconciliation_identity,
+)
+from cayu.tasks.records import copy_task as copy_task
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -237,54 +264,68 @@ from cayu.tasks.scheduling import (
     task_schedule_eligibility,
     validate_task_schedule_window,
 )
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT as TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
+)
+from cayu.tasks.topology import TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH as TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH
+from cayu.tasks.topology import TASK_TOPOLOGY_MAX_BRANCH_LIMIT as TASK_TOPOLOGY_MAX_BRANCH_LIMIT
+from cayu.tasks.topology import TASK_TOPOLOGY_MAX_CURSOR_BYTES as TASK_TOPOLOGY_MAX_CURSOR_BYTES
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES as TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+)
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_MAX_EXPANDED_PARENTS as TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
+)
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS as TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
+)
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES as TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+)
+from cayu.tasks.topology import TASK_TOPOLOGY_MAX_NODES as TASK_TOPOLOGY_MAX_NODES
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_MAX_VALIDATION_NODES as TASK_TOPOLOGY_MAX_VALIDATION_NODES,
+)
+from cayu.tasks.topology import TaskTopologyChildBranch as TaskTopologyChildBranch
+from cayu.tasks.topology import TaskTopologyCycle as TaskTopologyCycle
+from cayu.tasks.topology import TaskTopologyInconsistent as TaskTopologyInconsistent
+from cayu.tasks.topology import TaskTopologyNode as TaskTopologyNode
+from cayu.tasks.topology import TaskTopologyQuery as TaskTopologyQuery
+from cayu.tasks.topology import TaskTopologySessionBranch as TaskTopologySessionBranch
+from cayu.tasks.topology import TaskTopologyStoreResult as TaskTopologyStoreResult
+from cayu.tasks.topology import (
+    TaskTopologyTraversalLimitExceeded as TaskTopologyTraversalLimitExceeded,
+)
+from cayu.tasks.topology import TaskTopologyTruncatedField as TaskTopologyTruncatedField
+from cayu.tasks.topology import (
+    _allocate_task_topology_branch_limits as _allocate_task_topology_branch_limits,
+)
+from cayu.tasks.topology import (
+    _bounded_optional_task_topology_parent_id as _bounded_optional_task_topology_parent_id,
+)
+from cayu.tasks.topology import _bounded_task_topology_display as _bounded_task_topology_display
+from cayu.tasks.topology import _bounded_task_topology_text as _bounded_task_topology_text
+from cayu.tasks.topology import (
+    _copy_task_topology_branch_limits as _copy_task_topology_branch_limits,
+)
+from cayu.tasks.topology import (
+    _reject_loaded_task_topology_cycles as _reject_loaded_task_topology_cycles,
+)
+from cayu.tasks.topology import _reject_task_parent_link_cycles as _reject_task_parent_link_cycles
+from cayu.tasks.topology import _retain_task_topology_page as _retain_task_topology_page
+from cayu.tasks.topology import _validate_task_topology_ancestry as _validate_task_topology_ancestry
+from cayu.tasks.topology import _validate_task_topology_page as _validate_task_topology_page
+from cayu.tasks.topology import build_task_topology_result as build_task_topology_result
+from cayu.tasks.topology import decode_task_topology_cursor as decode_task_topology_cursor
+from cayu.tasks.topology import encode_task_topology_cursor as encode_task_topology_cursor
 
 _DURABLE_WORKER_POLLER_REGISTRY_LOCK = Lock()
-_TASK_RETRY_COST_MAX_DIGITS = 64
-_TASK_RETRY_TOTAL_COST_MAX_DIGITS = 128
-_TASK_RETRY_COST_MAX_DECIMAL_PLACES = 64
 _TASK_RETRY_MAX_ATTEMPT_TOKEN_REPORT = MAX_DURABLE_JSON_INTEGER // 100
 _TASK_CANCELLATION_REQUESTED_REASON = "cancellation_requested"
 _TASK_RETRY_CANCELLATION_REQUESTED_REASON = "retry_cancellation_requested"
-_TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES = 1024
 _TASK_RETRY_RECONCILIATION_EVIDENCE_ID_MAX_BYTES = 256
 _TASK_RETRY_RECONCILIATION_VERSION_MAX_BYTES = 64
 _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE = 100
-
-
-def _bounded_task_retry_decimal(
-    value: Decimal,
-    field_name: str,
-    *,
-    max_digits: int,
-) -> Decimal:
-    if not value.is_finite() or value < 0:
-        raise ValueError(f"{field_name} must be a finite non-negative Decimal.")
-    digits = value.as_tuple().digits
-    exponent = value.as_tuple().exponent
-    if len(digits) > max_digits:
-        raise ValueError(f"{field_name} exceeds its decimal digit limit.")
-    if (
-        not isinstance(exponent, int)
-        or exponent < -_TASK_RETRY_COST_MAX_DECIMAL_PLACES
-        or exponent > _TASK_RETRY_COST_MAX_DIGITS
-    ):
-        raise ValueError(f"{field_name} exceeds its decimal scale limit.")
-    return value
-
-
-class TaskStatus(StrEnum):
-    PENDING = "pending"
-    WAITING_DEPENDENCIES = "waiting_dependencies"
-    WAITING_GROUP = "waiting_group"
-    DEPENDENCY_SKIPPED = "dependency_skipped"
-    CLAIMED = "claimed"
-    RUNNING = "running"
-    PAUSED = "paused"
-    BLOCKED = "blocked"
-    NEEDS_ATTENTION = "needs_attention"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 class TaskClaimLost(ValueError):
@@ -312,20 +353,6 @@ class TaskRetryAttemptDisposition(StrEnum):
     RETRYABLE_FAILURE = "retryable_failure"
     NON_RETRYABLE_FAILURE = "non_retryable_failure"
     CANCELLED = "cancelled"
-
-
-class TaskRetrySeriesDisposition(StrEnum):
-    """Durable retry-series state or terminal reason."""
-
-    ACTIVE = "active"
-    RETRY_SCHEDULED = "retry_scheduled"
-    SUCCEEDED = "succeeded"
-    NON_RETRYABLE_FAILURE = "non_retryable_failure"
-    CANCELLED = "cancelled"
-    ATTEMPTS_EXHAUSTED = "attempts_exhausted"
-    ELAPSED_EXHAUSTED = "elapsed_exhausted"
-    TOKENS_EXHAUSTED = "tokens_exhausted"
-    COST_EXHAUSTED = "cost_exhausted"
 
 
 class TaskRetryEventType(StrEnum):
@@ -387,197 +414,6 @@ _POSITIVE_TASK_CANCELLATION_RECONCILIATION_OUTCOMES = frozenset(
 )
 
 
-def _validate_task_retry_cost_currency(value: str) -> str:
-    value = require_clean_nonblank(value, "cost_currency").upper()
-    if len(value.encode("utf-8")) > 16:
-        raise ValueError("cost_currency must be at most 16 UTF-8 bytes.")
-    return value
-
-
-class TaskRetryPolicy(BaseModel):
-    """Serializable cumulative limits and backoff for one task retry series."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        hide_input_in_errors=True,
-        allow_inf_nan=False,
-    )
-
-    max_attempts: StrictInt = Field(ge=1, le=100)
-    max_elapsed_seconds: StrictFloat | None = Field(default=None, gt=0, le=31_536_000)
-    max_total_tokens: StrictInt | None = Field(
-        default=None,
-        gt=0,
-        le=MAX_DURABLE_JSON_INTEGER,
-        description=(
-            "Maximum cumulative reported tokens used for retry-successor admission; "
-            "not an external-dispatch reservation."
-        ),
-    )
-    max_estimated_cost: Decimal | None = Field(
-        default=None,
-        gt=0,
-        description=(
-            "Maximum cumulative reported estimated cost used for retry-successor "
-            "admission; not an external-dispatch reservation."
-        ),
-    )
-    cost_currency: str = "USD"
-    initial_backoff_seconds: StrictFloat = Field(default=1.0, ge=0, le=86_400)
-    backoff_multiplier: StrictFloat = Field(default=2.0, ge=1, le=100)
-    max_backoff_seconds: StrictFloat = Field(default=300.0, ge=0, le=86_400)
-
-    @model_validator(mode="after")
-    def validate_bounds(self) -> TaskRetryPolicy:
-        for field_name in (
-            "max_elapsed_seconds",
-            "initial_backoff_seconds",
-            "backoff_multiplier",
-            "max_backoff_seconds",
-        ):
-            value = getattr(self, field_name)
-            if value is not None and not math.isfinite(value):
-                raise ValueError(f"{field_name} must be finite.")
-        return self
-
-    @field_validator("max_estimated_cost")
-    @classmethod
-    def validate_max_estimated_cost(cls, value: Decimal | None) -> Decimal | None:
-        if value is None:
-            return None
-        return _bounded_task_retry_decimal(
-            value,
-            "max_estimated_cost",
-            max_digits=_TASK_RETRY_COST_MAX_DIGITS,
-        )
-
-    @field_validator("cost_currency")
-    @classmethod
-    def validate_cost_currency(cls, value: str) -> str:
-        return _validate_task_retry_cost_currency(value)
-
-
-class TaskRetrySeriesSnapshot(BaseModel):
-    """Bounded cumulative retry authority carried by each durable attempt."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        hide_input_in_errors=True,
-        allow_inf_nan=False,
-    )
-
-    series_id: str
-    causal_budget_id: str
-    authority_sha256: str
-    attempt: StrictInt = Field(ge=1, le=100)
-    policy: TaskRetryPolicy
-    started_at: datetime
-    cumulative_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    cumulative_estimated_cost: Decimal = Field(default=Decimal(0), ge=0)
-    attempts_remaining: StrictInt = Field(ge=0, le=99)
-    tokens_remaining: StrictInt | None = Field(
-        default=None,
-        ge=0,
-        le=MAX_DURABLE_JSON_INTEGER,
-    )
-    estimated_cost_remaining: Decimal | None = Field(default=None, ge=0)
-    elapsed_deadline: datetime | None = None
-    disposition: TaskRetrySeriesDisposition = TaskRetrySeriesDisposition.ACTIVE
-    predecessor_task_id: str | None = None
-    successor_task_id: str | None = None
-    next_eligible_at: datetime | None = None
-
-    @field_validator("series_id", "causal_budget_id")
-    @classmethod
-    def validate_series_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("authority_sha256")
-    @classmethod
-    def validate_authority_sha256(cls, value: str) -> str:
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-            raise ValueError("authority_sha256 must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("predecessor_task_id", "successor_task_id")
-    @classmethod
-    def validate_optional_task_id(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("started_at")
-    @classmethod
-    def normalize_started_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "started_at")
-
-    @field_validator("next_eligible_at")
-    @classmethod
-    def normalize_next_eligible_at(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        return normalize_utc_datetime(value, "next_eligible_at")
-
-    @field_validator("elapsed_deadline")
-    @classmethod
-    def normalize_elapsed_deadline(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        return normalize_utc_datetime(value, "elapsed_deadline")
-
-    @field_validator("cumulative_estimated_cost", "estimated_cost_remaining")
-    @classmethod
-    def validate_estimated_costs(cls, value: Decimal | None, info) -> Decimal | None:
-        if value is None:
-            return None
-        return _bounded_task_retry_decimal(
-            value,
-            info.field_name,
-            max_digits=(
-                _TASK_RETRY_TOTAL_COST_MAX_DIGITS
-                if info.field_name == "cumulative_estimated_cost"
-                else _TASK_RETRY_COST_MAX_DIGITS
-            ),
-        )
-
-    @model_validator(mode="after")
-    def validate_snapshot(self) -> TaskRetrySeriesSnapshot:
-        if self.attempts_remaining != max(0, self.policy.max_attempts - self.attempt):
-            raise ValueError("attempts_remaining conflicts with the retry policy.")
-        expected_tokens = (
-            None
-            if self.policy.max_total_tokens is None
-            else max(0, self.policy.max_total_tokens - self.cumulative_tokens)
-        )
-        if self.tokens_remaining != expected_tokens:
-            raise ValueError("tokens_remaining conflicts with cumulative token usage.")
-        expected_cost = (
-            None
-            if self.policy.max_estimated_cost is None
-            else max(
-                Decimal(0),
-                self.policy.max_estimated_cost - self.cumulative_estimated_cost,
-            )
-        )
-        if self.estimated_cost_remaining != expected_cost:
-            raise ValueError("estimated_cost_remaining conflicts with cumulative cost.")
-        expected_deadline = (
-            None
-            if self.policy.max_elapsed_seconds is None
-            else self.started_at + timedelta(seconds=self.policy.max_elapsed_seconds)
-        )
-        if self.elapsed_deadline != expected_deadline:
-            raise ValueError("elapsed_deadline conflicts with the retry policy.")
-        scheduled = self.disposition is TaskRetrySeriesDisposition.RETRY_SCHEDULED
-        if scheduled != (self.successor_task_id is not None):
-            raise ValueError("Only retry_scheduled snapshots carry a successor_task_id.")
-        if scheduled != (self.next_eligible_at is not None):
-            raise ValueError("Only retry_scheduled snapshots carry next_eligible_at.")
-        return self
-
-
 class TaskRetryEvent(BaseModel):
     """Bounded, failure-payload-free retry evidence committed by a task store."""
 
@@ -634,18 +470,6 @@ class TaskRetryEvent(BaseModel):
             "estimated_cost_remaining",
             max_digits=_TASK_RETRY_COST_MAX_DIGITS,
         )
-
-
-def _validate_task_retry_reconciliation_identity(
-    value: str,
-    field_name: str,
-    *,
-    max_bytes: int = _TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES,
-) -> str:
-    value = require_clean_nonblank(value, field_name)
-    if len(value.encode("utf-8")) > max_bytes:
-        raise ValueError(f"{field_name} must be at most {max_bytes} UTF-8 bytes.")
-    return value
 
 
 def _task_retry_reconciliation_identity_is_bounded(value: str) -> bool:
@@ -1488,28 +1312,6 @@ class _TaskCancellationReconciliationRejectionRecord(BaseModel):
 
 
 TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES = 256
-_CONTRACT_TASK_JSON_FIELDS = ("input", "metadata", "status_payload", "result", "error")
-
-
-def _preflight_bounded_task_payloads(
-    value: object,
-    field_names: tuple[str, ...] = _CONTRACT_TASK_JSON_FIELDS,
-    *,
-    field_label: str = "Contract-bound task",
-) -> None:
-    document = cast("dict[str, object]", value) if type(value) is dict else None
-    for field_name in field_names:
-        field_value = (
-            document.get(field_name) if document is not None else getattr(value, field_name)
-        )
-        if field_value is None:
-            continue
-        preflight_work_completion_document(
-            field_value,
-            f"{field_label} {field_name}",
-            max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
-            max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
-        )
 
 
 class TaskOrder(StrEnum):
@@ -1517,216 +1319,6 @@ class TaskOrder(StrEnum):
     CREATED_AT_DESC = "created_at_desc"
     UPDATED_AT_ASC = "updated_at_asc"
     UPDATED_AT_DESC = "updated_at_desc"
-
-
-class Task(BaseModel):
-    """Durable unit of work.
-
-    Tasks are intentionally generic. They can represent background jobs,
-    workflow steps, external work items, orchestrator assignments, or a
-    single-agent durable job.
-    """
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    type: str
-    title: str | None = None
-    description: str | None = None
-    status: TaskStatus = TaskStatus.PENDING
-    session_id: str | None = None
-    session_instance_id: str | None = None
-    parent_task_id: str | None = None
-    assigned_agent_name: str | None = None
-    graph_id: str | None = Field(default=None, frozen=True)
-    prerequisite_task_ids: tuple[str, ...] = Field(default=(), frozen=True)
-    available_at: datetime | None = None
-    worker_id: str | None = None
-    lease_expires_at: datetime | None = None
-    interrupted_handoff_id: str | None = None
-    status_reason: str | None = None
-    status_payload: dict[str, Any] | None = None
-    input: dict[str, Any] = Field(default_factory=dict)
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    invocation: TaskInvocation = Field(frozen=True)
-    schedule: TaskScheduleState | None = None
-    retry_series: TaskRetrySeriesSnapshot | None = None
-    work_contract: WorkContractRef | None = Field(default=None, frozen=True)
-
-    @model_validator(mode="after")
-    def validate_graph_membership(self) -> Task:
-        from cayu.tasks.graphs import TASK_GRAPH_MAX_NODES, graph_identifier
-
-        if self.graph_id is None:
-            if self.prerequisite_task_ids or self.status in {
-                TaskStatus.WAITING_DEPENDENCIES,
-                TaskStatus.WAITING_GROUP,
-                TaskStatus.DEPENDENCY_SKIPPED,
-            }:
-                raise ValueError("Dependency state requires graph membership.")
-            return self
-        graph_identifier(self.graph_id)
-        graph_identifier(self.id)
-        if len(self.prerequisite_task_ids) > TASK_GRAPH_MAX_NODES:
-            raise ValueError("Graph prerequisite count exceeds its bound.")
-        dependencies = tuple(graph_identifier(identity) for identity in self.prerequisite_task_ids)
-        if dependencies != tuple(sorted(set(dependencies))) or self.id in dependencies:
-            raise ValueError("Graph prerequisites must be distinct ordered identities.")
-        if (
-            self.status in {TaskStatus.WAITING_DEPENDENCIES, TaskStatus.DEPENDENCY_SKIPPED}
-            and not dependencies
-        ):
-            raise ValueError("Dependency state requires prerequisites.")
-        return self
-
-    @model_validator(mode="before")
-    @classmethod
-    def preflight_work_contract_payloads(cls, value: object) -> object:
-        if type(value) is not dict:
-            return value
-        document = cast("dict[str, object]", value)
-        if document.get("work_contract") is None:
-            return value
-        _preflight_bounded_task_payloads(document)
-        return value
-
-    @field_validator("input", "metadata", mode="before")
-    @classmethod
-    def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        if info.field_name == "metadata":
-            return copy_durable_metadata(value)
-        return copy_durable_json_object(value, info.field_name)
-
-    @field_validator("status_payload", "result", "error", mode="before")
-    @classmethod
-    def copy_optional_json_object(
-        cls,
-        value: dict[str, Any] | None,
-        info,
-    ) -> dict[str, Any] | None:
-        if value is None:
-            return None
-        return copy_durable_json_object(value, info.field_name)
-
-    @field_validator("id", "type")
-    @classmethod
-    def validate_nonblank_required_strings(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator(
-        "title",
-        "description",
-        "session_id",
-        "parent_task_id",
-        "assigned_agent_name",
-        "worker_id",
-        "interrupted_handoff_id",
-        "status_reason",
-    )
-    @classmethod
-    def validate_optional_nonblank_strings(
-        cls,
-        value: str | None,
-        info,
-    ) -> str | None:
-        if value is None:
-            return None
-        if info.field_name in {"title", "description", "status_reason"}:
-            return require_nonblank(value, info.field_name)
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("session_instance_id")
-    @classmethod
-    def validate_session_instance_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return SessionInvocationBinding.validate_session_instance_id(value)
-
-    @field_validator("available_at")
-    @classmethod
-    def normalize_available_at(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        return normalize_utc_datetime(value, "available_at")
-
-    @field_validator("schedule", mode="before")
-    @classmethod
-    def copy_schedule(cls, value: object) -> object:
-        return revalidate_model_input(value, TaskScheduleState)
-
-    @model_validator(mode="after")
-    def validate_schedule(self) -> Task:
-        if self.schedule is not None:
-            if self.available_at is None:
-                raise ValueError("Managed task schedules require available_at.")
-            if self.schedule.admitted_at is None:
-                validate_task_schedule_window(self.available_at, self.schedule.policy)
-        return self
-
-    @field_validator("work_contract", mode="before")
-    @classmethod
-    def copy_work_contract(cls, value: object) -> object:
-        return revalidate_model_input(value, WorkContractRef)
-
-    @model_validator(mode="after")
-    def validate_retry_and_work_contract_authority(self) -> Task:
-        if self.session_instance_id is not None and self.session_id is None:
-            raise ValueError("Task session-instance authority requires a session_id.")
-        if self.interrupted_handoff_id is not None and (
-            self.status is not TaskStatus.RUNNING
-            or self.session_id is None
-            or self.session_instance_id is None
-        ):
-            raise ValueError("Interrupted-handoff lineage requires an attached running task.")
-        if self.retry_series is not None:
-            _validate_task_retry_reconciliation_identity(self.id, "id")
-            if self.worker_id is not None:
-                _validate_task_retry_reconciliation_identity(self.worker_id, "worker_id")
-            expected = _task_retry_attempt_authority_sha256(
-                task_id=self.id,
-                task_type=self.type,
-                title=self.title,
-                description=self.description,
-                parent_task_id=self.parent_task_id,
-                assigned_agent_name=self.assigned_agent_name,
-                available_at=self.available_at,
-                created_at=self.created_at,
-                task_input=self.input,
-                metadata=self.metadata,
-                invocation=self.invocation,
-                series_id=self.retry_series.series_id,
-                causal_budget_id=self.retry_series.causal_budget_id,
-                attempt=self.retry_series.attempt,
-                policy=self.retry_series.policy,
-                started_at=self.retry_series.started_at,
-                cumulative_tokens=self.retry_series.cumulative_tokens,
-                cumulative_estimated_cost=self.retry_series.cumulative_estimated_cost,
-                predecessor_task_id=self.retry_series.predecessor_task_id,
-            )
-            if self.retry_series.authority_sha256 != expected:
-                raise ValueError("Task retry-series authority conflicts with its task evidence.")
-        if self.retry_series is not None and self.work_contract is not None:
-            raise ValueError("Retry-series tasks cannot use verified work contracts.")
-        if self.work_contract is None:
-            return self
-        validate_work_completion_linked_id(self.id, "id")
-        if self.session_id is not None:
-            validate_work_completion_linked_id(self.session_id, "session_id")
-        if self.worker_id is not None:
-            validate_work_completion_linked_id(self.worker_id, "worker_id")
-        require_bounded_work_completion_document(
-            self.model_dump(mode="json", warnings=False),
-            "Contract-bound task",
-            max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
-            max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
-        )
-        return self
 
 
 class TaskInvocationSnapshot(BaseModel):
@@ -2885,543 +2477,6 @@ class TaskOperationalSnapshot(BaseModel):
             > self.counts_by_status.pending
         ):
             raise ValueError("Claimable and scheduled pending counts cannot exceed pending count.")
-        return self
-
-
-TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS = 50
-TASK_TOPOLOGY_MAX_EXPANDED_PARENTS = 50
-TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT = 25
-TASK_TOPOLOGY_MAX_BRANCH_LIMIT = 100
-TASK_TOPOLOGY_MAX_NODES = 500
-TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES = 1024
-TASK_TOPOLOGY_MAX_CURSOR_BYTES = 4096
-TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES = 4096
-TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH = 128
-TASK_TOPOLOGY_MAX_VALIDATION_NODES = 4096
-TaskTopologyTruncatedField = Literal[
-    "type",
-    "title",
-    "assigned_agent_name",
-    "status_reason",
-]
-
-
-class TaskTopologyCycle(ValueError):
-    """Durable parent-task records contain a cycle reachable from the projection."""
-
-
-class TaskTopologyInconsistent(ValueError):
-    """Durable task records cannot form a truthful bounded topology projection."""
-
-
-class TaskTopologyTraversalLimitExceeded(ValueError):
-    """Task ancestry cannot be validated within the bounded topology contract."""
-
-
-def _bounded_task_topology_text(
-    value: str,
-    field_name: str,
-    *,
-    max_bytes: int,
-    allow_controls: bool = False,
-) -> str:
-    validator = require_nonblank if allow_controls else require_clean_nonblank
-    value = validator(value, field_name)
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"{field_name} must contain portable Unicode text.") from exc
-    if len(encoded) > max_bytes:
-        raise ValueError(f"{field_name} exceeds the task topology byte limit.")
-    return value
-
-
-def _bounded_task_topology_display(
-    value: str | None,
-    field_name: TaskTopologyTruncatedField,
-    *,
-    allow_controls: bool,
-) -> tuple[str | None, bool]:
-    if value is None:
-        return None, False
-    try:
-        return (
-            _bounded_task_topology_text(
-                value,
-                field_name,
-                max_bytes=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
-                allow_controls=allow_controls,
-            ),
-            False,
-        )
-    except ValueError:
-        # Oversized display text is omitted rather than copied into the bounded
-        # projection. The explicit marker keeps absence distinct from truncation.
-        if len(value.encode("utf-8", errors="surrogatepass")) > (
-            TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES
-        ):
-            return None, True
-        raise
-
-
-class TaskTopologyNode(BaseModel):
-    """Payload-free bounded identity for one task topology node."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    type: str | None
-    title: str | None
-    status: TaskStatus
-    status_reason: str | None
-    session_id: str | None
-    parent_task_id: str | None
-    assigned_agent_name: str | None
-    created_at: datetime
-    updated_at: datetime
-    truncated_fields: tuple[TaskTopologyTruncatedField, ...] = ()
-
-    @classmethod
-    def from_task(cls, task: Task) -> TaskTopologyNode:
-        if type(task) is not Task:
-            raise TypeError("Task topology nodes require Task instances.")
-        task_type, type_truncated = _bounded_task_topology_display(
-            task.type,
-            "type",
-            allow_controls=False,
-        )
-        title, title_truncated = _bounded_task_topology_display(
-            task.title,
-            "title",
-            allow_controls=True,
-        )
-        assigned_agent_name, agent_truncated = _bounded_task_topology_display(
-            task.assigned_agent_name,
-            "assigned_agent_name",
-            allow_controls=False,
-        )
-        status_reason, reason_truncated = _bounded_task_topology_display(
-            task.status_reason,
-            "status_reason",
-            allow_controls=True,
-        )
-        truncated_fields = tuple(
-            field_name
-            for field_name, truncated in (
-                ("type", type_truncated),
-                ("title", title_truncated),
-                ("assigned_agent_name", agent_truncated),
-                ("status_reason", reason_truncated),
-            )
-            if truncated
-        )
-        try:
-            return cls(
-                id=task.id,
-                type=task_type,
-                title=title,
-                status=task.status,
-                status_reason=status_reason,
-                session_id=task.session_id,
-                parent_task_id=task.parent_task_id,
-                assigned_agent_name=assigned_agent_name,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-                truncated_fields=truncated_fields,
-            )
-        except (TypeError, ValueError) as exc:
-            raise TaskTopologyInconsistent(
-                "A task record cannot be represented by the bounded topology contract."
-            ) from exc
-
-    @field_validator("id")
-    @classmethod
-    def validate_id(cls, value: str) -> str:
-        return _bounded_task_topology_text(
-            value,
-            "id",
-            max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-        )
-
-    @field_validator("session_id", "parent_task_id")
-    @classmethod
-    def validate_optional_ids(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_task_topology_text(
-            value,
-            info.field_name,
-            max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-        )
-
-    @field_validator("type", "assigned_agent_name")
-    @classmethod
-    def validate_optional_clean_display(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_task_topology_text(
-            value,
-            info.field_name,
-            max_bytes=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
-        )
-
-    @field_validator("title", "status_reason")
-    @classmethod
-    def validate_optional_display(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_task_topology_text(
-            value,
-            info.field_name,
-            max_bytes=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
-            allow_controls=True,
-        )
-
-    @field_validator("created_at", "updated_at")
-    @classmethod
-    def normalize_timestamps(cls, value: datetime, info) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"{info.field_name} must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @field_validator("truncated_fields")
-    @classmethod
-    def validate_truncated_fields(
-        cls,
-        value: tuple[TaskTopologyTruncatedField, ...],
-    ) -> tuple[TaskTopologyTruncatedField, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("Task topology truncated_fields must not contain duplicates.")
-        canonical = ("type", "title", "assigned_agent_name", "status_reason")
-        if tuple(field for field in canonical if field in value) != value:
-            raise ValueError("Task topology truncated_fields must use canonical order.")
-        return value
-
-    @model_validator(mode="after")
-    def validate_display_omissions(self) -> TaskTopologyNode:
-        truncated = set(self.truncated_fields)
-        for field_name in truncated:
-            if getattr(self, field_name) is not None:
-                raise ValueError("Truncated task topology display fields must be omitted.")
-        if self.type is None and "type" not in truncated:
-            raise ValueError("Task topology type may be absent only when explicitly truncated.")
-        return self
-
-
-class TaskTopologyQuery(BaseModel):
-    """Batched task links for explicitly expanded session and task branches."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    linked_session_ids: tuple[str, ...] = Field(
-        default_factory=tuple,
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
-    )
-    session_cursors: dict[str, str] = Field(
-        default_factory=dict,
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
-    )
-    expanded_parent_ids: tuple[str, ...] = Field(
-        default_factory=tuple,
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
-    )
-    child_cursors: dict[str, str] = Field(
-        default_factory=dict,
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
-    )
-    session_task_limit: StrictInt = Field(
-        default=TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
-        ge=1,
-        le=TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
-    )
-    child_limit: StrictInt = Field(
-        default=TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
-        ge=1,
-        le=TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
-    )
-
-    @field_validator("linked_session_ids", "expanded_parent_ids", mode="before")
-    @classmethod
-    def copy_branch_ids(cls, value, info) -> tuple[str, ...]:
-        if value is None:
-            return ()
-        if type(value) is str:
-            raise ValueError(f"{info.field_name} must be a sequence of strings.")
-        branch_limit = (
-            TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS
-            if info.field_name == "linked_session_ids"
-            else TASK_TOPOLOGY_MAX_EXPANDED_PARENTS
-        )
-        try:
-            values = islice(iter(value), branch_limit + 1)
-        except TypeError as exc:
-            raise ValueError(f"{info.field_name} must be a sequence of strings.") from exc
-        copied: list[str] = []
-        for index, item in enumerate(values):
-            if index == branch_limit:
-                raise ValueError(f"{info.field_name} exceeds its task topology branch limit.")
-            if type(item) is not str:
-                raise ValueError(f"{info.field_name} must contain only strings.")
-            item = _bounded_task_topology_text(
-                item,
-                f"{info.field_name}[{index}]",
-                max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-            )
-            if item in copied:
-                raise ValueError(f"{info.field_name} must not contain duplicates.")
-            copied.append(item)
-        return tuple(copied)
-
-    @field_validator("session_cursors", "child_cursors", mode="before")
-    @classmethod
-    def copy_cursors(cls, value, info) -> dict[str, str]:
-        if value is None:
-            return {}
-        if type(value) is not dict:
-            raise ValueError(f"{info.field_name} must be an object.")
-        cursor_limit = (
-            TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS
-            if info.field_name == "session_cursors"
-            else TASK_TOPOLOGY_MAX_EXPANDED_PARENTS
-        )
-        if len(value) > cursor_limit:
-            raise ValueError(f"{info.field_name} exceeds its task topology branch limit.")
-        copied: dict[str, str] = {}
-        for raw_parent_id, raw_cursor in value.items():
-            if type(raw_parent_id) is not str or type(raw_cursor) is not str:
-                raise ValueError(f"{info.field_name} must map strings to strings.")
-            parent_id = _bounded_task_topology_text(
-                raw_parent_id,
-                f"{info.field_name} key",
-                max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-            )
-            copied[parent_id] = _bounded_task_topology_text(
-                raw_cursor,
-                f"{info.field_name}[{parent_id!r}]",
-                max_bytes=TASK_TOPOLOGY_MAX_CURSOR_BYTES,
-            )
-        return copied
-
-    @model_validator(mode="after")
-    def validate_cursor_authority(self) -> TaskTopologyQuery:
-        if set(self.session_cursors).difference(self.linked_session_ids):
-            raise ValueError("session_cursors keys must also appear in linked_session_ids.")
-        if set(self.child_cursors).difference(self.expanded_parent_ids):
-            raise ValueError("child_cursors keys must also appear in expanded_parent_ids.")
-        return self
-
-
-def _allocate_task_topology_branch_limits(
-    query: TaskTopologyQuery,
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Reserve the shared node budget before stores hydrate branch candidates.
-
-    Every requested branch receives at least one return slot. Earlier branches
-    receive their requested limit while capacity permits; later branches retain
-    a slot and therefore always have a truthful continuation boundary. Each
-    store reads one additional sentinel row per branch to determine ``has_more``.
-    """
-
-    if type(query) is not TaskTopologyQuery:
-        raise TypeError("Task topology branch allocation requires a TaskTopologyQuery.")
-    requested_limits = (
-        *(query.session_task_limit for _ in query.linked_session_ids),
-        *(query.child_limit for _ in query.expanded_parent_ids),
-    )
-    if not requested_limits:
-        return (), ()
-
-    remaining = TASK_TOPOLOGY_MAX_NODES - len(query.expanded_parent_ids)
-    allocated: list[int] = []
-    for index, requested_limit in enumerate(requested_limits):
-        remaining_branches = len(requested_limits) - index - 1
-        branch_limit = min(requested_limit, remaining - remaining_branches)
-        if branch_limit < 1:
-            raise RuntimeError("Task topology node allocation cannot retain every branch.")
-        allocated.append(branch_limit)
-        remaining -= branch_limit
-
-    session_count = len(query.linked_session_ids)
-    return tuple(allocated[:session_count]), tuple(allocated[session_count:])
-
-
-class TaskTopologySessionBranch(BaseModel):
-    """Tasks attached to one explicitly expanded session."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str
-    tasks: tuple[TaskTopologyNode, ...] = Field(
-        default=(),
-        max_length=TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
-    )
-    next_cursor: str | None = None
-    has_more: StrictBool = False
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, value: str) -> str:
-        return _bounded_task_topology_text(
-            value,
-            "session_id",
-            max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-        )
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> TaskTopologySessionBranch:
-        if any(task.session_id != self.session_id for task in self.tasks):
-            raise ValueError("A session-task branch contains a contradictory session link.")
-        _validate_task_topology_page(
-            self.tasks,
-            self.next_cursor,
-            self.has_more,
-            scope_id=self.session_id,
-            scope_kind="session",
-        )
-        return self
-
-
-class TaskTopologyChildBranch(BaseModel):
-    """Direct task children of one explicitly expanded task."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    parent_task_id: str
-    children: tuple[TaskTopologyNode, ...] = Field(
-        default=(),
-        max_length=TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
-    )
-    next_cursor: str | None = None
-    has_more: StrictBool = False
-
-    @field_validator("parent_task_id")
-    @classmethod
-    def validate_parent_task_id(cls, value: str) -> str:
-        return _bounded_task_topology_text(
-            value,
-            "parent_task_id",
-            max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-        )
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> TaskTopologyChildBranch:
-        if any(task.parent_task_id != self.parent_task_id for task in self.children):
-            raise ValueError("A child-task branch contains a contradictory parent link.")
-        _validate_task_topology_page(
-            self.children,
-            self.next_cursor,
-            self.has_more,
-            scope_id=self.parent_task_id,
-            scope_kind="parent_task",
-        )
-        return self
-
-
-class TaskTopologyStoreResult(BaseModel):
-    """Backend-neutral bounded task projection captured by one task-store snapshot."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    observed_at: datetime
-    session_branches: tuple[TaskTopologySessionBranch, ...] = Field(
-        default=(),
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
-    )
-    expanded_parents: tuple[TaskTopologyNode, ...] = Field(
-        default=(),
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
-    )
-    child_branches: tuple[TaskTopologyChildBranch, ...] = Field(
-        default=(),
-        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
-    )
-
-    @field_validator("observed_at")
-    @classmethod
-    def normalize_observed_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("observed_at must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> TaskTopologyStoreResult:
-        session_ids = [branch.session_id for branch in self.session_branches]
-        if len(set(session_ids)) != len(session_ids):
-            raise ValueError("Task topology session branches must not contain duplicates.")
-        expanded_ids = [node.id for node in self.expanded_parents]
-        if len(set(expanded_ids)) != len(expanded_ids):
-            raise ValueError("Task topology expanded parents must not contain duplicates.")
-        if len(self.child_branches) != len(self.expanded_parents):
-            raise ValueError("Every expanded task parent requires exactly one child branch.")
-        if [branch.parent_task_id for branch in self.child_branches] != expanded_ids:
-            raise ValueError("Task child branches must preserve expanded-parent order.")
-
-        nodes = (
-            *self.expanded_parents,
-            *(task for branch in self.session_branches for task in branch.tasks),
-            *(task for branch in self.child_branches for task in branch.children),
-        )
-        nodes_by_id: dict[str, TaskTopologyNode] = {}
-        for node in nodes:
-            prior = nodes_by_id.setdefault(node.id, node)
-            if prior != node:
-                raise TaskTopologyInconsistent(
-                    "Task topology contains contradictory representations of one task."
-                )
-        if len(nodes_by_id) > TASK_TOPOLOGY_MAX_NODES:
-            raise ValueError(
-                f"Task topology cannot retain more than {TASK_TOPOLOGY_MAX_NODES} nodes."
-            )
-        _reject_loaded_task_topology_cycles(nodes_by_id)
-        return self
-
-    def validate_for_query(self, query: TaskTopologyQuery) -> TaskTopologyStoreResult:
-        """Verify that a custom store honored the exact requested branches and bounds."""
-
-        if type(query) is not TaskTopologyQuery:
-            raise TypeError("Task topology result validation requires a TaskTopologyQuery.")
-        if tuple(branch.session_id for branch in self.session_branches) != (
-            query.linked_session_ids
-        ):
-            raise TaskTopologyInconsistent(
-                "Task topology session branches do not match the requested sessions."
-            )
-        if tuple(node.id for node in self.expanded_parents) != query.expanded_parent_ids:
-            raise TaskTopologyInconsistent(
-                "Task topology parents do not match the requested expansions."
-            )
-        for branch in self.session_branches:
-            if len(branch.tasks) > query.session_task_limit:
-                raise TaskTopologyInconsistent(
-                    "A task topology session branch exceeds its requested limit."
-                )
-            cursor = query.session_cursors.get(branch.session_id)
-            if cursor is not None and branch.tasks:
-                boundary = decode_task_topology_cursor(
-                    cursor,
-                    scope_kind="session",
-                    scope_id=branch.session_id,
-                )
-                if (branch.tasks[0].created_at, branch.tasks[0].id) <= boundary:
-                    raise TaskTopologyInconsistent(
-                        "A task topology session branch did not advance past its cursor."
-                    )
-        for branch in self.child_branches:
-            if len(branch.children) > query.child_limit:
-                raise TaskTopologyInconsistent(
-                    "A task topology child branch exceeds its requested limit."
-                )
-            cursor = query.child_cursors.get(branch.parent_task_id)
-            if cursor is not None and branch.children:
-                boundary = decode_task_topology_cursor(
-                    cursor,
-                    scope_kind="parent_task",
-                    scope_id=branch.parent_task_id,
-                )
-                if (branch.children[0].created_at, branch.children[0].id) <= boundary:
-                    raise TaskTopologyInconsistent(
-                        "A task topology child branch did not advance past its cursor."
-                    )
         return self
 
 
@@ -9086,490 +8141,6 @@ class InMemoryTaskStore(TaskStore):
             del index[scope_id]
 
 
-def encode_task_topology_cursor(
-    scope_kind: Literal["session", "parent_task"],
-    scope_id: str,
-    node: TaskTopologyNode,
-) -> str:
-    """Encode a scope-bound direct-link cursor."""
-
-    if scope_kind not in {"session", "parent_task"}:
-        raise ValueError("Invalid task topology cursor scope.")
-    scope_id = _bounded_task_topology_text(
-        scope_id,
-        "scope_id",
-        max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    )
-    if type(node) is not TaskTopologyNode:
-        raise TypeError("Task topology cursors require TaskTopologyNode values.")
-    raw = json.dumps(
-        [
-            scope_kind,
-            scope_id,
-            node.created_at.astimezone(UTC).isoformat(),
-            node.id,
-        ],
-        separators=(",", ":"),
-    )
-    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
-    if len(encoded) > TASK_TOPOLOGY_MAX_CURSOR_BYTES:
-        raise ValueError("Task topology cursor exceeds its byte limit.")
-    return encoded
-
-
-def decode_task_topology_cursor(
-    cursor: str,
-    *,
-    scope_kind: Literal["session", "parent_task"],
-    scope_id: str,
-) -> tuple[datetime, str]:
-    """Decode a task cursor and reject reuse against a different branch."""
-
-    if scope_kind not in {"session", "parent_task"}:
-        raise ValueError("Invalid task topology cursor scope.")
-    scope_id = _bounded_task_topology_text(
-        scope_id,
-        "scope_id",
-        max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    )
-    try:
-        cursor = _bounded_task_topology_text(
-            cursor,
-            "cursor",
-            max_bytes=TASK_TOPOLOGY_MAX_CURSOR_BYTES,
-        )
-        encoded = cursor.encode("ascii")
-        raw = base64.b64decode(encoded, altchars=b"-_", validate=True)
-        if base64.urlsafe_b64encode(raw) != encoded:
-            raise ValueError("Non-canonical task topology cursor.")
-        decoded = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, ValueError, TypeError) as exc:
-        raise ValueError("Invalid task topology cursor.") from exc
-    if (
-        type(decoded) is not list
-        or len(decoded) != 4
-        or type(decoded[0]) is not str
-        or type(decoded[1]) is not str
-        or type(decoded[2]) is not str
-        or type(decoded[3]) is not str
-        or decoded[0] != scope_kind
-        or decoded[1] != scope_id
-        or not decoded[3]
-    ):
-        raise ValueError("Invalid task topology cursor.")
-    try:
-        task_id = _bounded_task_topology_text(
-            decoded[3],
-            "cursor task_id",
-            max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-        )
-        created_at = datetime.fromisoformat(decoded[2])
-    except ValueError as exc:
-        raise ValueError("Invalid task topology cursor.") from exc
-    if created_at.tzinfo is None or created_at.utcoffset() is None:
-        raise ValueError("Invalid task topology cursor.")
-    return created_at.astimezone(UTC), task_id
-
-
-def _validate_task_topology_page(
-    tasks: tuple[TaskTopologyNode, ...],
-    next_cursor: str | None,
-    has_more: bool,
-    *,
-    scope_id: str,
-    scope_kind: Literal["session", "parent_task"],
-) -> None:
-    task_ids = [task.id for task in tasks]
-    if len(set(task_ids)) != len(task_ids):
-        raise ValueError("A task topology branch must not repeat a task.")
-    if list(tasks) != sorted(tasks, key=lambda task: (task.created_at, task.id)):
-        raise ValueError("Task topology branches must use stable creation ordering.")
-    if has_more and next_cursor is None:
-        raise ValueError("A task topology branch with more rows requires a cursor.")
-    if not has_more and next_cursor is not None:
-        raise ValueError("A complete task topology branch cannot expose a cursor.")
-    if next_cursor is not None:
-        cursor_created_at, cursor_id = decode_task_topology_cursor(
-            next_cursor,
-            scope_kind=scope_kind,
-            scope_id=scope_id,
-        )
-        if not tasks or (cursor_created_at, cursor_id) != (
-            tasks[-1].created_at,
-            tasks[-1].id,
-        ):
-            raise ValueError(
-                "A task topology continuation cursor must identify the last returned task."
-            )
-
-
-def build_task_topology_result(
-    *,
-    observed_at: datetime,
-    linked_session_ids: Iterable[str],
-    session_branch_candidates: Iterable[Iterable[TaskTopologyNode]],
-    session_branch_limits: Iterable[int],
-    expanded_parents: Iterable[TaskTopologyNode],
-    child_branch_candidates: Iterable[Iterable[TaskTopologyNode]],
-    child_branch_limits: Iterable[int],
-    session_task_limit: int,
-    child_limit: int,
-) -> TaskTopologyStoreResult:
-    """Apply the shared task-node ceiling without losing branch continuation."""
-
-    for value, field_name in (
-        (session_task_limit, "session_task_limit"),
-        (child_limit, "child_limit"),
-    ):
-        if type(value) is not int or value < 1 or value > TASK_TOPOLOGY_MAX_BRANCH_LIMIT:
-            raise ValueError(f"{field_name} is outside the task topology bounds.")
-
-    session_ids = tuple(islice(linked_session_ids, TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS + 1))
-    if len(session_ids) > TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS:
-        raise ValueError("Task topology exceeds the linked-session bound.")
-    if len(set(session_ids)) != len(session_ids):
-        raise ValueError("Task topology linked sessions must not contain duplicates.")
-    allocated_session_limits = _copy_task_topology_branch_limits(
-        session_branch_limits,
-        branch_count=len(session_ids),
-        requested_limit=session_task_limit,
-        field_name="session_branch_limits",
-    )
-    session_pages = tuple(
-        tuple(islice(page, allocated_limit + 1))
-        for page, allocated_limit in zip(
-            islice(session_branch_candidates, len(session_ids) + 1),
-            allocated_session_limits,
-            strict=True,
-        )
-    )
-    if len(session_pages) != len(session_ids):
-        raise ValueError("Every linked session requires one task candidate page.")
-
-    expanded_nodes = tuple(islice(expanded_parents, TASK_TOPOLOGY_MAX_EXPANDED_PARENTS + 1))
-    if len(expanded_nodes) > TASK_TOPOLOGY_MAX_EXPANDED_PARENTS:
-        raise ValueError("Task topology exceeds the expanded-parent bound.")
-    allocated_child_limits = _copy_task_topology_branch_limits(
-        child_branch_limits,
-        branch_count=len(expanded_nodes),
-        requested_limit=child_limit,
-        field_name="child_branch_limits",
-    )
-    child_pages = tuple(
-        tuple(islice(page, allocated_limit + 1))
-        for page, allocated_limit in zip(
-            islice(child_branch_candidates, len(expanded_nodes) + 1),
-            allocated_child_limits,
-            strict=True,
-        )
-    )
-    if len(child_pages) != len(expanded_nodes):
-        raise ValueError("Every expanded task parent requires one candidate page.")
-
-    all_pages = (*session_pages, *child_pages)
-    nonempty_after = [
-        sum(bool(later) for later in all_pages[index + 1 :]) for index in range(len(all_pages))
-    ]
-    retained_ids = {node.id for node in expanded_nodes}
-
-    session_branches: list[TaskTopologySessionBranch] = []
-    page_index = 0
-    for session_id, candidates, allocated_limit in zip(
-        session_ids,
-        session_pages,
-        allocated_session_limits,
-        strict=True,
-    ):
-        retained = _retain_task_topology_page(
-            candidates,
-            retained_ids=retained_ids,
-            reserve_unique_slots=nonempty_after[page_index],
-            limit=allocated_limit,
-        )
-        page_index += 1
-        has_more = len(candidates) > len(retained)
-        session_branches.append(
-            TaskTopologySessionBranch(
-                session_id=session_id,
-                tasks=retained,
-                next_cursor=(
-                    encode_task_topology_cursor("session", session_id, retained[-1])
-                    if has_more
-                    else None
-                ),
-                has_more=has_more,
-            )
-        )
-
-    child_branches: list[TaskTopologyChildBranch] = []
-    for parent, candidates, allocated_limit in zip(
-        expanded_nodes,
-        child_pages,
-        allocated_child_limits,
-        strict=True,
-    ):
-        retained = _retain_task_topology_page(
-            candidates,
-            retained_ids=retained_ids,
-            reserve_unique_slots=nonempty_after[page_index],
-            limit=allocated_limit,
-        )
-        page_index += 1
-        has_more = len(candidates) > len(retained)
-        child_branches.append(
-            TaskTopologyChildBranch(
-                parent_task_id=parent.id,
-                children=retained,
-                next_cursor=(
-                    encode_task_topology_cursor("parent_task", parent.id, retained[-1])
-                    if has_more
-                    else None
-                ),
-                has_more=has_more,
-            )
-        )
-
-    loaded_nodes = (
-        *expanded_nodes,
-        *(task for branch in session_branches for task in branch.tasks),
-        *(task for branch in child_branches for task in branch.children),
-    )
-    loaded_nodes_by_id: dict[str, TaskTopologyNode] = {}
-    for node in loaded_nodes:
-        prior = loaded_nodes_by_id.setdefault(node.id, node)
-        if prior != node:
-            raise TaskTopologyInconsistent(
-                "Task topology contains contradictory representations of one task."
-            )
-    _reject_loaded_task_topology_cycles(loaded_nodes_by_id)
-
-    return TaskTopologyStoreResult(
-        observed_at=observed_at,
-        session_branches=tuple(session_branches),
-        expanded_parents=expanded_nodes,
-        child_branches=tuple(child_branches),
-    )
-
-
-def _copy_task_topology_branch_limits(
-    values: Iterable[int],
-    *,
-    branch_count: int,
-    requested_limit: int,
-    field_name: str,
-) -> tuple[int, ...]:
-    copied = tuple(islice(values, branch_count + 1))
-    if len(copied) != branch_count:
-        raise ValueError(f"{field_name} must provide exactly one limit per branch.")
-    if any(type(value) is not int or value < 1 or value > requested_limit for value in copied):
-        raise ValueError(f"{field_name} contains an invalid allocated branch limit.")
-    return copied
-
-
-def _retain_task_topology_page(
-    candidates: tuple[TaskTopologyNode, ...],
-    *,
-    retained_ids: set[str],
-    reserve_unique_slots: int,
-    limit: int,
-) -> tuple[TaskTopologyNode, ...]:
-    available_unique = TASK_TOPOLOGY_MAX_NODES - len(retained_ids)
-    unique_capacity = max(0, available_unique - reserve_unique_slots)
-    retained: list[TaskTopologyNode] = []
-    new_ids: set[str] = set()
-    for candidate in candidates[:limit]:
-        is_new = candidate.id not in retained_ids and candidate.id not in new_ids
-        if is_new and len(new_ids) >= unique_capacity:
-            break
-        retained.append(candidate)
-        if is_new:
-            new_ids.add(candidate.id)
-    if candidates and not retained:
-        raise RuntimeError("Task topology node allocation could not retain a branch cursor.")
-    retained_ids.update(new_ids)
-    return tuple(retained)
-
-
-def _reject_loaded_task_topology_cycles(
-    nodes_by_id: Mapping[str, TaskTopologyNode],
-) -> None:
-    _reject_task_parent_link_cycles(
-        {node_id: node.parent_task_id for node_id, node in nodes_by_id.items()}
-    )
-
-
-def _bounded_optional_task_topology_parent_id(value: str | None) -> str | None:
-    if value is None:
-        return None
-    try:
-        return _bounded_task_topology_text(
-            value,
-            "parent_task_id",
-            max_bytes=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-        )
-    except (TypeError, ValueError) as exc:
-        raise TaskTopologyInconsistent(
-            "A task topology record contains an invalid durable parent identifier."
-        ) from exc
-
-
-async def _validate_task_topology_ancestry(
-    seed_nodes: Iterable[TaskTopologyNode],
-    load_parent_links: Callable[
-        [tuple[str, ...]],
-        Awaitable[Mapping[str, str | None]],
-    ],
-) -> None:
-    """Validate complete parent chains for projected candidates under hard bounds."""
-
-    parent_by_id: dict[str, str | None] = {}
-    for node in seed_nodes:
-        prior = parent_by_id.setdefault(node.id, node.parent_task_id)
-        if prior != node.parent_task_id:
-            raise TaskTopologyInconsistent(
-                "Task topology contains contradictory parent links for one task."
-            )
-
-    frontier = {
-        parent_id
-        for parent_id in parent_by_id.values()
-        if parent_id is not None and parent_id not in parent_by_id
-    }
-    depth = 0
-    while frontier:
-        if depth >= TASK_TOPOLOGY_MAX_ANCESTOR_DEPTH:
-            raise TaskTopologyTraversalLimitExceeded(
-                "Task topology ancestry exceeds its depth limit."
-            )
-        task_ids = tuple(sorted(frontier))
-        if len(parent_by_id) + len(task_ids) > TASK_TOPOLOGY_MAX_VALIDATION_NODES:
-            raise TaskTopologyTraversalLimitExceeded(
-                "Task topology ancestry exceeds its validation-node limit."
-            )
-        loaded = await load_parent_links(task_ids)
-        if set(loaded) != set(task_ids):
-            raise TaskTopologyInconsistent(
-                "A task topology record references a missing durable parent."
-            )
-        for task_id in task_ids:
-            parent_by_id[task_id] = _bounded_optional_task_topology_parent_id(loaded[task_id])
-        frontier = {
-            parent_id
-            for parent_id in (parent_by_id[task_id] for task_id in task_ids)
-            if parent_id is not None and parent_id not in parent_by_id
-        }
-        depth += 1
-
-    _reject_task_parent_link_cycles(parent_by_id)
-
-
-def _reject_task_parent_link_cycles(
-    parent_by_id: Mapping[str, str | None],
-) -> None:
-    complete: set[str] = set()
-    for start_id in parent_by_id:
-        if start_id in complete:
-            continue
-        path: list[str] = []
-        path_positions: dict[str, int] = {}
-        current_id: str | None = start_id
-        while current_id is not None and current_id in parent_by_id:
-            if current_id in complete:
-                break
-            if current_id in path_positions:
-                raise TaskTopologyCycle("Task topology contains a cycle among loaded task nodes.")
-            path_positions[current_id] = len(path)
-            path.append(current_id)
-            current_id = parent_by_id[current_id]
-        complete.update(path)
-
-
-def copy_task(task: Task) -> Task:
-    if type(task) is not Task:
-        raise TypeError("Tasks must be Task instances.")
-    if task.work_contract is not None:
-        _preflight_bounded_task_payloads(task)
-    return Task(
-        id=task.id,
-        type=task.type,
-        title=task.title,
-        description=task.description,
-        status=task.status,
-        session_id=task.session_id,
-        session_instance_id=task.session_instance_id,
-        parent_task_id=task.parent_task_id,
-        graph_id=task.graph_id,
-        prerequisite_task_ids=task.prerequisite_task_ids,
-        assigned_agent_name=task.assigned_agent_name,
-        available_at=task.available_at,
-        schedule=task.schedule,
-        worker_id=task.worker_id,
-        lease_expires_at=task.lease_expires_at,
-        interrupted_handoff_id=task.interrupted_handoff_id,
-        status_reason=task.status_reason,
-        status_payload=(
-            None
-            if task.status_payload is None
-            else copy_durable_json_object(task.status_payload, "status_payload")
-        ),
-        input=copy_durable_json_object(task.input, "input"),
-        result=(None if task.result is None else copy_durable_json_object(task.result, "result")),
-        error=None if task.error is None else copy_durable_json_object(task.error, "error"),
-        metadata=copy_durable_metadata(task.metadata),
-        created_at=task.created_at,
-        updated_at=task.updated_at,
-        started_at=task.started_at,
-        completed_at=task.completed_at,
-        invocation=copy_task_invocation(task.invocation),
-        retry_series=(
-            None
-            if task.retry_series is None
-            else _copy_task_retry_series_snapshot(task.retry_series)
-        ),
-        work_contract=copy_work_contract_ref(task.work_contract),
-    )
-
-
-def _copy_task_retry_policy(policy: TaskRetryPolicy) -> TaskRetryPolicy:
-    if type(policy) is not TaskRetryPolicy:
-        raise TypeError("Task retry policy must be a TaskRetryPolicy instance.")
-    return TaskRetryPolicy(
-        max_attempts=policy.max_attempts,
-        max_elapsed_seconds=policy.max_elapsed_seconds,
-        max_total_tokens=policy.max_total_tokens,
-        max_estimated_cost=policy.max_estimated_cost,
-        cost_currency=policy.cost_currency,
-        initial_backoff_seconds=policy.initial_backoff_seconds,
-        backoff_multiplier=policy.backoff_multiplier,
-        max_backoff_seconds=policy.max_backoff_seconds,
-    )
-
-
-def _copy_task_retry_series_snapshot(
-    series: TaskRetrySeriesSnapshot,
-) -> TaskRetrySeriesSnapshot:
-    if type(series) is not TaskRetrySeriesSnapshot:
-        raise TypeError("Task retry authority must be a TaskRetrySeriesSnapshot instance.")
-    return TaskRetrySeriesSnapshot(
-        series_id=series.series_id,
-        causal_budget_id=series.causal_budget_id,
-        authority_sha256=series.authority_sha256,
-        attempt=series.attempt,
-        policy=_copy_task_retry_policy(series.policy),
-        started_at=series.started_at,
-        cumulative_tokens=series.cumulative_tokens,
-        cumulative_estimated_cost=series.cumulative_estimated_cost,
-        attempts_remaining=series.attempts_remaining,
-        tokens_remaining=series.tokens_remaining,
-        estimated_cost_remaining=series.estimated_cost_remaining,
-        elapsed_deadline=series.elapsed_deadline,
-        disposition=series.disposition,
-        predecessor_task_id=series.predecessor_task_id,
-        successor_task_id=series.successor_task_id,
-        next_eligible_at=series.next_eligible_at,
-    )
-
-
 def _copy_task_retry_event(event: TaskRetryEvent) -> TaskRetryEvent:
     if type(event) is not TaskRetryEvent:
         raise TypeError("Task retry events must be TaskRetryEvent instances.")
@@ -10132,62 +8703,6 @@ def _task_retry_successor_id(series_id: str, attempt: int) -> str:
         "task_retry_successor_id",
     )
     return f"task-retry-attempt:v1:{sha256(material).hexdigest()}"
-
-
-def _task_retry_attempt_authority_sha256(
-    *,
-    task_id: str,
-    task_type: str,
-    title: str | None,
-    description: str | None,
-    parent_task_id: str | None,
-    assigned_agent_name: str | None,
-    available_at: datetime | None,
-    created_at: datetime,
-    task_input: dict[str, Any],
-    metadata: dict[str, Any],
-    invocation: TaskInvocation,
-    series_id: str,
-    causal_budget_id: str,
-    attempt: int,
-    policy: TaskRetryPolicy,
-    started_at: datetime,
-    cumulative_tokens: int,
-    cumulative_estimated_cost: Decimal,
-    predecessor_task_id: str | None,
-) -> str:
-    """Bind one attempt to its complete immutable and cumulative authority."""
-
-    material = canonical_durable_json_bytes(
-        {
-            "schema": "cayu.task-retry-attempt-authority.v1",
-            "task_id": task_id,
-            "task_type": task_type,
-            "title": title,
-            "description": description,
-            "parent_task_id": parent_task_id,
-            "assigned_agent_name": assigned_agent_name,
-            "available_at": (
-                None
-                if available_at is None
-                else normalize_utc_datetime(available_at, "available_at").isoformat()
-            ),
-            "created_at": normalize_utc_datetime(created_at, "created_at").isoformat(),
-            "input": task_input,
-            "metadata": metadata,
-            "invocation": invocation.model_dump(mode="json", warnings=False),
-            "series_id": series_id,
-            "causal_budget_id": causal_budget_id,
-            "attempt": attempt,
-            "policy": policy.model_dump(mode="json", warnings=False),
-            "started_at": normalize_utc_datetime(started_at, "started_at").isoformat(),
-            "cumulative_tokens": cumulative_tokens,
-            "cumulative_estimated_cost": str(cumulative_estimated_cost),
-            "predecessor_task_id": predecessor_task_id,
-        },
-        "task_retry_attempt_authority",
-    )
-    return sha256(material).hexdigest()
 
 
 def _rescheduled_initial_task_retry_series(

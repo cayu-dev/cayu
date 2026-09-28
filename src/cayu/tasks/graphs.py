@@ -23,18 +23,15 @@ from pydantic import (
 )
 
 from cayu._clock import normalize_utc_datetime
-from cayu._validation import (
-    MAX_PORTABLE_JSON_INTEGER,
-    canonical_durable_json_bytes,
-    require_durable_clean_nonblank,
-)
+from cayu._validation import MAX_PORTABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.sessions.invocation import TaskInvocation
-from cayu.tasks.base import TaskCreate, TaskInvocationSnapshot, TaskStatus, copy_task_create
-
-TASK_GRAPH_MAX_NODES = 128
-TASK_GRAPH_MAX_EDGES = 1024
-TASK_GRAPH_MAX_BYTES = 1024 * 1024
-TASK_GRAPH_ID_MAX_BYTES = 256
+from cayu.tasks._graph_identity import TASK_GRAPH_ID_MAX_BYTES as TASK_GRAPH_ID_MAX_BYTES
+from cayu.tasks._graph_identity import TASK_GRAPH_MAX_BYTES as TASK_GRAPH_MAX_BYTES
+from cayu.tasks._graph_identity import TASK_GRAPH_MAX_EDGES as TASK_GRAPH_MAX_EDGES
+from cayu.tasks._graph_identity import TASK_GRAPH_MAX_NODES as TASK_GRAPH_MAX_NODES
+from cayu.tasks._graph_identity import graph_identifier as graph_identifier
+from cayu.tasks.base import TaskCreate, TaskInvocationSnapshot, copy_task_create
+from cayu.tasks.records import TaskStatus
 
 
 class TaskGraphConflict(ValueError):
@@ -43,13 +40,6 @@ class TaskGraphConflict(ValueError):
 
 class TaskGraphUnavailable(ValueError):
     """Complete authoritative graph evidence is unavailable."""
-
-
-def graph_identifier(value: str) -> str:
-    value = require_durable_clean_nonblank(value, "graph identity")
-    if len(value.encode("utf-8")) > TASK_GRAPH_ID_MAX_BYTES:
-        raise ValueError("Graph identity exceeds its byte limit.")
-    return value
 
 
 GraphIdentifier = Annotated[str, AfterValidator(graph_identifier)]

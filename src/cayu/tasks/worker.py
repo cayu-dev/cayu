@@ -103,7 +103,6 @@ from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     InterruptedTaskContinuationClaimPage,
-    Task,
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
@@ -119,10 +118,8 @@ from cayu.tasks.base import (
     TaskRetryCancellationReconciliationEvidence,
     TaskRetryCancellationReconciliationOutcome,
     TaskRetryCancellationReconciliationRequest,
-    TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
-    TaskStatus,
     TaskStore,
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,
@@ -134,12 +131,12 @@ from cayu.tasks.base import (
     _task_retry_runtime_terminal_request,
     _terminalize_claimed_task,
     _terminalize_claimed_task_or_detect_peer_winner,
-    copy_task,
     interrupted_task_handoff_request,
     new_interrupted_task_continuation_handoff_id,
     prepare_interrupted_task_handoff,
     settle_task_retry_attempt_with_retry,
 )
+from cayu.tasks.records import Task, TaskRetrySeriesDisposition, TaskStatus, copy_task
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp

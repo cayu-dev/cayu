@@ -87,12 +87,8 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     TaskExecutionSource,
 )
-from cayu.tasks.base import (
-    Task,
-    TaskCreate,
-    TaskStatus,
-    task_create_with_runtime_invocation,
-)
+from cayu.tasks.base import TaskCreate, task_create_with_runtime_invocation
+from cayu.tasks.records import Task, TaskStatus
 from cayu.vaults import (
     REDACTED_SECRET,
     SecretRedactionCapacityError,

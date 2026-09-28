@@ -732,12 +732,9 @@ from cayu.tasks.admission import (
     work_attempt_recovery_session_authority_from_checkpoint,
 )
 from cayu.tasks.base import (
-    Task,
     TaskCreate,
     TaskInvocationSnapshot,
-    TaskStatus,
     TaskStore,
-    copy_task,
     copy_task_create,
     preflight_contract_bound_task_creation,
     require_contract_bound_task_creation_snapshot,
@@ -781,6 +778,7 @@ from cayu.tasks.graphs import (
     TaskGraphEvent,
     TaskGraphSnapshot,
 )
+from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,

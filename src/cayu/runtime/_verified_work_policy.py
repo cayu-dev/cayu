@@ -12,9 +12,7 @@ from datetime import UTC, datetime
 
 from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
-    Task,
     TaskClaimLost,
-    TaskStatus,
     TaskTerminalizationConflict,
     _ensure_active_task_lease,
     _ensure_can_transition,
@@ -33,6 +31,7 @@ from cayu.tasks.contracts import (
     WorkContractConflict,
     WorkContractRef,
 )
+from cayu.tasks.records import Task, TaskStatus
 
 
 def require_contract_reference(

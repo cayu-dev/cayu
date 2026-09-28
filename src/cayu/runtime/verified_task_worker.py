@@ -66,14 +66,11 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
 )
 from cayu.tasks.base import (
-    Task,
     TaskAggregateFilter,
     TaskClaimLost,
     TaskQuery,
-    TaskStatus,
     WorkAttemptLifecycleReceipt,
     WorkAttemptPreparationHoldReceipt,
-    copy_task,
     copy_task_query,
 )
 from cayu.tasks.contracts import (
@@ -94,6 +91,7 @@ from cayu.tasks.contracts import (
     require_bounded_work_completion_document,
 )
 from cayu.tasks.groups import TaskGroupResultResolutionPending
+from cayu.tasks.records import Task, TaskStatus, copy_task
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp

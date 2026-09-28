@@ -105,7 +105,6 @@ from cayu.tasks._execution_settlement import (
 )
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
-    Task,
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
@@ -115,7 +114,6 @@ from cayu.tasks.base import (
     TaskCreate,
     TaskOrder,
     TaskQuery,
-    TaskStatus,
     TaskStore,
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,
@@ -123,9 +121,9 @@ from cayu.tasks.base import (
     _task_cancellation_requested,
     _task_cancellation_terminalization_request,
     _terminalize_claimed_task_or_detect_peer_winner,
-    copy_task,
     task_create_with_runtime_invocation,
 )
+from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.tools.exposure import ToolCapabilityCeiling, copy_tool_capability_ceiling
 from cayu.tools.grants import TargetedToolGrant, validate_targeted_tool_grants
 from cayu.vaults import SecretRedactor

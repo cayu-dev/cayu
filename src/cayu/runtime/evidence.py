@@ -55,7 +55,7 @@ from cayu.sessions.base import (
     SessionQuery,
     SessionStatus,
 )
-from cayu.tasks.base import TaskTopologyQuery
+from cayu.tasks.topology import TaskTopologyQuery
 from cayu.tools.inference import validate_inference_purpose
 from cayu.tools.policy import taint_labels_from_metadata
 from cayu.workspaces.observation_recovery import (

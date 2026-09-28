@@ -74,19 +74,19 @@ from cayu.storage._task_group_schema import (
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.tasks.base import (
-    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
-    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    Task,
     TaskInterruptedHandoffRequest,
     TaskOrder,
-    TaskRetrySeriesSnapshot,
-    TaskStatus,
-    TaskTopologyInconsistent,
-    TaskTopologyNode,
     prepare_interrupted_task_handoff,
 )
 from cayu.tasks.contracts import WorkContractRef
+from cayu.tasks.records import Task, TaskRetrySeriesSnapshot, TaskStatus
 from cayu.tasks.scheduling import TaskScheduleState
+from cayu.tasks.topology import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+)
 
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -5227,9 +5227,7 @@ def _backfill_pending_action_checkpoint_batch(
     connection: sqlite3.Connection,
     after_session_id: str | None,
 ) -> str | None:
-    from cayu.sessions.pending_actions import (
-        pending_action_checkpoint_metrics,
-    )
+    from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
 
     rows = connection.execute(
         "SELECT session_id FROM cayu_checkpoints "

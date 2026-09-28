@@ -21,7 +21,7 @@ from cayu.tasks._graphs import (
     require_member_authority,
 )
 from cayu.tasks._groups import prepare_group_admission
-from cayu.tasks.base import Task, TaskCreate
+from cayu.tasks.base import TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
     TaskGraphCreate,
@@ -36,6 +36,7 @@ from cayu.tasks.graphs import (
     task_graph_request_sha256,
 )
 from cayu.tasks.groups import TaskGroupCreate, TaskGroupInvocationObligation
+from cayu.tasks.records import Task
 
 if TYPE_CHECKING:
     from cayu.storage.sqlite import SQLiteTaskStore

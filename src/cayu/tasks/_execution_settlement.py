@@ -13,8 +13,9 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.tasks.base import Task, TaskStore, copy_task
+from cayu.tasks.base import TaskStore
 from cayu.tasks.groups import TaskGroupConflict
+from cayu.tasks.records import Task, copy_task
 from cayu.vaults.redaction import SecretRedactor
 
 _OBSERVATION_TIMEOUT_SECONDS = 1.0

@@ -45,11 +45,8 @@ from cayu.tasks.admission import (
 )
 from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
-    Task,
-    TaskStatus,
     TaskStore,
     WorkAttemptLifecycleReceipt,
-    copy_task,
 )
 from cayu.tasks.contracts import (
     CompletionDecision,
@@ -63,6 +60,7 @@ from cayu.tasks.contracts import (
     validate_work_completion_linked_id,
 )
 from cayu.tasks.groups import TaskGroupConflict
+from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.vaults.redaction import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")

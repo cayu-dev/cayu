@@ -8,12 +8,9 @@ from datetime import datetime
 
 from cayu.tasks._graphs import dependency_skip_evidence
 from cayu.tasks.base import (
-    Task,
     TaskCreate,
     TaskInvocationSnapshot,
-    TaskStatus,
     _task_from_create,
-    copy_task,
     require_contract_bound_task_creation_snapshot,
 )
 from cayu.tasks.graphs import (
@@ -23,6 +20,7 @@ from cayu.tasks.graphs import (
     TaskGraphEvent,
     TaskGraphEventType,
 )
+from cayu.tasks.records import Task, TaskStatus, copy_task
 
 
 @dataclass(frozen=True)

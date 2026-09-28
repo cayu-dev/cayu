@@ -70,7 +70,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     inherited_session_invocation,
 )
-from cayu.tasks.base import TaskStatus, TaskStore
+from cayu.tasks.base import TaskStore
 from cayu.tasks.dispatch import (
     DispatchHandle,
     DispatchStatus,
@@ -81,6 +81,7 @@ from cayu.tasks.dispatch import (
     _QueuedDispatchEnvelope,
     _QueuedDispatchSettlement,
 )
+from cayu.tasks.records import TaskStatus
 from cayu.tools.base import ToolContext, ToolResult, _runtime_tool_invocation_authority
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,

@@ -21,18 +21,16 @@ from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
 from cayu.storage._accounting_schema import (
     POSTGRES_AUXILIARY_ACCOUNTING_DDL as POSTGRES_AUXILIARY_ACCOUNTING_DDL,
 )
-from cayu.tasks.base import (
+from cayu.tasks.base import TaskOrder
+from cayu.tasks.contracts import WorkContractRef
+from cayu.tasks.records import Task, TaskRetrySeriesSnapshot, TaskStatus
+from cayu.tasks.scheduling import TaskScheduleState
+from cayu.tasks.topology import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
-    Task,
-    TaskOrder,
-    TaskRetrySeriesSnapshot,
-    TaskStatus,
     TaskTopologyInconsistent,
     TaskTopologyNode,
 )
-from cayu.tasks.contracts import WorkContractRef
-from cayu.tasks.scheduling import TaskScheduleState
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,

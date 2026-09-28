@@ -19,7 +19,7 @@ from pydantic import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_nonblank
 from cayu.environments.factory import EnvironmentAllocationState
 from cayu.sessions.base import IncompleteSessionRecoveryAction, PendingActionKind, SessionStatus
-from cayu.tasks.base import TaskStatus
+from cayu.tasks.records import TaskStatus
 
 RECOVERY_PLAN_SCHEMA_VERSION = 1
 RECOVERY_PLAN_MAX_ITEMS = 1000

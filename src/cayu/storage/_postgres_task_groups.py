@@ -22,7 +22,7 @@ from cayu.tasks.groups import (
 
 if TYPE_CHECKING:
     from cayu.storage.postgres import PostgresTaskStore
-    from cayu.tasks.base import Task
+    from cayu.tasks.records import Task
 
 
 async def read_group(cur: Any, group_id: str) -> TaskGroupSnapshot | None:

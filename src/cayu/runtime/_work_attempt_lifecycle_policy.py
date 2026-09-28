@@ -34,13 +34,10 @@ from cayu.tasks.admission import (
 )
 from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
-    Task,
-    TaskStatus,
     WorkAttemptLifecycleReceipt,
     WorkAttemptPreparationHoldReceipt,
     _ensure_exact_owned_active_task_lease,
     _task_cancellation_requested,
-    copy_task,
 )
 from cayu.tasks.contracts import (
     CompletionDecision,
@@ -48,6 +45,7 @@ from cayu.tasks.contracts import (
     CompletionVerdict,
     CompletionVerificationClaim,
 )
+from cayu.tasks.records import Task, TaskStatus, copy_task
 
 
 def plan_work_attempt_execution_entry(

@@ -20,7 +20,6 @@ from cayu.tasks._group_quiescence import (
     waiting_finalizer,
 )
 from cayu.tasks._groups import prepare_group_admission, require_group_replay
-from cayu.tasks.base import Task
 from cayu.tasks.graphs import (
     TaskGraphConflict,
     TaskGraphCreate,
@@ -34,6 +33,7 @@ from cayu.tasks.graphs import (
     task_graph_request_sha256,
 )
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupCreate, TaskGroupInvocationObligation
+from cayu.tasks.records import Task
 
 if TYPE_CHECKING:
     from cayu.tasks.base import InMemoryTaskStore

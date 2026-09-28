@@ -451,20 +451,18 @@ from cayu.sessions.invocation import (
     inherited_session_invocation,
 )
 from cayu.tasks.base import (
-    Task,
     TaskQuery,
-    TaskStatus,
     TaskStore,
     TaskTerminalizationRequest,
     TaskTerminalKind,
     _terminalize_claimed_task,
-    copy_task,
 )
 from cayu.tasks.dispatch import (
     _new_prepared_subagent_dispatch_envelope,
     _require_dispatch_task_authority,
     _task_matches_queued_dispatch,
 )
+from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import durable_runner_recovery_authority

@@ -60,7 +60,7 @@ from cayu.sessions.base import (
     _renew_completion_result_event_publication,
     _reserve_completion_result_event_publication,
 )
-from cayu.tasks.base import CompletionDecisionApplicationReceipt, Task, TaskStore
+from cayu.tasks.base import CompletionDecisionApplicationReceipt, TaskStore
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
@@ -72,6 +72,7 @@ from cayu.tasks.contracts import (
     completion_decision_application_request_sha256,
 )
 from cayu.tasks.groups import TaskGroupConflict
+from cayu.tasks.records import Task
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,

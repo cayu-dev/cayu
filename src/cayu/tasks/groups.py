@@ -25,7 +25,6 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
-from cayu.tasks.base import TaskStatus
 from cayu.tasks.graphs import (
     TASK_GRAPH_MAX_BYTES,
     GraphIdentifier,
@@ -35,6 +34,7 @@ from cayu.tasks.graphs import (
     TaskGraphMember,
     copy_task_graph_create,
 )
+from cayu.tasks.records import TaskStatus
 
 
 class TaskGroupConflict(ValueError):

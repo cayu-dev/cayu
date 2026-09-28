@@ -69,16 +69,12 @@ from cayu.storage.memory import (
     knowledge_access_scope_sha256,
 )
 from cayu.tasks.base import (
-    Task,
     TaskClaimLost,
     TaskCreate,
     TaskOrder,
     TaskQuery,
     TaskRetryAttemptDisposition,
-    TaskRetryPolicy,
-    TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
-    TaskStatus,
     TaskStore,
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,
@@ -86,10 +82,16 @@ from cayu.tasks.base import (
     TaskTerminalKind,
     _task_cancellation_terminalization_request,
     _task_retry_requested_cancellation_settlement,
-    copy_task,
     settle_task_retry_attempt_with_retry,
     task_create_with_execution_source,
     terminalize_task_with_retry,
+)
+from cayu.tasks.records import (
+    Task,
+    TaskRetryPolicy,
+    TaskRetrySeriesDisposition,
+    TaskStatus,
+    copy_task,
 )
 
 KNOWLEDGE_ENRICHMENT_SCHEMA_VERSION = 1

@@ -18,14 +18,13 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.runtime._verified_work_authority import invocation_contains_secret_public_identity
 from cayu.tasks._scheduling import schedule_creation_digest, schedule_mutation_digest
 from cayu.tasks.base import (
-    Task,
     TaskCreate,
     TaskInvocationSnapshot,
     TaskStore,
-    copy_task,
     copy_task_create,
     task_invocation_for_create,
 )
+from cayu.tasks.records import Task, copy_task
 from cayu.tasks.scheduling import (
     TASK_SCHEDULE_ID_MAX_BYTES,
     TaskRescheduleRequest,

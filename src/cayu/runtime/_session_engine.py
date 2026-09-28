@@ -800,22 +800,20 @@ from cayu.tasks.admission import (
     work_attempt_recovery_session_authority_from_checkpoint,
 )
 from cayu.tasks.base import (
-    Task,
     TaskClaimLost,
     TaskCompletionDecisionRequired,
     TaskQuery,
-    TaskStatus,
     TaskStore,
     TaskTerminalizationRequest,
     TaskTerminalKind,
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
     _terminalize_claimed_task,
-    copy_task,
     prepare_task_terminalization,
 )
 from cayu.tasks.contracts import WorkCompletionConflict
 from cayu.tasks.dispatch import DispatchRequest
+from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.tools.base import (
     ToolResult,
 )

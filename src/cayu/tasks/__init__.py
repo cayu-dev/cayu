@@ -1,6 +1,7 @@
 """Durable task contracts and worker configuration.
 
-Public import surface; implementations retain their existing internal owners."""
+Task records and topology contracts can also be imported directly from
+``cayu.tasks.records`` and ``cayu.tasks.topology``."""
 
 from typing import Any as _Any
 

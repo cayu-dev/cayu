@@ -8,7 +8,6 @@ from datetime import datetime
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.tasks._graph_admission import GraphAdmission
 from cayu.tasks._graphs import GRAPH_TERMINAL_STATUSES, GraphTransition, member_from_task
-from cayu.tasks.base import TaskStatus
 from cayu.tasks.graphs import task_graph_request_sha256
 from cayu.tasks.groups import (
     TaskGroupConflict,
@@ -25,6 +24,7 @@ from cayu.tasks.groups import (
     TaskGroupUnavailable,
     task_group_request_sha256,
 )
+from cayu.tasks.records import TaskStatus
 
 
 @dataclass(frozen=True)

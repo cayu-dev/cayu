@@ -74,19 +74,15 @@ from cayu.tasks.admission import (
 )
 from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
-    Task,
     TaskAggregateFilter,
     TaskClaimLost,
     TaskQuery,
-    TaskStatus,
-    TaskTopologyInconsistent,
     WorkAttemptLifecycleReceipt,
     WorkAttemptPreparationHoldReceipt,
     _ensure_exact_owned_active_task_lease,
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
     _work_attempt_discovery_query,
-    copy_task,
 )
 from cayu.tasks.contracts import (
     CompletionDecision,
@@ -124,6 +120,8 @@ from cayu.tasks.contracts import (
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
 )
+from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.topology import TaskTopologyInconsistent
 
 _T = TypeVar("_T")
 _POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS = 1.0
