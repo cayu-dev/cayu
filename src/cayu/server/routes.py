@@ -256,6 +256,13 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.exceptions import TerminalEventPublicationUncertain
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeRevisionConflict,
+    KnowledgeVisibility,
+)
 from cayu.messages import Message, MessageRole
 from cayu.project_control_plane import ResolvedProjectControlPlaneContext
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
@@ -493,14 +500,9 @@ from cayu.sessions.invocation import (
 )
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
     KnowledgeActivationConflict,
-    KnowledgeChunk,
-    KnowledgeEntry,
     KnowledgeListItem,
     KnowledgeReviewApproval,
-    KnowledgeRevisionConflict,
-    KnowledgeVisibility,
 )
 from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,

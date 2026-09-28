@@ -74,6 +74,10 @@ from cayu.evals.models import (
 )
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.events import EventType, event_durable_sequence
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.memory.attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -144,9 +148,7 @@ from cayu.snapshots.base import (
     execution_profile_snapshot_ref,
 )
 from cayu.storage.memory import (
-    KnowledgeAccessScope,
     KnowledgeStore,
-    copy_knowledge_access_scope,
 )
 
 MEMORY_INTERVENTION_EXECUTION_SCHEMA_VERSION = 1

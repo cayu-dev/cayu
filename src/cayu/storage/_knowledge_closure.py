@@ -156,7 +156,7 @@ class KnowledgeClosureInventory:
         return entry_id, revision
 
     def add_evidence(self, evidence) -> tuple[str, int]:
-        from cayu.storage.memory import copy_knowledge_evidence
+        from cayu.knowledge.records import copy_knowledge_evidence
 
         copied = copy_knowledge_evidence(evidence)
         self.add(

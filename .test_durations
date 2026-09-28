@@ -39147,5 +39147,10 @@
     "tests/core/test_size_report.py::test_inventory_counts_physical_lines_in_source_tests_and_stubs[unterminated]": 0.00019900081679224968,
     "tests/core/test_size_report.py::test_string_separators_do_not_make_a_test_module_oversized": 0.0006192498840391636,
     "tests/server/test_server_evaluation_promotion.py::test_promotion_routes_preserve_prefix_order_and_shared_auth_dependency[/api-api]": 1.3016778752207756,
-    "tests/server/test_server_evaluation_promotion.py::test_promotion_routes_preserve_prefix_order_and_shared_auth_dependency[/custom/v2-custom_v2]": 1.3682813339401037
+    "tests/server/test_server_evaluation_promotion.py::test_promotion_routes_preserve_prefix_order_and_shared_auth_dependency[/custom/v2-custom_v2]": 1.3682813339401037,
+    "tests/core/test_knowledge_package_layout.py::test_record_contracts_do_not_load_storage_implementations[cayu-cayu]": 0.11840737517923117,
+    "tests/core/test_knowledge_package_layout.py::test_record_contracts_do_not_load_storage_implementations[cayu.knowledge.records-cayu.knowledge.scopes]": 0.11709666601382196,
+    "tests/core/test_knowledge_package_layout.py::test_record_contracts_do_not_load_storage_implementations[cayu.storage-cayu.storage]": 0.11033608322031796,
+    "tests/core/test_knowledge_package_layout.py::test_record_contracts_preserve_public_and_legacy_class_identity": 0.0004687919281423092,
+    "tests/core/test_knowledge_package_layout.py::test_record_values_support_pickle_round_trips": 0.0012264580000191927
 }

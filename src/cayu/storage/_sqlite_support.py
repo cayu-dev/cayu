@@ -21,6 +21,10 @@ from cayu._validation import (
     require_execution_unit_id,
 )
 from cayu.events import Event
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
+    MAX_KNOWLEDGE_ENTRY_ID_BYTES,
+)
 from cayu.messages import Message
 from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
@@ -69,10 +73,6 @@ from cayu.storage._task_group_schema import (
 )
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_CHUNK_ID_BYTES,
-    MAX_KNOWLEDGE_ENTRY_ID_BYTES,
-)
 from cayu.tasks.base import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,

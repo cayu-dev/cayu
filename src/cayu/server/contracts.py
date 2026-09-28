@@ -107,6 +107,7 @@ from cayu.evals.suite_authoring import (
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.events import EVENT_ID_MAX_CHARS
+from cayu.knowledge.records import MAX_KNOWLEDGE_REVISION
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.system_diagnostics import (
@@ -204,7 +205,6 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
-from cayu.storage.memory import MAX_KNOWLEDGE_REVISION
 from cayu.tasks.base import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
     TASK_TOPOLOGY_MAX_BRANCH_LIMIT,

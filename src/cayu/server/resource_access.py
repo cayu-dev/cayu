@@ -18,6 +18,7 @@ from pydantic import Base64Bytes, BaseModel, ConfigDict, Field
 
 from cayu._resource_access_errors import ResourceAccessDenied
 from cayu.applications import CayuApp
+from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.resource_access import ScopedCayuAccess
 from cayu.sessions.base import (
     EventQuery,
@@ -26,7 +27,10 @@ from cayu.sessions.base import (
     RunRequest,
     SessionQuery,
 )
-from cayu.storage.memory import KnowledgeAccessScope, KnowledgeListQuery, KnowledgeQuery
+from cayu.storage.memory import (
+    KnowledgeListQuery,
+    KnowledgeQuery,
+)
 from cayu.tasks.base import TaskCreate, TaskQuery
 
 

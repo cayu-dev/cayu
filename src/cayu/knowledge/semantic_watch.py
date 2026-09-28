@@ -37,6 +37,17 @@ from cayu._validation import (
     require_durable_nonblank,
     thaw_json_value,
 )
+from cayu.knowledge.records import (
+    DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeRevisionRef,
+    KnowledgeStatus,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
@@ -52,14 +63,7 @@ from cayu.memory.recall import (
 )
 from cayu.memory.retrieval import RetrievalFusionDiagnostics
 from cayu.storage.memory import (
-    DEFAULT_KNOWLEDGE_NAMESPACE,
-    KnowledgeAccessScope,
-    KnowledgeChunk,
-    KnowledgeEntry,
-    KnowledgeRevisionRef,
-    KnowledgeStatus,
     KnowledgeStore,
-    copy_knowledge_access_scope,
     knowledge_access_scope_sha256,
 )
 

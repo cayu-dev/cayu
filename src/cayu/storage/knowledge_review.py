@@ -9,20 +9,27 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.knowledge.records import (
+    DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeEvidenceResult,
+    KnowledgeStatus,
+    KnowledgeVisibility,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
-    DEFAULT_KNOWLEDGE_MAX_BYTES,
     MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
     MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
     MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
-    KnowledgeAccessScope,
     KnowledgeActivationAuthority,
     KnowledgeActivationConflict,
     KnowledgeActivationReceipt,
     KnowledgeActivationSource,
-    KnowledgeChunk,
-    KnowledgeEntry,
-    KnowledgeEvidenceResult,
     KnowledgeGovernanceMode,
     KnowledgeListQuery,
     KnowledgeListResult,
@@ -32,10 +39,7 @@ from cayu.storage.memory import (
     KnowledgeMaintenanceProposal,
     KnowledgePublicationReceipt,
     KnowledgeReviewApproval,
-    KnowledgeStatus,
-    KnowledgeVisibility,
     _replay_review_approval_from_receipts,
-    copy_knowledge_access_scope,
     copy_knowledge_activation_authority,
     copy_knowledge_activation_receipt,
     prepare_knowledge_activation_request,

@@ -49,6 +49,11 @@ from cayu.knowledge.curator import (
     _validate_curator_access_scope,
     validate_learning_batch,
 )
+from cayu.knowledge.records import MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerStep,
     run_durable_lease_heartbeat,
@@ -60,10 +65,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
-    KnowledgeAccessScope,
     KnowledgeGovernanceMode,
-    copy_knowledge_access_scope,
     knowledge_access_scope_sha256,
 )
 from cayu.tasks.base import (

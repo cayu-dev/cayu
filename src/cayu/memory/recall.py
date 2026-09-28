@@ -35,6 +35,16 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu._validation import require_durable_nonblank as require_nonblank
+from cayu.knowledge.records import (
+    DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeRevisionRef,
+    KnowledgeStatus,
+    copy_knowledge_revision_refs,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.memory.retrieval import (
     FusedRetrievalCandidate,
     RankedRetrievalChannel,
@@ -56,22 +66,16 @@ from cayu.sessions.base import (
     encode_transcript_search_cursor,
 )
 from cayu.storage.memory import (
-    DEFAULT_KNOWLEDGE_NAMESPACE,
     MAX_KNOWLEDGE_CHANGE_SEQUENCE,
     MAX_KNOWLEDGE_RELATION_BYTES,
-    KnowledgeAccessScope,
     KnowledgeHit,
     KnowledgeIndexCoverage,
     KnowledgeLineageQuery,
     KnowledgeLineageResult,
     KnowledgeQuery,
-    KnowledgeRevisionRef,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
-    KnowledgeStatus,
     KnowledgeStore,
-    copy_knowledge_access_scope,
-    copy_knowledge_revision_refs,
 )
 
 RECALL_ENGINE_VERSION = "cayu.recall.v1"

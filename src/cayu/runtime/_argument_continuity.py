@@ -21,9 +21,9 @@ from cayu.messages import Message, ProviderStatePart, ToolCallPart
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
+    from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.runtime._runtime_records import ToolCallRequest
     from cayu.sessions.base import Session, SessionStore
-    from cayu.storage.memory import KnowledgeAccessScope
 
 STORAGE_KEY = "cayu:private-argument-continuity"
 MAX_ROUNDS = 16
@@ -77,7 +77,7 @@ class ArgumentContinuity(BaseModel):
 def scope_digest(scope: KnowledgeAccessScope | None) -> str:
     if scope is None:
         return "0" * 64
-    from cayu.storage.memory import KnowledgeAccessScope
+    from cayu.knowledge.scopes import KnowledgeAccessScope
 
     if type(scope) is not KnowledgeAccessScope:
         raise TypeError("Argument continuity requires a native knowledge access scope.")

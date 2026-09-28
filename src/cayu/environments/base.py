@@ -31,7 +31,10 @@ from cayu.workspaces import Workspace
 from cayu.workspaces.checkpoints import WorkspaceCheckpointPolicy
 
 if TYPE_CHECKING:
-    from cayu.storage.memory import KnowledgeAccessScope, KnowledgeStore
+    from cayu.knowledge.scopes import KnowledgeAccessScope
+    from cayu.storage.memory import (
+        KnowledgeStore,
+    )
 else:
     KnowledgeAccessScope = Any
     KnowledgeStore = Any
@@ -328,7 +331,7 @@ def _validate_knowledge_store(value: Any) -> None:
 def _copy_knowledge_access_scope(value: Any) -> Any:
     # Local import avoids the storage package importing runtime/environment
     # modules while cayu.environments itself is still initializing.
-    from cayu.storage.memory import copy_knowledge_access_scope
+    from cayu.knowledge.scopes import copy_knowledge_access_scope
 
     return copy_knowledge_access_scope(value)
 

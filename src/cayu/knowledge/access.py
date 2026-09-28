@@ -134,7 +134,7 @@ class ScopedKnowledgeAccess:
     """Explicit data operations intersected with a host-selected knowledge scope."""
 
     def __init__(self, store, *, binding, policy, access_scope=None):
-        from cayu.storage.memory import copy_knowledge_access_scope
+        from cayu.knowledge.scopes import copy_knowledge_access_scope
 
         if type(store).__dict__.get("resource_knowledge_access_version") != 1:
             raise NotImplementedError("Knowledge store cannot enforce resource access.")

@@ -35,23 +35,27 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_finite,
 )
+from cayu.knowledge.records import (
+    KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
+    KnowledgeRevisionRef,
+    KnowledgeStatus,
+    copy_knowledge_entry,
+    copy_knowledge_revision_ref,
+    knowledge_entry_payload_bytes,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
     MAX_KNOWLEDGE_RELATION_BYTES,
     MAX_KNOWLEDGE_RELATION_LIMIT,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeEntryReadLimitExceeded,
     KnowledgeRelation,
     KnowledgeRelationKind,
     KnowledgeRelationQuery,
     KnowledgeRelationResult,
-    KnowledgeRevisionRef,
-    KnowledgeStatus,
-    copy_knowledge_access_scope,
-    copy_knowledge_entry,
-    copy_knowledge_revision_ref,
-    knowledge_entry_payload_bytes,
 )
 
 KNOWLEDGE_MAINTENANCE_ROUTING_SCHEMA_VERSION = 1

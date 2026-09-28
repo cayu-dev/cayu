@@ -18,6 +18,12 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.evals.memory_baseline import MemoryRetrievalAccessSpec
+from cayu.knowledge.records import (
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeStatus,
+)
+from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.memory.base import AutomaticRecallPolicy, admit_recall
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
@@ -50,11 +56,7 @@ from cayu.sessions.base import (
     SessionStore,
 )
 from cayu.storage.memory import (
-    KnowledgeAccessScope,
-    KnowledgeChunk,
-    KnowledgeEntry,
     KnowledgeListQuery,
-    KnowledgeStatus,
     KnowledgeStore,
 )
 

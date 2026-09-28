@@ -77,6 +77,11 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.trajectory import SessionTrajectoryError, trajectory_from_session
+from cayu.knowledge.records import (
+    KnowledgeEntry,
+    KnowledgeStatus,
+)
+from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.memory.base import AutomaticRecallMode, AutomaticRecallPolicy
 from cayu.memory.context import (
     AutomaticRecallContextPolicy,
@@ -161,9 +166,6 @@ from cayu.snapshots.base import (
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,
-    KnowledgeAccessScope,
-    KnowledgeEntry,
-    KnowledgeStatus,
     KnowledgeStore,
 )
 from cayu.storage.sqlite import SQLiteSessionStore

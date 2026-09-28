@@ -2614,6 +2614,39 @@ from cayu.knowledge.maintenance_planning import (
 from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenanceStageBudget as KnowledgeMaintenanceStageBudget,
 )
+from cayu.knowledge.records import BUILTIN_KNOWLEDGE_KINDS as BUILTIN_KNOWLEDGE_KINDS
+from cayu.knowledge.records import DEFAULT_KNOWLEDGE_KIND as DEFAULT_KNOWLEDGE_KIND
+from cayu.knowledge.records import DEFAULT_KNOWLEDGE_MAX_BYTES as DEFAULT_KNOWLEDGE_MAX_BYTES
+from cayu.knowledge.records import DEFAULT_KNOWLEDGE_NAMESPACE as DEFAULT_KNOWLEDGE_NAMESPACE
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES as MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
+)
+from cayu.knowledge.records import MAX_KNOWLEDGE_CHUNK_ID_BYTES as MAX_KNOWLEDGE_CHUNK_ID_BYTES
+from cayu.knowledge.records import MAX_KNOWLEDGE_CHUNK_INDEX as MAX_KNOWLEDGE_CHUNK_INDEX
+from cayu.knowledge.records import MAX_KNOWLEDGE_ENTRY_ID_BYTES as MAX_KNOWLEDGE_ENTRY_ID_BYTES
+from cayu.knowledge.records import MAX_KNOWLEDGE_EVIDENCE_BYTES as MAX_KNOWLEDGE_EVIDENCE_BYTES
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES as MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES,
+)
+from cayu.knowledge.records import MAX_KNOWLEDGE_REVISION as MAX_KNOWLEDGE_REVISION
+from cayu.knowledge.records import KnowledgeActorType as KnowledgeActorType
+from cayu.knowledge.records import KnowledgeChunk as KnowledgeChunk
+from cayu.knowledge.records import KnowledgeChunkConflict as KnowledgeChunkConflict
+from cayu.knowledge.records import KnowledgeEntry as KnowledgeEntry
+from cayu.knowledge.records import (
+    KnowledgeEntryReadLimitExceeded as KnowledgeEntryReadLimitExceeded,
+)
+from cayu.knowledge.records import KnowledgeEvidence as KnowledgeEvidence
+from cayu.knowledge.records import KnowledgeEvidenceConflict as KnowledgeEvidenceConflict
+from cayu.knowledge.records import KnowledgeEvidenceDisposition as KnowledgeEvidenceDisposition
+from cayu.knowledge.records import KnowledgeEvidenceResult as KnowledgeEvidenceResult
+from cayu.knowledge.records import KnowledgeEvidenceRole as KnowledgeEvidenceRole
+from cayu.knowledge.records import KnowledgeRevisionConflict as KnowledgeRevisionConflict
+from cayu.knowledge.records import KnowledgeRevisionRef as KnowledgeRevisionRef
+from cayu.knowledge.records import KnowledgeStatus as KnowledgeStatus
+from cayu.knowledge.records import KnowledgeVisibility as KnowledgeVisibility
+from cayu.knowledge.scopes import KnowledgeAccessDenied as KnowledgeAccessDenied
+from cayu.knowledge.scopes import KnowledgeAccessScope as KnowledgeAccessScope
 from cayu.knowledge.semantic_watch import (
     MAX_KNOWLEDGE_SEMANTIC_WATCH_ANNOTATION_BYTES as MAX_KNOWLEDGE_SEMANTIC_WATCH_ANNOTATION_BYTES,
 )
@@ -4187,14 +4220,10 @@ from cayu.storage.knowledge_indexer import KnowledgeIndexRequest as KnowledgeInd
 from cayu.storage.knowledge_indexer import KnowledgeIndexResult as KnowledgeIndexResult
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow as KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore as SQLiteKnowledgeStore
-from cayu.storage.memory import BUILTIN_KNOWLEDGE_KINDS as BUILTIN_KNOWLEDGE_KINDS
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
 )
-from cayu.storage.memory import DEFAULT_KNOWLEDGE_KIND as DEFAULT_KNOWLEDGE_KIND
 from cayu.storage.memory import DEFAULT_KNOWLEDGE_LIMIT as DEFAULT_KNOWLEDGE_LIMIT
-from cayu.storage.memory import DEFAULT_KNOWLEDGE_MAX_BYTES as DEFAULT_KNOWLEDGE_MAX_BYTES
-from cayu.storage.memory import DEFAULT_KNOWLEDGE_NAMESPACE as DEFAULT_KNOWLEDGE_NAMESPACE
 from cayu.storage.memory import KNOWLEDGE_CHUNK_TEXT_GENERATOR as KNOWLEDGE_CHUNK_TEXT_GENERATOR
 from cayu.storage.memory import (
     KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION as KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
@@ -4220,9 +4249,6 @@ from cayu.storage.memory import (
     MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS as MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
 )
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES as MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
-)
-from cayu.storage.memory import (
     MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES as MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES,
 )
 from cayu.storage.memory import (
@@ -4230,18 +4256,11 @@ from cayu.storage.memory import (
 )
 from cayu.storage.memory import MAX_KNOWLEDGE_CHANGE_LIMIT as MAX_KNOWLEDGE_CHANGE_LIMIT
 from cayu.storage.memory import MAX_KNOWLEDGE_CHANGE_SEQUENCE as MAX_KNOWLEDGE_CHANGE_SEQUENCE
-from cayu.storage.memory import MAX_KNOWLEDGE_CHUNK_ID_BYTES as MAX_KNOWLEDGE_CHUNK_ID_BYTES
-from cayu.storage.memory import MAX_KNOWLEDGE_CHUNK_INDEX as MAX_KNOWLEDGE_CHUNK_INDEX
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS as MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS,
 )
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
-)
-from cayu.storage.memory import MAX_KNOWLEDGE_ENTRY_ID_BYTES as MAX_KNOWLEDGE_ENTRY_ID_BYTES
-from cayu.storage.memory import MAX_KNOWLEDGE_EVIDENCE_BYTES as MAX_KNOWLEDGE_EVIDENCE_BYTES
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES as MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES,
 )
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_INDEX_READINESS_LIMIT as MAX_KNOWLEDGE_INDEX_READINESS_LIMIT,
@@ -4262,11 +4281,8 @@ from cayu.storage.memory import (
     MAX_KNOWLEDGE_RELATION_CURSOR_BYTES as MAX_KNOWLEDGE_RELATION_CURSOR_BYTES,
 )
 from cayu.storage.memory import MAX_KNOWLEDGE_RELATION_LIMIT as MAX_KNOWLEDGE_RELATION_LIMIT
-from cayu.storage.memory import MAX_KNOWLEDGE_REVISION as MAX_KNOWLEDGE_REVISION
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
-from cayu.storage.memory import KnowledgeAccessDenied as KnowledgeAccessDenied
-from cayu.storage.memory import KnowledgeAccessScope as KnowledgeAccessScope
 from cayu.storage.memory import KnowledgeActivationAuthority as KnowledgeActivationAuthority
 from cayu.storage.memory import KnowledgeActivationConflict as KnowledgeActivationConflict
 from cayu.storage.memory import KnowledgeActivationDecision as KnowledgeActivationDecision
@@ -4274,15 +4290,12 @@ from cayu.storage.memory import KnowledgeActivationDisposition as KnowledgeActiv
 from cayu.storage.memory import KnowledgeActivationReceipt as KnowledgeActivationReceipt
 from cayu.storage.memory import KnowledgeActivationRequest as KnowledgeActivationRequest
 from cayu.storage.memory import KnowledgeActivationSource as KnowledgeActivationSource
-from cayu.storage.memory import KnowledgeActorType as KnowledgeActorType
 from cayu.storage.memory import KnowledgeChange as KnowledgeChange
 from cayu.storage.memory import KnowledgeChangeBatch as KnowledgeChangeBatch
 from cayu.storage.memory import KnowledgeChangeClaim as KnowledgeChangeClaim
 from cayu.storage.memory import KnowledgeChangeConsumerConflict as KnowledgeChangeConsumerConflict
 from cayu.storage.memory import KnowledgeChangeConsumerState as KnowledgeChangeConsumerState
 from cayu.storage.memory import KnowledgeChangeKind as KnowledgeChangeKind
-from cayu.storage.memory import KnowledgeChunk as KnowledgeChunk
-from cayu.storage.memory import KnowledgeChunkConflict as KnowledgeChunkConflict
 from cayu.storage.memory import KnowledgeEmbeddingBackfillResult as KnowledgeEmbeddingBackfillResult
 from cayu.storage.memory import KnowledgeEmbeddingIdentity as KnowledgeEmbeddingIdentity
 from cayu.storage.memory import KnowledgeEmbeddingProjection as KnowledgeEmbeddingProjection
@@ -4293,13 +4306,6 @@ from cayu.storage.memory import (
     KnowledgeEmbeddingProjectionWriteResult as KnowledgeEmbeddingProjectionWriteResult,
 )
 from cayu.storage.memory import KnowledgeEmbeddingWorkerResult as KnowledgeEmbeddingWorkerResult
-from cayu.storage.memory import KnowledgeEntry as KnowledgeEntry
-from cayu.storage.memory import KnowledgeEntryReadLimitExceeded as KnowledgeEntryReadLimitExceeded
-from cayu.storage.memory import KnowledgeEvidence as KnowledgeEvidence
-from cayu.storage.memory import KnowledgeEvidenceConflict as KnowledgeEvidenceConflict
-from cayu.storage.memory import KnowledgeEvidenceDisposition as KnowledgeEvidenceDisposition
-from cayu.storage.memory import KnowledgeEvidenceResult as KnowledgeEvidenceResult
-from cayu.storage.memory import KnowledgeEvidenceRole as KnowledgeEvidenceRole
 from cayu.storage.memory import KnowledgeFacet as KnowledgeFacet
 from cayu.storage.memory import KnowledgeGovernanceConfig as KnowledgeGovernanceConfig
 from cayu.storage.memory import KnowledgeGovernanceMode as KnowledgeGovernanceMode
@@ -4341,13 +4347,9 @@ from cayu.storage.memory import (
 from cayu.storage.memory import KnowledgeRelationQuery as KnowledgeRelationQuery
 from cayu.storage.memory import KnowledgeRelationResult as KnowledgeRelationResult
 from cayu.storage.memory import KnowledgeReviewApproval as KnowledgeReviewApproval
-from cayu.storage.memory import KnowledgeRevisionConflict as KnowledgeRevisionConflict
-from cayu.storage.memory import KnowledgeRevisionRef as KnowledgeRevisionRef
 from cayu.storage.memory import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.storage.memory import KnowledgeSearchResult as KnowledgeSearchResult
-from cayu.storage.memory import KnowledgeStatus as KnowledgeStatus
 from cayu.storage.memory import KnowledgeStore as KnowledgeStore
-from cayu.storage.memory import KnowledgeVisibility as KnowledgeVisibility
 from cayu.storage.memory import (
     knowledge_chunk_embedding_identity as knowledge_chunk_embedding_identity,
 )

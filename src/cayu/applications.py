@@ -287,6 +287,10 @@ from cayu.events import (
     validate_public_custom_event_type,
 )
 from cayu.knowledge._publication import KnowledgePublicationLifecycle
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.mcp.tools import (
     McpToolAdapter,
     McpToolset,
@@ -696,9 +700,7 @@ from cayu.sessions.recovery import (
     RecoveryReceipt,
 )
 from cayu.storage.memory import (
-    KnowledgeAccessScope,
     KnowledgeStore,
-    copy_knowledge_access_scope,
 )
 from cayu.tasks._scheduling import schedule_creation_digest
 from cayu.tasks.admission import (

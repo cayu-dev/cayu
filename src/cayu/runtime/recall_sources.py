@@ -10,8 +10,8 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import require_durable_clean_nonblank
 from cayu.context.base import ContextRequest
+from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.memory.recall import RecallSituation, RecallSource, RecallSourceResult
-from cayu.storage.memory import KnowledgeAccessScope
 
 
 @dataclass(frozen=True, kw_only=True)

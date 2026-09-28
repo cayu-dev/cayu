@@ -1455,10 +1455,12 @@ class AgentRecallSubscription(_WorkContextModel):
     def recall_situation(self, access_scope: Any, *, current_time: datetime):
         """Build the exact recurring processor input for this subscription."""
 
-        from cayu.memory.recall import RecallSituation
-        from cayu.storage.memory import (
+        from cayu.knowledge.scopes import (
             KnowledgeAccessScope,
             copy_knowledge_access_scope,
+        )
+        from cayu.memory.recall import RecallSituation
+        from cayu.storage.memory import (
             knowledge_access_scope_sha256,
         )
 

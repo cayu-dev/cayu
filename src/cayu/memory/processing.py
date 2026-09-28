@@ -20,6 +20,15 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_REVISION_SEARCH_REFS,
+    KnowledgeRevisionRef,
+    copy_knowledge_revision_refs,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.memory.recall import (
     RECALL_MAX_LINEAGE_BYTES_PER_RECORD,
     RECALL_MAX_LINEAGE_CANDIDATES,
@@ -38,21 +47,16 @@ from cayu.memory.recall import (
 from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_RELATION_BYTES,
-    MAX_KNOWLEDGE_REVISION_SEARCH_REFS,
-    KnowledgeAccessScope,
     KnowledgeChange,
     KnowledgeChangeBatch,
     KnowledgeEmbeddingIdentity,
     KnowledgeIndexReadiness,
     KnowledgeIndexReadinessBatch,
     KnowledgeIndexState,
-    KnowledgeRevisionRef,
     KnowledgeSearchMode,
     KnowledgeStore,
-    copy_knowledge_access_scope,
     copy_knowledge_change,
     copy_knowledge_index_readiness,
-    copy_knowledge_revision_refs,
     knowledge_access_scope_sha256,
 )
 from cayu.work_context import (

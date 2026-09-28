@@ -30,10 +30,13 @@ from cayu.knowledge.maintenance_persistence import (
     KnowledgeMaintenanceProposalPublication,
     KnowledgeMaintenanceProposalPublicationReceipt,
 )
+from cayu.knowledge.records import KnowledgeActorType
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgeAccessScope,
-    KnowledgeActorType,
     KnowledgeGovernanceConfig,
     KnowledgeGovernanceMode,
     KnowledgeMaintenanceConflict,
@@ -43,7 +46,6 @@ from cayu.storage.memory import (
     KnowledgeMaintenanceOutcome,
     KnowledgeMaintenanceProposal,
     KnowledgeStore,
-    copy_knowledge_access_scope,
     copy_knowledge_maintenance_decision,
     copy_knowledge_maintenance_decision_receipt,
     copy_knowledge_maintenance_proposal,

@@ -44,6 +44,22 @@ from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenancePlanningOutcome,
     KnowledgeMaintenancePlanningResult,
 )
+from cayu.knowledge.records import (
+    MAX_KNOWLEDGE_REVISION,
+    KnowledgeActorType,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeEvidence,
+    KnowledgeEvidenceDisposition,
+    KnowledgeEvidenceRole,
+    KnowledgeRevisionRef,
+    KnowledgeStatus,
+    copy_knowledge_revision_ref,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES,
@@ -55,22 +71,10 @@ from cayu.storage.knowledge_indexer import (
 )
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES,
-    MAX_KNOWLEDGE_REVISION,
-    KnowledgeAccessScope,
-    KnowledgeActorType,
-    KnowledgeChunk,
-    KnowledgeEntry,
-    KnowledgeEvidence,
-    KnowledgeEvidenceDisposition,
-    KnowledgeEvidenceRole,
     KnowledgeMaintenanceProposal,
     KnowledgeRelation,
     KnowledgeRelationKind,
-    KnowledgeRevisionRef,
-    KnowledgeStatus,
-    copy_knowledge_access_scope,
     copy_knowledge_maintenance_proposal,
-    copy_knowledge_revision_ref,
     prepare_knowledge_publication,
 )
 
