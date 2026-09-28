@@ -39095,5 +39095,22 @@
     "tests/core/test_request_planning_stages.py::test_local_receiving_stage_fences_raw_calls_and_reconstructs_disposition[asyncio-sqlite-True]": 6.108993100991938,
     "tests/core/test_request_planning_stages.py::test_receiving_commit_and_stage_settlement_roll_back_together[asyncio-memory]": 5.295387703052256,
     "tests/core/test_request_planning_stages.py::test_receiving_commit_and_stage_settlement_roll_back_together[asyncio-postgres]": 7.047093003930058,
-    "tests/core/test_request_planning_stages.py::test_receiving_commit_and_stage_settlement_roll_back_together[asyncio-sqlite]": 5.900620256958064
+    "tests/core/test_request_planning_stages.py::test_receiving_commit_and_stage_settlement_roll_back_together[asyncio-sqlite]": 5.900620256958064,
+    "tests/core/test_public_concept_layout.py::test_example_completes_a_real_session_through_public_imports": 0.7902092908043414,
+    "tests/core/test_public_concept_layout.py::test_public_definitions_have_canonical_identity[cayu.agents-AgentSpec]": 0.0003462929744273424,
+    "tests/core/test_public_concept_layout.py::test_public_definitions_have_canonical_identity[cayu.applications-CayuApp]": 0.0001600421965122223,
+    "tests/core/test_public_concept_layout.py::test_public_definitions_have_canonical_identity[cayu.events-Event]": 0.000255499966442585,
+    "tests/core/test_public_concept_layout.py::test_public_definitions_have_canonical_identity[cayu.messages-Message]": 0.00019104289822280407,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[approvals]": 0.0018466247711330652,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[budgets]": 0.01259770873002708,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[context]": 0.0002298331819474697,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[delivery.git]": 0.024642750155180693,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[delivery.github]": 0.014934833627194166,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[exceptions]": 0.0002376670017838478,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[sessions]": 0.004685875028371811,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[snapshots.bundles]": 0.00017174892127513885,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[snapshots]": 0.033106167102232575,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[tasks]": 0.0024343328550457954,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[tools]": 0.02808612515218556,
+    "tests/core/test_public_concept_layout.py::test_public_packages_export_resolvable_objects[workflows]": 0.005125832976773381
 }
