@@ -557,6 +557,12 @@ from cayu.collaboration._producer_disposition import (
 from cayu.collaboration._producer_export_cleanup import (
     ProducerExportCleanupStatus as ProducerExportCleanupStatus,
 )
+from cayu.collaboration._producer_inspection import (
+    ProducerDestinationInspection as ProducerDestinationInspection,
+)
+from cayu.collaboration._producer_inspection import (
+    ProducerOutputInspection as ProducerOutputInspection,
+)
 from cayu.collaboration._producer_progress_contracts import (
     ProducerProgressOccurrence as ProducerProgressOccurrence,
 )
@@ -572,6 +578,10 @@ from cayu.collaboration._session_export_participant import (
 from cayu.collaboration._wait_coordinator import (
     CollaborationWaitLatchReceiver as CollaborationWaitLatchReceiver,
 )
+from cayu.collaboration._wait_discovery import DiscoveredWait as DiscoveredWait
+from cayu.collaboration._wait_discovery import WaitDiscoveryCursor as WaitDiscoveryCursor
+from cayu.collaboration._wait_discovery import WaitDiscoveryPage as WaitDiscoveryPage
+from cayu.collaboration._wait_discovery import WaitRecovery as WaitRecovery
 from cayu.collaboration.access import CollaborationAccessContext as CollaborationAccessContext
 from cayu.collaboration.access import CollaborationAccessDenied as CollaborationAccessDenied
 from cayu.collaboration.access import CollaborationAccessGrant as CollaborationAccessGrant
@@ -612,6 +622,28 @@ from cayu.collaboration.exports import (
     SessionExportSettlementRequest as SessionExportSettlementRequest,
 )
 from cayu.collaboration.exports import SessionExportUnavailable as SessionExportUnavailable
+from cayu.collaboration.host import CollaborationHost as CollaborationHost
+from cayu.collaboration.host import (
+    HostClarificationMaintenanceSource as HostClarificationMaintenanceSource,
+)
+from cayu.collaboration.host import HostClarificationRule as HostClarificationRule
+from cayu.collaboration.host import HostContinuationRule as HostContinuationRule
+from cayu.collaboration.host import HostInspection as HostInspection
+from cayu.collaboration.host import HostOwnershipLimits as HostOwnershipLimits
+from cayu.collaboration.host import HostPlannedProducer as HostPlannedProducer
+from cayu.collaboration.host import HostPlannedProducerRule as HostPlannedProducerRule
+from cayu.collaboration.host import HostPlanningRule as HostPlanningRule
+from cayu.collaboration.host import HostProducerDisclosure as HostProducerDisclosure
+from cayu.collaboration.host import HostProducerExecution as HostProducerExecution
+from cayu.collaboration.host import HostProducerExecutionRule as HostProducerExecutionRule
+from cayu.collaboration.host import HostProducerMaintenance as HostProducerMaintenance
+from cayu.collaboration.host import HostProducerMaintenanceRule as HostProducerMaintenanceRule
+from cayu.collaboration.host import HostProducerOutputRule as HostProducerOutputRule
+from cayu.collaboration.host import HostProducerRegistrationRule as HostProducerRegistrationRule
+from cayu.collaboration.host import HostProducerSource as HostProducerSource
+from cayu.collaboration.host import HostRegistration as HostRegistration
+from cayu.collaboration.host import HostRequestMaintenanceSource as HostRequestMaintenanceSource
+from cayu.collaboration.host import HostWaitRule as HostWaitRule
 from cayu.collaboration.lifecycle import (
     CollaborationHistoryUnavailable as CollaborationHistoryUnavailable,
 )
@@ -3215,6 +3247,10 @@ from cayu.runtime._durable_worker_loop import (
     DurableWorkerMetricsSnapshot as DurableWorkerMetricsSnapshot,
 )
 from cayu.runtime._environment_lifecycle import EnvironmentCapacityError as EnvironmentCapacityError
+from cayu.runtime._host_continuation_discovery import (
+    ContinuationDiscoveryPage as ContinuationDiscoveryPage,
+)
+from cayu.runtime._host_continuation_discovery import ContinuationRecovery as ContinuationRecovery
 from cayu.runtime._policy_evidence import ToolPolicyEvidence as ToolPolicyEvidence
 from cayu.runtime._producer_retirement import (
     ProducerCleanupReclamation as ProducerCleanupReclamation,
@@ -3223,6 +3259,10 @@ from cayu.runtime._producer_retirement import ProducerCleanupRetirement as Produ
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
+from cayu.runtime._session_continuation import ContinuationConflict as ContinuationConflict
+from cayu.runtime._session_continuation import ContinuationRecord as ContinuationRecord
+from cayu.runtime._session_continuation import ContinuationService as ContinuationService
+from cayu.runtime._session_continuation import ContinuationUnavailable as ContinuationUnavailable
 from cayu.runtime._task_group_invocation import (
     TaskGroupInvocationSettlementPending as TaskGroupInvocationSettlementPending,
 )
@@ -3700,6 +3740,12 @@ from cayu.runtime.verified_task_worker import VerifiedTaskWorker as VerifiedTask
 from cayu.runtime.verified_task_worker import (
     VerifiedTaskWorkerDraining as VerifiedTaskWorkerDraining,
 )
+from cayu.sessions._participant_discovery import (
+    ParticipantSessionCursor as ParticipantSessionCursor,
+)
+from cayu.sessions._participant_discovery import (
+    ParticipantSessionReference as ParticipantSessionReference,
+)
 from cayu.sessions._recipient_continuation import (
     RecipientContinuationSelection as RecipientContinuationSelection,
 )
@@ -3984,6 +4030,10 @@ from cayu.sessions.recovery import RECOVERY_PLAN_MAX_CONCURRENCY as RECOVERY_PLA
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_INSPECTIONS as RECOVERY_PLAN_MAX_INSPECTIONS
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_ITEMS as RECOVERY_PLAN_MAX_ITEMS
 from cayu.sessions.recovery import RECOVERY_PLAN_SCHEMA_VERSION as RECOVERY_PLAN_SCHEMA_VERSION
+from cayu.sessions.recovery import (
+    ContinuationRecoveryExpectation as ContinuationRecoveryExpectation,
+)
+from cayu.sessions.recovery import ProducerRecoveryExpectation as ProducerRecoveryExpectation
 from cayu.sessions.recovery import RecoveryBlockerCode as RecoveryBlockerCode
 from cayu.sessions.recovery import RecoveryClaimEvidence as RecoveryClaimEvidence
 from cayu.sessions.recovery import RecoveryDecision as RecoveryDecision

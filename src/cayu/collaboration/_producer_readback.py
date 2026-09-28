@@ -31,9 +31,12 @@ async def lookup_producer_registration(
     expected: ProducerOutputRegistration | ProducerOutputRecovery,
     *,
     context: CollaborationAccessContext,
+    wait_for_settlement=False,
 ) -> ExactLookup[ProducerOutputRegistration]:
     """Read the exact original registration without conferring execution authority."""
-    return await _lookup_producer(app, expected, context=context, completion=False)
+    return await _lookup_producer(
+        app, expected, context=context, completion=False, wait_for_settlement=wait_for_settlement
+    )
 
 
 async def lookup_producer_completion(
@@ -46,7 +49,9 @@ async def lookup_producer_completion(
     return await _lookup_producer(app, expected, context=context, completion=True)
 
 
-async def _lookup_producer(app, expected, *, context, completion):
+async def _lookup_producer(
+    app, expected, *, context, completion, inspection=False, wait_for_settlement=False
+):
     """Recover the original immutable command; never mint a launch or content grant.
 
     The token is only a complete-command commitment and an indexed address.
@@ -110,6 +115,21 @@ async def _lookup_producer(app, expected, *, context, completion):
                 return ExactUnavailable()
             if retained != candidate:
                 return ExactUnavailable()
+            if inspection:
+                from cayu.collaboration._producer_inspection import (
+                    ProducerOutputInspection,
+                    inspect_record,
+                )
+
+                try:
+                    projected = await inspect_record(
+                        tx, store, initialized, retained, redactor=redactor
+                    )
+                except CollaborationConflict:
+                    return ExactConflict()
+                except (CollaborationContractError, CollaborationUnavailable):
+                    return ExactUnavailable()
+                return ExactMatch[ProducerOutputInspection](receipt=projected)
             if completion:
                 if retained.completion is None:
                     return ExactNotFound()
@@ -132,8 +152,9 @@ async def _lookup_producer(app, expected, *, context, completion):
             key=("producer_readback", object()),
             expectation=contract_bytes(expected, redactor=redactor)
             + contract_bytes(context, redactor=redactor)
-            + (b"completion" if completion else b"registration"),
+            + (b"inspection" if inspection else b"completion" if completion else b"registration"),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

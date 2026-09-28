@@ -38,8 +38,12 @@ from cayu.events import EventType
 _SEAL = object()
 
 
-async def read_retired_export_native(sessions, command, closure, intent, *, redactor):
+async def read_retired_export_native(
+    sessions, command, closure, intent, *, redactor, allow_pending=False
+):
     """Fixed native-owner readback; historical cleanup grants no content access."""
+    if type(allow_pending) is not bool:
+        raise TypeError("Producer retirement observation requires an explicit mode.")
     if not sessions._supports_producer_attachment_protocol():
         raise SessionExportUnavailable()
     command = prepare_contract(ProducerOutputRegistration, command, redactor=redactor)
@@ -70,31 +74,35 @@ async def read_retired_export_native(sessions, command, closure, intent, *, reda
         return future
     if type(raw) is dict and "admission" in raw and "receipt" not in raw:
         retained = prepare_contract(ExportPreparation, raw, redactor=redactor)
-        if retained.state != "excluded" or not retained.admission.settled:
-            raise SessionExportUnavailable()
+        pending = retained.state != "excluded" or not retained.admission.settled
         require_exact_contract(request, retained.admission.request, redactor=redactor)
         authorization = retained.admission.authorization
         admission = retained.admission
     else:
         retained = prepare_contract(ExportRecord, raw, redactor=redactor)
-        if retained.state not in ("retired", "released") or retained.settlement is None:
+        pending = retained.state == "pending" and retained.settlement is None
+        if not pending and (
+            retained.state not in ("retired", "released") or retained.settlement is None
+        ):
             raise SessionExportUnavailable()
         require_exact_contract(request, retained.receipt.expected.intent.request, redactor=redactor)
         admission = retained.admission
         authorization = retained.receipt.expected.intent.authorization
-        with read_scope(request.ref.session_id):
-            raw = await sessions.load_session_operation(
-                request.ref.session_id, operation_key(retained.settlement.request.operation)
-            )
-        settlement = prepare_contract(SettlementRecord, raw, redactor=redactor)
-        require_exact_contract(retained.settlement, settlement.settlement, redactor=redactor)
-    if (
-        admission is None
-        or not admission.settled
-        or admission.permit.intent.request.participant != prepared.recipient
-    ):
+        if not pending:
+            assert retained.settlement is not None
+            with read_scope(request.ref.session_id):
+                raw = await sessions.load_session_operation(
+                    request.ref.session_id, operation_key(retained.settlement.request.operation)
+                )
+            settlement = prepare_contract(SettlementRecord, raw, redactor=redactor)
+            require_exact_contract(retained.settlement, settlement.settlement, redactor=redactor)
+    if admission is None or admission.permit.intent.request.participant != prepared.recipient:
         raise SessionExportUnavailable()
     require_exact_contract(intent.initiator, authorization.initiating_identity(), redactor=redactor)
+    if pending or not admission.settled:
+        if allow_pending:
+            return None
+        raise SessionExportUnavailable()
     return retained
 
 

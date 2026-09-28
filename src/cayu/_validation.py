@@ -938,6 +938,11 @@ def _walk_bounded_durable_json(
     current_path = "$"
     result: Any = None
     value = None
+    # Nested authority envelopes repeat short field names and exact immutable
+    # identifiers. Reuse only successful string sizing within this one walk,
+    # never validation/authority decisions across inputs or calls. Both entry
+    # count and retained text length are bounded independently of input size.
+    string_sizes: dict[str, int] = {}
 
     def consume(count: int, path: str) -> None:
         nonlocal remaining
@@ -953,6 +958,11 @@ def _walk_bounded_durable_json(
 
     def consume_string(text: str, path: str) -> None:
         consume(2, path)
+        before = remaining
+        cached_size = string_sizes.get(text) if len(text) <= 256 else None
+        if cached_size is not None and cached_size <= remaining:
+            consume(cached_size, path)
+            return
         # Bound temporary allocation and avoid Python work per character for
         # ordinary text. Special characters retain the ordered scalar checks
         # below, so a later invalid scalar cannot hide an exhausted byte bound.
@@ -970,6 +980,10 @@ def _walk_bounded_durable_json(
                     consume(size, path)
                     continue
             consume_special_string(chunk, path)
+        # A crossing string always takes the original ordered path, preserving
+        # the error location, first invalid scalar and observed lower bound.
+        if len(text) <= 256 and len(string_sizes) < 128:
+            string_sizes[text] = before - remaining
 
     def consume_special_string(text: str, path: str) -> None:
         for character in text:
@@ -1167,6 +1181,7 @@ def _walk_bounded_durable_json(
         parent = None
         frames.clear()
         active_container_ids.clear()
+        string_sizes.clear()
 
 
 def copy_bounded_durable_json_value(

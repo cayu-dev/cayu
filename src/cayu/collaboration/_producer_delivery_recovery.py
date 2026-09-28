@@ -42,7 +42,9 @@ class ProducerDeliveryStatus(ContractValue):
         return self
 
 
-async def reconcile_producer_delivery(app, recovery, *, context, exclude=False):
+async def reconcile_producer_delivery(
+    app, recovery, *, context, exclude=False, wait_for_settlement=False
+):
     """Reconcile or explicitly fence one attempt; never append, expose or release output."""
     requests = app._request_coordinator
     participants = app._participant_coordinator
@@ -158,5 +160,6 @@ async def reconcile_producer_delivery(app, recovery, *, context, exclude=False):
             + (b"exclude" if exclude else b"reconcile"),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

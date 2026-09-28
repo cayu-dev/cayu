@@ -75,8 +75,12 @@ async def pending_deliveries(coordinator, *, context, cursor=None, limit=32):
     )
 
 
-async def reconcile_pending_delivery(coordinator, recovery, *, context, exclude=False):
-    _, store, initialized, redactor = _authorize(coordinator, context, mutation=True)
+async def reconcile_pending_delivery(
+    coordinator, recovery, *, context, exclude=False, read_only=False
+):
+    if read_only and exclude:
+        raise ValueError("Delivery inspection cannot exclude work.")
+    _, store, initialized, redactor = _authorize(coordinator, context, mutation=not read_only)
     recovery = prepare_contract(ClarificationDeliveryRecovery, recovery, redactor=redactor)
     if (
         recovery.operation.application_scope != initialized.binding.application_scope
@@ -98,6 +102,10 @@ async def reconcile_pending_delivery(coordinator, recovery, *, context, exclude=
         )
         if exact != record:
             raise CollaborationUnavailable("Delivery recovery contradicts its native registration.")
+    if read_only:
+        return (
+            ClarificationDeliveryReceipt.from_record(record) if record.state == "settled" else None
+        )
     if exclude:
         receiving = coordinator.exports.store
         if receiving.peer_content_version != 1:

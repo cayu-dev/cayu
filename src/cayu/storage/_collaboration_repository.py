@@ -502,6 +502,20 @@ class _SQLRepository:
             sql += "".join(f", {column} = excluded.{column}" for column in extra)
         await self._execute(sql, (self.scope, *key, *extra_values, document))
         if table == "operations":
+            from cayu.collaboration.waits import WaitSnapshot
+
+            if isinstance(value, WaitSnapshot):
+                from cayu.collaboration._wait_discovery import wait_projection
+
+                _, projection = wait_projection(value, scope=self.scope, key=key)
+                await self._execute(
+                    "INSERT INTO cayu_collaboration_wait_discovery "
+                    "(scope, namespace, generation, caller_key, state, delivery) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (scope, namespace, generation, caller_key) DO UPDATE "
+                    "SET state=excluded.state, delivery=excluded.delivery",
+                    (self.scope, *key, *projection),
+                )
             if not insert:
                 # Replacing an owner record and its exact history projection is
                 # one transaction. Re-inserting the old pins either conflicts or
@@ -525,6 +539,11 @@ class _SQLRepository:
     async def delete(self, table: Table, key: Key) -> None:
         if table == "operations":
             await self._execute(
+                "DELETE FROM cayu_collaboration_wait_discovery "
+                "WHERE scope=? AND namespace=? AND generation=? AND caller_key=?",
+                (self.scope, *key),
+            )
+            await self._execute(
                 "DELETE FROM cayu_collaboration_history_uses WHERE scope=? AND namespace=? AND generation=? AND caller_key=?",
                 (self.scope, *key),
             )
@@ -544,6 +563,42 @@ class _SQLRepository:
             )
         )
         return bool(rows)
+
+    async def scan_waits(self, *, namespace, after, limit):
+        from cayu.collaboration._wait_discovery import wait_projection
+
+        # Match the native Python cursor comparison on every database locale.
+        # The predicate and ordering must use the same indexable expression.
+        key = 'i.caller_key COLLATE "C"' if self.postgres else "i.caller_key COLLATE BINARY"
+        where = ""
+        args: tuple = (self.scope, namespace)
+        if after is not None:
+            where = f" AND (i.generation, {key}) > (?, ?)"
+            args += after
+        rows = await self._rows(
+            await self._execute(
+                f"SELECT substr(o.document, 1, {MAX_ENVELOPE_BYTES + 1}), "
+                "i.namespace, i.generation, i.caller_key, i.state, i.delivery "
+                "FROM cayu_collaboration_wait_discovery i "
+                "LEFT JOIN cayu_collaboration_operations o ON "
+                "(o.scope, o.namespace, o.generation, o.caller_key) = "
+                "(i.scope, i.namespace, i.generation, i.caller_key) "
+                f"WHERE i.scope=? AND i.namespace=?{where} "
+                f"ORDER BY i.generation, {key} LIMIT ?",
+                (*args, limit),
+            )
+        )
+        result = []
+        for document, namespace, generation, key, state, delivery in rows:
+            if document is None:
+                raise CollaborationContractError("Wait discovery lost its source record.")
+            record, projection = wait_projection(
+                self._decode(document), scope=self.scope, key=(namespace, generation, key)
+            )
+            if projection != (state, delivery):
+                raise CollaborationContractError("Wait discovery contradicts its source state.")
+            result.append(snapshot_input(record))
+        return result
 
     async def scan_operations(self, namespace: str, generation: int, *, limit: int) -> list[object]:
         rows = await self._rows(

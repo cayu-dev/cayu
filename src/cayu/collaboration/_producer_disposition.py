@@ -78,7 +78,7 @@ async def _service_native_stop(receiver, record, closure, *, redactor):
     )
 
 
-async def service_closed_producer(app, command, *, context):
+async def service_closed_producer(app, command, *, context, wait_for_settlement=False):
     """Private owner entrance for already-closed, launch-claimed producers.
 
     The retained closure and frozen disposition are the durable stop intent;
@@ -135,5 +135,6 @@ async def service_closed_producer(app, command, *, context):
             + contract_bytes(context, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

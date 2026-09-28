@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from tests.core.test_collaboration_request_foundation import RequestResolver
-from tests.core.test_participant_identity import CONTEXT, app, registration
+from tests.core.test_participant_identity import CONTEXT, Policy, app, registration
 from tests.recovery.producer_recovery_fixture import (
     ProducerRecoveryPolicy,
     ProducerRecoveryProvider,
@@ -53,11 +53,13 @@ async def main():
             return binding
 
     resolver = RequestResolver(command.admission.expected.intent.request)
+    access_policy = Policy()
     application = app(
         collaboration,
         registration(
             scope=command.operation.application_scope,
             limits=command.admission.expected.intent.limits,
+            policy=access_policy,
         ),
         session_store=sessions,
         config=producer_recovery_config(),
@@ -129,8 +131,192 @@ async def main():
             )
             assert len(pending_queue.records) == 1
             assert pending_queue.records[0].status.value == "queued"
+
+        async def recover_exact_plan():
+            from cayu.runtime._producer_output_store import attachment_index
+            from cayu.sessions.recovery import (
+                ProducerRecoveryExpectation,
+                RecoveryDecision,
+                RecoveryExecutionRequest,
+                RecoveryItemExecutionStatus,
+                RecoveryPlanAction,
+                RecoveryPlanRequest,
+                RecoveryPlanSelection,
+            )
+
+            attachment = await sessions._read_native_producer_attachment(command)
+            assert attachment is not None
+            index = attachment_index(attachment)
+            selection = RecoveryPlanRequest(
+                selection=RecoveryPlanSelection(session_ids=(session_id,)),
+                producer=ProducerRecoveryExpectation(
+                    session_instance_id=index.session_instance_id,
+                    attachment_operation_key=index.operation_key,
+                    attachment_commitment=index.record_commitment,
+                ),
+                participant_context=CONTEXT,
+            )
+            access_policy.denied.add("administration")
+            try:
+                try:
+                    await application.plan_recovery(selection)
+                except PermissionError:
+                    pass
+                else:
+                    raise AssertionError("Recovery planning accepted revoked execution access")
+            finally:
+                access_policy.denied.remove("administration")
+            assert await sessions.load(session_id) == before
+            assert await sessions.load_checkpoint(session_id) == checkpoint
+            assert not provider.requests
+            for changed in (
+                {"session_instance_id": "another-incarnation"},
+                {"attachment_operation_key": "another-operation"},
+                {"attachment_commitment": "sha256:" + "0" * 64},
+            ):
+                try:
+                    await application.plan_recovery(
+                        selection.model_copy(
+                            update={"producer": selection.producer.model_copy(update=changed)}
+                        )
+                    )
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("Producer recovery accepted another native identity")
+                assert await sessions.load(session_id) == before
+                assert await sessions.load_checkpoint(session_id) == checkpoint
+                assert not provider.requests
+            too_recent = await application.plan_recovery(
+                selection.model_copy(
+                    update={
+                        "selection": selection.selection.model_copy(
+                            update={"inactive_for_seconds": 86400}
+                        )
+                    }
+                )
+            )
+            refused = await application.execute_recovery(
+                RecoveryExecutionRequest(
+                    plan=too_recent,
+                    execution_id="producer-still-active",
+                    decisions=(
+                        RecoveryDecision(
+                            item_id=too_recent.items[0].item_id,
+                            action=RecoveryPlanAction.AUTOMATIC_REPAIR,
+                        ),
+                    ),
+                )
+            )
+            assert len(refused.items) == 1
+            assert refused.items[0].status is RecoveryItemExecutionStatus.BLOCKED, refused
+            assert await sessions.load(session_id) == before
+            assert await sessions.load_checkpoint(session_id) == checkpoint
+            assert not provider.requests
+            plan = await application.plan_recovery(selection)
+            assert len(plan.items) == 1
+            execution = RecoveryExecutionRequest(plan=plan, execution_id="producer-native-plan")
+
+            async def require_revoked_execution_refusal():
+                retained_session = await sessions.load(session_id)
+                retained_checkpoint = await sessions.load_checkpoint(session_id)
+                access_policy.denied.add("administration")
+                try:
+                    try:
+                        await application.execute_recovery(execution)
+                    except PermissionError:
+                        pass
+                    else:
+                        raise AssertionError("Recovery accepted revoked execution access")
+                finally:
+                    access_policy.denied.remove("administration")
+                assert await sessions.load(session_id) == retained_session
+                assert await sessions.load_checkpoint(session_id) == retained_checkpoint
+                assert not provider.requests
+
+            # An inspected plan is not a renewable execution grant.
+            await require_revoked_execution_refusal()
+            receipt = await application.execute_recovery(execution)
+            assert all(
+                item.status is RecoveryItemExecutionStatus.EXECUTED for item in receipt.items
+            ), receipt
+            release = await sessions._read_native_producer_release(command)
+            # A committed receipt must not bypass current readback authority either.
+            await require_revoked_execution_refusal()
+            replay = await application.execute_recovery(execution)
+            assert len(replay.items) == 1 and replay.items[0].replayed
+            assert await sessions._read_native_producer_release(command) == release
+            assert not provider.requests
+            return receipt
+
+        async def recover_with_host():
+            from cayu.collaboration._host import (
+                CollaborationHost,
+                _HostRegistration,
+                _ProducerExecutionRule,
+                _ProducerSource,
+            )
+            from cayu.collaboration._host_ownership import HostOwnershipLimits
+            from cayu.collaboration._host_producer_execution import HostProducerExecution
+
+            participant = command.admission.prepared.recipient
+            pending = await application.pending_producer_outputs(participant, context=CONTEXT)
+            token = next(
+                item.recovery
+                for item in pending.items
+                if item.recovery.registration == command.operation
+            )
+            async with CollaborationHost(
+                application,
+                _HostRegistration(
+                    limits=HostOwnershipLimits(1, 1, 2, 262144),
+                    producer_sources=(_ProducerSource(participant, CONTEXT),),
+                    producer_rules=(),
+                    producer_execution_rules=(
+                        _ProducerExecutionRule(
+                            HostProducerExecution(recovery=token, recovery_inactive_for_seconds=1),
+                            CONTEXT,
+                            resolver.context,
+                        ),
+                    ),
+                ),
+            ) as host:
+                try:
+                    async with asyncio.timeout(65):
+                        while not host.inspect().serviced:
+                            await host.service_once()
+                            if host._source_errors:
+                                raise ExceptionGroup(
+                                    "Host source failures", list(host._source_errors.values())
+                                )
+                            for observed in host._owned.inspect().completed:
+                                if observed.error is not None:
+                                    raise observed.error
+                            await asyncio.sleep(0.01)
+                except TimeoutError as error:
+                    error.add_note(f"Host recovery observation: {host.inspect()}")
+                    tasks = [entry.task for entry in host._owned._operations.values()]
+                    tasks.extend(entry[2] for entry in host._reads._tasks.values())
+                    for task in tasks:
+                        coroutine = task.get_coro()
+                        names = []
+                        while coroutine is not None:
+                            code = getattr(coroutine, "cr_code", None)
+                            if code is not None:
+                                names.append(code.co_qualname)
+                            coroutine = getattr(coroutine, "cr_await", None)
+                        error.add_note("Retained await path: " + " -> ".join(names))
+                    raise
+            assert not host.inspect().pending
+            assert not provider.requests
+
+        mode = material.get("recovery_mode")
         recovery = asyncio.create_task(
-            application.recover_incomplete_session(
+            recover_exact_plan()
+            if mode == "plan"
+            else recover_with_host()
+            if mode == "host"
+            else application.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(session_id=session_id), context=CONTEXT
             )
         )

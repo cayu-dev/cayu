@@ -25,7 +25,9 @@ class _Query(ContractValue):
     limit: StrictInt = Field(ge=1, le=MAX_REQUEST_PLANNING_PAGE)
 
 
-async def list_pending_plans(requests, *, context, after=None, limit=MAX_REQUEST_PLANNING_PAGE):
+async def list_pending_plans(
+    requests, *, context, after=None, limit=MAX_REQUEST_PLANNING_PAGE, wait_for_settlement=False
+):
     query = prepare_contract(
         _Query, {"context": context, "after": after, "limit": limit}, redactor=requests._redactor
     )
@@ -37,6 +39,7 @@ async def list_pending_plans(requests, *, context, after=None, limit=MAX_REQUEST
         requests._owners.run(
             owned,
             key=("planning-discovery", object()),
+            wait_for_settlement=wait_for_settlement,
             expectation=contract_bytes(query, redactor=requests._redactor),
             redactor=requests._redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),

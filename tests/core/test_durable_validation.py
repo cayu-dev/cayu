@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import re
 from copy import deepcopy
 from datetime import date
 from decimal import Decimal
@@ -50,6 +51,80 @@ _DURABLE_VALUES = st.recursive(
     ),
     max_leaves=30,
 )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["plain", "é😀", '\n"\\\x01', "\x00", "\ud800", "x" * 256],
+    ids=["plain", "unicode", "escaped", "nul", "surrogate", "uncached-length"],
+)
+def test_repeated_json_strings_preserve_exact_failure_evidence(suffix):
+    repeated = ["a" + suffix, {"a" + suffix: "a" + suffix}]
+    distinct = ["a" + suffix, {"b" + suffix: "c" + suffix}]
+    # Distinct strings exercise the uncached path with identical byte/node
+    # consumption. Include failures at every byte and after successful reuse.
+    size = len(json.dumps(repeated, ensure_ascii=True).encode())
+
+    def outcome(value, limit):
+        try:
+            inspect_bounded_durable_json(value, "record", max_bytes=limit, max_nodes=20)
+        except DurableValueError as error:
+            return error.code, error.path, error.limit, error.observed_lower_bound
+        return None
+
+    for limit in range(size + 2):
+        assert outcome(repeated, limit) == outcome(distinct, limit)
+
+
+def test_repeated_json_string_sizing_is_local_and_bounded(monkeypatch):
+    from cayu import _validation
+
+    search = _validation.re.search
+    scanned = []
+
+    def record(pattern, text, *args, **kwargs):
+        scanned.append(text)
+        return search(pattern, text, *args, **kwargs)
+
+    monkeypatch.setattr(_validation.re, "search", record)
+    for _ in range(2):
+        scanned.clear()
+        inspect_bounded_durable_json(["repeat"] * 20, "record", max_bytes=1024, max_nodes=100)
+        assert scanned.count("repeat") == 1
+    # Filling the cache never drops validation of later strings.
+    scanned.clear()
+    strings = [str(index) for index in range(129)] + ["128", "x" * 257, "x" * 257]
+    inspect_bounded_durable_json(strings, "record", max_bytes=4096, max_nodes=256)
+    assert scanned.count("128") == 2
+    assert scanned.count("x" * 257) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '\n"\\\x01é😀',
+        "\n" * 4097,
+        '"' * 4095 + "\x00",
+        '"' * 4095 + "\ud800",
+        "\x01" * 4096 + "é😀",
+    ],
+    ids=["mixed", "newline-chunk", "nul-boundary", "surrogate-boundary", "unicode-tail"],
+)
+def test_escaped_chunk_sizing_preserves_scalar_failure_order(monkeypatch, text):
+    from cayu import _validation
+
+    def outcome(limit):
+        try:
+            return copy_bounded_durable_json_value(text, "record", max_bytes=limit, max_nodes=1)
+        except DurableValueError as error:
+            return error.code, error.path, error.limit, error.observed_lower_bound
+
+    size = len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+    limits = sorted({0, 1, 2, 3, 17, 4096, 8192, size - 1, size, size + 1})
+    fast = [outcome(limit) for limit in limits]
+    # Force every special chunk down the original ordered scalar path.
+    monkeypatch.setattr(_validation, "_NONPORTABLE_STRING_RE", re.compile(""))
+    assert [outcome(limit) for limit in limits] == fast
 
 
 @pytest.mark.parametrize("suffix", ["\x00", "\ud800"])

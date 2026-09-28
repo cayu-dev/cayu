@@ -629,6 +629,10 @@ async def test_public_question_uses_real_assistant_export(
     planning_driver=None,
     planning_journey=None,
     journey_ttl_ms=300_000,
+    service_driver=None,
+    maintenance_driver=None,
+    question_driver=None,
+    delivery_prepared_driver=None,
 ):
     if prune_history == "lost_native_ack":
         from cayu.runtime._session_continuation import ContinuationConflict
@@ -1342,6 +1346,17 @@ async def test_public_question_uses_real_assistant_export(
                 delivery, context=context
             )
             assert prepared_delivery.status == "pending"
+            if delivery_prepared_driver is not None:
+                await delivery_prepared_driver(
+                    current,
+                    delivery=delivery,
+                    context=context,
+                    application_for=application_for,
+                    collaboration_factory=collaboration_factory,
+                )
+            if maintenance_driver is not None:
+                await maintenance_driver(current, context=CONTEXT)
+                assert await store.read_peer_content_attempt(peer) is None
             if question_recovery:
                 from tests.core._clarification_question_recovery_flow import expire_due_question
                 from tests.core._clarification_recovery_flow import cleanup_in_fresh_process
@@ -1357,7 +1372,7 @@ async def test_public_question_uses_real_assistant_export(
                     )
 
                 count = len(payloads)
-                await expire_due_question(
+                await (question_driver or expire_due_question)(
                     current,
                     collaboration_factory,
                     initialized,
@@ -1809,6 +1824,7 @@ async def test_public_question_uses_real_assistant_export(
                             current,
                             service_request,
                             timing=final_latch_timing,
+                            service_driver=service_driver,
                             context=service_context,
                             delivery_context=context,
                             publish=publish_latch,
@@ -2014,7 +2030,7 @@ async def test_public_question_uses_real_assistant_export(
                                 owners.observation_timeout = normal_observation_timeout
 
                         patch.setattr(current, "service_clarification", expire_launch_observation)
-                    serviced = await await_service_return(
+                    serviced = await (service_driver or await_service_return)(
                         current,
                         service_request,
                         context=service_context,
@@ -2346,6 +2362,7 @@ async def test_public_question_uses_real_assistant_export(
                         service_context,
                         export_policy,
                         payloads,
+                        service_driver=service_driver,
                     )
                     await continue_with_reply(
                         current,
@@ -2435,11 +2452,12 @@ async def test_public_question_uses_real_assistant_export(
                         if one_slot:
                             assert driver.active == 0
                             assert driver.order == [
+                                parked.ticket.session_id,
+                                source.id,
+                                *([target.id] if side_session else []),
                                 target.id,
                                 source.id,
-                                target.id,
-                                source.id,
-                                target.id,
+                                parked.ticket.session_id,
                             ]
                 reopened_store = (
                     store if backend == "memory" else _store_factory(backend, tmp_path, request)()

@@ -144,6 +144,11 @@ from cayu.collaboration._planning_records import (
 from cayu.collaboration._request_coordinator import RequestCoordinator
 from cayu.collaboration._session_export_coordinator import SessionExportCoordinator
 from cayu.collaboration._wait_coordinator import WaitCoordinator
+from cayu.collaboration._wait_discovery import (
+    WaitDiscoveryCursor,
+    WaitDiscoveryPage,
+    WaitRecovery,
+)
 from cayu.collaboration.access import (
     CollaborationAccessContext,
     CollaborationAccessDenied,
@@ -900,11 +905,21 @@ if TYPE_CHECKING:
     )
     from cayu.collaboration._producer_disposition import ProducerDispositionStatus
     from cayu.collaboration._producer_export_cleanup import ProducerExportCleanupStatus
+    from cayu.collaboration._producer_inspection import ProducerOutputInspection
     from cayu.collaboration._producer_progress_contracts import ProducerProgressOccurrence
     from cayu.collaboration._producer_recovery import ProducerOutputRecovery, ProducerPendingPage
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
+    from cayu.runtime._host_continuation_discovery import (
+        ContinuationDiscoveryPage,
+        ContinuationRecovery,
+    )
     from cayu.runtime._producer_retirement import ProducerCleanupReclamation
+    from cayu.runtime._session_continuation import ContinuationRecord
     from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
+    from cayu.sessions._participant_discovery import (
+        ParticipantSessionCursor,
+        ParticipantSessionReference,
+    )
     from cayu.tasks.groups import (
         TaskGroupCreate,
         TaskGroupCreationReceipt,
@@ -1670,6 +1685,7 @@ class CayuApp:
             project_session_id=self.project_session_id_for_exposure,
             resolve_session_id=self._resolve_public_session_id,
             clock=self._clock,
+            secret_redactor=self._secret_redactor,
         )
         self._durable_subagent_coordinator = DurableSubagentCoordinator(
             session_store=self.session_store,
@@ -1990,20 +2006,9 @@ class CayuApp:
         self, request: RequestPlanningRequest, *, context: MandateAccessContext
     ) -> RequestPlanningRecord:
         """Explicitly retain and prepare a registered decision without launching work."""
-        from cayu.collaboration._planning_coordinator import plan_request
-        from cayu.sessions._planning_creation_owner import NativePlanningCreationOwner
-        from cayu.sessions._planning_fork_owner import NativePlanningForkOwner
-        from cayu.sessions._planning_resource_owner import NativePlanningResourceOwner
+        from cayu.collaboration._planning_coordinator import service_application_plan
 
-        return await plan_request(
-            self._request_coordinator,
-            request,
-            context=context,
-            clarifications=self._clarification_coordinator,
-            recipient_creation=NativePlanningCreationOwner(self),
-            recipient_fork=NativePlanningForkOwner(self),
-            recipient_resources=NativePlanningResourceOwner(self),
-        )
+        return await service_application_plan(self, request, context=context)
 
     async def lookup_collaboration_plan(
         self, expected: RequestPlanningRequest, *, context: MandateAccessContext
@@ -2019,20 +2024,10 @@ class CayuApp:
         self, expected: RequestPlanningRequest, *, context: MandateAccessContext
     ) -> RequestPlanningRecord:
         """Make one bounded recovery pass using only the retained operation keys."""
-        from cayu.collaboration._planning_coordinator import plan_request
-        from cayu.sessions._planning_creation_owner import NativePlanningCreationOwner
-        from cayu.sessions._planning_fork_owner import NativePlanningForkOwner
-        from cayu.sessions._planning_resource_owner import NativePlanningResourceOwner
+        from cayu.collaboration._planning_coordinator import service_application_plan
 
-        return await plan_request(
-            self._request_coordinator,
-            expected,
-            context=context,
-            clarifications=self._clarification_coordinator,
-            require_retained=True,
-            recipient_creation=NativePlanningCreationOwner(self),
-            recipient_fork=NativePlanningForkOwner(self),
-            recipient_resources=NativePlanningResourceOwner(self),
+        return await service_application_plan(
+            self, expected, context=context, require_retained=True
         )
 
     async def control_collaboration_plan(
@@ -2136,6 +2131,17 @@ class CayuApp:
 
         return RegisteredRequestAdmissionReader(self._request_coordinator)
 
+    async def recover_collaboration_admission(
+        self,
+        expected: RequestSnapshot,
+        *,
+        context: MandateAccessContext,
+    ) -> ExactLookup[RequestAdmissionReceipt]:
+        """Recover exact admission from a discovered request, without granting execution."""
+        from cayu.collaboration._admission_recovery import recover_admission
+
+        return await recover_admission(self._request_coordinator, expected, context=context)
+
     async def prepare_producer_output(
         self,
         proposal: ProducerOutputProposal,
@@ -2185,6 +2191,17 @@ class CayuApp:
         return await pending_producer_outputs(
             self, participant, context=context, after=after, limit=limit
         )
+
+    async def inspect_producer_output(
+        self,
+        expected: ProducerOutputRegistration | ProducerOutputRecovery,
+        *,
+        context: CollaborationAccessContext,
+    ) -> ExactLookup[ProducerOutputInspection]:
+        """Inspect exact source evidence without implying execution or delivery."""
+        from cayu.collaboration._producer_inspection import inspect_producer_output
+
+        return await inspect_producer_output(self, expected, context=context)
 
     async def lookup_producer_completion(
         self,
@@ -2367,6 +2384,66 @@ class CayuApp:
         context: MandateAccessContext,
     ) -> WaitSnapshot:
         return await self._wait_coordinator.register(wait, context=context)
+
+    async def list_collaboration_waits(
+        self,
+        *,
+        context: CollaborationAccessContext,
+        cursor: WaitDiscoveryCursor | None = None,
+        limit: int = 32,
+    ) -> WaitDiscoveryPage:
+        """Discover retained wait identities; a page is neither a claim nor quiescence."""
+        from cayu.collaboration._wait_discovery import discover_waits
+
+        return await discover_waits(
+            self._wait_coordinator, context=context, cursor=cursor, limit=limit
+        )
+
+    async def list_participant_sessions(
+        self,
+        participant: ParticipantRef,
+        *,
+        context: CollaborationAccessContext,
+        cursor: ParticipantSessionCursor | None = None,
+        limit: int = 32,
+    ) -> tuple[tuple[ParticipantSessionReference, ...], ParticipantSessionCursor | None]:
+        """Discover exact creation identities, not execution grants or global quiescence."""
+        from cayu.sessions._participant_discovery import discover_participant_sessions
+
+        return await discover_participant_sessions(
+            self, participant, context=context, cursor=cursor, limit=limit
+        )
+
+    async def list_session_continuations(
+        self,
+        session: ParticipantSessionReference,
+        *,
+        context: CollaborationAccessContext,
+        after: str | None = None,
+        limit: int = 32,
+    ) -> ContinuationDiscoveryPage:
+        """Discover native continuation identities within one authenticated incarnation."""
+        from cayu.runtime._host_continuation_discovery import discover_session_continuations
+
+        return await discover_session_continuations(
+            self, session, context=context, after=after, limit=limit
+        )
+
+    async def recover_session_continuation(
+        self, expected: ContinuationRecovery, *, context: CollaborationAccessContext
+    ) -> ContinuationRecord:
+        """Reconstruct an exact retained continuation; this does not authorize servicing."""
+        from cayu.runtime._host_continuation_discovery import recover_session_continuation
+
+        return await recover_session_continuation(self, expected, context=context)
+
+    async def recover_collaboration_wait(
+        self, expected: WaitRecovery, *, context: MandateAccessContext
+    ) -> ExactLookup[CollaborationWait]:
+        """Read the exact original wait under current source authorization; never dispatch."""
+        from cayu.collaboration._wait_discovery import resolve_wait
+
+        return await resolve_wait(self._wait_coordinator, expected, context=context)
 
     async def observe_collaboration_wait(
         self,

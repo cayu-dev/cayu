@@ -15,6 +15,8 @@ import pytest
     [
         (False, "complete", False),
         (True, "complete", False),
+        (True, "plan", False),
+        (True, "host", False),
         (True, "continue", False),
         (True, "cancel", False),
         (True, "queue", False),

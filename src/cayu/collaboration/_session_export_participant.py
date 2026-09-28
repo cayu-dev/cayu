@@ -382,6 +382,7 @@ class ExportParticipantAdapter:
                 current.admission.permit,
                 reader=_SourceSettlementReader(exports, current.admission),
                 redactor=exports.redactor,
+                wait_for_settlement=True,
             )
         )
         if result.expected != current.admission.permit:
@@ -503,9 +504,17 @@ class ExportParticipantAdapter:
         )
 
     async def register(self, admission: ExportAdmission) -> None:
+        # These permit operations are nested inside retained export/cleanup
+        # ownership. Their public observer is bounded by that outer owner;
+        # ending this await early would abandon the remaining native handshake.
         store, initialized = self.participants._ready()
         result = await self.participants._store_result(
-            store._register_permit(initialized, admission.permit, redactor=self.exports.redactor)
+            store._register_permit(
+                initialized,
+                admission.permit,
+                redactor=self.exports.redactor,
+                wait_for_settlement=True,
+            )
         )
         if result.expected != admission.permit:
             raise SessionExportUnavailable()
@@ -519,6 +528,7 @@ class ExportParticipantAdapter:
                     admission.permit,
                     reader=_SourceSettlementReader(self.exports, admission),
                     redactor=self.exports.redactor,
+                    wait_for_settlement=True,
                 )
             )
         except CollaborationUnavailable:

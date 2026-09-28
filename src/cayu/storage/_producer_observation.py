@@ -2,17 +2,22 @@
 
 import json
 
+from cayu.runtime._producer_output_store import attachment_from_snapshot
 from cayu.runtime._producer_progress import progress_from_snapshot, published_progress
 from cayu.runtime._producer_release import release_from_snapshot, release_read_target
 
 
-def _project(command, kind, session, checkpoint, attachment):
+def _project(command, kind, session, checkpoint, attachment, *, attachment_only=False):
+    if attachment_only:
+        if kind is not None:
+            raise ValueError("Attachment observation cannot select invocation progress.")
+        return attachment_from_snapshot(command, session, checkpoint, attachment)
     if kind is None:
         return release_from_snapshot(command, session, checkpoint, attachment)
     return progress_from_snapshot(command, kind, session, checkpoint, attachment)
 
 
-async def memory_observation(store, command, *, kind=None):
+async def memory_observation(store, command, *, kind=None, attachment_only=False):
     if kind == "published":
         return await published_progress(store, command)
     command, sid, key = release_read_target(command)
@@ -23,10 +28,11 @@ async def memory_observation(store, command, *, kind=None):
             store._sessions.get(sid),
             store._checkpoints.get(sid),
             store._session_operation_records.get(sid, {}).get(key),
+            attachment_only=attachment_only,
         )
 
 
-async def sqlite_observation(store, command, *, kind=None):
+async def sqlite_observation(store, command, *, kind=None, attachment_only=False):
     if kind == "published":
         return await published_progress(store, command)
     from cayu.storage.sqlite import _load_checkpoint_state, _load_session
@@ -44,13 +50,18 @@ async def sqlite_observation(store, command, *, kind=None):
                 (sid, key),
             ).fetchone()
             return _project(
-                command, kind, session, checkpoint, None if row is None else json.loads(row[0])
+                command,
+                kind,
+                session,
+                checkpoint,
+                None if row is None else json.loads(row[0]),
+                attachment_only=attachment_only,
             )
 
     return await store._run_read(query)
 
 
-async def postgres_observation(store, command, *, kind=None):
+async def postgres_observation(store, command, *, kind=None, attachment_only=False):
     if kind == "published":
         return await published_progress(store, command)
     from cayu.storage.postgres import _json_obj
@@ -68,5 +79,10 @@ async def postgres_observation(store, command, *, kind=None):
         )
         row = await cursor.fetchone()
         return _project(
-            command, kind, session, checkpoint, None if row is None else _json_obj(row[0])
+            command,
+            kind,
+            session,
+            checkpoint,
+            None if row is None else _json_obj(row[0]),
+            attachment_only=attachment_only,
         )

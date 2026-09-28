@@ -30,7 +30,9 @@ async def require_missing_rebind_refusal(application, command):
     project = _producer_observation._project
     observations = []
 
-    def without_rebind(expected, kind, session, checkpoint, attachment):
+    def without_rebind(expected, kind, session, checkpoint, attachment, *, attachment_only=False):
+        if attachment_only:
+            return project(expected, kind, session, checkpoint, attachment, attachment_only=True)
         ledger = _invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
         assert any(item.kind is InvocationLifecycleCommandKind.REBIND for item in ledger.receipts)
         receipts = tuple(
@@ -50,8 +52,10 @@ async def require_missing_rebind_refusal(application, command):
 
     with (
         patch.object(_producer_observation, "_project", without_rebind),
-        pytest.raises(CollaborationUnavailable),
+        pytest.raises(CollaborationUnavailable) as caught,
     ):
         await application.settle_producer_output(command, context=CONTEXT)
-    assert observations
+    if not observations:
+        caught.value.add_note("Settlement refused before the injected native lineage read.")
+        raise caught.value
     assert await retained() == before

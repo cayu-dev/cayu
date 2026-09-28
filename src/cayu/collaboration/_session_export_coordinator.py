@@ -484,6 +484,7 @@ class SessionExportCoordinator:
         *,
         key: tuple[object, ...],
         expected: bytes,
+        wait_for_settlement: bool = False,
     ) -> T:
         failure: BaseException | None = None
         try:
@@ -509,6 +510,7 @@ class SessionExportCoordinator:
                 expectation=expected,
                 redactor=self.redactor,
                 failure_snapshot=lambda error: _safe_export_error(error, self.redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         except _EXPORT_ERRORS as error:
             failure = _safe_export_error(error, self.redactor)
@@ -633,6 +635,7 @@ class SessionExportCoordinator:
         session_id: str,
         *,
         context: SessionExportAccessContext,
+        wait_for_settlement: bool = False,
     ) -> SessionExportNamespace:
         self.ready()
         context = self.prepare(SessionExportAccessContext, context)
@@ -694,6 +697,7 @@ class SessionExportCoordinator:
         return await self.observed(
             operation,
             key=("initialize", session_id),
+            wait_for_settlement=wait_for_settlement,
             expected=encoded(
                 {
                     "context": snapshot_input(context),
@@ -847,6 +851,7 @@ class SessionExportCoordinator:
         *,
         context: SessionExportAccessContext,
         invocation=None,
+        wait_for_settlement: bool = False,
     ) -> SessionExportReceipt:
         self.ready()
         request = self.prepare(SessionExportRequest, request)
@@ -1131,6 +1136,7 @@ class SessionExportCoordinator:
         return await self.observed(
             operation,
             key=(request.ref.session_id, operation_key(request.ref.operation)),
+            wait_for_settlement=wait_for_settlement,
             expected=encoded(
                 {
                     "request": snapshot_input(request),
@@ -1294,6 +1300,7 @@ class SessionExportCoordinator:
         *,
         context: SessionExportAccessContext,
         expose: bool = False,
+        wait_for_settlement: bool = False,
     ):
         self.ready(access="readback")
         request = self.prepare(SessionExportRequest, request)
@@ -1371,7 +1378,12 @@ class SessionExportCoordinator:
                 raise SessionExportUnavailable()
             return outcome
 
-        return await self.observed(operation, key=("read", uuid4().hex), expected=b"read")
+        return await self.observed(
+            operation,
+            key=("read", uuid4().hex),
+            expected=b"read",
+            wait_for_settlement=wait_for_settlement,
+        )
 
     async def inspect_clarification_source(
         self,
@@ -1464,7 +1476,11 @@ class SessionExportCoordinator:
         )
 
     async def settle(
-        self, request: SessionExportSettlementRequest, *, context: SessionExportAccessContext
+        self,
+        request: SessionExportSettlementRequest,
+        *,
+        context: SessionExportAccessContext,
+        wait_for_settlement: bool = False,
     ) -> SessionExportSettlementReceipt:
         self.ready()
         request = self.prepare(SessionExportSettlementRequest, request)
@@ -1616,6 +1632,7 @@ class SessionExportCoordinator:
         return await self.observed(
             operation,
             key=(original.ref.session_id, key),
+            wait_for_settlement=wait_for_settlement,
             expected=encoded(
                 {"request": snapshot_input(request), "context": snapshot_input(context)}
             ),

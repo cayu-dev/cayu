@@ -233,6 +233,25 @@ class _MemoryRepository:
         values.sort(key=lambda item: item[0])
         return deepcopy([value for _, value in values[:limit]])
 
+    async def scan_waits(self, *, namespace, after, limit):
+        from cayu.collaboration._wait_discovery import wait_projection
+
+        values = []
+        for (family, key), raw in self.rows.items():
+            if family != "operations" or key[0] != namespace:
+                continue
+            if (
+                not isinstance(raw, dict)
+                or cast("dict[str, Any]", raw).get("mode") != "collaboration_wait"
+            ):
+                continue
+            if after is not None and key[1:] <= after:
+                continue
+            record, _ = wait_projection(raw, scope=self.scope, key=key)
+            values.append((key, snapshot_input(record)))
+        values.sort(key=lambda entry: entry[0])
+        return deepcopy([value for _, value in values[:limit]])
+
     async def scan_clarification_questions(self, request, *, limit):
         request = prepare_question_scan(request, limit)
         if request.owner.application_scope != self.scope:

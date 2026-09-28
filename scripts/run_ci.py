@@ -42,10 +42,15 @@ _SPECIALIST_TEST_ENV = {
 _GENERAL_SHARDS = 32
 _SPECIALIST_LANES = {
     "browser-docker": ("browser_docker", 1, 1),
+    **{f"host-journey-{group}": ("host_journey", 3, group) for group in range(1, 4)},
     **{f"qualification-{group}": ("stress or qualification", 8, group) for group in range(1, 9)},
     **{
-        f"postgres-conformance-{group}": ("postgres and not (stress or qualification)", 8, group)
-        for group in range(1, 9)
+        f"postgres-conformance-{group}": (
+            "postgres and not (stress or qualification or host_journey)",
+            12,
+            group,
+        )
+        for group in range(1, 13)
     },
 }
 _SQLITE_PYTHON_VERSIONS = ("3.11", "3.12", "3.13", "3.14")
@@ -587,7 +592,7 @@ def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
             "pytest",
             "-q",
             "-m",
-            "not (stress or qualification or postgres or browser_docker)",
+            "not (stress or qualification or postgres or browser_docker or host_journey)",
             "--splits",
             str(_GENERAL_SHARDS),
             "--group",
@@ -635,7 +640,7 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
             "least_duration",
             "-n",
             # Capacity fixtures already create their own concurrent workers.
-            "1" if lane.startswith("qualification-") else "2",
+            "1" if lane.startswith(("qualification-", "host-journey-")) else "2",
             "--dist",
             "loadfile",
             "--durations=20",

@@ -59,7 +59,9 @@ class ProducerExportCleanupStatus(ContractValue):
         return self
 
 
-async def retire_unneeded_producer_export(app, command, destination_operation, *, context):
+async def retire_unneeded_producer_export(
+    app, command, destination_operation, *, context, wait_for_settlement=False
+):
     """Never disclose content, append, rerun production or release source retention."""
     redactor = app._secret_redactor
     command = prepare_contract(ProducerOutputRegistration, command, redactor=redactor)
@@ -271,5 +273,6 @@ async def retire_unneeded_producer_export(app, command, destination_operation, *
             + contract_bytes(context, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

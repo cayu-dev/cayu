@@ -1,5 +1,8 @@
 """Owner-clock expiry using the existing question decision transaction."""
 
+from dataclasses import dataclass
+from typing import Literal
+
 from cayu.collaboration._clarification_commands import (
     ClarificationCloseCommand,
     ClarificationOpenReceipt,
@@ -16,13 +19,28 @@ from cayu.collaboration._clarification_state import clarification_commitment
 from cayu.collaboration._clarification_store import (
     close_in_transaction,
     discover_due_in_transaction,
+    lookup_clarification_in_transaction,
 )
-from cayu.collaboration._contracts import CollaborationConflict, InitiatorBinding
+from cayu.collaboration._contracts import (
+    CollaborationConflict,
+    ExactMatch,
+    ExactNotFound,
+    InitiatorBinding,
+)
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration._request_store import operation_key
 from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.base import REQUEST_FAMILY
 from cayu.collaboration.participants import CollaborationUnavailable
+
+
+@dataclass(frozen=True)
+class _QuestionExpirySuperseded:
+    """Internal local-turn evidence; not an expiry or handoff settlement receipt."""
+
+    expected: ClarificationExpiryRequest
+    state: Literal["answered", "superseded", "cancelled", "expired", "request_terminal"]
+    decision_sha256: str
 
 
 def _authorize(coordinator, context, *, mutation):
@@ -73,8 +91,10 @@ async def due_questions(coordinator, query, *, context):
     )
 
 
-async def expire_question(coordinator, request, *, context):
-    _, store, initialized, redactor, context = _authorize(coordinator, context, mutation=True)
+async def expire_question(coordinator, request, *, context, read_only=False):
+    _, store, initialized, redactor, context = _authorize(
+        coordinator, context, mutation=not read_only
+    )
     request = prepare_contract(ClarificationExpiryRequest, request, redactor=redactor)
     recovery = request.recovery
     if (
@@ -82,7 +102,7 @@ async def expire_question(coordinator, request, *, context):
         or recovery.operation.namespace_incarnation != initialized.namespace_incarnation
     ):
         raise CollaborationConflict("Question recovery belongs to another owner.")
-    async with store._transaction(initialized.binding.application_scope, write=True) as tx:
+    async with store._transaction(initialized.binding.application_scope, write=not read_only) as tx:
         raw = await tx.get("operations", operation_key(recovery.operation))
         if raw is None:
             raise CollaborationUnavailable("Original question evidence is unavailable.")
@@ -115,7 +135,28 @@ async def expire_question(coordinator, request, *, context):
         # The existing owner checks deadline against native time, authenticates
         # the complete question/parent frontier, and elects against replies.
         # Exact replay precedes current deadline checks. This settles no handoff.
-        receipt = await close_in_transaction(store, tx, initialized, command, redactor=redactor)
+        if read_only:
+            found = await lookup_clarification_in_transaction(
+                store, tx, initialized, command, redactor=redactor
+            )
+            if isinstance(found, ExactNotFound):
+                current = await lookup_clarification_in_transaction(
+                    store, tx, initialized, opening.command, redactor=redactor, include_state=True
+                )
+                if isinstance(current, ExactMatch) and current.receipt.state != "open":
+                    # The native close transaction cannot admit another close
+                    # after any terminal question decision. This excludes only
+                    # the stale expiry turn, not its outstanding delivery.
+                    return _QuestionExpirySuperseded(
+                        request,
+                        current.receipt.state,
+                        clarification_commitment(current.receipt, redactor),
+                    )
+            if not isinstance(found, ExactMatch):
+                return None
+            receipt = found.receipt
+        else:
+            receipt = await close_in_transaction(store, tx, initialized, command, redactor=redactor)
         return prepare_contract(
             ClarificationExpiryReceipt,
             {

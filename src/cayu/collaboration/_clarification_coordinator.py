@@ -127,7 +127,37 @@ class ClarificationCoordinator:
         context: SessionExportAccessContext,
         delivery_context: SessionExportAccessContext | None = None,
     ) -> ClarificationServiceReceipt:
+        return await self._service(
+            app,
+            request,
+            context=context,
+            delivery_context=delivery_context,
+            wait_for_settlement=False,
+        )
+
+    async def _service_owned(self, app, request, *, context, delivery_context=None):
+        return await self._service(
+            app,
+            request,
+            context=context,
+            delivery_context=delivery_context,
+            wait_for_settlement=True,
+        )
+
+    async def _service(
+        self,
+        app,
+        request: ClarificationServiceRequest,
+        *,
+        context: SessionExportAccessContext,
+        delivery_context: SessionExportAccessContext | None = None,
+        wait_for_settlement: bool,
+    ) -> ClarificationServiceReceipt:
         from cayu.collaboration._clarification_service_api import service_clarification
+        from cayu.collaboration._preparation_progress import (
+            PreparationProgress,
+            PreparationReadFailure,
+        )
         from cayu.runtime._session_continuation import ContinuationConflict
 
         requests = self.requests
@@ -142,10 +172,16 @@ class ClarificationCoordinator:
             )
 
         async def owned():
+            progress = PreparationProgress()
             try:
                 return await requests._dependency(
                     lambda: service_clarification(
-                        self, app, request, context=context, delivery_context=delivery_context
+                        self,
+                        app,
+                        request,
+                        context=context,
+                        delivery_context=delivery_context,
+                        _preparation_progress=progress,
                     )
                 )
             except SessionExportDenied as error:
@@ -154,6 +190,14 @@ class ClarificationCoordinator:
             except ContinuationConflict as error:
                 failure = CollaborationConflict("Clarification service selection conflicts.")
                 failure.__cause__ = _safe_request_failure(error, requests._redactor)
+            except Exception as error:
+                evidence = progress.read_failure(error)
+                if wait_for_settlement and evidence is not None:
+                    return evidence
+                raise
+            evidence = progress.read_failure(failure)
+            if wait_for_settlement and evidence is not None:
+                return evidence
             raise failure
 
         return await requests._observe(
@@ -171,10 +215,94 @@ class ClarificationCoordinator:
                 ),
                 redactor=requests._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+                result_failure=lambda result: (
+                    result.error if type(result) is PreparationReadFailure else None
+                ),
+                wait_for_settlement=wait_for_settlement,
             )
         )
 
-    async def reconcile_service(self, app, request, *, context, exclude=False):
+    async def _inspect_service_owned(self, app, request, *, context):
+        """Retain one authenticated read through its exact native outcome."""
+        from cayu.collaboration._clarification_recovery import inspect_settled_service
+        from cayu.runtime._session_continuation import ContinuationConflict, ContinuationUnavailable
+
+        requests = self.requests
+        request = prepare_contract(
+            ClarificationServiceRequest, request, redactor=requests._redactor
+        )
+        context = prepare_contract(CollaborationAccessContext, context, redactor=requests._redactor)
+
+        async def owned():
+            try:
+                return await requests._dependency(
+                    lambda: inspect_settled_service(self, app, request, context=context)
+                )
+            except ContinuationConflict as error:
+                failure = CollaborationConflict("Service inspection selection conflicts.")
+                failure.__cause__ = _safe_request_failure(error, requests._redactor)
+            except ContinuationUnavailable as error:
+                failure = CollaborationUnavailable("Service inspection remains unresolved.")
+                failure.__cause__ = _safe_request_failure(error, requests._redactor)
+            raise failure
+
+        return await requests._observe(
+            requests._owners.run(
+                owned,
+                key=("clarification-service-inspection", object()),
+                expectation=contract_bytes(request, redactor=requests._redactor)
+                + contract_bytes(context, redactor=requests._redactor),
+                redactor=requests._redactor,
+                failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+                wait_for_settlement=True,
+            )
+        )
+
+    async def _inspect_maintenance_owned(self, app, expected, *, context):
+        """Retained exact readback, without repeating a maintenance mutation."""
+        from cayu.collaboration._clarification_delivery_recovery import reconcile_pending_delivery
+        from cayu.collaboration._clarification_question_recovery import expire_question
+        from cayu.collaboration._clarification_recovery import inspect_settled_service
+        from cayu.collaboration._clarification_recovery_types import (
+            ClarificationDeliveryRecovery,
+            ClarificationExpiryRequest,
+            ClarificationServiceRecovery,
+        )
+
+        if type(expected) not in (
+            ClarificationDeliveryRecovery,
+            ClarificationExpiryRequest,
+            ClarificationServiceRecovery,
+        ):
+            raise TypeError("Maintenance inspection requires an exact recovery selector.")
+        requests = self.requests
+        expected = prepare_contract(type(expected), expected, redactor=requests._redactor)
+        context = prepare_contract(CollaborationAccessContext, context, redactor=requests._redactor)
+
+        async def owned():
+            if type(expected) is ClarificationExpiryRequest:
+                return await expire_question(self, expected, context=context, read_only=True)
+            if type(expected) is ClarificationDeliveryRecovery:
+                return await reconcile_pending_delivery(
+                    self, expected, context=context, read_only=True
+                )
+            return await inspect_settled_service(self, app, expected, context=context)
+
+        return await requests._observe(
+            requests._owners.run(
+                owned,
+                key=("clarification-maintenance-inspection", object()),
+                expectation=contract_bytes(expected, redactor=requests._redactor)
+                + contract_bytes(context, redactor=requests._redactor),
+                redactor=requests._redactor,
+                failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+                wait_for_settlement=True,
+            )
+        )
+
+    async def reconcile_service(
+        self, app, request, *, context, exclude=False, wait_for_settlement=False
+    ):
         from cayu.collaboration._clarification_recovery import (
             ServiceRecoveryInput,
             reconcile_service,
@@ -214,10 +342,11 @@ class ClarificationCoordinator:
                 + (b"exclude" if exclude else b"reconcile"),
                 redactor=requests._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         )
 
-    async def due_questions(self, *, context, cursor=None, limit=32):
+    async def due_questions(self, *, context, cursor=None, limit=32, wait_for_settlement=False):
         from cayu.collaboration._clarification_question_recovery import due_questions
         from cayu.collaboration._clarification_recovery_types import (
             ClarificationPendingServiceQuery,
@@ -234,6 +363,7 @@ class ClarificationCoordinator:
             requests._owners.run(
                 lambda: requests._dependency(lambda: due_questions(self, query, context=context)),
                 key=("clarification-due-questions", object()),
+                wait_for_settlement=wait_for_settlement,
                 expectation=contract_bytes(query, redactor=requests._redactor)
                 + contract_bytes(context, redactor=requests._redactor),
                 redactor=requests._redactor,
@@ -241,7 +371,7 @@ class ClarificationCoordinator:
             )
         )
 
-    async def expire_question(self, request, *, context):
+    async def expire_question(self, request, *, context, wait_for_settlement=False):
         from cayu.collaboration._clarification_question_recovery import expire_question
         from cayu.collaboration._clarification_recovery_types import ClarificationExpiryRequest
 
@@ -258,10 +388,13 @@ class ClarificationCoordinator:
                 + contract_bytes(context, redactor=requests._redactor),
                 redactor=requests._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         )
 
-    async def pending_deliveries(self, *, context, cursor=None, limit=32):
+    async def pending_deliveries(
+        self, *, context, cursor=None, limit=32, wait_for_settlement=False
+    ):
         from cayu.collaboration._clarification_delivery_recovery import pending_deliveries
         from cayu.collaboration._clarification_recovery_types import (
             ClarificationPendingServiceQuery,
@@ -282,6 +415,7 @@ class ClarificationCoordinator:
                     )
                 ),
                 key=("clarification-pending-deliveries", object()),
+                wait_for_settlement=wait_for_settlement,
                 expectation=contract_bytes(query, redactor=requests._redactor)
                 + contract_bytes(context, redactor=requests._redactor),
                 redactor=requests._redactor,
@@ -289,7 +423,9 @@ class ClarificationCoordinator:
             )
         )
 
-    async def reconcile_delivery(self, recovery, *, context, exclude=False):
+    async def reconcile_delivery(
+        self, recovery, *, context, exclude=False, wait_for_settlement=False
+    ):
         from cayu.collaboration._clarification_delivery_recovery import reconcile_pending_delivery
         from cayu.collaboration._clarification_recovery_types import ClarificationDeliveryRecovery
 
@@ -316,10 +452,11 @@ class ClarificationCoordinator:
                 + contract_bytes(context, redactor=requests._redactor),
                 redactor=requests._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         )
 
-    async def pending_services(self, *, context, cursor=None, limit=32):
+    async def pending_services(self, *, context, cursor=None, limit=32, wait_for_settlement=False):
         from cayu.collaboration._clarification_recovery import pending_services
         from cayu.collaboration._clarification_recovery_types import (
             ClarificationPendingServiceQuery,
@@ -344,6 +481,7 @@ class ClarificationCoordinator:
             requests._owners.run(
                 owned,
                 key=("clarification-service-discovery", object()),
+                wait_for_settlement=wait_for_settlement,
                 expectation=contract_bytes(query, redactor=requests._redactor)
                 + contract_bytes(context, redactor=requests._redactor),
                 redactor=requests._redactor,

@@ -29,6 +29,7 @@ class _MutationOwners:
         expectation: bytes,
         redactor: SecretRedactor,
         failure_snapshot: Callable[[BaseException], BaseException] | None = None,
+        result_failure: Callable[[T], BaseException | None] | None = None,
         wait_for_settlement: bool = False,
     ) -> T:
         cancelled = False
@@ -76,6 +77,11 @@ class _MutationOwners:
             diagnostic = None
             if task.done() and not task.cancelled():
                 error = task.exception()
+                if error is None and result_failure is not None:
+                    # Some owners return typed failure evidence for their own
+                    # handoff logic. Cancellation must preserve that evidence
+                    # through the same sanitizer as a raised task failure.
+                    error = result_failure(task.result())
                 if error is not None:
                     diagnostic = (
                         safe_failure(error, redactor=redactor)

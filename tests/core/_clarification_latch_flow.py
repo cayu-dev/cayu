@@ -25,9 +25,24 @@ async def arbitrate_latch(
     consume,
     payloads,
     monkeypatch,
+    service_driver=None,
 ):
     count = len(payloads)
     ticket = request.ticket
+
+    async def service():
+        if service_driver is None:
+            return await app.service_clarification(
+                request, context=context, delivery_context=delivery_context
+            )
+        return await service_driver(
+            app,
+            request,
+            context=context,
+            delivery_context=delivery_context,
+            recovery_context=CONTEXT,
+            timeout=180,
+        )
 
     async def read_ticket():
         return await app.session_store.load_continuation_ticket(
@@ -67,11 +82,7 @@ async def arbitrate_latch(
 
         with monkeypatch.context() as patch:
             patch.setattr(TemporaryServicePermitAuthority, "settle", fail_settlement)
-            observer = asyncio.create_task(
-                app.service_clarification(
-                    request, context=context, delivery_context=delivery_context
-                )
-            )
+            observer = asyncio.create_task(service())
             try:
                 await asyncio.wait_for(entered.wait(), 120)
                 returned = await read_ticket()
@@ -103,9 +114,7 @@ async def arbitrate_latch(
         latched = await publish()
         assert latched.ticket.state == "WAITING"
         with suppress(CollaborationConflict, CollaborationUnavailable):
-            result = await app.service_clarification(
-                request, context=context, delivery_context=delivery_context
-            )
+            result = await service()
             assert result.state in {"prepared", "excluded"}
         assert len(payloads) == count
         retained = await read_ticket()
@@ -144,9 +153,7 @@ async def arbitrate_latch(
 
     with monkeypatch.context() as patch:
         patch.setattr(SessionContinuationOwner, "reconcile_temporary", held)
-        observer = asyncio.create_task(
-            app.service_clarification(request, context=context, delivery_context=delivery_context)
-        )
+        observer = asyncio.create_task(service())
         try:
             await asyncio.wait_for(entered.wait(), 120)
             assert len(payloads) == count + 1

@@ -124,6 +124,7 @@ async def output_scenario(
     native_stores,
     *,
     with_exports=False,
+    provider_events=(),
     tools=(),
     tool_policy=None,
     loop_policies=(),
@@ -133,6 +134,8 @@ async def output_scenario(
     consumer_origin=None,
     operation_prefix="",
     planned=False,
+    planning_driver=None,
+    request_ttl_ms=None,
     cancellation="stop",
     unchecked_registration=False,
     requested_session_id=None,
@@ -142,6 +145,7 @@ async def output_scenario(
     application, resolver, admission, provider, session, initialized = await prepared_scenario(
         native_stores,
         use_example=True,
+        provider_events=provider_events,
         session_exports_factory=(
             lambda initialized, request, resolver: output_exports(
                 initialized,
@@ -162,9 +166,14 @@ async def output_scenario(
         budget_binding_factory=budget_binding_factory,
         operation_prefix=operation_prefix,
         planned=planned,
+        planning_driver=planning_driver,
         request_cancellation=cancellation,
         requested_session_id=requested_session_id,
-        request_ttl_ms=300_000 if planned else None,
+        request_ttl_ms=request_ttl_ms
+        if request_ttl_ms is not None
+        else 300_000
+        if planned
+        else None,
     )
     found = await application.collaboration_admission_reader().lookup(
         admission, context=resolver.recipient.context
@@ -1447,12 +1456,23 @@ async def test_registered_producer_enters_native_participant_runtime(
 
             with pytest.raises(CollaborationUnavailable, match="export responsibility"):
                 await read_producer_settlement(application, proposal)
+            from cayu.collaboration._host_output_selection import select_producer_output
+
+            inspected = await application.inspect_producer_output(proposal, context=CONTEXT)
+            assert isinstance(inspected, ExactMatch)
+            assert inspected.receipt.destinations[0].delivery == "appended"
+            assert inspected.receipt.destinations[0].export_cleanup is None
+            assert select_producer_output(inspected.receipt).intent.action == "release_export"
             released = await application.settle_session_export(settlement, context=export_context)
             assert released.acceptance == accepted_export.receipt
             assert (
                 await application.settle_session_export(settlement, context=export_context)
                 == released
             )
+            inspected = await application.inspect_producer_output(proposal, context=CONTEXT)
+            assert isinstance(inspected, ExactMatch)
+            assert inspected.receipt.destinations[0].export_cleanup == "released"
+            assert select_producer_output(inspected.receipt).intent.action == "settle"
             settled_output = await read_producer_settlement(application, proposal)
             assert settled_output.registration == proposal.operation
             assert settled_output.completion == completion.operation
@@ -1927,7 +1947,17 @@ async def test_producer_failure_without_answer_uses_native_settlement(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("gate", ["input", "approval"])
-async def test_producer_human_pause_is_not_failure(native_stores, gate, monkeypatch):
+async def test_host_releases_human_paused_producer_slot(native_stores, gate, monkeypatch):
+    await test_producer_human_pause_is_not_failure(
+        native_stores, gate, monkeypatch, through_host=True
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("gate", ["input", "approval"])
+async def test_producer_human_pause_is_not_failure(
+    native_stores, gate, monkeypatch, through_host=False
+):
     from tests.core.test_participant_identity import CONTEXT
 
     from cayu import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
@@ -1940,9 +1970,18 @@ async def test_producer_human_pause_is_not_failure(native_stores, gate, monkeypa
     from cayu.events import EventType
     from cayu.providers.base import ModelStreamEvent
     from cayu.runtime._producer_execution import _ProducerExecution
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
     from cayu.tools.user_input import UserInputTool
 
     class Approval(ToolPolicy):
+        @property
+        def execution_profile_identity(self):
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:producer-human-approval",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
         async def authorize(self, request):
             return ToolPolicyResult(decision=ToolPolicyDecision.REQUIRE_APPROVAL, reason="Review")
 
@@ -1953,6 +1992,11 @@ async def test_producer_human_pause_is_not_failure(native_stores, gate, monkeypa
             name="reviewed",
             effect=ToolEffect.NONE,
             input_schema={"type": "object", "properties": {}},
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:producer-reviewed-tool",
+                behavior_version="1",
+                implementation_version="1",
+            ),
         )
 
         async def run(self, ctx, args):
@@ -1972,6 +2016,7 @@ async def test_producer_human_pause_is_not_failure(native_stores, gate, monkeypa
         with_exports=True,
         tools=(UserInputTool(),) if gate == "input" else (ReviewedTool(),),
         tool_policy=Approval() if gate == "approval" else None,
+        planned=through_host,
     )
     monkeypatch.setattr(application._request_coordinator._owners, "observation_timeout", 60)
     provider._batches = (
@@ -2002,15 +2047,70 @@ async def test_producer_human_pause_is_not_failure(native_stores, gate, monkeypa
             ),
         }
     )
-    events = [
-        event
-        async for event in application._execute_participant_session(
-            execution,
-            participant=admission.prepared.recipient,
-            context=CONTEXT,
-            producer_output=_ProducerExecution(application, proposal, resolver.recipient.context),
+    if through_host:
+        import asyncio
+
+        from cayu.collaboration._host import (
+            CollaborationHost,
+            _HostRegistration,
+            _ProducerExecutionRule,
+            _ProducerSource,
         )
-    ]
+        from cayu.collaboration._host_ownership import HostOwnershipLimits
+        from cayu.collaboration._host_producer_execution import HostProducerExecution
+
+        page = await application.pending_producer_outputs(
+            admission.prepared.recipient, context=CONTEXT
+        )
+        token = next(
+            item.recovery for item in page.items if item.recovery.registration == proposal.operation
+        )
+        events = []
+        execute = application.execute_producer_output
+
+        async def capture(*args, **kwargs):
+            async for event in execute(*args, **kwargs):
+                events.append(event)
+                yield event
+
+        monkeypatch.setattr(application, "execute_producer_output", capture)
+        async with CollaborationHost(
+            application,
+            _HostRegistration(
+                limits=HostOwnershipLimits(1, 1, 2, 262144),
+                producer_sources=(_ProducerSource(admission.prepared.recipient, CONTEXT),),
+                producer_rules=(),
+                producer_execution_rules=(
+                    _ProducerExecutionRule(
+                        HostProducerExecution(recovery=token), CONTEXT, resolver.recipient.context
+                    ),
+                ),
+                observation_timeout_s=60,
+                shutdown_timeout_s=60,
+            ),
+        ) as host:
+            async with asyncio.timeout(180):
+                while not events or host.inspect().pending:
+                    await host.service_once()
+                    for outcome in host._owned.inspect().completed:
+                        if outcome.error is not None:
+                            raise outcome.error
+            assert host.inspect().uncertain == 0
+            # Another discovery pass must not redispatch the paused producer.
+            await host.service_once()
+            assert host.inspect().active == host.inspect().uncertain == 0
+    else:
+        events = [
+            event
+            async for event in application._execute_participant_session(
+                execution,
+                participant=admission.prepared.recipient,
+                context=CONTEXT,
+                producer_output=_ProducerExecution(
+                    application, proposal, resolver.recipient.context
+                ),
+            )
+        ]
     assert any(event.type is EventType.INTERACTION_PAUSED for event in events)
     assert (await native_stores[1].load(session.id)).status == "interrupted"
     with pytest.raises(CollaborationUnavailable):

@@ -20,7 +20,7 @@ from cayu.collaboration.request_access import RequestReceivingAuthorization
 from cayu.runtime._producer_output_store import preflight_native_output
 
 
-async def prepare_producer_output(app, proposal, execution, *, context):
+async def prepare_producer_output(app, proposal, execution, *, context, wait_for_settlement=False):
     """Derive the native commitment from authenticated preparation, not caller hashes.
 
     The returned immutable command is still untrusted at registration and launch.
@@ -59,7 +59,17 @@ async def prepare_producer_output(app, proposal, execution, *, context):
         raise CollaborationUnavailable("Native producer attachment is not qualified.")
 
     async def prepare():
-        found = await app.collaboration_admission_reader().lookup(admission, context=context)
+        reader = app.collaboration_admission_reader()
+        if wait_for_settlement:
+            from cayu.collaboration._admission_reader import RegisteredRequestAdmissionReader
+
+            if type(reader) is not RegisteredRequestAdmissionReader:
+                raise CollaborationUnavailable(
+                    "Retained preparation requires the native admission reader."
+                )
+            found = await reader._lookup_owned(admission, context=context)
+        else:
+            found = await reader.lookup(admission, context=context)
         if not isinstance(found, ExactMatch) or found.receipt.state != "admitted":
             raise CollaborationUnavailable("Producer admission evidence is unavailable.")
         require_exact_contract(admission, found.receipt.command, redactor=redactor)
@@ -98,5 +108,6 @@ async def prepare_producer_output(app, proposal, execution, *, context):
             expectation=contract_bytes(proposal, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

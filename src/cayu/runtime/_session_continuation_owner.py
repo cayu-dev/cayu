@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, TypeVar
 
@@ -93,6 +94,18 @@ LATCH_FAMILY = FamilyVersion(family="session.continuation.latch", version=1)
 T = TypeVar("T")
 
 
+@dataclass(frozen=True, slots=True)
+class _ContinuationServiceResult:
+    """Native service distinguishes its own execution from admission readback.
+
+    An admitted replay can belong to a still-running invocation supervised by
+    another owner. It is not release evidence for that invocation.
+    """
+
+    record: ContinuationRecord
+    dispatched: bool
+
+
 def _failure_graph(error: BaseException, redactor: SecretRedactor) -> BaseException:
     seen: set[int] = set()
 
@@ -128,6 +141,21 @@ def _failure_graph(error: BaseException, redactor: SecretRedactor) -> BaseExcept
     result = copy(error, 0)
     assert result is not None
     return result
+
+
+class _ContinuationServiceNotStarted(Exception):
+    """Private evidence that this service finished before entering admission."""
+
+    def __init__(self, failure: Exception):
+        super().__init__("Continuation service did not enter admission.")
+        self.failure = failure
+
+
+@dataclass(frozen=True)
+class _ContinuationServiceReadFailure:
+    """Completed initial read, with no admission dispatched by this service turn."""
+
+    failure: Exception
 
 
 class SessionContinuationOwner:
@@ -213,6 +241,9 @@ class SessionContinuationOwner:
                 expectation=expected,
                 redactor=self.redactor,
                 failure_snapshot=lambda error: _failure_graph(error, self.redactor),
+                result_failure=lambda result: (
+                    result.failure if type(result) is _ContinuationServiceReadFailure else None
+                ),
                 wait_for_settlement=wait_for_settlement,
             )
         except CollaborationConflict:
@@ -222,30 +253,72 @@ class SessionContinuationOwner:
         raise failure
 
     async def latch(self, candidate: ContinuationLatch) -> ContinuationRecord:
+        return await self._receive_latch(candidate, wait_for_settlement=False)
+
+    async def _latch_owned(self, candidate: ContinuationLatch) -> ContinuationRecord:
+        """Retained runtime observation; authentication is identical to latch()."""
+        return await self._receive_latch(candidate, wait_for_settlement=True)
+
+    async def _read_latch_record(self, latch):
+        retained = await self.store.load_continuation_ticket(
+            latch.ticket.session_id,
+            registration_key=latch.ticket.registration_key,
+            session_instance_id=latch.ticket.session_instance_id,
+        )
+        if retained is None:
+            raise ContinuationConflict("Continuation is not durably prepared.")
+        require_ticket_identity(retained.ticket, latch.ticket)
+        if retained.preparation.registration.child.destination != self.receiver_capability.owner:
+            raise PermissionError("Continuation wait belongs to another registered receiver.")
+        if retained.latch is not None:
+            require_latch_identity(retained.latch, latch)
+        return retained
+
+    async def _inspect_latch_owned(self, candidate: ContinuationLatch):
+        """Exact retained latch readback; cannot create a latch or start execution."""
+        from cayu.collaboration._wait_coordinator import CollaborationWaitLatchReceiver
+
+        latch = prepare_contract(ContinuationLatch, candidate, redactor=self.redactor)
+        if (
+            latch.ticket.owner != self.owner
+            or type(self.receiver) is not CollaborationWaitLatchReceiver
+        ):
+            raise PermissionError("Retained latch readback requires its registered receiver.")
+
+        async def inspect():
+            retained = await self._read_latch_record(latch)
+            return retained if retained.latch is not None else None
+
+        return await self._observe(
+            inspect,
+            key=(
+                latch.ticket.session_id,
+                continuation_operation_key(latch.ticket),
+                "inspect-latch",
+            ),
+            expected=contract_bytes(latch, redactor=self.redactor),
+            wait_for_settlement=True,
+        )
+
+    async def _receive_latch(self, candidate, *, wait_for_settlement):
         latch = prepare_contract(ContinuationLatch, candidate, redactor=self.redactor)
         if latch.ticket.owner != self.owner:
             raise PermissionError("Continuation belongs to a different session owner.")
+        authenticate = self.receiver.authenticate_continuation_latch
+        if wait_for_settlement:
+            from cayu.collaboration._wait_coordinator import CollaborationWaitLatchReceiver
+
+            if type(self.receiver) is not CollaborationWaitLatchReceiver:
+                raise PermissionError("Retained latch observation requires its native receiver.")
+            authenticate = self.receiver._authenticate_latch_owned
 
         async def receive() -> ContinuationRecord:
-            retained = await self.store.load_continuation_ticket(
-                latch.ticket.session_id,
-                registration_key=latch.ticket.registration_key,
-                session_instance_id=latch.ticket.session_instance_id,
-            )
-            if retained is None:
-                raise ContinuationConflict("Continuation is not durably prepared.")
-            require_ticket_identity(retained.ticket, latch.ticket)
-            if (
-                retained.preparation.registration.child.destination
-                != self.receiver_capability.owner
-            ):
-                raise PermissionError("Continuation wait belongs to another registered receiver.")
+            retained = await self._read_latch_record(latch)
             if retained.latch is not None:
-                require_latch_identity(retained.latch, latch)
                 return retained
             authenticated = prepare_contract(
                 ContinuationLatch,
-                await self.receiver.authenticate_continuation_latch(latch),
+                await authenticate(latch),
                 redactor=self.redactor,
             )
             require_latch_identity(latch, authenticated)
@@ -256,6 +329,7 @@ class SessionContinuationOwner:
             receive,
             key=(latch.ticket.session_id, continuation_operation_key(latch.ticket), "latch"),
             expected=contract_bytes(latch, redactor=self.redactor),
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def prepare(
@@ -469,6 +543,29 @@ class SessionContinuationOwner:
         *,
         invocation: InvocationContext,
     ) -> tuple[InvocationMutationResult, ContinuationRecord]:
+        return await self._admit(
+            candidate, command, invocation=invocation, wait_for_settlement=False
+        )
+
+    async def _admit_owned(
+        self,
+        candidate,
+        command,
+        *,
+        invocation,
+    ) -> tuple[InvocationMutationResult, ContinuationRecord]:
+        return await self._admit(
+            candidate, command, invocation=invocation, wait_for_settlement=True
+        )
+
+    async def _admit(
+        self,
+        candidate: ContinuationConsumption,
+        command: AdmitInvocationCommand,
+        *,
+        invocation: InvocationContext,
+        wait_for_settlement: bool,
+    ) -> tuple[InvocationMutationResult, ContinuationRecord]:
         """Receive a runtime-prepared invocation; never compute policy gates here."""
         if (
             type(invocation) is not InvocationContext
@@ -523,6 +620,7 @@ class SessionContinuationOwner:
             dispatch,
             key=(expected.ticket.session_id, continuation_operation_key(expected.ticket), "admit"),
             expected=contract_bytes(expected, redactor=self.redactor),
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def prepare_temporary_admission(
@@ -847,6 +945,7 @@ class SessionContinuationOwner:
         *,
         participant_context: CollaborationAccessContext,
         delivery: Callable[[InvocationContext], Awaitable[None]] | None = None,
+        wait_for_settlement: bool = False,
     ) -> TemporaryServiceRecord:
         """Explicit internal service, with durable reconciliation before dispatch.
 
@@ -965,6 +1064,7 @@ class SessionContinuationOwner:
             key=(intent.target.object_id, temporary_service_key(intent.operation), "service"),
             expected=contract_bytes(intent, redactor=self.redactor)
             + contract_bytes(participant_context, redactor=self.redactor),
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def service(
@@ -975,15 +1075,42 @@ class SessionContinuationOwner:
         *,
         participant_context: CollaborationAccessContext | None = None,
     ) -> ContinuationRecord:
-        """Run the existing resume path, or reconcile its exact prior admission.
+        """Observe normal resume or exact reconciliation with a bounded waiter."""
+        result = await self._service(
+            app,
+            request,
+            candidate,
+            participant_context=participant_context,
+            wait_for_settlement=False,
+        )
+        return result.record
 
-        This is an explicitly invoked host service, not a scheduler. The supplied
-        application owns all normal session gates and execution. Event output
-        remains in the session's durable event stream rather than an unbounded
-        secondary buffer here.
-        """
-        from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
+    async def _service_owned(
+        self,
+        app,
+        request,
+        candidate,
+        *,
+        participant_context,
+    ) -> _ContinuationServiceResult:
+        """Runtime-owned observation; all service authentication remains shared."""
+        return await self._service(
+            app,
+            request,
+            candidate,
+            participant_context=participant_context,
+            wait_for_settlement=True,
+        )
 
+    def _prepare_service_input(
+        self,
+        app: CayuApp,
+        request: ResumeRequest,
+        candidate: ContinuationService,
+        *,
+        participant_context: CollaborationAccessContext | None,
+    ):
+        """Snapshot identical service input without granting execution or read access."""
         service = prepare_contract(ContinuationService, candidate, redactor=self.redactor)
         if app.session_store is not self.store or service.ticket.owner != self.owner:
             raise PermissionError("Continuation service belongs to another application owner.")
@@ -993,13 +1120,6 @@ class SessionContinuationOwner:
             participant_context = prepare_contract(
                 CollaborationAccessContext, participant_context, redactor=self.redactor
             )
-        source = await self.store.load(service.ticket.session_id)
-        if source is None or source.instance_id != service.ticket.session_instance_id:
-            raise ContinuationConflict("Continuation session incarnation is unavailable.")
-        # A latch proves the wait decision, not current participant access.
-        # Authenticate each observer, including settled replay; normal resume
-        # rechecks execution authority before the receiving mutation.
-        await app._require_participant_execution(source, participant_context)
         failure = None
         try:
             copied_request = copy_resume_request(request)
@@ -1016,28 +1136,113 @@ class SessionContinuationOwner:
         service_digest = sha256(
             contract_bytes(service, redactor=self.redactor) + request_digest.encode("ascii")
         ).hexdigest()
+        return copied_request, service, participant_context, service_digest
 
-        async def receive() -> ContinuationRecord:
-            retained = await self.store.load_continuation_ticket(
-                service.ticket.session_id,
-                registration_key=service.ticket.registration_key,
-                session_instance_id=service.ticket.session_instance_id,
+    async def _prepare_service_observation(self, app, request, candidate, *, participant_context):
+        prepared = self._prepare_service_input(
+            app, request, candidate, participant_context=participant_context
+        )
+        _, service, context, _ = prepared
+        source = await self.store.load(service.ticket.session_id)
+        if source is None or source.instance_id != service.ticket.session_instance_id:
+            raise ContinuationConflict("Continuation session incarnation is unavailable.")
+        # Public execution and replay continue to require current execution
+        # authority. The separate inspection entrance cannot dispatch work.
+        await app._require_participant_execution(source, context)
+        return prepared
+
+    async def _read_service_record(self, service, service_digest):
+        retained = await self.store.load_continuation_ticket(
+            service.ticket.session_id,
+            registration_key=service.ticket.registration_key,
+            session_instance_id=service.ticket.session_instance_id,
+        )
+        if retained is None or retained.latch is None:
+            raise ContinuationConflict("Continuation has no retained ready wait.")
+        require_ticket_identity(service.ticket, retained.ticket)
+        require_latch_identity(service.latch, retained.latch)
+        consumption = retained.consumption
+        if consumption is not None and (
+            consumption.service_digest != service_digest
+            or consumption.continuation_id != service.continuation_id
+            or consumption.mode != service.mode
+            or consumption.accepted_at != service.accepted_at
+        ):
+            raise ContinuationConflict("Continuation service was accepted differently.")
+        return retained
+
+    async def _inspect_service(self, app, request, candidate, *, expected, participant_context):
+        """Read exact service acceptance without admitting or replaying execution."""
+        from cayu.runtime._host_continuation_discovery import recover_session_continuation
+
+        _, service, context, service_digest = self._prepare_service_input(
+            app, request, candidate, participant_context=participant_context
+        )
+        # Readback authenticates the exact participant/creation/incarnation and
+        # original preparation, without requiring that participant to be active.
+        observed = await recover_session_continuation(app, expected, context=context)
+        require_ticket_identity(service.ticket, observed.ticket)
+        retained = await self._read_service_record(service, service_digest)
+        if retained != observed:
+            raise ContinuationUnavailable("Continuation changed during service inspection.")
+        return retained
+
+    async def _service(
+        self,
+        app: CayuApp,
+        request: ResumeRequest,
+        candidate: ContinuationService,
+        *,
+        participant_context: CollaborationAccessContext | None,
+        wait_for_settlement: bool,
+    ) -> _ContinuationServiceResult:
+        """Run normal resume, or reconcile its exact prior admission.
+
+        The application owns session gates and execution; this service is not a
+        scheduler and retains no secondary event buffer.
+        """
+        from cayu.runtime._session_continuation_resume import _ContinuationResumeHandoff
+
+        try:
+            (
+                copied_request,
+                service,
+                participant_context,
+                service_digest,
+            ) = await self._prepare_service_observation(
+                app, request, candidate, participant_context=participant_context
             )
-            if retained is None or retained.latch is None:
-                raise ContinuationConflict("Continuation has no retained ready wait.")
-            require_ticket_identity(service.ticket, retained.ticket)
-            require_latch_identity(service.latch, retained.latch)
+        except Exception as error:
+            if wait_for_settlement:
+                # Only the internal host entrance consumes this proof. The
+                # public entrance preserves its original exception contract.
+                # Control signals and failures after entering receive remain
+                # subject to the normal retained-ownership boundary.
+                evidence = _failure_graph(error, self.redactor)
+                assert isinstance(evidence, Exception)
+                raise _ContinuationServiceNotStarted(evidence) from None
+            raise
+
+        async def receive() -> _ContinuationServiceResult | _ContinuationServiceReadFailure:
+            try:
+                retained = await self._read_service_record(service, service_digest)
+            except Exception as error:
+                # Carry positive completion evidence through the owned observer.
+                # Ordinary ExceptionGroups are completed failures too. Groups
+                # containing control signals are not Exceptions and still pass
+                # through _observe()'s existing control-signal classification.
+                # Only this initial read is covered: later failures may follow
+                # admission/dispatch and must retain their normal recovery fence.
+                return _ContinuationServiceReadFailure(error)
+            # The read above authenticates the complete latch identity, excluding
+            # mutable ticket state/revision. Admission must carry the native
+            # representation that consume_continuation retains, while the original
+            # service digest continues to bind the caller's exact request.
+            native_service = service.model_copy(update={"latch": retained.latch})
             if retained.consumption is not None:
                 consumption = retained.consumption
-                if (
-                    consumption.service_digest != service_digest
-                    or consumption.continuation_id != service.continuation_id
-                    or consumption.mode != service.mode
-                    or consumption.accepted_at != service.accepted_at
-                ):
-                    raise ContinuationConflict("Continuation service was accepted differently.")
                 if consumption.receipt_stage in {"admitted", "excluded"}:
-                    return retained
+                    return _ContinuationServiceResult(retained, False)
                 if consumption.receipt_stage == "prepared":
                     from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
                     from cayu.runtime._invocation_lifecycle import (
@@ -1072,8 +1277,11 @@ class SessionContinuationOwner:
                         )
                         is not None
                     ):
-                        return await self.reconcile_admission(
-                            consumption.model_copy(update={"receipt_stage": "prepared"})
+                        return _ContinuationServiceResult(
+                            await self.reconcile_admission(
+                                consumption.model_copy(update={"receipt_stage": "prepared"})
+                            ),
+                            False,
                         )
                     # Release rechecks the receipt in the admission transaction.
                     # Late dispatches check this exact claim ID and are fenced;
@@ -1084,7 +1292,7 @@ class SessionContinuationOwner:
                 # Re-enter normal gates with the exact retained command identity.
                 # If the gates now refuse, responsibility remains unclaimed and
                 # can be explicitly excluded rather than stranded as in-flight.
-                handoff = _ContinuationResumeHandoff(self, service, service_digest)
+                handoff = _ContinuationResumeHandoff(self, native_service, service_digest)
                 stream = app._resume_private(
                     copied_request,
                     store_resolved_session_id=service.ticket.session_id,
@@ -1103,13 +1311,13 @@ class SessionContinuationOwner:
                 )
                 if result is None:
                     raise ContinuationUnavailable("Continuation service readback is unavailable.")
-                return result
+                return _ContinuationServiceResult(result, True)
             if (
                 retained.ticket.state != "WAITING"
                 or retained.ticket.revision != service.ticket.revision
             ):
                 raise ContinuationConflict("Continuation is no longer eligible for service.")
-            handoff = _ContinuationResumeHandoff(self, service, service_digest)
+            handoff = _ContinuationResumeHandoff(self, native_service, service_digest)
             stream = app._resume_private(
                 copied_request,
                 store_resolved_session_id=service.ticket.session_id,
@@ -1128,9 +1336,9 @@ class SessionContinuationOwner:
             )
             if result is None:
                 raise ContinuationUnavailable("Continuation service readback is unavailable.")
-            return result
+            return _ContinuationServiceResult(result, True)
 
-        return await self._observe(
+        observed = await self._observe(
             receive,
             key=(service.ticket.session_id, continuation_operation_key(service.ticket), "service"),
             expected=service_digest.encode("ascii")
@@ -1139,7 +1347,29 @@ class SessionContinuationOwner:
                 if participant_context is None
                 else contract_bytes(participant_context, redactor=self.redactor)
             ),
+            wait_for_settlement=wait_for_settlement,
         )
+        if isinstance(observed, _ContinuationServiceReadFailure):
+            # Public callers retain the same sanitized exception contract as
+            # _observe(). Conversion is observer-local, including joined calls.
+            error = observed.failure
+            kind = (
+                ContinuationConflict
+                if isinstance(error, ContinuationConflict)
+                else PermissionError
+                if isinstance(error, PermissionError)
+                else ContinuationUnavailable
+            )
+            failure = kind(
+                "Receiving dependency failed; reconcile the latch."
+                if isinstance(error, ExceptionGroup)
+                else "Continuation receiving operation failed."
+            )
+            failure.__cause__ = _failure_graph(error, self.redactor)
+            if wait_for_settlement:
+                raise _ContinuationServiceNotStarted(failure) from None
+            raise failure
+        return observed
 
     async def reconcile_admission(self, candidate: ContinuationConsumption) -> ContinuationRecord:
         """Settle a retained handoff only from positive typed admission evidence."""

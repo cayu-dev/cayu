@@ -16,7 +16,7 @@ class PostgresCollaborationStore(_PostgresStoreBase, CollaborationStore):
     request_contract_version = 2
     planning_contract_version = 1
 
-    _min_required_revision = 107
+    _min_required_revision = 111
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

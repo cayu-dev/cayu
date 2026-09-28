@@ -12,6 +12,7 @@ from cayu.storage.sqlite import SQLiteSessionStore
 @pytest.mark.parametrize(
     "method",
     [
+        "_read_native_producer_attachment",
         "_complete_native_producer_cleanup",
         "_read_completed_native_producer_cleanup",
         "_retire_native_producer_cleanup",

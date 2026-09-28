@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -164,7 +165,7 @@ def test_http_and_sdk_cursor_preserve_priority_fifo_highwater_and_unreadable_row
                 "future-mode",
             )
         else:
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute("PRAGMA ignore_check_constraints = ON")
                 connection.execute(
                     "UPDATE cayu_session_message_queue SET delivery_mode = ? WHERE queue_id = ?",
@@ -441,7 +442,7 @@ def test_http_sqlite_pruning_retains_exact_references_and_fresh_app_replay(
         assert accepted.status_code == 200, accepted.text
         accepted_id = sse_events(accepted)[0]["id"]
         if outcome == "quarantine":
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute(
                     "UPDATE cayu_session_message_queue SET message_json = ? WHERE session_id = ?",
                     ('{"invalid":"malformed-private-content"}', "target"),
@@ -1879,7 +1880,7 @@ def test_corrupt_acceptance_pointer_can_be_inspected_quarantined_and_replayed(
             "message-1"
         ].accepted_event_id = broken
     else:
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute(
                 "UPDATE cayu_session_message_queue SET accepted_event_id = ? WHERE session_id = ?",
                 (broken, "target"),
@@ -1983,6 +1984,29 @@ def test_corrupt_acceptance_pointer_can_be_inspected_quarantined_and_replayed(
     finally:
         if backend == "sqlite":
             asyncio.run(store.close())
+
+
+def test_corrupt_acceptance_fixture_closes_every_sqlite_connection(tmp_path, monkeypatch):
+    connect = sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    try:
+        test_corrupt_acceptance_pointer_can_be_inspected_quarantined_and_replayed(
+            tmp_path, monkeypatch, "sqlite", "http", "missing"
+        )
+        assert opened
+        for connection in opened:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+                connection.execute("SELECT 1")
+    finally:
+        for connection in opened:
+            connection.close()
 
 
 @pytest.mark.parametrize("error_type", [OSError, SessionMessageConflict])

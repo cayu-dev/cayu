@@ -31,7 +31,9 @@ from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
 
 
-async def export_producer_output(app, command, destination_operation, *, context):
+async def export_producer_output(
+    app, command, destination_operation, *, context, wait_for_settlement=False
+):
     """Do not dispatch production, elect an answer, append, expose or release pins."""
     coordinator = app._request_coordinator
     redactor = app._secret_redactor
@@ -69,7 +71,9 @@ async def export_producer_output(app, command, destination_operation, *, context
 
         if await retain_output_failure(app, command, destination, intent) is not None:
             raise SessionExportDenied()
-        found = await exports.lookup(intent.request, context=context)
+        found = await exports.lookup(
+            intent.request, context=context, wait_for_settlement=wait_for_settlement
+        )
         if isinstance(found, ExactMatch):
             return found.receipt
         if isinstance(found, ExactConflict):
@@ -83,13 +87,17 @@ async def export_producer_output(app, command, destination_operation, *, context
                 store, tx, initialized, command, destination, intent, redactor=redactor
             )
         try:
-            return await exports.export(intent.request, context=context)
+            return await exports.export(
+                intent.request, context=context, wait_for_settlement=wait_for_settlement
+            )
         except Exception:
             await retain_output_failure(app, command, destination, intent)
             raise
 
     async def export():
-        completion = await retain_producer_completion(app, command)
+        completion = await retain_producer_completion(
+            app, command, wait_for_settlement=wait_for_settlement
+        )
         if completion.output.disposition != "answer":
             raise CollaborationUnavailable("Producer output requires failure election, not export.")
         async with store._transaction(initialized.owner.application_scope, write=False) as tx:
@@ -109,7 +117,9 @@ async def export_producer_output(app, command, destination_operation, *, context
                     receipt,
                     redactor=redactor,
                 )
-        namespace = await exports.initialize(target.session_id, context=context)
+        namespace = await exports.initialize(
+            target.session_id, context=context, wait_for_settlement=wait_for_settlement
+        )
         request = SessionExportRequest(
             ref=SessionExportRef(
                 session_id=target.session_id,
@@ -163,5 +173,6 @@ async def export_producer_output(app, command, destination_operation, *, context
             + contract_bytes(context, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

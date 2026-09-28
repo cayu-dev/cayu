@@ -21,6 +21,7 @@ from cayu.collaboration._planning_store import (
     retain_plan_in_transaction,
 )
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
+from cayu.collaboration._preparation_progress import PreparationProgress, PreparationReadFailure
 from cayu.collaboration._request_coordinator import _initiator, _safe_request_failure
 from cayu.collaboration._request_store import operation_key
 from cayu.collaboration.access import CollaborationAccessContext, CollaborationAccessDenied
@@ -57,6 +58,7 @@ async def plan_request(
     recipient_creation=None,
     recipient_fork=None,
     recipient_resources=None,
+    wait_for_settlement=False,
 ):
     """Retained mutation ownership outlives a cancelled foreground observer."""
     value = prepare_contract(
@@ -68,10 +70,19 @@ async def plan_request(
         require_exact_contract(value.request, value.control.expected, redactor=requests._redactor)
 
     async def owned():
+        progress_evidence = PreparationProgress()
+
         async def progress():
             record = await _held(
-                requests, value, read_only=read_only, require_retained=require_retained
+                requests,
+                value,
+                read_only=read_only,
+                require_retained=require_retained,
+                preparation_progress=progress_evidence,
             )
+            # Subsequent progress can call foreign preparation/recovery owners.
+            # Only the initial native read phase can prove a no-mutation turn.
+            progress_evidence.enter_mutation()
             if isinstance(record, _PrerequisiteRead):
                 # The registered admission reader may use the same non-reentrant
                 # mandate guard. Resolve outside it, then reacquire current
@@ -159,7 +170,13 @@ async def plan_request(
                 raise CollaborationUnavailable("Planning clarification readback is unavailable.")
             return result.receipt
 
-        return await requests._dependency(progress)
+        try:
+            return await requests._dependency(progress)
+        except Exception as error:
+            evidence = progress_evidence.read_failure(error)
+            if wait_for_settlement and not read_only and evidence is not None:
+                return evidence
+            raise
 
     return await requests._observe(
         requests._owners.run(
@@ -168,7 +185,38 @@ async def plan_request(
             expectation=contract_bytes(value, redactor=requests._redactor),
             redactor=requests._redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, requests._redactor),
+            result_failure=lambda result: (
+                result.error if type(result) is PreparationReadFailure else None
+            ),
+            wait_for_settlement=wait_for_settlement,
         )
+    )
+
+
+async def service_application_plan(
+    app, request, *, context, require_retained=False, wait_for_settlement=False
+):
+    """One application wiring boundary for public and retained host observers.
+
+    A host keeps the native operation attached to its retained task. Its own
+    foreground observation remains bounded; a public client observation timeout
+    must not be mistaken for failure or quiescence of that background operation.
+    All preparation, permission and source-state checks remain in plan_request.
+    """
+    from cayu.sessions._planning_creation_owner import NativePlanningCreationOwner
+    from cayu.sessions._planning_fork_owner import NativePlanningForkOwner
+    from cayu.sessions._planning_resource_owner import NativePlanningResourceOwner
+
+    return await plan_request(
+        app._request_coordinator,
+        request,
+        context=context,
+        clarifications=app._clarification_coordinator,
+        require_retained=require_retained,
+        recipient_creation=NativePlanningCreationOwner(app),
+        recipient_fork=NativePlanningForkOwner(app),
+        recipient_resources=NativePlanningResourceOwner(app),
+        wait_for_settlement=wait_for_settlement,
     )
 
 
@@ -184,6 +232,7 @@ async def _held(
     view_readback=None,
     view_reservation=None,
     resource_readback=None,
+    preparation_progress=None,
 ):
     registration = requests._registration
     if registration is None or requests._resolver_ref is None:
@@ -281,6 +330,8 @@ async def _held(
                 cleanup_grant, (selected.sender.reference, selected.recipient.reference)
             )
             await validate(("readback", "administer"))
+            if preparation_progress is not None:
+                preparation_progress.enter_mutation()
             async with store._transaction(initialized.binding.application_scope, write=True) as tx:
                 if await tx.now_ms() >= deadline:
                     raise CollaborationAccessDenied("Planning cleanup authority expired.")
@@ -335,6 +386,8 @@ async def _held(
                 settlement_grant, (selected.sender.reference, selected.recipient.reference)
             )
             await validate(("readback", "administer" if cleanup else "prepare"))
+            if preparation_progress is not None:
+                preparation_progress.enter_mutation()
             async with store._transaction(initialized.binding.application_scope, write=True) as tx:
                 if await tx.now_ms() >= deadline:
                     raise CollaborationAccessDenied("Planning settlement authority expired.")
@@ -386,6 +439,8 @@ async def _held(
                 control_grant, (selected.sender.reference, selected.recipient.reference)
             )
             await validate(("readback", "administer"))
+            if preparation_progress is not None:
+                preparation_progress.enter_mutation()
             async with store._transaction(initialized.binding.application_scope, write=True) as tx:
                 if await tx.now_ms() >= deadline:
                     raise CollaborationAccessDenied("Planning cleanup authority expired.")
@@ -448,6 +503,8 @@ async def _held(
                 ):
                     return _PrerequisiteRead(predecessor.decision.prerequisite)
         if isinstance(found, ExactNotFound):
+            if preparation_progress is not None:
+                preparation_progress.enter_mutation()
             async with store._transaction(initialized.binding.application_scope, write=True) as tx:
                 if await tx.now_ms() >= deadline:
                     raise CollaborationAccessDenied("Planning authority expired before retention.")
@@ -469,6 +526,8 @@ async def _held(
                 input_revision=command.expected_input_revision,
                 redactor=redactor,
             )
+            if preparation_progress is not None:
+                preparation_progress.enter_mutation()
             async with store._transaction(initialized.binding.application_scope, write=True) as tx:
                 if await tx.now_ms() >= deadline:
                     raise CollaborationAccessDenied("Planning authority expired before decision.")
@@ -485,6 +544,8 @@ async def _held(
                     creation_grant,
                     (record.decision.preparation.view.permit.intent.request.participant,),
                 )
+        if preparation_progress is not None:
+            preparation_progress.enter_mutation()
         async with store._transaction(initialized.binding.application_scope, write=True) as tx:
             if await tx.now_ms() >= deadline:
                 raise CollaborationAccessDenied("Planning authority expired before admission.")

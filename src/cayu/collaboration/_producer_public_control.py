@@ -40,14 +40,35 @@ def _public_control(app, command, context) -> ProducerOutputRegistration:
 
 
 async def retain_public_producer_completion(
-    app, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
+    app,
+    command: ProducerOutputRegistration,
+    *,
+    context: CollaborationAccessContext,
+    wait_for_settlement=False,
 ) -> ProducerCompletionRecord:
     command = _public_control(app, command, context)
-    return await retain_producer_completion(app, command)
+    return await retain_producer_completion(app, command, wait_for_settlement=wait_for_settlement)
 
 
 async def settle_public_producer_output(
-    app, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
+    app,
+    command: ProducerOutputRegistration,
+    *,
+    context: CollaborationAccessContext,
+    wait_for_settlement=False,
 ) -> ProducerCleanupFinalized:
     command = _public_control(app, command, context)
-    return await settle_producer_output(app, command)
+    return await settle_producer_output(app, command, wait_for_settlement=wait_for_settlement)
+
+
+async def observe_public_producer_completion(
+    app,
+    command: ProducerOutputRegistration,
+    *,
+    context: CollaborationAccessContext,
+) -> ProducerCompletionRecord | None:
+    """Retained host observation; only exact native absence is a pending result."""
+    command = _public_control(app, command, context)
+    return await retain_producer_completion(
+        app, command, wait_for_settlement=True, allow_pending=True
+    )

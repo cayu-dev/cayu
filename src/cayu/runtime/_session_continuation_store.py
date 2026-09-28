@@ -74,6 +74,7 @@ class _Entry(ContractValue):
     admission_claim_id: StrictStr | None = Field(default=None, min_length=1, max_length=128)
     admission_command_digest: StrictStr | None = None
     admission_expected_run_epoch: StrictInt | None = Field(default=None, ge=1)
+    service_digest: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     service_receipt_epochs: tuple[StrictInt, ...] = Field(
         default=(), max_length=CONTINUATION_MAX_SERVICES
     )
@@ -82,6 +83,8 @@ class _Entry(ContractValue):
     def complete_admission_identity(self) -> _Entry:
         if (self.admission_command_digest is None) != (self.admission_expected_run_epoch is None):
             raise ValueError("Continuation index has incomplete admission identity.")
+        if self.service_digest is not None and self.admission_command_digest is None:
+            raise ValueError("Continuation service index lacks its admission identity.")
         if (
             tuple(sorted(set(self.service_receipt_epochs))) != self.service_receipt_epochs
             or any(epoch < 1 or epoch > 2**53 - 1 for epoch in self.service_receipt_epochs)
@@ -347,6 +350,8 @@ def index_publication(
                 or entry.record_sha256 != digest(current_record)
                 or entry.originating_writer_generation != before.ticket.writer_generation
                 or entry.service_receipt_epochs != service_receipt_epochs(before)
+                or entry.service_digest
+                != (None if before.consumption is None else before.consumption.service_digest)
                 or record.events != before.events
                 or record.services != before.services
                 or (
@@ -426,6 +431,7 @@ def index_publication(
             admission_expected_run_epoch=(
                 None if consumption is None else consumption.admission_expected_run_epoch
             ),
+            service_digest=None if consumption is None else consumption.service_digest,
             service_receipt_epochs=service_receipt_epochs(record),
         )
         root = root.model_copy(update={"entries": tuple(entries[item] for item in sorted(entries))})
@@ -440,7 +446,7 @@ def index_publication(
 
 
 def pending_admission_receipt_identities(session: Session, checkpoint) -> frozenset[str]:
-    """Pin receiving evidence until its continuation responsibility settles."""
+    """Retain exact native handoffs while their continuation records are retained."""
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
     if raw is None:
         return frozenset()
@@ -453,7 +459,10 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
     final_admissions = frozenset(
         f"admit:{session.id}:{session.instance_id}:{entry.admission_expected_run_epoch + 1}"
         for entry in root.entries
-        if entry.state in {"WAITING", "SERVICING"}
+        if (
+            entry.state in {"WAITING", "SERVICING"}
+            or (entry.state == "CONSUMED" and entry.service_digest is not None)
+        )
         and entry.admission_expected_run_epoch is not None
     )
     service_receipts = frozenset(
@@ -474,7 +483,45 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
         if entry.state in {"ARMING", "WAITING", "SERVICING"}
         for kind in ("admit", "release")
     )
-    return final_admissions | service_receipts | target_receipts | original_receipts
+    # An exactly registered native service can outlive its failed observer.
+    # Admission-only handoffs do not own native execution/release observation;
+    # they retain their existing settlement boundary rather than borrowing the
+    # service contract from an absent or caller-shaped host marker.
+    # Keep the native release/rebind lineage rather than creating a host receipt
+    # cache. Existing admission/release capacity reservation accounts for these
+    # protected receipts before dispatch; pruning the owning namespace releases
+    # retention. Historical quiescence is never current execution authority.
+    from cayu.runtime._invocation_lifecycle import (
+        _invocation_lifecycle_receipt_ledger_from_checkpoint,
+    )
+
+    ledger = _invocation_lifecycle_receipt_ledger_from_checkpoint(checkpoint)
+    consumed = set()
+    for entry in root.entries:
+        if (
+            entry.state != "CONSUMED"
+            or entry.service_digest is None
+            or entry.admission_expected_run_epoch is None
+        ):
+            continue
+        identity = (
+            f"admit:{session.id}:{session.instance_id}:{entry.admission_expected_run_epoch + 1}"
+        )
+        original = next(
+            (item for item in ledger.receipts if item.command_identity == identity), None
+        )
+        if original is None or original.command_sha256 != entry.admission_command_digest:
+            raise ContinuationConflict("Consumed continuation lost its native admission evidence.")
+        consumed.update(
+            item.command_identity
+            for item in ledger.receipts
+            if item.session_id == session.id
+            and item.session_instance_id == session.instance_id
+            and item.active_profile.interaction_id == original.active_profile.interaction_id
+            and item.active_profile.profile == original.active_profile.profile
+            and item.active_profile.run_epoch >= original.active_profile.run_epoch
+        )
+    return final_admissions | service_receipts | target_receipts | original_receipts | consumed
 
 
 def require_admission_claim(session: Session, checkpoint, command) -> None:
@@ -585,6 +632,8 @@ def require_erasure_quiescence(*, session: Session, checkpoint, records: dict[st
             or entry.originating_writer_generation != record.ticket.writer_generation
             or entry.state != record.ticket.state
             or entry.service_receipt_epochs != service_receipt_epochs(record)
+            or entry.service_digest
+            != (None if record.consumption is None else record.consumption.service_digest)
         ):
             raise ContinuationConflict("Continuation deletion evidence conflicts.")
         if record.ticket.state not in {"CONSUMED", "RETIRED"}:

@@ -12,11 +12,14 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    StrictStr,
     field_validator,
     model_validator,
 )
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_nonblank
+from cayu.collaboration._contracts import ContractValue
+from cayu.collaboration.access import CollaborationAccessContext
 from cayu.environments.factory import EnvironmentAllocationState
 from cayu.sessions.base import IncompleteSessionRecoveryAction, PendingActionKind, SessionStatus
 from cayu.tasks.records import TaskStatus
@@ -123,11 +126,64 @@ class RecoveryPlanBounds(BaseModel):
     )
 
 
+class ProducerRecoveryExpectation(ContractValue):
+    """Exact native attachment selection, not execution or cleanup authority."""
+
+    model_config = _MODEL_CONFIG
+
+    session_instance_id: str
+    attachment_operation_key: str
+    attachment_commitment: str
+
+    @field_validator("session_instance_id", "attachment_operation_key")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _clean_id(value, info.field_name)
+
+    @field_validator("attachment_commitment")
+    @classmethod
+    def validate_commitment(cls, value: str) -> str:
+        if (
+            not value.startswith("sha256:")
+            or len(value) != 71
+            or any(character not in "0123456789abcdef" for character in value[7:])
+        ):
+            raise ValueError("Producer recovery requires an exact attachment commitment.")
+        return value
+
+
+class ContinuationRecoveryExpectation(ContractValue):
+    """Exact consumed-ticket invocation selection, never a new execution grant."""
+
+    session_instance_id: StrictStr = Field(min_length=1, max_length=512)
+    ticket_key: StrictStr = Field(pattern=r"^session-continuation:[0-9a-f]{64}$")
+    record_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    admission_command_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    admission_expected_run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    profile_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RecoveryPlanRequest(BaseModel):
     model_config = _MODEL_CONFIG
 
     selection: RecoveryPlanSelection
     bounds: RecoveryPlanBounds = Field(default_factory=RecoveryPlanBounds)
+    producer: ProducerRecoveryExpectation | None = None
+    continuation: ContinuationRecoveryExpectation | None = None
+    participant_context: CollaborationAccessContext | None = None
+
+    @model_validator(mode="after")
+    def validate_producer_selection(self) -> Self:
+        selected = int(self.producer is not None) + int(self.continuation is not None)
+        if selected > 1:
+            raise ValueError("Recovery requires one native ownership selection.")
+        if (selected == 0) != (self.participant_context is None):
+            raise ValueError(
+                "Native recovery selection and current access must be supplied together."
+            )
+        if selected and (len(self.selection.session_ids) != 1 or self.participant_context is None):
+            raise ValueError("Native recovery requires one exact target and current access.")
+        return self
 
 
 class RecoveryRegistrationStatus(StrEnum):

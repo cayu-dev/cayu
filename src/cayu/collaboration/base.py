@@ -154,6 +154,10 @@ class _Repository(Protocol):
 
     async def scan_request_events(self, *, after: int, limit: int) -> list[object]: ...
 
+    async def scan_waits(
+        self, *, namespace: str, after: tuple[int, str] | None, limit: int
+    ) -> list[object]: ...
+
     async def scan_clarification_questions(
         self, request: RequestRef, *, limit: int
     ) -> list[object]: ...
@@ -406,20 +410,44 @@ class CollaborationStore(ABC):
     async def register_wait(self, initialized, wait, *, redactor: SecretRedactor):
         return await self._owned_wait("register", self._register_wait, initialized, wait, redactor)
 
-    async def load_wait(self, initialized, wait, *, redactor: SecretRedactor):
-        return await self._owned_wait("load", self._load_wait, initialized, wait, redactor)
+    async def load_wait(
+        self, initialized, wait, *, redactor: SecretRedactor, wait_for_settlement=False
+    ):
+        return await self._owned_wait(
+            "load",
+            self._load_wait,
+            initialized,
+            wait,
+            redactor,
+            wait_for_settlement=wait_for_settlement,
+        )
 
-    async def record_wait_evidence(self, initialized, wait, evidence, *, redactor: SecretRedactor):
+    async def record_wait_evidence(
+        self, initialized, wait, evidence, *, redactor: SecretRedactor, wait_for_settlement=False
+    ):
         from cayu.collaboration.waits import WaitEvidence
 
         evidence = prepare_contract(WaitEvidence, evidence, redactor=redactor)
         return await self._owned_wait(
-            "evidence", self._record_wait_evidence, initialized, wait, redactor, evidence=evidence
+            "evidence",
+            self._record_wait_evidence,
+            initialized,
+            wait,
+            redactor,
+            evidence=evidence,
+            wait_for_settlement=wait_for_settlement,
         )
 
-    async def release_wait_sources(self, initialized, wait, *, redactor: SecretRedactor):
+    async def release_wait_sources(
+        self, initialized, wait, *, redactor: SecretRedactor, wait_for_settlement=False
+    ):
         return await self._owned_wait(
-            "release", self._release_wait_sources, initialized, wait, redactor
+            "release",
+            self._release_wait_sources,
+            initialized,
+            wait,
+            redactor,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def record_wait_delivery(
@@ -430,6 +458,7 @@ class CollaborationStore(ABC):
         receipt_digest: str,
         delivery: Literal["accepted", "excluded"] = "accepted",
         redactor: SecretRedactor,
+        wait_for_settlement=False,
     ):
         return await self._owned_wait(
             "delivery",
@@ -439,6 +468,7 @@ class CollaborationStore(ABC):
             redactor,
             receipt_digest=receipt_digest,
             delivery=delivery,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def cancel_wait(self, initialized, wait, *, expired: bool, redactor: SecretRedactor):
@@ -446,7 +476,9 @@ class CollaborationStore(ABC):
             "cancel", self._cancel_wait, initialized, wait, redactor, expired=expired
         )
 
-    async def _owned_wait(self, action, operation, initialized, wait, redactor, **kwargs):
+    async def _owned_wait(
+        self, action, operation, initialized, wait, redactor, *, wait_for_settlement=False, **kwargs
+    ):
         from cayu._validation import canonical_durable_json_bytes
         from cayu.collaboration._contracts import snapshot_input
         from cayu.collaboration.waits import CollaborationWait, wait_operation_key
@@ -466,6 +498,7 @@ class CollaborationStore(ABC):
             key=("wait", action, initialized.binding.application_scope, *wait_operation_key(wait)),
             expectation=expectation,
             redactor=redactor,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def _register_wait(
@@ -1581,6 +1614,7 @@ class CollaborationStore(ABC):
         expected: PermitCommand,
         *,
         redactor: SecretRedactor,
+        wait_for_settlement: bool = False,
     ) -> PermitReceipt:
         """Trusted owner integration only; registration never dispatches execution."""
         from cayu.collaboration._permit_store import prepare_permit, register_permit
@@ -1592,6 +1626,7 @@ class CollaborationStore(ABC):
             key=("mutation", initialized.binding.application_scope, *_key(expected)),
             expectation=contract_bytes(expected, redactor=redactor),
             redactor=redactor,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def _lookup_registered_permit(
@@ -1707,6 +1742,7 @@ class CollaborationStore(ABC):
         *,
         reader: PermitSettlementReader,
         redactor: SecretRedactor,
+        wait_for_settlement: bool = False,
     ) -> PermitSettlement:
         """Consume trusted receiving-owner readback, never a caller-supplied proof."""
         from cayu.collaboration._permit_store import prepare_permit, settle_permit
@@ -1725,6 +1761,7 @@ class CollaborationStore(ABC):
             ),
             expectation=contract_bytes(expected, redactor=redactor),
             redactor=redactor,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def _exclude_permit(
@@ -1734,6 +1771,7 @@ class CollaborationStore(ABC):
         *,
         reader: PermitSettlementReader,
         redactor: SecretRedactor,
+        wait_for_settlement: bool = False,
     ) -> PermitExclusion | PermitSettlement | RetiredPermitExclusion:
         """Qualified receiver exclusion, not a caller-supplied abort assertion."""
         from cayu.collaboration._permit_store import exclude_permit, prepare_permit
@@ -1745,6 +1783,7 @@ class CollaborationStore(ABC):
             key=("permit_exclusion", initialized.binding.application_scope, *_key(expected)),
             expectation=contract_bytes(expected, redactor=redactor),
             redactor=redactor,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def apply_lifecycle(

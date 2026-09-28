@@ -181,14 +181,14 @@ async def pending_services(
     )
 
 
-async def reconcile_service(
+async def _read_service_record(
     coordinator: ClarificationCoordinator,
     app: CayuApp,
     request: ClarificationServiceRequest | ClarificationServiceRecovery,
     *,
     context: CollaborationAccessContext,
-    exclude: bool = False,
-) -> ClarificationServiceReceipt:
+    mutation: bool,
+):
     participants = coordinator.requests._participants
     redactor = coordinator.requests._redactor
     request = prepare_contract(
@@ -196,10 +196,14 @@ async def reconcile_service(
     ).request
     context = prepare_contract(CollaborationAccessContext, context, redactor=redactor)
     store, initialized = participants._ready()
-    participants._capability(store, initialized, mutation=True, family=REQUEST_FAMILY)
-    _, grant = participants._authorize(context, "request_control")
-    # This is a scope-wide maintenance entrance, not participant discovery.
-    participants._require_refs(grant, (), create=True)
+    participants._capability(store, initialized, mutation=mutation, family=REQUEST_FAMILY)
+    _, grant = participants._authorize(
+        context, "request_control" if mutation else "request_readback"
+    )
+    # Public reconciliation is scope-wide maintenance. Read-only host settlement
+    # instead authenticates the exact participating references below.
+    if mutation:
+        participants._require_refs(grant, (), create=True)
     if request.operation.application_scope != initialized.binding.application_scope:
         raise CollaborationAccessDenied("Service belongs to another receiving owner.")
     if isinstance(request, ClarificationServiceRequest):
@@ -213,12 +217,16 @@ async def reconcile_service(
         session_id = request.session_id
         session_instance_id = request.session_instance_id
         selected = request.selection_sha256
+    if not app.session_store._supports_session_continuation_protocol():
+        raise CollaborationUnavailable("Session store does not qualify service readback.")
     raw = await app.session_store.load_session_operation(
         session_id, temporary_service_key(request.operation)
     )
     if raw is None:
         raise ContinuationUnavailable("Service responsibility is unavailable, not excluded.")
     record = prepare_contract(TemporaryServiceRecord, raw, redactor=redactor)
+    if record.intent.ticket.owner != initialized.owner:
+        raise CollaborationAccessDenied("Service belongs to another receiving owner.")
     # Authorize retained participants before reporting a conflicting caller tuple.
     participants._require_refs(grant, (record.intent.question.responder,))
     if (
@@ -234,6 +242,31 @@ async def reconcile_service(
         raise ContinuationConflict("Service reconciliation requires the exact original selection.")
     if await app.session_store._load_temporary_continuation_service(record.admission) != record:
         raise ContinuationUnavailable("Service responsibility changed during reconstruction.")
+    return store, initialized, request, record
+
+
+async def inspect_settled_service(coordinator, app, request, *, context):
+    """Positive native return readback only; no permit settlement or dispatch."""
+    _, _, _, record = await _read_service_record(
+        coordinator, app, request, context=context, mutation=False
+    )
+    if record.state not in {"returned", "excluded"} or not record.settlement_acknowledged:
+        return None
+    return ClarificationServiceReceipt.from_record(record)
+
+
+async def reconcile_service(
+    coordinator: ClarificationCoordinator,
+    app: CayuApp,
+    request: ClarificationServiceRequest | ClarificationServiceRecovery,
+    *,
+    context: CollaborationAccessContext,
+    exclude: bool = False,
+) -> ClarificationServiceReceipt:
+    store, initialized, request, record = await _read_service_record(
+        coordinator, app, request, context=context, mutation=True
+    )
+    redactor = coordinator.requests._redactor
     owner = SessionContinuationOwner(
         store=app.session_store,
         owner=initialized.owner,

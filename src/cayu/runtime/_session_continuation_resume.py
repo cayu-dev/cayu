@@ -111,7 +111,7 @@ class _ContinuationResumeHandoff:
             admission_expected_run_epoch=command.expected_run_epoch,
             receipt_stage="prepared",
         )
-        result, _ = await self.owner.admit(consumption, command, invocation=invocation)
+        result, _ = await self.owner._admit_owned(consumption, command, invocation=invocation)
         return result
 
 

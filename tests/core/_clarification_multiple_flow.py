@@ -32,6 +32,7 @@ async def second_question(
     service_context,
     export_policy,
     payloads,
+    service_driver=None,
 ):
     expected = original.expected
     before = await application.inspect_collaboration_request(expected, context=actor_a.context)
@@ -129,18 +130,30 @@ async def second_question(
         )
         == retained
     )
-    async with asyncio.timeout(120):
-        while True:
-            try:
-                result = await application.service_clarification(
-                    service, context=service_context, delivery_context=source_context
-                )
-            except CollaborationUnavailable:
+    if service_driver is not None:
+        from tests.core.test_participant_identity import CONTEXT
+
+        result = await service_driver(
+            application,
+            service,
+            context=service_context,
+            delivery_context=source_context,
+            recovery_context=CONTEXT,
+            timeout=360,
+        )
+    else:
+        async with asyncio.timeout(120):
+            while True:
+                try:
+                    result = await application.service_clarification(
+                        service, context=service_context, delivery_context=source_context
+                    )
+                except CollaborationUnavailable:
+                    await asyncio.sleep(0.05)
+                    continue
+                if result.state == "returned":
+                    break
                 await asyncio.sleep(0.05)
-                continue
-            if result.state == "returned":
-                break
-            await asyncio.sleep(0.05)
     assert result.released_session_status == "completed", [
         (event.type, event.payload)
         for event in await sessions.load_events(target.id)

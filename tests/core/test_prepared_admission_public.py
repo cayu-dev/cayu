@@ -535,6 +535,7 @@ async def prepared_scenario(
     budget_binding_factory=None,
     operation_prefix="",
     planned=False,
+    planning_driver=None,
     request_cancellation=None,
     requested_session_id=None,
 ):
@@ -578,7 +579,7 @@ async def prepared_scenario(
             collaboration_requests=RequestRegistration(
                 mandates=resolver,
                 planning_policies=planning_policies,
-                max_ttl_ms=300_000,
+                max_ttl_ms=max(300_000, request_ttl_ms or 0),
                 prepared_admission=PreparedAdmissionRegistration(
                     receiver=ObjectRef(
                         owner=initialized.owner,
@@ -663,7 +664,9 @@ async def prepared_scenario(
             deadline_at_ms=accepted.expected.intent.selection.expires_at_ms,
             predecessor=None,
         )
-        retained = await complete_plan(application, planning, resolver.recipient.context)
+        retained = await (planning_driver or complete_plan)(
+            application, planning, resolver.recipient.context
+        )
         assert retained.state == "admitted" and retained.pending_stages == 0
         assert provider.requests == []
         child = await application.lookup_recipient_session(creation, context=CONTEXT)

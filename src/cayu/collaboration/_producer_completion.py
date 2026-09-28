@@ -13,7 +13,9 @@ from cayu.collaboration.base import REQUEST_FAMILY
 from cayu.collaboration.participants import CollaborationUnavailable
 
 
-async def retain_producer_completion(app, command):
+async def retain_producer_completion(
+    app, command, *, wait_for_settlement=False, allow_pending=False
+):
     """Internal mandatory handoff. Public callers cannot supply production receipts.
 
     This retains content-free references to already-owned output even after expiry
@@ -53,6 +55,8 @@ async def retain_producer_completion(app, command):
         # pin stays held until later authenticated export/delivery acceptance.
         output = await receiver._read_producer_output(record)
         if output is None:
+            if allow_pending:
+                return None
             raise CollaborationUnavailable("Native producer output remains unresolved.")
         async with store._transaction(initialized.owner.application_scope, write=True) as tx:
             return await accept_native_completion(
@@ -66,8 +70,10 @@ async def retain_producer_completion(app, command):
         coordinator._owners.run(
             owned,
             key=("producer_completion", object()),
-            expectation=contract_bytes(command, redactor=redactor),
+            expectation=contract_bytes(command, redactor=redactor)
+            + (b"pending" if allow_pending else b"required"),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

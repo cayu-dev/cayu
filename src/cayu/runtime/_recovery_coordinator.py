@@ -18517,6 +18517,7 @@ class RecoveryCoordinator:
         *,
         session: Session,
         inactive_for_seconds: int | None,
+        participant_context: CollaborationAccessContext | None = None,
     ) -> IncompleteSessionRecoveryResult | None:
         """Validate one recovery path without acquiring claims or mutating state.
 
@@ -18544,6 +18545,7 @@ class RecoveryCoordinator:
                 metadata={"source": "registered_application_recovery_plan"},
                 before_mutation=prevent_mutation,
                 record_profile_rejection=False,
+                participant_context=participant_context,
             )
         except _RecoveryPreflightMutationRequired:
             return None
@@ -21055,6 +21057,13 @@ class RecoveryCoordinator:
         ) -> dict[str, Any]:
             nonlocal claim_expires_at, claim_run_epoch, session_before_fence
             _require_aware_datetime(claimed_at, "recovery claim clock")
+            if (current_session.id, current_session.instance_id) != (
+                session.id,
+                session.instance_id,
+            ):
+                raise _IncompleteRecoveryClaimLost(
+                    "Incomplete-session recovery target incarnation changed."
+                )
             if (
                 active_provider_operation_cancellation_claim_from_checkpoint(
                     checkpoint,

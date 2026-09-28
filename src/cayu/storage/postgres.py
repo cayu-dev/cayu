@@ -664,6 +664,10 @@ from cayu.storage._collaboration_schema import (
     POSTGRES_COLLABORATION_REQUEST_DDL,
     validate_postgres_collaboration_schema,
 )
+from cayu.storage._collaboration_wait_schema import (
+    POSTGRES_COLLABORATION_WAIT_DDL,
+    validate_postgres_wait_discovery,
+)
 from cayu.storage._context_selection_schema import validate_postgres_context_selection_schema
 from cayu.storage._diagnostic_inspection import (
     current_diagnostic_store_inspection,
@@ -1529,6 +1533,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """,
     ),
     107: POSTGRES_COLLABORATION_PLANNING_DDL,
+    111: POSTGRES_COLLABORATION_WAIT_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
@@ -6817,6 +6822,8 @@ class _PostgresStoreBase:
                             await self._validate_producer_cleanup_receipts(cur)
                         if current_state.revision >= 96:
                             await validate_postgres_participant_bindings(cur)
+                        if current_state.revision >= 111:
+                            await validate_postgres_wait_discovery(cur)
                         if self._min_required_revision >= 36:
                             await self._validate_session_invocation_column(cur)
                         if self._min_required_revision >= 38:
@@ -7196,6 +7203,8 @@ class _PostgresStoreBase:
             await self._validate_producer_cleanup_receipts(cur)
         if state.revision >= 96:
             await validate_postgres_participant_bindings(cur)
+        if state.revision >= 111:
+            await validate_postgres_wait_discovery(cur)
         if state.revision >= 93:
             await validate_postgres_collaboration_schema(
                 cur,
@@ -7364,6 +7373,8 @@ class _PostgresStoreBase:
             await validate_postgres_context_selection_schema(cur)
         if revision.revision == 110:
             await self._validate_producer_cleanup_receipts(cur)
+        if revision.revision == 111:
+            await validate_postgres_wait_discovery(cur)
         if revision.revision == 102:
             await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:
@@ -27920,6 +27931,30 @@ class PostgresSessionStore(
         receipt = await self.load_participant_session_creation_receipt(session_id)
         return None if receipt is None else receipt.binding
 
+    async def _scan_participant_session_bindings(self, participant, *, after=None, limit=32):
+        from cayu.sessions._participant_discovery import prepare_scan, reference, scan_parameters
+        from cayu.storage._participant_session_records import reconstruct, row_mapping
+
+        query = prepare_scan(participant, after, limit)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            await cur.execute(
+                f"SELECT {PARTICIPANT_BINDING_PROJECTION} FROM cayu_participant_session_bindings WHERE "
+                "application_scope=%s AND participant_owner_id=%s AND "
+                "participant_owner_incarnation=%s AND participant_id=%s AND "
+                'participant_incarnation=%s AND creation_key COLLATE "C">%s '
+                'ORDER BY creation_key COLLATE "C" LIMIT %s',
+                scan_parameters(query),
+            )
+            rows = await cur.fetchall()
+            result = []
+            for raw in rows:
+                row = row_mapping(raw)
+                receipt = reconstruct(row, await self._load(cur, row["session_id"]))
+                result.append(reference(receipt, query))
+            return tuple(result)
+
     async def load_participant_session_creation_receipt(self, session_id):
         from cayu.storage._participant_session_records import reconstruct, row_mapping
 
@@ -37634,6 +37669,13 @@ class PostgresSessionStore(
             raise NotImplementedError("Native producer progress readback is not qualified.")
         return await postgres_observation(self, command, kind=kind)
 
+    async def _read_native_producer_attachment(self, command):
+        from cayu.storage._producer_observation import postgres_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer attachment readback is not qualified.")
+        return await postgres_observation(self, command, attachment_only=True)
+
     async def load_session_export_snapshot(
         self,
         session_id: str,
@@ -40733,11 +40775,11 @@ class PostgresSessionStore(
                 if session is not None and session[2] in {"completed", "failed", "interrupted"}:
                     assert target_id is not None
                     from cayu.storage._peer_attempts import (
-                        parked_clarification_key,
-                        permits_parked_clarification_append,
+                        parked_delivery_key,
+                        permits_parked_delivery_append,
                     )
 
-                    wait_key = parked_clarification_key(
+                    wait_key = parked_delivery_key(
                         checkpoint, session_id=target_id, instance_id=session[0]
                     )
                     if wait_key is not None:
@@ -40746,7 +40788,7 @@ class PostgresSessionStore(
                             (target_id, wait_key),
                         )
                         wait_row = await cur.fetchone()
-                        parked_target = permits_parked_clarification_append(
+                        parked_target = permits_parked_delivery_append(
                             request,
                             checkpoint,
                             None if wait_row is None else wait_row[0],

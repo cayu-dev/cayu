@@ -347,6 +347,16 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
         require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
         return await self._sessions._read_native_producer_release(registration.command)
 
+    async def _read_producer_exclusion(self, registration, control):
+        """Exact no-start evidence, distinct from release of an admitted invocation."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._read_native_producer_exclusion(registration, control)
+
+    async def _read_producer_attachment(self, registration):
+        """Exact native attachment; not a launch or cleanup authorization."""
+        require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
+        return await self._sessions._read_native_producer_attachment(registration.command)
+
     async def _read_producer_progress(self, registration, *, kind):
         """Atomic content-free observation from the registered native owner."""
         require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
@@ -373,8 +383,16 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
             self._sessions, registration, closure, authority=authority
         )
 
-    async def _read_producer_export_settlement(self, registration, delivery):
-        """Read a committed export settlement without renewing content permission."""
+    async def _read_producer_export_settlement(
+        self, registration, delivery, *, allow_pending=False
+    ):
+        """Read settlement, or explicitly identify an authenticated pending export.
+
+        Missing, malformed or conflicting evidence still raises. None is returned
+        only when requested and the exact native export positively remains pending.
+        """
+        if type(allow_pending) is not bool:
+            raise TypeError("Producer settlement observation requires an explicit mode.")
         from cayu.collaboration._session_export_store import (
             ExportRecord,
             SettlementRecord,
@@ -402,6 +420,8 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
             )
         record = prepare_contract(ExportRecord, raw, redactor=self._redactor)
         require_exact_contract(expected, record.receipt, redactor=self._redactor)
+        if allow_pending and record.state == "pending" and record.settlement is None:
+            return None
         if record.state not in ("released", "retired") or record.settlement is None:
             raise CollaborationUnavailable("Producer export responsibility remains pending.")
         with read_scope(request.ref.session_id):
@@ -436,12 +456,19 @@ class RecipientAdmissionReceivingOwner(RequestReceivingOwner):
             self._sessions, command, intent, redactor=self._redactor
         )
 
-    async def _read_producer_export_retirement(self, registration, closure, intent):
+    async def _read_producer_export_retirement(
+        self, registration, closure, intent, *, allow_pending=False
+    ):
         from cayu.collaboration._producer_export_retirement import read_retired_export_native
 
         require_exact_contract(registration.command.receiver, self.ref, redactor=self._redactor)
         return await read_retired_export_native(
-            self._sessions, registration.command, closure, intent, redactor=self._redactor
+            self._sessions,
+            registration.command,
+            closure,
+            intent,
+            redactor=self._redactor,
+            allow_pending=allow_pending,
         )
 
     async def _acknowledge_producer_cleanup(self, registration, control, cleanup):

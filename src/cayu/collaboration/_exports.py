@@ -1,6 +1,58 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ContinuationConflict": ("cayu.runtime._session_continuation", "ContinuationConflict"),
+    "ContinuationUnavailable": ("cayu.runtime._session_continuation", "ContinuationUnavailable"),
+    "ContinuationDiscoveryPage": (
+        "cayu.runtime._host_continuation_discovery",
+        "ContinuationDiscoveryPage",
+    ),
+    "ContinuationRecovery": ("cayu.runtime._host_continuation_discovery", "ContinuationRecovery"),
+    "ContinuationRecord": ("cayu.runtime._session_continuation", "ContinuationRecord"),
+    "ContinuationService": ("cayu.runtime._session_continuation", "ContinuationService"),
+    "ParticipantSessionCursor": (
+        "cayu.sessions._participant_discovery",
+        "ParticipantSessionCursor",
+    ),
+    "ParticipantSessionReference": (
+        "cayu.sessions._participant_discovery",
+        "ParticipantSessionReference",
+    ),
+    "CollaborationHost": ("cayu.collaboration.host", "CollaborationHost"),
+    "HostInspection": ("cayu.collaboration.host", "HostInspection"),
+    "HostRegistration": ("cayu.collaboration.host", "HostRegistration"),
+    "HostProducerSource": ("cayu.collaboration.host", "HostProducerSource"),
+    "HostProducerMaintenanceRule": ("cayu.collaboration.host", "HostProducerMaintenanceRule"),
+    "HostProducerExecutionRule": ("cayu.collaboration.host", "HostProducerExecutionRule"),
+    "HostProducerDisclosure": ("cayu.collaboration.host", "HostProducerDisclosure"),
+    "HostProducerOutputRule": ("cayu.collaboration.host", "HostProducerOutputRule"),
+    "HostPlanningRule": ("cayu.collaboration.host", "HostPlanningRule"),
+    "HostProducerRegistrationRule": ("cayu.collaboration.host", "HostProducerRegistrationRule"),
+    "HostWaitRule": ("cayu.collaboration.host", "HostWaitRule"),
+    "HostContinuationRule": ("cayu.collaboration.host", "HostContinuationRule"),
+    "HostClarificationRule": ("cayu.collaboration.host", "HostClarificationRule"),
+    "HostClarificationMaintenanceSource": (
+        "cayu.collaboration.host",
+        "HostClarificationMaintenanceSource",
+    ),
+    "HostRequestMaintenanceSource": ("cayu.collaboration.host", "HostRequestMaintenanceSource"),
+    "HostPlannedProducerRule": ("cayu.collaboration.host", "HostPlannedProducerRule"),
+    "HostPlannedProducer": ("cayu.collaboration.host", "HostPlannedProducer"),
+    "HostProducerExecution": ("cayu.collaboration.host", "HostProducerExecution"),
+    "HostProducerMaintenance": ("cayu.collaboration.host", "HostProducerMaintenance"),
+    "HostOwnershipLimits": ("cayu.collaboration.host", "HostOwnershipLimits"),
+    "ProducerDestinationInspection": (
+        "cayu.collaboration._producer_inspection",
+        "ProducerDestinationInspection",
+    ),
+    "ProducerOutputInspection": (
+        "cayu.collaboration._producer_inspection",
+        "ProducerOutputInspection",
+    ),
+    "WaitDiscoveryCursor": ("cayu.collaboration._wait_discovery", "WaitDiscoveryCursor"),
+    "WaitDiscoveryPage": ("cayu.collaboration._wait_discovery", "WaitDiscoveryPage"),
+    "WaitRecovery": ("cayu.collaboration._wait_discovery", "WaitRecovery"),
+    "DiscoveredWait": ("cayu.collaboration._wait_discovery", "DiscoveredWait"),
     "ResourceMaterialReference": (
         "cayu.artifacts._resource_material_types",
         "ResourceMaterialReference",

@@ -7,7 +7,7 @@ from cayu.collaboration.peer_content import (
 )
 
 
-def parked_clarification_key(checkpoint, *, session_id: str, instance_id: str):
+def parked_delivery_key(checkpoint, *, session_id: str, instance_id: str):
     """Select a native waiting owner, never infer permission from interruption."""
     from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
@@ -25,14 +25,17 @@ def parked_clarification_key(checkpoint, *, session_id: str, instance_id: str):
     return None if not waiting else waiting[0].ticket_key
 
 
-def permits_parked_clarification_append(
+def permits_parked_delivery_append(
     request, checkpoint, record, *, session_id: str, instance_id: str, run_epoch: int
 ) -> bool:
     """Called with the actual record under the peer append transaction/lock.
 
-    Only inert peer delivery is enabled. Execution still requires the exact
-    temporary-service permit and arbitration with the original final latch.
+    Only inert peer delivery is enabled. Clarifications require an unlatched
+    clarification wait. Native producer results must match a selected request
+    under live owner provenance, including when its final latch arrived first.
+    Neither grants execution or bypasses ordinary peer disclosure authority.
     """
+    from cayu.collaboration.peer_content import PeerContentUnavailable
     from cayu.runtime._invocation_lifecycle import _invocation_lifecycle_receipt_from_checkpoint
     from cayu.runtime._session_continuation import (
         ContinuationRecord,
@@ -44,11 +47,11 @@ def permits_parked_clarification_append(
     from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
 
-    if record is None or request.wake_policy != "none":
-        return False
+    if record is None:
+        raise PeerContentUnavailable("Indexed peer target wait is unavailable.")
     checkpoint = decode_runtime_checkpoint(checkpoint, session_id=session_id)
     if checkpoint is None or PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint:
-        return False
+        raise PeerContentUnavailable("Peer target wait has not settled its native writer.")
     record = ContinuationRecord.model_validate(record)
     root = ContinuationRoot.model_validate(checkpoint[ROOT_KEY])
     indexed = next(
@@ -63,22 +66,34 @@ def permits_parked_clarification_append(
         raise PeerContentConflict("Peer target wait lost its exact native index.")
     if (
         record.ticket.state != "WAITING"
-        or record.ticket.service_policy != "clarification"
-        or record.latch is not None
         or record.ticket.session_id != session_id
         or record.ticket.session_instance_id != instance_id
     ):
-        return False
+        raise PeerContentUnavailable("Peer target wait is not available for delivery.")
+    from cayu.collaboration._producer_peer_scope import permits_producer_wait_delivery
+
+    if request.wake_policy != "none" or not (
+        (record.ticket.service_policy == "clarification" and record.latch is None)
+        or permits_producer_wait_delivery(request, record)
+    ):
+        # A durable waiting owner is not a terminal-session exclusion. In
+        # particular, the generic pending-peer worker cannot reconstruct a
+        # producer's private provenance: leave its exact attempt pending for
+        # the producer owner rather than irreversibly excluding that result.
+        raise PeerContentUnavailable("Peer target wait requires its registered delivery owner.")
     require_record_writer_generation(record, run_epoch, allow_released_next_generation=True)
     release = _invocation_lifecycle_receipt_from_checkpoint(
         checkpoint, command_identity=f"release:{session_id}:{instance_id}:{run_epoch - 1}"
     )
-    return release is not None and (
+    released = release is not None and (
         release.kind.value == "release"
         and release.session_id == session_id
         and release.session_instance_id == instance_id
         and release.result_session.run_epoch == run_epoch
     )
+    if not released:
+        raise PeerContentUnavailable("Peer target wait has no authenticated writer release.")
+    return True
 
 
 def require_capacity(outstanding: int) -> None:

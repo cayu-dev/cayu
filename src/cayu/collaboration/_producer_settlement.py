@@ -146,7 +146,7 @@ async def read_producer_settlement(app, command):
     )
 
 
-async def prepare_producer_cleanup(app, command):
+async def prepare_producer_cleanup(app, command, *, wait_for_settlement=False):
     """Retain authenticated cleanup evidence without releasing responsibility.
 
     Exact acknowledgement-loss recovery uses source-owned acceptance. Observation
@@ -198,5 +198,6 @@ async def prepare_producer_cleanup(app, command):
             expectation=contract_bytes(command, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

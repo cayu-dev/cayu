@@ -110,12 +110,17 @@ async def test_public_producer_stream_close_after_dispatch_keeps_cleanup_owned(
         before = await app.lookup_producer_completion(command, context=CONTEXT)
 
         observations = []
+        project = _producer_observation._project
 
-        def unavailable_release(*args):
+        def unavailable_release(*args, **kwargs):
+            if kwargs.get("attachment_only", False):
+                return project(*args, **kwargs)
             observations.append(True)
             raise ValueError("Native release receipt is unavailable")
 
-        def foreign_release(*args):
+        def foreign_release(*args, **kwargs):
+            if kwargs.get("attachment_only", False):
+                return project(*args, **kwargs)
             observations.append(True)
             return native_release.model_copy(update={"interaction_id": "another-invocation"})
 

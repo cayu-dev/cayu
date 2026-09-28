@@ -4258,6 +4258,32 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         receipt = await self.load_participant_session_creation_receipt(session_id)
         return None if receipt is None else receipt.binding
 
+    async def _scan_participant_session_bindings(self, participant, *, after=None, limit=32):
+        from cayu.sessions._participant_discovery import prepare_scan, reference, scan_parameters
+        from cayu.storage._participant_session_records import reconstruct
+
+        query = prepare_scan(participant, after, limit)
+
+        def read(connection):
+            with connection:
+                connection.execute("BEGIN")
+                rows = connection.execute(
+                    "SELECT * FROM cayu_participant_session_bindings WHERE "
+                    "application_scope=? AND participant_owner_id=? AND "
+                    "participant_owner_incarnation=? AND participant_id=? AND "
+                    "participant_incarnation=? AND creation_key>? "
+                    "ORDER BY creation_key LIMIT ?",
+                    scan_parameters(query),
+                ).fetchall()
+                return tuple(
+                    reference(
+                        reconstruct(dict(row), _load_session(connection, row["session_id"])), query
+                    )
+                    for row in rows
+                )
+
+        return await self._run_read(read)
+
     async def load_participant_session_creation_receipt(self, session_id):
         from cayu.storage._participant_session_records import reconstruct
 
@@ -13394,6 +13420,13 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
             raise NotImplementedError("Native producer progress readback is not qualified.")
         return await sqlite_observation(self, command, kind=kind)
 
+    async def _read_native_producer_attachment(self, command):
+        from cayu.storage._producer_observation import sqlite_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer attachment readback is not qualified.")
+        return await sqlite_observation(self, command, attachment_only=True)
+
     async def load_session_export_snapshot(
         self,
         session_id: str,
@@ -16876,11 +16909,11 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 parked_target = False
                 if session is not None and session.status in {"completed", "failed", "interrupted"}:
                     from cayu.storage._peer_attempts import (
-                        parked_clarification_key,
-                        permits_parked_clarification_append,
+                        parked_delivery_key,
+                        permits_parked_delivery_append,
                     )
 
-                    wait_key = parked_clarification_key(
+                    wait_key = parked_delivery_key(
                         checkpoint, session_id=session.id, instance_id=session.instance_id
                     )
                     if wait_key is not None:
@@ -16888,7 +16921,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                             "SELECT record_json FROM cayu_session_operations WHERE session_id = ? AND idempotency_key = ?",
                             (session.id, wait_key),
                         ).fetchone()
-                        parked_target = permits_parked_clarification_append(
+                        parked_target = permits_parked_delivery_append(
                             request,
                             checkpoint,
                             None if wait_row is None else json.loads(wait_row[0]),

@@ -16,7 +16,7 @@ from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.runtime._producer_cleanup_receipt import _accepted_source_cleanup
 
 
-async def settle_producer_output(app, command):
+async def settle_producer_output(app, command, *, wait_for_settlement=False):
     """Internal mandatory cleanup. No content read, new dispatch or sponsor renewal.
 
     Native acknowledgement is session-independent. If observer cancellation or
@@ -46,7 +46,7 @@ async def settle_producer_output(app, command):
             if final is not None:
                 return final
         if not isinstance(record.cleanup, ProducerCleanupRecord):
-            await prepare_producer_cleanup(app, command)
+            await prepare_producer_cleanup(app, command, wait_for_settlement=wait_for_settlement)
         async with store._transaction(initialized.owner.application_scope, write=False) as tx:
             record = await read_output_registration(tx, command, redactor=redactor)
             if record is None:
@@ -69,5 +69,6 @@ async def settle_producer_output(app, command):
             expectation=contract_bytes(command, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

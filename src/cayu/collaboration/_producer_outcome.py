@@ -34,7 +34,9 @@ from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.requests import ProducerOutcomeCommand, RequestOutcomeReceipt
 
 
-async def publish_producer_outcome(app, registration, *, destination_operation=None, context):
+async def publish_producer_outcome(
+    app, registration, *, destination_operation=None, context, wait_for_settlement=False
+):
     """Elect once; leave mandatory delivery, native effects and budget cleanup owned."""
     requests = app._request_coordinator
     redactor = app._secret_redactor
@@ -182,7 +184,9 @@ async def publish_producer_outcome(app, registration, *, destination_operation=N
             if existing is not None:
                 return existing
         if record.completion is None:
-            await retain_producer_completion(app, registration)
+            await retain_producer_completion(
+                app, registration, wait_for_settlement=wait_for_settlement
+            )
         async with store._transaction(initialized.owner.application_scope, write=False) as tx:
             record, _ = await read(tx)
             completion = prepare_contract(
@@ -281,5 +285,6 @@ async def publish_producer_outcome(app, registration, *, destination_operation=N
             ),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

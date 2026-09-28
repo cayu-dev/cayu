@@ -54,7 +54,9 @@ class _Query(ContractValue):
     limit: Annotated[StrictInt, Field(ge=1, le=32)] = 32
 
 
-async def pending_producer_outputs(app, participant, *, context, after=0, limit=32):
+async def pending_producer_outputs(
+    app, participant, *, context, after=0, limit=32, wait_for_settlement=False
+):
     """Find live responsibility even after answer election, without content access.
 
     Uses the existing (scope, participant, state, position) permit index. Each
@@ -175,5 +177,6 @@ async def pending_producer_outputs(app, participant, *, context, after=0, limit=
             + contract_bytes(context, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

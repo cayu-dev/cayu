@@ -121,6 +121,7 @@ async def service_clarification(
     *,
     context: SessionExportAccessContext,
     delivery_context: SessionExportAccessContext | None = None,
+    _preparation_progress=None,
 ) -> ClarificationServiceReceipt:
     """Acquire fresh disclosure per observer; retain registration in its owner."""
     from cayu.collaboration._capabilities import CapabilityDescriptor
@@ -319,6 +320,8 @@ async def service_clarification(
         if delivered.status != "appended":
             raise ContinuationUnavailable("Admitted service delivery has not been appended.")
 
+    if _preparation_progress is not None:
+        _preparation_progress.enter_mutation()
     try:
         result = await owner.service_temporary(
             app,
@@ -329,6 +332,7 @@ async def service_clarification(
             intent,
             participant_context=participant_context,
             delivery=None if delivery_context is None else deliver_after_admission,
+            wait_for_settlement=True,
         )
     except (ContinuationConflict, ContinuationUnavailable) as error:
         # A competing exact preparation or lost acknowledgement may have won.

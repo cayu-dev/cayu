@@ -444,9 +444,11 @@ class RequestCoordinator:
         raise failure
 
     async def _observe(self, operation: Awaitable[T]) -> T:
+        from cayu.collaboration._preparation_progress import PreparationReadFailure
+
         failure: BaseException
         try:
-            return await operation
+            result = await operation
         except asyncio.CancelledError as error:
             failure = asyncio.CancelledError(
                 "Request observation cancelled; reconcile exact state."
@@ -473,6 +475,19 @@ class RequestCoordinator:
         except Exception as error:
             failure = CollaborationUnavailable("Request dependency failed; reconcile exact state.")
             failure.__cause__ = _safe_request_failure(error, self._redactor)
+        else:
+            if type(result) is PreparationReadFailure:
+                # A typed no-mutation result still crosses the public diagnostic
+                # boundary. Reuse the same classification and detached evidence
+                # as raised failures; keep the original private to its owner.
+                async def rejected():
+                    raise result.error
+
+                try:
+                    await self._observe(rejected())
+                except Exception as error:
+                    return PreparationReadFailure(error)
+            return result
         raise failure
 
     async def due(
@@ -481,6 +496,7 @@ class RequestCoordinator:
         context: MandateAccessContext,
         cursor: RequestDueCursor | None = None,
         limit: int = 32,
+        wait_for_settlement: bool = False,
     ) -> RequestDuePage:
         value = prepare_contract(
             _DueQuery,
@@ -499,6 +515,7 @@ class RequestCoordinator:
             self._owners.run(
                 owned,
                 key=("request_due_observation", object()),
+                wait_for_settlement=wait_for_settlement,
                 expectation=contract_bytes(value, redactor=self._redactor),
                 redactor=self._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, self._redactor),
@@ -610,14 +627,14 @@ class RequestCoordinator:
         return result.receipt
 
     async def inspect(
-        self, expected: RequestCommand, *, context: MandateAccessContext
+        self, expected: RequestCommand, *, context: MandateAccessContext, wait_for_settlement=False
     ) -> RequestSnapshot | None:
         value = prepare_contract(
             _Submission, {"request": expected, "context": context}, redactor=self._redactor
         )
         if not isinstance(value.request, RequestCommand):
             raise CollaborationContractError("Expected the complete accepted command.")
-        result = await self._run(value, mode="inspect")
+        result = await self._run(value, mode="inspect", wait_for_settlement=wait_for_settlement)
         assert result is None or isinstance(result, RequestSnapshot)
         return result
 
@@ -675,7 +692,11 @@ class RequestCoordinator:
             return ExactUnavailable()
 
     async def lookup(
-        self, expected: RequestCommand | RequestControlCommand, *, context: MandateAccessContext
+        self,
+        expected: RequestCommand | RequestControlCommand,
+        *,
+        context: MandateAccessContext,
+        wait_for_settlement=False,
     ) -> ExactLookup[RequestReceipt | RequestControlReceipt]:
         # Authorization failures remain denials; only qualified readback failure
         # becomes the fourth exact-lookup alternative.
@@ -693,13 +714,16 @@ class RequestCoordinator:
                         redactor=self._redactor,
                     ),
                     mode="lookup_control",
+                    wait_for_settlement=wait_for_settlement,
                 )
                 return (
                     ExactNotFound()
                     if result is None
                     else ExactMatch[RequestControlReceipt](receipt=result)
                 )
-            result = await self.inspect(expected, context=context)
+            result = await self.inspect(
+                expected, context=context, wait_for_settlement=wait_for_settlement
+            )
         except CollaborationConflict:
             return ExactConflict()
         except (CollaborationUnavailable, CollaborationContractError):
@@ -710,15 +734,40 @@ class RequestCoordinator:
             else ExactMatch[RequestReceipt](receipt=result.receipt)
         )
 
-    async def control(
+    async def lookup_control_intent(
         self, request: RequestControl, *, context: MandateAccessContext
+    ):
+        """Read an exact control using the same owner-minted authority tuple.
+
+        This is readback only: absence cannot dispatch control or settle its
+        responsibility. The ordinary lookup retains current access checks.
+        """
+        request = prepare_contract(RequestControl, request, redactor=self._redactor)
+        context = prepare_contract(MandateAccessContext, context, redactor=self._redactor)
+        _, initialized = self._participants._ready()
+        command = prepare_contract(
+            RequestControlCommand,
+            {
+                "operation": request.operation,
+                "kind": request.kind,
+                "source": initialized.owner,
+                "destination": initialized.owner,
+                "initiator": _initiator(context),
+                "intent": request,
+            },
+            redactor=self._redactor,
+        )
+        return await self.lookup(command, context=context, wait_for_settlement=True)
+
+    async def control(
+        self, request: RequestControl, *, context: MandateAccessContext, wait_for_settlement=False
     ) -> RequestControlReceipt:
         value = prepare_contract(
             _Submission, {"request": request, "context": context}, redactor=self._redactor
         )
         if not isinstance(value.request, RequestControl):
             raise CollaborationContractError("Expected a request control.")
-        result = await self._run(value, mode="control")
+        result = await self._run(value, mode="control", wait_for_settlement=wait_for_settlement)
         assert isinstance(result, RequestControlReceipt)
         return result
 
@@ -826,7 +875,11 @@ class RequestCoordinator:
         )
 
     async def lookup_admission(
-        self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
+        self,
+        expected: RequestAdmissionCommand,
+        *,
+        context: MandateAccessContext,
+        wait_for_settlement=False,
     ) -> ExactLookup[RequestAdmissionReceipt]:
         value = prepare_contract(
             _Submission, {"request": expected, "context": context}, redactor=self._redactor
@@ -834,7 +887,9 @@ class RequestCoordinator:
         if not isinstance(value.request, RequestAdmissionCommand):
             raise CollaborationContractError("Admission readback requires an exact command.")
         try:
-            return await self._run(value, mode="lookup_admission")
+            return await self._run(
+                value, mode="lookup_admission", wait_for_settlement=wait_for_settlement
+            )
         except (CollaborationUnavailable, CollaborationContractError):
             return ExactUnavailable()
 
@@ -869,9 +924,14 @@ class RequestCoordinator:
         observation: RequestObservation,
         *,
         context: MandateAccessContext,
+        wait_for_settlement=False,
     ) -> RequestObservationReceipt:
         return await self._observe_source(
-            expected, observation, context=context, allow_retention=True
+            expected,
+            observation,
+            context=context,
+            allow_retention=True,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def _authorize_retained_source(
@@ -879,6 +939,7 @@ class RequestCoordinator:
         expected: RequestCommand,
         *,
         context: MandateAccessContext,
+        wait_for_settlement=False,
     ) -> None:
         """Authorize a frozen source command without rereading its record."""
         expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
@@ -887,7 +948,7 @@ class RequestCoordinator:
             {"request": expected, "context": context},
             redactor=self._redactor,
         )
-        await self._run(value, mode="authorize_retained")
+        await self._run(value, mode="authorize_retained", wait_for_settlement=wait_for_settlement)
 
     async def _observe_source(
         self,
@@ -896,6 +957,7 @@ class RequestCoordinator:
         *,
         context: MandateAccessContext,
         allow_retention: bool,
+        wait_for_settlement=False,
     ) -> RequestObservationReceipt:
         expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
         observation = prepare_contract(RequestObservation, observation, redactor=self._redactor)
@@ -905,7 +967,9 @@ class RequestCoordinator:
             redactor=self._redactor,
         )
         value = value.model_copy(update={"allow_retention": allow_retention})
-        return await self._run(value, mode="register_observation")
+        return await self._run(
+            value, mode="register_observation", wait_for_settlement=wait_for_settlement
+        )
 
     async def read_observation(
         self,
@@ -931,6 +995,7 @@ class RequestCoordinator:
         observation: RequestObservation,
         *,
         context: MandateAccessContext,
+        wait_for_settlement=False,
     ) -> RequestObservationRead:
         """Read coverage and the authenticated source snapshot atomically."""
         expected = prepare_contract(RequestCommand, expected, redactor=self._redactor)
@@ -940,7 +1005,9 @@ class RequestCoordinator:
             {"request": expected, "context": context, "observation": observation},
             redactor=self._redactor,
         )
-        result = await self._run(value, mode="read_observation_source")
+        result = await self._run(
+            value, mode="read_observation_source", wait_for_settlement=wait_for_settlement
+        )
         if not isinstance(result, RequestObservationRead):
             raise CollaborationUnavailable("Observation source read is unavailable.")
         return result
@@ -1094,7 +1161,7 @@ class RequestCoordinator:
                     )
                 return await operation(store, tx, initialized, command, redactor=self._redactor)
 
-    async def _run(self, value: _Submission, *, mode: str):
+    async def _run(self, value: _Submission, *, mode: str, wait_for_settlement=False):
         if self._registration is None:
             raise CollaborationNotInitialized("No collaboration request owner is registered.")
         operation = value.request.operation
@@ -1119,6 +1186,7 @@ class RequestCoordinator:
                 expectation=contract_bytes(value, redactor=self._redactor),
                 redactor=self._redactor,
                 failure_snapshot=lambda error: _safe_request_failure(error, self._redactor),
+                wait_for_settlement=wait_for_settlement,
             )
         )
 

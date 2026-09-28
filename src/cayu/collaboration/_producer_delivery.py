@@ -25,7 +25,7 @@ from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
 
 
 async def deliver_producer_output(
-    app, command, destination_operation, *, context, prepare_only=False
+    app, command, destination_operation, *, context, prepare_only=False, wait_for_settlement=False
 ):
     """One owned attempt; append acceptance is not exposure or producer settlement."""
     coordinator = app._request_coordinator
@@ -129,7 +129,10 @@ async def deliver_producer_output(
             redactor=redactor,
         )
         if current.receipt is None:
-            await app.append_peer_content(current.append, context=peer_context)
+            from cayu.collaboration._producer_peer_scope import producer_delivery_scope
+
+            with producer_delivery_scope(command, current.append, redactor=redactor):
+                await app.append_peer_content(current.append, context=peer_context)
             current = await reconcile_delivery(
                 store,
                 initialized,
@@ -153,5 +156,6 @@ async def deliver_producer_output(
             + (b"prepare" if prepare_only else b"deliver"),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )

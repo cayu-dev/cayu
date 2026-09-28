@@ -98,8 +98,17 @@ jobs:
             sudo apt-get install --yes ripgrep
           fi
       - name: Install recording encoder
+        timeout-minutes: 5
         run: |
           if ! command -v ffmpeg >/dev/null; then
+            # Some GCE runners' regional HTTP mirror takes half an hour for
+            # ffmpeg's dependencies. Use Ubuntu's HTTPS archive and bound setup
+            # separately so it cannot consume the test execution budget.
+            for source in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+              if test -f "$source"; then
+                sudo sed -i -E 's@https?://[a-z0-9.-]+\.gce\.archive\.ubuntu\.com/ubuntu@https://archive.ubuntu.com/ubuntu@g' "$source"
+              fi
+            done
             sudo apt-get update
             sudo apt-get install --yes --no-install-recommends ffmpeg
           fi
@@ -127,6 +136,13 @@ jobs:
           - postgres-conformance-6
           - postgres-conformance-7
           - postgres-conformance-8
+          - postgres-conformance-9
+          - postgres-conformance-10
+          - postgres-conformance-11
+          - postgres-conformance-12
+          - host-journey-1
+          - host-journey-2
+          - host-journey-3
     env:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"

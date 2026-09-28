@@ -748,12 +748,17 @@ async def test_wait_receiver_binds_complete_latch_to_retained_ticket(stores):
             }
         )
         async with store._transaction(values[1].binding.application_scope, write=True) as tx:
-            await tx.put(
-                "operations",
-                wait_operation_key(wait),
-                elected.model_copy(update={"election": forged}),
-                insert=False,
-            )
+            damaged = elected.model_copy(update={"election": forged})
+            if isinstance(store, identity_tests.InMemoryCollaborationStore):
+                await tx.put("operations", wait_operation_key(wait), damaged, insert=False)
+            else:
+                # Inject storage corruption below the validated write boundary.
+                # Normal writes must not admit a contradictory wait projection.
+                await tx._execute(
+                    "UPDATE cayu_collaboration_operations SET document=? "
+                    "WHERE scope=? AND namespace=? AND generation=? AND caller_key=?",
+                    (damaged.model_dump_json(), tx.scope, *wait_operation_key(wait)),
+                )
         for read in (
             application.inspect_collaboration_wait,
             application.observe_collaboration_wait,
@@ -810,15 +815,17 @@ async def test_wait_delivery_snapshot_requires_positive_pending_responsibility(s
         WaitSnapshot.model_validate(malformed)
 
 
-@pytest.mark.parametrize("settlement", ["accepted", "excluded"])
+@pytest.mark.parametrize("settlement", ["accepted", "excluded", "host"])
 async def test_wait_delivery_uses_real_session_continuation_owner(stores, settlement):
     """The public wait handoff must reach the real session owner and receiver."""
     collaboration_store = stores()
-    application, resolver, values = await public_setup(collaboration_store)
+    session_store = InMemorySessionStore()
+    application, resolver, values = await public_setup(
+        collaboration_store, session_store=session_store
+    )
     source = await application.accept_collaboration_request(values[4], context=resolver.context)
     wait = wait_for(source, values[1], predicate="ANY_SUCCESS")
 
-    session_store = InMemorySessionStore()
     session_app = CayuApp(session_store=session_store, enable_logging=False)
     provider = ScriptedModelProvider(
         (ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})),
@@ -890,7 +897,7 @@ async def test_wait_delivery_uses_real_session_continuation_owner(stores, settle
     waiting = await owner.park(prepared.ticket, invocation=invocation)
     wait = wait.model_copy(update={"delivery_ticket": waiting.ticket})
     await application.register_collaboration_wait(wait, context=resolver.context)
-    if settlement == "accepted":
+    if settlement in ("accepted", "host"):
         await application.control_collaboration_request(
             RequestControl(
                 operation=values[1].operation("wait-delivery-cancel"),
@@ -902,11 +909,49 @@ async def test_wait_delivery_uses_real_session_continuation_owner(stores, settle
         )
         elected = await application.observe_collaboration_wait(wait, context=resolver.context)
         assert elected.delivery == "pending"
-        delivered = await application.deliver_collaboration_wait(
-            wait,
-            context=resolver.context,
-            continuation_owner=owner,
-        )
+        if settlement == "host":
+            from tests.core.test_participant_identity import CONTEXT
+
+            from cayu.collaboration._host import CollaborationHost, _HostRegistration, _WaitRule
+            from cayu.collaboration._host_ownership import HostOwnershipLimits
+
+            page = await application.list_collaboration_waits(context=CONTEXT)
+            recovery = next(
+                item.recovery for item in page.items if item.recovery.operation == wait.operation
+            )
+            host = CollaborationHost(
+                application,
+                _HostRegistration(
+                    limits=HostOwnershipLimits(1, 1, 4, 262144),
+                    producer_sources=(),
+                    producer_rules=(),
+                    wait_rules=(_WaitRule(recovery, resolver.context),),
+                    observation_timeout_s=30,
+                    shutdown_timeout_s=30,
+                ),
+            )
+            assert host.inspect().active == 0
+            async with host:
+                async with asyncio.timeout(60):
+                    while True:
+                        await host.service_once()
+                        for outcome in host._owned.inspect().completed:
+                            if outcome.error is not None:
+                                raise outcome.error
+                        delivered = await application.inspect_collaboration_wait(
+                            wait, context=resolver.context
+                        )
+                        if delivered.delivery == "accepted":
+                            break
+                        await asyncio.sleep(0.01)
+            assert host.inspect().uncertain == 0
+            assert host.inspect().failed == 0
+        else:
+            delivered = await application.deliver_collaboration_wait(
+                wait,
+                context=resolver.context,
+                continuation_owner=owner,
+            )
         assert delivered.delivery == "accepted"
         assert delivered.delivery_receipt_digest is not None
         assert (
@@ -942,7 +987,7 @@ async def test_wait_delivery_uses_real_session_continuation_owner(stores, settle
         session_instance_id=admitted.session.instance_id,
     )
     assert retained is not None
-    if settlement == "accepted":
+    if settlement in ("accepted", "host"):
         assert retained.latch is not None
     else:
         assert retained.ticket.state == "RETIRED"

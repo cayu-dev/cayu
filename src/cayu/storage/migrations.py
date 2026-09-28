@@ -501,6 +501,8 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=109, kind=RevisionKind.ADDITIVE, compatible_from=108),
     # Native producer cleanup receipts outlive the producing session.
     Revision(revision=110, kind=RevisionKind.BREAKING, compatible_from=110),
+    # Wait writers maintain restart discovery; participant scans retain native identity ordering.
+    Revision(revision=111, kind=RevisionKind.BREAKING, compatible_from=111),
 )
 
 #: The revision an empty database is initialized to.

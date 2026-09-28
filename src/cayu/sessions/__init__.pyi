@@ -378,6 +378,10 @@ from cayu.sessions.recovery import RECOVERY_PLAN_MAX_CONCURRENCY as RECOVERY_PLA
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_INSPECTIONS as RECOVERY_PLAN_MAX_INSPECTIONS
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_ITEMS as RECOVERY_PLAN_MAX_ITEMS
 from cayu.sessions.recovery import RECOVERY_PLAN_SCHEMA_VERSION as RECOVERY_PLAN_SCHEMA_VERSION
+from cayu.sessions.recovery import (
+    ContinuationRecoveryExpectation as ContinuationRecoveryExpectation,
+)
+from cayu.sessions.recovery import ProducerRecoveryExpectation as ProducerRecoveryExpectation
 from cayu.sessions.recovery import RecoveryBlockerCode as RecoveryBlockerCode
 from cayu.sessions.recovery import RecoveryClaimEvidence as RecoveryClaimEvidence
 from cayu.sessions.recovery import RecoveryDecision as RecoveryDecision

@@ -528,6 +528,48 @@ async def admit_native_producer(store, registration: ProducerOutputRecord, comma
         return await store.apply_invocation_lifecycle_command(bound)
 
 
+def attachment_from_snapshot(command, session, checkpoint, raw_attachment):
+    """Read both attachment representations from one native-store snapshot.
+
+    None proves absence only within the exact existing target incarnation. A
+    partial record, replaced session, or conflicting index is never absence.
+    This does not grant permission to execute or certify invocation settlement.
+    """
+    command = prepare_contract(ProducerOutputRegistration, command, redactor=SecretRedactor())
+    prepared = command.admission.prepared
+    assert prepared is not None and isinstance(prepared.target, FreshRecipientAdmissionTarget)
+    if session is None or (session.id, session.instance_id) != (
+        prepared.target.session_id,
+        prepared.target.session_instance_id,
+    ):
+        raise ValueError("Producer attachment target is unavailable or replaced.")
+    raw_index = None if checkpoint is None else checkpoint.get(ROOT_KEY)
+    if raw_index is None and raw_attachment is None:
+        return None
+    if raw_index is None or raw_attachment is None:
+        raise ValueError("Producer attachment has incomplete native evidence.")
+    redactor = SecretRedactor()
+    attachment = prepare_contract(NativeProducerAttachment, raw_attachment, redactor=redactor)
+    require_exact_contract(command, attachment.command, redactor=redactor)
+    index = prepare_contract(NativeProducerIndex, raw_index, redactor=redactor)
+    require_exact_contract(
+        attachment_index(attachment),
+        index.model_copy(
+            update={
+                "state": "prepared",
+                "invocation": None,
+                "exclusion_commitment": None,
+                "cleanup_commitment": None,
+                "cleanup_receipt": None,
+                "output_commitment": None,
+                "paused_stop": None,
+            }
+        ),
+        redactor=redactor,
+    )
+    return attachment
+
+
 async def attach_native_producer(store, registration: ProducerOutputRecord):
     """Private registered-owner handoff, retaining both native representations atomically.
 
@@ -548,27 +590,8 @@ async def attach_native_producer(store, registration: ProducerOutputRecord):
             raise ValueError("Producer attachment targets another session incarnation.")
         existing_index = None if checkpoint is None else checkpoint.get(ROOT_KEY)
         if current is not None:
-            retained = prepare_contract(
-                NativeProducerAttachment, current, redactor=SecretRedactor()
-            )
+            retained = attachment_from_snapshot(attachment.command, session, checkpoint, current)
             require_exact_contract(attachment, retained, redactor=SecretRedactor())
-            require_exact_contract(
-                index,
-                prepare_contract(
-                    NativeProducerIndex, existing_index, redactor=SecretRedactor()
-                ).model_copy(
-                    update={
-                        "state": "prepared",
-                        "invocation": None,
-                        "exclusion_commitment": None,
-                        "cleanup_commitment": None,
-                        "cleanup_receipt": None,
-                        "output_commitment": None,
-                        "paused_stop": None,
-                    }
-                ),
-                redactor=SecretRedactor(),
-            )
             # Replay acknowledges attachment, not preparation or permission to
             # execute. Never replace an admitted/excluded/settled index.
             raise AlreadyAttached()

@@ -105,14 +105,28 @@ def test_general_and_specialist_lane_plans_own_the_pytest_topology() -> None:
     assert runner.evidence[0].command == "ffmpeg -version"
     assert "--splits 32 --group 4" in runner.evidence[-1].command
     assert (
-        "not (stress or qualification or postgres or browser_docker)" in runner.evidence[-1].command
+        "not (stress or qualification or postgres or browser_docker or host_journey)"
+        in runner.evidence[-1].command
     )
 
     specialist = _dry_runner()
     _run_specialist_lane(specialist, "postgres-conformance-2")
     assert len(specialist.evidence) == 1
-    assert "--splits 8 --group 2" in specialist.evidence[0].command
-    assert "postgres and not (stress or qualification)" in specialist.evidence[0].command
+    assert "--splits 12 --group 2" in specialist.evidence[0].command
+    assert (
+        "postgres and not (stress or qualification or host_journey)"
+        in specialist.evidence[0].command
+    )
+    final_specialist = _dry_runner()
+    _run_specialist_lane(final_specialist, "postgres-conformance-12")
+    assert "--splits 12 --group 12" in final_specialist.evidence[0].command
+    for group in range(1, 4):
+        journey = _dry_runner()
+        _run_specialist_lane(journey, f"host-journey-{group}")
+        command = journey.evidence[0].command
+        assert "-m host_journey" in command
+        assert f"--splits 3 --group {group}" in command
+        assert "-n 1" in command
 
     with pytest.raises(ValueError, match="between 1 and 32"):
         _run_general_shard(_dry_runner(), 33)
@@ -463,7 +477,7 @@ def test_pr_gate_keeps_process_regressions_and_release_waits_for_qualification()
     general = _dry_runner()
     _run_general_shard(general, 1)
     assert (
-        "not (stress or qualification or postgres or browser_docker)"
+        "not (stress or qualification or postgres or browser_docker or host_journey)"
         in general.evidence[-1].command
     )
     qualification = _dry_runner()

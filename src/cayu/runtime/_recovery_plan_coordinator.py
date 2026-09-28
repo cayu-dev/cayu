@@ -10,11 +10,12 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from hashlib import sha256
 from time import monotonic
-from typing import cast
+from typing import Protocol, cast
 from uuid import uuid4
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome
+from cayu.collaboration.access import CollaborationAccessContext
 from cayu.events import (
     Event,
     EventType,
@@ -158,9 +159,17 @@ class _RecoveryPlanSnapshotChanged(RuntimeError):
 ResolveRegisteredAgent = Callable[[str], runtime_records.RegisteredAgentState]
 ResolveRegisteredProvider = Callable[[str | None], runtime_records.RegisteredProvider]
 ResolveRegisteredEnvironment = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
-RecoverIncompleteSession = Callable[
-    [IncompleteSessionRecoveryRequest], Awaitable[IncompleteSessionRecoveryResult]
-]
+
+
+class RecoverIncompleteSession(Protocol):
+    def __call__(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
+    ) -> Awaitable[IncompleteSessionRecoveryResult]: ...
+
+
 RecoverModelCompletion = Callable[
     [ModelCompletionManualRecoveryRequest], Awaitable[ModelCompletionManualRecoveryResult]
 ]
@@ -430,6 +439,7 @@ class RecoveryPlanCoordinator:
         project_session_id: ProjectSessionId,
         resolve_session_id: ResolveSessionId,
         clock: Callable[[], datetime],
+        secret_redactor,
     ) -> None:
         self._session_store = session_store
         self._task_store = task_store
@@ -445,11 +455,14 @@ class RecoveryPlanCoordinator:
         self._project_session_id = project_session_id
         self._resolve_session_id = resolve_session_id
         self._clock = clock
+        self._secret_redactor = secret_redactor
 
     async def plan_recovery(self, request: RecoveryPlanRequest) -> RecoveryPlan:
         if type(request) is not RecoveryPlanRequest:
             raise TypeError("Recovery planning requires a RecoveryPlanRequest.")
-        request = request.model_copy(deep=True)
+        from cayu.runtime._producer_recovery_selection import prepare_recovery_selection
+
+        request = prepare_recovery_selection(request, redactor=self._secret_redactor)
         private_ids, inspected, next_cursor = await self._select_sessions(request)
         items: list[RecoveryPlanItem] = []
         for private_session_id in private_ids:
@@ -602,6 +615,13 @@ class RecoveryPlanCoordinator:
         fingerprint: str,
         request: RecoveryPlanRequest,
     ) -> RecoveryPlanItem:
+        from cayu.runtime._producer_recovery_selection import require_recovery_selection
+
+        require_recovery_selection(session, checkpoint, request)
+        if request.participant_context is not None:
+            await self._recovery_coordinator._require_participant_execution(
+                session, request.participant_context
+            )
         public_session_id = self._project_session_id(session.id)
         blockers: list[RecoveryPlanBlocker] = []
         allowed_actions: list[RecoveryPlanAction] = [RecoveryPlanAction.LEAVE_INTACT]
@@ -640,6 +660,7 @@ class RecoveryPlanCoordinator:
                 preflight = await self._recovery_coordinator.preflight_incomplete_session(
                     session=session,
                     inactive_for_seconds=request.selection.inactive_for_seconds,
+                    participant_context=request.participant_context,
                 )
             except ModelCompletionManualRecoveryRequired:
                 registration_reason = "model_completion_manual_recovery_required"
@@ -1538,7 +1559,12 @@ class RecoveryPlanCoordinator:
     async def execute_recovery(self, request: RecoveryExecutionRequest) -> RecoveryReceipt:
         if type(request) is not RecoveryExecutionRequest:
             raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
-        request = request.model_copy(deep=True)
+        from cayu.runtime._producer_recovery_selection import prepare_recovery_selection
+
+        selection = prepare_recovery_selection(request.plan.request, redactor=self._secret_redactor)
+        request = request.model_copy(
+            update={"plan": request.plan.model_copy(update={"request": selection})}, deep=True
+        )
         expected_plan_id = _plan_id(
             created_at=request.plan.created_at,
             request=request.plan.request,
@@ -1578,9 +1604,16 @@ class RecoveryPlanCoordinator:
             async with semaphore:
                 try:
                     if decision.action is RecoveryPlanAction.LEAVE_INTACT:
+                        await self._authenticate_item_selection(request, item)
                         return await self._leave_item_intact(request, item, decision)
                     return await self._execute_item(request, item, decision)
                 except Exception as exc:
+                    if request.plan.request.participant_context is not None and isinstance(
+                        exc, PermissionError
+                    ):
+                        # Access refusal must not become a receipt containing
+                        # freshly loaded private lifecycle state.
+                        raise
                     failure_status = (
                         RecoveryItemExecutionStatus.BLOCKED
                         if isinstance(
@@ -1668,6 +1701,23 @@ class RecoveryPlanCoordinator:
             final_run_epoch=session.run_epoch,
         )
 
+    async def _authenticate_item_selection(self, request, item):
+        if request.plan.request.participant_context is None:
+            return
+        from cayu.runtime._producer_recovery_selection import require_recovery_selection
+
+        private_session_id = await self._resolve_session_id(item.session_id)
+        selected = await self._session_store.load(private_session_id)
+        if selected is None:
+            raise StaleRecoveryPlanError("Recovery target is unavailable.")
+        await self._recovery_coordinator._require_participant_execution(
+            selected, request.plan.request.participant_context
+        )
+        selected_checkpoint = await self._session_store.load_checkpoint(private_session_id)
+        require_recovery_selection(
+            selected, selected_checkpoint, request.plan.request, allow_settled=True
+        )
+
     async def _execute_item(
         self,
         request: RecoveryExecutionRequest,
@@ -1675,6 +1725,7 @@ class RecoveryPlanCoordinator:
         decision: RecoveryDecision,
     ) -> RecoveryItemReceipt:
         private_session_id = await self._resolve_session_id(item.session_id)
+        await self._authenticate_item_selection(request, item)
         receipt_event_id = self._receipt_event_id(request, item)
         replay = await self._load_receipt(
             private_session_id=private_session_id,
@@ -1900,6 +1951,28 @@ class RecoveryPlanCoordinator:
             checkpoint: dict[str, object] | None,
             store_now: datetime,
         ) -> dict[str, object]:
+            from cayu.runtime._producer_recovery_selection import (
+                require_recovery_selection,
+            )
+
+            try:
+                require_recovery_selection(current_session, checkpoint, request.plan.request)
+            except (TypeError, ValueError):
+                raise StaleRecoveryPlanError("Native recovery authority changed.") from None
+            inactivity = request.plan.request.selection.inactive_for_seconds
+            if (
+                (
+                    request.plan.request.producer is not None
+                    or request.plan.request.continuation is not None
+                )
+                and not allow_started_state
+                and inactivity is not None
+                and (
+                    store_now - max(current_session.updated_at, current_session.last_activity_at)
+                ).total_seconds()
+                < inactivity
+            ):
+                raise RecoveryPlanExecutionFenced("Native recovery target is still active.")
             current_marker = _parse_execution_marker(checkpoint)
             if current_session.instance_id != session.instance_id or (
                 not allow_started_state
@@ -2099,7 +2172,12 @@ class RecoveryPlanCoordinator:
                             inactive_for_seconds=None,
                             reason="operator_executed_recovery_plan",
                             metadata={"plan_item_id": item.item_id},
-                        )
+                        ),
+                        **(
+                            {}
+                            if request.plan.request.participant_context is None
+                            else {"participant_context": request.plan.request.participant_context}
+                        ),
                     )
             if (
                 item.interruption_cascade is not None
@@ -2178,7 +2256,12 @@ class RecoveryPlanCoordinator:
                     inactive_for_seconds=None,
                     reason="operator_executed_model_recovery_plan",
                     metadata={"plan_item_id": item.item_id},
-                )
+                ),
+                **(
+                    {}
+                    if request.plan.request.participant_context is None
+                    else {"participant_context": request.plan.request.participant_context}
+                ),
             )
             event_ids = tuple(
                 _safe_ref("event", event.id)

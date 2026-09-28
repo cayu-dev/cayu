@@ -14,6 +14,8 @@ class ClarificationServiceRecovery(ContractValue):
     Recovery compares both commitments against the native and collaboration
     owners' full immutable tuples. This selector only permits reconciliation;
     it cannot be submitted as a service request or used for admission.
+    Session fields identify the original waiting ticket, not a side-session
+    target selected by the authenticated dispatch.
     """
 
     kind: Literal["clarification_service_recovery"] = "clarification_service_recovery"

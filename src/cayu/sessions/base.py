@@ -10372,6 +10372,10 @@ class SessionStore(ABC):
     ) -> ParticipantSessionBinding | None:
         raise NotImplementedError("This SessionStore does not support participant bindings.")
 
+    async def _scan_participant_session_bindings(self, participant, *, after=None, limit=32):
+        """Owner-internal inventory; callers must authenticate current participant access."""
+        raise NotImplementedError("This SessionStore does not qualify participant discovery.")
+
     async def load_participant_session_creation_receipt(
         self, session_id: str
     ) -> ParticipantSessionCreationReceipt | None:
@@ -12070,6 +12074,7 @@ class SessionStore(ABC):
                 (
                     *_SESSION_EXPORT_OWNER_METHODS,
                     "_attach_native_producer",
+                    "_read_native_producer_attachment",
                     "_admit_native_producer",
                     "_exclude_native_producer",
                     "_read_native_producer_exclusion",
@@ -12097,6 +12102,9 @@ class SessionStore(ABC):
         if not self._supports_producer_attachment_protocol():
             raise NotImplementedError("This store does not qualify native producer attachment.")
         return await attach_native_producer(self, registration)
+
+    async def _read_native_producer_attachment(self, command):
+        raise NotImplementedError("Atomic native producer attachment readback is not qualified.")
 
     async def _admit_native_producer(self, registration, command):
         from cayu.runtime._producer_output_store import admit_native_producer
@@ -17665,6 +17673,35 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             binding = self._participant_session_bindings.get(session_id)
             return None if binding is None else binding.model_copy(deep=True)
 
+    async def _scan_participant_session_bindings(self, participant, *, after=None, limit=32):
+        from cayu.sessions._participant_discovery import prepare_scan, reference
+
+        query = prepare_scan(participant, after, limit)
+        async with self._lock:
+            bindings = sorted(
+                (
+                    item
+                    for item in self._participant_session_bindings.values()
+                    if item.participant == query.participant
+                    and (query.after is None or item.creation_key > query.after)
+                ),
+                key=lambda item: item.creation_key,
+            )[: query.limit]
+            result = []
+            for binding in bindings:
+                session = self._sessions.get(binding.session_id)
+                receipt = self._participant_session_receipts.get(binding.session_id)
+                if (
+                    session is None
+                    or session.instance_id != binding.session_instance_id
+                    or receipt is None
+                    or receipt.binding != binding
+                    or self._participant_session_ids_by_key.get(binding.creation_key) != session.id
+                ):
+                    raise ValueError("Participant inventory lacks coherent native creation.")
+                result.append(reference(receipt, query))
+            return tuple(result)
+
     async def load_participant_session_creation_receipt(
         self, session_id: str
     ) -> ParticipantSessionCreationReceipt | None:
@@ -21728,16 +21765,16 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 SessionStatus.INTERRUPTED,
             }:
                 from cayu.storage._peer_attempts import (
-                    parked_clarification_key,
-                    permits_parked_clarification_append,
+                    parked_delivery_key,
+                    permits_parked_delivery_append,
                 )
 
                 checkpoint = self._checkpoints.get(target.id)
-                wait_key = parked_clarification_key(
+                wait_key = parked_delivery_key(
                     checkpoint, session_id=target.id, instance_id=target.instance_id
                 )
                 if wait_key is not None:
-                    parked_target = permits_parked_clarification_append(
+                    parked_target = permits_parked_delivery_append(
                         request,
                         checkpoint,
                         self._session_operation_records.get(target.id, {}).get(wait_key),
@@ -24259,6 +24296,13 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         if not self._supports_producer_attachment_protocol():
             raise NotImplementedError("Native producer release readback is not qualified.")
         return await memory_observation(self, command)
+
+    async def _read_native_producer_attachment(self, command):
+        from cayu.storage._producer_observation import memory_observation
+
+        if not self._supports_producer_attachment_protocol():
+            raise NotImplementedError("Native producer attachment readback is not qualified.")
+        return await memory_observation(self, command, attachment_only=True)
 
     async def _read_native_producer_progress(self, command, *, kind):
         from cayu.storage._producer_observation import memory_observation

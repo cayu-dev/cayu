@@ -19,3 +19,11 @@ class RegisteredRequestAdmissionReader(RequestAdmissionReader):
         self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
     ) -> ExactLookup[RequestAdmissionReceipt]:
         return await self._owner.lookup_admission(expected, context=context)
+
+    async def _lookup_owned(
+        self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
+    ) -> ExactLookup[RequestAdmissionReceipt]:
+        """Native runtime observation under an enclosing retained owner."""
+        return await self._owner.lookup_admission(
+            expected, context=context, wait_for_settlement=True
+        )

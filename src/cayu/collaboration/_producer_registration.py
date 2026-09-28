@@ -125,6 +125,7 @@ async def register_producer_output(
     execution: ParticipantSessionExecutionRequest,
     *,
     context: MandateAccessContext,
+    wait_for_settlement=False,
 ) -> ProducerOutputRecord:
     """Retain authenticated responsibility without starting the prepared session."""
     coordinator = app._request_coordinator
@@ -215,6 +216,7 @@ async def register_producer_output(
             expectation=contract_bytes(command, redactor=redactor),
             redactor=redactor,
             failure_snapshot=lambda error: _safe_request_failure(error, redactor),
+            wait_for_settlement=wait_for_settlement,
         )
     )
 

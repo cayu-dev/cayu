@@ -158,6 +158,7 @@ cayu = "cayu.cli:main"
 testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
+  "host_journey: full bounded collaboration journeys isolated from unrelated CPU-heavy tests",
   "postgres: tests requiring a disposable Postgres database or sharing its schema",
   "process: real subprocess or container boundary coverage",
   "browser_docker: shared real-browser fixture run together in its own CI lane",

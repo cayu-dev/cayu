@@ -2224,6 +2224,17 @@ ordinary registration and recovery blockers.
 
 Registered applications expose recovery as a two-step operator workflow. `CayuApp.plan_recovery(RecoveryPlanRequest(...))` performs bounded, read-only inspection of explicitly selected session ids or statuses. Each immutable plan item binds the public session identity, session incarnation, lifecycle and run epoch, the durable execution-profile fingerprint and current registrations, recovery and task claims, pending approval/input/manual-tool actions, active model-stage and provider-reattachment capability, and any pending interruption cascade. The serialized plan includes only safe identifiers and digests: it never includes prompts, messages, tool arguments or results, credentials, reconnect metadata, checkpoint payloads, or raw exception messages. Use `cayu recovery plan --session SESSION_ID --output plan.json` (or a bounded repeated `--status` selection) to create this artifact through the project's canonical application factory.
 
+Producer-bound recovery can additionally supply `RecoveryPlanRequest.producer`
+as a `ProducerRecoveryExpectation` and an explicit `participant_context`. This
+selects one session incarnation and its native attachment operation and
+commitment. The expectation restricts recovery; it grants no execution or
+disclosure access. Planning and execution authenticate current participant
+access, and the atomic recovery claim repeats the native attachment match.
+A settled attachment cannot authorize recovery of a later ordinary invocation.
+For producer selections with an inactivity threshold, the claim checks that
+threshold against store time before acquiring ownership; observer timeouts do
+not extend it. Exact receipt replay still requires current participant access.
+
 Direct `app.run(RunRequest(task_id=...))` execution without a worker lease is
 supported. After a settled interruption, its task remains `running`, attached to
 the exact session incarnation. Recovery reports task ownership as `direct` only
@@ -16445,6 +16456,282 @@ identities, and foreign-session evidence prevent a complete closure claim.
 Inspection and export use the same enumeration path; export repeats enumeration
 and refuses newly observed truncation rather than trusting an earlier inspection.
 
+## Explicit collaboration host
+
+`CollaborationHost(app, registration)` services finite application-selected
+collaboration responsibilities. Import it and `HostRegistration` from `cayu`,
+`cayu.collaboration`, or `cayu.collaboration.host`. Registration and construction
+are inert: they snapshot configuration without starting a worker, reading a
+store, invoking a policy, or calling a model. Application code still owns roles,
+routing, iteration and business acceptance. The host does not invent another
+request queue, invocation loop or admission authority.
+
+Use `await host.service_once()` for a bounded observation of a service pass, or
+explicitly start `host.run()` for continuous servicing. Both use the same native
+owners. Overlapping servicing on one host is rejected. An observation timeout or
+caller cancellation is not evidence that a dispatched operation stopped: the
+host retains its owned tasks and local capacity until exact owner evidence permits
+release. A subsequent service call observes the retained pass rather than
+starting a replacement for uncertain work.
+
+`HostRegistration` contains finite typed rules rather than arbitrary scheduler
+callbacks. `HostPlanningRule` selects an exact planning request;
+`HostPlannedProducerRule` selects its producer operation and destination contracts.
+`HostProducerSource` enables source-owned pending discovery, and
+`HostProducerExecutionRule` and `HostProducerOutputRule` select execution and
+output servicing. `HostWaitRule`, `HostContinuationRule`, and
+`HostClarificationRule` compose the existing wait, native continuation and
+clarification entrances. Request and clarification maintenance sources service
+their corresponding native cleanup owners. Configured access contexts are
+presented to receiving owners for current authentication; they are not grants
+minted by the host. A retained admission or completed recovery receipt is not
+current execution or disclosure authority.
+
+`HostOwnershipLimits` declares host-local execution slots, separate maintenance
+slots, retained operation count and retained bytes. These are not deployment-wide
+quotas. Native durable capacity and common-root budget admission remain shared
+across hosts. Registration also bounds batch size, discovery slots/bytes, and
+observation, polling and shutdown intervals. Request-expiry and clarification
+maintenance discovery have separate reserved pools, each sized for one read slot
+and 128 KiB per configured source (at most 32 slots and 4 MiB per family),
+independent of the configured ordinary discovery slots and bytes. Stable source
+keys permit only one retained read per source, so a blocked source cannot consume
+another source's reserved discovery capacity.
+Producer maintenance has a separate reserved discovery slot and 128 KiB for
+each configured producer source (at most 32 slots and 4 MiB). These reads do not
+perform execution-only inspection, so a blocked ordinary read cannot prevent
+another source's cleanup discovery. Inspection counts all pools; shutdown retains
+and drains them within its single observation deadline, without cancelling blocked
+reads to reclaim capacity.
+Separate maintenance capacity does
+not authorize cleanup that the receiving owner refuses.
+
+`host.inspect()`, `service_once()` and `aclose()` return `HostInspection`.
+Its counts describe local active/uncertain work, retained failures, pending reads,
+and observed blocked work; they are not global pending totals. `serviced` counts
+completed dispatches acknowledged by the most recent local collection. Receipt
+replay and native-recovery handoffs can settle a turn without increasing that
+count. It is not a cumulative generation or delivery receipt. Consecutive collections may report
+the same count for different operations, and another host can commit progress
+without changing this host's count. `coverage_complete` remains false:
+an empty finite selection never proves global quiescence. Read authorized
+operation/output/participant state through the corresponding native inspection
+APIs, not by interpreting a host counter as accepted, delivered or settled work.
+
+`await host.aclose()` stops new local dispatch and boundedly observes retained
+ownership. Async context exit calls this method. Neither closes the application
+nor its stores. A returned inspection with `pending=True` requires further
+observation or recovery by the durable owner; shutdown does not fabricate
+quiescence or retry permission. Keep shared stores available while retained work
+can still use them.
+Host-owned wait observation and latch delivery retain their nested source reads,
+evidence writes and receiving authentication past public client observation
+bounds. The host's foreground wait and shutdown remain bounded; an unfinished
+native read is not repeatedly replaced or classified as unavailable merely
+because a client observation interval elapsed. Public wait calls keep their
+ordinary observation bounds and exact reconciliation behavior.
+After clarification-service acknowledgement loss, host shutdown may authenticate
+the exact native return or exclusion using current request-readback access.
+Only a native record acknowledging both service settlement obligations releases
+the local turn. This read does not renew disclosure, dispatch the service again,
+or settle a missing native obligation; unavailable evidence keeps the turn fenced.
+
+Producer maintenance reconciles an ordinary failed acknowledgement against the
+original authenticated native operation. Positive retained publication, delivery,
+exclusion or cleanup evidence can release that local maintenance turn while
+preserving the original exception for the observer. A retained output-contract
+rejection is failure evidence, not a published answer. Missing, conflicting or
+unavailable readback does not release capacity; an exception alone proves neither
+settlement nor permission to retry. Local turn completion is distinct from final
+producer cleanup and from the settlement of other destinations.
+Later explicit servicing or close observation can repeat the exact read for a
+failed producer-maintenance turn, including after another worker repairs its
+native outcome. This read remains capacity-counted and supervised across observer
+cancellation. It never retries the original effect. Each failed read attempt is
+reported with the original effect failure; a later positive handoff releases the
+local turn through its normal acknowledgement path.
+Planning and producer-attachment turns likewise reconcile through their exact
+native owners. A terminal plan with no pending stages, or an exactly attached or
+settled producer, can discharge the failed local turn without re-evaluating policy
+or attaching again. Planned attachment compares the complete retained planning
+operation as well as the admission operation and generation; matching the request
+alone is insufficient. These historical reads do not grant execution authority.
+Failed producer execution, wait servicing, request expiry and clarification
+maintenance turns also retry exact readback during later servicing or close
+observation. Admitted producer execution requires exact native invocation-release evidence;
+an input or approval pause can release its local execution slot without a producer
+completion record. Its durable producer responsibility and human gate remain owned.
+For a never-admitted producer, exact native exclusion is a separate no-start
+handoff; authenticated finalized cleanup also ends the local observation. Neither
+handoff invents an invocation-release receipt or settles outstanding business
+responsibility merely by freeing the host slot.
+An execution turn interrupted during attachment, before entering native execution,
+can release its local slot after exact attachment readback. It preserves the
+original failure; a later launch still requires current execution authorization.
+Wait delivery requires its accepted or excluded decision and released source
+pins. A native initial authorization or wait-read failure before observation mutations releases
+only the local observation turn and preserves its original error; a later pass
+retries the same durable wait under current authorization. Pending or blocked
+mutations are not released merely because observation failed.
+If the native latch committed but its source acknowledgement failed,
+recovery can finish that acknowledgement from exact native latch readback,
+including during host shutdown. It cannot create a missing latch or start a
+continuation. Maintenance reads require the original expiry or settled handoff evidence,
+or an authenticated competing terminal decision that permanently excludes that
+local effect. A later exact request revision also excludes a stale revision-bound
+expiry. Supersession releases no underlying producer or delivery responsibility.
+An initially unavailable read leaves the local slot fenced. A later positive
+read releases that slot while reporting the original failure, without repeating
+the invocation, delivery or control mutation.
+Cancellation or another control signal from an owned turn is reported once to
+the foreground observer without waiting for settlement. Its local slot remains
+fenced until exact native readback permits acknowledgement. Later positive
+readback does not rethrow the historical signal; a new ordinary read failure
+remains an ordinary failure, retaining the earlier signal as causal evidence.
+Read-only preparation that fails before entering a receiving mutation releases
+only its local turn and reports the original error. Later explicit servicing may
+prepare again under current authority. This does not settle existing native
+responsibilities or permit retry of an uncertain dispatched effect.
+
+After restart, re-register the same trusted owner configuration and exact finite
+operation selections. Pending discovery is source-owned; notifications are only
+hints. Wait discovery uses generation and Unicode code-point key order across
+Memory, SQLite and PostgreSQL, independently of the database locale; its cursor
+can be carried across store reopening.
+`app.list_participant_sessions(participant, context=...)` returns a bounded
+tuple of exact creation references and an optional continuation cursor.
+`app.list_session_continuations(reference, context=...)` reads that incarnation's
+native ticket index, and `app.recover_session_continuation(expected, context=...)`
+reconstructs the exact retained ticket/latch under current access checks. These
+read-only operations neither elect a wait nor authorize continuation. Supply the
+recovered identities, separately selected `ResumeRequest` and `ContinuationService`,
+and current context in `HostContinuationRule`; the native receiver repeats its
+admission gates. Native producer interruption recovery is opt-in through
+`HostProducerExecution.recovery_inactive_for_seconds` (or the corresponding
+`HostPlannedProducer` field). It uses the exact native recovery plan and store-time
+inactivity check, not a new producer invocation. Missing current authority,
+human gates or ambiguous native evidence do not authorize a replacement launch.
+Producer selection remains limited to qualified resource-free FRESH admission;
+the host does not extend the producer owner's supported target/resource families.
+
+Producer result delivery to an ordinary parked execution wait is inert. The
+producer owner reconstructs its exact retained delivery and supplies live native
+provenance; the peer transaction compares the selected request with the durable
+waiting ticket, its index and released writer generation. A final latch may
+already exist, but then the request must also belong to its selected manifest.
+An identical raw peer request does not acquire this producer provenance. Current
+participant and disclosure checks still apply, and delivery does not consume the
+ticket or authorize the subsequent invocation.
+Host continuation readiness resolves creation-bound destinations through the exact
+SessionStore creation decision before comparing the minted target incarnation.
+Pending delivery cannot be bypassed by the destination's absent public session fields.
+When a durable waiting target lacks the required delivery provenance, append
+reports unavailable without converting the wait into a terminal exclusion. This
+also leaves an existing pending attempt available for its registered producer
+owner when a generic peer worker cannot reconstruct that provenance.
+
+Before scheduling an unconsumed continuation, the host reads its exact wait
+election and selected native producer responsibilities. Any registered delivery
+to that same participant/session incarnation must have a retained appended or
+excluded outcome. A pending delivery defers continuation without occupying an
+execution slot; missing or conflicting evidence remains unavailable, not ready.
+This does not turn an answered request into a delivery receipt, wait for unrelated
+broadcast recipients, or grant provider disclosure. An explicit exclusion permits
+continuation with unavailable content, and provider exposure still checks current
+authority. Exact consumed replay remains with the native continuation owner.
+When the native service proves that its own pre-admission read or authority check
+failed before entering the mutation owner, the host releases only that local turn
+and reports the original error. Later servicing may retry the same selection.
+Missing consumption alone is not this proof; uncertain admission remains fenced.
+When an independent host observes a continuation already admitted by another
+worker, it verifies the exact native admission receipt and releases only its own
+observation slot. It neither reports invocation release nor dispatches another
+model call. The executing host continues to count and supervise its work until
+native release evidence arrives; admission readback is not quiescence.
+An exact excluded continuation service with its retired ticket is a distinct
+non-dispatched handoff. It frees the local reservation and ends that immutable
+selection without fabricating admission, completion, or invocation-release evidence.
+After such an authenticated handoff, the same host does not reserve another
+execution slot merely to replay that immutable continuation selection. Deferred
+or uncertain turns are not marked finished. This local scheduling hint neither
+replaces durable recovery nor grants new execution authority.
+
+An application may explicitly configure `HostContinuationRule.recovery_inactive_for_seconds`
+to select native abandoned-invocation recovery. The exact consumed-ticket record,
+original admission command, session incarnation, profile, and admitted interaction
+restrict the recovery claim; current participant execution authorization is still
+required. Inactivity is checked again under the store-owned claim. Recovery does
+not submit another continuation or replay an uncertain model call. An abandoned
+invocation may become interrupted rather than completed. Only the exact native
+release receipt settles this host's recovery observation; a historical admission
+receipt alone does not establish that abandoned work stopped.
+After an ordinary continuation-service or recovery acknowledgement failure,
+later servicing and close observation may authenticate the identical service
+input and read its native release. This read-only reconciliation cannot dispatch
+or recover work. It authenticates current readback of the original participant
+and session creation, rather than requiring renewed execution authority after
+participant disablement. Missing release evidence retains the failed turn; an
+exact release discharges it while preserving the original exception. Actual
+continuation and abandoned-invocation recovery still require execution authority.
+An exact native service commitment retains its admission, rebind, and release
+receipts while the corresponding continuation record is retained. Read-only
+cleanup can therefore distinguish the completed original invocation from a later
+interaction in the same session. This uses the existing bounded lifecycle ledger
+and release-capacity reservation, not a host-owned history. Admission-only
+continuation handoffs retain their ordinary settlement boundary.
+
+The credential-free example is runnable with
+`uv run python -m examples.collaboration.explicit_host`. It uses the real OpenAI
+request adapter with a finite, application-versioned local transport; no API key
+or network provider is used. Its captured requests include the actual serialized
+selected input. The example continues servicing while one separately retained
+business read is pending. It does not require a locally idle pass to inspect
+completion: discovery or unrelated maintenance may remain due. Neither local
+idleness nor a host progress count proves delivery, exposure or cleanup.
+Each finite question phase starts business readback between its owned effect
+turns, avoiding repeated full-source inspection while that effect is in flight.
+Pending discovery alone does not prevent readback.
+
+`uv run python -m examples.collaboration.finite_host_patterns PATTERN` selects
+one finite application policy: `sequential-specialists`, `supervisor-workers`,
+`peer-discussion`, `independent-parallel-candidates`, `bounded-review-revision`,
+or `shared-specialist`. These names are example functions, not runtime workflow
+modes. Each policy has two questions, distinct exact operations and six expected
+serialized model calls, including the parked and continued requester invocations.
+Questions share the team's owner capacity and one common-root budget: a $1
+synthetic priced ceiling, 16-dispatch allowance and 256-token output reservations.
+The team's 9 MiB retained-byte capacity and 512-event capacity include native
+settlement reservations and previous-round evidence. None of these finite example limits is a
+deployment-wide scheduler quota.
+
+Parallel candidates receive disjoint private inputs and separate reply grants.
+Each question has its own producer mandate, including when questions reuse a
+specialist. Source grants remain scoped to that question rather than accumulating
+unrelated source authority inside subsequent export and settlement receipts.
+Sequential specialists forward the designer's visible answer to the verifier
+under a separate disclosure grant bound to the source receipt, content commitment,
+next question and recipient. Neither ordering nor that selected answer grants
+access to private specialist history. Peer discussion alternates
+the asking and answering participants through separate exact reply obligations.
+Its second question responds to the preceding visible reply, with a separate
+application disclosure decision bound to that reply's receipt, content commitment,
+next question key and recipient. The example refuses this derived input without
+that explicit grant; it does not copy private history or authorize a third audience.
+Work-product review binds the draft revision and text commitment to the request
+and returned review; a positive review of an earlier draft is not acceptance of
+the next revision. This application decision does not replace native execution
+authority or human-tool approval gates.
+
+Finishing an example question does not drain the shared collaboration store;
+other questions can still use it. If a service helper raises, its original
+exception retains `collaboration_host` for inspection and further bounded close
+observation, and `collaboration_observation` retains any unfinished business-read
+task and its eventual original outcome. Cancellation still propagates as
+cancellation; neither handle proves that dispatched work stopped. Keep shared
+stores available until
+their retained owners have settled or transferred responsibility through exact
+native recovery.
+
 ## Durable session continuation tickets
 
 Session-owned waits use a durable continuation ticket rather than a process-local
@@ -16453,8 +16740,9 @@ then may become `WAITING` through `SessionContinuationOwner.park(...)`, authenti
 by its originating runtime invocation. Readiness is a separate immutable latch, so a result
 published before parking, during parking, or after a worker restart is retained
 exactly once. The ticket lifecycle is `ARMING`, `WAITING`, `SERVICING`,
-`CONSUMED`, or `RETIRED`; this slice reserves `SERVICING` for a later bounded
-clarification service and does not execute it.
+`CONSUMED`, or `RETIRED`. Bounded clarification uses `SERVICING` while retaining
+the original wait and its separate final-result latch; clarification return does
+not consume that latch.
 
 Readiness is accepted only through a qualified receiving owner implementing the
 typed continuation-latch receiver contract. A structurally valid latch or a
@@ -16542,7 +16830,9 @@ admission claim; an unclaimed preparation still retains settlement responsibilit
 An arbitrary receipt conflict or malformed readback is not supersession evidence.
 Pending prepared responsibilities protect their target admission receipts from
 lifecycle-ledger compaction, including a competing winner's receipt. Consumption
-or exclusion releases that protection. Ledger limits remain enforced: new
+or exclusion releases admission-only protection. An exact native continuation
+service retains its own admission, rebind, and release evidence while its
+continuation record remains retained, as described above. Ledger limits remain enforced: new
 lifecycle work must refuse before mutation if protected evidence and required
 release capacity cannot fit, rather than discard pending settlement evidence.
 Missing receipt evidence preserves pending responsibility; it is not exclusion.

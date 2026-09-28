@@ -30,6 +30,14 @@ from cayu.collaboration.waits import (
 )
 
 
+class _WaitObservationNotStarted(Exception):
+    """Native pre-mutation read failed; no observation effect was entered."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__("Wait observation did not enter mutation.")
+        self.error = error
+
+
 class WaitCoordinator:
     """Authenticate request sources, then delegate durable state to the store."""
 
@@ -80,25 +88,52 @@ class WaitCoordinator:
     async def observe(
         self, wait: CollaborationWait, *, context: MandateAccessContext
     ) -> WaitSnapshot:
+        return await self._observe(wait, context=context, retained_observer=False)
+
+    async def _observe_owned(self, wait, *, context):
+        """Retain each nested native observation beneath the host's bounded waiter."""
+        return await self._observe(wait, context=context, retained_observer=True)
+
+    async def _observe(self, wait, *, context, retained_observer):
         wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
         store, initialized = self._participants._ready()
         # Authorize every frozen target without requiring its source history
         # to remain retained.  Pending waits still reacquire source evidence
         # below; terminal waits use their retained evidence.
-        for target in wait.targets:
-            await self._requests._authorize_retained_source(target, context=context)
-        current = await store.load_wait(initialized, wait, redactor=self._redactor)
+        try:
+            for target in wait.targets:
+                await self._requests._authorize_retained_source(
+                    target, context=context, wait_for_settlement=retained_observer
+                )
+            current = await store.load_wait(
+                initialized, wait, redactor=self._redactor, wait_for_settlement=retained_observer
+            )
+        except Exception as error:
+            if retained_observer:
+                # The retained authorization/read has returned. No source registration,
+                # evidence write, release or latch dispatch has been entered.
+                # Do not extend this handoff across the mutations below, or catch
+                # caller cancellation while a nested operation remains owned.
+                raise _WaitObservationNotStarted(error) from None
+            raise
         if current is None:
             raise CollaborationUnavailable("Wait registration is unavailable.")
         if current.state != "pending":
             if current.state == "elected" and current.delivery == "none" and current.source_pins:
-                return await store.release_wait_sources(initialized, wait, redactor=self._redactor)
+                return await store.release_wait_sources(
+                    initialized,
+                    wait,
+                    redactor=self._redactor,
+                    wait_for_settlement=retained_observer,
+                )
             return current
         for target in wait.targets:
             try:
-                observation = await self._register_source_observation(wait, target, context=context)
+                observation = await self._register_source_observation(
+                    wait, target, context=context, wait_for_settlement=retained_observer
+                )
                 source_read = await self._requests.read_observation_source(
-                    target, observation, context=context
+                    target, observation, context=context, wait_for_settlement=retained_observer
                 )
                 page = source_read.page
                 if not page.complete:
@@ -122,21 +157,28 @@ class WaitCoordinator:
                 wait,
                 evidence,
                 redactor=self._redactor,
+                wait_for_settlement=retained_observer,
             )
             if current.state != "pending":
                 break
         if current.state == "elected" and current.delivery == "none":
-            current = await store.release_wait_sources(initialized, wait, redactor=self._redactor)
+            current = await store.release_wait_sources(
+                initialized, wait, redactor=self._redactor, wait_for_settlement=retained_observer
+            )
         return current
 
     async def inspect(
-        self, wait: CollaborationWait, *, context: MandateAccessContext
+        self, wait: CollaborationWait, *, context: MandateAccessContext, wait_for_settlement=False
     ) -> WaitSnapshot | None:
         wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
         store, initialized = self._participants._ready()
         for target in wait.targets:
-            await self._requests._authorize_retained_source(target, context=context)
-        return await store.load_wait(initialized, wait, redactor=self._redactor)
+            await self._requests._authorize_retained_source(
+                target, context=context, wait_for_settlement=wait_for_settlement
+            )
+        return await store.load_wait(
+            initialized, wait, redactor=self._redactor, wait_for_settlement=wait_for_settlement
+        )
 
     async def lookup(
         self, wait: CollaborationWait, *, context: MandateAccessContext
@@ -162,7 +204,9 @@ class WaitCoordinator:
             return ExactNotFound()
         return ExactMatch[WaitRegistration](receipt=current.registration)
 
-    async def _register_source_observation(self, wait, target, *, context):
+    async def _register_source_observation(
+        self, wait, target, *, context, wait_for_settlement=False
+    ):
         key = self._observation_key(wait, target)
         observation = RequestObservation(
             key=key,
@@ -175,7 +219,9 @@ class WaitCoordinator:
             revision=1,
             retention_until_ms=int(datetime.fromisoformat(wait.deadline).timestamp() * 1000),
         )
-        await self._requests._observe_retained_source(target, observation, context=context)
+        await self._requests._observe_retained_source(
+            target, observation, context=context, wait_for_settlement=wait_for_settlement
+        )
         # The request API keeps the caller's immutable registration intent
         # separate from its advanced coverage frontier. Reads must replay the
         # former while validating the latter transactionally.
@@ -265,16 +311,72 @@ class WaitCoordinator:
 
     async def deliver(self, wait: CollaborationWait, *, context, continuation_owner):
         """Deliver an elected result through the existing authenticated latch owner."""
+        return await self._deliver(
+            wait, context=context, continuation_owner=continuation_owner, retained_observer=False
+        )
+
+    async def _deliver_owned(self, wait, *, context, continuation_owner):
+        """The host keeps receiving work attached beyond its foreground bound."""
+        return await self._deliver(
+            wait, context=context, continuation_owner=continuation_owner, retained_observer=True
+        )
+
+    async def _reconcile_delivery_owned(self, wait, *, context, continuation_owner):
+        """Repair only the source ACK of a positively retained native latch.
+
+        Safe during host close: no new latch, election or invocation is created.
+        A missing native receipt leaves the existing ownership unresolved.
+        """
+        from cayu.runtime._session_continuation_owner import SessionContinuationOwner
+
+        if type(continuation_owner) is not SessionContinuationOwner:
+            raise PermissionError("Wait recovery requires its native continuation owner.")
+        wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
+        for target in wait.targets:
+            await self._requests._authorize_retained_source(
+                target, context=context, wait_for_settlement=True
+            )
+        store, initialized = self._participants._ready()
+        current = await store.load_wait(
+            initialized, wait, redactor=self._redactor, wait_for_settlement=True
+        )
+        if current is None or current.state != "elected" or current.election is None:
+            return None
+        if wait.delivery_ticket is None:
+            raise CollaborationUnavailable("Wait has no session delivery binding.")
+        latch = _elected_latch(current, self._redactor)
+        retained = await continuation_owner._inspect_latch_owned(latch)
+        if retained is None:
+            return None
+        # Identity permits ticket lifecycle revisions; receipt bytes must still
+        # match the native owner's retained representation, as in normal delivery.
+        return await store.record_wait_delivery(
+            initialized,
+            wait,
+            receipt_digest=sha256(
+                contract_bytes(retained.latch, redactor=self._redactor)
+            ).hexdigest(),
+            redactor=self._redactor,
+            wait_for_settlement=True,
+        )
+
+    async def _deliver(self, wait, *, context, continuation_owner, retained_observer):
 
         from cayu.runtime._session_continuation_owner import SessionContinuationOwner
 
         if not isinstance(continuation_owner, SessionContinuationOwner):
             raise PermissionError("Wait delivery requires a registered session continuation owner.")
+        if retained_observer and type(continuation_owner) is not SessionContinuationOwner:
+            raise PermissionError("Retained wait delivery requires its native receiving owner.")
         wait = prepare_contract(CollaborationWait, wait, redactor=self._redactor)
         store, initialized = self._participants._ready()
         for target in wait.targets:
-            await self._requests._authorize_retained_source(target, context=context)
-        current = await store.load_wait(initialized, wait, redactor=self._redactor)
+            await self._requests._authorize_retained_source(
+                target, context=context, wait_for_settlement=retained_observer
+            )
+        current = await store.load_wait(
+            initialized, wait, redactor=self._redactor, wait_for_settlement=retained_observer
+        )
         if current is None or current.state != "elected" or current.election is None:
             raise CollaborationUnavailable("Wait has no elected result.")
         if wait.delivery_ticket is None:
@@ -282,7 +384,11 @@ class WaitCoordinator:
         from cayu.runtime._session_continuation import require_latch_identity
 
         latch = _elected_latch(current, self._redactor)
-        record = await continuation_owner.latch(latch)
+        record = await (
+            continuation_owner._latch_owned(latch)
+            if retained_observer
+            else continuation_owner.latch(latch)
+        )
         if record.latch is None:
             raise CollaborationUnavailable("Session did not acknowledge the exact latch.")
         require_latch_identity(latch, record.latch)
@@ -292,6 +398,7 @@ class WaitCoordinator:
             wait,
             receipt_digest=digest,
             redactor=self._redactor,
+            wait_for_settlement=retained_observer,
         )
 
     async def exclude(
@@ -530,6 +637,12 @@ class CollaborationWaitLatchReceiver:
         return expected
 
     async def authenticate_continuation_latch(self, latch):
+        return await self._receive_latch(latch, wait_for_settlement=False)
+
+    async def _authenticate_latch_owned(self, latch):
+        return await self._receive_latch(latch, wait_for_settlement=True)
+
+    async def _receive_latch(self, latch, *, wait_for_settlement):
         from cayu.runtime._session_continuation import ContinuationLatch
 
         latch = prepare_contract(ContinuationLatch, latch, redactor=self._redactor)
@@ -547,6 +660,7 @@ class CollaborationWaitLatchReceiver:
             key=("wait-latch", self._initialized.binding.application_scope, latch.latch_key),
             expectation=contract_bytes(latch, redactor=self._redactor),
             redactor=self._redactor,
+            wait_for_settlement=wait_for_settlement,
         )
 
     async def _authenticate_latch(self, latch):
