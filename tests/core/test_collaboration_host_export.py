@@ -115,12 +115,17 @@ async def test_host_export_retains_nested_owner_after_publication(native_stores,
                         coroutine = getattr(coroutine, "cr_await", None)
                     error.add_note("Native await path: " + " -> ".join(path))
             raise
-        running.cancel()
-        running.cancel()
-        assert running.cancelling() == 2
+        # The host's idle wait may have a timeout-owned cancellation pending.
+        # Count our requests separately; that timeout must remove its own request
+        # when the observer unwinds, retaining both external cancellations.
+        prior_cancellations = running.cancelling()
+        assert running.cancel()
+        assert running.cancel()
+        assert running.cancelling() == prior_cancellations + 2
         with pytest.raises(asyncio.CancelledError):
             await running
         assert running.cancelled()
+        assert running.cancelling() == 2
         await asyncio.sleep(0.05)
         state = await host.aclose()
         assert state.uncertain == 1 and state.failed == 0
