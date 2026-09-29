@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import posixpath
@@ -73,9 +74,11 @@ from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
+    RemoteWorkspaceBranchCapability,
     Runner,
     RunnerBinaryStreamCapability,
     RunnerExecutionAdmissionObserver,
+    RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
@@ -1625,6 +1628,22 @@ class _DockerToolAdmissionObserver(RunnerExecutionAdmissionObserver):
         await self.collect()
 
 
+class _DockerRemoteWorkspaceBranchCapability(RemoteWorkspaceBranchCapability):
+    """One exact container's retained filesystem for the guest branch protocol."""
+
+    def __init__(self, container_id: str) -> None:
+        self._container_id = container_id
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("docker", self._container_id)
+
+    @property
+    def allocation_fingerprint(self) -> str:
+        encoded = f"docker\0{self._container_id}".encode()
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 class DockerRunner(Runner, RunnerBinaryStreamCapability):
     """Executes commands inside a plain Docker container via the ``docker`` CLI.
 
@@ -1653,6 +1672,21 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
     @property
     def resource_key(self) -> tuple[object, ...]:
         return ("docker", self.container_id or self.name)
+
+    def workspace_capability(
+        self,
+        capability_type: type[RunnerWorkspaceCapabilityT],
+    ) -> RunnerWorkspaceCapabilityT | None:
+        if (
+            type(self) is DockerRunner
+            and capability_type is RemoteWorkspaceBranchCapability
+            and self.container_id is not None
+        ):
+            # Only an exact container ID proves one retained container
+            # filesystem; a reusable legacy name does not.
+            capability = _DockerRemoteWorkspaceBranchCapability(self.container_id)
+            return cast("RunnerWorkspaceCapabilityT", capability)
+        return super().workspace_capability(capability_type)
 
     @property
     def container_reference(self) -> str:

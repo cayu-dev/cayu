@@ -40387,5 +40387,8 @@
     "tests/egress/test_aws_lambda_microvm_replacement.py::test_non_passthrough_inner_binding_keeps_isolation_authority": 0.0007297080010175705,
     "tests/egress/test_aws_lambda_microvm_replacement.py::test_replacement_pins_predecessor_image_version": 0.0017953318310901523,
     "tests/egress/test_aws_lambda_microvm_replacement.py::test_running_microvm_is_never_replaced": 7.6266002509510145,
-    "tests/egress/test_aws_lambda_microvm_replacement.py::test_writer_isolation_follows_the_owner_fence": 0.0022861670004203916
+    "tests/egress/test_aws_lambda_microvm_replacement.py::test_writer_isolation_follows_the_owner_fence": 0.0022861670004203916,
+    "tests/workspaces/test_lambda_microvm_workspace_branches.py::test_docker_declares_branches_only_for_an_exact_container_id": 0.00041620898991823196,
+    "tests/workspaces/test_lambda_microvm_workspace_branches.py::test_lambda_microvm_declares_its_retained_filesystem_exactly": 0.001991042052395642,
+    "tests/workspaces/test_lambda_microvm_workspace_branches.py::test_lambda_microvm_workspace_branches_share_conformance": 6.1829582079080865
 }

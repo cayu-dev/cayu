@@ -12,8 +12,9 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from math import isfinite
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 import httpx
 
@@ -53,8 +54,10 @@ from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
+    RemoteWorkspaceBranchCapability,
     Runner,
     RunnerSystemExecutionMode,
+    RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     _contains_runner_fatal_signal,
@@ -1841,6 +1844,18 @@ class LambdaMicroVMRunner(Runner):
         self._owner_generation = generation
         self._owner_claimed = True
 
+    def workspace_capability(
+        self,
+        capability_type: type[RunnerWorkspaceCapabilityT],
+    ) -> RunnerWorkspaceCapabilityT | None:
+        if type(self) is LambdaMicroVMRunner and capability_type is RemoteWorkspaceBranchCapability:
+            # The MicroVM disk retains branch state across Cayu process loss and
+            # suspend/resume for the MicroVM's lifetime; the sidecar guarantees
+            # python3 for the guest guard.
+            capability = _LambdaRemoteWorkspaceBranchCapability(self)
+            return cast("RunnerWorkspaceCapabilityT", capability)
+        return super().workspace_capability(capability_type)
+
     @property
     def owner_fence_generation(self) -> str | None:
         """Non-secret identity of this runner's current sidecar owner claim.
@@ -2011,6 +2026,22 @@ class LambdaMicroVMRunner(Runner):
     def _ensure_lifecycle_open(self) -> None:
         if self._closed or self._closing or self._command_cleanups_pending or self._exec_poisoned:
             raise RuntimeError("LambdaMicroVMRunner is closed.")
+
+
+class _LambdaRemoteWorkspaceBranchCapability(RemoteWorkspaceBranchCapability):
+    """The retained MicroVM filesystem for the guest branch protocol."""
+
+    def __init__(self, runner: LambdaMicroVMRunner) -> None:
+        self._runner = runner
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("lambda-microvm", self._runner.microvm_id)
+
+    @property
+    def allocation_fingerprint(self) -> str:
+        encoded = f"lambda-microvm\0{self._runner.microvm_id}".encode()
+        return "sha256:" + sha256(encoded).hexdigest()
 
 
 class _LambdaMicroVMCommandHandle:
