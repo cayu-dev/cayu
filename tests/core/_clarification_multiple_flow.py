@@ -1,7 +1,5 @@
 """A second host-selected question through the existing public runtime owners."""
 
-import asyncio
-
 import pytest
 from tests.core.test_peer_content import _delivery_request
 
@@ -142,18 +140,18 @@ async def second_question(
             timeout=360,
         )
     else:
-        async with asyncio.timeout(120):
-            while True:
-                try:
-                    result = await application.service_clarification(
-                        service, context=service_context, delivery_context=source_context
-                    )
-                except CollaborationUnavailable:
-                    await asyncio.sleep(0.05)
-                    continue
-                if result.state == "returned":
-                    break
-                await asyncio.sleep(0.05)
+        from tests.core._clarification_service_observation import await_service_return
+        from tests.core.test_participant_identity import CONTEXT
+
+        result = await await_service_return(
+            application,
+            service,
+            context=service_context,
+            delivery_context=source_context,
+            recovery_context=CONTEXT,
+            timeout=120,
+            nested_errors=[],
+        )
     assert result.released_session_status == "completed", [
         (event.type, event.payload)
         for event in await sessions.load_events(target.id)
