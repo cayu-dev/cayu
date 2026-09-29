@@ -40431,5 +40431,8 @@
     "tests/runtime/test_execution_admission_dispatch.py::test_lambda_microvm_admits_required_dependencies_from_live_guest_evidence[True]": 0.682879582978785,
     "tests/runtime/test_execution_admission_dispatch.py::test_unobserved_remote_runner_fails_closed_only_for_required_dependencies[e2b-False]": 0.40944874996785074,
     "tests/runtime/test_execution_admission_dispatch.py::test_unobserved_remote_runner_fails_closed_only_for_required_dependencies[e2b-True]": 0.2081385840428993,
-    "tests/runtime/test_execution_admission_dispatch.py::test_unobserved_remote_runner_fails_closed_only_for_required_dependencies[lambda_microvm-False]": 0.46735737391281873
+    "tests/runtime/test_execution_admission_dispatch.py::test_unobserved_remote_runner_fails_closed_only_for_required_dependencies[lambda_microvm-False]": 0.46735737391281873,
+    "tests/cli/test_nightly_verification.py::test_lambda_microvm_coding_check_requires_image_and_opt_in": 0.0006787070306017995,
+    "tests/runners/test_aws_lambda_microvm_sidecar.py::test_sidecar_image_ships_pinned_coding_tools": 0.00029175111558288336,
+    "tests/runners/test_aws_lambda_microvm_sidecar.py::test_sidecar_resolves_programs_with_the_guest_shell_default_path": 0.08004245697520673
 }

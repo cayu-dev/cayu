@@ -4,11 +4,11 @@ One MicroVM is allocated and terminated. Admission probes run through the
 agent execution lane of that exact MicroVM, bound to its control-plane image,
 sidecar protocol, and guest boot identity. The scenario proves that an
 executable the image contains is ``live_verified`` and admits a tool, that a
-missing executable (``rg`` in the minimal sidecar image) refuses the tool
-before any model request, that explicit probe arguments invoke the program,
+missing executable (``node``, which the first-party image does not ship)
+refuses the tool before any model request, that explicit probe arguments invoke the program,
 and that renewal re-observes the same identity with a new validity window.
 The image under test must contain ``python3`` and ``bash`` and must not
-contain ``rg``, as the first-party sidecar image does.
+contain ``node``, as the first-party sidecar image does.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ from cayu.tools.base import (
     ToolResult,
     ToolSpec,
 )
-from cayu.tools.search import SearchTextTool
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _MAXIMUM_DURATION_SECONDS = 600
@@ -57,6 +56,21 @@ class _PythonTool(Tool):
 
     async def run(self, ctx, args):
         return ToolResult(content="not dispatched by this contract")
+
+
+class _NodeTool(Tool):
+    spec = ToolSpec(
+        name="node_program",
+        execution_requirements=(
+            ToolExecutionRequirement(
+                name="node",
+                alternatives=(ToolExecutableRequirement(executable="node"),),
+            ),
+        ),
+    )
+
+    async def run(self, ctx, args):
+        return ToolResult(content="must be refused before dispatch")
 
 
 def _requirements(*alternatives: ToolExecutableRequirement) -> ExecutionRequirements:
@@ -101,7 +115,7 @@ async def main() -> None:
         raise SystemExit("Set CAYU_LAMBDA_MICROVM_IMAGE to a built MicroVM image ARN.")
     if not region:
         raise SystemExit("Set AWS_REGION or AWS_DEFAULT_REGION.")
-    missing = "rg"
+    missing = "node"
     ingress = os.environ.get(
         "CAYU_LAMBDA_MICROVM_INGRESS_CONNECTOR",
         f"arn:aws:lambda:{region}:aws:network-connector:aws-network-connector:ALL_INGRESS",
@@ -173,7 +187,7 @@ async def main() -> None:
             f"a tool requiring {_PRESENT} was not admitted",
         )
         refused_events, refused_provider = await _session(
-            runner, SearchTextTool(), "lambda-tool-admission-missing"
+            runner, _NodeTool(), "lambda-tool-admission-missing"
         )
         failed = next(
             (event for event in refused_events if event.type is EventType.SESSION_FAILED), None
@@ -182,10 +196,10 @@ async def main() -> None:
             failed is not None
             and not refused_provider.requests
             and any(
-                refusal.get("tool_name") == "search_text" and refusal.get("executable") == "rg"
+                refusal.get("tool_name") == "node_program" and refusal.get("executable") == missing
                 for refusal in failed.payload["execution_admission"]["refusals"]
             ),
-            "search_text was not refused before any model request",
+            "node_program was not refused before any model request",
         )
 
         print(

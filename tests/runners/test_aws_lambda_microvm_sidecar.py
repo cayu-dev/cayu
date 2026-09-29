@@ -622,3 +622,48 @@ def test_sidecar_expires_completed_command_results(tmp_path: Path) -> None:
         "command_id": "cmd-expiring",
         "state": "not_found",
     }
+
+
+def test_sidecar_resolves_programs_with_the_guest_shell_default_path(tmp_path: Path) -> None:
+    supervisor = CommandSupervisor(root=tmp_path)
+    supervisor.start(
+        "default-path",
+        {
+            "kind": "process",
+            "argv": [sys.executable, "-c", "import os; print(os.environ['PATH'])"],
+            "cwd": str(tmp_path),
+            "env": {},
+            "stdin_base64": None,
+            "timeout_s": 5,
+            "output_limit_bytes": 1024,
+        },
+    )
+    result = wait_for_terminal(supervisor, "default-path")
+    assert base64.b64decode(result["stdout_base64"]).decode().strip() == (
+        SUPERVISOR_MODULE.DEFAULT_COMMAND_PATH
+    )
+
+    supervisor.start(
+        "explicit-path",
+        {
+            "kind": "process",
+            "argv": [sys.executable, "-c", "import os; print(os.environ['PATH'])"],
+            "cwd": str(tmp_path),
+            "env": {"PATH": "/opt/tools/bin"},
+            "stdin_base64": None,
+            "timeout_s": 5,
+            "output_limit_bytes": 1024,
+        },
+    )
+    explicit = wait_for_terminal(supervisor, "explicit-path")
+    assert base64.b64decode(explicit["stdout_base64"]).decode().strip() == "/opt/tools/bin"
+
+
+def test_sidecar_image_ships_pinned_coding_tools() -> None:
+    dockerfile = (SUPERVISOR_PATH.parent / "Dockerfile").read_text()
+
+    assert "        git \\" in dockerfile
+    assert "ARG RIPGREP_VERSION=14.1.1" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f" in dockerfile
+    assert "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e" in dockerfile

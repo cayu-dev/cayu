@@ -4,7 +4,11 @@ This is the deployable guest half of `LambdaMicroVMRunner`. Cayu distributions s
 build context as a versioned, self-verifying artifact. It exposes the runner's command protocol,
 keeps each command in its own process group, bounds output while still draining pipes, and
 confirms timeout/cancellation cleanup before reporting a terminal result. Commands receive only
-the explicit environment supplied by Cayu; the image environment is not inherited.
+the explicit environment supplied by Cayu; the image environment is not inherited. When that
+environment has no `PATH`, the sidecar uses the guest shell's default
+(`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`) so process commands, shell
+commands, and executable admission probes resolve programs identically. The image ships `git`
+and a pinned, digest-verified `ripgrep` for coding tools.
 
 ## Export the installed artifact
 

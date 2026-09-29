@@ -30,6 +30,7 @@ _TERMINAL_STATES = frozenset({"completed", "cancelled", "failed"})
 _PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
 _AGENT_PROXY_RELAY_PORT = 18080
 LIFECYCLE_ACTIONS = frozenset({"suspend", "terminate"})
+DEFAULT_COMMAND_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 ExecutionProfile = Literal["agent", "trusted"]
 
@@ -689,6 +690,12 @@ def _validated_payload(
     for key, value in raw_env.items():
         env[_nonblank_string(key, "env key")] = _string(value, "env value")
     env = execution_boundary.environment_for(env, execution_profile=execution_profile)
+    if "PATH" not in env:
+        # Resolve programs exactly as the guest shell does. Without this the
+        # launcher falls back to /bin:/usr/bin while /bin/sh (used by admission
+        # probes and shell commands) also searches /usr/local, so a probe could
+        # admit a program that a process command then cannot start.
+        env["PATH"] = DEFAULT_COMMAND_PATH
 
     raw_stdin = request.get("stdin_base64")
     if raw_stdin is None:
