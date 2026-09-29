@@ -1,4 +1,4 @@
-"""Own live staging and exact ordinary, limit and recovered round publication.
+"""Own live staging and exact ordinary, structured, limit and recovered publication.
 
 Execution supplies tool events and outcomes. This owner retains the publication
 evidence and enforces the ordering between private stages, public terminals and
@@ -18,12 +18,14 @@ from typing import Any, Literal, Protocol
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
 from cayu.approvals.tools import ToolPolicyEvidence
+from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputValidation
 from cayu.events import Event, EventType, copy_event
 from cayu.messages import Message
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
@@ -114,6 +116,15 @@ class ToolTerminalPublisher(Protocol):
         terminal_event_emitter: Callable[[Event], Awaitable[Event]] | None,
         hooks_already_completed: bool,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]: ...
+
+
+@dataclass(frozen=True)
+class StructuredToolRoundPublication:
+    """Committed validation and events; session control owns retained cancellation."""
+
+    validation: StructuredOutputValidation
+    events: tuple[Event, ...]
+    cancellation: asyncio.CancelledError | None
 
 
 @dataclass(frozen=True)
@@ -330,6 +341,7 @@ class DurableToolRound:
         *,
         expected_statuses: set[SessionStatus] | None = None,
         expected_transcript_cursor: int | None = None,
+        extension: tool_round_publication.ToolRoundPublicationExtension | None = None,
     ) -> tuple[tool_round_publication.PreparedToolRoundPublication, asyncio.CancelledError | None]:
         """Commit the supplied fresh snapshot and retain its exact replay request."""
 
@@ -349,11 +361,411 @@ class DurableToolRound:
                 if expected_transcript_cursor is None
                 else expected_transcript_cursor
             ),
+            extension=extension,
         )
         cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
             prepared, session_store=self._session_store, event_writer=self._event_writer
         )
         return prepared, cancellation
+
+    async def publish_structured(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        pending_round: tool_round_recovery.PendingToolRound,
+        spec: StructuredOutputSpec,
+        step: int,
+        attempt: int,
+        retry_allowed: bool,
+        execution_profile: ExecutionProfileIdentity | None,
+        redactor: SecretRedactor,
+        tool_redactor: SecretRedactor,
+    ) -> AsyncGenerator[Event | StructuredToolRoundPublication, None]:
+        """Publish live validation; return cancellation for session-level closure."""
+        session = self._session
+        tool_round_identity = self._identity
+        validation = structured_output_tool_round._validate_structured_output_tool_round(
+            tool_calls=tool_calls,
+            spec=spec,
+        )
+        durable_validation = pending_round.structured_output_validation
+        if durable_validation is None:
+            raise RuntimeError("Structured-output tool round lost its authoritative validation.")
+        if durable_validation != structured_output_tool_round._redact_structured_output_validation(
+            validation,
+            redactor,
+        ):
+            raise RuntimeError(
+                "Structured-output validation conflicts with its durable model-completion evidence."
+            )
+        structured_tool_outcomes = (
+            structured_output_tool_round._structured_output_tool_round_outcomes(
+                tool_calls=tool_calls,
+                spec=spec,
+                validation=validation,
+            )
+        )
+        structured_tool_outcomes = tool_results.redact_tool_call_outcomes(
+            structured_tool_outcomes,
+            redactor,
+        )
+        structured_round_redactor = _redactor_for_tool_calls(
+            tool_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
+        for outcome in structured_tool_outcomes:
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.assistant_publication_snapshot_transform(
+                    tool_round_identity=tool_round_identity,
+                    tool_call_id=outcome.call.id,
+                    redactor=structured_round_redactor,
+                    unsafe_output=False,
+                ),
+            )
+            terminal_event = await self._event_writer.emit(
+                event_with_execution_profile_authority(
+                    structured_output_tool_round._structured_output_tool_terminal_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        tool_round_identity=tool_round_identity,
+                        outcome=outcome,
+                    ),
+                    execution_profile,
+                )
+            )
+            yield terminal_event
+
+        extension = self._structured_output_extension(
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            spec=spec,
+            validation=validation,
+            step=step,
+            attempt=attempt,
+            retry_allowed=retry_allowed,
+            execution_profile=execution_profile,
+            redactor=redactor,
+        )
+        source_checkpoint, durable_pending_round = await self._load_pending_round(
+            "Structured-output tool round marker changed before publication."
+        )
+        lifecycle_events = await self._session_store.load_tool_round_lifecycle_events_for_round(
+            session.id,
+            [call.tool_call_id for call in durable_pending_round.tool_calls],
+            tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                durable_pending_round
+            ),
+        )
+        prepared, cancellation = await self._commit_snapshot(
+            source_checkpoint, durable_pending_round, lifecycle_events, extension=extension
+        )
+        messages.extend(prepared.request.transcript_messages)
+        yield StructuredToolRoundPublication(validation, extension.events, cancellation)
+
+    async def recover_structured(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        pending_round: tool_round_recovery.PendingToolRound,
+        retry_allowed: bool,
+        expected_transcript_cursor: int,
+        execution_profile: ExecutionProfileIdentity | None,
+        redactor: SecretRedactor,
+        tool_redactor: SecretRedactor,
+        materialize_expected_deferred_input: DeferredInputMaterializer,
+        invocation_context: InvocationContext | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        """Rebuild one reserved finalizer round from its durable model output."""
+
+        session = self._session
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError(
+                "Structured-output recovery substituted frozen invocation authority."
+            )
+
+        spec = pending_round.structured_output
+        step = pending_round.model_step
+        attempt = pending_round.structured_output_attempt
+        if spec is None or step is None or attempt is None:
+            raise RuntimeError(
+                "Structured-output recovery requires durable config, step, and attempt."
+            )
+        if attempt > spec.max_retries + 1:
+            raise RuntimeError(
+                "Structured-output recovery attempt exceeds the durable retry policy."
+            )
+        tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        validation = pending_round.structured_output_validation
+        if validation is None:
+            raise RuntimeError(
+                "Structured-output recovery requires authoritative durable validation."
+            )
+        validation = validation.model_copy(deep=True)
+        expected_outcomes = structured_output_tool_round._structured_output_tool_round_outcomes(
+            tool_calls=tool_calls,
+            spec=spec,
+            validation=validation,
+        )
+        expected_outcomes = tool_results.redact_tool_call_outcomes(
+            expected_outcomes,
+            redactor,
+        )
+        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        structured_round_redactor = _redactor_for_tool_calls(
+            tool_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
+        for expected_outcome in expected_outcomes:
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.assistant_publication_snapshot_transform(
+                    tool_round_identity=tool_round_identity,
+                    tool_call_id=expected_outcome.call.id,
+                    redactor=structured_round_redactor,
+                    unsafe_output=False,
+                ),
+            )
+        source_checkpoint, pending_round = await self._load_pending_round(
+            "Structured-output tool round changed while sealing its publication projection."
+        )
+        environment_name = _environment_name(registered_environment)
+        lifecycle_events = await tool_round_recovery.load_tool_round_lifecycle_events(
+            self._session_store,
+            session_id=session.id,
+            pending_round=pending_round,
+        )
+        recorded_outcomes, _started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=lifecycle_events,
+            pending_round=pending_round,
+        )
+        terminal_events_by_call = {
+            event.payload["tool_call_id"]: event
+            for event in lifecycle_events
+            if event.type
+            in {
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+            }
+        }
+        planned_terminal_events: list[Event] = []
+        for expected_outcome in expected_outcomes:
+            expected_event = event_with_execution_profile_authority(
+                structured_output_tool_round._structured_output_tool_terminal_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                        pending_round
+                    ),
+                    outcome=expected_outcome,
+                ),
+                execution_profile,
+            )
+            if invocation_context is not None:
+                expected_event = expected_event.model_copy(
+                    update={"interaction_id": invocation_context.binding.interaction_id}
+                )
+            recorded_outcome = recorded_outcomes.get(expected_outcome.call.id)
+            if recorded_outcome is None:
+                planned_terminal_events.append(expected_event)
+                continue
+            recorded_event = terminal_events_by_call.get(expected_outcome.call.id)
+            expected_payload = expected_event.payload
+            legacy_expected_payload = dict(expected_payload)
+            legacy_expected_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
+            recorded_payload_matches = recorded_event is not None and (
+                recorded_event.payload == expected_payload
+                or (
+                    tool_argument_publication.ARGUMENTS_STATE_FIELD not in recorded_event.payload
+                    and recorded_event.payload == legacy_expected_payload
+                )
+            )
+            expected_recorded_outcome = expected_outcome
+            if recorded_event is not None:
+                recorded_projection = tool_argument_publication.terminal_argument_projection(
+                    recorded_event.payload,
+                    legacy_arguments=expected_outcome.call.arguments,
+                )
+                expected_recorded_outcome = runtime_records.ToolCallOutcome(
+                    call=runtime_records.copy_tool_call_request(
+                        expected_outcome.call,
+                        arguments=recorded_projection.transcript_arguments(),
+                        arguments_state=recorded_projection.state,
+                    ),
+                    result=expected_outcome.result,
+                )
+            if (
+                recorded_outcome != expected_recorded_outcome
+                or recorded_event is None
+                or recorded_event.id != expected_event.id
+                or recorded_event.type != expected_event.type
+                or recorded_event.session_id != expected_event.session_id
+                or (
+                    invocation_context is not None
+                    and recorded_event.interaction_id != expected_event.interaction_id
+                )
+                or recorded_event.agent_name != expected_event.agent_name
+                or recorded_event.environment_name != expected_event.environment_name
+                or recorded_event.tool_name != expected_event.tool_name
+                or not recorded_payload_matches
+            ):
+                raise RuntimeError(
+                    "Durable structured-output terminal evidence conflicts with "
+                    f"the pending call: {expected_outcome.call.id}"
+                )
+
+        tool_round_publication.collect_tool_round_publication_evidence(
+            session_id=session.id,
+            pending_round=pending_round,
+            durable_events=[*lifecycle_events, *planned_terminal_events],
+        )
+        emitted_terminal_events: list[Event] = []
+        for terminal_event in planned_terminal_events:
+            emitted_terminal_events.append(await self._event_writer.emit(terminal_event))
+
+        lifecycle_events = await tool_round_recovery.load_tool_round_lifecycle_events(
+            self._session_store,
+            session_id=session.id,
+            pending_round=pending_round,
+        )
+        extension = self._structured_output_extension(
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            spec=spec,
+            validation=validation,
+            step=step,
+            attempt=attempt,
+            retry_allowed=retry_allowed,
+            execution_profile=execution_profile,
+            redactor=redactor,
+            invocation_context=invocation_context,
+        )
+        _, cancellation = await self._commit_snapshot(
+            source_checkpoint,
+            pending_round,
+            lifecycle_events,
+            expected_statuses={
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+                SessionStatus.INTERRUPTED,
+            },
+            expected_transcript_cursor=expected_transcript_cursor,
+            extension=extension,
+        )
+        materialized = await materialize_expected_deferred_input(
+            session.id,
+            pending_round.deferred_messages,
+            cancellation=cancellation,
+        )
+        messages[:] = materialized.messages
+        cancellation = materialized.cancellation
+        for event in emitted_terminal_events:
+            yield event
+        for event in extension.events:
+            yield copy_event(event)
+        if cancellation is not None:
+            raise cancellation
+
+    def _structured_output_extension(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        spec: StructuredOutputSpec,
+        validation: StructuredOutputValidation,
+        step: int,
+        attempt: int,
+        retry_allowed: bool,
+        execution_profile: ExecutionProfileIdentity | None,
+        redactor: SecretRedactor,
+        invocation_context: InvocationContext | None = None,
+    ) -> structured_output_tool_round._StructuredOutputToolRoundPublicationExtension:
+        """Bind validation events and retry intent to the exact round publication."""
+        session = self._session
+        tool_round_identity = self._identity
+        retry_scheduled = not validation.valid and retry_allowed and attempt <= spec.max_retries
+        validating_event = structured_output_tool_round._structured_output_validating_event(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            spec=spec,
+            step=step,
+            attempt=attempt,
+            tool_round_identity=tool_round_identity,
+        )
+        outcome_event = structured_output_tool_round._structured_output_event(
+            event_type=(
+                EventType.STRUCTURED_OUTPUT_VALIDATED
+                if validation.valid
+                else EventType.STRUCTURED_OUTPUT_FAILED
+            ),
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            spec=spec,
+            validation=validation,
+            step=step,
+            attempt=attempt,
+            redactor=redactor,
+            tool_round_identity=tool_round_identity,
+        )
+        auxiliary_events = [validating_event, outcome_event]
+        if retry_scheduled:
+            auxiliary_events.append(
+                structured_output_tool_round._structured_output_event(
+                    event_type=EventType.STRUCTURED_OUTPUT_RETRY,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    spec=spec,
+                    validation=validation,
+                    step=step,
+                    attempt=attempt,
+                    redactor=redactor,
+                    tool_round_identity=tool_round_identity,
+                )
+            )
+        auxiliary_events = self._event_writer.prepare_many(
+            [
+                event_with_execution_profile_authority(
+                    event
+                    if invocation_context is None
+                    else event.model_copy(
+                        update={"interaction_id": invocation_context.binding.interaction_id}
+                    ),
+                    execution_profile,
+                )
+                for event in auxiliary_events
+            ]
+        )
+        return structured_output_tool_round._StructuredOutputToolRoundPublicationExtension(
+            intent={
+                "schema_version": 1,
+                "kind": "structured-output-validation",
+                "step": step,
+                "attempt": attempt,
+                "valid": validation.valid,
+                "retry_scheduled": retry_scheduled,
+                "event_ids": [event.id for event in auxiliary_events],
+            },
+            events=tuple(auxiliary_events),
+        )
 
     async def close_for_limit(
         self,

@@ -277,7 +277,6 @@ from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_results as tool_results
-from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._binding_cleanup import binding_finalize_explicit_cancellation
@@ -481,11 +480,7 @@ from cayu.runtime._structured_output_tool_round import (
     _has_structured_output_tool_call,
     _redact_structured_output_validation,
     _structured_output_event,
-    _structured_output_tool_round_outcomes,
-    _structured_output_tool_terminal_event,
     _structured_output_validating_event,
-    _StructuredOutputToolRoundPublicationExtension,
-    _validate_structured_output_tool_round,
 )
 from cayu.runtime._task_lease_authority import (
     active_task_lease_authority,
@@ -26119,177 +26114,42 @@ class SessionEngine:
                         raise RuntimeError(
                             "Structured-output tool round lost its durable pending marker."
                         )
-                    structured_attempt = structured_output_retries + 1
-                    validation = _validate_structured_output_tool_round(
-                        tool_calls=tool_calls,
-                        spec=structured_output,
-                    )
-                    durable_validation = pending_tool_round.structured_output_validation
-                    if durable_validation is None:
-                        raise RuntimeError(
-                            "Structured-output tool round lost its authoritative validation."
-                        )
-                    if durable_validation != _redact_structured_output_validation(
-                        validation,
-                        self._secret_redactor,
-                    ):
-                        raise RuntimeError(
-                            "Structured-output validation conflicts with its durable "
-                            "model-completion evidence."
-                        )
-                    structured_tool_outcomes = _structured_output_tool_round_outcomes(
-                        tool_calls=tool_calls,
-                        spec=structured_output,
-                        validation=validation,
-                    )
-                    structured_tool_outcomes = tool_results.redact_tool_call_outcomes(
-                        structured_tool_outcomes,
-                        self._secret_redactor,
-                    )
-                    structured_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
-                        registered_agent=registered_agent,
-                        tool_calls=tool_calls,
-                    )
-                    terminal_events: list[Event] = []
-                    for outcome in structured_tool_outcomes:
-                        await self.session_store.transform_checkpoint(
-                            session.id,
-                            tool_round_recovery.assistant_publication_snapshot_transform(
-                                tool_round_identity=tool_round_identity,
-                                tool_call_id=outcome.call.id,
-                                redactor=structured_round_redactor,
-                                unsafe_output=False,
-                            ),
-                        )
-                        terminal_event = await self._event_writer.emit(
-                            event_with_execution_profile_authority(
-                                _structured_output_tool_terminal_event(
-                                    session=session,
-                                    registered_agent=registered_agent,
-                                    environment_name=environment_name,
-                                    tool_round_identity=tool_round_identity,
-                                    outcome=outcome,
-                                ),
-                                execution_profile,
-                            )
-                        )
-                        terminal_events.append(terminal_event)
-                        yield terminal_event
-
-                    retry_scheduled = (
-                        not validation.valid
-                        and structured_output_retries < structured_output.max_retries
-                        and step < max_steps
-                    )
-                    validating_event = _structured_output_validating_event(
+                    round_owner = DurableToolRound(
                         session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        spec=structured_output,
-                        step=step,
-                        attempt=structured_attempt,
                         tool_round_identity=tool_round_identity,
+                        session_store=self.session_store,
+                        event_writer=self._event_writer,
                     )
-                    outcome_event = _structured_output_event(
-                        event_type=(
-                            EventType.STRUCTURED_OUTPUT_VALIDATED
-                            if validation.valid
-                            else EventType.STRUCTURED_OUTPUT_FAILED
-                        ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        spec=structured_output,
-                        validation=validation,
-                        step=step,
-                        attempt=structured_attempt,
-                        redactor=self._secret_redactor,
-                        tool_round_identity=tool_round_identity,
-                    )
-                    auxiliary_events = [validating_event, outcome_event]
-                    if retry_scheduled:
-                        auxiliary_events.append(
-                            _structured_output_event(
-                                event_type=EventType.STRUCTURED_OUTPUT_RETRY,
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                                spec=structured_output,
-                                validation=validation,
-                                step=step,
-                                attempt=structured_attempt,
-                                redactor=self._secret_redactor,
-                                tool_round_identity=tool_round_identity,
-                            )
+                    structured_publication = None
+                    async with contextlib.aclosing(
+                        round_owner.publish_structured(
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            messages=messages,
+                            tool_calls=tool_calls,
+                            pending_round=pending_tool_round,
+                            spec=structured_output,
+                            step=step,
+                            attempt=structured_output_retries + 1,
+                            retry_allowed=step < max_steps,
+                            execution_profile=execution_profile,
+                            redactor=self._secret_redactor,
+                            tool_redactor=self._tool_round_executor._secret_redactor,
                         )
-                    auxiliary_events = self._event_writer.prepare_many(
-                        [
-                            event_with_execution_profile_authority(event, execution_profile)
-                            for event in auxiliary_events
-                        ]
-                    )
-
-                    source_checkpoint = await self.session_store.load_checkpoint(session.id)
-                    durable_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-                        source_checkpoint
-                    )
-                    if (
-                        durable_pending_round is None
-                        or tool_round_recovery.pending_tool_round_identity(durable_pending_round)
-                        != tool_round_identity
-                    ):
-                        raise RuntimeError(
-                            "Structured-output tool round marker changed before publication."
-                        )
-                    lifecycle_events = (
-                        await self.session_store.load_tool_round_lifecycle_events_for_round(
-                            session.id,
-                            [call.tool_call_id for call in durable_pending_round.tool_calls],
-                            tool_round_identity=tool_round_recovery.pending_tool_round_identity(
-                                durable_pending_round
-                            ),
-                        )
-                    )
-                    extension = _StructuredOutputToolRoundPublicationExtension(
-                        intent={
-                            "schema_version": 1,
-                            "kind": "structured-output-validation",
-                            "step": step,
-                            "attempt": structured_attempt,
-                            "valid": validation.valid,
-                            "retry_scheduled": retry_scheduled,
-                            "event_ids": [event.id for event in auxiliary_events],
-                        },
-                        events=tuple(auxiliary_events),
-                    )
-                    prepared_publication = tool_round_publication.prepare_tool_round_publication(
-                        session_id=session.id,
-                        pending_round=durable_pending_round,
-                        source_checkpoint=source_checkpoint,
-                        durable_events=lifecycle_events,
-                        expected_statuses={
-                            SessionStatus.RUNNING,
-                            SessionStatus.INTERRUPTING,
-                        },
-                        expected_run_epoch=session.run_epoch,
-                        expected_transcript_cursor=(
-                            await self.session_store.load_transcript_cursor(session.id)
-                        ),
-                        extension=extension,
-                    )
-                    cancellation = (
-                        await tool_round_publication.publish_tool_round_with_exact_replay(
-                            prepared_publication,
-                            session_store=self.session_store,
-                            event_writer=self._event_writer,
-                        )
-                    )
-                    messages.extend(prepared_publication.request.transcript_messages)
+                    ) as structured_events:
+                        async for item in structured_events:
+                            if isinstance(item, Event):
+                                yield item
+                            else:
+                                structured_publication = item
+                    assert structured_publication is not None
+                    validation = structured_publication.validation
+                    cancellation = structured_publication.cancellation
                     close_new_pending_round_on_interrupt = False
                     if cancellation is not None:
                         raise cancellation
                     await self._session_control.raise_if_interrupted(session.id)
-                    for event in auxiliary_events:
+                    for event in structured_publication.events:
                         yield copy_event(event)
                     await self._stop_at_requested_tool_round_boundary(session)
 

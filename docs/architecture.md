@@ -125,13 +125,20 @@ before returning. Recovery still selects safe outcomes and coordinates workspace
 settlement, uncertain external effects, isolated dispatch evidence and child
 sessions. Those operations do not authorize a second tool execution.
 
+Live and recovered structured-output tool rounds also publish through
+`DurableToolRound`. Live execution validates the original provider arguments and
+checks the result against the durable validation snapshot; recovery uses that
+recorded snapshot. The owner binds validation and retry events to the same atomic
+transcript/checkpoint publication. It retains the distinct live and recovery event order and returns
+live cancellation to session control before auxiliary events reach the caller.
+The session engine owns model-step limits, retry scheduling and session completion.
+
 The owner reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation
 across checkpoint writes. Shared staging, projection and receipt algorithms keep
-their existing authority and cancellation checks. Structured-output and paused
-continuation callers still await migration; some use the shared staging
-implementation directly. Session-level interruption and approval resolution
-retain their existing owners.
+their existing authority and cancellation checks. Paused continuation callers
+still await migration; some use the shared staging implementation directly.
+Session-level interruption and approval resolution retain their existing owners.
 
 `DurableSubagentCoordinator` owns the staged parent seed, child-session, queue-task,
 receipt, and restart-reconciliation handoff for task-backed subagents. The application

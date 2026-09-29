@@ -208,6 +208,7 @@ def store_factory(request, tmp_path):
     async def open_store(fault_type, **fault_options):
         class FaultStore(fault_type, backend_type):
             invocation_lifecycle_command_version = 1
+            session_access_version = 1
 
         if backend == "memory":
             store = FaultStore(**fault_options)
