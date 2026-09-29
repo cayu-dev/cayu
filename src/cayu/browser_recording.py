@@ -94,14 +94,29 @@ class BrowserRecordingConfig(_RecordingModel):
 class BrowserRecordingCapability(_RecordingModel):
     backend: str
     supported: bool
-    reason: Literal["docker_sampled_active_page", "unsupported_backend"]
+    reason: Literal[
+        "docker_sampled_active_page",
+        "lambda_microvm_control_relay",
+        "unsupported_backend",
+    ]
+
+
+_RECORDING_BACKEND_REASONS: dict[
+    str, Literal["docker_sampled_active_page", "lambda_microvm_control_relay"]
+] = {
+    "docker": "docker_sampled_active_page",
+    # Supported only on MicroVMs whose runner verified the control relay; each
+    # dispatch still requires the runner's own recording declaration.
+    "lambda-microvm": "lambda_microvm_control_relay",
+}
 
 
 def browser_recording_capability(backend: str) -> BrowserRecordingCapability:
+    reason = _RECORDING_BACKEND_REASONS.get(backend)
     return BrowserRecordingCapability(
         backend=backend,
-        supported=backend == "docker",
-        reason="docker_sampled_active_page" if backend == "docker" else "unsupported_backend",
+        supported=reason is not None,
+        reason=reason or "unsupported_backend",
     )
 
 

@@ -50,7 +50,11 @@ from cayu.runners.workloads import (
 )
 from cayu.tools import WebBridge
 from cayu.tools.base import ToolContext
-from cayu.tools.browser_session import BrowserSessionTool, _RunnerBrowserSessionBackend
+from cayu.tools.browser_session import (
+    BrowserSessionTool,
+    _browser_recording_admitted,
+    _RunnerBrowserSessionBackend,
+)
 from cayu.vaults import SecretRef, StaticVault
 
 _IMAGE = "arn:aws:lambda:us-east-1:123:microvm-image:cayu-browser"
@@ -252,9 +256,14 @@ def test_operator_control_is_refused_on_lambda_before_any_credential_delivery() 
     assert runner.private_calls == []
 
 
-def test_recording_is_refused_on_lambda_before_dispatch() -> None:
-    assert browser_recording_capability("lambda-microvm").supported is False
-    assert browser_recording_capability("lambda-microvm").reason == "unsupported_backend"
+def test_recording_is_refused_on_a_lambda_runner_without_a_verified_relay() -> None:
+    # The backend can record, but only a runner that verified its control relay.
+    assert browser_recording_capability("lambda-microvm").supported is True
+    assert not _browser_recording_admitted(
+        _LambdaWireRunner(),
+        "lambda-microvm",
+        "wss://cayu-control:18443/api/browser-recordings/guest",
+    )
 
 
 def _credentialless_broker() -> TransparentEgressBroker:

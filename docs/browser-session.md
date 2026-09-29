@@ -21,10 +21,10 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:17-playwright-1.62.0` workload (the Docker image, or on
+`cayu-browser-fetch:18-playwright-1.62.0` workload (the Docker image, or on
 Lambda MicroVM the verified worker described in
 [Lambda MicroVM browser image and admission](#lambda-microvm-browser-image-and-admission)), the
-`cayu.browser-session.v4` protocol and worker version 17, brokered deny-by-default egress,
+`cayu.browser-session.v4` protocol and worker version 18, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -978,13 +978,77 @@ plus a profile checkpoint; larger configured uploads are refused before
 dispatch. The sidecar keeps only a digest of each request and drops a result
 once the host has read it.
 
-Not available on Lambda yet: operator view and takeover (refused before any
-control credential is delivered, because the agent namespace has no route to
-the control plane), recording (`unsupported_backend`), and live browser state
-across suspend, reconnect, or replacement. The browser shares UID 1000 with
-other agent commands in the same MicroVM, as it shares `pwuser` with them on
-Docker; a shell tool in the same session can reach the browser's daemon
-socket and profile directory.
+#### Operator control and recording on Lambda
+
+Operator view, takeover, and recording need the guest to dial the Cayu control
+server. The agent namespace has exactly one route out for this: the sidecar's
+control relay. Configure it on the adapter with the control server's private
+address and the public CA of its certificate:
+
+```python
+from cayu.egress.aws_lambda_microvm_adapter import (
+    LambdaMicroVMBrowserControlRelay,
+    LambdaMicroVMEgressAdapter,
+)
+
+adapter = LambdaMicroVMEgressAdapter(
+    region_name="us-east-1",
+    egress_network_connector_arn=connector_arn,
+    exposure=VpcTaskProxyExposure(task_private_ip),
+    browser_workload=True,
+    browser_control_relay=LambdaMicroVMBrowserControlRelay(
+        host=task_private_ip,  # private IPv4 of the protected Cayu server
+        port=8443,             # its TLS port
+        ca_certificate_pem=control_ca_pem,
+    ),
+)
+browser_control = BrowserControlConfig(
+    policy=policy,
+    purpose=purpose,
+    guest_endpoint="wss://cayu-control:18443/api/browser-control/guest",
+)
+```
+
+Admission then runs three more steps on every created or reconnected MicroVM,
+after the browser workload is proven: a trusted command installs the public CA
+as root-owned, read-only `/etc/cayu/control-ca.pem`; the owner-fenced sidecar
+relays `cayu-control:18443` in the agent namespace to `host:port`; and the
+agent profile completes a TLS handshake through that relay with the worker's own
+control trust. A failure terminates the new MicroVM with
+`LambdaMicroVMBrowserControlError`. Only after the handshake does the runner
+declare `wss://cayu-control:18443/...` reachable, and the browser session tool
+delivers a control or recording credential only to an endpoint the runner
+declares. Other endpoints, or a runner without a verified relay, are refused
+before any credential is sent.
+
+The relay forwards TCP only: TLS is end to end, so the server needs a
+certificate for `cayu-control` issued by that CA, and the guest never holds its
+key. The relay is not the egress proxy, and pages cannot use it: Chromium sends
+all traffic through the Cayu proxy, whose policy does not name the control
+host. The target must be an RFC 1918 IPv4 address, is fixed for the MicroVM's
+current owner (a different target is a conflict), and is cleared when a new
+owner claims the MicroVM or it is suspended, so the next admission configures
+it again. The connector's security group must reach the server's port.
+
+Recording uses the same relay, so its guest endpoint is
+`wss://cayu-control:18443/api/browser-recordings/guest`. Before the adapter
+suspends or terminates the MicroVM it runs the worker's recording finalization
+(normal for a completed run, partial otherwise, bounded to six seconds), as the
+Docker adapter does before disposal. Frames are encoded on the host with FFmpeg.
+
+The worker reads control roots from `/etc/cayu/control-ca.pem` in addition to
+its default trust. The worker's environment points `SSL_CERT_FILE` at the
+session egress CA, which on Amazon Linux replaces the system bundle, so the
+control CA cannot come from the system store there. The file is used only when
+it is root-owned and not group- or world-writable, and an unsafe or unreadable
+file fails closed. Docker images without the file keep their existing trust.
+
+Not available on Lambda yet: live browser state across suspend, reconnect, or
+replacement. The browser shares UID 1000 with other agent commands in the same
+MicroVM, as it shares `pwuser` with them on Docker; a shell tool in the same
+session can reach the browser's daemon socket and profile directory, and can
+open TCP connections through the control relay (the control server still
+requires its short-lived credentials, as on Docker's `cayu-control` network).
 
 ### Large documentation pages
 

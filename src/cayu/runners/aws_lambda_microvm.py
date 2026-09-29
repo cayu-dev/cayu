@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import calendar
+import contextlib
 import importlib
 import json
 import logging
@@ -17,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from math import isfinite
 from typing import Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -93,7 +95,7 @@ DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "4"
+LAMBDA_MICROVM_PROTOCOL_VERSION = "5"
 # Sized for the built-in browser worker: a default session response envelope
 # plus a browser-profile checkpoint, and a default upload batch on stdin. Both
 # match the first-party sidecar's own ceilings.
@@ -102,6 +104,12 @@ LAMBDA_MICROVM_MAX_STDIN_BYTES = 24 * 1024 * 1024
 # A MicroVM fetches its root filesystem lazily, so a first Chromium start
 # measured from a few seconds to about a minute.
 LAMBDA_MICROVM_BROWSER_LAUNCH_TIMEOUT_SECONDS = 120
+#: The agent namespace reaches the Cayu control server only through the
+#: sidecar's control relay, as ``wss://cayu-control:18443/...``.
+LAMBDA_MICROVM_CONTROL_HOSTNAME = "cayu-control"
+LAMBDA_MICROVM_CONTROL_RELAY_PORT = 18443
+_BROWSER_RECORDING_FINALIZE_TIMEOUT_SECONDS = 6
+_CONTROL_CA_MAX_BYTES = 64 * 1024
 LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES + 2) // 3)
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
 _LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
@@ -337,6 +345,10 @@ class LambdaMicroVMBrowserWorkloadError(LambdaMicroVMError):
     """The MicroVM image does not contain this Cayu release's browser worker."""
 
 
+class LambdaMicroVMBrowserControlError(LambdaMicroVMError):
+    """The guest could not reach the Cayu control server through the relay."""
+
+
 class LambdaMicroVMClientTokenConflict(LambdaMicroVMError):
     """AWS rejected a client-token replay because its request parameters changed.
 
@@ -426,6 +438,17 @@ class LambdaMicroVMEndpointTransport(Protocol):
         endpoint: str,
         token: str,
         claim_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]: ...
+
+    async def configure_control_relay(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        owner_claim: str,
+        host: str,
+        port: int,
         timeout_s: float,
     ) -> Mapping[str, Any]: ...
 
@@ -577,6 +600,25 @@ class HttpxLambdaMicroVMEndpointTransport:
             token=token,
             path="/v1/owner/lifecycle/release",
             payload={"claim_id": claim_id},
+            timeout_s=timeout_s,
+        )
+
+    async def configure_control_relay(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        owner_claim: str,
+        host: str,
+        port: int,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path="/v1/control-relay",
+            payload={"owner_claim": owner_claim, "host": host, "port": port},
             timeout_s=timeout_s,
         )
 
@@ -740,6 +782,10 @@ class LambdaMicroVMRunner(Runner):
         self._admission_epoch = 0
         # Set only by a trusted probe of this MicroVM's image; never configured.
         self._browser_workload_verified = False
+        # Set only after the agent profile completed a verified TLS handshake
+        # with the control server through the sidecar relay. The sidecar drops
+        # the relay on suspension, so every lifecycle transition clears it.
+        self._browser_control_relay_verified = False
         # Fail closed: an overlay may carry secret values unless the adapter that
         # built it declares otherwise after verifying the guest boundary.
         self._env_overlay_secret_values_present = bool(self.env_overlay)
@@ -802,6 +848,127 @@ class LambdaMicroVMRunner(Runner):
         """Declare whether command output can contain runner-owned secret values."""
 
         return self._env_overlay_secret_values_present
+
+    def browser_control_endpoint_reachable(self, endpoint: str) -> bool:
+        """Report whether the guest can dial ``endpoint`` for browser control or recording.
+
+        Only the verified control relay leaves the agent namespace, so only its
+        exact ``wss://cayu-control:18443`` authority is reachable. Anything else
+        would carry a control credential toward an address the guest cannot
+        reach, so it is reported unreachable.
+        """
+
+        if not self._browser_control_relay_verified or type(endpoint) is not str:
+            return False
+        try:
+            parsed = urlsplit(endpoint)
+            port = parsed.port
+        except ValueError:
+            return False
+        return (
+            parsed.scheme == "wss"
+            and parsed.hostname == LAMBDA_MICROVM_CONTROL_HOSTNAME
+            and port == LAMBDA_MICROVM_CONTROL_RELAY_PORT
+        )
+
+    def browser_recording_supported(self) -> bool:
+        """Declare recording once the worker and its control relay are both verified.
+
+        Frames leave through the control relay, and the adapter finalizes
+        recordings in the guest before the MicroVM is suspended or terminated.
+        """
+
+        return self._browser_workload_verified and self._browser_control_relay_verified
+
+    async def configure_browser_control_relay(
+        self,
+        *,
+        host: str,
+        port: int,
+        ca_certificate_pem: bytes,
+        timeout_s: int = 30,
+    ) -> None:
+        """Give the agent namespace one verified path to the Cayu control server, or raise.
+
+        A trusted command installs the control server's public CA where the
+        browser worker reads control roots. The owner-fenced sidecar then relays
+        ``cayu-control:18443`` in the agent namespace to ``host:port`` (a private
+        IPv4 target). Finally the agent profile completes a TLS handshake through
+        the relay with the worker's own control trust, which proves the route,
+        the name mapping, and certificate verification without sending any
+        credential. Only then does :meth:`browser_control_endpoint_reachable`
+        report the relay endpoint.
+        """
+
+        from cayu.tools._browser_control_transport import CONTROL_CA_PATH
+
+        certificate = _control_ca_certificate(ca_certificate_pem)
+        if type(host) is not str or not host:
+            raise ValueError("control relay host must be a private IPv4 literal.")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("control relay port must be an integer from 1 to 65535.")
+        self._browser_control_relay_verified = False
+        installed = await self.exec_system(
+            ExecCommand.process("python3", "-c", _CONTROL_CA_INSTALL_SCRIPT, CONTROL_CA_PATH),
+            stdin=certificate.decode("ascii"),
+            timeout_s=timeout_s,
+            output_limit_bytes=_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        if installed.timed_out or installed.exit_code != 0:
+            raise LambdaMicroVMBrowserControlError(
+                "Lambda MicroVM could not install the control server CA."
+            )
+        try:
+            if not self._owner_claimed:
+                await self._claim_owner()
+            await self._endpoint_call(
+                "configure_control_relay",
+                owner_claim=self._owner_claim,
+                host=host,
+                port=port,
+            )
+        except LambdaMicroVMOwnershipSuperseded:
+            self._mark_superseded()
+            raise
+        probe = await self.exec(
+            ExecCommand.process(
+                PINNED_BROWSER_SESSION_WORKLOAD.command[0],
+                "-I",
+                "-c",
+                _CONTROL_RELAY_PROBE_SCRIPT,
+                BROWSER_WORKER_DIRECTORY,
+                LAMBDA_MICROVM_CONTROL_HOSTNAME,
+                str(LAMBDA_MICROVM_CONTROL_RELAY_PORT),
+            ),
+            timeout_s=timeout_s,
+            output_limit_bytes=_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        if probe.timed_out or probe.exit_code != 0:
+            reason = _CONTROL_RELAY_PROBE_FAILURES.get(
+                probe.exit_code, "the relay probe did not complete"
+            )
+            raise LambdaMicroVMBrowserControlError(
+                f"Lambda MicroVM cannot reach the control server: {reason}."
+            )
+        self._browser_control_relay_verified = True
+
+    async def _finalize_browser_recordings(self, *, normal: bool) -> None:
+        """Settle optional media before suspension or termination; never browser input."""
+
+        if not self.browser_recording_supported():
+            return
+        with contextlib.suppress(Exception):
+            await self.exec(
+                ExecCommand.process(
+                    *PINNED_BROWSER_SESSION_WORKLOAD.command,
+                    "--finalize-recordings",
+                    "normal" if normal else "partial",
+                ),
+                timeout_s=_BROWSER_RECORDING_FINALIZE_TIMEOUT_SECONDS,
+                output_limit_bytes=_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+        # A missing acknowledgement is reconciled as partial or unavailable.
+        # Browser input or business work is never repeated to fill a media gap.
 
     async def verify_browser_workload(
         self,
@@ -1615,6 +1782,7 @@ class LambdaMicroVMRunner(Runner):
         if self._suspended or self._termination_requested:
             return
         self._admission_epoch += 1
+        self._browser_control_relay_verified = False
         if fenced:
             await self._owned_provider_mutation("suspend", self._client.suspend_microvm)
         else:
@@ -1630,6 +1798,7 @@ class LambdaMicroVMRunner(Runner):
         if self._termination_requested:
             raise RuntimeError("Cannot resume a terminated Lambda MicroVM.")
         self._admission_epoch += 1
+        self._browser_control_relay_verified = False
         if not self._suspended:
             response = await asyncio.to_thread(
                 self._client.get_microvm, microvmIdentifier=self.microvm_id
@@ -1814,6 +1983,7 @@ class LambdaMicroVMRunner(Runner):
         if self._termination_requested:
             return
         self._admission_epoch += 1
+        self._browser_control_relay_verified = False
         if not fenced:
             await asyncio.to_thread(
                 self._client.terminate_microvm, microvmIdentifier=self.microvm_id
@@ -2562,6 +2732,71 @@ print(json.dumps({
     'certutil': owned('/usr/bin/certutil') and os.access('/usr/bin/certutil', os.X_OK),
 }, sort_keys=True))
 """
+
+
+# Runs in the trusted profile. Installs the control server's public roots where
+# the browser worker's control transport reads them, root-owned and read-only.
+_CONTROL_CA_INSTALL_SCRIPT = """
+import os, sys
+path = sys.argv[1]
+directory = os.path.dirname(path)
+os.makedirs(directory, mode=0o755, exist_ok=True)
+os.chown(directory, 0, 0)
+os.chmod(directory, 0o755)
+temporary = path + '.tmp'
+with open(temporary, 'wb') as handle:
+    handle.write(sys.stdin.buffer.read())
+os.chown(temporary, 0, 0)
+os.chmod(temporary, 0o644)
+os.replace(temporary, path)
+"""
+# Runs in the agent profile with the worker's interpreter and control trust.
+# It completes a TLS handshake through the relay and sends nothing else. Exit
+# status is the whole protocol.
+_CONTROL_RELAY_PROBE_SCRIPT = """
+import socket, ssl, sys
+sys.path.insert(0, sys.argv[1])
+from _browser_control_transport import control_tls_context
+host, port = sys.argv[2], int(sys.argv[3])
+try:
+    context = control_tls_context()
+except Exception:
+    sys.exit(20)
+try:
+    connection = socket.create_connection((host, port), timeout=10)
+except OSError:
+    sys.exit(21)
+try:
+    with context.wrap_socket(connection, server_hostname=host):
+        pass
+except ssl.SSLCertVerificationError:
+    sys.exit(22)
+except (OSError, ssl.SSLError):
+    sys.exit(23)
+"""
+_CONTROL_RELAY_PROBE_FAILURES = {
+    20: "the installed control CA is unusable",
+    21: "the relay did not connect to the control server",
+    22: "the control server certificate is not trusted for cayu-control",
+    23: "the TLS handshake with the control server failed",
+}
+
+
+def _control_ca_certificate(value: object) -> bytes:
+    """Return only the PEM certificates from ``value``; refuse anything else."""
+
+    if type(value) is not bytes or not value or len(value) > _CONTROL_CA_MAX_BYTES:
+        raise ValueError("control CA must be PEM certificate bytes of at most 64 KiB.")
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding
+
+    try:
+        certificates = x509.load_pem_x509_certificates(value)
+    except ValueError:
+        raise ValueError("control CA must contain PEM certificates.") from None
+    if not certificates:
+        raise ValueError("control CA must contain PEM certificates.")
+    return b"".join(certificate.public_bytes(Encoding.PEM) for certificate in certificates)
 
 
 def _browser_workload_mismatch(observed: object, expected: Mapping[str, str]) -> str | None:

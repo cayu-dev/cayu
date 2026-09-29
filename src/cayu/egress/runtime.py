@@ -2275,6 +2275,16 @@ class _EgressManagedRunner(Runner):
             return True
         return self._runner.output_secret_values_present()
 
+    def browser_control_endpoint_reachable(self, endpoint: str) -> bool | None:
+        """Forward the inner runner's guest control-path declaration."""
+
+        return self._runner.browser_control_endpoint_reachable(endpoint)
+
+    def browser_recording_supported(self) -> bool:
+        """Forward the inner runner's recording declaration."""
+
+        return self._runner.browser_recording_supported()
+
     @property
     def closed(self) -> bool:
         """Report whether managed finalization completed."""

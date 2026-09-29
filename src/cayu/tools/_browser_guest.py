@@ -124,7 +124,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "17"
+INTERACTIVE_WORKER_VERSION = "18"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -159,6 +159,11 @@ _INTERACTIVE_DAEMON_ARGUMENT = "--interactive-daemon"
 _INTERACTIVE_ROOT = Path("/tmp/cayu-browser-sessions")
 _INTERACTIVE_IDLE_SECONDS = 15 * 60
 _INTERACTIVE_CONNECT_SECONDS = 5.0
+# The daemon launches Chromium before it listens. A first launch on a guest
+# whose root filesystem is fetched lazily (a Lambda MicroVM) can take far
+# longer than on a local container, so the launching request waits longer
+# for the socket than for any other interactive connection.
+_INTERACTIVE_STARTUP_SECONDS = 20.0
 _INTERACTIVE_STARTUP_SETTLEMENT_SECONDS = 5.0
 _INTERACTIVE_IDLE_POLL_SECONDS = 0.25
 _INTERACTIVE_RESPONSE_DRAIN_SECONDS = 5.0
@@ -4454,7 +4459,7 @@ async def _run_interactive_request(raw: Any) -> dict[str, Any]:
     # is not stranded behind the parent allocation-capacity gate.
     deadline = (
         asyncio.get_running_loop().time()
-        + _INTERACTIVE_CONNECT_SECONDS
+        + _INTERACTIVE_STARTUP_SECONDS
         + _INTERACTIVE_STARTUP_SETTLEMENT_SECONDS
     )
     while asyncio.get_running_loop().time() < deadline:

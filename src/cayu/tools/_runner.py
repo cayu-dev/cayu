@@ -333,6 +333,22 @@ class InvocationRunnerHandle:
             raise TypeError("Runner output_secret_values_present() must return bool or None.")
         return present
 
+    def browser_control_endpoint_reachable(self, endpoint: str) -> bool | None:
+        """Return the runner's guest control-path declaration for ``endpoint``."""
+
+        reachable = self.__runner.browser_control_endpoint_reachable(endpoint)
+        if reachable is not None and type(reachable) is not bool:
+            raise TypeError("Runner browser_control_endpoint_reachable() must return bool or None.")
+        return reachable
+
+    def browser_recording_supported(self) -> bool:
+        """Return the runner's browser recording declaration."""
+
+        supported = self.__runner.browser_recording_supported()
+        if type(supported) is not bool:
+            raise TypeError("Runner browser_recording_supported() must return bool.")
+        return supported
+
     def durable_resource_identity(self) -> str | None:
         """Return a privacy-safe identity for the exact hidden runner allocation."""
 

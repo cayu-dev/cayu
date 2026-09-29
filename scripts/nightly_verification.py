@@ -734,6 +734,45 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="aws-lambda-microvm-browser-control-live",
+        capability=(
+            "AWS Lambda MicroVM browser operator control and recording: a live view frame, "
+            "takeover with private input and handback, and a finalized WebM recording, over "
+            "the sidecar's verified control relay with Chromium's sandbox enabled as UID 1000"
+        ),
+        lane="aws-lambda-microvm",
+        command=(
+            "uv",
+            "run",
+            "--extra",
+            "aws",
+            "--extra",
+            "egress",
+            "--extra",
+            "server",
+            "--extra",
+            "recording",
+            "python",
+            "-m",
+            "examples.aws.lambda_microvm_browser_control_live",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_LAMBDA_MICROVM_BROWSER_CONTROL_LIVE=1",
+            "CAYU_LAMBDA_MICROVM_IMAGE built from `cayu lambda-microvm sidecar export --browser`",
+            "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR whose VPC reaches this host's private address",
+            "a host inside that VPC whose TCP 8443 accepts the connector (the control server)",
+            "FFmpeg (ffmpeg and ffprobe) on this host",
+            "AWS_REGION or AWS_DEFAULT_REGION",
+            "AWS credential chain with Lambda MicroVM run, read, and terminate",
+        ),
+        required_env=("CAYU_LAMBDA_MICROVM_IMAGE", "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR"),
+        required_env_values={"CAYU_LAMBDA_MICROVM_BROWSER_CONTROL_LIVE": "1"},
+        required_any_env=(("AWS_REGION", "AWS_DEFAULT_REGION"),),
+        required_commands=("ffmpeg", "ffprobe"),
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="aws-durable-services-live",
         capability="AWS S3 artifact store and Secrets Manager vault",
         lane="aws-durable-services",

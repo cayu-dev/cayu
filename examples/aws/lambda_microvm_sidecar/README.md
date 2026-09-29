@@ -103,8 +103,8 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `4`. `GET /health` returns
-`{"status":"ok","protocol_version":"4"}` so the host can reject an incompatible image before
+The sidecar implements Cayu Lambda MicroVM command protocol version `5`. `GET /health` returns
+`{"status":"ok","protocol_version":"5"}` so the host can reject an incompatible image before
 sending a command. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
 secret, while ordinary and trusted executions retain their bounded output.
@@ -158,6 +158,15 @@ commands and its root relay presents it to the Cayu proxy in an authenticated tr
 before relaying any agent bytes, so a proxy listener reachable from other MicroVMs on the shared
 connector is usable only through this MicroVM.
 
+Version 5 adds the browser control relay. `POST /v1/control-relay` with the current
+`owner_claim`, a private RFC 1918 IPv4 `host`, and a `port` relays `cayu-control:18443` in the
+agent namespace to that target: the entrypoint accepts only TCP 18443 (besides the proxy relay's
+18080) from the agent namespace and maps `cayu-control` to the namespace gateway in
+`/etc/netns/<namespace>/hosts`. The relay forwards TCP only, so TLS to the Cayu control server
+stays end to end. The target is fixed for the current owner (a different target returns HTTP
+409), and a superseding owner claim or the suspend hook clears it. Browser operator view,
+takeover, and recording use this path; they never use the egress proxy.
+
 - `GET /health`
 - `POST /v1/owner`
 - `POST /v1/owner/check`
@@ -166,6 +175,7 @@ connector is usable only through this MicroVM.
 - `POST /v1/commands`
 - `GET /v1/commands/{command_id}`
 - `POST /v1/commands/{command_id}/release`
+- `POST /v1/control-relay`
 - `DELETE /v1/commands/{command_id}`
 - AWS lifecycle hooks under `/aws/lambda-microvms/runtime/v1/`
 

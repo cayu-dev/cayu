@@ -926,6 +926,23 @@ class Runner(ABC):
 
         return None
 
+    def browser_control_endpoint_reachable(self, endpoint: str) -> bool | None:
+        """Report whether the guest can dial a browser control or recording endpoint.
+
+        ``None`` makes no declaration: reachability then rests on deployment
+        configuration, as with Docker's colocated control-server alias. A runner
+        whose guest has a fixed, verified control path returns ``False`` for
+        every endpoint outside it, so no control credential is sent there.
+        """
+
+        del endpoint
+        return None
+
+    def browser_recording_supported(self) -> bool:
+        """Declare that this runner captures and finalizes browser recordings."""
+
+        return False
+
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
         """Return a stable application declaration, or ``None`` when non-portable."""

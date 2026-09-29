@@ -9,8 +9,10 @@ closing a network connection is never evidence that browser input stopped.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import ssl
+import stat
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -21,6 +23,12 @@ if TYPE_CHECKING:
 CONTROL_MESSAGE_BYTES = 64 * 1024
 CONTROL_FRAME_BYTES = 2 * 1024 * 1024
 CONTROL_SUBPROTOCOL = "cayu.browser-control.v1"
+# Public roots for the control plane, installed by a trusted setup step. The
+# worker's sanitized environment points SSL_CERT_FILE at the session egress CA,
+# which replaces a bundle-file system store (such as Amazon Linux's), so the
+# control roots are loaded from this separate path instead.
+CONTROL_CA_PATH = "/etc/cayu/control-ca.pem"
+_CONTROL_CA_MAX_BYTES = 64 * 1024
 
 
 class BrowserControlTransportUnavailable(RuntimeError):
@@ -66,6 +74,43 @@ def validate_control_endpoint(endpoint: str) -> str:
     return endpoint
 
 
+def control_tls_context(ca_path: str = CONTROL_CA_PATH) -> ssl.SSLContext:
+    """Verify the control plane with the default roots plus installed control roots.
+
+    The control roots are trusted only from a root-owned regular file that no
+    other user can write, in a root-owned directory, so an unprivileged guest
+    process cannot substitute them. An absent file adds nothing, which keeps the
+    default trust behavior. A present file that is unsafe or unreadable fails
+    closed rather than silently falling back.
+    """
+    context = ssl.create_default_context()
+    try:
+        info = os.lstat(ca_path)
+    except FileNotFoundError:
+        return context
+    except OSError:
+        raise BrowserControlTransportUnavailable() from None
+    try:
+        parent = os.lstat(os.path.dirname(ca_path))
+    except OSError:
+        raise BrowserControlTransportUnavailable() from None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or info.st_size > _CONTROL_CA_MAX_BYTES
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_mode & 0o022
+    ):
+        raise BrowserControlTransportUnavailable()
+    try:
+        context.load_verify_locations(cafile=ca_path)
+    except (OSError, ssl.SSLError, ValueError):
+        raise BrowserControlTransportUnavailable() from None
+    return context
+
+
 def _private_transport_logger() -> logging.Logger:
     # Never register this logger: application-wide DEBUG configuration must not
     # enable headers, credentials, screenshots, or input payloads in wire logs.
@@ -95,7 +140,7 @@ async def open_guest_control_channel(
     if type(credential) is not str or re.fullmatch(r"[A-Za-z0-9._~-]{32,4096}", credential) is None:
         raise BrowserControlTransportUnavailable()
     if tls is None:
-        tls = ssl.create_default_context()
+        tls = control_tls_context()
     if tls.verify_mode != ssl.CERT_REQUIRED or not tls.check_hostname:
         raise BrowserControlTransportUnavailable()
 

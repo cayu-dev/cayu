@@ -19,7 +19,7 @@ from .supervisor import (
 )
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
-PROTOCOL_VERSION = "4"
+PROTOCOL_VERSION = "5"
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
 AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
@@ -132,6 +132,40 @@ async def start_command(payload: dict[str, Any]) -> dict[str, Any]:
     owner_claim = command_payload.pop("owner_claim", None)
     try:
         return await asyncio.to_thread(_start_admitted, owner_claim, command_id, command_payload)
+    except OwnerSupersededError as exc:
+        raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
+    except OwnerLifecycleLeasedError as exc:
+        raise HTTPException(status_code=OWNER_LIFECYCLE_LEASED_STATUS, detail=str(exc)) from exc
+    except CommandConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CommandRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _configure_control_relay_admitted(
+    owner_claim: object, host: object, port: object
+) -> dict[str, Any]:
+    # Like command admission, the relay is configured while the fence is held,
+    # so a takeover (which closes the execution boundary) either precedes this
+    # and refuses it, or follows it and clears the relay.
+    with OWNER.admitted(owner_claim):
+        return EXECUTION_BOUNDARY.configure_control_relay(host, port)
+
+
+@app.post("/v1/control-relay")
+async def configure_control_relay(payload: dict[str, Any]) -> dict[str, Any]:
+    """Relay the agent namespace's ``cayu-control`` name to one private control server.
+
+    Only the current owner may configure it. The relay forwards TCP only; the
+    guest verifies the control server's TLS certificate end to end.
+    """
+    try:
+        return await asyncio.to_thread(
+            _configure_control_relay_admitted,
+            payload.get("owner_claim"),
+            payload.get("host"),
+            payload.get("port"),
+        )
     except OwnerSupersededError as exc:
         raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
     except OwnerLifecycleLeasedError as exc:

@@ -38,6 +38,12 @@ LIFECYCLE_ACTIONS = frozenset({"suspend", "terminate"})
 TRANSPORT_TOKEN_ENV = "CAYU_EGRESS_PROXY_TRANSPORT_TOKEN"
 _TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
 _MAX_TRANSPORT_RESPONSE_BYTES = 4096
+# The only route from the agent namespace to the Cayu control server. The
+# trusted host configures one private target; the agent namespace resolves
+# AGENT_CONTROL_HOSTNAME to the gateway, and TLS stays end to end.
+AGENT_CONTROL_RELAY_PORT = 18443
+AGENT_CONTROL_HOSTNAME = "cayu-control"
+_AGENT_GATEWAY = "192.0.2.1"
 DEFAULT_COMMAND_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 ExecutionProfile = Literal["agent", "trusted"]
@@ -207,7 +213,8 @@ class _TcpRelay:
         port: int,
         *,
         transport_token: bytes | None = None,
-        listen_host: str = "192.0.2.1",
+        listen_host: str = _AGENT_GATEWAY,
+        listen_port: int | None = None,
     ) -> None:
         self.target = (host, port)
         self._transport_request = (
@@ -222,7 +229,9 @@ class _TcpRelay:
         )
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind((listen_host, _AGENT_PROXY_RELAY_PORT))
+        self._listener.bind(
+            (listen_host, _AGENT_PROXY_RELAY_PORT if listen_port is None else listen_port)
+        )
         self._listener.listen(32)
         self._listener.settimeout(0.2)
         self.proxy_url = f"http://{listen_host}:{self._listener.getsockname()[1]}"
@@ -231,7 +240,7 @@ class _TcpRelay:
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._accept,
-            name="cayu-agent-proxy-relay",
+            name=f"cayu-agent-relay-{self._listener.getsockname()[1]}",
             daemon=True,
         )
         self._thread.start()
@@ -318,6 +327,7 @@ class CommandExecutionBoundary:
         agent_gid: int | None = None,
         agent_netns: str | None = None,
         relay_factory: Any | None = None,
+        control_relay_factory: Any | None = None,
     ) -> None:
         if (agent_uid is None) != (agent_gid is None):
             raise ValueError("agent_uid and agent_gid must be configured together")
@@ -335,6 +345,31 @@ class CommandExecutionBoundary:
         self._relay: Any | None = None
         self._relay_target: tuple[tuple[str, int], bytes | None] | None = None
         self._relay_lock = threading.Lock()
+        self._control_relay_factory = control_relay_factory or _control_relay
+        self._control_relay: Any | None = None
+        self._control_target: tuple[str, int] | None = None
+
+    def configure_control_relay(self, host: object, port: object) -> dict[str, Any]:
+        """Relay the agent namespace's control hostname to one trusted private target.
+
+        Only the owner-fenced host calls this. The target is fixed for the
+        MicroVM's current owner: repeating it is idempotent, changing it is a
+        conflict, and a superseding owner claim or suspension clears it.
+        """
+        if self.agent_netns is None:
+            raise CommandRequestError("control relay requires the agent network namespace")
+        target = (_private_ipv4(host, what="control relay target"), _tcp_port(port))
+        with self._relay_lock:
+            if self._control_relay is None:
+                self._control_relay = self._control_relay_factory(*target)
+                self._control_target = target
+            elif self._control_target != target:
+                raise CommandConflictError("control relay target changed within one MicroVM")
+        return {
+            "hostname": AGENT_CONTROL_HOSTNAME,
+            "port": AGENT_CONTROL_RELAY_PORT,
+            "target": f"{target[0]}:{target[1]}",
+        }
 
     def argv_for(
         self,
@@ -404,11 +439,18 @@ class CommandExecutionBoundary:
 
     def close(self) -> None:
         with self._relay_lock:
-            relay = self._relay
+            relays = (self._relay, self._control_relay)
             self._relay = None
             self._relay_target = None
-        if relay is not None:
-            relay.close()
+            self._control_relay = None
+            self._control_target = None
+        for relay in relays:
+            if relay is not None:
+                relay.close()
+
+
+def _control_relay(host: str, port: int) -> _TcpRelay:
+    return _TcpRelay(host, port, listen_port=AGENT_CONTROL_RELAY_PORT)
 
 
 @dataclass
@@ -833,24 +875,30 @@ def _private_http_proxy(value: str) -> tuple[str, int]:
         or parsed.fragment
     ):
         raise CommandRequestError("agent proxy must be an unauthenticated HTTP origin")
+    return _private_ipv4(parsed.hostname, what="agent proxy host"), port
+
+
+_PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def _private_ipv4(value: object, *, what: str) -> str:
+    if type(value) is not str:
+        raise CommandRequestError(f"{what} must be a private IPv4 literal")
     try:
-        address = ipaddress.IPv4Address(parsed.hostname)
+        address = ipaddress.IPv4Address(value)
     except ipaddress.AddressValueError as exc:
-        raise CommandRequestError("agent proxy host must be a private IPv4 literal") from exc
-    address_value = int(address)
-    if not (
-        int(ipaddress.IPv4Address("10.0.0.0"))
-        <= address_value
-        <= int(ipaddress.IPv4Address("10.255.255.255"))
-        or int(ipaddress.IPv4Address("172.16.0.0"))
-        <= address_value
-        <= int(ipaddress.IPv4Address("172.31.255.255"))
-        or int(ipaddress.IPv4Address("192.168.0.0"))
-        <= address_value
-        <= int(ipaddress.IPv4Address("192.168.255.255"))
-    ):
-        raise CommandRequestError("agent proxy host must be a private IPv4 literal")
-    return str(address), port
+        raise CommandRequestError(f"{what} must be a private IPv4 literal") from exc
+    if not any(address in network for network in _PRIVATE_IPV4_NETWORKS):
+        raise CommandRequestError(f"{what} must be a private IPv4 literal")
+    return str(address)
+
+
+def _tcp_port(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 65535:
+        raise CommandRequestError("control relay port must be an integer from 1 to 65535")
+    return value
 
 
 def _transport_token(value: str) -> bytes:

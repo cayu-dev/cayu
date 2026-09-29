@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -193,11 +193,48 @@ MAX_BROWSER_SESSION_MAX_UPLOAD_FILENAME_BYTES = 255
 MAX_BROWSER_SESSION_MAX_UPLOAD_MATERIALIZATION_MS = 120_000
 
 _MAX_BROWSER_ID_LENGTH = 128
-# Operator control needs the guest to dial the Cayu control plane. A Lambda
-# MicroVM's agent namespace routes only to the egress proxy relay, so control is
-# refused there before any credential is delivered. Recording is gated to Docker
-# separately.
-_BROWSER_CONTROL_UNREACHABLE_BACKENDS = frozenset({"lambda-microvm"})
+# Operator control and recording need the guest to dial the Cayu control plane.
+# These backends reach it only through a runner-verified path, so the runner
+# must positively declare the exact endpoint reachable before any control
+# credential is delivered.
+_BROWSER_CONTROL_DECLARED_BACKENDS = frozenset({"lambda-microvm"})
+
+
+@runtime_checkable
+class _GuestControlAwareRunnerHandle(Protocol):
+    def browser_control_endpoint_reachable(self, endpoint: str) -> bool | None: ...
+
+    def browser_recording_supported(self) -> bool: ...
+
+
+def _guest_control_endpoint_admitted(runner: object, candidate: str, endpoint: str) -> bool:
+    """Admit a guest control endpoint only where the runner does not deny it.
+
+    Backends in ``_BROWSER_CONTROL_DECLARED_BACKENDS`` must positively declare
+    the endpoint; others may make no declaration.
+    """
+
+    reachable: bool | None = None
+    if isinstance(runner, _GuestControlAwareRunnerHandle):
+        try:
+            reachable = runner.browser_control_endpoint_reachable(endpoint)
+        except Exception:
+            return False
+    if reachable is None:
+        return candidate not in _BROWSER_CONTROL_DECLARED_BACKENDS
+    return reachable is True
+
+
+def _browser_recording_admitted(runner: object, candidate: str, endpoint: str) -> bool:
+    if not isinstance(runner, _GuestControlAwareRunnerHandle):
+        return False
+    try:
+        supported = runner.browser_recording_supported()
+    except Exception:
+        return False
+    return supported is True and _guest_control_endpoint_admitted(runner, candidate, endpoint)
+
+
 _MAX_OPERATION_ID_LENGTH = 128
 _MAX_REF_LENGTH = 128
 _MAX_ELEMENT_TEXT_BYTES = 2 * 1024
@@ -645,7 +682,7 @@ class BrowserBackendIdentity(BaseModel):
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
     worker_protocol: Literal["cayu.browser-session.v4"]
-    worker_version: Literal["17"]
+    worker_version: Literal["18"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod
@@ -1421,9 +1458,8 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             control_candidate = runner.execution_admission_candidate()
         except Exception:
             control_candidate = None
-        if (
-            control_candidate is None
-            or control_candidate.candidate in _BROWSER_CONTROL_UNREACHABLE_BACKENDS
+        if control_candidate is None or not _guest_control_endpoint_admitted(
+            runner, control_candidate.candidate, endpoint
         ):
             raise RuntimeError(
                 "Browser operator control is unavailable: the selected runner has no "
@@ -1818,7 +1854,12 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
             return _pre_dispatch_backend_failure(request, "capability_refused")
         if not _browser_runner_is_admitted(candidate):
             return _pre_dispatch_backend_failure(request, "capability_refused")
-        if self.recording is not None and (candidate is None or candidate.candidate != "docker"):
+        if self.recording is not None and (
+            candidate is None
+            or not _browser_recording_admitted(
+                runner, candidate.candidate, self.recording.guest_endpoint
+            )
+        ):
             return _pre_dispatch_backend_failure(request, "capability_refused")
         if self.recording is not None and (
             not isinstance(runner, _OutputSecretAwareRunnerHandle)

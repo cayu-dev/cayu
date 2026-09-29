@@ -1,4 +1,4 @@
-# Docker browser recordings
+# Browser recordings
 
 Browser recording is **off by default**. An application can authorize a finite
 recording scope for one exact Runtime session and selected HTTPS origins. Model
@@ -18,6 +18,17 @@ worker with `cayu[recording]`, and FFmpeg with the VP8 encoder. Probe the backen
 contract with `browser_recording_capability("docker")`; other backend names report
 `unsupported_backend`. There is no host-browser or dashboard-canvas fallback.
 The recording store checks encoder/dependency availability before issuing consent.
+
+AWS Lambda MicroVM also records (`browser_recording_capability("lambda-microvm")`
+reports `lambda_microvm_control_relay`), but only on a MicroVM whose runner
+verified the sidecar's control relay: configure
+`LambdaMicroVMEgressAdapter(browser_workload=True, browser_control_relay=...)`
+and use the guest endpoint `wss://cayu-control:18443/api/browser-recordings/guest`
+(see [operator control and recording on Lambda](browser-session.md#operator-control-and-recording-on-lambda)).
+Each dispatch still requires the runner's own recording declaration and a
+reachable guest endpoint, so a backend name alone never admits recording. The
+adapter finalizes recordings in the guest before it suspends or terminates the
+MicroVM.
 
 The guest starts a bounded sampling task before its first page is created. It
 samples the **active page viewport**, at up to the configured rate (default two

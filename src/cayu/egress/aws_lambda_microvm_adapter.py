@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import email.utils
+import ipaddress
 import secrets
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
 from typing import Any, Literal, TypedDict
@@ -130,6 +132,40 @@ class _ReconnectIdentity(TypedDict):
     image_version: str | None
 
 
+_RFC1918_NETWORKS = tuple(
+    ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LambdaMicroVMBrowserControlRelay:
+    """The Cayu control server a browser MicroVM may dial, and the CA it presents.
+
+    ``host`` and ``port`` are the control server's private IPv4 address and TLS
+    port inside the egress connector's VPC. The guest reaches it only as
+    ``wss://cayu-control:18443/...``, so configure ``BrowserControlConfig`` and
+    recording guest endpoints with that authority and give the server a
+    certificate for ``cayu-control`` issued by ``ca_certificate_pem``. Only the
+    public CA is installed in the guest.
+    """
+
+    host: str
+    port: int
+    ca_certificate_pem: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            address = ipaddress.IPv4Address(self.host)
+        except (ipaddress.AddressValueError, TypeError):
+            raise ValueError("control relay host must be a private IPv4 literal.") from None
+        if not any(address in network for network in _RFC1918_NETWORKS):
+            raise ValueError("control relay host must be a private IPv4 literal.")
+        if type(self.port) is not int or not 1 <= self.port <= 65535:
+            raise ValueError("control relay port must be an integer from 1 to 65535.")
+        if type(self.ca_certificate_pem) is not bytes or not self.ca_certificate_pem:
+            raise ValueError("control relay requires the control server's PEM CA bytes.")
+
+
 class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     """Run virtual-egress sandboxes in AWS Lambda MicroVMs.
 
@@ -208,6 +244,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         runner_options: Mapping[str, Any] | None = None,
         client_token_replay_window_s: int = DEFAULT_CLIENT_TOKEN_REPLAY_WINDOW_SECONDS,
         browser_workload: bool = False,
+        browser_control_relay: LambdaMicroVMBrowserControlRelay | None = None,
     ) -> None:
         if (
             type(client_token_replay_window_s) is not int
@@ -228,6 +265,13 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             raise ValueError("metadata_isolation must be 'required' or 'unverified'.")
         if type(browser_workload) is not bool:
             raise TypeError("browser_workload must be a boolean.")
+        if browser_control_relay is not None:
+            if type(browser_control_relay) is not LambdaMicroVMBrowserControlRelay:
+                raise TypeError("browser_control_relay must be LambdaMicroVMBrowserControlRelay.")
+            if not browser_workload:
+                raise ValueError("browser_control_relay requires browser_workload=True.")
+            if metadata_isolation != "required":
+                raise ValueError("browser_control_relay requires metadata_isolation='required'.")
         self.region_name = region_name
         self.egress_network_connector_arn = egress_network_connector_arn
         self.exposure = exposure
@@ -249,6 +293,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         self.runner_options = dict(runner_options or {})
         self.client_token_replay_window_s = client_token_replay_window_s
         self.browser_workload = browser_workload
+        self.browser_control_relay = browser_control_relay
         self._runner_session_ids: weakref.WeakKeyDictionary[Runner, str] = (
             weakref.WeakKeyDictionary()
         )
@@ -688,6 +733,14 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             if self.browser_workload:
                 # The launch step keeps its own budget for a cold Chromium start.
                 await runner.verify_browser_workload(timeout_s=self.preflight_timeout_s)
+            if self.browser_control_relay is not None:
+                relay = self.browser_control_relay
+                await runner.configure_browser_control_relay(
+                    host=relay.host,
+                    port=relay.port,
+                    ca_certificate_pem=relay.ca_certificate_pem,
+                    timeout_s=self.preflight_timeout_s,
+                )
             self._runner_preflight_observations[runner] = preflight_observed_at
         except BaseException:
             if owns_allocation:
@@ -853,6 +906,11 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         if not isinstance(runner, LambdaMicroVMRunner):
             raise TypeError("Lambda MicroVM adapter received a different runner type.")
         preserve = outcome == "interrupted"
+        # Recordings settle while the browser still runs: a completed run
+        # finalizes normally and anything else is published as partial.
+        finalize_recordings = getattr(runner, "_finalize_browser_recordings", None)
+        if callable(finalize_recordings):
+            await finalize_recordings(normal=outcome == "completed")
         runner.close_action = "suspend" if preserve else "terminate"
         # close() returns only after the control plane reports SUSPENDED or
         # TERMINATED, which is the quiescence and preservation proof.

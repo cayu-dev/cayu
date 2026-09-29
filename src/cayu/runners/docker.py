@@ -2863,6 +2863,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             return PINNED_BROWSER_SESSION_WORKLOAD
         return None
 
+    def browser_recording_supported(self) -> bool:
+        """Docker samples the active page and finalizes recordings before disposal."""
+
+        return True
+
     def output_secret_values_present(self) -> bool:
         """Declare whether Docker resolves runner-owned secret environment values."""
 
