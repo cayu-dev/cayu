@@ -222,6 +222,13 @@ from cayu.tasks.topology import (
 SERVER_API_PREFIX = "/api"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:cayu_event_<sequence>"
+SESSION_FOLLOW_PATH = "/sessions/{session_id}/events/stream"
+DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS = 300.0
+DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS = 15.0
+DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL = 16
+DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION = 32
+SESSION_FOLLOW_RETRY_AFTER_SECONDS = 5
+SESSION_EVENTS_MAX_WAIT_SECONDS = 25.0
 DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES = 1024 * 1024
 MAX_SESSION_TOPOLOGY_RESULT_BYTES = 4 * 1024 * 1024
 MAX_SESSION_TOPOLOGY_REQUEST_BYTES = 256 * 1024
@@ -748,6 +755,70 @@ class SseFrameExamples(ApiBaseModel):
     error_data: SseErrorEnvelope = Field(default_factory=_sse_error_example)
 
 
+class SseSessionFollowEndEnvelope(ApiBaseModel):
+    """JSON payload in the final ``event: end`` frame of a session follow stream."""
+
+    type: Literal["session.follow.end"]
+    session_id: str
+    status: Literal["pending", "running", "interrupting", "completed", "failed", "interrupted"]
+
+
+def _session_follow_end_example() -> SseSessionFollowEndEnvelope:
+    return SseSessionFollowEndEnvelope(
+        type="session.follow.end",
+        session_id="session-123",
+        status="completed",
+    )
+
+
+class SessionFollowContract(ApiBaseModel):
+    """Read-only SSE stream that follows one session's durable events.
+
+    The stream never admits, re-runs, or acknowledges a mutation. It emits the
+    same ``SseEventEnvelope`` frames as mutation streams, SSE comment heartbeats,
+    and one final ``event: end`` frame after the session's terminal event.
+    """
+
+    method: Literal["GET"] = "GET"
+    path_template: str = f"{SERVER_API_PREFIX}{SESSION_FOLLOW_PATH}"
+    event_id_format: Literal["session_id:cayu_event_<sequence>"] = SSE_LAST_EVENT_ID_FORMAT
+    start_query_param: Literal["after_sequence"] = "after_sequence"
+    resume_header: Literal["Last-Event-ID"] = "Last-Event-ID"
+    unknown_event_marker_behavior: Literal["reject"] = "reject"
+    filter_query_params: tuple[
+        Literal["event_type", "exclude_event_type", "interaction_id"], ...
+    ] = ("event_type", "exclude_event_type", "interaction_id")
+    event_data_schema: Literal["SseEventEnvelope"] = "SseEventEnvelope"
+    heartbeat_interval_seconds: float = Field(
+        default=DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
+        gt=0,
+        description="Seconds between SSE comment heartbeat lines that start with `:`.",
+    )
+    end_event_name: Literal["end"] = "end"
+    end_data_schema: Literal["SseSessionFollowEndEnvelope"] = "SseSessionFollowEndEnvelope"
+    terminal_behavior: Literal["end_after_terminal_event"] = "end_after_terminal_event"
+    idle_timeout_seconds: float = Field(
+        default=DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
+        gt=0,
+        description=(
+            "Seconds a running session may produce no durable events before the "
+            "stream sends a retryable `replay_idle_timeout` error and closes."
+        ),
+    )
+    max_streams_per_principal: StrictInt = Field(
+        default=DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL,
+        ge=1,
+    )
+    max_streams_per_session: StrictInt = Field(
+        default=DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION,
+        ge=1,
+    )
+    limit_exceeded_status: Literal[429] = 429
+    end_data_example: SseSessionFollowEndEnvelope = Field(
+        default_factory=_session_follow_end_example
+    )
+
+
 class SseContract(ApiBaseModel):
     content_type: Literal["text/event-stream"] = SSE_CONTENT_TYPE
     event_id_format: Literal["session_id:cayu_event_<sequence>"] = SSE_LAST_EVENT_ID_FORMAT
@@ -771,6 +842,7 @@ class SseContract(ApiBaseModel):
         description="Maximum UTF-8 bytes in the redacted error field.",
     )
     examples: SseFrameExamples = Field(default_factory=SseFrameExamples)
+    session_follow: SessionFollowContract = Field(default_factory=SessionFollowContract)
 
 
 class ClientGenerationContract(ApiBaseModel):
@@ -2829,6 +2901,52 @@ BOUNDED_STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     413: {
         "description": "The control-plane request exceeds its encoded byte limit.",
         "model": ApiErrorResponse,
+    },
+}
+
+SESSION_FOLLOW_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": (
+            "Read-only Server-Sent Events stream of one session's durable events. "
+            "Each event is an SSE frame with an `id:` marker and a JSON "
+            "SseEventEnvelope `data:` value. Heartbeats are SSE comment lines. "
+            "After the session's terminal event the stream sends `event: end` "
+            "with a SseSessionFollowEndEnvelope and closes. A classified observer "
+            "condition is emitted as `event: error` with a SseErrorEnvelope payload."
+        ),
+        "content": {
+            SSE_CONTENT_TYPE: {
+                "schema": {
+                    "type": "string",
+                    "description": (
+                        "SSE stream. Event `data:` frames contain SseEventEnvelope JSON; "
+                        "`event: end` frames contain SseSessionFollowEndEnvelope JSON; "
+                        "`event: error` frames contain SseErrorEnvelope JSON."
+                    ),
+                }
+            }
+        },
+    },
+    404: {
+        "description": "The session does not exist.",
+        "model": ApiErrorResponse,
+    },
+    409: {
+        "description": "The Last-Event-ID event marker is unknown in this session.",
+        "model": ApiErrorResponse,
+    },
+    429: {
+        "description": (
+            "The caller or session already holds the configured maximum number of "
+            "follow streams. Retry after the `Retry-After` header."
+        ),
+        "model": ApiErrorResponse,
+    },
+}
+
+SESSION_STATE_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    304: {
+        "description": ("The session state is unchanged from the `If-None-Match` entity tag."),
     },
 }
 

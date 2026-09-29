@@ -92,6 +92,10 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.session_topology_supported,
                     mutation_supported=False,
                 ),
+                session_follow=_optional_surface(
+                    True,
+                    mutation_supported=False,
+                ),
                 tasks=_optional_surface(
                     self.tasks_configured,
                     mutation_supported=True,

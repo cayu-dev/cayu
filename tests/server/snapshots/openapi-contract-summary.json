@@ -5075,6 +5075,16 @@
         "reviewed_knowledge": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
+        "session_follow": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tasks": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
@@ -9063,6 +9073,125 @@
       "title": "SessionExecutionSource",
       "type": "string"
     },
+    "SessionFollowContract": {
+      "additionalProperties": false,
+      "description": "Read-only SSE stream that follows one session's durable events.\n\nThe stream never admits, re-runs, or acknowledges a mutation. It emits the\nsame ``SseEventEnvelope`` frames as mutation streams, SSE comment heartbeats,\nand one final ``event: end`` frame after the session's terminal event.",
+      "properties": {
+        "end_data_example": {
+          "$ref": "#/components/schemas/SseSessionFollowEndEnvelope"
+        },
+        "end_data_schema": {
+          "const": "SseSessionFollowEndEnvelope",
+          "default": "SseSessionFollowEndEnvelope",
+          "title": "End Data Schema",
+          "type": "string"
+        },
+        "end_event_name": {
+          "const": "end",
+          "default": "end",
+          "title": "End Event Name",
+          "type": "string"
+        },
+        "event_data_schema": {
+          "const": "SseEventEnvelope",
+          "default": "SseEventEnvelope",
+          "title": "Event Data Schema",
+          "type": "string"
+        },
+        "event_id_format": {
+          "const": "session_id:cayu_event_<sequence>",
+          "default": "session_id:cayu_event_<sequence>",
+          "title": "Event Id Format",
+          "type": "string"
+        },
+        "filter_query_params": {
+          "default": [
+            "event_type",
+            "exclude_event_type",
+            "interaction_id"
+          ],
+          "items": {
+            "enum": [
+              "event_type",
+              "exclude_event_type",
+              "interaction_id"
+            ],
+            "type": "string"
+          },
+          "title": "Filter Query Params",
+          "type": "array"
+        },
+        "heartbeat_interval_seconds": {
+          "default": 15.0,
+          "description": "Seconds between SSE comment heartbeat lines that start with `:`.",
+          "exclusiveMinimum": 0.0,
+          "title": "Heartbeat Interval Seconds",
+          "type": "number"
+        },
+        "idle_timeout_seconds": {
+          "default": 300.0,
+          "description": "Seconds a running session may produce no durable events before the stream sends a retryable `replay_idle_timeout` error and closes.",
+          "exclusiveMinimum": 0.0,
+          "title": "Idle Timeout Seconds",
+          "type": "number"
+        },
+        "limit_exceeded_status": {
+          "const": 429,
+          "default": 429,
+          "title": "Limit Exceeded Status",
+          "type": "integer"
+        },
+        "max_streams_per_principal": {
+          "default": 16,
+          "minimum": 1.0,
+          "title": "Max Streams Per Principal",
+          "type": "integer"
+        },
+        "max_streams_per_session": {
+          "default": 32,
+          "minimum": 1.0,
+          "title": "Max Streams Per Session",
+          "type": "integer"
+        },
+        "method": {
+          "const": "GET",
+          "default": "GET",
+          "title": "Method",
+          "type": "string"
+        },
+        "path_template": {
+          "default": "/api/sessions/{session_id}/events/stream",
+          "title": "Path Template",
+          "type": "string"
+        },
+        "resume_header": {
+          "const": "Last-Event-ID",
+          "default": "Last-Event-ID",
+          "title": "Resume Header",
+          "type": "string"
+        },
+        "start_query_param": {
+          "const": "after_sequence",
+          "default": "after_sequence",
+          "title": "Start Query Param",
+          "type": "string"
+        },
+        "terminal_behavior": {
+          "const": "end_after_terminal_event",
+          "default": "end_after_terminal_event",
+          "title": "Terminal Behavior",
+          "type": "string"
+        },
+        "unknown_event_marker_behavior": {
+          "const": "reject",
+          "default": "reject",
+          "title": "Unknown Event Marker Behavior",
+          "type": "string"
+        }
+      },
+      "title": "SessionFollowContract",
+      "type": "object"
+    },
     "SessionMessageActionBody": {
       "additionalProperties": false,
       "properties": {
@@ -10287,6 +10416,9 @@
           "title": "Replay Start Marker Format",
           "type": "string"
         },
+        "session_follow": {
+          "$ref": "#/components/schemas/SessionFollowContract"
+        },
         "unknown_event_marker_behavior": {
           "const": "reject",
           "default": "reject",
@@ -10467,6 +10599,40 @@
         }
       },
       "title": "SseFrameExamples",
+      "type": "object"
+    },
+    "SseSessionFollowEndEnvelope": {
+      "additionalProperties": false,
+      "description": "JSON payload in the final ``event: end`` frame of a session follow stream.",
+      "properties": {
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "interrupting",
+            "completed",
+            "failed",
+            "interrupted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "type": {
+          "const": "session.follow.end",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "session_id",
+        "status"
+      ],
+      "title": "SseSessionFollowEndEnvelope",
       "type": "object"
     },
     "StructuredOutputSpec": {
@@ -11650,15 +11816,6 @@
           "const": "tool_call",
           "default": "tool_call",
           "title": "Type",
-          "type": "string"
-        },
-        "arguments_state": {
-          "default": "finalized",
-          "enum": [
-            "finalized",
-            "unavailable"
-          ],
-          "title": "Arguments State",
           "type": "string"
         }
       },
@@ -16115,6 +16272,25 @@
           },
           {
             "in": "query",
+            "name": "wait_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 25.0,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Long-poll fallback for clients that cannot hold the follow stream open. Wait up to this many seconds for a matching event after `after_sequence` while the session is pending, running, or interrupting, then return the page (possibly empty).",
+              "title": "Wait Seconds"
+            }
+          },
+          {
+            "in": "query",
             "name": "workflow_name",
             "required": false,
             "schema": {
@@ -16145,6 +16321,133 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/events/stream": {
+      "get": {
+        "operation_id": "follow_session_events_api_sessions__session_id__events_stream_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Stream only events with a greater durable sequence. Ignored when a `Last-Event-ID` header is present.",
+              "title": "After Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send only events of this type.",
+              "title": "Event Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Do not send events of this type.",
+              "title": "Exclude Event Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send only events attributed to this interaction.",
+              "title": "Interaction Id"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Event `data:` frames contain SseEventEnvelope JSON; `event: end` frames contain SseSessionFollowEndEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -17082,6 +17385,9 @@
               }
             }
           },
+          "304": {
+            "content": {}
+          },
           "422": {
             "content": {
               "application/json": {
@@ -17755,70 +18061,6 @@
         }
       }
     },
-    "/api/tasks/{task_id}/schedule/events": {
-      "get": {
-        "operation_id": "list_task_schedule_events_api_tasks__task_id__schedule_events_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "task_id",
-            "required": true,
-            "schema": {
-              "minLength": 1,
-              "title": "Task Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "after_sequence",
-            "required": false,
-            "schema": {
-              "default": 0,
-              "maximum": 9007199254740991,
-              "minimum": 0,
-              "title": "After Sequence",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "default": 100,
-              "maximum": 1000,
-              "minimum": 1,
-              "title": "Limit",
-              "type": "integer"
-            }
-          }
-        ],
-        "request_body": {
-          "content": {}
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "items": {
-                  "$ref": "#/components/schemas/ApiTaskScheduleEvent"
-                },
-                "title": "Response List Task Schedule Events Api Tasks  Task Id  Schedule Events Get",
-                "type": "array"
-              }
-            }
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "$ref": "#/components/schemas/HTTPValidationError"
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/tasks/{task_id}/needs-attention": {
       "post": {
         "operation_id": "mark_task_needs_attention_api_tasks__task_id__needs_attention_post",
@@ -17938,6 +18180,70 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/schedule/events": {
+      "get": {
+        "operation_id": "list_task_schedule_events_api_tasks__task_id__schedule_events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "title": "After Sequence",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "items": {
+                  "$ref": "#/components/schemas/ApiTaskScheduleEvent"
+                },
+                "title": "Response List Task Schedule Events Api Tasks  Task Id  Schedule Events Get",
+                "type": "array"
               }
             }
           },

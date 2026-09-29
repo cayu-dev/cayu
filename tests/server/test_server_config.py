@@ -339,6 +339,15 @@ def test_cors_and_lifecycle_configuration_are_finite_and_immutable() -> None:
         ServerLifecycleConfig(replay_idle_timeout_s=float("inf"))
     with pytest.raises(ValidationError, match="non-negative integer"):
         ServerLifecycleConfig(recovery_inactive_after_seconds=True)
+    with pytest.raises(ValidationError, match="finite positive"):
+        ServerLifecycleConfig(session_follow_heartbeat_s=0)
+    for field_name in (
+        "session_follow_max_streams_per_principal",
+        "session_follow_max_streams_per_session",
+    ):
+        for value in (0, True, 1.5):
+            with pytest.raises(ValidationError, match="positive integer"):
+                ServerLifecycleConfig(**{field_name: value})
     with pytest.raises(ValidationError, match="must not be empty"):
         ServerLifecycleConfig(startup_recovery_statuses=set())
     terminal_recovery = ServerLifecycleConfig(startup_recovery_statuses={SessionStatus.COMPLETED})

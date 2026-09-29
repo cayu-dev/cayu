@@ -188,8 +188,9 @@ explicit application policy decision for its exact authority.
   one durable eval store, and the embedded fenced execution coordinator;
 - `docs`: generated OpenAPI, Swagger UI, and ReDoc exposure;
 - `cors`: allowed origins, methods, headers, and credential behavior; and
-- `lifecycle`: replay timeout, startup recovery, inactivity fencing, durable
-  side-effect recovery, and shutdown drain limits.
+- `lifecycle`: replay timeout, session follow-stream heartbeat and concurrency
+  caps, startup recovery, inactivity fencing, durable side-effect recovery, and
+  shutdown drain limits.
 
 The packaged dashboard uses the configured local control-plane API, so an
 enabled dashboard requires an enabled API. Disable both when exposing neither

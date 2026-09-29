@@ -3842,6 +3842,7 @@ export type ControlPlaneSurfaceCapabilities = {
     evaluation_promotion: OptionalSurfaceCapability;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
+    session_follow?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
@@ -15607,6 +15608,87 @@ export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_is
 export type SessionExecutionSource = 'http_run' | 'sdk_run' | 'fork' | 'subagent' | 'task' | 'workflow_step';
 
 /**
+ * SessionFollowContract
+ *
+ * Read-only SSE stream that follows one session's durable events.
+ *
+ * The stream never admits, re-runs, or acknowledges a mutation. It emits the
+ * same ``SseEventEnvelope`` frames as mutation streams, SSE comment heartbeats,
+ * and one final ``event: end`` frame after the session's terminal event.
+ */
+export type SessionFollowContract = {
+    end_data_example?: SseSessionFollowEndEnvelope;
+    /**
+     * End Data Schema
+     */
+    end_data_schema?: 'SseSessionFollowEndEnvelope';
+    /**
+     * End Event Name
+     */
+    end_event_name?: 'end';
+    /**
+     * Event Data Schema
+     */
+    event_data_schema?: 'SseEventEnvelope';
+    /**
+     * Event Id Format
+     */
+    event_id_format?: 'session_id:cayu_event_<sequence>';
+    /**
+     * Filter Query Params
+     */
+    filter_query_params?: Array<'event_type' | 'exclude_event_type' | 'interaction_id'>;
+    /**
+     * Heartbeat Interval Seconds
+     *
+     * Seconds between SSE comment heartbeat lines that start with `:`.
+     */
+    heartbeat_interval_seconds?: number;
+    /**
+     * Idle Timeout Seconds
+     *
+     * Seconds a running session may produce no durable events before the stream sends a retryable `replay_idle_timeout` error and closes.
+     */
+    idle_timeout_seconds?: number;
+    /**
+     * Limit Exceeded Status
+     */
+    limit_exceeded_status?: 429;
+    /**
+     * Max Streams Per Principal
+     */
+    max_streams_per_principal?: number;
+    /**
+     * Max Streams Per Session
+     */
+    max_streams_per_session?: number;
+    /**
+     * Method
+     */
+    method?: 'GET';
+    /**
+     * Path Template
+     */
+    path_template?: string;
+    /**
+     * Resume Header
+     */
+    resume_header?: 'Last-Event-ID';
+    /**
+     * Start Query Param
+     */
+    start_query_param?: 'after_sequence';
+    /**
+     * Terminal Behavior
+     */
+    terminal_behavior?: 'end_after_terminal_event';
+    /**
+     * Unknown Event Marker Behavior
+     */
+    unknown_event_marker_behavior?: 'reject';
+};
+
+/**
  * SessionMessageActionBody
  */
 export type SessionMessageActionBody = {
@@ -16319,6 +16401,7 @@ export type SseContract = {
      * Replay Start Marker Format
      */
     replay_start_marker_format?: 'session_id:';
+    session_follow?: SessionFollowContract;
     /**
      * Unknown Event Marker Behavior
      */
@@ -16417,6 +16500,26 @@ export type SseEventEnvelope = {
 export type SseFrameExamples = {
     error_data?: SseErrorEnvelope;
     event_data?: SseEventEnvelope;
+};
+
+/**
+ * SseSessionFollowEndEnvelope
+ *
+ * JSON payload in the final ``event: end`` frame of a session follow stream.
+ */
+export type SseSessionFollowEndEnvelope = {
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'pending' | 'running' | 'interrupting' | 'completed' | 'failed' | 'interrupted';
+    /**
+     * Type
+     */
+    type: 'session.follow.end';
 };
 
 /**
@@ -22495,6 +22598,12 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetData = {
          * Limit
          */
         limit?: number;
+        /**
+         * Wait Seconds
+         *
+         * Long-poll fallback for clients that cannot hold the follow stream open. Wait up to this many seconds for a matching event after `after_sequence` while the session is pending, running, or interrupting, then return the page (possibly empty).
+         */
+        wait_seconds?: number | null;
     };
     url: '/api/sessions/{session_id}/events';
 };
@@ -22516,6 +22625,73 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetResponses = {
 };
 
 export type ListSessionEventsApiSessionsSessionIdEventsGetResponse = ListSessionEventsApiSessionsSessionIdEventsGetResponses[keyof ListSessionEventsApiSessionsSessionIdEventsGetResponses];
+
+export type FollowSessionEventsApiSessionsSessionIdEventsStreamGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * After Sequence
+         *
+         * Stream only events with a greater durable sequence. Ignored when a `Last-Event-ID` header is present.
+         */
+        after_sequence?: number | null;
+        /**
+         * Event Type
+         *
+         * Send only events of this type.
+         */
+        event_type?: string | null;
+        /**
+         * Exclude Event Type
+         *
+         * Do not send events of this type.
+         */
+        exclude_event_type?: string | null;
+        /**
+         * Interaction Id
+         *
+         * Send only events attributed to this interaction.
+         */
+        interaction_id?: string | null;
+    };
+    url: '/api/sessions/{session_id}/events/stream';
+};
+
+export type FollowSessionEventsApiSessionsSessionIdEventsStreamGetErrors = {
+    /**
+     * The session does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The Last-Event-ID event marker is unknown in this session.
+     */
+    409: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The caller or session already holds the configured maximum number of follow streams. Retry after the `Retry-After` header.
+     */
+    429: ApiErrorResponse;
+};
+
+export type FollowSessionEventsApiSessionsSessionIdEventsStreamGetError = FollowSessionEventsApiSessionsSessionIdEventsStreamGetErrors[keyof FollowSessionEventsApiSessionsSessionIdEventsStreamGetErrors];
+
+export type FollowSessionEventsApiSessionsSessionIdEventsStreamGetResponses = {
+    /**
+     * SSE stream. Event `data:` frames contain SseEventEnvelope JSON; `event: end` frames contain SseSessionFollowEndEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.
+     */
+    200: string;
+};
+
+export type FollowSessionEventsApiSessionsSessionIdEventsStreamGetResponse = FollowSessionEventsApiSessionsSessionIdEventsStreamGetResponses[keyof FollowSessionEventsApiSessionsSessionIdEventsStreamGetResponses];
 
 export type InspectHumanReviewApiSessionsSessionIdHumanReviewGetData = {
     body?: never;

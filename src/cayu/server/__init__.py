@@ -73,6 +73,9 @@ try:
         DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS,
         DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
         DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
+        DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
+        DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL,
+        DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION,
         AuthenticatedAccess,
         BrowserControlServerConfig,
         CorsConfig,
@@ -434,6 +437,11 @@ def create_server(
             api_path=control_plane_path,
             openapi_url=server.openapi_url,
             replay_idle_timeout_s=lifecycle.replay_idle_timeout_s,
+            session_follow_heartbeat_s=lifecycle.session_follow_heartbeat_s,
+            session_follow_max_streams_per_principal=(
+                lifecycle.session_follow_max_streams_per_principal
+            ),
+            session_follow_max_streams_per_session=lifecycle.session_follow_max_streams_per_session,
             dashboard_configured=resolved_config.dashboard.enabled,
             browser_recordings_configured=browser_recordings is not None,
             dashboard_pricing_configured=pricing_metadata is not None,
@@ -518,6 +526,11 @@ def mount_cayu(
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evals: EvalsConfig | None = None,
     replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
+    session_follow_heartbeat_s: float = DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
+    session_follow_max_streams_per_principal: int = (
+        DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL
+    ),
+    session_follow_max_streams_per_session: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION,
     event_side_effect_startup_timeout_seconds: float = (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     ),
@@ -615,6 +628,9 @@ def mount_cayu(
         api_path=api_path,
         openapi_url=getattr(server, "openapi_url", None),
         replay_idle_timeout_s=replay_idle_timeout_s,
+        session_follow_heartbeat_s=session_follow_heartbeat_s,
+        session_follow_max_streams_per_principal=session_follow_max_streams_per_principal,
+        session_follow_max_streams_per_session=session_follow_max_streams_per_session,
         dashboard_configured=dashboard,
         dashboard_pricing_configured=(
             prepared_dashboard is not None and prepared_dashboard[1].dashboard_pricing_configured

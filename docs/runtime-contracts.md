@@ -4936,8 +4936,17 @@ caller intended. An existing session with no matching event returns an empty pag
 For ascending pages, continue with
 `after_sequence=next_sequence`; for descending pages, continue with
 `before_sequence=next_sequence`. Clients should use this endpoint for timelines,
-logs, replay panes, and polling instead of fetching the full session when they
-only need events.
+logs, history panes, and backfill instead of fetching the full session when they
+only need events. To show a running session's live progress, follow it with the
+read-only stream described below rather than polling. Polling with
+`after_sequence` is a fallback for clients that cannot hold a stream open: poll
+only while the page is visible and the session is pending, running, or
+interrupting, stop once `/state` reports a terminal status, and prefer
+`wait_seconds` long polls over short fixed timers. `wait_seconds` (at most 25)
+holds an ascending tail read open until a matching event after `after_sequence`
+exists or the deadline passes, and returns an empty page at the deadline. It
+returns at once when the session is not pending, running, or interrupting, and
+is rejected with `before_sequence`, `event_id`, or descending order.
 
 `next_sequence` paginates matching history. `scan_through_sequence` is a
 separate forward-tail watermark and can exceed it when filters excluded newer
@@ -5004,9 +5013,68 @@ or initially unavailable inventory leaves the mutation disabled. New Run calls
 the Cayu runtime directly; it does not invoke application-specific entrypoints
 or orchestration.
 
+### Session follow stream
+
+`GET /api/sessions/{session_id}/events/stream` is the read-only way to follow a
+session's durable events. It returns `text/event-stream` that a plain browser
+`EventSource` can consume. It never admits, re-runs, or acknowledges a mutation:
+it ignores `Cayu-Mutation-ID`, writes nothing, and uses the same authentication
+dependency, public-identity resolution, redaction, and event exposure projection
+as `GET /api/sessions/{session_id}/events`. Authentication still does not add
+tenant filtering.
+
+- **Start position.** `after_sequence=N` starts after durable sequence `N`;
+  without it the stream starts at the beginning of the session. On reconnect the
+  standard `Last-Event-ID` header takes precedence over the query parameter, so
+  an `EventSource` whose URL still carries the original `after_sequence` resumes
+  natively. The header uses the same `session_id:cayu_event_<sequence>` marker
+  and `session_id:` start marker as mutation-stream replay. A marker for another
+  session or a malformed marker returns `422`, and an unknown event returns `409`
+  rather than widening to full history. Markers resolve against durable records,
+  so a reconnect after a server restart resumes with no gap or duplicate.
+- **Filters.** `event_type`, `exclude_event_type`, and `interaction_id` select
+  which events are sent, with the same validation and matching as the list
+  endpoint. Filtered-out events still advance the stream's cursor and its
+  terminal tracking, and each frame's `id:` names the last event actually sent.
+- **Frames.** Each event is the existing `SseEventEnvelope` JSON frame with an
+  `id:` marker. Heartbeats are SSE comment lines (`: heartbeat`) sent every 15
+  seconds by default so proxies and load-balancer idle timeouts keep quiet
+  streams open; `EventSource` ignores them.
+- **Ending.** Once the session is terminal and its terminal event has been sent,
+  the stream sends one `event: end` frame whose data is
+  `{"type": "session.follow.end", "session_id": ..., "status": ...}` and closes.
+  The frame has no `id:`. A session that is already terminal at connect drains
+  the remaining events and closes immediately, including when the start boundary
+  is already past the terminal event. Clients should close their `EventSource` on
+  `end` instead of letting it reconnect, and must not hold streams open on
+  finished sessions.
+- **Implementation and limits.** The stream is the same bounded loop used for
+  mutation-stream replay: fixed-size durable pages, store polling that backs off
+  from 50 ms to a 1 s ceiling while the session is quiet, terminal-boundary
+  detection, and `lifecycle.replay_idle_timeout_s`. A running session with no new
+  durable events for that long receives a retryable `replay_idle_timeout`
+  `event: error` frame and the stream closes. Concurrent follow streams are
+  capped per authenticated subject
+  (`lifecycle.session_follow_max_streams_per_principal`, default 16) and per
+  session (`lifecycle.session_follow_max_streams_per_session`, default 32);
+  unauthenticated callers share one principal bucket and the caps are
+  process-local. A request over either cap returns `429` with `Retry-After`.
+  `lifecycle.session_follow_heartbeat_s` sets the heartbeat interval.
+
+`GET /api/contract` advertises the stream as `sse.session_follow` (method, path
+template under the configured API prefix, event id format, start parameter,
+resume header, filter parameters, heartbeat interval, end event name and data
+schema, idle timeout, and stream caps) and as the read-only
+`capabilities.surfaces.session_follow` capability.
+
+### Session state and read models
+
 `GET /api/sessions/{session_id}/state` is the bounded lifecycle-polling surface.
 It returns the session id, status, update/activity timestamps, and typed
-interruption-cascade state. `SessionStore.load_state` projects the mutable
+interruption-cascade state. Responses carry a weak `ETag` and
+`Cache-Control: private, no-cache`; a request whose `If-None-Match` matches the
+current state returns `304` with no body, so a browser revalidates unchanged
+state without transferring it. `SessionStore.load_state` projects the mutable
 session columns without labels or metadata, while
 `load_interruption_cascade_marker` projects only the bounded structural fields
 needed to classify the cascade and never reads its embedded interrupt payload.
@@ -8249,7 +8317,7 @@ accept string counters.
 
 The protected `GET /api/contract` response also carries the server-authoritative
 control-plane capability projection. It reports whether Workflow topology,
-Tasks, reviewed
+the read-only session follow stream, Tasks, reviewed
 Knowledge, registered artifact storage, usage aggregation, and dashboard pricing
 are available, with separate read and mutation availability and stable
 `not_configured` or `unsupported` reasons. Usage aggregation is reported

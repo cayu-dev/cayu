@@ -49,6 +49,9 @@ from cayu.server.config import (
     DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     DEFAULT_SERVER_DEPLOYMENT_NAME,
     DEFAULT_SERVER_TITLE,
+    DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
+    DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL,
+    DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION,
     AuthenticatedAccess,
     CorsConfig,
     DashboardConfig,
@@ -211,6 +214,9 @@ class ServerLifecycleSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS
+    session_follow_heartbeat_s: float = DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS
+    session_follow_max_streams_per_principal: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL
+    session_follow_max_streams_per_session: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS
     event_side_effect_startup_timeout_seconds: float = (
@@ -735,6 +741,13 @@ class ServerSettings(BaseSettings):
             ),
             lifecycle=ServerLifecycleConfig(
                 replay_idle_timeout_s=self.lifecycle.replay_idle_timeout_s,
+                session_follow_heartbeat_s=self.lifecycle.session_follow_heartbeat_s,
+                session_follow_max_streams_per_principal=(
+                    self.lifecycle.session_follow_max_streams_per_principal
+                ),
+                session_follow_max_streams_per_session=(
+                    self.lifecycle.session_follow_max_streams_per_session
+                ),
                 startup_recovery_statuses=self.lifecycle.startup_recovery_statuses,
                 recovery_inactive_after_seconds=(self.lifecycle.recovery_inactive_after_seconds),
                 event_side_effect_startup_timeout_seconds=(

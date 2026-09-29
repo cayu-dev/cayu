@@ -183,6 +183,29 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["sse"]["error_data_schema"] == "SseErrorEnvelope"
     assert body["sse"]["max_event_data_bytes"] == SSE_EVENT_DATA_MAX_BYTES
     assert body["sse"]["max_error_text_bytes"] == SSE_ERROR_TEXT_MAX_BYTES
+    assert body["sse"]["session_follow"] == {
+        "method": "GET",
+        "path_template": "/api/sessions/{session_id}/events/stream",
+        "event_id_format": SSE_LAST_EVENT_ID_FORMAT,
+        "start_query_param": "after_sequence",
+        "resume_header": "Last-Event-ID",
+        "unknown_event_marker_behavior": "reject",
+        "filter_query_params": ["event_type", "exclude_event_type", "interaction_id"],
+        "event_data_schema": "SseEventEnvelope",
+        "heartbeat_interval_seconds": 15.0,
+        "end_event_name": "end",
+        "end_data_schema": "SseSessionFollowEndEnvelope",
+        "terminal_behavior": "end_after_terminal_event",
+        "idle_timeout_seconds": 300.0,
+        "max_streams_per_principal": 16,
+        "max_streams_per_session": 32,
+        "limit_exceeded_status": 429,
+        "end_data_example": {
+            "type": "session.follow.end",
+            "session_id": "session-123",
+            "status": "completed",
+        },
+    }
     assert body["client_generation"] == {
         "openapi_url": "/openapi.json",
         "supported_targets": ["typescript", "python"],
@@ -202,6 +225,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
         "workflow": {
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
+        "session_follow": {
             "configured": True,
             "read": {"enabled": True, "unavailable_reason": None},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
@@ -760,6 +788,10 @@ def test_custom_api_path_updates_contract_and_openapi_paths() -> None:
 
     assert response.status_code == 200
     assert response.json()["api_prefix"] == "/cayu/api"
+    assert (
+        response.json()["sse"]["session_follow"]["path_template"]
+        == "/cayu/api/sessions/{session_id}/events/stream"
+    )
     assert client.get("/api/contract").status_code == 404
 
     schema = client.get("/openapi.json").json()
@@ -773,6 +805,19 @@ def test_streaming_routes_document_sse_response_contract() -> None:
 
     assert "SseEventEnvelope" in components
     assert "SseErrorEnvelope" in components
+    assert "SseSessionFollowEndEnvelope" in components
+    follow = schema["paths"]["/api/sessions/{session_id}/events/stream"]
+    assert set(follow) == {"get"}
+    follow_responses = follow["get"]["responses"]
+    assert sorted(follow_responses["200"]["content"]) == ["text/event-stream"]
+    assert (
+        "SseSessionFollowEndEnvelope"
+        in (follow_responses["200"]["content"]["text/event-stream"]["schema"]["description"])
+    )
+    for status_code in ("404", "409", "429"):
+        assert follow_responses[status_code]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ApiErrorResponse"
+        }
     for path in _STREAMING_ROUTES:
         operation = schema["paths"][path]["post"]
         response = operation["responses"]["200"]

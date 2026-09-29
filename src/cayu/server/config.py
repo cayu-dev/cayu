@@ -38,14 +38,20 @@ from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
 from cayu.server._browser_control_config import BrowserControlServerConfig
-from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
+from cayu.server.contracts import (
+    DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
+    DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL,
+    DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION,
+    SERVER_API_PREFIX,
+    validate_usage_rollup_price_book,
+)
 from cayu.sessions.base import IncompleteSessionsRecoveryRequest, SessionStatus
 
 DEFAULT_SERVER_DEPLOYMENT_NAME = "development"
 DEFAULT_SERVER_TITLE = "Cayu"
 DEFAULT_DASHBOARD_PATH = "/cayu"
 DEFAULT_LOCAL_CORS_ORIGIN = "http://localhost:5173"
-DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS = 300
 DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS = 10.0
@@ -486,6 +492,9 @@ class ServerLifecycleConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS
+    session_follow_heartbeat_s: float = DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS
+    session_follow_max_streams_per_principal: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_PRINCIPAL
+    session_follow_max_streams_per_session: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS
     event_side_effect_startup_timeout_seconds: float = (
@@ -498,6 +507,7 @@ class ServerLifecycleConfig(BaseModel):
 
     @field_validator(
         "replay_idle_timeout_s",
+        "session_follow_heartbeat_s",
         "event_side_effect_startup_timeout_seconds",
         "interruption_shutdown_grace_seconds",
         "knowledge_publication_shutdown_grace_seconds",
@@ -506,6 +516,17 @@ class ServerLifecycleConfig(BaseModel):
     @classmethod
     def validate_positive_seconds(cls, value: object, info) -> float:
         return _positive_seconds(value, info.field_name)
+
+    @field_validator(
+        "session_follow_max_streams_per_principal",
+        "session_follow_max_streams_per_session",
+        mode="before",
+    )
+    @classmethod
+    def validate_stream_limit(cls, value: object, info) -> int:
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{info.field_name} must be a positive integer.")
+        return value
 
     @field_validator("recovery_inactive_after_seconds", mode="before")
     @classmethod
@@ -692,6 +713,13 @@ class ServerConfig(BaseModel):
             },
             "lifecycle": {
                 "replay_idle_timeout_s": self.lifecycle.replay_idle_timeout_s,
+                "session_follow_heartbeat_s": self.lifecycle.session_follow_heartbeat_s,
+                "session_follow_max_streams_per_principal": (
+                    self.lifecycle.session_follow_max_streams_per_principal
+                ),
+                "session_follow_max_streams_per_session": (
+                    self.lifecycle.session_follow_max_streams_per_session
+                ),
                 "startup_recovery_statuses": (
                     None
                     if self.lifecycle.startup_recovery_statuses is None

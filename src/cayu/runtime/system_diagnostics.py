@@ -218,6 +218,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     dashboard: OptionalSurfaceCapability
     workflow: OptionalSurfaceCapability | None = None
     browser_recordings: OptionalSurfaceCapability | None = None
+    session_follow: OptionalSurfaceCapability | None = None
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability
     artifacts: OptionalSurfaceCapability

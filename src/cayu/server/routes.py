@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sse_starlette.event import ServerSentEvent
 from sse_starlette.sse import EventSourceResponse
 
 if TYPE_CHECKING:
@@ -337,6 +339,11 @@ from cayu.server.contracts import (
     PENDING_ACTION_ENDPOINT_RESPONSES,
     RUN_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
+    SESSION_EVENTS_MAX_WAIT_SECONDS,
+    SESSION_FOLLOW_ENDPOINT_RESPONSES,
+    SESSION_FOLLOW_PATH,
+    SESSION_FOLLOW_RETRY_AFTER_SECONDS,
+    SESSION_STATE_ENDPOINT_RESPONSES,
     SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
     TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
@@ -413,6 +420,7 @@ from cayu.server.contracts import (
     PendingKnowledgeListResponse,
     ServerContractResponse,
     SessionCostEndpointContract,
+    SessionFollowContract,
     SessionsSummaryResponse,
     SessionStateResponse,
     SessionSummaryResponse,
@@ -420,6 +428,7 @@ from cayu.server.contracts import (
     SessionTopologyResponse,
     SessionTranscriptResponse,
     SessionUsageEndpointContract,
+    SseContract,
     SystemDiagnosticsResponse,
     UsageBreakdownItem,
     UsageRollupRequest,
@@ -439,6 +448,7 @@ from cayu.server.sse import (
     SSE_REPLAY_PAGE_EVENTS,
     SSE_REPLAY_START_MARKER_FORMAT,
     SSE_SEND_TIMEOUT_SECONDS,
+    SSE_SESSION_FOLLOW_HEARTBEAT_COMMENT,
     SseErrorCode,
     SseErrorKind,
     SseEventFrameTooLargeError,
@@ -446,6 +456,7 @@ from cayu.server.sse import (
     error_to_sse_message,
     event_to_sse_message,
     parse_last_event_id,
+    session_follow_end_message,
     sse_message_data_bytes,
 )
 from cayu.sessions.base import (
@@ -1147,6 +1158,97 @@ class _ObserverLifecycleEventSourceResponse(EventSourceResponse):
             await super().__call__(scope, receive, send)
         finally:
             self._observer_started.set()
+
+
+_SessionFollowPrincipal = tuple[str | None, str] | None
+
+
+class _SessionFollowStreamLimiter:
+    """Process-local caps on concurrent read-only session follow streams.
+
+    Unauthenticated callers share one principal bucket. Counters are released
+    by the response wrapper, not the event generator, so a stream that never
+    starts iterating still returns its slot.
+    """
+
+    def __init__(self, *, max_per_principal: int, max_per_session: int) -> None:
+        self._max_per_principal = max_per_principal
+        self._max_per_session = max_per_session
+        self._by_principal: dict[_SessionFollowPrincipal, int] = {}
+        self._by_session: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def try_acquire(self, principal: _SessionFollowPrincipal, session_id: str) -> bool:
+        with self._lock:
+            if self._by_principal.get(principal, 0) >= self._max_per_principal:
+                return False
+            if self._by_session.get(session_id, 0) >= self._max_per_session:
+                return False
+            self._by_principal[principal] = self._by_principal.get(principal, 0) + 1
+            self._by_session[session_id] = self._by_session.get(session_id, 0) + 1
+            return True
+
+    def release(self, principal: _SessionFollowPrincipal, session_id: str) -> None:
+        with self._lock:
+            _decrement_stream_count(self._by_principal, principal)
+            _decrement_stream_count(self._by_session, session_id)
+
+
+_StreamCountKey = TypeVar("_StreamCountKey")
+
+
+def _decrement_stream_count(counts: dict[_StreamCountKey, int], key: _StreamCountKey) -> None:
+    remaining = counts.get(key, 0) - 1
+    if remaining > 0:
+        counts[key] = remaining
+    else:
+        counts.pop(key, None)
+
+
+class _SessionFollowEventSourceResponse(EventSourceResponse):
+    """Return a follow-stream slot when the response finishes for any reason."""
+
+    def __init__(
+        self,
+        *args: Any,
+        heartbeat_s: float,
+        release: Callable[[], None],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, ping_message_factory=_session_follow_heartbeat, **kwargs)
+        self.ping_interval = heartbeat_s
+        self._release = release
+        self._released = False
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if not self._released:
+                self._released = True
+                self._release()
+
+
+def _session_follow_heartbeat() -> ServerSentEvent:
+    return ServerSentEvent(comment=SSE_SESSION_FOLLOW_HEARTBEAT_COMMENT)
+
+
+def _session_state_etag(body: Mapping[str, Any]) -> str:
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return f'W/"{hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]}"'
+
+
+def _if_none_match_matches(header: str | None, etag: str) -> bool:
+    """Weakly compare an ``If-None-Match`` header with one entity tag."""
+
+    if header is None:
+        return False
+    opaque = etag.removeprefix("W/")
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate == "*" or candidate.removeprefix("W/") == opaque:
+            return True
+    return False
 
 
 _MutationAcceptanceStage = Literal[
@@ -4085,6 +4187,9 @@ def create_router(
     api_path: str = SERVER_API_PREFIX,
     openapi_url: str | None = "/openapi.json",
     replay_idle_timeout_s: float = 300.0,
+    session_follow_heartbeat_s: float = 15.0,
+    session_follow_max_streams_per_principal: int = 16,
+    session_follow_max_streams_per_session: int = 32,
     dashboard_configured: bool = False,
     browser_recordings_configured: bool = False,
     dashboard_pricing_configured: bool = False,
@@ -4120,6 +4225,14 @@ def create_router(
             client generation. Pass ``None`` when generated OpenAPI is disabled.
         replay_idle_timeout_s: Maximum time an active replay stream may wait
             without seeing a new persisted event before emitting an error and closing.
+            It also bounds idle read-only session follow streams.
+        session_follow_heartbeat_s: Seconds between SSE comment heartbeats on
+            the read-only session follow stream.
+        session_follow_max_streams_per_principal: Maximum concurrent follow
+            streams one authenticated subject may hold in this process.
+            Unauthenticated callers share one bucket.
+        session_follow_max_streams_per_session: Maximum concurrent follow
+            streams for one session in this process.
         dashboard_pricing_configured: Whether resolved dashboard configuration
             supplies a default price book for cost estimation. This is discovery
             metadata only; the usage endpoint still validates every submitted
@@ -4177,6 +4290,24 @@ def create_router(
     ):
         raise ValueError("replay_idle_timeout_s must be a finite positive number.")
     replay_idle_timeout_s = float(replay_idle_timeout_s)
+    if (
+        isinstance(session_follow_heartbeat_s, bool)
+        or not isinstance(session_follow_heartbeat_s, (int, float))
+        or not isfinite(session_follow_heartbeat_s)
+        or session_follow_heartbeat_s <= 0
+    ):
+        raise ValueError("session_follow_heartbeat_s must be a finite positive number.")
+    session_follow_heartbeat_s = float(session_follow_heartbeat_s)
+    for field_name, value in (
+        ("session_follow_max_streams_per_principal", session_follow_max_streams_per_principal),
+        ("session_follow_max_streams_per_session", session_follow_max_streams_per_session),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{field_name} must be a positive integer.")
+    session_follow_limiter = _SessionFollowStreamLimiter(
+        max_per_principal=session_follow_max_streams_per_principal,
+        max_per_session=session_follow_max_streams_per_session,
+    )
 
     if evaluation_promotion is not None:
         if type(evaluation_promotion) is not EvaluationPromotionConfig:
@@ -4275,6 +4406,13 @@ def create_router(
     eval_registry = eval_runtime.registry if eval_runtime is not None else generated_registry
 
     api_prefix = normalize_api_path(api_path, field_name="api_path")
+    session_follow_contract = SessionFollowContract(
+        path_template=f"{api_prefix}{SESSION_FOLLOW_PATH}",
+        heartbeat_interval_seconds=session_follow_heartbeat_s,
+        idle_timeout_seconds=replay_idle_timeout_s,
+        max_streams_per_principal=session_follow_max_streams_per_principal,
+        max_streams_per_session=session_follow_max_streams_per_session,
+    )
 
     @contextlib.asynccontextmanager
     async def evals_lifespan(_app):
@@ -4646,6 +4784,7 @@ def create_router(
         response.headers["Cache-Control"] = "private, no-store"
         return ServerContractResponse(
             api_prefix=api_prefix,
+            sse=SseContract(session_follow=session_follow_contract),
             accounting=accounting_contract,
             client_generation=ClientGenerationContract(openapi_url=openapi_url),
             capabilities=capability_snapshot.project(
@@ -8619,6 +8758,172 @@ def create_router(
             return None
         return terminal_record.event.id
 
+    async def _terminal_boundary_behind_cursor(
+        terminal_record: EventRecord,
+        cursor: int | None,
+    ) -> bool:
+        """Whether a follower already passed this terminal event in its epoch."""
+
+        if cursor is None or terminal_record.sequence > cursor:
+            return False
+        later_operation_starts = await session_store.query_events(
+            EventQuery(
+                session_id=terminal_record.event.session_id,
+                event_types=tuple(sorted(_REPLAY_OPERATION_START_EVENT_TYPES, key=str)),
+                after_sequence=terminal_record.sequence,
+                before_sequence=cursor + 1,
+                limit=1,
+            )
+        )
+        return not later_operation_starts
+
+    async def _stream_durable_session_events(
+        *,
+        session_id: str,
+        initial_status: SessionStatus,
+        after_sequence: int | None,
+        marker_record: EventRecord | None,
+        include_event: Callable[[Event], bool] | None = None,
+        end_on_terminal: bool = False,
+    ) -> AsyncIterator[dict[str, str]]:
+        """Replay durable events after a boundary and follow until terminal.
+
+        Mutation reconnects and the read-only follow stream share this loop:
+        bounded pages, store polling that backs off from 50 ms to 1 s while the
+        session is quiet, terminal-boundary detection, and the idle timeout.
+        ``include_event`` only selects which events are sent; every record still
+        advances the cursor, resets the idle deadline, and feeds terminal
+        tracking. ``end_on_terminal`` adds the follow stream's final ``end``
+        frame, and also closes when the latest terminal event is already behind
+        the cursor with no later operation start. A follower then never waits on
+        a finished session because its start boundary was an unclassified event
+        or because it read the terminal event before the terminal status.
+        """
+        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
+        replay_after_sequence = after_sequence
+        operation_in_progress = initial_status in _REPLAY_ACTIVE_SESSION_STATUSES
+        observed_terminal_event_id = (
+            None
+            if marker_record is None or operation_in_progress
+            else await _marker_terminal_boundary_id(marker_record)
+        )
+        loop = asyncio.get_running_loop()
+        idle_deadline = loop.time() + replay_idle_timeout_s
+        poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
+
+        while True:
+            page = await session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    after_sequence=replay_after_sequence,
+                    limit=SSE_REPLAY_PAGE_EVENTS,
+                )
+            )
+            for record in page:
+                message: dict[str, str] | None = None
+                if include_event is None or include_event(record.event):
+                    try:
+                        message = event_to_sse_message(
+                            cayu_app._project_persisted_event_record_for_exposure(record).event
+                        )
+                    except SseEventFrameTooLargeError as exc:
+                        yield _stream_error_sse_message(
+                            cayu_app,
+                            exc,
+                            kind="observer",
+                            code="event_frame_too_large",
+                            retryable=False,
+                            session_id=session_id,
+                        )
+                        return
+                replay_after_sequence = record.sequence
+                terminal_boundary_id = _replay_terminal_boundary_id(record.event)
+                if record.event.type in _REPLAY_TERMINAL_EVENT_TYPES:
+                    observed_terminal_event_id = terminal_boundary_id
+                    operation_in_progress = False
+                elif record.event.type in _REPLAY_OPERATION_START_EVENT_TYPES:
+                    observed_terminal_event_id = None
+                    operation_in_progress = True
+                elif (
+                    terminal_boundary_id is not None
+                    and not operation_in_progress
+                    and terminal_boundary_id != observed_terminal_event_id
+                ):
+                    # A hook may establish a boundary when replay began after
+                    # the terminal event. Validate its durable reference and
+                    # operation epoch before trusting payload-carried lineage.
+                    validated_boundary_id = await _marker_terminal_boundary_id(record)
+                    if validated_boundary_id is not None:
+                        observed_terminal_event_id = validated_boundary_id
+                elif operation_in_progress:
+                    observed_terminal_event_id = None
+                if message is not None:
+                    yield message
+            if page:
+                idle_deadline = loop.time() + replay_idle_timeout_s
+                poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
+            if len(page) == SSE_REPLAY_PAGE_EVENTS:
+                continue
+            current = await session_store.load_state(session_id)
+            if current is None:
+                return
+            terminal_event_type = _REPLAY_TERMINAL_EVENT_BY_STATUS.get(current.status)
+            if terminal_event_type is not None:
+                terminal_records = await session_store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=terminal_event_type,
+                        order_by=EventOrder.SEQUENCE_DESC,
+                        limit=1,
+                    )
+                )
+                if terminal_records and (
+                    observed_terminal_event_id == terminal_records[0].event.id
+                    or (
+                        end_on_terminal
+                        and await _terminal_boundary_behind_cursor(
+                            terminal_records[0],
+                            replay_after_sequence,
+                        )
+                    )
+                ):
+                    if end_on_terminal:
+                        yield session_follow_end_message(
+                            session_id=public_session_id,
+                            status=str(current.status),
+                        )
+                    return
+            elif current.status in _REPLAY_ACTIVE_SESSION_STATUSES:
+                operation_in_progress = True
+                observed_terminal_event_id = None
+            else:
+                if end_on_terminal:
+                    yield session_follow_end_message(
+                        session_id=public_session_id,
+                        status=str(current.status),
+                    )
+                return
+            remaining = idle_deadline - loop.time()
+            if remaining <= 0:
+                timeout_error = TimeoutError(
+                    f"Replay for session {session_id} received no events for "
+                    f"{replay_idle_timeout_s:g} seconds."
+                )
+                yield _stream_error_sse_message(
+                    cayu_app,
+                    timeout_error,
+                    kind="observer",
+                    code="replay_idle_timeout",
+                    retryable=True,
+                    session_id=session_id,
+                )
+                return
+            await asyncio.sleep(min(poll_interval, remaining))
+            poll_interval = _next_replay_poll_interval(
+                poll_interval,
+                received_events=bool(page),
+            )
+
     async def _replay_events_response(
         http_request: Request,
         *,
@@ -8678,113 +8983,15 @@ def create_router(
             marker_record = await _marker_record(session_id, last_seen_event_id)
         after_sequence = None if marker_record is None else marker_record.sequence
 
-        async def replay() -> AsyncIterator[dict[str, str]]:
-            replay_after_sequence = after_sequence
-            operation_in_progress = state.status in _REPLAY_ACTIVE_SESSION_STATUSES
-            observed_terminal_event_id = (
-                None
-                if marker_record is None or operation_in_progress
-                else await _marker_terminal_boundary_id(marker_record)
-            )
-            loop = asyncio.get_running_loop()
-            idle_deadline = loop.time() + replay_idle_timeout_s
-            poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
-
-            while True:
-                page = await session_store.query_events(
-                    EventQuery(
-                        session_id=session_id,
-                        after_sequence=replay_after_sequence,
-                        limit=SSE_REPLAY_PAGE_EVENTS,
-                    )
-                )
-                for record in page:
-                    try:
-                        message = event_to_sse_message(
-                            cayu_app._project_persisted_event_record_for_exposure(record).event
-                        )
-                    except SseEventFrameTooLargeError as exc:
-                        yield _stream_error_sse_message(
-                            cayu_app,
-                            exc,
-                            kind="observer",
-                            code="event_frame_too_large",
-                            retryable=False,
-                            session_id=session_id,
-                        )
-                        return
-                    replay_after_sequence = record.sequence
-                    terminal_boundary_id = _replay_terminal_boundary_id(record.event)
-                    if record.event.type in _REPLAY_TERMINAL_EVENT_TYPES:
-                        observed_terminal_event_id = terminal_boundary_id
-                        operation_in_progress = False
-                    elif record.event.type in _REPLAY_OPERATION_START_EVENT_TYPES:
-                        observed_terminal_event_id = None
-                        operation_in_progress = True
-                    elif (
-                        terminal_boundary_id is not None
-                        and not operation_in_progress
-                        and terminal_boundary_id != observed_terminal_event_id
-                    ):
-                        # A hook may establish a boundary when replay began after
-                        # the terminal event. Validate its durable reference and
-                        # operation epoch before trusting payload-carried lineage.
-                        validated_boundary_id = await _marker_terminal_boundary_id(record)
-                        if validated_boundary_id is not None:
-                            observed_terminal_event_id = validated_boundary_id
-                    elif operation_in_progress:
-                        observed_terminal_event_id = None
-                    yield message
-                if page:
-                    idle_deadline = loop.time() + replay_idle_timeout_s
-                    poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
-                if len(page) == SSE_REPLAY_PAGE_EVENTS:
-                    continue
-                current = await session_store.load_state(session_id)
-                if current is None:
-                    return
-                terminal_event_type = _REPLAY_TERMINAL_EVENT_BY_STATUS.get(current.status)
-                if terminal_event_type is not None:
-                    terminal_records = await session_store.query_events(
-                        EventQuery(
-                            session_id=session_id,
-                            event_type=terminal_event_type,
-                            order_by=EventOrder.SEQUENCE_DESC,
-                            limit=1,
-                        )
-                    )
-                    if (
-                        terminal_records
-                        and observed_terminal_event_id == terminal_records[0].event.id
-                    ):
-                        return
-                elif current.status in _REPLAY_ACTIVE_SESSION_STATUSES:
-                    operation_in_progress = True
-                    observed_terminal_event_id = None
-                else:
-                    return
-                remaining = idle_deadline - loop.time()
-                if remaining <= 0:
-                    timeout_error = TimeoutError(
-                        f"Replay for session {session_id} received no events for "
-                        f"{replay_idle_timeout_s:g} seconds."
-                    )
-                    yield _stream_error_sse_message(
-                        cayu_app,
-                        timeout_error,
-                        kind="observer",
-                        code="replay_idle_timeout",
-                        retryable=True,
-                        session_id=session_id,
-                    )
-                    return
-                await asyncio.sleep(min(poll_interval, remaining))
-                poll_interval = _next_replay_poll_interval(
-                    poll_interval,
-                    received_events=bool(page),
-                )
-
-        return EventSourceResponse(replay(), send_timeout=SSE_SEND_TIMEOUT_SECONDS)
+        return EventSourceResponse(
+            _stream_durable_session_events(
+                session_id=session_id,
+                initial_status=state.status,
+                after_sequence=after_sequence,
+                marker_record=marker_record,
+            ),
+            send_timeout=SSE_SEND_TIMEOUT_SECONDS,
+        )
 
     @bounded_control_plane_router.post(
         "/run",
@@ -10837,16 +11044,25 @@ def create_router(
     @router.get(
         "/sessions/{session_id}/state",
         response_model=SessionStateResponse,
+        responses=SESSION_STATE_ENDPOINT_RESPONSES,
         dependencies=protected,
+        description=(
+            "Return bounded lifecycle state. The response carries a weak `ETag`; "
+            "a matching `If-None-Match` returns `304` without a body."
+        ),
     )
-    async def get_session_state(session_id: NonBlankString):
+    async def get_session_state(
+        session_id: NonBlankString,
+        http_request: Request,
+        response: Response,
+    ):
         session_id = await _resolve_public_session_id(session_id)
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
         interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
         provider_operation = await inspect_provider_operation(session_store, session_id)
-        return {
+        body = {
             "session_id": cayu_app.project_session_id_for_exposure(state.id),
             "status": state.status,
             "updated_at": state.updated_at.isoformat(),
@@ -10854,6 +11070,14 @@ def create_router(
             "interruption_cascade": interruption_cascade,
             "provider_operation": provider_operation.model_dump(mode="json"),
         }
+        etag = _session_state_etag(body)
+        # `no-cache` lets a browser store the body but revalidate every read,
+        # so repeated polls of an unchanged session cost a 304 and no body.
+        cache_headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+        if _if_none_match_matches(http_request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers=cache_headers)
+        response.headers.update(cache_headers)
+        return body
 
     async def get_session_tool_view(
         session_id: NonBlankString,
@@ -11038,6 +11262,7 @@ def create_router(
     )
     async def list_session_events(
         session_id: NonBlankString,
+        http_request: Request,
         event_id: str | None = Query(
             default=None,
             description="Return the event with this exact session-scoped event ID, if it exists.",
@@ -11070,7 +11295,30 @@ def create_router(
             Query(description="Return events in durable sequence order."),
         ] = EventOrder.SEQUENCE_ASC,
         limit: int = Query(default=100, ge=1, le=_EVENT_PAGE_LIMIT_MAX),
+        wait_seconds: float | None = Query(
+            default=None,
+            ge=0,
+            le=SESSION_EVENTS_MAX_WAIT_SECONDS,
+            description=(
+                "Long-poll fallback for clients that cannot hold the follow stream "
+                "open. Wait up to this many seconds for a matching event after "
+                "`after_sequence` while the session is pending, running, or "
+                "interrupting, then return the page (possibly empty)."
+            ),
+        ),
     ):
+        if wait_seconds and (
+            before_sequence is not None
+            or event_id is not None
+            or order_by != EventOrder.SEQUENCE_ASC
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "wait_seconds only applies to ascending tail reads without "
+                    "before_sequence or event_id."
+                ),
+            )
         session_id = await _resolve_public_session_id(session_id)
         public_session_id = cayu_app.project_session_id_for_exposure(session_id)
         state = await session_store.load_state(session_id)
@@ -11132,6 +11380,52 @@ def create_router(
                 detail=exc.errors(include_context=False, include_url=False),
             ) from exc
 
+        if not wait_seconds:
+            return await _read_session_events_page(
+                session_id=session_id,
+                public_session_id=public_session_id,
+                query=query,
+                limit=limit,
+                has_event_filters=has_event_filters,
+                unresolved_public_event_id=unresolved_public_event_id,
+            )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_seconds
+        poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
+        while True:
+            result = await _read_session_events_page(
+                session_id=session_id,
+                public_session_id=public_session_id,
+                query=query,
+                limit=limit,
+                has_event_filters=has_event_filters,
+                unresolved_public_event_id=unresolved_public_event_id,
+            )
+            remaining = deadline - loop.time()
+            if result["events"] or remaining <= 0:
+                return result
+            current = await session_store.load_state(session_id)
+            if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
+                return result
+            if await http_request.is_disconnected():
+                return result
+            # Same backoff as the follow stream: quick first checks, then at
+            # most one store read per second while the session is quiet.
+            await asyncio.sleep(min(poll_interval, remaining))
+            poll_interval = _next_replay_poll_interval(poll_interval, received_events=False)
+
+    async def _read_session_events_page(
+        *,
+        session_id: str,
+        public_session_id: str,
+        query: EventQuery,
+        limit: int,
+        has_event_filters: bool,
+        unresolved_public_event_id: bool,
+    ) -> dict[str, Any]:
+        after_sequence = query.after_sequence
+        before_sequence = query.before_sequence
+        order_by = query.order_by
         raw_scan_sequence: int | None = None
         if before_sequence is None and has_event_filters:
             # Capture the raw high-water mark before the filtered read. Advancing
@@ -11177,6 +11471,149 @@ def create_router(
             "scan_through_sequence": scan_through_sequence,
             "has_more": has_more,
         }
+
+    @router.get(
+        SESSION_FOLLOW_PATH,
+        response_class=EventSourceResponse,
+        responses=SESSION_FOLLOW_ENDPOINT_RESPONSES,
+        description=(
+            "Follow one session's durable events over Server-Sent Events without "
+            "admitting or re-running any mutation. Start after `after_sequence`, or "
+            "resume after the event named by the standard `Last-Event-ID` header, "
+            "which takes precedence so a browser EventSource reconnects natively. "
+            "Filters match `GET /sessions/{session_id}/events`. The stream sends SSE "
+            "comment heartbeats and, after the session's terminal event, one "
+            "`event: end` frame before closing; an already-terminal session drains "
+            "and closes immediately. Concurrent streams are capped per caller and "
+            "per session and return `429` with `Retry-After` when exceeded."
+        ),
+    )
+    async def follow_session_events(
+        session_id: NonBlankString,
+        http_request: Request,
+        after_sequence: int | None = Query(
+            default=None,
+            ge=0,
+            description=(
+                "Stream only events with a greater durable sequence. Ignored when "
+                "a `Last-Event-ID` header is present."
+            ),
+        ),
+        event_type: str | None = Query(
+            default=None,
+            description="Send only events of this type.",
+        ),
+        exclude_event_type: str | None = Query(
+            default=None,
+            description="Do not send events of this type.",
+        ),
+        interaction_id: str | None = Query(
+            default=None,
+            description="Send only events attributed to this interaction.",
+        ),
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        session_id = await _resolve_public_session_id(session_id)
+        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
+        state = await session_store.load_state(session_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if interaction_id is not None:
+            interaction_id = await _resolve_public_interaction_id(
+                session_id=session_id,
+                value=interaction_id,
+            )
+        try:
+            # Validate filters exactly as the list endpoint does. The follow
+            # loop reads unfiltered pages so terminal tracking sees every event.
+            filter_query = EventQuery(
+                session_id=session_id,
+                event_type=event_type,
+                interaction_id=interaction_id,
+                exclude_event_types=(exclude_event_type,) if exclude_event_type is not None else (),
+                after_sequence=after_sequence,
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.errors(include_context=False, include_url=False),
+            ) from exc
+        included_type = None if filter_query.event_type is None else str(filter_query.event_type)
+        excluded_types = frozenset(map(str, filter_query.exclude_event_types))
+        included_interaction_id = filter_query.interaction_id
+
+        def include_event(event: Event) -> bool:
+            event_type_name = str(event.type)
+            if included_type is not None and event_type_name != included_type:
+                return False
+            if event_type_name in excluded_types:
+                return False
+            return included_interaction_id is None or (
+                event.interaction_id == included_interaction_id
+            )
+
+        marker_record: EventRecord | None = None
+        start_after_sequence = filter_query.after_sequence
+        last_event_id = http_request.headers.get("last-event-id")
+        if last_event_id is not None:
+            marker = parse_last_event_id(
+                last_event_id,
+                expected_session_id=session_id,
+                public_session_id=public_session_id,
+            )
+            if marker is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Last-Event-ID must use a session-bound Cayu public event id "
+                        f"or the explicit `{SSE_REPLAY_START_MARKER_FORMAT}` start marker."
+                    ),
+                )
+            marker_session_id, last_seen_event_id = marker
+            if marker_session_id not in {session_id, public_session_id}:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Last-Event-ID session does not match the request session_id.",
+                )
+            start_after_sequence = None
+            if last_seen_event_id is not None:
+                marker_record = await _marker_record(session_id, last_seen_event_id)
+                start_after_sequence = marker_record.sequence
+        elif start_after_sequence is not None:
+            # The latest event at or before the cursor is the client's boundary.
+            # It lets an already-terminal session close as soon as it drains.
+            boundary_records = await session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    before_sequence=min(start_after_sequence + 1, MAX_DURABLE_JSON_INTEGER),
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            marker_record = boundary_records[0] if boundary_records else None
+
+        principal: _SessionFollowPrincipal = (
+            None if auth_context is None else (auth_context.tenant, auth_context.subject)
+        )
+        if not session_follow_limiter.try_acquire(principal, session_id):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many concurrent session follow streams.",
+                headers={"Retry-After": str(SESSION_FOLLOW_RETRY_AFTER_SECONDS)},
+            )
+        return _SessionFollowEventSourceResponse(
+            _stream_durable_session_events(
+                session_id=session_id,
+                initial_status=state.status,
+                after_sequence=start_after_sequence,
+                marker_record=marker_record,
+                include_event=include_event,
+                end_on_terminal=True,
+            ),
+            send_timeout=SSE_SEND_TIMEOUT_SECONDS,
+            heartbeat_s=session_follow_heartbeat_s,
+            release=lambda: session_follow_limiter.release(principal, session_id),
+        )
 
     @router.get(
         "/sessions/{session_id}/transcript",

@@ -40858,5 +40858,18 @@
     "tests/core/test_incremental_session_usage.py::test_usage_cache_serves_only_plain_whole_session_reads": 0.0006461249431595206,
     "tests/server/test_session_usage_http.py::test_contract_advertises_usage_and_cost_endpoints": 1.2383578340522945,
     "tests/server/test_session_usage_http.py::test_session_list_includes_usage_without_rescanning_history": 0.1593526251381263,
-    "tests/server/test_session_usage_http.py::test_session_usage_returns_etag_and_not_modified_until_usage_changes": 0.6437712920596823
+    "tests/server/test_session_usage_http.py::test_session_usage_returns_etag_and_not_modified_until_usage_changes": 0.6437712920596823,
+    "tests/server/test_server_contract.py::test_sse_event_frame_preflight_counts_utf8_del": 0.0003483330365270376,
+    "tests/server/test_server_contract.py::test_sse_event_frame_rejects_mutated_unicode_surrogates_safely": 0.0002792919985949993,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_caps_concurrent_streams_per_principal_and_session": 0.8951609170762822,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_closes_terminal_session_after_post_terminal_boundary": 0.23114658414851874,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_is_read_only": 0.23800345801282674,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_long_poll_and_state_etag_match_across_stores[memory]": 2.9045360001036897,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_long_poll_and_state_etag_match_across_stores[postgres]": 19.730096291867085,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_long_poll_and_state_etag_match_across_stores[sqlite]": 1.6997376679209992,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_rejects_invalid_markers_and_filters": 0.3206472081365064,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_requires_the_list_endpoint_authentication": 0.7734962919494137,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_sends_heartbeats_and_closes_idle_streams": 0.9058597089024261,
+    "tests/server/test_session_follow_stream.py::test_follow_stream_uses_list_endpoint_exposure_projection": 0.212017166079022,
+    "tests/server/test_session_follow_stream.py::test_idle_follower_of_quiet_running_session_has_bounded_store_reads": 3.8456135420128703
 }

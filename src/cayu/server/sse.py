@@ -22,6 +22,8 @@ SSE_OBSERVER_MAX_BYTES = 2 * 1024 * 1024
 SSE_REPLAY_PAGE_EVENTS = 32
 SSE_REPLAY_START_MARKER_FORMAT = "session_id:"
 SSE_SEND_TIMEOUT_SECONDS = 30.0
+SSE_SESSION_FOLLOW_END_EVENT = "end"
+SSE_SESSION_FOLLOW_HEARTBEAT_COMMENT = "heartbeat"
 
 SseErrorKind = Literal["runtime", "observer"]
 SseErrorCode = Literal[
@@ -206,6 +208,26 @@ def error_to_sse_message(
                 "session_id": session_id,
             },
             separators=(",", ":"),
+        ),
+    }
+
+
+def session_follow_end_message(*, session_id: str, status: str) -> dict[str, str]:
+    """Serialize the final ``event: end`` frame of a read-only follow stream.
+
+    The frame has no ``id:`` so it never replaces the client's last durable
+    event marker. ``session_id`` must already be the exposure-safe identity.
+    """
+    return {
+        "event": SSE_SESSION_FOLLOW_END_EVENT,
+        "data": json.dumps(
+            {
+                "type": "session.follow.end",
+                "session_id": require_clean_nonblank(session_id, "session_id"),
+                "status": require_clean_nonblank(status, "status"),
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
         ),
     }
 

@@ -28,6 +28,12 @@
   `data/product.db` before removing it.
 - Support durable artifact pins on `S3ArtifactStore` with conditional-write state,
   so workspace checkpoints can use S3 artifact storage.
+- Add a read-only `GET /api/sessions/{session_id}/events/stream` follow stream for
+  session events, advertised in `/api/contract` as `sse.session_follow` and
+  `capabilities.surfaces.session_follow`. It resumes with `Last-Event-ID`, filters
+  like the event list, sends comment heartbeats, ends with an `end` frame after
+  the terminal event, and is capped per caller and per session. Add `wait_seconds`
+  long polling to the event list and `ETag`/`304` revalidation to session state.
 - Accept already-searching OpenAI web-search registrations and completed replay
   registrations. Reconcile unoccupied completion indexes by exact item identity,
   retain terminal integrity checks, and retry function index-type collisions and

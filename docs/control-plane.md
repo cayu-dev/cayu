@@ -178,6 +178,22 @@ source. Begin with `GET /api/contract`, honor its capability projection, use the
 detail APIs, and fail closed on an unsupported `contract_version`. Authentication,
 authorization, redaction, and capability contracts are identical regardless of frontend.
 
+To show a running session's live progress, open the read-only follow stream that the contract
+advertises as `sse.session_follow` (`GET /api/sessions/{session_id}/events/stream`) with a
+browser `EventSource`. Pass `after_sequence` for the last event you already rendered; the
+browser's automatic reconnect sends `Last-Event-ID` and resumes without gaps or duplicates.
+Filter out chatty events such as `exclude_event_type=model.text.delta` when you do not render
+them. Close the `EventSource` when the `end` event arrives: the session is finished and the
+server has already closed the stream. The stream never starts or changes work, so opening it is
+safe from any page.
+
+Do not poll `/events` or `/state` on a fixed timer while a page is open. If a client cannot hold
+a stream open, poll `/events` with `after_sequence` and `wait_seconds` only while the page is
+visible and the session is pending, running, or interrupting, and stop at a terminal status.
+`GET /api/sessions/{session_id}/state` returns an `ETag`, so a browser revalidates unchanged
+state with a `304` and no body. Concurrent follow streams are capped per caller and per
+session; a `429` carries `Retry-After`.
+
 Show tokens and cost with the accounting endpoints that the contract lists under
 `accounting.usage` and `accounting.cost`, each with its `path` and a `supported` flag:
 

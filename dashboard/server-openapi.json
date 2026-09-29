@@ -7779,6 +7779,16 @@
           "reviewed_knowledge": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "session_follow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tasks": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -31151,6 +31161,125 @@
         "title": "SessionExecutionSource",
         "type": "string"
       },
+      "SessionFollowContract": {
+        "additionalProperties": false,
+        "description": "Read-only SSE stream that follows one session's durable events.\n\nThe stream never admits, re-runs, or acknowledges a mutation. It emits the\nsame ``SseEventEnvelope`` frames as mutation streams, SSE comment heartbeats,\nand one final ``event: end`` frame after the session's terminal event.",
+        "properties": {
+          "end_data_example": {
+            "$ref": "#/components/schemas/SseSessionFollowEndEnvelope"
+          },
+          "end_data_schema": {
+            "const": "SseSessionFollowEndEnvelope",
+            "default": "SseSessionFollowEndEnvelope",
+            "title": "End Data Schema",
+            "type": "string"
+          },
+          "end_event_name": {
+            "const": "end",
+            "default": "end",
+            "title": "End Event Name",
+            "type": "string"
+          },
+          "event_data_schema": {
+            "const": "SseEventEnvelope",
+            "default": "SseEventEnvelope",
+            "title": "Event Data Schema",
+            "type": "string"
+          },
+          "event_id_format": {
+            "const": "session_id:cayu_event_<sequence>",
+            "default": "session_id:cayu_event_<sequence>",
+            "title": "Event Id Format",
+            "type": "string"
+          },
+          "filter_query_params": {
+            "default": [
+              "event_type",
+              "exclude_event_type",
+              "interaction_id"
+            ],
+            "items": {
+              "enum": [
+                "event_type",
+                "exclude_event_type",
+                "interaction_id"
+              ],
+              "type": "string"
+            },
+            "title": "Filter Query Params",
+            "type": "array"
+          },
+          "heartbeat_interval_seconds": {
+            "default": 15.0,
+            "description": "Seconds between SSE comment heartbeat lines that start with `:`.",
+            "exclusiveMinimum": 0.0,
+            "title": "Heartbeat Interval Seconds",
+            "type": "number"
+          },
+          "idle_timeout_seconds": {
+            "default": 300.0,
+            "description": "Seconds a running session may produce no durable events before the stream sends a retryable `replay_idle_timeout` error and closes.",
+            "exclusiveMinimum": 0.0,
+            "title": "Idle Timeout Seconds",
+            "type": "number"
+          },
+          "limit_exceeded_status": {
+            "const": 429,
+            "default": 429,
+            "title": "Limit Exceeded Status",
+            "type": "integer"
+          },
+          "max_streams_per_principal": {
+            "default": 16,
+            "minimum": 1.0,
+            "title": "Max Streams Per Principal",
+            "type": "integer"
+          },
+          "max_streams_per_session": {
+            "default": 32,
+            "minimum": 1.0,
+            "title": "Max Streams Per Session",
+            "type": "integer"
+          },
+          "method": {
+            "const": "GET",
+            "default": "GET",
+            "title": "Method",
+            "type": "string"
+          },
+          "path_template": {
+            "default": "/api/sessions/{session_id}/events/stream",
+            "title": "Path Template",
+            "type": "string"
+          },
+          "resume_header": {
+            "const": "Last-Event-ID",
+            "default": "Last-Event-ID",
+            "title": "Resume Header",
+            "type": "string"
+          },
+          "start_query_param": {
+            "const": "after_sequence",
+            "default": "after_sequence",
+            "title": "Start Query Param",
+            "type": "string"
+          },
+          "terminal_behavior": {
+            "const": "end_after_terminal_event",
+            "default": "end_after_terminal_event",
+            "title": "Terminal Behavior",
+            "type": "string"
+          },
+          "unknown_event_marker_behavior": {
+            "const": "reject",
+            "default": "reject",
+            "title": "Unknown Event Marker Behavior",
+            "type": "string"
+          }
+        },
+        "title": "SessionFollowContract",
+        "type": "object"
+      },
       "SessionMessageActionBody": {
         "additionalProperties": false,
         "properties": {
@@ -32447,6 +32576,9 @@
             "title": "Replay Start Marker Format",
             "type": "string"
           },
+          "session_follow": {
+            "$ref": "#/components/schemas/SessionFollowContract"
+          },
           "unknown_event_marker_behavior": {
             "const": "reject",
             "default": "reject",
@@ -32627,6 +32759,40 @@
           }
         },
         "title": "SseFrameExamples",
+        "type": "object"
+      },
+      "SseSessionFollowEndEnvelope": {
+        "additionalProperties": false,
+        "description": "JSON payload in the final ``event: end`` frame of a session follow stream.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "interrupting",
+              "completed",
+              "failed",
+              "interrupted"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.follow.end",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "session_id",
+          "status"
+        ],
+        "title": "SseSessionFollowEndEnvelope",
         "type": "object"
       },
       "StoreManifest": {
@@ -43041,6 +43207,26 @@
               "title": "Limit",
               "type": "integer"
             }
+          },
+          {
+            "description": "Long-poll fallback for clients that cannot hold the follow stream open. Wait up to this many seconds for a matching event after `after_sequence` while the session is pending, running, or interrupting, then return the page (possibly empty).",
+            "in": "query",
+            "name": "wait_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 25.0,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Long-poll fallback for clients that cannot hold the follow stream open. Wait up to this many seconds for a matching event after `after_sequence` while the session is pending, running, or interrupting, then return the page (possibly empty).",
+              "title": "Wait Seconds"
+            }
           }
         ],
         "responses": {
@@ -43066,6 +43252,151 @@
           }
         },
         "summary": "List Session Events"
+      }
+    },
+    "/api/sessions/{session_id}/events/stream": {
+      "get": {
+        "description": "Follow one session's durable events over Server-Sent Events without admitting or re-running any mutation. Start after `after_sequence`, or resume after the event named by the standard `Last-Event-ID` header, which takes precedence so a browser EventSource reconnects natively. Filters match `GET /sessions/{session_id}/events`. The stream sends SSE comment heartbeats and, after the session's terminal event, one `event: end` frame before closing; an already-terminal session drains and closes immediately. Concurrent streams are capped per caller and per session and return `429` with `Retry-After` when exceeded.",
+        "operationId": "follow_session_events_api_sessions__session_id__events_stream_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream only events with a greater durable sequence. Ignored when a `Last-Event-ID` header is present.",
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Stream only events with a greater durable sequence. Ignored when a `Last-Event-ID` header is present.",
+              "title": "After Sequence"
+            }
+          },
+          {
+            "description": "Send only events of this type.",
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send only events of this type.",
+              "title": "Event Type"
+            }
+          },
+          {
+            "description": "Do not send events of this type.",
+            "in": "query",
+            "name": "exclude_event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Do not send events of this type.",
+              "title": "Exclude Event Type"
+            }
+          },
+          {
+            "description": "Send only events attributed to this interaction.",
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Send only events attributed to this interaction.",
+              "title": "Interaction Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "description": "SSE stream. Event `data:` frames contain SseEventEnvelope JSON; `event: end` frames contain SseSessionFollowEndEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Read-only Server-Sent Events stream of one session's durable events. Each event is an SSE frame with an `id:` marker and a JSON SseEventEnvelope `data:` value. Heartbeats are SSE comment lines. After the session's terminal event the stream sends `event: end` with a SseSessionFollowEndEnvelope and closes. A classified observer condition is emitted as `event: error` with a SseErrorEnvelope payload."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The session does not exist."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The Last-Event-ID event marker is unknown in this session."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The caller or session already holds the configured maximum number of follow streams. Retry after the `Retry-After` header."
+          }
+        },
+        "summary": "Follow Session Events"
       }
     },
     "/api/sessions/{session_id}/human-review": {
@@ -44496,6 +44827,7 @@
     },
     "/api/sessions/{session_id}/state": {
       "get": {
+        "description": "Return bounded lifecycle state. The response carries a weak `ETag`; a matching `If-None-Match` returns `304` without a body.",
         "operationId": "get_session_state_api_sessions__session_id__state_get",
         "parameters": [
           {
@@ -44519,6 +44851,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "304": {
+            "description": "The session state is unchanged from the `If-None-Match` entity tag."
           },
           "422": {
             "content": {
