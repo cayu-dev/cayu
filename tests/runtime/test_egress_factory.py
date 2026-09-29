@@ -1674,39 +1674,78 @@ def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence(
         )
 
 
+@pytest.mark.parametrize("backend", ["microsandbox", "lambda_microvm"])
 @pytest.mark.parametrize("executable_present", [True, False])
-def test_virtual_egress_combines_adapter_security_with_actual_guest_tool_probes(executable_present):
+def test_virtual_egress_combines_adapter_security_with_actual_guest_tool_probes(
+    executable_present, backend, tmp_path
+):
+    from tests.runners.lambda_microvm_harness import (
+        ClientTokenLambdaModel,
+        SupervisorTransport,
+        is_boot_id_read,
+    )
     from tests.runners.test_microsandbox_admission import Guest, sdk
 
+    from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
     from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+    from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner
     from cayu.runners.microsandbox import MicrosandboxRunner
     from cayu.tools.search import SearchTextTool
 
+    guest_bin = tmp_path / "guest-bin"
+    guest_bin.mkdir()
+    if executable_present:
+        (guest_bin / "rg").write_text("#!/bin/sh\nexit 0\n")
+        (guest_bin / "rg").chmod(0o755)
+    transport = SupervisorTransport(tmp_path / "workspace")
+
     async def create_runner(request):
+        if backend == "lambda_microvm":
+            model = ClientTokenLambdaModel()
+            allocation = model.run_microvm(imageIdentifier=model.image_arn)
+            return LambdaMicroVMRunner(
+                model,
+                microvm_id=allocation["microvmId"],
+                endpoint=allocation["endpoint"],
+                default_cwd=str(transport.supervisor.root),
+                endpoint_transport=transport,
+                poll_interval_s=0,
+                env_overlay={**request.env_overlay, "PATH": str(guest_bin)},
+            )
         guest = Guest(0 if executable_present else 1)
         guest.registry_name = request.name
         guest.running_name = request.name
         return MicrosandboxRunner(guest, name=request.name, sandbox_module=sdk(guest))
 
+    declaring_adapter = (
+        LambdaMicroVMEgressAdapter if backend == "lambda_microvm" else MicrosandboxEgressAdapter
+    )
+
     class ProbeAdapter(_RecordingAdapter):
-        execution_admission_evidence_for = (
-            MicrosandboxEgressAdapter.execution_admission_evidence_for
-        )
+        execution_admission_evidence_for = declaring_adapter.execution_admission_evidence_for
 
         def execution_capability_evidence(self, runner=None):
             return _available_untrusted_execution_evidence(self.runner_kind)
 
-    adapter = ProbeAdapter("microsandbox", runner_factory=create_runner)
+    adapter = ProbeAdapter(
+        "lambda-microvm" if backend == "lambda_microvm" else "microsandbox",
+        runner_factory=create_runner,
+    )
     events, provider, _ = asyncio.run(
         _run_virtual_factory_lifecycle(
             _virtual_factory(adapter=adapter),
-            session_id=f"egress_probe_{executable_present}",
+            session_id=f"egress_probe_{backend}_{executable_present}",
             requirements=ExecutionRequirements.untrusted(),
             tools=[SearchTextTool()],
         )
     )
     assert len(provider.requests) == (1 if executable_present else 0)
-    assert adapter.captured["inner_runner"]._sandbox.calls
+    if backend == "lambda_microvm":
+        probes = [payload for payload in transport.payloads if not is_boot_id_read(payload)]
+        assert [payload["argv"][-1] for payload in probes] == ["rg"]
+        assert {payload["execution_profile"] for payload in transport.payloads} == {"agent"}
+    else:
+        assert adapter.captured["inner_runner"]._sandbox.calls
     if not executable_present:
         failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
         assert any(

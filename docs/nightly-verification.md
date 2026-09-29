@@ -103,7 +103,7 @@ or in CI.
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
-| AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-recoverable-allocation-live`, `aws-lambda-microvm-replacement-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
+| AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-recoverable-allocation-live`, `aws-lambda-microvm-replacement-live`, `aws-lambda-microvm-tool-admission-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
 | Chat Completions live | `GEMINI_API_KEY`; or `OPENROUTER_API_KEY` plus explicit `CAYU_OPENROUTER_MODEL` | provider-dependent | `gemini-eval`, `chat-completions-contract`, `openrouter-contract` |
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | AWS durable services | `cayu[aws]`, AWS credentials/region, and an explicit opt-in per check; each check creates and deletes one temporary S3 bucket, and `aws-durable-services-live` also one Secrets Manager secret | S3 and Secrets Manager request charges | `aws-durable-services-live`, `aws-s3-artifact-pins-live` |
@@ -168,6 +168,7 @@ high level:
 | real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and an operator-selected image passes the authenticated protocol handshake | `lambda-microvm-live` |
 | fresh-process Lambda MicroVM allocation recovery after a lost acknowledgement, concurrent client-token adoption, changed-parameter rejection, suspended reconnect by durable identity with a verified unprivileged agent boundary, disposal proof, in-window and never-submitted reaping, and a zero-unaccounted census | verified when AWS, a protocol-compatible image ARN, an egress network connector, at least 3 GiB of free ARM64 MicroVM memory quota, and the explicit opt-in are available; guest egress enforcement is covered by the metadata-isolation check | `aws-lambda-microvm-recoverable-allocation-live` |
 | Lambda MicroVM owner-fence writer isolation, predecessor disposal proof, replacement pinned to the predecessor image version, and workspace checkpoint restore verified in a fresh MicroVM | verified when AWS, a protocol-3 image ARN, an egress network connector, and the explicit opt-in are available; the full factory replacement path also needs the integrated private proxy and is covered by deterministic tests | `aws-lambda-microvm-replacement-live` |
+| live Lambda MicroVM executable admission through the agent lane, bound to the MicroVM identifier, endpoint, image ARN/version, guest root, environment overlay, sidecar protocol, and guest boot id: a present executable admits a tool, a missing one refuses it before any model request, explicit probe arguments run the program, and renewal re-observes the same identity | verified when AWS, the explicit opt-in, and an image with `python3` and `bash` but without `rg` are available | `aws-lambda-microvm-tool-admission-live` |
 | canonical Lambda MicroVM artifact packaging, AWS image build/boot, EFS and S3 Files helpers, provenance, and cleanup | verified when the explicit AWS image-build opt-in and required build permissions are available | `aws-lambda-microvm-image-build-live` |
 | real AWS Lambda MicroVM required metadata denial plus proxy, public-egress, execution-role, UID/capability/namespace/route/sidecar-port, guest inspection, vault-canary, credential, revocation, workspace-release, and cleanup boundaries | verified only when the integrated agent-network-namespace boundary emits the exact versioned schema and the explicit opt-in is enabled | `aws-lambda-microvm-metadata-isolation-live` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
@@ -200,14 +201,14 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 38 live example files across `examples/` and its provider subdirectories:
+There are 39 live example files across `examples/` and its provider subdirectories:
 
 | prerequisite | examples |
 | --- | --- |
 | Docker | `docker_interrupt_live.py`, `docker_sync_binding_live.py` |
 | microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py`, `microsandbox_guest_agent_liveness_live.py`, `microsandbox_network_default_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_hardened_coding_agent_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
-| AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py`, `aws/lambda_microvm_recoverable_allocation_live.py` and `aws/lambda_microvm_replacement_live.py` (also need an egress network connector) |
+| AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py`, `aws/lambda_microvm_tool_admission_live.py`, `aws/lambda_microvm_recoverable_allocation_live.py` and `aws/lambda_microvm_replacement_live.py` (also need an egress network connector) |
 | AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | Playwright Chromium | `dashboard_behavior_live.py` |

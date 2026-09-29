@@ -128,7 +128,8 @@ def test_duplicate_alternatives_and_requirement_names_are_rejected() -> None:
 
 
 @pytest.mark.parametrize(
-    "entrance", ["agent", "factory_request", "manifest", "microsandbox_declaration"]
+    "entrance",
+    ["agent", "factory_request", "manifest", "microsandbox_declaration", "lambda_declaration"],
 )
 @pytest.mark.parametrize(
     "field",
@@ -197,6 +198,16 @@ def test_agent_requirement_revalidation_does_not_publish_rejected_values(
                 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 
                 MicrosandboxEgressAdapter().execution_admission_evidence_for(requirements)
+            elif entrance == "lambda_declaration":
+                from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
+                from cayu.egress.proxy_exposure import VpcTaskProxyExposure
+
+                LambdaMicroVMEgressAdapter(
+                    region_name="us-east-1",
+                    egress_network_connector_arn="arn:aws:lambda:us-east-1:1:network-connector:n",
+                    exposure=VpcTaskProxyExposure("10.0.0.5"),
+                    client=object(),
+                ).execution_admission_evidence_for(requirements)
             else:
                 app.describe()
     output = capsys.readouterr()

@@ -64,7 +64,7 @@ def sdk(guest):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX guest probe semantics")
-@pytest.mark.parametrize("backend", ["microsandbox", "docker"])
+@pytest.mark.parametrize("backend", ["microsandbox", "docker", "lambda_microvm"])
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("proof", ["builtin", "file", "directory", "absolute", "relative", "empty"])
 def test_public_admission_requires_an_executable_not_only_a_shell_builtin(
@@ -165,6 +165,27 @@ def test_public_admission_requires_an_executable_not_only_a_shell_builtin(
             monkeypatch.setattr(docker_module, "_run_docker_admission_probe", probe)
             runner = DockerRunner(
                 "probe-semantics", _container_id=container_id, close_action="none"
+            )
+        elif backend == "lambda_microvm":
+            from tests.runners.lambda_microvm_harness import (
+                ClientTokenLambdaModel,
+                SupervisorTransport,
+            )
+
+            from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner
+
+            # The real sidecar supervisor executes the generated lookup through
+            # the agent lane, with the fixture PATH as the runner overlay.
+            model = ClientTokenLambdaModel()
+            allocation = model.run_microvm(imageIdentifier=model.image_arn)
+            runner = LambdaMicroVMRunner(
+                model,
+                microvm_id=allocation["microvmId"],
+                endpoint=allocation["endpoint"],
+                default_cwd=str(tmp_path),
+                endpoint_transport=SupervisorTransport(tmp_path),
+                poll_interval_s=0,
+                env_overlay={"PATH": search_path},
             )
         provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
         app = CayuApp(enable_logging=False)

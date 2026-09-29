@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import email.utils
 import weakref
@@ -138,17 +139,33 @@ class ConformanceLambdaClient:
         return {}
 
 
+DEFAULT_GUEST_BOOT_ID = "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9"
+
+
+def is_boot_id_read(payload: dict[str, Any]) -> bool:
+    """Whether a command reads the guest kernel boot id for admission identity."""
+
+    return any("/proc/sys/kernel/random/boot_id" in part for part in payload.get("argv") or ())
+
+
 class SupervisorTransport(OwnerFencedTransport):
-    """Lambda sidecar transport shared by runner conformance and composition tests."""
+    """Lambda sidecar transport shared by runner conformance and composition tests.
+
+    Guest boot-id reads are answered from ``boot_id`` so admission identity is
+    deterministic on hosts without Linux ``/proc`` (every other command runs in
+    the real supervisor).
+    """
 
     def __init__(
         self,
         root: Path,
         *,
         scripted_exit_code: Callable[[dict[str, Any]], int | None] | None = None,
+        boot_id: str | Callable[[], str] = DEFAULT_GUEST_BOOT_ID,
     ) -> None:
         self.supervisor = CommandSupervisor(root=root)
         self.scripted_exit_code = scripted_exit_code
+        self.boot_id = boot_id
         self.execution_profiles: list[str] = []
         self.payloads: list[dict[str, Any]] = []
         self._scripted_results: dict[str, dict[str, Any]] = {}
@@ -167,6 +184,12 @@ class SupervisorTransport(OwnerFencedTransport):
         copied = copy.deepcopy(payload)
         self.execution_profiles.append(copied["execution_profile"])
         self.payloads.append(copied)
+        if is_boot_id_read(copied):
+            boot_id = self.boot_id() if callable(self.boot_id) else self.boot_id
+            self._scripted_results[command_id] = _terminal_result(
+                command_id, exit_code=0, stdout=boot_id
+            )
+            return {"command_id": command_id, "state": "accepted"}
         if self.scripted_exit_code is not None:
             exit_code = self.scripted_exit_code(copied)
             if exit_code is not None:
@@ -194,18 +217,19 @@ class SupervisorTransport(OwnerFencedTransport):
         self.supervisor.cancel_all(reason="owner_superseded", before_generation=generation)
 
 
-def _terminal_result(command_id: str, *, exit_code: int) -> dict[str, Any]:
+def _terminal_result(command_id: str, *, exit_code: int, stdout: str = "") -> dict[str, Any]:
+    encoded = stdout.encode("utf-8")
     return {
         "command_id": command_id,
         "state": "completed",
-        "stdout_base64": "",
+        "stdout_base64": base64.b64encode(encoded).decode("ascii"),
         "stderr_base64": "",
         "exit_code": exit_code,
         "timed_out": False,
         "cancelled": False,
         "stdout_truncated": False,
         "stderr_truncated": False,
-        "stdout_bytes": 0,
+        "stdout_bytes": len(encoded),
         "stderr_bytes": 0,
     }
 

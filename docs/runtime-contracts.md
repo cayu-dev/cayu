@@ -11315,11 +11315,32 @@ environment identity. Inner executable or native-tool evidence cannot replace
 an adapter's security claim. Unsupported adapters do not gain evidence merely
 because a tool requests it.
 
-The built-in E2B and Lambda MicroVM runners currently inherit the no-evidence
-default for tool dependencies. A registered tool requiring executable or native
-capability proof is refused with those defaults; tools without external
-requirements remain compatible. Supporting a dependency requires an integration
-that supplies the explicit evidence contract, not a backend-name exemption.
+`LambdaMicroVMRunner` collects request-scoped executable evidence through the
+guest's ordinary agent execution lane, never the trusted system lane, using the
+same availability script and process-form probe arguments as Docker and
+Microsandbox. The evidence is bound to one exact MicroVM: its identifier and
+endpoint, the control-plane image ARN and version, the guest root, the runner
+environment overlay, the sidecar protocol version confirmed by a live health
+read, and the guest kernel boot id. The runner reads that identity before and
+after the probes; the control plane must report the MicroVM `PENDING` or
+`RUNNING` both times, and any change, including an image that differs from the
+one the runner was bound to, fails collection closed. Live claims are valid for
+at most `EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS` from the start of the
+observation. Every probe is an ordinary runner command, so interruption,
+timeout, and transport failure use the runner's command cleanup: the command is
+cancelled at the sidecar, or execution is fenced until its settlement is
+positively known. A superseded owner, a suspended or terminating MicroVM, and a
+closed runner refuse collection, snapshots, and renewal; a suspend, resume, or
+termination retires previously collected evidence. `LambdaMicroVMEgressAdapter`
+declares the planned checks before allocation. The boot id detects an in-place
+guest restart; it is not a uniqueness claim across MicroVMs, which the
+identifier already carries.
+
+The built-in E2B runner still inherits the no-evidence default for tool
+dependencies. A registered tool requiring executable or native capability proof
+is refused with that default; tools without external requirements remain
+compatible. Supporting a dependency requires an integration that supplies the
+explicit evidence contract, not a backend-name exemption.
 
 Cayu applies admission only at its common runtime lifecycle. The `pre_create`
 gate runs before any registered factory's `create()` method. Before creation,

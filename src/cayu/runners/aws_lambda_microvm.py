@@ -6,12 +6,14 @@ import calendar
 import importlib
 import json
 import logging
+import re
 import secrets
 import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from math import isfinite
 from typing import Any, Literal, Protocol, cast
@@ -25,11 +27,13 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
 from cayu.providers._http import SharedAsyncClient
+from cayu.runners._admission_probes import EXECUTABLE_AVAILABILITY_SCRIPT
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -56,6 +60,7 @@ from cayu.runners.base import (
     ExecResult,
     RemoteWorkspaceBranchCapability,
     Runner,
+    RunnerExecutionAdmissionObserver,
     RunnerSystemExecutionMode,
     RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
@@ -121,6 +126,16 @@ _LAMBDA_TRANSIENT_CONTROL_ERROR_TYPES = frozenset(
 )
 _LAMBDA_UNUSABLE_ALLOCATION_STATES = frozenset({"FAILED", "TERMINATING", "TERMINATED"})
 _LAMBDA_POLL_ATTEMPTS = 3
+LAMBDA_MICROVM_ADMISSION_PROBE_TIMEOUT_SECONDS = 5
+_LAMBDA_ADMISSION_PROBE_OUTPUT_LIMIT_BYTES = 1024
+_LAMBDA_ADMISSION_RUNNING_STATES = frozenset({"PENDING", "RUNNING"})
+# Read through the agent lane with a shell builtin, so the identity read does
+# not depend on any guest utility beyond /bin/sh.
+_LAMBDA_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+_LAMBDA_BOOT_ID_SCRIPT = f'read -r boot_id < {_LAMBDA_BOOT_ID_PATH} && printf "%s" "$boot_id"'
+_LAMBDA_BOOT_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
 _CommandPollTask = asyncio.Task[CapturedAwaitableOutcome[Mapping[str, Any]]]
 _PENDING_LAMBDA_POLLS: set[_CommandPollTask] = set()
 _PENDING_LAMBDA_LIFECYCLES: set[asyncio.Task[CapturedAwaitableOutcome[None]]] = set()
@@ -292,6 +307,10 @@ class LambdaMicroVMLifecycleInProgress(LambdaMicroVMError):
     definitively rejected, or the guest's matching suspend/terminate hook
     observes the request's effect. The lease never expires by time.
     """
+
+
+class _LambdaMicroVMAdmissionIdentityDrift(LambdaMicroVMError):
+    """The exact MicroVM changed while admission evidence was being observed."""
 
 
 class LambdaMicroVMClientTokenConflict(LambdaMicroVMError):
@@ -676,6 +695,52 @@ class LambdaMicroVMRunner(Runner):
         self._owner_claimed = False
         self._owner_superseded = False
         self._owner_generation: int | None = None
+        # Advanced by every lifecycle transition so retained admission evidence
+        # never outlives the running incarnation it observed.
+        self._admission_epoch = 0
+
+    def execution_admission_observer(self, requirements):
+        """Own live executable evidence for this exact MicroVM and requirement set."""
+
+        if not requirements.executable_names():
+            return super().execution_admission_observer(requirements)
+        return _LambdaAdmissionObserver(self, requirements)
+
+    def execution_admission_candidate_for(self, requirements):
+        if not requirements.executable_names():
+            return self.execution_admission_candidate()
+        return _LambdaAdmissionObserver(self, requirements).snapshot()
+
+    async def refresh_execution_admission(self) -> None:
+        """Refuse renewal for a MicroVM that cannot execute; claims are request-scoped.
+
+        Executable evidence is renewed by the request's admission observer,
+        which re-reads the complete identity. This hook adds no claim.
+        """
+
+        self._require_admission_open()
+
+    def _require_admission_open(self) -> None:
+        if self._owner_superseded:
+            raise LambdaMicroVMOwnershipSuperseded("Lambda MicroVM has a newer owner.")
+        self._ensure_exec_open()
+        if (
+            self._suspended
+            or self._termination_requested
+            or self._public_lifecycle_task is not None
+        ):
+            raise LambdaMicroVMError("Lambda MicroVM is not running; admission is unavailable.")
+
+    def _admission_local_identity(self) -> tuple[object, ...]:
+        return (
+            self.microvm_id,
+            self.endpoint,
+            self.image_identifier,
+            self.image_version,
+            self.default_cwd,
+            tuple(sorted(copy_runner_env(self.env_overlay, inherit_env=False).items())),
+            self._admission_epoch,
+        )
 
     @classmethod
     async def create(
@@ -1391,6 +1456,7 @@ class LambdaMicroVMRunner(Runner):
     async def _suspend(self, *, fenced: bool = True) -> None:
         if self._suspended or self._termination_requested:
             return
+        self._admission_epoch += 1
         if fenced:
             await self._owned_provider_mutation("suspend", self._client.suspend_microvm)
         else:
@@ -1405,6 +1471,7 @@ class LambdaMicroVMRunner(Runner):
         # The public lifecycle owner holds the lock across all provider calls.
         if self._termination_requested:
             raise RuntimeError("Cannot resume a terminated Lambda MicroVM.")
+        self._admission_epoch += 1
         if not self._suspended:
             response = await asyncio.to_thread(
                 self._client.get_microvm, microvmIdentifier=self.microvm_id
@@ -1588,6 +1655,7 @@ class LambdaMicroVMRunner(Runner):
     async def _terminate(self, *, fenced: bool = True) -> None:
         if self._termination_requested:
             return
+        self._admission_epoch += 1
         if not fenced:
             await asyncio.to_thread(
                 self._client.terminate_microvm, microvmIdentifier=self.microvm_id
@@ -2056,6 +2124,223 @@ class _LambdaMicroVMCommandHandle:
             raise LambdaMicroVMProtocolError(
                 f"Lambda MicroVM cancellation did not reach a terminal state: {state}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _LambdaAdmissionIdentity:
+    """One complete observation of the exact MicroVM an admission probe ran in."""
+
+    local: tuple[object, ...]
+    image_arn: str
+    image_version: str | None
+    protocol_version: str
+    boot_id: str
+
+
+@dataclass
+class _LambdaAdmissionState:
+    candidate: Any = None
+    identity: _LambdaAdmissionIdentity | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class _LambdaAdmissionObserver(RunnerExecutionAdmissionObserver):
+    """Probe executables through the agent lane of one exact, unchanged MicroVM.
+
+    Identity is read before and after the probes from the control plane
+    (``get_microvm``), the sidecar health endpoint, and the guest kernel boot
+    id. Any change fails closed. Probes use ``runner.exec``, so every dispatched
+    command is settled, or the runner is fenced, by the runner's own command
+    cleanup before this observer returns or raises.
+    """
+
+    runner: LambdaMicroVMRunner
+    state: _LambdaAdmissionState = field(default_factory=_LambdaAdmissionState)
+
+    def _fingerprint(self, identity: _LambdaAdmissionIdentity | None) -> str:
+        runner = self.runner
+        return (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "microvm_id": runner.microvm_id,
+                        "endpoint": runner.endpoint,
+                        "image_arn": None if identity is None else identity.image_arn,
+                        "image_version": None if identity is None else identity.image_version,
+                        "root": runner.default_cwd,
+                        "environment": copy_runner_env(runner.env_overlay, inherit_env=False),
+                        "protocol_version": None if identity is None else identity.protocol_version,
+                        "boot_id": None if identity is None else identity.boot_id,
+                    },
+                    "lambda_microvm_execution_identity",
+                )
+            ).hexdigest()
+        )
+
+    def _candidate(self, identity: _LambdaAdmissionIdentity | None, claims=()):
+        from cayu.environments.admission import (
+            ExecutionAdmissionCandidate,
+            ExecutionCapabilityEvidence,
+            ExecutionToolRequirementEvidence,
+        )
+
+        fingerprint = self._fingerprint(identity)
+        return ExecutionAdmissionCandidate(
+            candidate="lambda-microvm",
+            evidence=ExecutionCapabilityEvidence(
+                subject="lambda-microvm",
+                unclaimed_reason_code="security_unclaimed",
+                environment_fingerprint=fingerprint,
+                tool_requirements=ExecutionToolRequirementEvidence(
+                    environment_fingerprint=fingerprint,
+                    executables=claims,
+                ),
+            ),
+        )
+
+    def snapshot(self):
+        from cayu.environments.admission import ExecutionExecutableEvidence
+
+        self.runner._require_admission_open()
+        identity = self.state.identity
+        candidate = self.state.candidate
+        if (
+            candidate is not None
+            and identity is not None
+            and identity.local == self.runner._admission_local_identity()
+        ):
+            return candidate
+        probes = {probe.executable: probe for probe in self.requirements.executable_probes()}
+        return self._candidate(
+            None,
+            tuple(
+                ExecutionExecutableEvidence(
+                    executable=name,
+                    state="declared",
+                    requirement_fingerprint=None
+                    if name not in probes
+                    else probes[name].fingerprint,
+                )
+                for name in self.requirements.executable_names()
+            ),
+        )
+
+    async def _observe_identity(self) -> _LambdaAdmissionIdentity:
+        runner = self.runner
+        runner._require_admission_open()
+        local = runner._admission_local_identity()
+        # A read-only control-plane call; a timed-out worker thread cannot
+        # mutate the MicroVM and its late answer is discarded.
+        response = await asyncio.wait_for(
+            asyncio.to_thread(runner._client.get_microvm, microvmIdentifier=runner.microvm_id),
+            timeout=runner.request_timeout_s,
+        )
+        response_id, endpoint = _microvm_identity(response)
+        if response_id != runner.microvm_id or endpoint != runner.endpoint:
+            raise _LambdaMicroVMAdmissionIdentityDrift(
+                "get_microvm returned a different MicroVM identity during admission."
+            )
+        state = _required_response_string(response, "state")
+        if state not in _LAMBDA_ADMISSION_RUNNING_STATES:
+            raise LambdaMicroVMError(
+                f"Lambda MicroVM is {state}; executable admission requires a running MicroVM."
+            )
+        image_arn = _response_string(response, "imageArn")
+        if image_arn is None:
+            raise LambdaMicroVMProtocolError("get_microvm omitted the MicroVM image ARN.")
+        image_version = _response_string(response, "imageVersion")
+        if (
+            runner.image_identifier is not None
+            and runner.image_identifier.startswith("arn:")
+            and image_arn != runner.image_identifier
+        ) or (runner.image_version is not None and image_version != runner.image_version):
+            raise _LambdaMicroVMAdmissionIdentityDrift(
+                "Lambda MicroVM reports a different image than this runner was bound to."
+            )
+        # Proves the running sidecar speaks the exact protocol this runner uses.
+        await runner._endpoint_health()
+        result = await runner.exec(
+            ExecCommand.process("/bin/sh", "-c", _LAMBDA_BOOT_ID_SCRIPT),
+            timeout_s=LAMBDA_MICROVM_ADMISSION_PROBE_TIMEOUT_SECONDS,
+            output_limit_bytes=_LAMBDA_ADMISSION_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        boot_id = result.stdout.strip()
+        if (
+            result.timed_out
+            or result.cancelled
+            or result.exit_code != 0
+            or _LAMBDA_BOOT_ID_PATTERN.fullmatch(boot_id) is None
+        ):
+            raise LambdaMicroVMError("Lambda MicroVM guest boot identity is unavailable.")
+        return _LambdaAdmissionIdentity(
+            local=local,
+            image_arn=image_arn,
+            image_version=image_version,
+            protocol_version=LAMBDA_MICROVM_PROTOCOL_VERSION,
+            boot_id=boot_id,
+        )
+
+    async def _probe(self, command: ExecCommand) -> int:
+        result = await self.runner.exec(
+            command,
+            timeout_s=LAMBDA_MICROVM_ADMISSION_PROBE_TIMEOUT_SECONDS,
+            output_limit_bytes=_LAMBDA_ADMISSION_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        if result.timed_out or result.cancelled:
+            raise LambdaMicroVMError("Lambda MicroVM admission probe did not complete.")
+        return result.exit_code
+
+    async def collect(self):
+        from cayu.environments.admission import (
+            EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
+            ExecutionExecutableEvidence,
+        )
+
+        self.state.candidate = None
+        self.state.identity = None
+        # Timestamp the start of the complete observation, not its end.
+        observed_at = datetime.now(UTC)
+        valid_until = observed_at + timedelta(seconds=EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS)
+        initial = await self._observe_identity()
+        probes = {probe.executable: probe for probe in self.requirements.executable_probes()}
+        claims = []
+        for name in self.requirements.executable_names():
+            probe = probes.get(name)
+            arguments = None if probe is None else probe.probe_arguments
+            command = (
+                ExecCommand.process(
+                    "/bin/sh", "-c", EXECUTABLE_AVAILABILITY_SCRIPT, "cayu-admission", name
+                )
+                if arguments is None
+                else ExecCommand.process(name, *arguments)
+            )
+            code = await self._probe(command)
+            available = code in ((0,) if probe is None else probe.accepted_exit_codes)
+            claims.append(
+                ExecutionExecutableEvidence(
+                    executable=name,
+                    state="live_verified" if available else "unavailable",
+                    observed_at=observed_at if available else None,
+                    valid_until=valid_until if available else None,
+                    requirement_fingerprint=None if probe is None else probe.fingerprint,
+                    reason_code=None if available else "executable_unavailable",
+                    remediation_code=None if available else "install_executable",
+                )
+            )
+        final = await self._observe_identity()
+        if final != initial:
+            raise _LambdaMicroVMAdmissionIdentityDrift(
+                "Lambda MicroVM identity changed during admission observation."
+            )
+        self.runner._require_admission_open()
+        candidate = self._candidate(final, tuple(claims))
+        self.state.identity = final
+        self.state.candidate = candidate
+        return candidate
+
+    async def refresh(self):
+        await self.collect()
 
 
 def _exec_result(response: Mapping[str, Any]) -> ExecResult:

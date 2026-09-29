@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import warnings
 from collections.abc import AsyncIterator
@@ -1180,8 +1181,10 @@ def _bound_factory_app(
     return app, factory, binding, source_runner, bound_runner, lifecycle
 
 
-@pytest.mark.parametrize("backend", ["e2b", "lambda_microvm"])
-@pytest.mark.parametrize("requires_executable", [False, True])
+@pytest.mark.parametrize(
+    ("backend", "requires_executable"),
+    [("e2b", False), ("e2b", True), ("lambda_microvm", False)],
+)
 def test_unobserved_remote_runner_fails_closed_only_for_required_dependencies(
     backend,
     requires_executable,
@@ -1230,6 +1233,68 @@ def test_unobserved_remote_runner_fails_closed_only_for_required_dependencies(
         await runner.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX guest probe semantics")
+@pytest.mark.parametrize("executable_present", [True, False])
+def test_lambda_microvm_admits_required_dependencies_from_live_guest_evidence(
+    tmp_path, executable_present
+):
+    from tests.runners.lambda_microvm_harness import (
+        ClientTokenLambdaModel,
+        SupervisorTransport,
+        is_boot_id_read,
+    )
+
+    from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner
+
+    bin_dir = tmp_path / "guest-bin"
+    bin_dir.mkdir()
+    if executable_present:
+        (bin_dir / "rg").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "rg").chmod(0o755)
+
+    async def scenario():
+        model = ClientTokenLambdaModel()
+        transport = SupervisorTransport(tmp_path / "workspace")
+        allocation = model.run_microvm(imageIdentifier=model.image_arn)
+        runner = LambdaMicroVMRunner(
+            model,
+            microvm_id=allocation["microvmId"],
+            endpoint=allocation["endpoint"],
+            image_identifier=allocation["imageArn"],
+            image_version=allocation["imageVersion"],
+            default_cwd=str(transport.supervisor.root),
+            endpoint_transport=transport,
+            poll_interval_s=0,
+            env_overlay={"PATH": str(bin_dir)},
+        )
+        provider = _RecordingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="remote"), runner=runner), default=True
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"), tools=[SearchTextTool()]
+        )
+        events = await _run(app, f"lambda-live-evidence-{executable_present}")
+        await runner.close()
+        return events, provider, transport
+
+    events, provider, transport = asyncio.run(scenario())
+    probes = [payload for payload in transport.payloads if not is_boot_id_read(payload)]
+    assert [payload["argv"][-1] for payload in probes] == ["rg"]
+    assert {payload["execution_profile"] for payload in transport.payloads} == {"agent"}
+    assert len(provider.requests) == int(executable_present)
+    assert (EventType.SESSION_COMPLETED in {event.type for event in events}) is executable_present
+    if not executable_present:
+        failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+        assert any(
+            refusal["tool_name"] == "search_text" and refusal["executable"] == "rg"
+            for refusal in failed.payload["execution_admission"]["refusals"]
+        )
+        assert not any(str(event.type).startswith("model.") for event in events)
 
 
 def test_static_local_runner_is_refused_for_untrusted_workload(tmp_path) -> None:

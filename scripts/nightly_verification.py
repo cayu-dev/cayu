@@ -646,6 +646,33 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="aws-lambda-microvm-tool-admission-live",
+        capability=(
+            "AWS Lambda MicroVM live executable admission bound to the exact MicroVM identity"
+        ),
+        lane="aws-lambda-microvm",
+        command=(
+            "uv",
+            "run",
+            "--extra",
+            "aws",
+            "python",
+            "-m",
+            "examples.aws.lambda_microvm_tool_admission_live",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_LAMBDA_MICROVM_TOOL_ADMISSION_LIVE=1",
+            "CAYU_LAMBDA_MICROVM_IMAGE with python3 and bash but without rg",
+            "AWS_REGION or AWS_DEFAULT_REGION",
+            "AWS credential chain",
+        ),
+        required_env=("CAYU_LAMBDA_MICROVM_IMAGE",),
+        required_env_values={"CAYU_LAMBDA_MICROVM_TOOL_ADMISSION_LIVE": "1"},
+        required_any_env=(("AWS_REGION", "AWS_DEFAULT_REGION"),),
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="aws-durable-services-live",
         capability="AWS S3 artifact store and Secrets Manager vault",
         lane="aws-durable-services",

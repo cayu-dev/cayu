@@ -23,7 +23,11 @@ from cayu.egress import (
 from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy, VpcTaskProxyExposure
-from cayu.environments import ExecutionRequirements, evaluate_execution_admission
+from cayu.environments import (
+    ExecutionRequirements,
+    ExecutionToolRequirement,
+    evaluate_execution_admission,
+)
 from cayu.runners import Runner
 from cayu.vaults import SecretRef, StaticVault
 
@@ -84,6 +88,52 @@ def test_lambda_microvm_admission_reflects_metadata_isolation_mode() -> None:
         if item.capability == "confirmed_cancellation"
     )
     assert cancellation.code == "unsupported_capability"
+
+
+def test_lambda_microvm_declares_planned_executable_checks_without_claiming_them() -> None:
+    from cayu.tools.search import SearchTextTool
+
+    adapter = LambdaMicroVMEgressAdapter(
+        region_name="us-east-1",
+        egress_network_connector_arn="arn:aws:lambda:us-east-1:123:network-connector:nc-1",
+        exposure=VpcTaskProxyExposure("10.0.0.5"),
+        client=object(),
+    )
+    requirements = ExecutionRequirements.model_validate(
+        {
+            **ExecutionRequirements.untrusted().model_dump(),
+            "tool_requirements": [
+                ExecutionToolRequirement(tool_name="search_text", requirement=requirement)
+                for requirement in SearchTextTool.spec.execution_requirements
+            ],
+        }
+    )
+
+    evidence = adapter.execution_admission_evidence_for(requirements)
+
+    assert evidence.tool_requirements is not None
+    assert [
+        (claim.executable, claim.state) for claim in evidence.tool_requirements.executables
+    ] == [("rg", "declared")]
+    # A planned check lets allocation proceed; only live guest evidence admits.
+    assert (
+        evaluate_execution_admission(
+            candidate="lambda-microvm",
+            requirements=requirements,
+            evidence=evidence,
+            stage="pre_create",
+        ).status
+        == "admitted"
+    )
+    assert (
+        evaluate_execution_admission(
+            candidate="lambda-microvm",
+            requirements=requirements,
+            evidence=evidence,
+            stage="pre_exposure",
+        ).status
+        == "refused"
+    )
 
 
 class _FakeProxyServer:

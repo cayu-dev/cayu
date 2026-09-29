@@ -143,6 +143,9 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     supports_reconnect = True
     supports_allocation_fingerprint = True
 
+    def execution_admission_evidence_for(self, requirements):
+        return self._execution_admission_executable_declaration(requirements)
+
     def execution_capability_evidence(
         self,
         runner: Runner | None = None,
