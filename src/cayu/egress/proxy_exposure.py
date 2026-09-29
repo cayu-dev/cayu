@@ -1,14 +1,15 @@
+"""Provider-neutral proxy exposure contracts for sandbox runtimes."""
+
 from __future__ import annotations
 
+import importlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from ipaddress import IPv4Address, ip_address
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from cayu.egress.errors import UnsupportedEgressError
-
-MICROSANDBOX_HOST = "host.microsandbox.internal"
 
 
 @dataclass(frozen=True)
@@ -74,21 +75,6 @@ class ProxyExposure(Protocol):
     async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy: ...
 
 
-class MicrosandboxHostProxyExposure:
-    """Advertises a host listener through Microsandbox's reserved host name."""
-
-    async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
-        normalized = local_host.strip().lower()
-        if normalized != "127.0.0.1":
-            raise UnsupportedEgressError(
-                "Microsandbox virtual egress requires Cayu's paired IPv4/IPv6 "
-                "loopback proxy listener."
-            )
-        if local_port <= 0:
-            raise ValueError("local_port must be positive.")
-        return ExposedProxy(proxy_url=f"http://{MICROSANDBOX_HOST}:{local_port}")
-
-
 class VpcTaskProxyExposure:
     """Advertise a proxy listener through the private IPv4 of its VPC task.
 
@@ -124,3 +110,18 @@ def _is_rfc1918(address: IPv4Address) -> bool:
         or int(IPv4Address("172.16.0.0")) <= value <= int(IPv4Address("172.31.255.255"))
         or int(IPv4Address("192.168.0.0")) <= value <= int(IPv4Address("192.168.255.255"))
     )
+
+
+# Microsandbox's exposure is provider-specific and lives with its adapter. These
+# names remain importable from here during the optional-package transition.
+_RELOCATED_NAMES = {
+    "MICROSANDBOX_HOST": "cayu.egress.microsandbox_adapter",
+    "MicrosandboxHostProxyExposure": "cayu.egress.microsandbox_adapter",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _RELOCATED_NAMES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(module_name), name)

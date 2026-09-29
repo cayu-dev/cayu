@@ -340,9 +340,107 @@ app.register_environment(Environment(EnvironmentSpec(name="modal"), runner=runne
 Any agent in that environment whose tools include `ExecCommandTool` then runs its
 commands through your runner.
 
+## Extension seams (experimental)
+
+Cayu's own sandbox runners share cleanup, redaction, and validation helpers. The
+modules below publish those same objects so an adapter shipped as a separate
+package does not need to import private `cayu.*._module` paths.
+
+**Compatibility.** Everything in this section is experimental. Names and
+signatures may change between Cayu releases until the supported extension
+contract and its compatibility tiers are defined. Pin the Cayu versions you
+test against.
+
+### Adapter identity registry
+
+Runner diagnostics (`cayu.runner_execution_error.v1`, `cayu.runner_unavailable.v1`)
+and cleanup receipts (`cayu.runner_cleanup.v1`) are durable, so Cayu publishes
+only adapter names and exception class names it trusts. Unregistered adapter
+names become `"unknown"` and unregistered exception classes become
+`"Exception"`. To have your runner's `isolation` label and your SDK's error
+classes appear in that evidence, register them once, explicitly, when your
+package is composed into the application:
+
+```python
+from cayu.extensions.runners import register_runner_adapter_identity
+
+register_runner_adapter_identity(
+    "modal",
+    trusted_error_types=("SandboxTerminatedError", "ExecTimeoutError"),
+)
+```
+
+- The name must be a lowercase ASCII slug (letters, digits, single hyphens,
+  starting with a letter, at most 63 characters) and cannot be `"unknown"`.
+  Error types are Python class-name identifiers (at most 128 characters, at most
+  64 per adapter). Only the bare class name is ever published, never messages.
+- Registration is process-wide and permanent. Repeating an identical
+  registration returns the existing `RunnerAdapterIdentity`; registering the
+  same name with a different error-type set raises `ValueError`. Built-in
+  identities (`docker`, `e2b`, `lambda-microvm`, `local`, `microsandbox`) are
+  pre-registered and cannot be widened.
+- `registered_runner_adapter_identities()` returns a read-only snapshot.
+- Cayu never discovers adapters automatically (no entry points). An adapter
+  that is not registered keeps working; its diagnostics are just anonymous.
+
+### `cayu.extensions.runners`
+
+| Name | Purpose |
+| --- | --- |
+| `cleanup_runner_command_with_diagnostic` | One bounded `kill()` of a command handle (`"command"`) or sandbox (`"sandbox"`), or a skipped receipt (`"none"`); returns a `RunnerCleanupResult` with a `cayu.runner_cleanup.v1` artifact. Only an awaited, non-`False` kill is `completed`. |
+| `RunnerCleanupResult`, `RUNNER_CLEANUP_ARTIFACT_TYPE` | Cleanup receipt container and its artifact type string. |
+| `validate_runner_cleanup_policy`, `validate_cancel_timeout`, `DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS` | Constructor validation for `cancellation_cleanup` / `timeout_cleanup` and `cancel_timeout_s` (default 5 seconds). |
+| `RedactedOutputCapture` | Streams output through a `SecretRedactor` into a bounded head, counting original bytes and reporting truncation. |
+| `redact_completed_exec_result` | Redacts and bounds a complete `ExecResult`. |
+| `validate_timeout`, `validate_output_limit`, `validate_stdin` | The `Runner.exec` argument rules for `timeout_s`, `output_limit_bytes`, and `stdin`. |
+| `copy_runner_env`, `remove_runner_env` | Validated environment construction; pass `inherit_env=False` so no host variable reaches the sandbox, then apply `env_remove`. |
+| `copy_exec_command` | Detached, revalidated `ExecCommand` snapshot. |
+
+The policy constants and `RunnerCleanupPolicy` type remain in `cayu.runners`.
+
+### `cayu.extensions.egress`
+
+For runners that pair with a remote virtual-egress adapter (see
+[Virtual egress](virtual-egress.md)):
+
+| Name | Purpose |
+| --- | --- |
+| `prepare_exposed_proxy_binding` | Starts a session proxy listener, exposes it through a `ProxyExposure`, and returns an `EgressBinding`. Teardown revokes grants before releasing the exposure and listener; failed preparation rolls back the same way. |
+| `ProxyExposure`, `ExposedProxy` | The exposure protocol and its result (`credentialless_isolated` must be asserted for credentialless routes). |
+| `ProxyServerFactory`, `DEFAULT_PROXY_SERVER_FACTORY` | Injectable proxy listener constructor. |
+| `run_setup_commands`, `DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS` | Runs the request's setup commands through `Runner.exec_system`. |
+| `run_enforcement_preflight` | In-guest probe proving brokered reachability and direct-egress denial; returns the observation time. |
+| `virtual_egress_execution_capability_evidence` | Builds `ExecutionCapabilityEvidence` for an enforced virtual-egress runner with strictly typed inputs. |
+
+### Runner lifecycle hooks
+
+The built-in sandbox runners manage their exec fence through these protected
+`Runner` methods. Subclasses may use them as part of the experimental extension
+contract; keep the leading underscore, and do not override them.
+
+- Call `_ensure_exec_open()` at the start of `exec` so a closed, closing,
+  fenced, or poisoned runner refuses new commands.
+- `_close_exec(reason)` fences the exec path. `reopen_exec()` (which calls
+  `_open_exec()`) clears that fence unless the runner is poisoned, closing, or
+  still settling command cleanup.
+- `_poison_exec(reason=None)` fences the exec path permanently. Use it when
+  cleanup cannot prove that an interrupted command stopped.
+- `_settle_command_cleanup(operation, *, adapter, timeout_s, policy, cancellation=None)`
+  runs your cleanup coroutine factory in a shielded task and keeps new commands
+  fenced until it settles. `timeout_s` bounds observation, not the cleanup
+  itself: a timed-out cleanup keeps running and the runner is poisoned. It
+  applies the result with `_apply_cleanup_result` and, when given the caller's
+  `cancellation`, re-raises it with the cleanup artifacts attached.
+- `_apply_cleanup_result(result)` closes the exec path when
+  `result.close_runner` is set, marks the runner closed after a completed
+  `kill_sandbox`, and poisons it after any `kill_command` that is not
+  `completed` or `deferred`, or any `kill_sandbox` that is not `completed`.
+
 ## Checklist
 
 - [ ] Subclass `cayu.runners.Runner`; set `isolation`.
+- [ ] Register the `isolation` label (and any SDK error class names) with
+      `register_runner_adapter_identity` if diagnostics should name your backend.
 - [ ] Match the exact `exec` signature/defaults; validate `type(command) is ExecCommand`.
 - [ ] Translate `process` (argv) and `shell` (script) commands.
 - [ ] Enforce `timeout_s` → return `ExecResult(timed_out=True, exit_code=-9)` (the

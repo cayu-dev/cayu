@@ -42,6 +42,16 @@ async def prepare_exposed_proxy_binding(
     certificate_authority: SessionCertificateAuthority | None = None,
     owns_certificate_authority: bool = True,
 ) -> EgressBinding:
+    """Start and expose one session proxy listener as an ``EgressBinding``.
+
+    The binding's teardown revokes the grants' presented values and waits for
+    that before closing the exposure and the listener. Any failure while
+    starting or exposing the listener runs the same rollback, bounded by the
+    default egress teardown timeout, before the original error propagates.
+    Credentialless destinations require an exposure that asserts
+    ``credentialless_isolated``.
+    """
+
     if type(bind_port) is not int or not 0 <= bind_port <= 65535:
         raise ValueError("bind_port must be an integer between 0 and 65535.")
     validate_grant_scope(session_id=session_id, grants=grants)
@@ -167,6 +177,16 @@ async def run_enforcement_preflight(
     metadata_isolation_reason: str | None = None,
     metadata_isolation_remediation: str | None = None,
 ) -> datetime:
+    """Prove brokered reachability and direct-egress denial inside the guest.
+
+    Runs a ``python3`` probe through ``runner.exec``: the proxy must accept a
+    CONNECT to the first grant destination and complete TLS with the guest CA,
+    while direct TLS to public addresses must fail. With ``probe_metadata`` it
+    also fails if link-local metadata is reachable. Returns the UTC observation
+    time on success and raises ``UnsupportedEgressError`` (or
+    ``UnsupportedEgressCapabilityError`` for metadata) otherwise.
+    """
+
     if not request.egress_destinations:
         raise UnsupportedEgressError(
             f"Runner {request.runner_kind!r} has no provider destination to preflight."
@@ -221,6 +241,8 @@ async def run_enforcement_preflight(
 
 
 async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest) -> None:
+    """Run each setup command through ``Runner.exec_system``; fail on the first error."""
+
     for command in request.setup_commands:
         result = await runner.exec_system(
             ExecCommand.bash(command),

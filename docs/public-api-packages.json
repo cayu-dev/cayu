@@ -9,6 +9,8 @@
   "cayu.egress",
   "cayu.environments",
   "cayu.evals",
+  "cayu.extensions.egress",
+  "cayu.extensions.runners",
   "cayu.mcp",
   "cayu.memory",
   "cayu.observability",

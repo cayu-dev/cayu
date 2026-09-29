@@ -10940,6 +10940,17 @@ permission, prove absence of side effects, or change timeout, cancellation,
 cleanup, or workspace mutation-settlement decisions. A failure after dispatch
 continues to require unknown-outcome reconciliation under the existing contract.
 
+The `adapter` field of runner execution, unavailable-runner, and
+`cayu.runner_cleanup.v1` diagnostics publishes only a registered runner adapter
+identity: the built-in `docker`, `e2b`, `lambda-microvm`, `local`, and
+`microsandbox`, plus any name an application registers explicitly with the
+experimental `cayu.extensions.runners.register_runner_adapter_identity`. Any
+other value is published as `"unknown"`. `error_type` likewise publishes only
+the runtime's fixed class-name baseline or a class name registered as trusted by
+an adapter identity; other exceptions are `"Exception"`. Registration is
+process-wide, validated, idempotent for identical values, and cannot widen or
+replace an existing identity. Nothing is discovered automatically.
+
 
 Executes commands/code and returns stdout, stderr, exit code, timeout/cancel flags, and artifacts.
 

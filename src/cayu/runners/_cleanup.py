@@ -7,6 +7,7 @@ from typing import Any, Literal, cast
 
 from cayu._exception_groups import set_exception_cause
 from cayu._exception_state import exception_state, pop_exception_state, set_exception_state
+from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners._diagnostics import (
     trusted_runner_error_type_name,
     trusted_runner_exception_type_name,
@@ -18,7 +19,6 @@ RUNNER_CLEANUP_ARTIFACT_TYPE = "cayu.runner_cleanup.v1"
 RunnerCleanupPolicy = Literal["command", "sandbox", "none"]
 DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
 DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY: RunnerCleanupPolicy = "command"
-_KNOWN_CLEANUP_ADAPTERS = frozenset({"docker", "e2b", "lambda-microvm", "local", "microsandbox"})
 _KNOWN_CLEANUP_ACTIONS = frozenset({"kill_command", "kill_sandbox", "close_transports", "none"})
 _KNOWN_CLEANUP_STATUSES = frozenset(
     {"completed", "deferred", "failed", "skipped", "timeout", "unsupported"}
@@ -32,6 +32,14 @@ _RUNNER_CANCELLATION_FAILURE_TOKEN = object()
 
 @dataclass(frozen=True)
 class RunnerCleanupResult:
+    """One cleanup receipt plus whether the runner's exec path must close.
+
+    ``artifact`` is the ``cayu.runner_cleanup.v1`` receipt for the phase just
+    settled; ``preceding_artifacts`` holds receipts from earlier phases in
+    order. ``failure``, when present, is the cleanup failure that must remain
+    attached to the caller's outcome.
+    """
+
     artifact: dict[str, Any]
     close_runner: bool
     preceding_artifacts: tuple[dict[str, Any], ...] = ()
@@ -152,6 +160,8 @@ def transfer_runner_cancellation_failures(
 
 
 def validate_cancel_timeout(timeout_s: float | None) -> float:
+    """Return a positive finite cleanup bound, defaulting ``None`` to five seconds."""
+
     if timeout_s is None:
         return DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS
     if type(timeout_s) not in {int, float}:
@@ -167,6 +177,8 @@ def validate_runner_cleanup_policy(
     policy: RunnerCleanupPolicy,
     field_name: str,
 ) -> RunnerCleanupPolicy:
+    """Accept only ``"command"``, ``"sandbox"``, or ``"none"``."""
+
     if policy not in {"command", "sandbox", "none"}:
         raise ValueError(f"Runner {field_name} must be one of: command, sandbox, none.")
     return policy
@@ -180,6 +192,17 @@ async def cleanup_runner_command_with_diagnostic(
     timeout_s: float,
     policy: RunnerCleanupPolicy,
 ) -> RunnerCleanupResult:
+    """Run one bounded interruption cleanup and describe its outcome.
+
+    ``"command"`` awaits ``handle.kill()``, ``"sandbox"`` awaits
+    ``sandbox.kill()`` (and asks the runner to close), and ``"none"`` records a
+    skipped receipt. A missing handle or ``kill`` method is ``unsupported``,
+    ``kill()`` returning ``False`` or raising is ``failed``, and exceeding
+    ``timeout_s`` is ``timeout``; only an awaited, non-``False`` kill is
+    ``completed``. Ordinary exceptions from ``kill()`` become evidence rather
+    than propagating.
+    """
+
     cleanup_policy = validate_runner_cleanup_policy(policy, "cleanup policy")
     if cleanup_policy == "sandbox":
         artifact = await _call_cleanup_target(
@@ -360,12 +383,9 @@ def _sanitize_runner_artifact(artifact: object) -> dict[str, Any] | None:
         or timeout_s is None
     ):
         return None
-    safe_adapter = (
-        adapter if type(adapter) is str and adapter in _KNOWN_CLEANUP_ADAPTERS else "unknown"
-    )
     safe: dict[str, Any] = {
         "type": RUNNER_CLEANUP_ARTIFACT_TYPE,
-        "adapter": safe_adapter,
+        "adapter": trusted_runner_adapter_name(adapter),
         "action": action,
         "status": status,
         "timeout_s": timeout_s,

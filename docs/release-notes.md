@@ -6,6 +6,12 @@
   registrations. Reconcile unoccupied completion indexes by exact item identity,
   retain terminal integrity checks, and retry function index-type collisions and
   unregistered argument completions under the caller's transient retry budget.
+- Add experimental `cayu.extensions.runners` and `cayu.extensions.egress` seams
+  for externally packaged adapters, including an explicit runner adapter
+  identity registry so registered adapter names and error classes survive in
+  runner diagnostics instead of becoming `"unknown"`/`"Exception"`. The
+  Microsandbox proxy exposure now lives in `cayu.egress.microsandbox_adapter`;
+  its former import path still works.
 
 ## v0.7.0
 

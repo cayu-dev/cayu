@@ -445,6 +445,12 @@ def copy_runner_env(
     inherit_env: bool,
     case_sensitive: bool = True,
 ) -> dict[str, str]:
+    """Validate and copy a command environment.
+
+    With ``inherit_env=False`` (what sandbox runners use) the host process
+    environment is never included; only the explicit ``env`` entries are.
+    """
+
     if env is not None and type(env) is not dict:
         raise TypeError("Runner env must be a dictionary.")
     base_env = (
@@ -485,6 +491,8 @@ def _copy_runner_env_entries(
 
 
 def validate_timeout(timeout_s: int | None) -> int | None:
+    """Accept ``None`` or a positive ``int`` command timeout in seconds."""
+
     if timeout_s is None:
         return None
     if type(timeout_s) is not int:
@@ -495,6 +503,8 @@ def validate_timeout(timeout_s: int | None) -> int | None:
 
 
 def validate_stdin(stdin: str | None) -> str | None:
+    """Accept ``None`` or text without Unicode surrogates (NUL is allowed)."""
+
     if stdin is None:
         return None
     if type(stdin) is not str:
@@ -527,6 +537,8 @@ def validate_binary_output_stream(stream: BinaryIO | None) -> BinaryIO | None:
 
 
 def validate_output_limit(output_limit_bytes: int | None) -> int | None:
+    """Accept ``None`` or a positive ``int`` per-stream capture limit in bytes."""
+
     if output_limit_bytes is None:
         return None
     if type(output_limit_bytes) is not int:

@@ -19,6 +19,7 @@ from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
 from cayu.failure_evidence import exception_evidence
 from cayu.resource_access import model_data_access
+from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope
@@ -915,11 +916,7 @@ def _runner_failure_result(
         adapter = source.get("adapter")
         diagnostic = {
             "type": "cayu.runner_unavailable.v1",
-            "adapter": (
-                adapter
-                if adapter in {"docker", "e2b", "lambda-microvm", "local", "microsandbox"}
-                else "unknown"
-            ),
+            "adapter": trusted_runner_adapter_name(adapter),
             "status": "unavailable",
             "error_type": "RunnerUnavailableError",
         }

@@ -44,6 +44,7 @@ from cayu.runners import (
     RunnerUnavailableError,
     RunnerWorkloadAuthority,
 )
+from cayu.runners._adapter_identity import UNKNOWN_RUNNER_ADAPTER, trusted_runner_adapter_name
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
     runner_cancellation_failure,
@@ -82,7 +83,6 @@ from cayu.tools._resources import (
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
 
-_KNOWN_RUNNER_ADAPTERS = frozenset({"docker", "e2b", "lambda-microvm", "local", "microsandbox"})
 _KNOWN_UNAVAILABLE_REASONS = frozenset(
     {
         "guest_agent_unavailable_after_incomplete_exec",
@@ -1956,9 +1956,7 @@ def _safe_runner_unavailable_error_for_adapter(
 ) -> RunnerUnavailableError:
     diagnostic: dict[str, Any] = {
         "type": "cayu.runner_unavailable.v1",
-        "adapter": (
-            adapter if type(adapter) is str and adapter in _KNOWN_RUNNER_ADAPTERS else "unknown"
-        ),
+        "adapter": trusted_runner_adapter_name(adapter),
         "status": "unavailable",
         "error_type": trusted_runner_exception_type_name(error),
     }
@@ -1983,10 +1981,8 @@ def _safe_runner_unavailable_error_for_adapter(
 def _safe_leaf_adapter(error: BaseException) -> str:
     diagnostic = _base_exception_namespace_value(error, "diagnostic")
     if type(diagnostic) is dict:
-        adapter = cast("dict[str, Any]", diagnostic).get("adapter")
-        if type(adapter) is str and adapter in _KNOWN_RUNNER_ADAPTERS:
-            return cast("str", adapter)
-    return "unknown"
+        return trusted_runner_adapter_name(cast("dict[str, Any]", diagnostic).get("adapter"))
+    return UNKNOWN_RUNNER_ADAPTER
 
 
 def _safe_last_command_diagnostic(value: object) -> dict[str, Any]:
@@ -2037,17 +2033,16 @@ def _safe_runner_adapter(runner: Runner) -> str:
         adapter = type.__getattribute__(type(runner), "isolation")
     except BaseException:
         adapter = None
-    if type(adapter) is str and adapter in _KNOWN_RUNNER_ADAPTERS:
-        return cast("str", adapter)
+    trusted = trusted_runner_adapter_name(adapter)
+    if trusted != UNKNOWN_RUNNER_ADAPTER:
+        return trusted
     try:
         namespace = object.__getattribute__(runner, "__dict__")
     except BaseException:
         namespace = None
     if type(namespace) is dict:
-        adapter = dict.get(namespace, "isolation")
-        if type(adapter) is str and adapter in _KNOWN_RUNNER_ADAPTERS:
-            return cast("str", adapter)
-    return "unknown"
+        return trusted_runner_adapter_name(dict.get(namespace, "isolation"))
+    return UNKNOWN_RUNNER_ADAPTER
 
 
 def _partition_runner_cancellation_group(

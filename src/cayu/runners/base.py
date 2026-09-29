@@ -52,6 +52,7 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
+from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners._cleanup import (
     RunnerCleanupPolicy,
     RunnerCleanupProgress,
@@ -534,14 +535,7 @@ def runner_execution_error(
 ) -> RunnerExecutionError:
     """Detach an opaque runner failure from its raw message and traceback."""
 
-    if type(adapter) is not str or adapter not in {
-        "docker",
-        "e2b",
-        "lambda-microvm",
-        "local",
-        "microsandbox",
-    }:
-        adapter = "unknown"
+    adapter = trusted_runner_adapter_name(adapter)
     error_type = trusted_runner_exception_type_name(error)
     failure_fields = runner_failure_fields(error)
     source_diagnostic = _base_exception_namespace_value(error, "diagnostic")
@@ -584,15 +578,7 @@ def _safe_runner_execution_diagnostic(diagnostic: dict[str, Any]) -> dict[str, A
     if type(diagnostic) is not dict:
         raise TypeError("Runner execution diagnostic must be a dict.")
     diagnostic = {key: value for key, value in dict.items(diagnostic) if type(key) is str}
-    adapter = diagnostic.get("adapter")
-    if type(adapter) is not str or adapter not in {
-        "docker",
-        "e2b",
-        "lambda-microvm",
-        "local",
-        "microsandbox",
-    }:
-        adapter = "unknown"
+    adapter = trusted_runner_adapter_name(diagnostic.get("adapter"))
     error_type = trusted_runner_error_type_name(diagnostic.get("error_type")) or "Exception"
     safe: dict[str, Any] = {
         "type": "cayu.runner_execution_error.v1",

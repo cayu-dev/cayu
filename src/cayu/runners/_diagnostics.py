@@ -5,12 +5,16 @@ from __future__ import annotations
 import errno as errno_module
 
 from cayu._exception_state import set_exception_state
+from cayu.runners._adapter_identity import is_registered_runner_error_type_name
 
 
 class SubprocessLaunchRefused(OSError):
     """An exec E2BIG refusal positively established at the local spawn boundary."""
 
 
+# Runtime baseline: Python built-ins, Cayu-owned runner errors, and the SDK
+# exception names of the built-in adapters. External adapters extend the
+# trusted set only through ``register_runner_adapter_identity``.
 _TRUSTED_RUNNER_ERROR_TYPE_NAMES = frozenset(
     {
         "ArithmeticError",
@@ -147,11 +151,13 @@ def trusted_runner_exception_type_name(error: BaseException) -> str:
 
 
 def trusted_runner_error_type_name(value: object) -> str | None:
-    """Accept only runtime-owned runner classifications, never extension text."""
+    """Accept only runtime-owned or explicitly registered class names, never free text."""
 
-    if type(value) is not str or value not in _TRUSTED_RUNNER_ERROR_TYPE_NAMES:
+    if type(value) is not str:
         return None
-    return value
+    if value in _TRUSTED_RUNNER_ERROR_TYPE_NAMES or is_registered_runner_error_type_name(value):
+        return value
+    return None
 
 
 _RUNNER_FAILURE_PHASES = frozenset(

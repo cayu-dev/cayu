@@ -12,14 +12,6 @@ from types import ModuleType
 from typing import Any
 
 from cayu._exception_groups import iter_exception_tree
-from cayu.egress._remote_adapter import (
-    DEFAULT_PROXY_SERVER_FACTORY,
-    DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
-    ProxyServerFactory,
-    prepare_exposed_proxy_binding,
-    run_enforcement_preflight,
-    run_setup_commands,
-)
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressAuthorityCutoverRequest,
@@ -29,7 +21,6 @@ from cayu.egress.adapter import (
     RunnerFinalizationResult,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
-    _virtual_egress_execution_capability_evidence,
     retain_predecessor_binding_cleanup,
 )
 from cayu.egress.authority import (
@@ -44,9 +35,18 @@ from cayu.egress.errors import (
     UnsupportedEgressError,
 )
 from cayu.egress.grants import VirtualCredentialGrant
-from cayu.egress.proxy_exposure import ProxyExposure
 from cayu.egress.proxy_server import SessionCertificateAuthority
 from cayu.environments.admission import ExecutionCapabilityEvidence
+from cayu.extensions.egress import (
+    DEFAULT_PROXY_SERVER_FACTORY,
+    DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
+    ProxyExposure,
+    ProxyServerFactory,
+    prepare_exposed_proxy_binding,
+    run_enforcement_preflight,
+    run_setup_commands,
+    virtual_egress_execution_capability_evidence,
+)
 from cayu.runners.base import Runner
 from cayu.runners.e2b import (
     DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS,
@@ -98,7 +98,7 @@ class E2BEgressAdapter(SandboxEgressAdapter):
     ) -> ExecutionCapabilityEvidence:
         if runner is not None and not isinstance(runner, E2BRunner):
             raise TypeError("E2B adapter received a different runner type.")
-        return _virtual_egress_execution_capability_evidence(
+        return virtual_egress_execution_capability_evidence(
             runner_kind=self.runner_kind,
             runner_ready=runner is not None,
             preflight_observed_at=(

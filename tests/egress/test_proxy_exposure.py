@@ -5,11 +5,8 @@ import asyncio
 import pytest
 
 from cayu.egress import UnsupportedEgressError
-from cayu.egress.proxy_exposure import (
-    ExposedProxy,
-    HttpProxyEndpoint,
-    MicrosandboxHostProxyExposure,
-)
+from cayu.egress.microsandbox_adapter import MicrosandboxHostProxyExposure
+from cayu.egress.proxy_exposure import ExposedProxy, HttpProxyEndpoint
 
 
 def test_http_proxy_endpoint_centralizes_url_validation() -> None:

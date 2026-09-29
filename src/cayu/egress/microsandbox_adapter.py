@@ -21,12 +21,6 @@ from types import ModuleType
 from typing import Any, BinaryIO, TypedDict
 
 from cayu._exception_groups import add_exception_note_safely, exception_cause
-from cayu.egress._remote_adapter import (
-    ProxyServerFactory,
-    prepare_exposed_proxy_binding,
-    run_enforcement_preflight,
-    run_setup_commands,
-)
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
@@ -36,7 +30,6 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
     _consume_accounted_task_cancellation,
     _raise_primary_with_cleanup_cancellation,
-    _virtual_egress_execution_capability_evidence,
 )
 from cayu.egress.authority import EgressAuthorityCutoverStrategy
 from cayu.egress.broker import TransparentEgressBroker
@@ -49,17 +42,21 @@ from cayu.egress.errors import (
     UnsupportedEgressReconnectError,
 )
 from cayu.egress.grants import VirtualCredentialGrant
-from cayu.egress.proxy_exposure import (
-    MICROSANDBOX_HOST,
-    MicrosandboxHostProxyExposure,
-    ProxyExposure,
-)
 from cayu.egress.proxy_server import DualStackLoopbackEgressProxyServer
 from cayu.environments.admission import ExecutionCapabilityEvidence
 from cayu.environments.factory import (
     attach_environment_factory_cleanup_settlement_task,
     environment_factory_cleanup_settlement_task,
     register_environment_factory_cleanup_retry,
+)
+from cayu.extensions.egress import (
+    ExposedProxy,
+    ProxyExposure,
+    ProxyServerFactory,
+    prepare_exposed_proxy_binding,
+    run_enforcement_preflight,
+    run_setup_commands,
+    virtual_egress_execution_capability_evidence,
 )
 from cayu.runners._creation_cleanup import retry_acquisition_settlement
 from cayu.runners.base import ExecCommand, Runner
@@ -69,6 +66,23 @@ from cayu.runners.microsandbox import (
     MicrosandboxRunner,
     microsandbox_reconnect_settlement_task,
 )
+
+MICROSANDBOX_HOST = "host.microsandbox.internal"
+
+
+class MicrosandboxHostProxyExposure:
+    """Advertises a host listener through Microsandbox's reserved host name."""
+
+    async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
+        normalized = local_host.strip().lower()
+        if normalized != "127.0.0.1":
+            raise UnsupportedEgressError(
+                "Microsandbox virtual egress requires Cayu's paired IPv4/IPv6 "
+                "loopback proxy listener."
+            )
+        if local_port <= 0:
+            raise ValueError("local_port must be positive.")
+        return ExposedProxy(proxy_url=f"http://{MICROSANDBOX_HOST}:{local_port}")
 
 
 class _ReconnectIdentity(TypedDict):
@@ -188,7 +202,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     ) -> ExecutionCapabilityEvidence:
         if runner is not None and not isinstance(runner, MicrosandboxRunner):
             raise TypeError("Microsandbox adapter received a different runner type.")
-        return _virtual_egress_execution_capability_evidence(
+        return virtual_egress_execution_capability_evidence(
             runner_kind=self.runner_kind,
             runner_ready=runner is not None,
             preflight_observed_at=(

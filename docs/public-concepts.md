@@ -58,6 +58,7 @@ src/cayu/
     egress/                     # Network authority and runtime transitions
     vaults/                     # Secret storage
     proxies/                    # Proxy support
+    extensions/                 # Experimental seams for externally packaged adapters
     mcp/                        # MCP integration
     webhooks/                   # Webhook support
     observability/              # Event sinks, watchers, hooks, instrumentation

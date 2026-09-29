@@ -28,8 +28,8 @@ from cayu.egress import (
     VirtualCredentialRegistry,
     VirtualEgressRunnerRequest,
 )
-from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
-from cayu.egress.proxy_exposure import MICROSANDBOX_HOST, ExposedProxy
+from cayu.egress.microsandbox_adapter import MICROSANDBOX_HOST, MicrosandboxEgressAdapter
+from cayu.egress.proxy_exposure import ExposedProxy
 from cayu.egress.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.environments import (
     EnvironmentFactoryOperation,

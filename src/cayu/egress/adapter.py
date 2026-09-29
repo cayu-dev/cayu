@@ -174,6 +174,75 @@ def _virtual_egress_execution_capability_evidence(
     return ExecutionCapabilityEvidence(subject=runner_kind, claims=tuple(claims))
 
 
+_EXECUTION_CAPABILITY_POSTURES = frozenset(
+    {"available", "live_verified", "unverified", "unsupported"}
+)
+
+
+def virtual_egress_execution_capability_evidence(
+    *,
+    runner_kind: str,
+    runner_ready: bool,
+    preflight_observed_at: datetime | None,
+    untrusted_isolation: bool,
+    credential_non_possession_posture: _ExecutionCapabilityPosture,
+    guest_privilege: _ExecutionCapabilityPosture,
+    unprivileged_guest: _ExecutionCapabilityPosture,
+    host_filesystem_isolation: bool,
+    reconnect: bool,
+    network_unverified: bool = False,
+    cancellation_confirmed: bool = True,
+) -> ExecutionCapabilityEvidence:
+    """Build execution admission evidence for one enforced virtual-egress runner.
+
+    Experimental extension seam (see ``docs/build-a-runner.md``). This is the
+    builder used by Cayu's own virtual-egress adapters, with strict input
+    types. Supported claims stay ``declared`` until ``runner_ready`` is true.
+    Network, brokered-egress, and ``"live_verified"`` posture claims become
+    live-verified only with a timezone-aware ``preflight_observed_at`` from a
+    successful enforcement preflight on a ready runner, and expire after the
+    admission live-evidence TTL. Each posture is one of ``"available"``,
+    ``"live_verified"``, ``"unverified"``, or ``"unsupported"``.
+    """
+
+    if type(runner_kind) is not str:
+        raise TypeError("runner_kind must be a string.")
+    for field_name, value in (
+        ("runner_ready", runner_ready),
+        ("untrusted_isolation", untrusted_isolation),
+        ("host_filesystem_isolation", host_filesystem_isolation),
+        ("reconnect", reconnect),
+        ("network_unverified", network_unverified),
+        ("cancellation_confirmed", cancellation_confirmed),
+    ):
+        if type(value) is not bool:
+            raise TypeError(f"{field_name} must be a bool.")
+    for field_name, value in (
+        ("credential_non_possession_posture", credential_non_possession_posture),
+        ("guest_privilege", guest_privilege),
+        ("unprivileged_guest", unprivileged_guest),
+    ):
+        if type(value) is not str or value not in _EXECUTION_CAPABILITY_POSTURES:
+            raise ValueError(
+                f"{field_name} must be one of: available, live_verified, unverified, unsupported."
+            )
+    if preflight_observed_at is not None and not isinstance(preflight_observed_at, datetime):
+        raise TypeError("preflight_observed_at must be a datetime or None.")
+    return _virtual_egress_execution_capability_evidence(
+        runner_kind=runner_kind,
+        runner_ready=runner_ready,
+        preflight_observed_at=preflight_observed_at,
+        untrusted_isolation=untrusted_isolation,
+        credential_non_possession_posture=credential_non_possession_posture,
+        guest_privilege=guest_privilege,
+        unprivileged_guest=unprivileged_guest,
+        host_filesystem_isolation=host_filesystem_isolation,
+        reconnect=reconnect,
+        network_unverified=network_unverified,
+        cancellation_confirmed=cancellation_confirmed,
+    )
+
+
 def _execution_posture_claim(
     capability: str,
     *,
