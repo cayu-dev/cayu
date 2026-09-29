@@ -77,6 +77,8 @@ from cayu.egress import (
 )
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    VirtualEgressAllocationPreparation,
+    VirtualEgressAllocationReap,
     _await_bounded_cleanup_task,
 )
 from cayu.egress.authority import _copy_egress_authority_identity
@@ -416,6 +418,24 @@ def _build_reconnect_metadata(
         "capability": "supported",
         "identity": copied_identity,
     }
+
+
+def _copy_adapter_allocation_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    copied = copy_durable_metadata(dict(metadata), "adapter allocation metadata")
+    try:
+        _reject_replayable_authority(copied, path="adapter")
+    except InvalidEgressReconnectMetadataError as exc:
+        raise ValueError(
+            "Egress adapter allocation metadata cannot contain replayable authority."
+        ) from exc
+    return copied
+
+
+def _adapter_allocation_metadata(provider_metadata: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = provider_metadata.get("adapter", {})
+    if not isinstance(metadata, Mapping):
+        raise ValueError("Virtual-egress allocation intent has malformed adapter metadata.")
+    return _copy_adapter_allocation_metadata(metadata)
 
 
 def _validate_environment_fingerprint(value: object) -> str:
@@ -1078,13 +1098,80 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         if not isinstance(allocation, EnvironmentAllocationContext):
             raise TypeError("Recoverable virtual egress requires an allocation context.")
         if allocation.state is EnvironmentAllocationState.UNPREPARED:
-            await allocation.prepare(
-                {
-                    "runner_kind": self._runner_kind,
-                    "allocation_marker": allocation.intent.allocation_id,
-                }
+            adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
+            provider_metadata: dict[str, Any] = {
+                "runner_kind": self._runner_kind,
+                "allocation_marker": allocation.intent.allocation_id,
+            }
+            adapter_metadata = await adapter.prepare_allocation_metadata(
+                VirtualEgressAllocationPreparation(
+                    allocation_id=allocation.intent.allocation_id,
+                    session_id=request.session_id,
+                    environment_name=request.environment_name,
+                    image=self._image,
+                )
             )
+            if type(adapter_metadata) is not dict:
+                raise TypeError("Egress adapter allocation metadata must be a dict.")
+            if adapter_metadata:
+                # Existing adapters keep their established two-key intent shape.
+                provider_metadata["adapter"] = _copy_adapter_allocation_metadata(adapter_metadata)
+            await allocation.prepare(provider_metadata)
         return await self._create(request, allocation=allocation)
+
+    async def reap_allocation(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> None:
+        if not isinstance(allocation, EnvironmentAllocationContext):
+            raise TypeError("Virtual-egress cleanup requires an allocation context.")
+        adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
+        intent = allocation.intent
+        if (
+            request.operation is not EnvironmentFactoryOperation.CREATE
+            or intent.session_id != request.session_id
+            or intent.environment_name != request.environment_name
+            or intent.scope != self.allocation_scope(request)
+            or intent.provider_metadata.get("runner_kind") != adapter.runner_kind
+            or intent.provider_metadata.get("allocation_marker") != intent.allocation_id
+        ):
+            raise ValueError("Virtual-egress cleanup allocation authority changed.")
+        if allocation.state is EnvironmentAllocationState.REAPED:
+            return
+        if allocation.state is EnvironmentAllocationState.PREPARED:
+            # Fencing a never-dispatched intent atomically precludes dispatch.
+            await allocation.mark_reaping()
+        if not allocation.dispatch_precluded:
+            if allocation.state not in {
+                EnvironmentAllocationState.DISPATCHED,
+                EnvironmentAllocationState.ACKNOWLEDGED,
+                EnvironmentAllocationState.REAPING,
+            }:
+                raise RuntimeError("Virtual-egress cleanup found an unreapable allocation state.")
+            acknowledged = allocation.acknowledged_reconnect_metadata
+            acknowledged_identity: dict[str, Any] | None = None
+            if acknowledged is not None:
+                if acknowledged.get("capability") == "supported":
+                    acknowledged_identity = adapter.validate_reconnect_metadata(
+                        acknowledged.get("identity", {})
+                    )
+                else:
+                    acknowledged_identity = {}
+            if not await allocation.mark_reaping():
+                # Publication won the fence; the published owner disposes it.
+                return
+            await adapter.reap_allocation(
+                VirtualEgressAllocationReap(
+                    allocation_id=intent.allocation_id,
+                    session_id=intent.session_id,
+                    environment_name=intent.environment_name,
+                    image=self._image,
+                    allocation_metadata=_adapter_allocation_metadata(intent.provider_metadata),
+                    acknowledged_identity=acknowledged_identity,
+                )
+            )
+        await allocation.mark_reaped()
 
     async def _create(
         self,
@@ -1225,6 +1312,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 reconnect_metadata=reconnect_identity or {},
                 allocation_id=(None if allocation is None else allocation.intent.allocation_id),
                 host_workspace_path=host_workspace_path,
+                allocation_metadata=(
+                    {}
+                    if allocation is None
+                    else _adapter_allocation_metadata(allocation.intent.provider_metadata)
+                ),
             )
             if allocation is None:
                 runner = await adapter.create_runner(runner_request)

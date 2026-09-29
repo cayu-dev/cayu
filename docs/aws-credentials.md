@@ -203,6 +203,10 @@ The `LambdaMicroVMRunner` control-plane principal calls:
 
 - `lambda:RunMicrovm`
 - `lambda:GetMicrovm`
+- `lambda:GetMicrovmImage` (recoverable virtual-egress allocation pins the exact active
+  image version before dispatch unless `runner_options["image_version"]` is set with an
+  image ARN; cleanup also reads AWS's clock from this call before treating the pinned
+  lifetime as elapsed)
 - `lambda:CreateMicrovmAuthToken`
 - `lambda:SuspendMicrovm`
 - `lambda:ResumeMicrovm`
@@ -220,6 +224,7 @@ A functional development policy is:
       "Action": [
         "lambda:RunMicrovm",
         "lambda:GetMicrovm",
+        "lambda:GetMicrovmImage",
         "lambda:CreateMicrovmAuthToken",
         "lambda:SuspendMicrovm",
         "lambda:ResumeMicrovm",

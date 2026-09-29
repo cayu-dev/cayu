@@ -9,6 +9,10 @@ from cayu.egress.adapter import EgressBinding as EgressBinding
 from cayu.egress.adapter import RunnerFinalizationResult as RunnerFinalizationResult
 from cayu.egress.adapter import SandboxEgressAdapter as SandboxEgressAdapter
 from cayu.egress.adapter import UnsupportedEgressAdapter as UnsupportedEgressAdapter
+from cayu.egress.adapter import (
+    VirtualEgressAllocationPreparation as VirtualEgressAllocationPreparation,
+)
+from cayu.egress.adapter import VirtualEgressAllocationReap as VirtualEgressAllocationReap
 from cayu.egress.adapter import VirtualEgressRunnerRequest as VirtualEgressRunnerRequest
 from cayu.egress.authority import EGRESS_AUTHORITY_SCHEMA_VERSION as EGRESS_AUTHORITY_SCHEMA_VERSION
 from cayu.egress.authority import EgressAuthorityBindingIdentity as EgressAuthorityBindingIdentity

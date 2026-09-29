@@ -584,6 +584,36 @@ class VirtualEgressRunnerRequest:
     env_overlay_secret_values_present: bool | None = None
     allocation_id: str | None = None
     host_workspace_path: str | None = None
+    #: Adapter-owned inputs pinned in the durable allocation intent before the
+    #: first provider mutation; empty outside recoverable allocation.
+    allocation_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class VirtualEgressAllocationPreparation:
+    """Trusted inputs available before one recoverable provider mutation."""
+
+    allocation_id: str
+    session_id: str
+    environment_name: str
+    image: str
+
+
+@dataclass(frozen=True)
+class VirtualEgressAllocationReap:
+    """Exact durable authority for disposing one unpublished allocation.
+
+    ``allocation_metadata`` is the adapter-owned mapping pinned at preparation.
+    ``acknowledged_identity`` is the adapter's reconnect identity when the
+    provider result was durably acknowledged, otherwise ``None``.
+    """
+
+    allocation_id: str
+    session_id: str
+    environment_name: str
+    image: str
+    allocation_metadata: Mapping[str, Any]
+    acknowledged_identity: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -794,6 +824,37 @@ class SandboxEgressAdapter(ABC):
         del request, allow_create
         raise UnsupportedEgressError(
             f"Runner {self.runner_kind!r} does not implement durable create-or-lookup."
+        )
+
+    async def prepare_allocation_metadata(
+        self,
+        request: VirtualEgressAllocationPreparation,
+    ) -> dict[str, Any]:
+        """Return non-secret provider inputs to pin before the first mutation.
+
+        Cayu persists the returned mapping in the allocation intent before
+        ``create_or_recover_runner`` may dispatch, then passes the same mapping
+        to every create, recovery, and reap attempt. Recovery must therefore use
+        these pinned inputs instead of re-resolving mutable configuration. The
+        default pins nothing.
+        """
+
+        del request
+        return {}
+
+    async def reap_allocation(self, request: VirtualEgressAllocationReap) -> None:
+        """Positively dispose one unpublished intent-owned allocation or raise.
+
+        Cayu calls this only after it holds the durable cleanup fence for a
+        dispatched intent. Return only when the exact provider resource is
+        proven terminal; raise when the outcome is ambiguous so the runtime
+        retains retryable ownership. Never create a replacement allocation,
+        attach guest work, or infer absence from an empty lookup.
+        """
+
+        del request
+        raise UnsupportedEgressError(
+            f"Runner {self.runner_kind!r} cannot reap an unpublished allocation."
         )
 
     async def prepare_reconnect(

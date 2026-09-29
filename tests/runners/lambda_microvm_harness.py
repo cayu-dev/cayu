@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import email.utils
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -117,3 +118,161 @@ def _terminal_result(command_id: str, *, exit_code: int) -> dict[str, Any]:
         "stdout_bytes": 0,
         "stderr_bytes": 0,
     }
+
+
+class FakeLambdaClientError(Exception):
+    """Botocore-shaped client error; tests must not require the AWS SDK."""
+
+    def __init__(self, code: str, message: str = "") -> None:
+        super().__init__(f"{code}: {message}")
+        self.response = {"Error": {"Code": code, "Message": message}}
+
+
+class ClientTokenLambdaModel:
+    """Control-plane model of the RunMicrovm client-token semantics observed live.
+
+    Verified against AWS in us-east-1 (see the recoverable-allocation live probe):
+    an identical replay returns the original acknowledgement unchanged, including
+    its original ``PENDING`` state, even after termination; changed parameters are
+    rejected with ``ValidationException``; concurrent submissions converge on one
+    MicroVM; termination is idempotent; unknown identifiers are not found.
+
+    With ``clock`` set, the model also enforces what AWS guarantees in time: a
+    request that arrives more than 15 minutes after it was signed is rejected,
+    a MicroVM is terminated once its ``maximumDurationInSeconds`` elapses, and
+    read responses carry AWS's clock in a ``Date`` header.
+    """
+
+    sigv4_validity_s = 900
+
+    image_arn = "arn:aws:lambda:us-east-1:123:microvm-image:cayu"
+
+    def __init__(self) -> None:
+        self.microvms: dict[str, dict[str, Any]] = {}
+        self.tokens: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        self.run_calls: list[dict[str, Any]] = []
+        self.terminate_calls: list[str] = []
+        self.image_calls: list[str] = []
+        self.run_failures: list[BaseException] = []
+        self.lose_acknowledgements = 0
+        self.terminal_after_polls: int = 0
+        self.latest_image_version = "3"
+        self.clock: Callable[[], float] | None = None
+
+    def created_ids(self) -> list[str]:
+        return list(self.microvms)
+
+    def run_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        return self.arrive(self.clock() if self.clock is not None else None, **kwargs)
+
+    def arrive(self, signed_at: float | None, **kwargs: Any) -> dict[str, Any]:
+        """Apply one RunMicrovm request signed at ``signed_at`` as it reaches AWS."""
+
+        self.run_calls.append(copy.deepcopy(kwargs))
+        if self.run_failures:
+            raise self.run_failures.pop(0)
+        if (
+            self.clock is not None
+            and signed_at is not None
+            and self.clock() - signed_at > self.sigv4_validity_s
+        ):
+            raise FakeLambdaClientError("InvalidSignatureException", "Signature expired")
+        params = {key: value for key, value in kwargs.items() if key != "clientToken"}
+        token = kwargs.get("clientToken")
+        if token is not None and token in self.tokens:
+            original_params, acknowledgement = self.tokens[token]
+            if original_params != params:
+                raise FakeLambdaClientError(
+                    "ValidationException",
+                    "The provided clientToken was used with different request parameters.",
+                )
+            response = copy.deepcopy(acknowledgement)
+        else:
+            microvm_id = f"microvm-{len(self.microvms) + 1:04d}"
+            self.microvms[microvm_id] = {
+                "microvmId": microvm_id,
+                "endpoint": f"{microvm_id}.lambda-microvm.invalid",
+                "state": "RUNNING",
+                "imageArn": self.image_arn,
+                "imageVersion": kwargs.get("imageVersion", self.latest_image_version),
+                "polls_until_terminated": None,
+                "expires_at": (
+                    None
+                    if self.clock is None or kwargs.get("maximumDurationInSeconds") is None
+                    else self.clock() + kwargs["maximumDurationInSeconds"]
+                ),
+            }
+            response = self._public(self.microvms[microvm_id])
+            response["state"] = "PENDING"
+            if token is not None:
+                self.tokens[token] = (params, copy.deepcopy(response))
+        if self.lose_acknowledgements:
+            self.lose_acknowledgements -= 1
+            raise FakeLambdaClientError("InternalServerException", "acknowledgement lost")
+        return response
+
+    def get_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        microvm = self.microvms.get(kwargs["microvmIdentifier"])
+        if microvm is None:
+            raise FakeLambdaClientError("ResourceNotFoundException", "not found")
+        remaining = microvm["polls_until_terminated"]
+        if remaining is not None:
+            if remaining <= 0:
+                microvm["state"] = "TERMINATED"
+            else:
+                microvm["polls_until_terminated"] = remaining - 1
+        return self._public(microvm)
+
+    def live_ids(self) -> list[str]:
+        """Identifiers AWS would still report as not terminated."""
+
+        return [
+            identifier
+            for identifier, microvm in self.microvms.items()
+            if self._public(microvm)["state"] != "TERMINATED"
+        ]
+
+    def _public(self, microvm: dict[str, Any]) -> dict[str, Any]:
+        expires_at = microvm.get("expires_at")
+        if expires_at is not None and self.clock is not None and self.clock() >= expires_at:
+            microvm["state"] = "TERMINATED"
+        return {
+            key: value
+            for key, value in microvm.items()
+            if key not in {"polls_until_terminated", "expires_at"}
+        }
+
+    def get_microvm_image(self, **kwargs: Any) -> dict[str, Any]:
+        self.image_calls.append(kwargs["imageIdentifier"])
+        response: dict[str, Any] = {
+            "imageArn": self.image_arn,
+            "state": "CREATED",
+            "latestActiveImageVersion": self.latest_image_version,
+        }
+        if self.clock is not None:
+            response["ResponseMetadata"] = {
+                "HTTPHeaders": {"date": email.utils.formatdate(self.clock(), usegmt=True)}
+            }
+        return response
+
+    def create_microvm_auth_token(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"authToken": {"X-aws-proxy-auth": "model-token"}}
+
+    def suspend_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        self.microvms[kwargs["microvmIdentifier"]]["state"] = "SUSPENDED"
+        return {}
+
+    def resume_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        self.microvms[kwargs["microvmIdentifier"]]["state"] = "RUNNING"
+        return {}
+
+    def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        identifier = kwargs["microvmIdentifier"]
+        self.terminate_calls.append(identifier)
+        microvm = self.microvms.get(identifier)
+        if microvm is None:
+            raise FakeLambdaClientError("ResourceNotFoundException", "not found")
+        if microvm["state"] != "TERMINATED":
+            microvm["state"] = "TERMINATING"
+            microvm["polls_until_terminated"] = self.terminal_after_polls
+        return {}

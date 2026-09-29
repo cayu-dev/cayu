@@ -2465,11 +2465,62 @@ continues through caller cancellation until sockets, workers, upstream
 operations, permits, and the final certificate-authority owner are released.
 All rejection codes are fixed and non-echoing.
 
-New `CREATE` operations through the built-in Microsandbox and Lambda MicroVM
-virtual-egress adapters currently fail with
-`EnvironmentAllocationUnsupportedError` before adapter preparation or provider
-creation. Their provider APIs do not yet expose every primitive required for
-exact create-or-lookup recovery and race-safe cleanup. E2B binds its provider
+New `CREATE` operations through the built-in Microsandbox virtual-egress
+adapter currently fail with `EnvironmentAllocationUnsupportedError` before
+adapter preparation or provider creation. Its provider API does not yet expose
+every primitive required for exact create-or-lookup recovery and race-safe
+cleanup.
+
+Lambda MicroVM binds each allocation intent to an AWS `RunMicrovm` client token
+derived from the adapter generation and allocation id; the token itself is
+never persisted. Before dispatch the adapter pins, in the intent's `adapter`
+provider metadata, the exact image ARN and active image version, a maximum
+lifetime (AWS's 8-hour ceiling unless `maximum_duration_in_seconds` is
+configured), the preparation time, and a replay window (900 seconds by
+default, at most one hour). Recovery re-submits identical parameters under the
+same token, so AWS returns the original MicroVM. Cayu verified live that an
+identical replay returns the original identity even after termination, that
+concurrent submissions converge on one MicroVM, and that changed parameters
+fail with `ValidationException` without creating anything. The replay
+acknowledgement repeats the original state, so adoption reads current state
+with `GetMicrovm`; a failed, terminating, or terminated allocation raises
+`LambdaMicroVMAllocationTerminated` and changed parameters raise
+`LambdaMicroVMClientTokenConflict`. Neither is answered with a replacement.
+AWS does not document token retention, so no submission is made after the
+pinned replay window closes; recovery then raises
+`LambdaMicroVMAllocationRecoveryError` and leaves the intent pending. Live
+replays returned the original MicroVM after more than one hour, which bounds
+the configurable window.
+Transient control-plane failures (throttling, internal errors, connection
+loss) retry the same token a bounded number of times.
+The replay deadline is enforced where the request leaves the process, not only
+when a worker is admitted: every `RunMicrovm` for the token, including Cayu's
+retries and botocore's re-signed internal retries, passes a `before-send`
+check that refuses a request whose SigV4 signing time (`X-Amz-Date`) is after
+the deadline. A refused request raises `LambdaMicroVMSubmissionClosed` and is
+never retried, so a worker that stalls between admission and signing cannot
+allocate later.
+
+`VirtualEgressEnvironmentFactory.reap_allocation` forwards unpublished
+allocations to `SandboxEgressAdapter.reap_allocation` after taking the durable
+cleanup fence; a prepared intent is fenced as dispatch-precluded without any
+provider call, and publication winning the fence leaves disposal to the
+published owner. Lambda MicroVM reaping terminates an acknowledged identity
+directly. Without one, inside the replay window it resolves the token-owned
+MicroVM by replay (creating it only if the original request never arrived)
+and terminates it with positive `TERMINATED` or not-found readback within the
+ten-second cleanup bound. No request for the token is signed after the replay
+deadline, and AWS rejects a SigV4 request more than 15 minutes after its
+signing time, so every token-owned MicroVM started by the replay deadline plus
+15 minutes. Once AWS's own clock, read from the `Date` header of a
+`GetMicrovmImage` response, passes that instant plus the pinned maximum
+lifetime and a five-minute termination allowance, AWS's maximum-duration
+enforcement is the termination proof. Before then, or when AWS's time cannot be
+read, cleanup stays `pending_allocation_cleanup`; the local clock never proves
+disposal. The proof relies on AWS enforcing SigV4 request expiry and
+`maximumDurationInSeconds`.
+
+E2B binds its provider
 submission to the runtime allocation id in provider metadata. Recovery lists
 that exact marker, requires one matching sandbox, never creates a replacement,
 and repeats the protected guest handoff before publishing reconnect identity.
@@ -12386,9 +12437,12 @@ MicroVM while retaining the common path-safety and bounded-list/read behavior. T
 `examples/aws/environments/lambda_microvm.py` composes that pair with an `EnvironmentFactory` and a
 lifecycle binding for trusted direct driver code: resume reattaches from non-secret MicroVM
 id/endpoint/region/image metadata, interrupted finalization suspends, and completed/failed
-finalization terminates. `CayuApp` creation through that example fails before the provider call
-until Lambda MicroVM exposes an idempotent create-or-lookup allocation contract; direct calls own
-their allocation durability and cleanup obligations.
+finalization terminates. `CayuApp` creation through that direct-runner example still fails
+before the provider call because the example does not implement the recoverable allocation
+contract; use `LambdaMicroVMEgressAdapter` with `VirtualEgressEnvironmentFactory` for
+crash-recoverable allocation. Direct calls own their allocation durability and cleanup
+obligations. `LambdaMicroVMRunner.create(..., client_token=...)` exposes the idempotent
+submission primitive for drivers that persist their own intent.
 
 ## Durable mutable-workspace checkpoints
 

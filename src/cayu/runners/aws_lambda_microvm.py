@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import calendar
 import importlib
 import json
 import logging
+import threading
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -73,6 +76,34 @@ LAMBDA_MICROVM_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES + 2) // 3)
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
 _LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+LAMBDA_MICROVM_CLIENT_TOKEN_MAX_LENGTH = 128
+# Only a client-token submission may be retried: AWS returns the original
+# allocation for a replay of identical parameters instead of creating another.
+_LAMBDA_CLIENT_TOKEN_RETRY_DELAYS_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0)
+#: AWS rejects a SigV4-signed request more than this long after its signing
+#: time, so no request signed by a deadline can reach AWS after deadline + this.
+LAMBDA_SIGV4_REQUEST_VALIDITY_SECONDS = 900
+_RUN_SUBMISSION_GUARD_EVENT = "before-send.lambda-microvms.RunMicrovm"
+_RUN_SUBMISSION_GUARD_ID = "cayu.lambda-microvm.run-submission-deadline"
+_RUN_SUBMISSION_DEADLINE = threading.local()
+_submission_clock: Callable[[], float] = time.time
+_LAMBDA_TRANSIENT_CONTROL_ERROR_CODES = frozenset(
+    {
+        "InternalServerException",
+        "ServiceUnavailableException",
+        "ThrottlingException",
+        "TooManyRequestsException",
+    }
+)
+_LAMBDA_TRANSIENT_CONTROL_ERROR_TYPES = frozenset(
+    {
+        "ConnectTimeoutError",
+        "ConnectionClosedError",
+        "EndpointConnectionError",
+        "ReadTimeoutError",
+    }
+)
+_LAMBDA_UNUSABLE_ALLOCATION_STATES = frozenset({"FAILED", "TERMINATING", "TERMINATED"})
 _LAMBDA_POLL_ATTEMPTS = 3
 _CommandPollTask = asyncio.Task[CapturedAwaitableOutcome[Mapping[str, Any]]]
 _PENDING_LAMBDA_POLLS: set[_CommandPollTask] = set()
@@ -193,6 +224,30 @@ class LambdaMicroVMEndpointUnauthorized(LambdaMicroVMError):
 
 class LambdaMicroVMEndpointTransientError(LambdaMicroVMError):
     """A transport failure eligible for bounded command-state read retry only."""
+
+
+class LambdaMicroVMClientTokenConflict(LambdaMicroVMError):
+    """AWS rejected a client-token replay because its request parameters changed.
+
+    No MicroVM is created by the rejected request. The earlier allocation, if
+    any, remains owned by the original request and must not be replaced.
+    """
+
+
+class LambdaMicroVMSubmissionClosed(LambdaMicroVMError):
+    """A ``RunMicrovm`` request was not sent because its submission deadline passed.
+
+    Nothing reached AWS, so the refused request cannot create an allocation.
+    """
+
+
+class LambdaMicroVMAllocationTerminated(LambdaMicroVMError):
+    """An idempotent replay resolved an allocation that is no longer usable."""
+
+    def __init__(self, message: str, *, microvm_id: str, state: str) -> None:
+        super().__init__(message)
+        self.microvm_id = microvm_id
+        self.state = state
 
 
 class LambdaMicroVMEndpointTransport(Protocol):
@@ -462,8 +517,25 @@ class LambdaMicroVMRunner(Runner):
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         env_overlay: Mapping[str, str] | None = None,
+        client_token: str | None = None,
+        client_token_not_after: float | None = None,
     ) -> LambdaMicroVMRunner:
+        """Allocate a MicroVM and wait until its sidecar is ready.
+
+        With ``client_token``, submission is idempotent: transient control-plane
+        failures replay the same token and parameters, and a replay adopts the
+        allocation AWS already created for that token. The adopted state is read
+        back with ``get_microvm`` because a replay response repeats the original
+        acknowledgement. A token-owned allocation that is already failed or
+        terminated raises ``LambdaMicroVMAllocationTerminated``; changed
+        parameters raise ``LambdaMicroVMClientTokenConflict``. Neither creates a
+        replacement. ``client_token_not_after`` bounds when any submission for
+        the token may be sent (see ``run_microvm_with_client_token``).
+        """
         image = require_clean_nonblank(image_identifier, "image_identifier")
+        token = None if client_token is None else _validate_client_token(client_token)
+        if client_token_not_after is not None and token is None:
+            raise ValueError("client_token_not_after requires client_token.")
         guest_root = _validate_guest_root(default_cwd)
         environment_overlay = _preflight_runner_creation(
             region_name=region_name,
@@ -477,24 +549,16 @@ class LambdaMicroVMRunner(Runner):
             timeout_cleanup=timeout_cleanup,
             env_overlay=env_overlay,
         )
-        run_options: dict[str, Any] = {"imageIdentifier": image}
-        _put_optional(run_options, "imageVersion", image_version)
-        _put_optional(run_options, "executionRoleArn", execution_role_arn)
-        if ingress_network_connectors is not None:
-            run_options["ingressNetworkConnectors"] = _copy_string_list(
-                ingress_network_connectors, "ingress_network_connectors"
-            )
-        if egress_network_connectors is not None:
-            run_options["egressNetworkConnectors"] = _copy_string_list(
-                egress_network_connectors, "egress_network_connectors"
-            )
-        if idle_policy is not None:
-            run_options["idlePolicy"] = copy_json_value(idle_policy, "idle_policy")
-        if maximum_duration_in_seconds is not None:
-            if type(maximum_duration_in_seconds) is not int or maximum_duration_in_seconds <= 0:
-                raise ValueError("maximum_duration_in_seconds must be a positive integer.")
-            run_options["maximumDurationInSeconds"] = maximum_duration_in_seconds
-        _put_optional(run_options, "runHookPayload", run_hook_payload)
+        run_options = lambda_microvm_run_options(
+            image,
+            image_version=image_version,
+            execution_role_arn=execution_role_arn,
+            ingress_network_connectors=ingress_network_connectors,
+            egress_network_connectors=egress_network_connectors,
+            idle_policy=idle_policy,
+            maximum_duration_in_seconds=maximum_duration_in_seconds,
+            run_hook_payload=run_hook_payload,
+        )
 
         control_client, owns_client = _control_client(
             client=client,
@@ -507,8 +571,27 @@ class LambdaMicroVMRunner(Runner):
         async def allocate() -> LambdaMicroVMRunner:
             runner: LambdaMicroVMRunner | None = None
             try:
-                response = await asyncio.to_thread(control_client.run_microvm, **run_options)
+                if token is None:
+                    response = await asyncio.to_thread(control_client.run_microvm, **run_options)
+                else:
+                    response = await run_microvm_with_client_token(
+                        control_client,
+                        run_options,
+                        client_token=token,
+                        submit_not_after=client_token_not_after,
+                    )
                 microvm_id, endpoint = _microvm_identity(response)
+                adopted_state: str | None = None
+                if token is not None:
+                    # A replay repeats the original acknowledgement, including its
+                    # stale state, so trust only a fresh control-plane read.
+                    adopted_state = await _read_adoptable_state(
+                        control_client,
+                        microvm_id=microvm_id,
+                        endpoint=endpoint,
+                        image_arn=_response_string(response, "imageArn"),
+                        image_version=image_version,
+                    )
                 runner = cls(
                     control_client,
                     microvm_id=microvm_id,
@@ -530,7 +613,10 @@ class LambdaMicroVMRunner(Runner):
                 )
                 reclamation.runner = runner
                 if not reclamation.abandoned:
-                    await runner._wait_until_ready(ready_timeout_s)
+                    if adopted_state is None:
+                        await runner._wait_until_ready(ready_timeout_s)
+                    else:
+                        await runner._prepare_existing_for_attach(adopted_state, ready_timeout_s)
                 return runner
             except BaseException as primary:
                 reclamation.progress.failures = (primary,)
@@ -1675,6 +1761,271 @@ def _control_client(
     if endpoint_url is not None:
         client_options["endpoint_url"] = require_clean_nonblank(endpoint_url, "endpoint_url")
     return session.client("lambda-microvms", **client_options), True
+
+
+def lambda_microvm_run_options(
+    image_identifier: str,
+    *,
+    image_version: str | None = None,
+    execution_role_arn: str | None = None,
+    ingress_network_connectors: list[str] | None = None,
+    egress_network_connectors: list[str] | None = None,
+    idle_policy: dict[str, Any] | None = None,
+    maximum_duration_in_seconds: int | None = None,
+    run_hook_payload: str | None = None,
+) -> dict[str, Any]:
+    """Return the exact ``RunMicrovm`` parameters Cayu submits for one allocation."""
+
+    run_options: dict[str, Any] = {
+        "imageIdentifier": require_clean_nonblank(image_identifier, "image_identifier")
+    }
+    _put_optional(run_options, "imageVersion", image_version)
+    _put_optional(run_options, "executionRoleArn", execution_role_arn)
+    if ingress_network_connectors is not None:
+        run_options["ingressNetworkConnectors"] = _copy_string_list(
+            ingress_network_connectors, "ingress_network_connectors"
+        )
+    if egress_network_connectors is not None:
+        run_options["egressNetworkConnectors"] = _copy_string_list(
+            egress_network_connectors, "egress_network_connectors"
+        )
+    if idle_policy is not None:
+        run_options["idlePolicy"] = copy_json_value(idle_policy, "idle_policy")
+    if maximum_duration_in_seconds is not None:
+        if type(maximum_duration_in_seconds) is not int or maximum_duration_in_seconds <= 0:
+            raise ValueError("maximum_duration_in_seconds must be a positive integer.")
+        run_options["maximumDurationInSeconds"] = maximum_duration_in_seconds
+    _put_optional(run_options, "runHookPayload", run_hook_payload)
+    return run_options
+
+
+async def run_microvm_with_client_token(
+    client: Any,
+    run_options: Mapping[str, Any],
+    *,
+    client_token: str,
+    submit_not_after: float | None = None,
+) -> Mapping[str, Any]:
+    """Submit or replay one idempotent ``RunMicrovm`` request.
+
+    Transient control-plane failures are retried with the same token and
+    parameters a bounded number of times. The returned acknowledgement may be a
+    replay of the original response; callers must read current state separately.
+
+    With ``submit_not_after`` (epoch seconds), no attempt is sent after that
+    instant: a botocore client refuses, at its send boundary, any request whose
+    SigV4 signing time is later, including botocore's own re-signed retries;
+    other clients are checked in the calling thread immediately before the call.
+    A refused attempt raises ``LambdaMicroVMSubmissionClosed`` and is never
+    retried, so no request for the token can reach AWS later than
+    ``submit_not_after + LAMBDA_SIGV4_REQUEST_VALIDITY_SECONDS``.
+    """
+
+    token = _validate_client_token(client_token)
+    if submit_not_after is not None and (
+        type(submit_not_after) not in {int, float} or not isfinite(submit_not_after)
+    ):
+        raise ValueError("submit_not_after must be finite epoch seconds.")
+    options = {**dict(run_options), "clientToken": token}
+    delays = _LAMBDA_CLIENT_TOKEN_RETRY_DELAYS_SECONDS
+    for attempt in range(len(delays) + 1):
+        try:
+            response = await asyncio.to_thread(
+                _submit_run_microvm, client, options, submit_not_after
+            )
+        except LambdaMicroVMSubmissionClosed:
+            raise
+        except Exception as exc:
+            if _is_client_token_conflict(exc):
+                raise LambdaMicroVMClientTokenConflict(
+                    "Lambda MicroVM client token was already used with different run "
+                    "parameters; refusing to create a replacement allocation."
+                ) from exc
+            if attempt >= len(delays) or not _is_transient_control_error(exc):
+                raise
+            await asyncio.sleep(delays[attempt])
+            continue
+        if not isinstance(response, Mapping):
+            raise LambdaMicroVMProtocolError("run_microvm response must be an object.")
+        return response
+    raise AssertionError("unreachable")
+
+
+async def terminate_microvm_confirmed(
+    client: Any,
+    microvm_id: str,
+    *,
+    timeout_s: float,
+    poll_interval_s: float = 0.5,
+) -> str:
+    """Terminate one exact MicroVM and return only after terminal evidence.
+
+    ``TerminateMicrovm`` is idempotent. The result is ``"terminated"`` or
+    ``"absent"`` when the control plane no longer knows the identifier. A
+    timeout raises and leaves termination retryable.
+    """
+
+    identifier = require_clean_nonblank(microvm_id, "microvm_id")
+    timeout = _positive_float(timeout_s, "timeout_s")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        await asyncio.to_thread(client.terminate_microvm, microvmIdentifier=identifier)
+    except Exception as exc:
+        if _client_error_code(exc) != "ResourceNotFoundException":
+            raise
+        return "absent"
+    while True:
+        try:
+            response = await asyncio.to_thread(client.get_microvm, microvmIdentifier=identifier)
+        except Exception as exc:
+            if _client_error_code(exc) != "ResourceNotFoundException":
+                raise
+            return "absent"
+        if not isinstance(response, Mapping):
+            raise LambdaMicroVMProtocolError("get_microvm response must be an object.")
+        if _required_response_string(response, "microvmId") != identifier:
+            raise LambdaMicroVMProtocolError("get_microvm returned the wrong MicroVM id.")
+        if _required_response_string(response, "state") == "TERMINATED":
+            return "terminated"
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise LambdaMicroVMError(
+                f"Lambda MicroVM {identifier} did not reach TERMINATED within {timeout:g} seconds."
+            )
+        await asyncio.sleep(min(max(poll_interval_s, 0.05), remaining))
+
+
+async def _read_adoptable_state(
+    client: Any,
+    *,
+    microvm_id: str,
+    endpoint: str,
+    image_arn: str | None,
+    image_version: str | None,
+) -> str:
+    response = await asyncio.to_thread(client.get_microvm, microvmIdentifier=microvm_id)
+    response_id, response_endpoint = _microvm_identity(response)
+    if response_id != microvm_id or response_endpoint != endpoint:
+        raise LambdaMicroVMProtocolError(
+            "get_microvm returned a different identity for the client-token allocation."
+        )
+    if image_arn is not None and _response_string(response, "imageArn") != image_arn:
+        raise LambdaMicroVMProtocolError("Client-token allocation reports a different image.")
+    if image_version is not None and _response_string(response, "imageVersion") != image_version:
+        raise LambdaMicroVMProtocolError(
+            "Client-token allocation reports a different image version."
+        )
+    state = _required_response_string(response, "state")
+    if state in _LAMBDA_UNUSABLE_ALLOCATION_STATES:
+        raise LambdaMicroVMAllocationTerminated(
+            f"Client-token allocation {microvm_id} is {state}; it cannot be adopted and "
+            "will not be replaced.",
+            microvm_id=microvm_id,
+            state=state,
+        )
+    return state
+
+
+def _submit_run_microvm(
+    client: Any, options: Mapping[str, Any], submit_not_after: float | None
+) -> Any:
+    if submit_not_after is None:
+        return client.run_microvm(**options)
+    _install_run_submission_guard(client)
+    if _submission_clock() > submit_not_after:
+        raise _submission_closed(submit_not_after)
+    _RUN_SUBMISSION_DEADLINE.not_after = submit_not_after
+    try:
+        return client.run_microvm(**options)
+    finally:
+        _RUN_SUBMISSION_DEADLINE.not_after = None
+
+
+def _install_run_submission_guard(client: Any) -> None:
+    events = getattr(getattr(client, "meta", None), "events", None)
+    register = getattr(events, "register", None)
+    if callable(register):
+        # unique_id makes registration idempotent per client.
+        register(
+            _RUN_SUBMISSION_GUARD_EVENT,
+            _refuse_late_run_submission,
+            unique_id=_RUN_SUBMISSION_GUARD_ID,
+        )
+
+
+def _refuse_late_run_submission(request: Any, **_kwargs: Any) -> None:
+    # botocore signs every attempt, including its internal retries, before this
+    # event; the handler runs in the thread that called run_microvm.
+    not_after = getattr(_RUN_SUBMISSION_DEADLINE, "not_after", None)
+    if not_after is None:
+        return None
+    signed_at = _sigv4_signing_time(getattr(request, "headers", None))
+    if signed_at is None or signed_at > not_after:
+        raise _submission_closed(not_after)
+    return None
+
+
+def _sigv4_signing_time(headers: Any) -> float | None:
+    value = headers.get("X-Amz-Date") if isinstance(headers, Mapping) else None
+    if isinstance(value, bytes):
+        value = value.decode("ascii", "replace")
+    if type(value) is not str:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y%m%dT%H%M%SZ")))
+    except ValueError:
+        return None
+
+
+def _submission_closed(not_after: float) -> LambdaMicroVMSubmissionClosed:
+    return LambdaMicroVMSubmissionClosed(
+        "Lambda MicroVM RunMicrovm submission deadline "
+        f"{not_after:.0f} (epoch seconds) has passed; the request was not sent."
+    )
+
+
+def _validate_client_token(value: str) -> str:
+    token = require_clean_nonblank(value, "client_token")
+    if len(token) > LAMBDA_MICROVM_CLIENT_TOKEN_MAX_LENGTH or not token.isascii():
+        raise ValueError(
+            "Lambda MicroVM client_token must be ASCII and at most "
+            f"{LAMBDA_MICROVM_CLIENT_TOKEN_MAX_LENGTH} characters."
+        )
+    return token
+
+
+def _client_error_code(error: BaseException) -> str | None:
+    response = getattr(error, "response", None)
+    if not isinstance(response, Mapping):
+        return None
+    details = response.get("Error")
+    if not isinstance(details, Mapping):
+        return None
+    code = details.get("Code")
+    return code if type(code) is str else None
+
+
+def _client_error_message(error: BaseException) -> str:
+    response = getattr(error, "response", None)
+    details = response.get("Error") if isinstance(response, Mapping) else None
+    message = details.get("Message") if isinstance(details, Mapping) else None
+    return message if type(message) is str else ""
+
+
+def _is_client_token_conflict(error: BaseException) -> bool:
+    # AWS reports token reuse with different parameters as a validation error.
+    return (
+        _client_error_code(error) in {"ValidationException", "ConflictException"}
+        and "clienttoken" in _client_error_message(error).replace(" ", "").lower()
+    )
+
+
+def _is_transient_control_error(error: BaseException) -> bool:
+    return (
+        _client_error_code(error) in _LAMBDA_TRANSIENT_CONTROL_ERROR_CODES
+        or type(error).__name__ in _LAMBDA_TRANSIENT_CONTROL_ERROR_TYPES
+    )
 
 
 def _boto3_module() -> Any:

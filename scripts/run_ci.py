@@ -555,7 +555,9 @@ def _run_docker_prerequisite(runner: LocalCiRunner) -> None:
 def _sync_python_test_environment(runner: LocalCiRunner, *, browser: bool) -> None:
     runner.run("Install Python 3.14", ("uv", "python", "install", "3.14"))
     # General example contract tests import Playwright without launching a browser.
-    extras = ["--extra", "dev", "--extra", "server", "--extra", "browser"]
+    # The aws extra lets lifecycle and client-token tests drive real botocore
+    # signing, retry, and event hooks against a simulated HTTP transport.
+    extras = ["--extra", "dev", "--extra", "server", "--extra", "browser", "--extra", "aws"]
     runner.run(
         "Sync Python 3.14 test environment" + (" with browser support" if browser else ""),
         (

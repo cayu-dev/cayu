@@ -918,9 +918,11 @@ Reconnect support is explicit by adapter:
 | E2B | Generic reconnect is unsupported; crash-safe creation/recovery instead uses the durable exact-sandbox handoff described below. |
 
 Reconnect capability is distinct from crash-safe creation. New remote
-virtual-egress allocation remains unsupported for Microsandbox and Lambda
-MicroVM; each fails with `EnvironmentAllocationUnsupportedError` before provider
-mutation. E2B implements durable exact-sandbox create-or-lookup, while Docker
+virtual-egress allocation remains unsupported for Microsandbox; it fails with
+`EnvironmentAllocationUnsupportedError` before provider mutation. Lambda
+MicroVM binds each allocation intent to an idempotent `RunMicrovm` client token
+and recovers or reaps only that token's MicroVM inside a pinned replay window
+(see `docs/runtime-contracts.md`). E2B implements durable exact-sandbox create-or-lookup, while Docker
 creation remains available because it is process-local rather than a remote
 allocation boundary. Custom adapters must set `process_external_allocation`
 explicitly; leaving the classification undeclared also fails new creation before
@@ -1323,7 +1325,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; opt-in local reconnect. Container isolation is not a secure sandbox boundary. |
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; durable exact-sandbox create/recovery and process-local parked resume are supported. |
-| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; virtual-egress factory reconnect unsupported. |
+| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; crash-safe client-token creation, recovery, and reaping; virtual-egress factory reconnect unsupported. |
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:

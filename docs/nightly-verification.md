@@ -103,7 +103,7 @@ or in CI.
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
-| AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
+| AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-recoverable-allocation-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
 | Chat Completions live | `GEMINI_API_KEY`; or `OPENROUTER_API_KEY` plus explicit `CAYU_OPENROUTER_MODEL` | provider-dependent | `gemini-eval`, `chat-completions-contract`, `openrouter-contract` |
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | AWS durable services | `cayu[aws]`, AWS credentials/region, and an explicit opt-in per check; each check creates and deletes one temporary S3 bucket, and `aws-durable-services-live` also one Secrets Manager secret | S3 and Secrets Manager request charges | `aws-durable-services-live`, `aws-s3-artifact-pins-live` |
@@ -166,6 +166,7 @@ high level:
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
 | real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and an operator-selected image passes the authenticated protocol handshake | `lambda-microvm-live` |
+| fresh-process Lambda MicroVM allocation recovery after a lost acknowledgement, concurrent client-token adoption, changed-parameter rejection, in-window and never-submitted reaping, and a zero-unaccounted census | verified when AWS, a protocol-compatible image ARN, an egress network connector, and the explicit opt-in are available; guest egress enforcement is covered by the metadata-isolation check | `aws-lambda-microvm-recoverable-allocation-live` |
 | canonical Lambda MicroVM artifact packaging, AWS image build/boot, EFS and S3 Files helpers, provenance, and cleanup | verified when the explicit AWS image-build opt-in and required build permissions are available | `aws-lambda-microvm-image-build-live` |
 | real AWS Lambda MicroVM required metadata denial plus proxy, public-egress, execution-role, UID/capability/namespace/route/sidecar-port, guest inspection, vault-canary, credential, revocation, workspace-release, and cleanup boundaries | verified only when the integrated agent-network-namespace boundary emits the exact versioned schema and the explicit opt-in is enabled | `aws-lambda-microvm-metadata-isolation-live` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
@@ -205,7 +206,7 @@ There are 38 live example files across `examples/` and its provider subdirectori
 | Docker | `docker_interrupt_live.py`, `docker_sync_binding_live.py` |
 | microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py`, `microsandbox_guest_agent_liveness_live.py`, `microsandbox_network_default_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_hardened_coding_agent_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
-| AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py` |
+| AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py`, `aws/lambda_microvm_recoverable_allocation_live.py` (also needs an egress network connector) |
 | AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | Playwright Chromium | `dashboard_behavior_live.py` |

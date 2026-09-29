@@ -11,6 +11,12 @@ from cayu.runners.aws_lambda_microvm import DEFAULT_LAMBDA_MICROVM_CWD as DEFAUL
 from cayu.runners.aws_lambda_microvm import (
     HttpxLambdaMicroVMEndpointTransport as HttpxLambdaMicroVMEndpointTransport,
 )
+from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMAllocationTerminated as LambdaMicroVMAllocationTerminated,
+)
+from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMClientTokenConflict as LambdaMicroVMClientTokenConflict,
+)
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMCloseAction as LambdaMicroVMCloseAction
 from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMEndpointTransientError as LambdaMicroVMEndpointTransientError,
@@ -24,6 +30,9 @@ from cayu.runners.aws_lambda_microvm import (
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMError as LambdaMicroVMError
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMProtocolError as LambdaMicroVMProtocolError
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner as LambdaMicroVMRunner
+from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMSubmissionClosed as LambdaMicroVMSubmissionClosed,
+)
 from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES as DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
 from cayu.runners.base import ExecCommand as ExecCommand
 from cayu.runners.base import ExecResult as ExecResult

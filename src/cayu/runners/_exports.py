@@ -59,6 +59,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.runners.aws_lambda_microvm",
         "HttpxLambdaMicroVMEndpointTransport",
     ),
+    "LambdaMicroVMAllocationTerminated": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMAllocationTerminated",
+    ),
+    "LambdaMicroVMClientTokenConflict": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMClientTokenConflict",
+    ),
     "LambdaMicroVMCloseAction": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMCloseAction"),
     "LambdaMicroVMEndpointTransientError": (
         "cayu.runners.aws_lambda_microvm",
@@ -75,6 +83,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "LambdaMicroVMError": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMError"),
     "LambdaMicroVMProtocolError": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMProtocolError"),
     "LambdaMicroVMRunner": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMRunner"),
+    "LambdaMicroVMSubmissionClosed": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMSubmissionClosed",
+    ),
     "LocalRunner": ("cayu.runners.local", "LocalRunner"),
     "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS": (
         "cayu.runners.microsandbox",
@@ -150,6 +162,8 @@ PUBLIC_NAMES = [
     "ExecCommand",
     "ExecResult",
     "HttpxLambdaMicroVMEndpointTransport",
+    "LambdaMicroVMAllocationTerminated",
+    "LambdaMicroVMClientTokenConflict",
     "LambdaMicroVMCloseAction",
     "LambdaMicroVMEndpointTransientError",
     "LambdaMicroVMEndpointTransport",
@@ -157,6 +171,7 @@ PUBLIC_NAMES = [
     "LambdaMicroVMError",
     "LambdaMicroVMProtocolError",
     "LambdaMicroVMRunner",
+    "LambdaMicroVMSubmissionClosed",
     "LocalRunner",
     "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS",
     "MICROSANDBOX_NAME_MAX_BYTES",

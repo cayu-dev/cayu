@@ -603,6 +603,7 @@ Resources:
                 Action:
                   - lambda:RunMicrovm
                   - lambda:GetMicrovm
+                  - lambda:GetMicrovmImage
                   - lambda:CreateMicrovmAuthToken
                   - lambda:SuspendMicrovm
                   - lambda:ResumeMicrovm

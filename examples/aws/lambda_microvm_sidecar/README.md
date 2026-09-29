@@ -64,6 +64,7 @@ for the complete trust-boundary guidance.
 ## Networking and cleanup
 
 The control plane needs permission for `lambda:RunMicrovm`, `lambda:GetMicrovm`,
+`lambda:GetMicrovmImage` (to pin the exact image version for recoverable allocation),
 `lambda:CreateMicrovmAuthToken`, `lambda:SuspendMicrovm`, `lambda:ResumeMicrovm`, and
 `lambda:TerminateMicrovm`. Configure the managed ingress connector so Cayu can reach port 8080.
 Add only the egress connectors the workload requires; the sidecar itself does not require
