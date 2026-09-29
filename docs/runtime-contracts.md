@@ -11710,6 +11710,22 @@ model-controlled command input, and are never added to the guest environment.
 `DockerEgressAdapter` accepts the same argument and applies it to sidecar,
 network, and workload-runner Docker operations.
 
+Docker egress preparation requires a reachable broker before returning a binding.
+Automatic listener discovery fails with `egress_proxy_host_unresolved` when no
+Docker Desktop interface or default-bridge IPv4 gateway is available; it never
+implicitly binds all host interfaces. An explicit `proxy_host` still undergoes
+the sidecar's bounded authenticated CONNECT probe. A failed probe raises
+`egress_sidecar_unreachable` and enters the existing preparation rollback owner,
+including grant revocation and retryable resource cleanup. The probe establishes
+broker transport readiness, not upstream service availability.
+
+Egress audit denials carry an optional `error_code`. Sidecar probe failures and
+proxy-to-broker call exceptions/timeouts use transport decisions with fixed codes
+(`egress_sidecar_unreachable`, `proxy_broker_failed`, `proxy_broker_timeout`) and
+omit request and exception contents. These become `egress.request.denied` events
+through the existing audit sink; upstream denials retain their distinct response
+error codes. Older audit records may lack this field.
+
 `DockerRunner.create(seccomp_profile=...)` accepts an explicit absolute host
 path for a Docker seccomp profile; `DockerEgressAdapter` forwards the same
 setting to its workload container. Cayu resolves the path, requires an existing

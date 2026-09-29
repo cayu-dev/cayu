@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 import os
 import secrets
 import shutil
@@ -12,11 +11,12 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from hashlib import sha256
+from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any
 
 from cayu._exception_groups import add_exception_note_safely
-from cayu._task_wait import await_shielded_task_outcome
+from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu.credentials import CredentialMode
 from cayu.egress._docker_diagnostics import docker_setup_failure
 from cayu.egress._docker_reconnect import (
@@ -63,8 +63,6 @@ from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_al
 from cayu.runners.base import Runner
 from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
 
-_logger = logging.getLogger(__name__)
-
 #: Where the per-session CA is mounted inside the container and trusted from.
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
 _SIDECAR_LISTEN_PORT = 8080
@@ -72,6 +70,7 @@ _DEFAULT_SIDECAR_IMAGE = "alpine/socat"
 _SESSION_LABEL = "cayu.egress.session"
 _SIDECAR_AUTH_PATH = "/run/cayu/broker.auth"
 _SIDECAR_CONNECTOR_PATH = "/run/cayu/connect-broker"
+_SIDECAR_PROBE_TIMEOUT_S = 10.0
 _SIDECAR_READY_SCRIPT = (
     "attempts=0; "
     'while [ "$(cat /proc/1/comm 2>/dev/null)" != socat ] && '
@@ -120,6 +119,15 @@ def _create_sidecar_transport_authorization(
             connector_path,
             b"#!/bin/sh\n"
             b"set -eu\n"
+            b'if [ "${1:-}" = "probe" ]; then\n'
+            b'  awk \'$2 == "host.docker.internal" { print "cayu-broker-gateway=" $1 }\' '
+            b"/etc/hosts >&2\n"
+            b'  exec timeout 5 socat -T5 -u OPEN:/dev/null "PROXY:'
+            + broker_host
+            + b":cayu-transport.invalid:443,"
+            b"proxyport=${CAYU_BROKER_PORT},connect-timeout=5,"
+            b'proxyauthfile=/run/cayu/broker.auth"\n'
+            b"fi\n"
             b'if [ "${1:-}" = "listen" ]; then\n'
             b"  attempts=0\n"
             b"  bind_ip=\n"
@@ -174,7 +182,21 @@ async def _default_docker_exec(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await process.communicate()
+    try:
+        _, stderr = await process.communicate()
+    except asyncio.CancelledError as cancellation:
+        # Killing the CLI does not cancel daemon mutations. The preparation
+        # owner still rolls back its named resources; this settles the waiter.
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        outcome = await await_shielded_task_outcome(asyncio.create_task(process.communicate()))
+        # Keep later caller requests visible to an enclosing timeout, which
+        # must consume only its own cancellation after the CLI has settled.
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed,
+            cancellation=cancellation,
+        )
+        raise
     return process.returncode or 0, stderr.decode("utf-8", "replace")
 
 
@@ -204,7 +226,7 @@ async def resolve_proxy_bind_host(run: DockerRun = _run_docker_stdout) -> str:
       ``127.0.0.1`` is both reachable and tightest.
     - Native Linux: bind to the default-bridge gateway (e.g. ``172.17.0.1``),
       reachable from containers via host-gateway but not on the host's LAN.
-    - If neither can be determined, fall back to ``0.0.0.0`` and warn loudly.
+    - If neither can be determined, require explicit configuration.
     """
     with contextlib.suppress(Exception):
         code, out = await run(["info", "--format", "{{.OperatingSystem}}"])
@@ -223,14 +245,17 @@ async def resolve_proxy_bind_host(run: DockerRun = _run_docker_stdout) -> str:
         if code == 0:
             gateways = out.strip().split()
             if gateways and gateways[0]:
-                return gateways[0]
-    _logger.warning(
-        "Cayu egress proxy is binding to 0.0.0.0 (ALL host interfaces) because the "
-        "Docker host interface could not be determined — this is LAN-reachable. The "
-        "listener is credential-gated (no secret leaks), but pass an explicit "
-        "proxy_host=... to DockerEgressAdapter to avoid exposure."
+                gateway = IPv4Address(gateways[0])
+                if not gateway.is_unspecified:
+                    return str(gateway)
+    raise UnsupportedEgressError(
+        "egress_proxy_host_unresolved: Docker network=bridge has no discoverable IPv4 "
+        "gateway and the Docker host interface could not be determined. Configure the "
+        "daemon with a working default bridge (not --bridge=none) and matching "
+        "--host-gateway-ip, or set DockerEgressAdapter(proxy_host=...) to an explicitly "
+        "reachable broker bind address. An explicit bind address still requires a "
+        "working sidecar-to-broker route."
     )
-    return "0.0.0.0"
 
 
 class DockerEgressAdapter(SandboxEgressAdapter):
@@ -372,10 +397,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         self._proxy_host = "0.0.0.0" if control_server_container_id is not None else proxy_host
         self._proxy_bind_host_resolver = proxy_bind_host_resolver or partial(
             resolve_proxy_bind_host,
-            run=partial(
-                _run_docker_stdout,
-                docker_cli_env_allowlist=self._docker_cli_env_allowlist,
-            ),
+            run=self._docker_run,
         )
 
     @property
@@ -607,6 +629,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     "-d",
                     "--name",
                     sidecar,
+                    "--network",
+                    "bridge",
                     "--label",
                     label,
                     *ownership_label,
@@ -640,6 +664,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 ]
             )
             await self._run(["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT])
+            await self._probe_sidecar_broker(sidecar, bind_host=bind_host, broker=broker)
         except BaseException as original:
             _consume_accounted_task_cancellation(original)
             cleanup = _PreparationCleanup(
@@ -726,6 +751,46 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 None,
             ),
         )
+
+    async def _probe_sidecar_broker(
+        self,
+        sidecar: str,
+        *,
+        bind_host: str,
+        broker: TransparentEgressBroker,
+    ) -> None:
+        argv = ["exec", sidecar, _SIDECAR_CONNECTOR_PATH, "probe"]
+        stderr = ""
+        try:
+            async with asyncio.timeout(_SIDECAR_PROBE_TIMEOUT_S):
+                code, stderr = await self._docker_exec(argv)
+            if code == 0:
+                return
+            diagnostic = docker_setup_failure(argv, code, stderr)
+        except TimeoutError:
+            diagnostic = "Authenticated broker connection probe timed out."
+        except Exception:
+            diagnostic = "Authenticated broker connection probe could not run."
+        # Only validated addresses and fixed text enter durable diagnostics.
+        gateway = "host.docker.internal (host-gateway)"
+        if self._control_server_container_id is not None:
+            gateway = "cayu-control (session internal network)"
+        else:
+            for line in stderr[:65536].splitlines():
+                if line.startswith("cayu-broker-gateway="):
+                    with contextlib.suppress(ValueError):
+                        gateway += f" [{IPv4Address(line.partition('=')[2])}]"
+                    break
+        bind_address = "explicit hostname"
+        with contextlib.suppress(ValueError):
+            bind_address = str(IPv4Address(bind_host))
+        broker._record_proxy_failure("egress_sidecar_unreachable")
+        raise UnsupportedEgressError(
+            "egress_sidecar_unreachable: Docker sidecar cannot reach its authenticated "
+            f"broker; network=bridge; gateway={gateway}; proxy_host={bind_address}. "
+            "Check the daemon default bridge, --host-gateway-ip, and broker bind address. "
+            + diagnostic
+        ) from None
 
     def _seccomp_profile_for_image(self, image: str) -> str | None:
         from cayu.runners.browser_sandbox import browser_seccomp_profile

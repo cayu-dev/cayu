@@ -1248,14 +1248,29 @@ deliberately *out of scope*:
   `credential_mode`.
 - **The broker proxy listener.** `DockerEgressAdapter` binds the in-process proxy
   to the narrowest interface the sidecar can still reach — loopback on Docker
-  Desktop, the docker bridge gateway on Linux — falling back to `0.0.0.0` (with a
-  loud warning) only if neither can be determined. Pass `proxy_host=` to override.
+  Desktop, the Docker default-bridge gateway on Linux. If neither can be
+  determined, allocation fails with `egress_proxy_host_unresolved`. Configure a
+  working daemon bridge and matching `--host-gateway-ip`, or pass `proxy_host=`
+  to choose an explicitly reachable bind address. An explicit bind address does
+  not create a route for a daemon started with `--bridge=none`.
+  Before returning an environment, the sidecar makes one authenticated CONNECT
+  to the broker, bounded to five seconds inside the container and ten seconds
+  for the Docker command. Failure rolls back allocation with
+  `egress_sidecar_unreachable`, including the network, gateway, bind address,
+  and safely projected Docker diagnostics. This checks the broker transport;
+  upstream availability is evaluated separately for each request.
   Every connection must first complete a sidecar-only authenticated outer
   CONNECT, so the listener is not a credentialless generic proxy even when it is
   host- or LAN-reachable. The sidecar's guest-facing listener binds only its
   random per-session internal-network address. The transport credential is
   mounted into that sidecar alone and never enters guest env, files, events,
   evidence, artifacts, or persisted binding metadata.
+  Transport failures emit `egress.request.denied` with
+  `authorization_kind="transport"` and an `error_code` of
+  `egress_sidecar_unreachable`, `proxy_broker_failed`, or `proxy_broker_timeout`.
+  These records omit request data and exception text. Broker request denials
+  also include their existing response error code, such as `dns_failure` or
+  `fetch_failed`, so exported evidence can distinguish upstream failures.
 
 ## Credential modes on runners
 

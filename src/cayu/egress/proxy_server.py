@@ -782,10 +782,21 @@ class TransparentEgressProxyServer:
                     "Client disconnected before the broker response was available.",
                 )
             try:
-                return future.result(timeout=0.25)
-            except TimeoutError:
-                waited += 0.25
+                try:
+                    # Waiting for completion separately keeps an exception raised
+                    # by the broker (including TimeoutError) distinct from a poll.
+                    future.exception(timeout=0.25)
+                except TimeoutError:
+                    waited += 0.25
+                    continue
+                return future.result()
+            except Exception:
+                self._loop.call_soon_threadsafe(
+                    self._broker._record_proxy_failure, "proxy_broker_failed"
+                )
+                raise
         future.cancel()
+        self._loop.call_soon_threadsafe(self._broker._record_proxy_failure, "proxy_broker_timeout")
         raise TimeoutError("Broker did not respond within the timeout.")
 
 

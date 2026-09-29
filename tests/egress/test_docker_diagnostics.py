@@ -68,6 +68,10 @@ def test_untrusted_stderr_and_argv_never_escape():
             "connect",
             "Error response from daemon: endpoint with name private-name already exists in network private-network",
         ),
+        (
+            "probe",
+            "cayu-broker-gateway=172.30.0.1\nconnect(172.30.0.1): Network unreachable",
+        ),
     ],
 )
 def test_setup_failure_survives_sqlite_environment_and_session_evidence(
@@ -88,7 +92,9 @@ def test_setup_failure_survives_sqlite_environment_and_session_evidence(
 
     async def execute(argv):
         calls.append(list(argv))
-        if list(argv[:2]) == ["network", operation]:
+        if list(argv[:2]) == ["network", operation] or (
+            operation == "probe" and argv[-1] == "probe"
+        ):
             return 1, stderr + " AUTH_TOKEN=secret-canary"
         return 0, ""
 
@@ -129,11 +135,16 @@ def test_setup_failure_survives_sqlite_environment_and_session_evidence(
             durable = next(event for event in persisted if event.type == kind)
             assert live.payload["error"] == durable.payload["error"]
             payload = json.dumps(durable.payload)
-            assert f"docker network {operation}" in payload
+            if operation == "probe":
+                assert "egress_sidecar_unreachable" in payload
+                assert "172.30.0.1" in payload
+                assert "Network unreachable" in payload
+            else:
+                assert f"docker network {operation}" in payload
+                assert (
+                    "fully subnetted" if operation == "create" else "already exists in network"
+                ) in payload
             assert "exit_code=1" in payload
-            assert (
-                "fully subnetted" if operation == "create" else "already exists in network"
-            ) in payload
             assert "secret-canary" not in payload
             assert "private-name" not in payload
         assert any(argv[:2] == ["network", "rm"] for argv in calls)

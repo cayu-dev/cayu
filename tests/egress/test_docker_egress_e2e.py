@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import http.server
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -137,6 +138,82 @@ def test_shared_real_boundary_security_contract(
         assert all(item.status == "verified" for item in e2e_results)
         assert REAL_SECRET not in repr(e2e_results)
         emit_egress_nightly_evidence(e2e_results)
+
+
+@pytest.mark.parametrize(
+    ("network", "authenticated"), [("bridge", True), ("none", True), ("bridge", False)]
+)
+def test_sidecar_probe_requires_a_real_authenticated_broker_route(network, authenticated) -> None:
+    from cayu.egress import (
+        TransparentEgressBroker,
+        UnsupportedEgressError,
+        VirtualCredentialRegistry,
+    )
+    from cayu.egress.docker_adapter import (
+        _SIDECAR_AUTH_PATH,
+        _SIDECAR_CONNECTOR_PATH,
+        _create_sidecar_transport_authorization,
+        _default_docker_exec,
+    )
+    from cayu.egress.proxy_server import TransparentEgressProxyServer
+
+    async def run():
+        decisions = []
+        broker = TransparentEgressBroker(
+            registry=VirtualCredentialRegistry(), resolver=None, policies={}, audit=decisions.append
+        )
+        authorization = _create_sidecar_transport_authorization()
+        adapter = DockerEgressAdapter()
+        bind_host = await adapter._proxy_bind_host_resolver()
+        server = TransparentEgressProxyServer(
+            broker,
+            loop=asyncio.get_running_loop(),
+            host=bind_host,
+            transport_auth_token=authorization.token if authenticated else b"different-identity",
+        )
+        sidecar = f"cayu-test-broker-probe-{secrets.token_hex(6)}"
+        try:
+            port = await server.start()
+            code, stderr = await _default_docker_exec(
+                [
+                    "run",
+                    "-d",
+                    "--name",
+                    sidecar,
+                    "--network",
+                    network,
+                    "--add-host",
+                    "host.docker.internal:host-gateway",
+                    "--mount",
+                    f"type=bind,src={authorization.auth_path},dst={_SIDECAR_AUTH_PATH},readonly",
+                    "--mount",
+                    f"type=bind,src={authorization.connector_path},dst={_SIDECAR_CONNECTOR_PATH},readonly",
+                    "--env",
+                    f"CAYU_BROKER_PORT={port}",
+                    "--entrypoint",
+                    "sleep",
+                    "alpine/socat",
+                    "60",
+                ]
+            )
+            assert code == 0, stderr
+            if network == "none" or not authenticated:
+                with pytest.raises(UnsupportedEgressError, match="egress_sidecar_unreachable"):
+                    await adapter._probe_sidecar_broker(sidecar, bind_host=bind_host, broker=broker)
+                assert len(decisions) == 1
+                assert decisions[0].error_code == "egress_sidecar_unreachable"
+            else:
+                await adapter._probe_sidecar_broker(sidecar, bind_host=bind_host, broker=broker)
+                assert decisions == []
+        finally:
+            try:
+                code, stderr = await _default_docker_exec(["rm", "-f", sidecar])
+                assert code == 0, stderr
+            finally:
+                await server.close()
+                authorization.close()
+
+    asyncio.run(run())
 
 
 # --- Full runtime wiring: the VirtualEgressEnvironmentFactory lifecycle. ---

@@ -344,6 +344,79 @@ def test_tls_interception_swaps_credential_and_captures_traffic() -> None:
     assert REAL_SECRET not in response.text
 
 
+@pytest.mark.parametrize("failure", ["exception", "broker_timeout", "proxy_timeout"])
+def test_broker_call_failures_emit_secret_free_transport_events(monkeypatch, failure) -> None:
+    from cayu.egress.runtime import _EgressAuditBridge
+    from cayu.events import EventType
+
+    async def run():
+        events = []
+
+        async def emit(event):
+            events.append(event)
+            return event
+
+        audit = _EgressAuditBridge(
+            loop=asyncio.get_running_loop(),
+            emitter=emit,
+            session_id="sess_1",
+            interaction_id=None,
+            agent_name="assistant",
+            environment_name="docker",
+            execution_profile_fingerprint=None,
+        )
+        broker, registry = _broker(_CapturingUpstream())
+        broker._audit = audit
+        grant = _mint(registry)
+        settled = asyncio.Event()
+
+        async def fail(_request):
+            try:
+                if failure == "proxy_timeout":
+                    await asyncio.Event().wait()
+                if failure == "broker_timeout":
+                    raise TimeoutError("exception-secret-canary")
+                raise RuntimeError("exception-secret-canary")
+            finally:
+                settled.set()
+
+        monkeypatch.setattr(broker, "handle_request", fail)
+        if failure == "proxy_timeout":
+            monkeypatch.setattr(proxy_server_module, "_BROKER_TIMEOUT_S", 0.1)
+        server = TransparentEgressProxyServer(broker, loop=asyncio.get_running_loop())
+        port = await server.start()
+        try:
+            context = ssl.create_default_context(cadata=server.authority.ca_cert_pem().decode())
+            async with httpx.AsyncClient(
+                proxy=f"http://127.0.0.1:{port}", verify=context, timeout=5
+            ) as client:
+                with pytest.raises(httpx.RemoteProtocolError):
+                    await client.post(
+                        "https://api.stripe.com/v1/customers?query-secret-canary",
+                        headers={"Authorization": f"Bearer {grant.presented_value}"},
+                        content=b"body-secret-canary",
+                    )
+            await asyncio.wait_for(settled.wait(), timeout=2)
+        finally:
+            await server.close()
+            await audit.drain()
+        assert len(events) == 1
+        event = events[0]
+        assert event.type == EventType.EGRESS_REQUEST_DENIED
+        assert event.payload["authorization_kind"] == "transport"
+        assert event.payload["error_code"] == (
+            "proxy_broker_timeout" if failure == "proxy_timeout" else "proxy_broker_failed"
+        )
+        assert (
+            event.payload["destination"] == event.payload["method"] == event.payload["path"] == ""
+        )
+        assert "secret-canary" not in repr(events)
+        assert grant.presented_value not in repr(events)
+        assert REAL_SECRET not in repr(events)
+
+    asyncio.run(run())
+
+
 def test_proxy_close_terminates_connection_established_before_authority_cutover() -> None:
     async def run() -> None:
         broker, _registry = _broker(_CapturingUpstream())

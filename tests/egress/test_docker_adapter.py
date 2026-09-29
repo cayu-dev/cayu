@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -37,6 +38,111 @@ class _FakeDocker:
     async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
         self.calls.append(list(argv))
         return 0, ""
+
+
+def test_docker_exec_cancellation_reaps_the_cli_process(monkeypatch) -> None:
+    created = asyncio.Event()
+    processes = []
+    create_process = asyncio.create_subprocess_exec
+
+    async def capture_process(*args, **kwargs):
+        process = await create_process(*args, **kwargs)
+        processes.append(process)
+        created.set()
+        return process
+
+    monkeypatch.setattr("cayu.egress.docker_adapter.shutil.which", lambda _name: sys.executable)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_process)
+
+    async def run():
+        task = asyncio.create_task(_default_docker_exec(["-c", "import time; time.sleep(60)"]))
+        await asyncio.wait_for(created.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert processes[0].returncode is not None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("caller_cancellations", [0, 1, 2])
+def test_prepare_preserves_caller_cancellation_during_probe_timeout_cleanup(
+    monkeypatch, caller_cancellations
+) -> None:
+    import cayu.egress.docker_adapter as docker_adapter
+
+    # Expire only once the fake CLI has been created and starts waiting.
+    monkeypatch.setattr(docker_adapter, "_SIDECAR_PROBE_TIMEOUT_S", 0)
+    monkeypatch.setattr(docker_adapter.shutil, "which", lambda _name: "/docker")
+
+    async def run():
+        reaping = asyncio.Event()
+        release_reaping = asyncio.Event()
+
+        class Process:
+            returncode = None
+            killed = False
+
+            def kill(self):
+                self.killed = True
+
+            async def communicate(self):
+                if not self.killed:
+                    await asyncio.Event().wait()
+                reaping.set()
+                await release_reaping.wait()
+                self.returncode = -9
+                return b"", b""
+
+        process = Process()
+
+        async def create_process(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+        class ProbeDocker(_FakeDocker):
+            async def __call__(self, argv):
+                result = await super().__call__(argv)
+                if argv[-1] == "probe":
+                    return await _default_docker_exec(argv)
+                return result
+
+        docker = ProbeDocker()
+        broker, registry, grant = _broker_with_grant()
+        decisions = []
+        broker._audit = decisions.append
+        adapter = DockerEgressAdapter(docker_exec=docker, proxy_host="127.0.0.1")
+        task = asyncio.create_task(
+            adapter.prepare(session_id="sess_1", grants=[grant], broker=broker)
+        )
+        try:
+            await asyncio.wait_for(reaping.wait(), timeout=5)
+            for _ in range(caller_cancellations):
+                task.cancel("caller cancelled during CLI reaping")
+                await asyncio.sleep(0)
+            assert not task.done()
+            assert process.returncode is None
+        finally:
+            release_reaping.set()
+            expected_error = (
+                asyncio.CancelledError if caller_cancellations else UnsupportedEgressError
+            )
+            with pytest.raises(expected_error):
+                await asyncio.wait_for(task, timeout=5)
+            await adapter.drain_preparation_cleanup()
+
+        assert task.cancelled() is bool(caller_cancellations)
+        assert process.returncode == -9
+        assert registry.was_revoked(grant.grant_id)
+        assert not adapter._preparation_cleanups
+        assert any(argv[:2] == ["rm", "-f"] for argv in docker.calls)
+        assert any(argv[:2] == ["network", "rm"] for argv in docker.calls)
+        assert [decision.error_code for decision in decisions] == (
+            [] if caller_cancellations else ["egress_sidecar_unreachable"]
+        )
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout])
@@ -584,18 +690,95 @@ def test_resolve_bind_host_linux_uses_bridge_gateway() -> None:
     assert asyncio.run(resolve_proxy_bind_host(run)) == "172.17.0.1"
 
 
-def test_resolve_bind_host_falls_back_to_all_interfaces_with_warning(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+@pytest.mark.parametrize("gateway", [None, "", "<no value>", "0.0.0.0", "secret-canary"])
+def test_resolve_bind_host_requires_configuration_without_bridge_gateway(gateway) -> None:
     async def run(argv: Sequence[str]) -> tuple[int, str]:
-        return 1, ""  # nothing discoverable
+        if argv[0] == "network" and gateway is not None:
+            return 0, gateway
+        return 1, ""
 
-    with caplog.at_level("WARNING"):
-        host = asyncio.run(resolve_proxy_bind_host(run))
+    with pytest.raises(UnsupportedEgressError, match="egress_proxy_host_unresolved") as error:
+        asyncio.run(resolve_proxy_bind_host(run))
 
-    assert host == "0.0.0.0"
-    assert any("0.0.0.0" in record.message for record in caplog.records)
-    assert any("proxy_host" in record.message for record in caplog.records)
+    assert "network=bridge" in str(error.value)
+    assert "--bridge=none" in str(error.value)
+    assert "proxy_host" in str(error.value)
+    assert "secret-canary" not in str(error.value)
+
+
+def test_prepare_with_missing_bridge_fails_before_allocating_resources() -> None:
+    docker = _FakeDocker()
+
+    async def inspect(_argv):
+        return 1, "No such network: bridge"
+
+    async def run():
+        adapter = DockerEgressAdapter(docker_exec=docker, docker_run=inspect)
+        with pytest.raises(UnsupportedEgressError, match="egress_proxy_host_unresolved"):
+            await adapter.prepare(
+                session_id="missing_bridge", grants=[], broker=_credentialless_broker()
+            )
+
+    asyncio.run(run())
+    assert docker.calls == []
+
+
+@pytest.mark.parametrize("failure", ["no_route", "timeout", "cancelled"])
+def test_prepare_probes_broker_and_rolls_back_unreachable_sidecar(monkeypatch, failure) -> None:
+    import cayu.egress.docker_adapter as docker_adapter
+
+    # A zero deadline deterministically cancels the hanging probe at its first await.
+    if failure == "timeout":
+        monkeypatch.setattr(docker_adapter, "_SIDECAR_PROBE_TIMEOUT_S", 0)
+    decisions = []
+
+    class UnreachableDocker(_FakeDocker):
+        async def __call__(self, argv):
+            self.calls.append(list(argv))
+            if argv[-1] == "probe":
+                if failure == "timeout":
+                    await asyncio.Event().wait()
+                if failure == "cancelled":
+                    raise asyncio.CancelledError()
+                return 1, "cayu-broker-gateway=172.30.0.1\nNetwork unreachable TOKEN=secret-canary"
+            return 0, ""
+
+    docker = UnreachableDocker()
+
+    async def run():
+        broker, registry, grant = _broker_with_grant()
+        broker._audit = decisions.append
+        adapter = DockerEgressAdapter(docker_exec=docker, proxy_host="127.0.0.1")
+        if failure == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await adapter.prepare(session_id="sess_1", grants=[grant], broker=broker)
+        else:
+            with pytest.raises(UnsupportedEgressError, match="egress_sidecar_unreachable") as error:
+                await adapter.prepare(session_id="sess_1", grants=[grant], broker=broker)
+            assert "network=bridge" in str(error.value)
+            assert "host.docker.internal" in str(error.value)
+            if failure == "no_route":
+                assert "172.30.0.1" in str(error.value)
+                assert "Network unreachable" in str(error.value)
+            assert "secret-canary" not in str(error.value)
+        assert registry.was_revoked(grant.grant_id)
+        assert not adapter._preparation_cleanups
+
+    asyncio.run(run())
+    sidecar_run = next(argv for argv in docker.calls if argv[0] == "run")
+    for value in sidecar_run:
+        if value.startswith("type=bind,"):
+            source = next(part[4:] for part in value.split(",") if part.startswith("src="))
+            assert not Path(source).exists()
+    assert any(argv[:2] == ["rm", "-f"] for argv in docker.calls)
+    assert any(argv[:2] == ["network", "rm"] for argv in docker.calls)
+    if failure == "cancelled":
+        assert decisions == []
+    else:
+        assert len(decisions) == 1
+        assert decisions[0].error_code == "egress_sidecar_unreachable"
+        assert decisions[0].authorization_kind == "transport"
+        assert "secret-canary" not in repr(decisions)
 
 
 def test_prepare_fails_closed_when_docker_errors() -> None:

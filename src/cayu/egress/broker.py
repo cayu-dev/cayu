@@ -224,6 +224,7 @@ class EgressDecision:
     authorization_kind: Literal["virtual_credential", "credentialless", "transport"] = (
         "virtual_credential"
     )
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1835,6 +1836,7 @@ class TransparentEgressBroker:
                 policy_name=policy_name,
                 reason=reason,
                 authorization_kind=authorization_kind,
+                error_code=error_code,
             )
         )
         body = json.dumps({"error": {"message": reason}}).encode()
@@ -1845,6 +1847,32 @@ class TransparentEgressBroker:
                 CAYU_EGRESS_ERROR_HEADER: error_code,
             },
             body=body,
+        )
+
+    def _record_proxy_failure(
+        self,
+        error_code: Literal[
+            "egress_sidecar_unreachable", "proxy_broker_failed", "proxy_broker_timeout"
+        ],
+    ) -> None:
+        reason = {
+            "egress_sidecar_unreachable": "Docker sidecar could not reach the authenticated broker.",
+            "proxy_broker_failed": "Proxy closed the connection because the broker call failed.",
+            "proxy_broker_timeout": "Proxy closed the connection because the broker call timed out.",
+        }[error_code]
+        self._record(
+            EgressDecision(
+                allowed=False,
+                status_code=504 if error_code == "proxy_broker_timeout" else 502,
+                destination="",
+                method="",
+                path="",
+                grant_id=None,
+                policy_name=None,
+                reason=reason,
+                authorization_kind="transport",
+                error_code=error_code,
+            )
         )
 
     def _record(self, decision: EgressDecision) -> None:

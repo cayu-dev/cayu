@@ -40,6 +40,7 @@ _PHRASES = (
     "already exists in network",
     "endpoint with name",
     "network is unreachable",
+    "network unreachable",
     "no space left on device",
     "address pool exhausted",
     "i/o timeout",

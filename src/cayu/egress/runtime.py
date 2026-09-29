@@ -4480,6 +4480,7 @@ class _EgressAuditBridge:
                     "policy_name": decision.policy_name,
                     "reason": decision.reason,
                     "authorization_kind": decision.authorization_kind,
+                    **({"error_code": decision.error_code} if decision.error_code else {}),
                 },
             ),
             self._execution_profile_fingerprint,
