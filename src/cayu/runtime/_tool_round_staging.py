@@ -35,6 +35,7 @@ from cayu.events import (
 )
 from cayu.failure_evidence import FailureEvidence
 from cayu.mcp.tools import McpToolAdapter
+from cayu.observability.hooks import RuntimeHookPhase, _runtime_hook_supports_phase
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
@@ -58,6 +59,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation
 from cayu.tools.base import ToolResult, _bound_policy_denial_result, _bound_policy_denial_text
+from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority
 from cayu.tools.result_projection import _TOOL_RESULT_PROJECTION_PROVENANCE_PATH
 from cayu.tools.terminal_publication import (
@@ -1251,3 +1253,43 @@ def _redactor_for_tool_calls(
         if isinstance(tool, McpToolAdapter):
             redactor = redactor.merged_with(tool.toolset.secret_redactor)
     return redactor
+
+
+async def _tool_terminal_payload_limits(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_calls: Iterable[runtime_records.ToolCallRequest],
+    *,
+    publication_governor: ToolTerminalPublicationGovernor,
+    runtime_hooks: Iterable[runtime_records.RegisteredRuntimeHook] = (),
+) -> dict[str, int | None]:
+    """Resolve frozen registration-time terminal bounds for round admission."""
+
+    has_argument_modifying_hook = any(
+        _runtime_hook_supports_phase(
+            hook=registered_hook.hook,
+            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+        )
+        for registered_hook in (*runtime_hooks, *registered_agent.runtime_hooks)
+    )
+    limits: dict[str, int | None] = {}
+    for tool_call in tool_calls:
+        registered_tool = registered_agent.executable_tool(tool_call.name)
+        if registered_tool is None:
+            limits[tool_call.id] = None
+            continue
+        contract = ToolExecutionContract.model_validate(registered_tool.execution_contract)
+        result_limit = contract.max_terminal_payload_bytes
+        if result_limit is None:
+            limits[tool_call.id] = None
+            continue
+        if registered_tool.publish_arguments and has_argument_modifying_hook:
+            limits[tool_call.id] = None
+            continue
+        argument_bytes = 0
+        if registered_tool.publish_arguments:
+            argument_bytes = await publication_governor.run_cpu(
+                (TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1 if tool_call.arguments else 0),
+                lambda tool_call=tool_call: _durable_payload_utf8_size(tool_call.arguments),
+            )
+        limits[tool_call.id] = result_limit + argument_bytes
+    return limits

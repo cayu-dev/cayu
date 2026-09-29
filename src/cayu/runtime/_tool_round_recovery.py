@@ -61,7 +61,7 @@ from cayu.runtime.execution_profiles import active_invocation_execution_profile_
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
 from cayu.tools.base import ToolResult
 from cayu.tools.catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
@@ -1708,3 +1708,33 @@ def recovered_subagent_tool_result(
         },
         is_error=status is not SessionStatus.COMPLETED,
     )
+
+
+async def load_tool_round_lifecycle_events(
+    session_store: SessionStore,
+    *,
+    session_id: str,
+    pending_round: PendingToolRound,
+) -> list[Event]:
+    """Load bounded lifecycle evidence and scope reused call IDs by round."""
+    candidates = await session_store.load_tool_round_lifecycle_events_for_round(
+        session_id,
+        [call.tool_call_id for call in pending_round.tool_calls],
+        tool_round_identity=pending_tool_round_identity(pending_round),
+    )
+    lifecycle_events: list[Event] = []
+    for event in candidates:
+        event_round_id = event.payload.get("tool_round_id")
+        if event_round_id == pending_round.tool_round_id:
+            lifecycle_events.append(event)
+            continue
+        if (
+            type(event_round_id) is not str
+            or not event_round_id.strip()
+            or event_round_id.strip() != event_round_id
+        ):
+            raise RuntimeError("Indexed tool-round lifecycle evidence has no valid round identity.")
+        raise RuntimeError(
+            "Round-scoped lifecycle lookup returned evidence for a different tool round."
+        )
+    return lifecycle_events

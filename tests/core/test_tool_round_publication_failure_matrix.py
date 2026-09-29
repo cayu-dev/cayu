@@ -24,6 +24,7 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    InterruptSessionRequest,
     RunRequest,
     RuntimePublicationRequest,
     RuntimePublicationResult,
@@ -32,7 +33,7 @@ from cayu.sessions.base import (
 )
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 _WATCHDOG_SECONDS = 20  # Includes durable-backend startup; faults use explicit barriers.
 
@@ -709,6 +710,234 @@ def test_limited_round_preserves_repeated_cancellation_at_publication(
             assert len(provider.requests) == 1
             await _assert_limited_round(
                 store, app, tool, completed_first=completed_first, session_id=request.session_id
+            )
+
+    asyncio.run(scenario())
+
+
+def _interruptible_runtime(store, *, completed_first, effect=ToolEffect.NONE):
+    class InterruptibleTool(_SideEffectTool):
+        spec = _SideEffectTool.spec.model_copy(update={"effect": effect})
+
+        def __init__(self):
+            super().__init__()
+            self.blocked = asyncio.Event()
+
+        async def run(self, ctx, args):
+            if completed_first and args["value"] == "first":
+                return await super().run(ctx, args)
+            self.calls.append(args["value"])
+            self.blocked.set()
+            await asyncio.Event().wait()
+            raise AssertionError("Interrupted tool unexpectedly resumed.")
+
+    provider = _TwoCallProvider([_tool_call_response()])
+    tool = InterruptibleTool()
+    return _runtime(store, provider, tool, max_parallel_tool_calls=1), provider, tool
+
+
+async def _interrupt(app, session_id):
+    return [
+        event
+        async for event in app.interrupt_session(
+            InterruptSessionRequest(session_id=session_id, reason="operator stop")
+        )
+    ]
+
+
+async def _finish_tasks(*tasks):
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True), timeout=_WATCHDOG_SECONDS
+    )
+
+
+async def _assert_interrupted_round(store, app, tool, *, completed_first, session_id):
+    assert tool.calls == (["first", "second"] if completed_first else ["first"])
+    transcript = await store.load_transcript(session_id)
+    tool_messages = [message for message in transcript if message.role.value == "tool"]
+    assert len(tool_messages) == 1
+    results = [part for part in tool_messages[0].content if isinstance(part, ToolResultPart)]
+    assert [part.tool_call_id for part in results] == ["call-side-effect-a", "call-side-effect-b"]
+    if completed_first:
+        assert results[0].content == "executed first"
+        assert results[0].is_error is False
+    for result in results[int(completed_first) :]:
+        assert result.is_error is True
+        assert result.structured["interrupted"] is True
+    events = await store.load_events(session_id)
+    terminals = [
+        event
+        for event in events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    ]
+    assert [event.payload["tool_call_id"] for event in terminals] == [
+        "call-side-effect-a",
+        "call-side-effect-b",
+    ]
+    assert [event.type for event in terminals] == [
+        EventType.TOOL_CALL_COMPLETED if completed_first else EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_FAILED,
+    ]
+    round_id = terminals[0].payload["tool_round_id"]
+    assert await store.load_runtime_publication_receipt(session_id, f"tool-round:{round_id}")
+    assert (
+        tool_round_recovery.pending_tool_round_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        is None
+    )
+    assert len({event.id for event in events}) == len(events)
+    metrics = app.tool_terminal_publication_status()
+    assert metrics.active_round_reservations == metrics.staged_count == 0
+
+
+@pytest.mark.parametrize("completed_first", [False, True], ids=["no-completed-call", "partial"])
+def test_interrupted_round_replays_exact_publication_and_repeated_close(
+    store_factory, monkeypatch, completed_first
+):
+    async def scenario():
+        async with store_factory(_LostAcknowledgementStore) as store:
+            store.fail_before_tool_publication = False
+            session_id = f"interrupted-lost-ack-{completed_first}"
+            app, provider, tool = _interruptible_runtime(store, completed_first=completed_first)
+            executor = app._session_engine._tool_round_executor
+            close = executor._close_interrupted_round
+            close_requests = []
+
+            async def capture_close(request):
+                close_requests.append(request)
+                async with aclosing(close(request)) as stream:
+                    async for event in stream:
+                        yield event
+
+            monkeypatch.setattr(executor, "_close_interrupted_round", capture_close)
+            running = asyncio.create_task(_collect_run(app, session_id=session_id))
+            try:
+                await asyncio.wait_for(tool.blocked.wait(), timeout=_WATCHDOG_SECONDS)
+                interrupted = await asyncio.wait_for(
+                    _interrupt(app, session_id), timeout=_WATCHDOG_SECONDS
+                )
+                events = await asyncio.wait_for(running, timeout=_WATCHDOG_SECONDS)
+            finally:
+                await _finish_tasks(running)
+                assert await app.drain_background_interruptions()
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+            assert events[-1].id == interrupted[-1].id
+            assert (await store.load(session_id)).status is SessionStatus.INTERRUPTED
+            assert len(provider.requests) == 1
+            assert len(store.publication_requests) == 2
+            assert store.publication_requests[0] == store.publication_requests[1]
+            committed, replayed = store.publication_results
+            assert committed.replayed is False and replayed.replayed is True
+            assert committed.receipt == replayed.receipt
+            await _assert_interrupted_round(
+                store, app, tool, completed_first=completed_first, session_id=session_id
+            )
+
+            before_transcript = await store.load_transcript(session_id)
+            before_events = await store.load_events(session_id)
+            assert len(close_requests) == 1
+            assert [event async for event in close(close_requests[0])] == []
+            assert await store.load_transcript(session_id) == before_transcript
+            assert await store.load_events(session_id) == before_events
+            assert close_requests[0].messages == before_transcript
+            assert len(store.publication_requests) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ["before-commit", "after-commit"])
+def test_interrupted_round_preserves_repeated_cancellation_at_publication(
+    store_factory, monkeypatch, boundary
+):
+    async def scenario():
+        async with store_factory(_PublicationBarrierStore, boundary=boundary) as store:
+            session_id = f"interrupted-cancel-{boundary}"
+            app, provider, tool = _interruptible_runtime(store, completed_first=True)
+            executor = app._session_engine._tool_round_executor
+            close = executor._close_interrupted_round
+            cancellations = []
+
+            async def observe_close(request):
+                try:
+                    async with aclosing(close(request)) as stream:
+                        async for event in stream:
+                            yield event
+                except asyncio.CancelledError as exc:
+                    cancellations.append(exc.args)
+                    raise
+
+            monkeypatch.setattr(executor, "_close_interrupted_round", observe_close)
+            running = asyncio.create_task(_collect_run(app, session_id=session_id))
+            interrupting = None
+            try:
+                await asyncio.wait_for(tool.blocked.wait(), timeout=_WATCHDOG_SECONDS)
+                interrupting = asyncio.create_task(_interrupt(app, session_id))
+                await asyncio.wait_for(store.boundary_reached.wait(), timeout=_WATCHDOG_SECONDS)
+                running.cancel("interrupted round publication cancellation")
+                running.cancel("interrupted round publication cancellation")
+                store.release_publication.set()
+                events = await asyncio.wait_for(running, timeout=_WATCHDOG_SECONDS)
+                interrupted = await asyncio.wait_for(interrupting, timeout=_WATCHDOG_SECONDS)
+            finally:
+                store.release_publication.set()
+                await _finish_tasks(running, *([] if interrupting is None else [interrupting]))
+                assert await app.drain_background_interruptions()
+            # Closure retains cancellation; session control normalizes the operator stop.
+            assert cancellations == [("interrupted round publication cancellation",)]
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+            assert events[-1].id == interrupted[-1].id
+            assert len(provider.requests) == 1
+            await _assert_interrupted_round(
+                store, app, tool, completed_first=True, session_id=session_id
+            )
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_external_effect_keeps_round_pending_without_publication(store_factory):
+    async def scenario():
+        async with store_factory(_LostAcknowledgementStore) as store:
+            store.fail_before_tool_publication = False
+            session_id = "interrupted-external-effect"
+            app, provider, tool = _interruptible_runtime(
+                store, completed_first=True, effect=ToolEffect.EXTERNAL
+            )
+            running = asyncio.create_task(_collect_run(app, session_id=session_id))
+            try:
+                await asyncio.wait_for(tool.blocked.wait(), timeout=_WATCHDOG_SECONDS)
+                await asyncio.wait_for(_interrupt(app, session_id), timeout=_WATCHDOG_SECONDS)
+                await asyncio.wait_for(running, timeout=_WATCHDOG_SECONDS)
+            finally:
+                await _finish_tasks(running)
+                assert await app.drain_background_interruptions()
+            assert tool.calls == ["first", "second"]
+            assert len(provider.requests) == 1
+            assert store.publication_requests == []
+            pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+                await store.load_checkpoint(session_id)
+            )
+            assert pending is not None
+            assert (
+                await store.load_runtime_publication_receipt(
+                    session_id, f"tool-round:{pending.tool_round_id}"
+                )
+                is None
+            )
+            events = await store.load_events(session_id)
+            unknown = [
+                event for event in events if event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN
+            ]
+            assert [event.payload["tool_call_id"] for event in unknown] == ["call-side-effect-b"]
+            completed = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
+            assert len(completed) == 1
+            assert completed[0].payload["result"]["content"] == "executed first"
+            assert not any(event.type is EventType.TOOL_CALL_FAILED for event in events)
+            assert not any(
+                message.role.value == "tool" for message in await store.load_transcript(session_id)
             )
 
     asyncio.run(scenario())

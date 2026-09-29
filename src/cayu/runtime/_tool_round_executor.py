@@ -147,6 +147,15 @@ from cayu.runtime._checkpoint_redaction import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
 from cayu.runtime._durable_tool_round import DurableToolRound
+from cayu.runtime._durable_tool_round import (
+    InterruptedToolRoundRequest as InterruptedToolRoundRequest,
+)
+from cayu.runtime._durable_tool_round import (
+    _interrupted_tool_call_event as _interrupted_tool_call_event,
+)
+from cayu.runtime._durable_tool_round import (
+    _interrupted_tool_call_outcome as _interrupted_tool_call_outcome,
+)
 from cayu.runtime._environment_exposure import (
     refresh_and_require_environment_exposed,
     require_environment_exposed,
@@ -245,6 +254,9 @@ from cayu.runtime._tool_round_staging import (
 )
 from cayu.runtime._tool_round_staging import (
     _terminal_publication_work_estimate as _terminal_publication_work_estimate,
+)
+from cayu.runtime._tool_round_staging import (
+    _tool_terminal_payload_limits as _tool_terminal_payload_limits,
 )
 from cayu.runtime._tool_round_staging import (
     _ToolRoundPublicationCoordinator as _ToolRoundPublicationCoordinator,
@@ -561,22 +573,6 @@ class ToolRoundLimitRequest:
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
     execution_profile: ExecutionProfileIdentity | None
-    invocation_context: InvocationContext | None = None
-
-
-@dataclass(frozen=True)
-class InterruptedToolRoundRequest:
-    session: Session
-    registered_agent: runtime_records.RegisteredAgentState
-    registered_environment: runtime_records.RegisteredEnvironment | None
-    messages: list[Message]
-    tool_calls: list[runtime_records.ToolCallRequest]
-    tool_outcomes: list[runtime_records.ToolCallOutcome]
-    tool_round_identity: ToolRoundIdentity
-    cancellation_artifacts: list[dict[str, Any]] | None
-    cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None
-    cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
-    execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
 
 
@@ -8711,91 +8707,6 @@ def _consume_current_task_cancellation_requests(
     return max(requests_before - current_task.cancelling(), 0)
 
 
-def _interrupted_tool_call_outcome(
-    *,
-    tool_call: runtime_records.ToolCallRequest,
-    tool_round_identity: ToolRoundIdentity,
-    registered_tool: runtime_records.RegisteredTool | None,
-    execution_started: bool,
-    artifacts: list[dict[str, Any]] | None = None,
-) -> runtime_records.ToolCallOutcome:
-    """Build the canonical bounded result for one interrupted tool call."""
-
-    structured = {
-        "interrupted": True,
-        "tool_call_id": tool_call.id,
-        "tool_name": tool_call.name,
-        **copy_tool_round_identity(tool_round_identity).payload(),
-    }
-    if execution_started and registered_tool is not None:
-        try:
-            execution_contract = ToolExecutionContract.model_validate(
-                registered_tool.execution_contract
-            )
-        except (TypeError, ValueError):
-            execution_contract = None
-        if execution_contract is not None and execution_contract.boundary == "posix_process":
-            process_controls = {
-                "terminal_outcome": "tool_execution_error",
-                "tool_effect": registered_tool.effect.value,
-                "outcome_unknown": registered_tool.effect is not ToolEffect.NONE,
-                "manual_reconciliation_required": (registered_tool.effect is ToolEffect.EXTERNAL),
-                "isolated_tool_failure_code": "process_interrupted",
-                "tool_execution_boundary": "posix_process",
-                "tool_timeout_strength": "hard_process_deadline",
-            }
-            tool_results.runtime_terminal_controls(process_controls)
-            tool_results.runtime_tool_execution_boundary_controls(process_controls)
-            structured.update(process_controls)
-    return runtime_records.ToolCallOutcome(
-        call=tool_call,
-        result=ToolResult(
-            content="Tool call interrupted before completion.",
-            structured=structured,
-            artifacts=[] if artifacts is None else artifacts,
-            is_error=True,
-        ),
-    )
-
-
-def _interrupted_tool_call_event(
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    tool_call_outcome: runtime_records.ToolCallOutcome,
-    tool_round_identity: ToolRoundIdentity,
-) -> Event:
-    """Build the terminal event paired with the canonical interrupted result."""
-
-    structured = dict(tool_call_outcome.result.structured or {})
-    terminal_controls = tool_results.runtime_terminal_controls(structured)
-    terminal_controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
-    return Event(
-        type=(
-            EventType.TOOL_CALL_FAILED
-            if tool_call_outcome.result.is_error
-            else EventType.TOOL_CALL_COMPLETED
-        ),
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        tool_name=tool_call_outcome.call.name,
-        payload={
-            "tool_call_id": tool_call_outcome.call.id,
-            "idempotency_key": tool_execution.tool_idempotency_key(
-                session_id=session.id,
-                tool_round_id=tool_round_identity.tool_round_id,
-                tool_call_id=tool_call_outcome.call.id,
-            ),
-            "interrupted": True,
-            "result": tool_call_outcome.result.model_dump(),
-            **terminal_controls,
-            **copy_tool_round_identity(tool_round_identity).payload(),
-        },
-    )
-
-
 def _copy_agent_spec(spec: AgentSpec) -> AgentSpec:
     if type(spec) is not AgentSpec:
         raise TypeError("Agent registration requires an AgentSpec.")
@@ -10753,46 +10664,6 @@ def _tool_effect(
     if registered_tool is None:
         return ToolEffect.EXTERNAL
     return registered_tool.effect
-
-
-async def _tool_terminal_payload_limits(
-    registered_agent: runtime_records.RegisteredAgentState,
-    tool_calls: Iterable[runtime_records.ToolCallRequest],
-    *,
-    publication_governor: ToolTerminalPublicationGovernor,
-    runtime_hooks: Iterable[runtime_records.RegisteredRuntimeHook] = (),
-) -> dict[str, int | None]:
-    """Resolve frozen registration-time terminal bounds for round admission."""
-
-    has_argument_modifying_hook = any(
-        _runtime_hook_supports_phase(
-            hook=registered_hook.hook,
-            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-        )
-        for registered_hook in (*runtime_hooks, *registered_agent.runtime_hooks)
-    )
-    limits: dict[str, int | None] = {}
-    for tool_call in tool_calls:
-        registered_tool = registered_agent.executable_tool(tool_call.name)
-        if registered_tool is None:
-            limits[tool_call.id] = None
-            continue
-        contract = ToolExecutionContract.model_validate(registered_tool.execution_contract)
-        result_limit = contract.max_terminal_payload_bytes
-        if result_limit is None:
-            limits[tool_call.id] = None
-            continue
-        if registered_tool.publish_arguments and has_argument_modifying_hook:
-            limits[tool_call.id] = None
-            continue
-        argument_bytes = 0
-        if registered_tool.publish_arguments:
-            argument_bytes = await publication_governor.run_cpu(
-                (TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1 if tool_call.arguments else 0),
-                lambda tool_call=tool_call: _durable_payload_utf8_size(tool_call.arguments),
-            )
-        limits[tool_call.id] = result_limit + argument_bytes
-    return limits
 
 
 def _tool_round_publishes_arguments(

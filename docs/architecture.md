@@ -112,14 +112,26 @@ owner. It retains completed effects, publishes skipped results for unstarted
 calls, and commits the round using the same publication operation. A repeated
 closure reads the existing receipt and transcript. Cancellation remains observable
 after publication and deferred input materialization. Only live execution creates
-dispatch state or a private staging coordinator.
+dispatch state.
+
+`RecoveryCoordinator` delegates interruption snapshot validation and recovered
+round publication to the same owner. Interruption captures the transcript cursor
+before settlement; publication retains that cursor as its concurrency fence. The
+owner completes the assistant's secret projection, restores staged capacity,
+publishes safe terminals, and commits through the shared exact-replay operation.
+Recovered terminal events reach the caller after commit and deferred input
+materialization. An error while consuming a terminal hook closes that hook stream
+before returning. Recovery still selects safe outcomes and coordinates workspace
+settlement, uncertain external effects, isolated dispatch evidence and child
+sessions. Those operations do not authorize a second tool execution.
 
 The owner reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation
 across checkpoint writes. Shared staging, projection and receipt algorithms keep
-their existing authority and cancellation checks. Recovery callers still use the
-shared staging implementation directly. Session-level interruption and approval
-resolution retain their existing owners.
+their existing authority and cancellation checks. Structured-output and paused
+continuation callers still await migration; some use the shared staging
+implementation directly. Session-level interruption and approval resolution
+retain their existing owners.
 
 `DurableSubagentCoordinator` owns the staged parent seed, child-session, queue-task,
 receipt, and restart-reconciliation handoff for task-backed subagents. The application

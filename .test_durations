@@ -40594,5 +40594,21 @@
   "tests/core/test_tool_round_publication_failure_matrix.py::test_limited_round_replays_exact_publication_and_repeated_close[postgres-before-dispatch]": 3.889688790543005,
   "tests/core/test_tool_round_publication_failure_matrix.py::test_limited_round_replays_exact_publication_and_repeated_close[postgres-partial]": 1.2960256240330637,
   "tests/core/test_tool_round_publication_failure_matrix.py::test_limited_round_replays_exact_publication_and_repeated_close[sqlite-before-dispatch]": 0.7377146249637008,
-  "tests/core/test_tool_round_publication_failure_matrix.py::test_limited_round_replays_exact_publication_and_repeated_close[sqlite-partial]": 0.8134958741720766
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_limited_round_replays_exact_publication_and_repeated_close[sqlite-partial]": 0.8134958741720766,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_external_effect_keeps_round_pending_without_publication[memory]": 0.7929351672064513,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_external_effect_keeps_round_pending_without_publication[postgres]": 1.7156448317691684,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_external_effect_keeps_round_pending_without_publication[sqlite]": 1.070891751209274,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_preserves_repeated_cancellation_at_publication[memory-after-commit]": 0.5837725831661373,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_preserves_repeated_cancellation_at_publication[memory-before-commit]": 0.5790972493123263,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_preserves_repeated_cancellation_at_publication[postgres-after-commit]": 1.4043377919588238,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_preserves_repeated_cancellation_at_publication[postgres-before-commit]": 1.3925005421042442,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_preserves_repeated_cancellation_at_publication[sqlite-after-commit]": 0.8928482916671783,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_preserves_repeated_cancellation_at_publication[sqlite-before-commit]": 0.92522829095833,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_replays_exact_publication_and_repeated_close[memory-no-completed-call]": 0.5867593339644372,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_replays_exact_publication_and_repeated_close[memory-partial]": 0.5904869998339564,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_replays_exact_publication_and_repeated_close[postgres-no-completed-call]": 1.4689534569624811,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_replays_exact_publication_and_repeated_close[postgres-partial]": 1.4237790012266487,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_replays_exact_publication_and_repeated_close[sqlite-no-completed-call]": 0.8989573330618441,
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_interrupted_round_replays_exact_publication_and_repeated_close[sqlite-partial]": 0.9097544986288995,
+  "tests/core/test_tool_round_runtime_publication.py::test_recovered_publication_closes_hook_stream_before_rejecting_changed_evidence": 1.4834365819115192
 }

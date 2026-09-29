@@ -24,6 +24,7 @@ from cayu.events import Event, EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._durable_tool_round import DurableToolRound
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
@@ -510,6 +511,57 @@ def test_pending_tool_round_recovery_does_not_retry_precommit_rejection() -> Non
         Message.text("user", "continue"),
         Message.text("user", "retry recovery"),
     ]
+
+
+def test_recovered_publication_closes_hook_stream_before_rejecting_changed_evidence(monkeypatch):
+    session_id = "sess_recovered_hook_stream_cleanup"
+    app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
+    closed = []
+    rejected = []
+    publish = DurableToolRound.publish_recovered
+
+    async def changed_terminal(**kwargs):
+        try:
+            yield (
+                kwargs["event"],
+                runtime_records.ToolCallOutcome(
+                    call=kwargs["tool_call"], result=ToolResult(content="changed recovery result")
+                ),
+            )
+        finally:
+            await asyncio.sleep(0)
+            closed.append(kwargs["tool_call"].id)
+
+    async def checked_publication(owner, **kwargs):
+        try:
+            async for event in publish(owner, **kwargs):
+                yield event
+        except RuntimeError as exc:
+            assert str(exc) == "Recovered tool-round hooks changed terminal evidence."
+            assert closed == ["call_1"]
+            rejected.append(str(exc))
+            raise
+
+    monkeypatch.setattr(
+        app._tool_round_executor, "emit_tool_call_result_with_hooks", changed_terminal
+    )
+    monkeypatch.setattr(DurableToolRound, "publish_recovered", checked_publication)
+
+    async def scenario():
+        events = await collect_resume_events(
+            app, ResumeRequest(session_id=session_id, messages=[Message.text("user", "continue")])
+        )
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert len(rejected) == 1
+        assert tool.calls == [{}]
+        assert (
+            await store.load_runtime_publication_receipt(
+                session_id, f"tool-round:{checkpoint['pending_tool_round']['tool_round_id']}"
+            )
+            is None
+        )
+
+    asyncio.run(scenario())
 
 
 def test_pending_tool_round_recovery_preserves_cancellation_after_exact_replay() -> None:
