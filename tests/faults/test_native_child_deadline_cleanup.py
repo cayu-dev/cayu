@@ -65,6 +65,10 @@ class DeadlineEndpoint:
                 writer.write(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
                 await writer.drain()
 
+            if not slow:
+                # Keep the surviving sibling active until deadline cancellation
+                # has closed the slow response's socket.
+                await self.closed.wait()
             if self.output or not slow:
                 payload = {
                     "id": f"completion-{len(self.requests)}",
@@ -125,7 +129,10 @@ def test_native_http_child_deadlines_preserve_terminal_and_sibling(tmp_path, out
                 app.register_agent(AgentSpec(name=model, model=model))
             ctx = Verifiers(app).context("http-deadlines")
             await ctx.start()
-            deadlines = [ExecutionDeadline.after(3, scope=f"child-{i}") for i in range(2)]
+            deadlines = [
+                ExecutionDeadline.after(3 if both_expire or i == 1 else None, scope=f"child-{i}")
+                for i in range(2)
+            ]
             result_task = asyncio.create_task(
                 parallel(
                     [
