@@ -157,6 +157,7 @@ def _affects_dashboard(path: str) -> bool:
             "src/cayu/runtime/",
             "src/cayu/server/",
             "src/cayu/storage/",
+            "tests/browser_client/",
             "tests/server/",
         )
     )

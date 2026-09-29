@@ -665,3 +665,34 @@ def test_installed_order_support_discovery(capsys) -> None:
     ):
         assert main(["guide", topic]) == 0
         assert "cayu guide order-support" in capsys.readouterr().out
+
+
+def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
+    assert main(["guide", "app-ui", "--json"]) == 0
+    guide = json.loads(capsys.readouterr().out)
+    assert guide["package_source"] == "cayu.guides/app-ui.md"
+    assert guide["related_topics"] == ["anatomy", "human-attention", "references"]
+    content = " ".join(guide["content"].split())
+    for rule in (
+        'import { connect } from "/cayu/client.js"',
+        "Do not hand-write polling loops",
+        "only while the tab is visible",
+        "Poll only while something is active",
+        "no more often than every 15 seconds",
+        "Back off while responses do not change",
+        "## Split overview from detail",
+        "## Keep GET handlers read-only",
+        "cayu guide human-attention",
+        "GET /api/sessions/{id}/usage",
+        "POST /api/sessions/{id}/cost",
+        "under 1% of a 0.5 vCPU web process",
+        "cayu diagnostics requests --budget-idle-cpu 0.01 --vcpu 0.5",
+        "## Example: a progress panel",
+    ):
+        assert rule in content, rule
+
+    root = Path(__file__).resolve().parents[2]
+    assert "cayu guide app-ui" in (root / "src/cayu/guides/application-anatomy.md").read_text()
+    control_plane = (root / "docs/control-plane.md").read_text()
+    bring_your_own_ui = control_plane.split("## Bring your own UI", 1)[1].split("\n## ", 1)[0]
+    assert "../src/cayu/guides/app-ui.md" in bring_your_own_ui

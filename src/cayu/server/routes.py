@@ -311,6 +311,11 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
 )
 from cayu.runtime.stop_policy import RunLimits
+from cayu.server._browser_client import (
+    BROWSER_CLIENT_MODULE,
+    BROWSER_CLIENT_TYPES,
+    browser_client_url,
+)
 from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server._evaluation_promotion_routes import (
@@ -368,6 +373,7 @@ from cayu.server.contracts import (
     ApiTaskScheduleReceipt,
     ArtifactReadResponse,
     ArtifactsResponse,
+    BrowserClientContract,
     CapturedEvaluationConversion,
     CapturedEvaluationDraft,
     CapturedEvaluationExportRequest,
@@ -4213,6 +4219,7 @@ def create_router(
     ) = None,
     _project_context: ResolvedProjectControlPlaneContext | None = None,
     _system_diagnostics_snapshot_sink: (Callable[[SystemDiagnosticsSnapshot], None] | None) = None,
+    _browser_client_base_path: str | None = None,
     _request_timing: RequestTimingRecorder | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
@@ -4414,6 +4421,14 @@ def create_router(
     eval_registry = eval_runtime.registry if eval_runtime is not None else generated_registry
 
     api_prefix = normalize_api_path(api_path, field_name="api_path")
+    browser_client_contract = (
+        BrowserClientContract()
+        if _browser_client_base_path is None
+        else BrowserClientContract(
+            module_url=browser_client_url(_browser_client_base_path, BROWSER_CLIENT_MODULE),
+            types_url=browser_client_url(_browser_client_base_path, BROWSER_CLIENT_TYPES),
+        )
+    )
     session_follow_contract = SessionFollowContract(
         path_template=f"{api_prefix}{SESSION_FOLLOW_PATH}",
         heartbeat_interval_seconds=session_follow_heartbeat_s,
@@ -4795,6 +4810,7 @@ def create_router(
             sse=SseContract(session_follow=session_follow_contract),
             accounting=accounting_contract,
             client_generation=ClientGenerationContract(openapi_url=openapi_url),
+            client=browser_client_contract,
             capabilities=capability_snapshot.project(
                 auth_context,
                 artifacts_configured=cayu_app.has_registered_artifact_store(),

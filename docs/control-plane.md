@@ -178,8 +178,18 @@ source. Begin with `GET /api/contract`, honor its capability projection, use the
 detail APIs, and fail closed on an unsupported `contract_version`. Authentication,
 authorization, redaction, and capability contracts are identical regardless of frontend.
 
-To show a running session's live progress, open the read-only follow stream that the contract
-advertises as `sse.session_follow` (`GET /api/sessions/{session_id}/events/stream`) with a
+To show live sessions, import the browser client the server ships instead of writing polling
+loops. `mount_cayu(..., path="/cayu")` serves a dependency-free ES module at `/cayu/client.js`
+(types at `/cayu/client.d.ts`), behind the same access dependency as the API, and the contract
+advertises it under `client`. Its `followSession` streams when the contract advertises
+`sse.session_follow` and otherwise polls `after_sequence` with backoff; it pauses while the tab
+is hidden and stops when the session ends. `watchSessions` refreshes overview lists no faster
+than every 15 seconds and stops when nothing is active. Read
+[`cayu guide app-ui`](../src/cayu/guides/app-ui.md) before building the UI: it also covers
+splitting overview from detail, keeping GET handlers read-only, using usage and cost instead of
+folding events, and the idle-tab budget.
+
+For direct SSE integration, open the read-only follow stream that the contract advertises as `sse.session_follow` (`GET /api/sessions/{session_id}/events/stream`) with a
 browser `EventSource`. Pass `after_sequence` for the last event you already rendered; the
 browser's automatic reconnect sends `Last-Event-ID` and resumes without gaps or duplicates.
 Filter out chatty events such as `exclude_event_type=model.text.delta` when you do not render

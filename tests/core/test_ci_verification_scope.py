@@ -65,6 +65,8 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         sqlite_cancellation=False,
     )
     assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
+    assert select_pull_request_jobs(["tests/browser_client/client.test.mjs"]) == dashboard_only
+    assert select_pull_request_jobs(["src/cayu/server/browser_client/client.js"]) == dashboard_only
     assert select_pull_request_jobs([".gitattributes"]) == VerificationScope(
         dashboard=True,
         release_artifacts=True,

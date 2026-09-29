@@ -2639,6 +2639,34 @@ export type BillingIdentity = {
 };
 
 /**
+ * BrowserClientContract
+ *
+ * Where to load the dependency-free browser client served with the API.
+ *
+ * ``module_url`` and ``types_url`` are ``None`` when the host did not serve
+ * the module, for example when it composed ``create_router`` itself or used
+ * an API path whose last segment is not ``api``.
+ */
+export type BrowserClientContract = {
+    /**
+     * Guide Topic
+     */
+    guide_topic?: 'app-ui';
+    /**
+     * Module Url
+     */
+    module_url?: string | null;
+    /**
+     * Types Url
+     */
+    types_url?: string | null;
+    /**
+     * Version
+     */
+    version?: '1';
+};
+
+/**
  * BudgetLimit
  *
  * Estimated-cost budget that applies across one durable runtime scope.
@@ -15597,6 +15625,7 @@ export type ServerContractResponse = {
      */
     api_prefix?: string;
     capabilities: ControlPlaneCapabilities;
+    client?: BrowserClientContract;
     client_generation?: ClientGenerationContract;
     /**
      * Contract Version

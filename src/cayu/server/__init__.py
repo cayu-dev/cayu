@@ -65,6 +65,7 @@ try:
         ServiceIdentityStoreKind,
         ServiceMode,
     )
+    from cayu.server._browser_client import browser_client_base_path, browser_client_router
     from cayu.server._diagnostics import SystemDiagnosticsSnapshot, dashboard_pricing_metadata
     from cayu.server._request_timing import RequestTimingMiddleware, RequestTimingRecorder
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
@@ -418,6 +419,7 @@ def create_server(
     knowledge_store = app.knowledge_store
     control_plane_path = resolved_config.api.path
     if resolved_config.api.enabled:
+        browser_client_base = browser_client_base_path(control_plane_path)
         resolved_dashboard_runtime_config = dict(
             thaw_json_value(resolved_config.dashboard.runtime_config)
         )
@@ -467,9 +469,14 @@ def create_server(
             generated_evals_pricing=configured_dashboard_price_book,
             evals=resolved_config.evals,
             _project_context=resolved_project_context,
+            _browser_client_base_path=browser_client_base,
             _request_timing=request_timing,
         )
         server.include_router(router)
+        if browser_client_base is not None:
+            server.include_router(
+                browser_client_router(base_path=browser_client_base, auth=api_auth)
+            )
         if browser_control_server is not None:
             server.include_router(browser_control_server.router, prefix=control_plane_path)
         if browser_recordings is not None:
@@ -564,7 +571,9 @@ def mount_cayu(
 
     This is the high-level adapter for product apps that already own their
     server. It mounts API routes at ``{path}/api`` and the dashboard shell at
-    ``{path}``, so the browser can use one same-origin product path. Its composed
+    ``{path}``, so the browser can use one same-origin product path. The
+    dependency-free browser client is served at ``{path}/client.js`` with types
+    at ``{path}/client.d.ts``, even when ``dashboard=False``. Its composed
     lifespan recovers persisted event side effects, then cascade parents
     inactive for at least ``interruption_recovery_inactive_after_seconds``, and
     drains accepted background interruption cascades for up to
@@ -692,8 +701,10 @@ def mount_cayu(
         continuation_loop_policy_provider=continuation_loop_policy_provider,
         _project_context=resolved_project_context,
         _system_diagnostics_snapshot_sink=_system_diagnostics_snapshot_sink,
+        _browser_client_base_path=mount_path,
         _request_timing=mount_request_timing,
     )
+    client_router = browser_client_router(base_path=mount_path, auth=auth)
 
     # All caller-controlled values and route construction are validated before
     # changing the host application. A rejected mount must leave it reusable.
@@ -717,6 +728,7 @@ def mount_cayu(
         None if resolved_project_context is None else resolved_project_context.safe_summary()
     )
     server.include_router(router)
+    server.include_router(client_router)
     if prepared_dashboard is not None:
         prepared_mount_path, dashboard_app = prepared_dashboard
         _attach_dashboard_mount(

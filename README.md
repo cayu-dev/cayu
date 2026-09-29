@@ -624,6 +624,7 @@ Start with the document that matches the job:
 | Notify people about durable questions, approvals, and recovery gates | `cayu guide human-attention` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/human-attention.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/human_attention/)) |
 | Reconstruct service-backed tools with stable identities and scoped knowledge | `cayu guide durable-service-tools` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-service-tools.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/durable_service_tools/)) |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
+| Build a browser UI that follows sessions without hot polling | `cayu guide app-ui` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/app-ui.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Produce a durable checked patch without external delivery | [Maintained coding product](https://github.com/cayu-dev/cayu/blob/main/docs/coding-product.md) |

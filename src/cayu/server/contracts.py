@@ -845,6 +845,24 @@ class SseContract(ApiBaseModel):
     session_follow: SessionFollowContract = Field(default_factory=SessionFollowContract)
 
 
+BROWSER_CLIENT_VERSION = "1"
+BROWSER_CLIENT_GUIDE_TOPIC = "app-ui"
+
+
+class BrowserClientContract(ApiBaseModel):
+    """Where to load the dependency-free browser client served with the API.
+
+    ``module_url`` and ``types_url`` are ``None`` when the host did not serve
+    the module, for example when it composed ``create_router`` itself or used
+    an API path whose last segment is not ``api``.
+    """
+
+    module_url: str | None = None
+    types_url: str | None = None
+    version: Literal["1"] = BROWSER_CLIENT_VERSION
+    guide_topic: Literal["app-ui"] = BROWSER_CLIENT_GUIDE_TOPIC
+
+
 class ClientGenerationContract(ApiBaseModel):
     openapi_url: str | None = "/openapi.json"
     supported_targets: tuple[Literal["typescript", "python"], ...] = ("typescript", "python")
@@ -1945,6 +1963,7 @@ class ServerContractResponse(ApiBaseModel):
     accounting: AccountingContract
     sse: SseContract = Field(default_factory=SseContract)
     client_generation: ClientGenerationContract = Field(default_factory=ClientGenerationContract)
+    client: BrowserClientContract = Field(default_factory=BrowserClientContract)
     capabilities: ControlPlaneCapabilities
 
 

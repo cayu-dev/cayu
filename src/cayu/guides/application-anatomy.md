@@ -249,3 +249,6 @@ resolves to that callable. These checks prove structure and deterministic runtim
 behavior; they do not claim live provider, environment, or service verification.
 Use `cayu guide applications` for the generated placement convention,
 normalized plan, generator compatibility, and declared-layout diagnostics.
+Use `cayu guide app-ui` ([source](app-ui.md)) before building a browser UI
+over sessions: it covers the served `client.js`, polling rules, read-only GET
+handlers, and the idle-tab budget for the server integration role.

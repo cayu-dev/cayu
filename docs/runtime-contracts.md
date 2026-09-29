@@ -8336,6 +8336,16 @@ authentication claims are deliberately excluded.
 Because the response may contain caller identity, it is returned with
 `Cache-Control: private, no-store`.
 
+The contract's `client` entry advertises the dependency-free browser client
+served with the API: `module_url` and `types_url` (for example
+`/cayu/client.js` and `/cayu/client.d.ts` under `mount_cayu(path="/cayu")`),
+the client `version`, and `guide_topic: "app-ui"`. Cayu serves the module next
+to an API path whose last segment is `api`, behind the same access dependency
+as the API; otherwise both URLs are `null`. The module checks the exact
+`contract_version` and the advertised client `version` in `connect()`, so a
+page that kept an older module after a server upgrade fails closed and asks for
+a reload. See `cayu guide app-ui` for the request behavior it guarantees.
+
 The required `evals_readiness` projection reports captured evaluation, catalog
 read and write, captured-result persistence, scenario conversion, fresh launch,
 cancellation, comparison, and reports independently. Every operation is

@@ -40891,5 +40891,11 @@
     "tests/server/test_request_timing.py::test_request_timing_defaults_on_for_local_development_only": 1.009594958042726,
     "tests/server/test_request_timing.py::test_slow_get_warns_once_per_route_and_window": 0.0005820828955620527,
     "tests/server/test_request_timing.py::test_summary_flags_windows_the_ring_buffer_no_longer_covers": 0.0007784588960930705,
-    "tests/server/test_request_timing.py::test_summary_reports_rate_cpu_and_vcpu_share_over_the_covered_window": 0.0004864591173827648
+    "tests/server/test_request_timing.py::test_summary_reports_rate_cpu_and_vcpu_share_over_the_covered_window": 0.0004864591173827648,
+    "tests/cli/test_guide.py::test_package_shipped_app_ui_guide_states_the_request_rules": 0.017838916974142194,
+    "tests/server/test_browser_client.py::test_browser_client_is_behind_the_mount_access_dependency": 0.25421587482560426,
+    "tests/server/test_browser_client.py::test_browser_client_is_versioned_with_the_server_contract": 0.00041683297604322433,
+    "tests/server/test_browser_client.py::test_contract_advertises_the_browser_client": 0.254922374850139,
+    "tests/server/test_browser_client.py::test_create_server_serves_the_client_next_to_its_api": 0.598176958039403,
+    "tests/server/test_browser_client.py::test_mount_cayu_serves_the_browser_client_and_its_types": 1.3127935420488939
 }

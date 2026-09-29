@@ -5302,6 +5302,48 @@
         "title": "BillingIdentity",
         "type": "object"
       },
+      "BrowserClientContract": {
+        "additionalProperties": false,
+        "description": "Where to load the dependency-free browser client served with the API.\n\n``module_url`` and ``types_url`` are ``None`` when the host did not serve\nthe module, for example when it composed ``create_router`` itself or used\nan API path whose last segment is not ``api``.",
+        "properties": {
+          "guide_topic": {
+            "const": "app-ui",
+            "default": "app-ui",
+            "title": "Guide Topic",
+            "type": "string"
+          },
+          "module_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Module Url"
+          },
+          "types_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Types Url"
+          },
+          "version": {
+            "const": "1",
+            "default": "1",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "title": "BrowserClientContract",
+        "type": "object"
+      },
       "BudgetLimit": {
         "additionalProperties": false,
         "description": "Estimated-cost budget that applies across one durable runtime scope.",
@@ -31115,6 +31157,9 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/ControlPlaneCapabilities"
+          },
+          "client": {
+            "$ref": "#/components/schemas/BrowserClientContract"
           },
           "client_generation": {
             "$ref": "#/components/schemas/ClientGenerationContract"

@@ -15,6 +15,10 @@ _GUIDES = {
         "Restartable support agent with external approval receipts.",
     ),
     "anatomy": ("application-anatomy.md", "Application lifecycle and process roles."),
+    "app-ui": (
+        "app-ui.md",
+        "Browser UIs over sessions: client.js, polling rules, and the idle budget.",
+    ),
     "applications": (
         "applications.md",
         "Generated application convention, placement, planning, and drift checks.",
@@ -69,7 +73,8 @@ _INCLUDES = {
 }
 _RELATED = {
     "order-support": ("durable-service-tools", "durable-operations", "references"),
-    "anatomy": ("applications", "authoring", "diagnostics"),
+    "anatomy": ("applications", "authoring", "diagnostics", "app-ui"),
+    "app-ui": ("anatomy", "human-attention", "references"),
     "applications": ("anatomy", "authoring", "diagnostics", "references"),
     "authoring": (
         "anatomy",
