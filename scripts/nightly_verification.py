@@ -617,6 +617,35 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="aws-lambda-microvm-replacement-live",
+        capability=(
+            "AWS Lambda MicroVM owner-fence writer isolation, disposal proof, pinned "
+            "replacement image, and workspace checkpoint restore into a fresh MicroVM"
+        ),
+        lane="aws-lambda-microvm",
+        command=(
+            "uv",
+            "run",
+            "--extra",
+            "aws",
+            "python",
+            "-m",
+            "examples.aws.lambda_microvm_replacement_live",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_LAMBDA_MICROVM_REPLACEMENT_LIVE=1",
+            "CAYU_LAMBDA_MICROVM_IMAGE with sidecar protocol 3",
+            "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR",
+            "AWS_REGION or AWS_DEFAULT_REGION",
+            "AWS credential chain with Lambda MicroVM run, read, image-read, and terminate",
+        ),
+        required_env=("CAYU_LAMBDA_MICROVM_IMAGE", "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR"),
+        required_env_values={"CAYU_LAMBDA_MICROVM_REPLACEMENT_LIVE": "1"},
+        required_any_env=(("AWS_REGION", "AWS_DEFAULT_REGION"),),
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="aws-durable-services-live",
         capability="AWS S3 artifact store and Secrets Manager vault",
         lane="aws-durable-services",

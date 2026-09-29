@@ -392,6 +392,43 @@ def _preserve_failure_progress_control(
     raise signal from failure_control_cause(errors, signal)
 
 
+def _allocation_replacement_enabled(
+    registered_environment: runtime_records.RegisteredEnvironment,
+) -> bool:
+    policy = registered_environment.spec.workspace_checkpoint_policy
+    return policy is not None and policy.allocation_replacement == "restore"
+
+
+def _durable_workspace_checkpoint(
+    checkpoint: dict[str, Any] | None, *, session: Session, environment_name: str
+) -> bool:
+    from cayu.workspaces.checkpoint_lifecycle import WORKSPACE_CHECKPOINTS_KEY
+
+    record = (checkpoint or {}).get(WORKSPACE_CHECKPOINTS_KEY, {}).get(environment_name)
+    return (
+        type(record) is dict
+        and record.get("phase") == "durable"
+        and record.get("session_id") == session.id
+        and record.get("environment_name") == environment_name
+    )
+
+
+def _replacement_predecessor(
+    checkpoint: dict[str, Any] | None, *, session: Session, environment_name: str
+) -> dict[str, Any]:
+    retired = (checkpoint or {}).get(_ALLOCATION_GENERATIONS_KEY, {}).get(environment_name)
+    if (
+        type(retired) is not dict
+        or retired.get("reason") != "replacement"
+        or retired.get("session_instance_id") != session.instance_id
+    ):
+        return {}
+    predecessor = retired.get("reconnect_metadata")
+    if type(predecessor) is not dict or not predecessor:
+        raise RuntimeError("Allocation replacement lost its predecessor identity.")
+    return copy_durable_record(predecessor, "replacement_predecessor")
+
+
 def _retired_allocation_generation(
     checkpoint: dict[str, Any] | None, *, session: Session, environment_name: str
 ) -> str | None:
@@ -2787,6 +2824,22 @@ class EnvironmentLifecycle:
                     factory=factory,
                 )
                 checkpoint = await self._session_store.load_checkpoint(session.id)
+            elif (
+                operation is EnvironmentFactoryOperation.RECONNECT
+                and adopted_factory_result is None
+                and completion_recovery is None
+                and _allocation_replacement_enabled(factory_registration)
+            ):
+                # Replacement is an explicit durable transition taken only on
+                # positive disposal proof; a failed reconnect never implies it.
+                await self._retire_terminal_allocation(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    factory=factory,
+                    reason="replacement",
+                )
+                checkpoint = await self._session_store.load_checkpoint(session.id)
             allocation_generation = _retired_allocation_generation(
                 checkpoint, session=session, environment_name=environment_name
             )
@@ -2859,6 +2912,13 @@ class EnvironmentLifecycle:
                     ExecutionRequirements()
                     if completion_recovery is not None
                     else effective_execution_requirements(session, registered_agent)
+                ),
+                replacement_predecessor=(
+                    _replacement_predecessor(
+                        checkpoint, session=session, environment_name=environment_name
+                    )
+                    if effective_operation is EnvironmentFactoryOperation.CREATE
+                    else {}
                 ),
             )
             admission_candidate = (
@@ -3311,13 +3371,25 @@ class EnvironmentLifecycle:
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str,
         factory: EnvironmentFactory,
+        reason: Literal["terminal", "replacement"] = "terminal",
     ) -> None:
-        """Retire terminal invocation metadata only after exact provider disposal proof."""
+        """Retire session allocation metadata only after exact provider disposal proof.
+
+        ``terminal`` serves a new invocation after a completed or failed
+        session. ``replacement`` serves an environment whose checkpoint policy
+        opts into restore and additionally requires a durable workspace
+        checkpoint: an in-flight or unknown workspace mutation keeps exact
+        reconnect authority so recovery stays blocked rather than restored.
+        """
         checkpoint = await self._session_store.load_checkpoint(session.id)
         reconnect, owner = _factory_reconnect_state_from_checkpoint(
             checkpoint, environment_name=environment_name
         )
         if owner != session.id or not reconnect:
+            return
+        if reason == "replacement" and not _durable_workspace_checkpoint(
+            checkpoint, session=session, environment_name=environment_name
+        ):
             return
 
         expected_receipt = self._allocation_coordinator.receipt_from_checkpoint(
@@ -3351,6 +3423,10 @@ class EnvironmentLifecycle:
                 or receipt.reconnect_metadata != reconnect
             ):
                 raise RuntimeError("Terminal allocation conflicts with its receipt.")
+            if reason == "replacement" and not _durable_workspace_checkpoint(
+                current, session=session, environment_name=environment_name
+            ):
+                raise RuntimeError("Allocation replacement lost its durable workspace checkpoint.")
 
         require_exact(checkpoint)
         request = EnvironmentFactoryRequest(
@@ -3388,6 +3464,7 @@ class EnvironmentLifecycle:
                 "session_instance_id": session.instance_id,
                 "reconnect_metadata": reconnect,
                 "successor_generation": generation,
+                **({"reason": reason} if reason == "replacement" else {}),
             }
             for key in (
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,

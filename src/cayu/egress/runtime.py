@@ -182,6 +182,7 @@ from cayu.workspaces.revisions import (
     WorkspaceIdentity,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
+    WorkspaceWriterIsolationEvidence,
     copy_bounded_workspace_revision_observation,
 )
 
@@ -418,6 +419,29 @@ def _build_reconnect_metadata(
         "capability": "supported",
         "identity": copied_identity,
     }
+
+
+def _replacement_predecessor_identity(
+    request: EnvironmentFactoryRequest,
+    adapter: SandboxEgressAdapter,
+) -> dict[str, Any] | None:
+    predecessor = request.replacement_predecessor
+    if not predecessor:
+        return None
+    if (
+        predecessor.get("runner_kind") != adapter.runner_kind
+        or predecessor.get("session_id") != request.session_id
+        or predecessor.get("environment_name") != request.environment_name
+    ):
+        raise InvalidEgressReconnectMetadataError(
+            "Replacement predecessor belongs to another runner, session, or environment."
+        )
+    if predecessor.get("capability") != "supported":
+        return None
+    identity = predecessor.get("identity")
+    if not isinstance(identity, Mapping):
+        raise InvalidEgressReconnectMetadataError("Replacement predecessor has no identity.")
+    return adapter.validate_reconnect_metadata(identity)
 
 
 def _copy_adapter_allocation_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -1109,6 +1133,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     session_id=request.session_id,
                     environment_name=request.environment_name,
                     image=self._image,
+                    predecessor_identity=_replacement_predecessor_identity(request, adapter),
                 )
             )
             if type(adapter_metadata) is not dict:
@@ -4532,6 +4557,30 @@ class _EgressTeardownBinding(WorkspaceBinding):
             environment_name=environment_name,
             metadata=metadata,
         )
+
+    def observe_writer_isolation(self, bound: BoundWorkspace) -> WorkspaceWriterIsolationEvidence:
+        """Ask the adapter only when the workspace lives inside the managed sandbox.
+
+        A pass-through inner binding owns no separate resource, so exclusivity
+        is the sandbox adapter's to prove. Any other inner binding (for example
+        a shared network filesystem) keeps authority over its own resource.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("Workspace writer-isolation observation requires a BoundWorkspace.")
+        workspace = bound.workspace
+        if (
+            type(self._inner) in {NativeBinding, NoWorkspaceBinding}
+            and isinstance(workspace, RunnerBoundWorkspace)
+            and workspace.is_bound_to_runner(self._runner)
+        ):
+            evidence = self._runner._adapter.observe_writer_isolation(self._runner._runner)
+            if type(evidence) is not WorkspaceWriterIsolationEvidence:
+                raise TypeError(
+                    "Egress adapter writer isolation must be WorkspaceWriterIsolationEvidence."
+                )
+            return evidence
+        return self._inner.observe_writer_isolation(bound)
 
     async def observe_revision(self, bound: BoundWorkspace) -> WorkspaceRevisionObservation:
         """Delegate observation while retaining this wrapper's public identity."""

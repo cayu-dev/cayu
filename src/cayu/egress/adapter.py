@@ -32,6 +32,9 @@ from cayu.environments.admission import (
     ExecutionRequirements,
 )
 from cayu.runners.base import Runner
+from cayu.workspaces.revisions import (
+    WorkspaceWriterIsolationEvidence,
+)
 
 DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS = 15.0
 _CleanupResultT = TypeVar("_CleanupResultT")
@@ -597,6 +600,10 @@ class VirtualEgressAllocationPreparation:
     session_id: str
     environment_name: str
     image: str
+    #: Adapter-validated reconnect identity of the allocation this CREATE
+    #: replaces after runtime-verified disposal, or ``None``. Adapters pin a
+    #: compatible execution identity from it instead of re-resolving config.
+    predecessor_identity: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -931,6 +938,18 @@ class SandboxEgressAdapter(ABC):
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         """Return durable identity required to reattach to ``runner``."""
         return {}
+
+    def observe_writer_isolation(self, runner: Runner) -> WorkspaceWriterIsolationEvidence:
+        """Report writer isolation for a workspace held inside ``runner``'s sandbox.
+
+        Called only when the environment's workspace targets the managed
+        sandbox directly. ``EXCLUSIVE`` must name a real mechanism that keeps
+        every other writer out for the whole mutation window. The default is
+        unknown.
+        """
+
+        del runner
+        return WorkspaceWriterIsolationEvidence()
 
     def capability_evidence(self, runner: Runner) -> EgressCapabilityEvidence:
         """Return typed runtime evidence for capabilities proven by ``runner``."""

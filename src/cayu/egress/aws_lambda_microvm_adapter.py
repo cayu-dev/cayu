@@ -52,6 +52,10 @@ from cayu.runners.aws_lambda_microvm import (
     run_microvm_with_client_token,
     terminate_microvm_confirmed,
 )
+from cayu.workspaces.revisions import (
+    WorkspaceWriterIsolationEvidence,
+    WorkspaceWriterIsolationStatus,
+)
 
 DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 30
 #: Longest time after intent preparation that Cayu submits or replays one
@@ -349,9 +353,26 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         self,
         request: VirtualEgressAllocationPreparation,
     ) -> dict[str, Any]:
-        """Pin the exact image, lifetime bound, and replay window before dispatch."""
+        """Pin the exact image, lifetime bound, and replay window before dispatch.
+
+        A replacement pins its predecessor's exact image version so the session
+        continues on a compatible execution identity even if a newer version
+        of the configured image has since become active.
+        """
 
         image_arn, image_version = await self._resolve_exact_image(request.image)
+        predecessor = request.predecessor_identity
+        if predecessor is not None:
+            predecessor = self.validate_reconnect_metadata(predecessor)
+            if predecessor["image_identifier"] != image_arn:
+                raise UnsupportedEgressError(
+                    "Lambda MicroVM replacement image differs from its predecessor's image."
+                )
+            if predecessor["region"] != self.region_name:
+                raise UnsupportedEgressError(
+                    "Lambda MicroVM replacement region differs from its predecessor's region."
+                )
+            image_version = predecessor["image_version"]
         maximum_duration = self.runner_options.get(
             "maximum_duration_in_seconds", LAMBDA_MICROVM_MAXIMUM_DURATION_SECONDS
         )
@@ -720,6 +741,25 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                 "Lambda MicroVM reconnect identity must name an image ARN."
             )
         return identity
+
+    def observe_writer_isolation(self, runner: Runner) -> WorkspaceWriterIsolationEvidence:
+        """Exclusive while this runner holds the MicroVM's current owner claim.
+
+        The sidecar rejects or cancels every other owner's commands, so only
+        this runner can write the MicroVM filesystem while its claim is current.
+        """
+
+        if not isinstance(runner, LambdaMicroVMRunner):
+            raise TypeError("Lambda MicroVM adapter received a different runner type.")
+        generation = runner.owner_fence_generation
+        if generation is None:
+            return WorkspaceWriterIsolationEvidence()
+        return WorkspaceWriterIsolationEvidence(
+            status=WorkspaceWriterIsolationStatus.EXCLUSIVE,
+            mechanism="lambda-microvm-owner-fence",
+            generation=generation,
+            detail_code=None,
+        )
 
     async def egress_environment_fingerprint(self, runner: Runner) -> str:
         if not isinstance(runner, LambdaMicroVMRunner):

@@ -856,6 +856,29 @@ def test_lambda_microvm_recoverable_allocation_check_requires_connector_and_opt_
     assert check.requires_structured_evidence
 
 
+def test_lambda_microvm_replacement_check_requires_connector_and_opt_in(
+    tmp_path: Path,
+) -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "aws-lambda-microvm-replacement-live"
+    )
+    environ = {
+        "HOME": str(tmp_path),
+        "CAYU_LAMBDA_MICROVM_REPLACEMENT_LIVE": "1",
+        "CAYU_LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
+        "AWS_REGION": "us-west-2",
+    }
+
+    assert nightly._missing_prerequisites(check, environ) == [
+        "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR is not set"
+    ]
+    environ["CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR"] = (
+        "arn:aws:lambda:us-west-2:123:network-connector:nc-1"
+    )
+    assert nightly._missing_prerequisites(check, environ) == []
+    assert check.requires_structured_evidence
+
+
 def test_lambda_microvm_live_opt_in_flag_must_equal_one() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "lambda-microvm-live")
     environ = {

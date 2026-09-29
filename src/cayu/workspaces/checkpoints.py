@@ -9,7 +9,15 @@ import tarfile
 from collections.abc import Callable
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    StrictInt,
+    field_validator,
+    model_serializer,
+)
 
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 from cayu.artifacts import ArtifactMetadata, ArtifactReadResult, ArtifactScope, ArtifactStore
@@ -45,6 +53,22 @@ class WorkspaceCheckpointPolicy(BaseModel):
     max_file_bytes: StrictInt = Field(default=64 * 1024 * 1024, ge=1, le=256 * 1024 * 1024)
     max_total_bytes: StrictInt = Field(default=256 * 1024 * 1024, ge=1, le=4 * 1024**3)
     max_manifest_bytes: StrictInt = Field(default=4 * 1024 * 1024, ge=1024, le=32 * 1024 * 1024)
+    #: ``"restore"`` lets an interrupted or recovering session continue on a
+    #: replacement allocation after the factory positively proves the previous
+    #: allocation was disposed. The last durable checkpoint is restored before
+    #: any tool or model exposure. ``"never"`` keeps exact-allocation reconnect.
+    allocation_replacement: Literal["never", "restore"] = "never"
+
+    @model_serializer(mode="wrap")
+    def _omit_default_allocation_replacement(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        # Policies without replacement keep their established serialized
+        # identity, so existing execution profiles and manifests are unchanged.
+        data = handler(self)
+        if self.allocation_replacement == "never":
+            data.pop("allocation_replacement", None)
+        return data
 
 
 class WorkspaceCheckpointFile(BaseModel):

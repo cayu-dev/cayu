@@ -672,6 +672,7 @@ class LambdaMicroVMRunner(Runner):
         self._owner_claim = secrets.token_hex(32)
         self._owner_claimed = False
         self._owner_superseded = False
+        self._owner_generation: int | None = None
 
     @classmethod
     async def create(
@@ -1837,7 +1838,22 @@ class LambdaMicroVMRunner(Runner):
         generation = response.get("generation")
         if type(generation) is not int or generation <= 0:
             raise LambdaMicroVMProtocolError("Lambda MicroVM owner claim returned no generation.")
+        self._owner_generation = generation
         self._owner_claimed = True
+
+    @property
+    def owner_fence_generation(self) -> str | None:
+        """Non-secret identity of this runner's current sidecar owner claim.
+
+        ``None`` until the runner has claimed the MicroVM or once any guest
+        operation reported that a successor superseded it. Because every guest
+        operation is fenced, a successor that claims inside a caller's window
+        makes some operation in that window fail and clears this value.
+        """
+
+        if not self._owner_claimed or self._owner_superseded or self._owner_generation is None:
+            return None
+        return f"{self.microvm_id}:{self._owner_generation}"
 
     def _mark_superseded(self) -> None:
         self._owner_superseded = True

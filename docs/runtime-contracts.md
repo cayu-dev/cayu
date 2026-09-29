@@ -12557,6 +12557,51 @@ model/tool execution until verification succeeds. A crash with only a mutation
 intent or incomplete checkpoint leaves an unknown effect and blocks recovery.
 A failed or interrupted mutating tool also requires explicit reconciliation.
 
+### Allocation replacement
+
+`WorkspaceCheckpointPolicy(allocation_replacement="restore")` lets a session
+continue after its remote allocation is gone, for example a Lambda MicroVM that
+reached its maximum lifetime. The default `"never"` keeps exact-allocation
+reconnect and is omitted from the policy's serialized form, so existing
+execution-profile identities are unchanged. With `"restore"`, every environment
+reconnect other than completion cleanup and the new-invocation path after a
+completed or failed session (which already has its own disposal-proven fresh
+allocation) first asks the factory's `is_allocation_disposed` for positive
+proof. Interrupted resume is covered by tests; approval, user-input, and
+recovery entrances use the same reconnect resolution. Proof is
+required, not inferred: a failed reconnect, an unavailable provider, or a
+non-boolean answer never authorizes a replacement. The runtime also requires
+the environment's workspace checkpoint to be `durable` for this session; an
+in-flight or unknown mutation keeps exact reconnect authority so recovery stays
+blocked instead of restoring over an uncertain effect. Pending allocation
+intents, pending disposal, and pending completion finalization likewise refuse.
+
+On proof, one session-epoch-fenced checkpoint transition retires the old
+reconnect identity, allocation owner, and receipt and records an explicit
+successor generation with `reason="replacement"` and the predecessor's
+non-secret reconnect metadata. The factory then receives a `CREATE` whose
+`EnvironmentFactoryRequest.replacement_predecessor` carries that metadata;
+factories should provision a compatible execution identity from it and must
+not reconnect to it. The new binding restores the last durable checkpoint and
+verifies its revision before any model or tool exposure. Session history,
+approvals, pending input, and execution-profile constraints are untouched;
+process memory, background processes, and any state outside the checkpointed
+file projection are lost and are never reported as continued. Tool effects
+whose outcome is unknown still require reconciliation.
+
+`LambdaMicroVMEgressAdapter` pins a replacement to its predecessor's exact
+image ARN and version, even if a newer version became active, and refuses a
+predecessor from another image or region before provider mutation. For a
+workspace held inside the MicroVM (a `RunnerWorkspace` over the managed runner
+with the default pass-through binding), the adapter reports exclusive writer
+isolation through the sidecar owner claim: mechanism
+`lambda-microvm-owner-fence` and generation `<microvm_id>:<claim generation>`.
+Every guest operation is fenced, so a successor that claims inside a mutation
+window makes an operation in that window fail and removes the evidence. A
+workspace on a separately mounted filesystem keeps the mounted binding's own
+isolation evidence. Checkpoints still need a pin-capable `ArtifactStore`
+outside the MicroVM.
+
 The revision covers the regular-file projection exposed by the workspace adapter.
 Adapter-excluded paths, empty directories, and non-file filesystem metadata are
 outside this projection. Symlinks, special files, unsafe paths, truncated reads,

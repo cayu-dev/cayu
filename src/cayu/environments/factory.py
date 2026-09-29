@@ -576,6 +576,11 @@ class EnvironmentFactoryRequest:
     )
     execution_profile_fingerprint: str | None = None
     interaction_id: str | None = None
+    #: Non-secret reconnect metadata of an allocation the runtime retired after
+    #: positive disposal proof, when this CREATE replaces it. Factories should
+    #: provision a compatible execution identity (for example the same exact
+    #: image version) and must not reconnect to it. Empty otherwise.
+    replacement_predecessor: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
@@ -631,6 +636,15 @@ class EnvironmentFactoryRequest:
             "reconnect_metadata",
             copy_durable_metadata(self.reconnect_metadata, "reconnect_metadata"),
         )
+        object.__setattr__(
+            self,
+            "replacement_predecessor",
+            copy_durable_metadata(self.replacement_predecessor, "replacement_predecessor"),
+        )
+        if self.replacement_predecessor and (
+            self.operation is not EnvironmentFactoryOperation.CREATE or self.reconnect_metadata
+        ):
+            raise ValueError("Only a CREATE without reconnect metadata may replace an allocation.")
         object.__setattr__(
             self,
             "execution_requirements",
@@ -807,8 +821,11 @@ class EnvironmentFactory(ABC):
     async def is_allocation_disposed(self, request: EnvironmentFactoryRequest) -> bool:
         """Positively attest terminal disposal of the exact reconnect allocation.
 
-        Called only for a new invocation after a completed or failed session,
-        after profile admission, never to continue pending recovery. Return True only with durable provider ownership evidence;
+        Called for a new invocation after a completed or failed session, after
+        profile admission. When the environment's workspace checkpoint policy
+        opts into ``allocation_replacement="restore"``, it is also called before
+        reconnecting an interrupted or recovering session; a proof there
+        authorizes a replacement allocation plus checkpoint restore. Return True only with durable provider ownership evidence;
         absence or uncertainty is not proof. Do not dispose, reconnect, or create
         resources here. The default preserves exact-allocation reconnect.
         Wrappers must forward this hook to preserve this capability.
@@ -839,6 +856,7 @@ def copy_environment_factory_request(
         reconnect_metadata=request.reconnect_metadata,
         execution_requirements=request.execution_requirements,
         interaction_id=request.interaction_id,
+        replacement_predecessor=request.replacement_predecessor,
     )
 
 
