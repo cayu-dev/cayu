@@ -2054,6 +2054,14 @@ class SessionModelTransition:
 
 
 class ResumeRequest(BaseModel):
+    """Continue a conversation; omitted loop controls inherit verified prior settings.
+
+    ``max_steps``, ``limits``, and ``retry_policy`` inherit from the latest
+    profile-bound model completion when available. Explicit values still pass
+    normal execution-profile admission. Legacy/fork sessions without matching
+    evidence use application defaults. This does not reset session-scoped limits.
+    """
+
     model_config = ConfigDict(
         extra="forbid",
         arbitrary_types_allowed=True,
@@ -28233,7 +28241,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         }
     )
     copied_fields_set = set(copied.model_fields_set)
-    for field_name in ("max_steps", "limits", "thinking"):
+    for field_name in ("max_steps", "limits", "thinking", "retry_policy"):
         if field_name not in request.model_fields_set:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)

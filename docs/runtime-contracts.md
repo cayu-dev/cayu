@@ -16870,3 +16870,23 @@ proof before that protection ends. Missing or incompatible index evidence fails
 closed; no legacy index reconstruction from guessed writer epochs is supported.
 Checkpoint-copying forks exclude the source continuation index and tickets,
 including settled history; ordinary checkpoint transformations preserve them.
+
+### Ordinary resume configuration inheritance
+
+An ordinary `ResumeRequest` with omitted `max_steps`, `limits`, or `retry_policy`
+inherits those controls from the latest verified model-completion record when its
+session, invocation epoch, interaction, and finalization component match current
+durable authority. Foreground completions retain these three controls as well as
+background completions. This is configuration inheritance, not profile adoption:
+explicit overrides still undergo full profile admission, current resource access
+is revalidated, and session-scoped accounting is not reset. Budget limits,
+structured output, thinking, and loop policies retain their existing contracts.
+Legacy/fork sessions without matching evidence keep the existing application
+defaults. Mismatch tracebacks may name exact numeric/enum loop-control differences
+from that verified record; aggregate identity digests are never reverse-inferred.
+HTTP resumes preserve omitted retry policies; an explicit `null` still selects
+the application's retry policy and undergoes normal profile admission. Explicit
+profile-adoption replay binds the caller's request before configuration inheritance,
+while candidate-profile verification still checks the resolved execution controls.
+Writing the first complete foreground configuration cannot change that request's
+idempotency identity on a later replay.

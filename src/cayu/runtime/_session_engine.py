@@ -14473,6 +14473,23 @@ class SessionEngine:
         session = await self.session_store.load(request.session_id)
         if session is not None:
             await self._require_participant_execution(session, participant_context)
+        from cayu.runtime._resume_configuration import inherit_resume_configuration
+
+        # Bind adoption replay to the caller's request before resolving controls
+        # from mutable predecessor evidence. Candidate-profile checks still bind
+        # the effective controls used by the admitted invocation.
+        adoption_request_fingerprint = (
+            None
+            if request.profile_adoption is None
+            else execution_profile_adoption_request_fingerprint(
+                request, redactor=self._secret_redactor
+            )
+        )
+        configuration_differences: tuple[str, ...] = ()
+        if session is not None:
+            request, configuration_differences = await inherit_resume_configuration(
+                self.session_store, session, request, self._effective_retry_policy(None)
+            )
         task_id, task_session_instance_id = await self._linked_resume_task_id(request)
         replayed_failure, replay_events = await self._replay_runtime_task_failure_if_needed(
             session_id=request.session_id,
@@ -14486,6 +14503,7 @@ class SessionEngine:
             return
         session_stream = self._resume_session(
             request=request,
+            adoption_request_fingerprint=adoption_request_fingerprint,
             participant_context=participant_context,
             task_id=task_id,
             required_task_session_instance_id=task_session_instance_id,
@@ -14505,6 +14523,15 @@ class SessionEngine:
         try:
             async for event in forwarded_stream:
                 yield event
+        except ExecutionProfileMismatchError as exc:
+            if (
+                configuration_differences
+                and ExecutionProfileComponentClass.FINALIZATION in exc.changed_component_classes
+            ):
+                exc.add_note(
+                    "Resume configuration differs: " + "; ".join(configuration_differences)
+                )
+            raise
         except asyncio.CancelledError as exc:
             billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
             if billing_identity_cancellation is None:
@@ -20388,6 +20415,7 @@ class SessionEngine:
         task_id: str | None,
         start_event_payload_extra: dict[str, Any],
         start_task_on_enter: bool,
+        adoption_request_fingerprint: str | None = None,
         source_execution_profile: ExecutionProfileIdentity | None = None,
         required_execution_profile: ExecutionProfileIdentity | None = None,
         required_session_instance_fingerprint: str | None = None,
@@ -20512,14 +20540,11 @@ class SessionEngine:
             redactor=self._secret_redactor,
             field_name="ResumeRequest.structured_output",
         )
-        adoption_request_fingerprint = (
-            None
-            if request.profile_adoption is None
-            else execution_profile_adoption_request_fingerprint(
+        if request.profile_adoption is not None and adoption_request_fingerprint is None:
+            adoption_request_fingerprint = execution_profile_adoption_request_fingerprint(
                 request,
                 redactor=self._secret_redactor,
             )
-        )
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
@@ -25622,6 +25647,9 @@ class SessionEngine:
                         interaction_id=interaction_id,
                         execution_profile_fingerprint=execution_profile_fingerprint,
                         budget_reservations=budget_reservation_contexts,
+                        max_steps=max_steps,
+                        limits=limits,
+                        retry_policy=retry_policy,
                     )
                 context = ModelCompletionRecoveryContext(
                     interaction_id=interaction_id,

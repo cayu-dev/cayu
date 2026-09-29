@@ -406,6 +406,7 @@ async def run(args: argparse.Namespace) -> None:
                 RunRequest(
                     agent_name="support",
                     session_id=session,
+                    max_steps=18,
                     messages=[
                         Message.text("user", "Something in order-42 arrived damaged. Please help.")
                     ],

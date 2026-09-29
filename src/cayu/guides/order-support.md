@@ -58,6 +58,11 @@ turn. Delivering the identical receipt again reuses the completed resolution and
 creates no additional replacement. Commands print Runtime events, not only a
 canned success message.
 
+The initial run uses `max_steps=18`. Later `ResumeRequest`s omit that setting and
+inherit the verified persisted model-loop configuration; they do not need to
+repeat it. Explicit overrides still undergo execution-profile admission. Older
+sessions without matching stored configuration retain the existing default behavior.
+
 The independently persisted databases are `demo-state/sessions.sqlite` (Cayu)
 and `demo-state/service.sqlite` (orders, proposals, issued receipts, effects).
 The representative's private signing key is under `demo-operator`, created with

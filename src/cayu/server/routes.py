@@ -8944,7 +8944,6 @@ def create_router(
             profile_adoption=profile_adoption,
             failover=body.failover,
             budget_limits=body.budget_limits,
-            retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             metadata=trace_metadata,
             loop_policies=await _continuation_loop_policies(session_id),
@@ -8956,6 +8955,8 @@ def create_router(
             run_default_overrides["limits"] = body.limits
         if "thinking" in body.model_fields_set:
             run_default_overrides["thinking"] = body.thinking
+        if "retry_policy" in body.model_fields_set:
+            run_default_overrides["retry_policy"] = body.retry_policy
         if run_default_overrides:
             request = request.model_copy(update=run_default_overrides)
         request = _with_runtime_resume_transport_metadata(request, trace_metadata)
