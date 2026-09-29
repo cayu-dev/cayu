@@ -40573,5 +40573,8 @@
   "tests/test_benchmark_tool_round.py::test_instrumented_batch_completes_each_concurrent_round_once": 5.21083079231903,
   "tests/test_benchmark_tool_round.py::test_observation_preserves_protocols_and_restores_methods[False]": 0.010081000858917832,
   "tests/test_benchmark_tool_round.py::test_observation_preserves_protocols_and_restores_methods[True]": 0.004433000227436423,
-  "tests/test_benchmark_tool_round.py::test_case_timeout_retains_finished_samples_without_reporting_completion": 0.0011585841421037912
+  "tests/test_benchmark_tool_round.py::test_case_timeout_retains_finished_samples_without_reporting_completion": 0.0011585841421037912,
+  "tests/core/test_durable_tool_round.py::test_closing_deferred_publication_closes_its_hook_stream_before_return": 0.7099637077189982,
+  "tests/core/test_durable_tool_round.py::test_owner_requires_admission_before_evidence_or_publication[external]": 0.729643999831751,
+  "tests/core/test_durable_tool_round.py::test_owner_requires_admission_before_evidence_or_publication[none]": 0.7685267918277532
 }

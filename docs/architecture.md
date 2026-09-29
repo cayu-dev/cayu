@@ -97,6 +97,23 @@ continuations, manual outcome reconciliation, incomplete-session repair, and
 abandoned-run finalization. Model, tool, environment, limit, control, and event
 modules own their complete lower-level behavior slices.
 
+`ToolRoundExecutor` delegates ordinary tool-round publication to
+`DurableToolRound`. The owner reserves capacity for private terminal stages before
+dispatch, retains the round's lifecycle evidence, and publishes staged results in
+model order after secret scopes are sealed. It then commits the transcript and
+checkpoint together, retaining the exact request for acknowledgement-loss replay.
+The execution caller supplies policy decisions, tool execution and result hooks.
+It does not prepare the final publication request or manage individual stage
+leases. Closing the ordinary publication stream closes its active terminal hook
+stream before returning.
+
+The owner reads fresh checkpoint state for each observation and uses the same
+source snapshot when preparing final publication. It does not cache validation
+across checkpoint writes. Shared staging, projection and receipt algorithms keep
+their existing authority and cancellation checks. Recovery callers still use the
+shared staging implementation directly; session-level limit and interruption
+closure remain with their existing owners.
+
 `DurableSubagentCoordinator` owns the staged parent seed, child-session, queue-task,
 receipt, and restart-reconciliation handoff for task-backed subagents. The application
 facade and task dispatcher reach it only through narrow preparation, settlement, and
