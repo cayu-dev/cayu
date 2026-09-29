@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
+import { focusManager, keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import {
   Activity,
@@ -89,6 +89,7 @@ import type {
   MutationTransportController,
   MutationTransportSnapshot,
 } from "../lib/mutation-transport.ts"
+import { responseFingerprint, UnchangedResponseCounter } from "../lib/polling"
 import { providerOperationNeedsResolution } from "../lib/provider-operations"
 import {
   isFailureEventType,
@@ -122,11 +123,13 @@ import {
   navigateToOlderPage,
   olderTranscriptPage,
   pageNavigationForFilter,
+  pendingActionPollInterval,
   pendingTailCanReconcile,
   queryReadErrorIsFatal,
   sessionHistorySearchWithEventFilters,
   sessionHistorySearchWithTranscriptFilters,
   sessionMetadataNeedsRefresh,
+  sessionPollPhase,
   sessionSummaryRevision,
   statePollInterval,
   summaryStateIsStable,
@@ -1445,6 +1448,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     mutationTransport?.phase === "polling_fallback" ||
     mutationTransport?.phase === "paused"
   const liveEvents = mutationTransport?.events ?? []
+  const [stateBackoff] = useState(() => new UnchangedResponseCounter())
+  const [pendingActionBackoff] = useState(() => new UnchangedResponseCounter())
   const detailQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => fetchSession(sessionId),
@@ -1464,6 +1469,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         hasError: query.state.error !== null,
         failureCount: query.state.fetchFailureCount,
         nonRetryableError: isNonRetryableStateError(query.state.error),
+        unchangedResponses: stateBackoff.observe(
+          query.queryHash,
+          query.state.dataUpdateCount,
+          responseFingerprint(query.state.data),
+        ),
       }),
     refetchIntervalInBackground: false,
   })
@@ -1564,12 +1574,20 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     ],
     queryFn: () => fetchPendingActions({ session_id: sessionId, limit: 1 }),
     retry: (failureCount, error) => !isApiPayloadTooLarge(error) && failureCount < 3,
+    // The key follows the session status and updated_at, so a lifecycle change
+    // starts a new query and restarts the backoff.
     refetchInterval: (query) => {
       const result = query.state.data
-      if (result !== undefined && result.actions.length === 0 && result.issues.length === 0) {
-        return false
-      }
-      return 5000
+      return pendingActionPollInterval({
+        hasOpenItems:
+          result === undefined ? undefined : result.actions.length > 0 || result.issues.length > 0,
+        permanentError: isApiPayloadTooLarge(query.state.error),
+        unchangedResponses: pendingActionBackoff.observe(
+          query.queryHash,
+          query.state.dataUpdateCount,
+          responseFingerprint(result),
+        ),
+      })
     },
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: (query) => !isApiPayloadTooLarge(query.state.error),
@@ -2113,7 +2131,25 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     }
   }, [session?.status, interruptRequested])
 
+  useEffect(
+    () =>
+      focusManager.subscribe((focused) => {
+        if (!focused) return
+        stateBackoff.reset()
+        pendingActionBackoff.reset()
+      }),
+    [stateBackoff, pendingActionBackoff],
+  )
+
+  useEffect(() => {
+    if (!mutationActive) return
+    stateBackoff.reset()
+    pendingActionBackoff.reset()
+  }, [mutationActive, stateBackoff, pendingActionBackoff])
+
   const refreshSessionReadModels = () => {
+    stateBackoff.reset()
+    pendingActionBackoff.reset()
     eventReconcileRunner.clearPending()
     transcriptReconcileRunner.clearPending()
     eventReconcileAbortRef.current?.abort()
@@ -3032,6 +3068,19 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               sessionId={session.id}
               status={session.status}
             />
+            {sessionPollPhase(session.status) !== "active" && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={stateQuery.isFetching || mutationActive}
+                onClick={() => void finishContinuation()}
+              >
+                <RefreshCw
+                  className={cn("mr-1.5 h-4 w-4", stateQuery.isFetching && "animate-spin")}
+                />
+                Refresh session
+              </Button>
+            )}
             {canInterrupt && (
               <Button
                 variant="destructive"

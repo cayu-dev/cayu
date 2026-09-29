@@ -1,7 +1,18 @@
+import type { SessionState } from "./api"
+import { sessionStatusIsActive, waitingPollInterval } from "./polling.ts"
 import type { SessionHistorySearch, TranscriptRoleFilter } from "./session-history-search"
 
-const ACTIVE_SESSION_STATUSES = new Set(["pending", "running", "interrupting"])
-const TERMINAL_STATE_POLL_INTERVAL_MS = 15_000
+type SessionPollPhase = "active" | "waiting" | "terminal"
+
+// Every runtime session status must be classified here; a new status fails typecheck.
+const SESSION_POLL_PHASES: Record<SessionState["status"], SessionPollPhase> = {
+  pending: "active",
+  running: "active",
+  interrupting: "active",
+  interrupted: "waiting",
+  completed: "terminal",
+  failed: "terminal",
+}
 
 export type PageNavigation<T> = {
   current: T
@@ -58,6 +69,13 @@ export type StatePollInput = {
   hasError: boolean
   failureCount: number
   nonRetryableError: boolean
+  unchangedResponses: number
+}
+
+export type PendingActionPollInput = {
+  hasOpenItems: boolean | undefined
+  permanentError: boolean
+  unchangedResponses: number
 }
 
 type SequencedRecord = {
@@ -354,14 +372,22 @@ export function transcriptDeltaRequiresTailReload(
 }
 
 export function sessionSummaryRevision(state: SummaryRevisionState): string {
-  if (ACTIVE_SESSION_STATUSES.has(state.status) || state.interruptionCascade === "pending") {
+  if (sessionStatusIsActive(state.status) || state.interruptionCascade === "pending") {
     return `${state.status}:${state.interruptionCascade}:snapshot`
   }
   return `${state.status}:${state.interruptionCascade}:${state.lastActivityAt}`
 }
 
 export function summaryStateIsStable(state: SummaryRevisionState): boolean {
-  return !ACTIVE_SESSION_STATUSES.has(state.status) && state.interruptionCascade !== "pending"
+  return !sessionStatusIsActive(state.status) && state.interruptionCascade !== "pending"
+}
+
+export function sessionPollPhase(status: string | undefined): SessionPollPhase {
+  if (status === undefined) return "active"
+  // An unknown status keeps a bounded poll rather than stopping on a guess.
+  return Object.hasOwn(SESSION_POLL_PHASES, status)
+    ? SESSION_POLL_PHASES[status as SessionState["status"]]
+    : "waiting"
 }
 
 export function statePollInterval(input: StatePollInput): number | false {
@@ -371,9 +397,17 @@ export function statePollInterval(input: StatePollInput): number | false {
   }
   if (input.interruptRequested || input.interruptionCascade === "pending") return 1000
   if (input.mutationActive) return 2000
-  return input.status === undefined || ACTIVE_SESSION_STATUSES.has(input.status)
-    ? 2000
-    : TERMINAL_STATE_POLL_INTERVAL_MS
+  const phase = sessionPollPhase(input.status)
+  if (phase === "active") return 2000
+  // A finished session changes only when someone acts on it; focus refetches and
+  // explicit refreshes cover that without a background heartbeat.
+  if (phase === "terminal") return false
+  return waitingPollInterval(input.unchangedResponses)
+}
+
+export function pendingActionPollInterval(input: PendingActionPollInput): number | false {
+  if (input.permanentError || input.hasOpenItems === false) return false
+  return waitingPollInterval(input.unchangedResponses)
 }
 
 export function queryReadErrorIsFatal(isError: boolean, hasData: boolean): boolean {

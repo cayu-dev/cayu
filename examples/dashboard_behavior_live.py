@@ -11,9 +11,11 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from importlib.metadata import version
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -129,6 +131,16 @@ WORKFLOW_LINKED_TASK_PREFIX = "dashboard-workflow-linked-task"
 WORKFLOW_LINKED_TASK_COUNT = 26
 WORKFLOW_CHILD_TASK_PREFIX = "dashboard-workflow-child-task"
 WORKFLOW_CHILD_TASK_COUNT = 26
+POLLING_AGENT_NAME = "dashboard-polling-agent"
+POLLING_TERMINAL_SESSION_ID = "dashboard-polling-terminal"
+POLLING_WAITING_SESSION_ID = "dashboard-polling-waiting"
+POLLING_WAITING_BACKOFF_MS = (5_000, 10_000, 30_000, 60_000, 60_000)
+POLLING_IDLE_OVERVIEW_PATHS = (
+    ("POST", "/api/operations/snapshot"),
+    ("POST", "/api/sessions/summary"),
+    ("GET", "/api/tasks"),
+    ("GET", "/api/pending-actions"),
+)
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _LIVE_CREDENTIAL_ENV = (
     "ANTHROPIC_API_KEY",
@@ -349,6 +361,30 @@ class DashboardEvalSearchTool(Tool):
             content=f"Found public results for {args['query']}.",
             structured={"status": "ok", "count": min(args["limit"], 2)},
         )
+
+
+class PollingBudgetProvider(ModelProvider):
+    """Finish one session and leave another waiting on a tool approval."""
+
+    name = "polling-budget-provider"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        request_text = "\n".join(
+            part.text
+            for message in request.messages
+            for part in message.content
+            if isinstance(part, TextPart)
+        )
+        if "wait for approval" in request_text.lower():
+            yield ModelStreamEvent.tool_call(
+                id="dashboard-polling-approval-call",
+                name=DashboardContractTool.spec.name,
+                arguments={"operation": "verify-polling"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("dashboard polling budget session finished")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
 class MutationDisconnectFaults:
@@ -651,6 +687,7 @@ async def main() -> None:
                 event_sequence,
                 "Last-Event-ID must identify the exact durable event sequence",
             )
+        evidence["polling_budget"] = await _run_polling_budget_contract()
         evidence["mutation_provider_requests"] = len(provider.requests)
         evidence["injected_initial_disconnects"] = server_app.initial_run_requests
         evidence["mutation_replay_requests"] = len(server_app.replay_requests)
@@ -4673,6 +4710,383 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
     finally:
         await page.unroute(events_path, expose_recovered_events)
         await page.unroute(resume_path, inject_observer_failure_then_recovery)
+
+
+# Record each dashboard API fetch with the page's fake clock time. Counting in fake
+# time keeps interval checks exact however slowly the browser handles responses.
+_API_READ_LOG_SCRIPT = """(() => {
+    const reads = [];
+    window.__cayuApiReads = reads;
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+        const request = input instanceof Request ? input : null;
+        const url = new URL(request ? request.url : String(input), location.href);
+        if (url.pathname.startsWith("/api/")) {
+            const method = init?.method ?? request?.method ?? "GET";
+            reads.push([method.toUpperCase(), url.pathname, Date.now()]);
+        }
+        return originalFetch(input, init);
+    };
+})()"""
+# Let queued page tasks, such as response handling, run before the clock moves.
+_FLUSH_PAGE_TASKS = """() => new Promise((resolve) => {
+    const channel = new MessageChannel();
+    let hops = 0;
+    channel.port1.onmessage = () => {
+        hops += 1;
+        if (hops < 3) channel.port2.postMessage(null);
+        else resolve(null);
+    };
+    channel.port2.postMessage(null);
+})"""
+
+
+class _ApiRequestLog:
+    """Record dashboard API reads so a paused-clock check can count them."""
+
+    def __init__(self, page: Page) -> None:
+        self._page = page
+        self.started: list[tuple[str, str]] = []
+        self.settled = 0
+        self._handled_page_reads = 0
+        page.on("request", self._record_start)
+        page.on("requestfinished", self._record_settled)
+        page.on("requestfailed", self._record_settled)
+
+    @staticmethod
+    def _api_path(request: Request) -> str | None:
+        path = urlsplit(request.url).path
+        return path if path.startswith("/api/") else None
+
+    def _record_start(self, request: Request) -> None:
+        path = self._api_path(request)
+        if path is not None:
+            self.started.append((request.method, path))
+
+    def _record_settled(self, request: Request) -> None:
+        if self._api_path(request) is not None:
+            self.settled += 1
+
+    def count(self, method: str, path: str) -> int:
+        return self.started.count((method, path))
+
+    async def read_times(self, method: str, path: str) -> list[int]:
+        reads = await self._page.evaluate("window.__cayuApiReads")
+        return [
+            int(at)
+            for read_method, read_path, at in reads
+            if read_method == method and read_path == path
+        ]
+
+    async def settle(self) -> None:
+        """Wait until the page has sent, received, and handled every API read."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10
+        while True:
+            page_reads = await self._page.evaluate("window.__cayuApiReads.length")
+            if page_reads == self._handled_page_reads:
+                return
+            while len(self.started) < page_reads or self.settled < len(self.started):
+                if loop.time() >= deadline:
+                    raise AssertionError(f"dashboard API reads did not settle: {self.started!r}")
+                await asyncio.sleep(0.02)
+            await self._page.evaluate(_FLUSH_PAGE_TASKS)
+            self._handled_page_reads = page_reads
+
+
+async def _set_page_visibility(page: Page, state: str) -> None:
+    # Browsers bubble visibilitychange to window, where TanStack Query listens.
+    await page.evaluate(
+        """(state) => {
+            Object.defineProperty(document, "visibilityState", {
+                configurable: true,
+                get: () => state,
+            });
+            document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+        }""",
+        state,
+    )
+
+
+async def _refocus_page(page: Page, requests: _ApiRequestLog) -> None:
+    await _set_page_visibility(page, "hidden")
+    await _set_page_visibility(page, "visible")
+    await requests.settle()
+
+
+async def _pause_page_clock(page: Page, requests: _ApiRequestLog) -> None:
+    await requests.settle()
+    now = await page.evaluate("Date.now()")
+    await page.clock.pause_at(now + 50)
+    await requests.settle()
+
+
+async def _advance_page_clock(
+    page: Page,
+    requests: _ApiRequestLog,
+    milliseconds: int,
+    *,
+    step_ms: int = 5_000,
+) -> None:
+    """Advance fake time in steps, letting each fired read settle before the next."""
+    remaining = milliseconds
+    while remaining > 0:
+        step = min(remaining, step_ms)
+        await page.clock.run_for(step)
+        await requests.settle()
+        remaining -= step
+
+
+def _require_read_gaps(times: list[int], expected: tuple[int, ...], label: str) -> list[int]:
+    """Require consecutive reads to follow ``expected`` within one clock step."""
+    gaps = [later - earlier for earlier, later in pairwise(times)]
+    require_equal(len(gaps), len(expected), f"{label} read count; gaps={gaps!r}")
+    for gap, interval in zip(gaps, expected, strict=True):
+        require(
+            interval <= gap <= interval + 1_000,
+            f"{label} must wait {interval} ms between reads; gaps={gaps!r}",
+        )
+    return gaps
+
+
+async def _seed_polling_budget_app() -> CayuApp:
+    app = CayuApp(
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+        enable_logging=False,
+    )
+    app.register_provider(PollingBudgetProvider(), default=True)
+    app.register_agent(
+        AgentSpec(name=POLLING_AGENT_NAME, model=MODEL_NAME),
+        tools=[DashboardContractTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=[DashboardContractTool.spec.name]),
+    )
+    for session_id, prompt, terminal_event in (
+        (
+            POLLING_TERMINAL_SESSION_ID,
+            "Finish so the dashboard can stop polling.",
+            EventType.SESSION_COMPLETED,
+        ),
+        (
+            POLLING_WAITING_SESSION_ID,
+            "Wait for approval before verifying the polling budget.",
+            EventType.SESSION_INTERRUPTED,
+        ),
+    ):
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name=POLLING_AGENT_NAME,
+                    session_id=session_id,
+                    messages=[Message.text("user", prompt)],
+                )
+            )
+        ]
+        require_equal(
+            events[-1].type,
+            terminal_event,
+            f"the polling budget fixture {session_id} must settle through the runtime",
+        )
+    return app
+
+
+async def _run_polling_budget_contract() -> dict[str, object]:
+    """Check the dashboard's request budget on pages where nothing is running.
+
+    A separate idle server keeps these counts independent of the main contract's
+    active fixtures, and a paused Playwright clock replaces minutes of waiting.
+    """
+    app = await _seed_polling_budget_app()
+    listener = _loopback_listener()
+    base_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_server(
+                app,
+                config=ServerConfig.protected(
+                    BasicAuth(username=AUTH_USERNAME, password=AUTH_PASSWORD)
+                ),
+            ),
+            log_level="warning",
+            lifespan="on",
+        )
+    )
+    server_task = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        await _wait_for_server(server, server_task)
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                return {
+                    "terminal_session": await _exercise_terminal_session_polling(
+                        browser.new_context, base_url
+                    ),
+                    "waiting_session": await _exercise_waiting_session_backoff(
+                        browser.new_context, base_url
+                    ),
+                    "idle_overview": await _exercise_idle_overview_polling(
+                        browser.new_context, base_url
+                    ),
+                }
+            finally:
+                await browser.close()
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(server_task, timeout=10)
+        except TimeoutError:
+            server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+
+
+@asynccontextmanager
+async def _polling_budget_page(
+    new_context: Callable[..., Awaitable[BrowserContext]],
+) -> AsyncIterator[tuple[Page, _ApiRequestLog, list[str]]]:
+    context = await new_context(
+        viewport={"width": 1440, "height": 1000},
+        http_credentials={"username": AUTH_USERNAME, "password": AUTH_PASSWORD},
+        locale="en-US",
+    )
+    try:
+        await context.clock.install()
+        await context.add_init_script(script=_API_READ_LOG_SCRIPT)
+        page = await context.new_page()
+        failures: list[str] = []
+        page.on("pageerror", lambda error: failures.append(f"page error: {error}"))
+        page.on(
+            "console",
+            lambda message: (
+                failures.append(f"console error: {message.text}")
+                if message.type == "error"
+                else None
+            ),
+        )
+        page.on(
+            "response",
+            lambda response: (
+                failures.append(f"HTTP {response.status} {response.url}")
+                if response.status >= 400
+                else None
+            ),
+        )
+        yield page, _ApiRequestLog(page), failures
+        require_equal(failures, [], "polling budget pages must load without browser failures")
+    finally:
+        await context.close()
+
+
+async def _exercise_terminal_session_polling(
+    new_context: Callable[..., Awaitable[BrowserContext]], base_url: str
+) -> dict[str, int]:
+    state_path = f"/api/sessions/{POLLING_TERMINAL_SESSION_ID}/state"
+    async with _polling_budget_page(new_context) as (page, requests, _failures):
+        await page.goto(
+            f"{base_url}/cayu/sessions/{POLLING_TERMINAL_SESSION_ID}",
+            wait_until="networkidle",
+        )
+        await expect(page.get_by_role("heading", name=POLLING_TERMINAL_SESSION_ID)).to_be_visible()
+        refresh_button = page.get_by_role("button", name="Refresh session", exact=True)
+        await expect(refresh_button).to_be_enabled()
+        await _pause_page_clock(page, requests)
+        await _advance_page_clock(page, requests, 5_000)
+        settled_reads = len(requests.started)
+        await _advance_page_clock(page, requests, 10 * 60_000)
+        require_equal(
+            requests.started[settled_reads:],
+            [],
+            "a settled terminal session page must make no requests for ten minutes",
+        )
+
+        state_reads = requests.count("GET", state_path)
+        await _refocus_page(page, requests)
+        focus_state_reads = requests.count("GET", state_path)
+        require_equal(
+            focus_state_reads,
+            state_reads + 1,
+            "focusing a terminal session page must refresh its state exactly once",
+        )
+        await refresh_button.click()
+        await requests.settle()
+        require_equal(
+            requests.count("GET", state_path),
+            focus_state_reads + 1,
+            "refreshing a terminal session page must read its state exactly once",
+        )
+        refreshed_reads = len(requests.started)
+        await _advance_page_clock(page, requests, 5 * 60_000)
+        require_equal(
+            requests.started[refreshed_reads:],
+            [],
+            "a refreshed terminal session page must not resume polling",
+        )
+        return {"requests_in_ten_idle_minutes": 0, "state_reads": requests.count("GET", state_path)}
+
+
+async def _exercise_waiting_session_backoff(
+    new_context: Callable[..., Awaitable[BrowserContext]], base_url: str
+) -> dict[str, list[int]]:
+    endpoints = (
+        ("GET", f"/api/sessions/{POLLING_WAITING_SESSION_ID}/state"),
+        ("GET", "/api/pending-actions"),
+    )
+    async with _polling_budget_page(new_context) as (page, requests, _failures):
+        await page.goto(
+            f"{base_url}/cayu/sessions/{POLLING_WAITING_SESSION_ID}",
+            wait_until="networkidle",
+        )
+        await expect(page.get_by_text("Awaiting approval", exact=True)).to_be_visible()
+        await _pause_page_clock(page, requests)
+
+        observed: dict[str, list[int]] = {}
+        # A focus refetch restarts the backoff, so each cycle starts at five seconds.
+        for cycle in range(2):
+            await _refocus_page(page, requests)
+            focus_reads = {
+                endpoint: len(await requests.read_times(*endpoint)) for endpoint in endpoints
+            }
+            await _advance_page_clock(
+                page,
+                requests,
+                sum(POLLING_WAITING_BACKOFF_MS) + 5_000,
+                step_ms=1_000,
+            )
+            for endpoint in endpoints:
+                times = await requests.read_times(*endpoint)
+                gaps = _require_read_gaps(
+                    times[focus_reads[endpoint] - 1 :],
+                    POLLING_WAITING_BACKOFF_MS,
+                    f"a waiting session page {endpoint[1]} (cycle {cycle + 1})",
+                )
+                if cycle == 0:
+                    observed[endpoint[1]] = gaps
+        return observed
+
+
+async def _exercise_idle_overview_polling(
+    new_context: Callable[..., Awaitable[BrowserContext]], base_url: str
+) -> dict[str, list[int]]:
+    async with _polling_budget_page(new_context) as (page, requests, _failures):
+        await page.goto(f"{base_url}/cayu/", wait_until="networkidle")
+        await expect(page.get_by_role("heading", name="Dashboard")).to_be_visible()
+        await expect(page.get_by_text("Awaiting approval", exact=True).first).to_be_visible()
+        await _pause_page_clock(page, requests)
+        await _refocus_page(page, requests)
+        focus_reads = {
+            endpoint: len(await requests.read_times(*endpoint))
+            for endpoint in POLLING_IDLE_OVERVIEW_PATHS
+        }
+        await _advance_page_clock(page, requests, 62_000, step_ms=1_000)
+        observed: dict[str, list[int]] = {}
+        for endpoint in POLLING_IDLE_OVERVIEW_PATHS:
+            times = await requests.read_times(*endpoint)
+            observed[endpoint[1]] = _require_read_gaps(
+                times[focus_reads[endpoint] - 1 :],
+                (30_000, 30_000),
+                f"an idle dashboard home {endpoint[1]}",
+            )
+        return observed
 
 
 def _record_browser_failures(

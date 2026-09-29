@@ -26,11 +26,13 @@ import {
   navigateToOlderPage,
   olderTranscriptPage,
   pageNavigationForFilter,
+  pendingActionPollInterval,
   pendingTailCanReconcile,
   queryReadErrorIsFatal,
   sessionHistorySearchWithEventFilters,
   sessionHistorySearchWithTranscriptFilters,
   sessionMetadataNeedsRefresh,
+  sessionPollPhase,
   sessionSummaryRevision,
   statePollInterval,
   summaryStateIsStable,
@@ -403,7 +405,7 @@ test("summary revisions ignore hot activity but version stable terminal state", 
   assert.equal(summaryStateIsStable(completedCascade), true)
 })
 
-test("state polling keeps a low-frequency terminal heartbeat and backs off failures", () => {
+test("state polling covers every session status", () => {
   const base = {
     status: "running",
     interruptionCascade: "none",
@@ -412,15 +414,87 @@ test("state polling keeps a low-frequency terminal heartbeat and backs off failu
     hasError: false,
     failureCount: 0,
     nonRetryableError: false,
+    unchangedResponses: 0,
+  }
+  const expected = {
+    pending: [2000, 2000, 2000, 2000],
+    running: [2000, 2000, 2000, 2000],
+    interrupting: [2000, 2000, 2000, 2000],
+    interrupted: [5000, 10_000, 30_000, 60_000],
+    completed: [false, false, false, false],
+    failed: [false, false, false, false],
   }
 
-  assert.equal(statePollInterval(base), 2000)
-  assert.equal(statePollInterval({ ...base, interruptionCascade: "pending" }), 1000)
-  assert.equal(statePollInterval({ ...base, status: "completed" }), 15_000)
+  for (const [status, intervals] of Object.entries(expected)) {
+    const observed = [0, 1, 2, 20].map((unchangedResponses) =>
+      statePollInterval({ ...base, status, unchangedResponses }),
+    )
+    assert.deepEqual(observed, intervals, status)
+  }
+  assert.equal(sessionPollPhase(undefined), "active")
+  assert.equal(statePollInterval({ ...base, status: undefined, unchangedResponses: 5 }), 2000)
+  // A status this dashboard does not know yet keeps a bounded backoff.
+  assert.equal(sessionPollPhase("future_status"), "waiting")
+  assert.equal(
+    statePollInterval({ ...base, status: "future_status", unchangedResponses: 3 }),
+    60_000,
+  )
+  assert.equal(sessionPollPhase("toString"), "waiting")
+})
+
+test("terminal sessions poll only while an interrupt, cascade or mutation is pending", () => {
+  const base = {
+    status: "completed",
+    interruptionCascade: "none",
+    interruptRequested: false,
+    mutationActive: false,
+    hasError: false,
+    failureCount: 0,
+    nonRetryableError: false,
+    unchangedResponses: 0,
+  }
+
+  for (const status of ["completed", "failed"]) {
+    assert.equal(statePollInterval({ ...base, status }), false)
+    assert.equal(statePollInterval({ ...base, status, interruptRequested: true }), 1000)
+    assert.equal(statePollInterval({ ...base, status, interruptionCascade: "pending" }), 1000)
+    assert.equal(statePollInterval({ ...base, status, mutationActive: true }), 2000)
+    assert.equal(statePollInterval({ ...base, status, interruptionCascade: "failed" }), false)
+  }
   assert.equal(statePollInterval({ ...base, status: "interrupted", mutationActive: true }), 2000)
-  assert.equal(statePollInterval({ ...base, hasError: true, failureCount: 1 }), 4000)
-  assert.equal(statePollInterval({ ...base, hasError: true, failureCount: 20 }), 30_000)
-  assert.equal(statePollInterval({ ...base, hasError: true, nonRetryableError: true }), false)
+})
+
+test("state polling keeps its error backoff for every status", () => {
+  const base = {
+    status: "running",
+    interruptionCascade: "none",
+    interruptRequested: false,
+    mutationActive: false,
+    hasError: true,
+    failureCount: 1,
+    nonRetryableError: false,
+    unchangedResponses: 0,
+  }
+
+  for (const status of ["running", "interrupted", "completed", "failed"]) {
+    assert.equal(statePollInterval({ ...base, status }), 4000)
+    assert.equal(statePollInterval({ ...base, status, failureCount: 20 }), 30_000)
+    assert.equal(statePollInterval({ ...base, status, nonRetryableError: true }), false)
+  }
+})
+
+test("pending action polling backs off while open actions are unchanged", () => {
+  const base = { hasOpenItems: true, permanentError: false, unchangedResponses: 0 }
+
+  assert.deepEqual(
+    [0, 1, 2, 3, 9].map((unchangedResponses) =>
+      pendingActionPollInterval({ ...base, unchangedResponses }),
+    ),
+    [5000, 10_000, 30_000, 60_000, 60_000],
+  )
+  assert.equal(pendingActionPollInterval({ ...base, hasOpenItems: undefined }), 5000)
+  assert.equal(pendingActionPollInterval({ ...base, hasOpenItems: false }), false)
+  assert.equal(pendingActionPollInterval({ ...base, permanentError: true }), false)
 })
 
 test("a state refetch error is nonfatal while prior state remains available", () => {

@@ -31,6 +31,7 @@ import {
   TableHeader,
   TableRow,
 } from "../components/ui/table"
+import { aggregateRequestFailureIsPermanent, retryAggregateRequest } from "../lib/aggregate-query"
 import {
   type ArtifactRead,
   type ArtifactSummary,
@@ -38,9 +39,15 @@ import {
   artifactContentUrl,
   fetchArtifact,
   fetchArtifacts,
+  fetchOperationalSnapshot,
 } from "../lib/api"
 import { formatBytes, formatCount, formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
+import {
+  activityPollInterval,
+  IDLE_POLL_INTERVAL_MS,
+  operationalSnapshotIsActive,
+} from "../lib/polling"
 import { cn } from "../lib/utils"
 
 type ArtifactScopeFilter = "all" | "session" | "environment"
@@ -50,6 +57,7 @@ type ArtifactCopyFeedback = {
 }
 
 const PAGE_LIMIT = 100
+const ARTIFACT_ACTIVE_POLL_INTERVAL_MS = 10_000
 const selectClassName =
   "h-8 min-w-32 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
 const safeInlineContentTypes = new Set([
@@ -507,11 +515,25 @@ export function ArtifactsPage() {
     [agentFilter, artifactStoreId, environmentFilter, offset, scope, sessionFilter],
   )
 
+  // Artifacts carry no lifecycle state, so a slow session snapshot decides whether
+  // any session is running and the list is worth refreshing quickly.
+  const sessionActivity = useQuery({
+    queryKey: ["operational-snapshot", "artifacts-activity"],
+    queryFn: ({ signal }) => fetchOperationalSnapshot({ include_tasks: false }, signal),
+    retry: retryAggregateRequest,
+    refetchInterval: (activeQuery) =>
+      aggregateRequestFailureIsPermanent(activeQuery.state.error) ? false : IDLE_POLL_INTERVAL_MS,
+    refetchOnWindowFocus: (activeQuery) =>
+      !aggregateRequestFailureIsPermanent(activeQuery.state.error),
+  })
   const artifacts = useQuery({
     queryKey: ["artifacts", query],
     queryFn: () => fetchArtifacts(query),
     placeholderData: keepPreviousData,
-    refetchInterval: 10_000,
+    refetchInterval: activityPollInterval(
+      operationalSnapshotIsActive(sessionActivity.data),
+      ARTIFACT_ACTIVE_POLL_INTERVAL_MS,
+    ),
   })
 
   const artifactList = useMemo(() => {

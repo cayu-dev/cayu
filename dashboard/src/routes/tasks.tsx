@@ -36,6 +36,7 @@ import {
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatCurrencyWithCode, formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
+import { activityPollInterval, taskStatusIsActive } from "../lib/polling"
 import { taskAvailabilityDescriptor } from "../lib/task-availability"
 import { cn } from "../lib/utils"
 
@@ -50,6 +51,7 @@ type TaskActionVariables = {
 }
 
 const PAGE_LIMIT = 100
+const TASK_ACTIVE_POLL_INTERVAL_MS = 5_000
 const TASK_STATUSES: TaskStatusFilter[] = [
   "pending",
   "waiting_dependencies",
@@ -183,10 +185,13 @@ export function TasksPage() {
     [assignedAgentFilter, debouncedSearch, offset, orderBy, sessionFilter, status],
   )
 
+  // Poll quickly only while a listed or selected task is queued, claimed or running.
+  const [tasksActive, setTasksActive] = useState(false)
+  const pollInterval = activityPollInterval(tasksActive, TASK_ACTIVE_POLL_INTERVAL_MS)
   const tasks = useQuery({
     queryKey: ["tasks", "queue", query],
     queryFn: () => fetchTasks(query),
-    refetchInterval: 5000,
+    refetchInterval: pollInterval,
   })
   const taskList = tasks.data ?? []
   const listFallbackTask = taskList[0] ?? null
@@ -198,10 +203,14 @@ export function TasksPage() {
     queryKey: ["task", taskDetailId],
     queryFn: () => fetchTask(taskDetailId ?? ""),
     enabled: taskDetailId != null,
-    refetchInterval: 5000,
+    refetchInterval: pollInterval,
   })
   const selectedTask =
     taskDetail.data ?? (selectedListTask?.id === taskDetailId ? selectedListTask : null)
+  const hasActiveTask =
+    taskList.some((task) => taskStatusIsActive(task.status)) ||
+    (selectedTask !== null && taskStatusIsActive(selectedTask.status))
+  useEffect(() => setTasksActive(hasActiveTask), [hasActiveTask])
   const selectedAvailabilityLabel = selectedTask ? taskAvailabilityDescriptor(selectedTask) : null
   const hasNextPage = taskList.length === PAGE_LIMIT
   const hasPreviousPage = offset > 0

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { Activity, AlertTriangle, CheckCircle, Database, ListTodo, XCircle } from "lucide-react"
+import { useEffect, useState } from "react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
@@ -24,9 +25,16 @@ import {
 } from "../lib/api"
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatCount, formatDateTime, sumCounts } from "../lib/format"
+import {
+  activityPollInterval,
+  operationalSnapshotIsActive,
+  sessionStatusIsActive,
+  taskStatusIsActive,
+} from "../lib/polling"
 import { summarizeSessionDebugState } from "../lib/session-debug"
 
 const OVERVIEW_SOURCE_LIMIT = 25
+const OVERVIEW_ACTIVE_POLL_INTERVAL_MS = 5_000
 const OVERVIEW_VISIBLE_LIST_LIMIT = 8
 
 function describeOverviewSessionScope(
@@ -141,13 +149,17 @@ export function DashboardPage() {
   const sessionExecutionUnavailableText = dashboardCapabilityUnavailableText(
     sessionExecutionCapability,
   )
+  // Poll quickly only while sessions or tasks are active. Activity is known only
+  // after these queries load, so it reaches their interval through state.
+  const [overviewActive, setOverviewActive] = useState(false)
+  const pollInterval = activityPollInterval(overviewActive, OVERVIEW_ACTIVE_POLL_INTERVAL_MS)
   const operations = useQuery({
     queryKey: ["operational-snapshot", "dashboard", tasksCapability.enabled],
     queryFn: ({ signal }) =>
       fetchOperationalSnapshot({ include_tasks: tasksCapability.enabled }, signal),
     retry: retryAggregateRequest,
     refetchInterval: (query) =>
-      aggregateRequestFailureIsPermanent(query.state.error) ? false : 5000,
+      aggregateRequestFailureIsPermanent(query.state.error) ? false : pollInterval,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: (query) => !aggregateRequestFailureIsPermanent(query.state.error),
   })
@@ -155,21 +167,21 @@ export function DashboardPage() {
     queryKey: ["sessions-summary", "dashboard"],
     queryFn: () =>
       fetchSessionsSummary({ limit: OVERVIEW_SOURCE_LIMIT, order_by: "updated_at_desc" }),
-    refetchInterval: 5000,
+    refetchInterval: pollInterval,
     refetchIntervalInBackground: false,
   })
   const tasks = useQuery({
     queryKey: ["tasks", "dashboard"],
     queryFn: () => fetchTasks({ limit: OVERVIEW_SOURCE_LIMIT }),
     enabled: tasksCapability.enabled,
-    refetchInterval: 5000,
+    refetchInterval: pollInterval,
     refetchIntervalInBackground: false,
   })
   const pendingActions = useQuery({
     queryKey: ["pending-actions", "dashboard"],
     queryFn: () => fetchPendingActions({ limit: OVERVIEW_SOURCE_LIMIT }),
     retry: (failureCount, error) => !isApiPayloadTooLarge(error) && failureCount < 3,
-    refetchInterval: (query) => (isApiPayloadTooLarge(query.state.error) ? false : 5000),
+    refetchInterval: (query) => (isApiPayloadTooLarge(query.state.error) ? false : pollInterval),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: (query) => !isApiPayloadTooLarge(query.state.error),
   })
@@ -177,6 +189,11 @@ export function DashboardPage() {
   const sessionItems = summary.data?.sessions || []
   const list = sessionItems.map((item) => item.session)
   const taskList = tasks.data || []
+  const hasActiveWork =
+    operationalSnapshotIsActive(operations.data) ||
+    list.some((session) => sessionStatusIsActive(session.status)) ||
+    taskList.some((task) => taskStatusIsActive(task.status))
+  useEffect(() => setOverviewActive(hasActiveWork), [hasActiveWork])
   const pendingActionList = pendingActions.data?.actions || []
   const pendingActionIssues = pendingActions.data?.issues || []
   const sessionsError = summary.error instanceof Error ? summary.error.message : null
