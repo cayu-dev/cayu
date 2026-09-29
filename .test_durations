@@ -40569,5 +40569,9 @@
   "tests/core/test_tool_round_publication_failure_matrix.py::test_two_call_round_survives_cancellation_at_publication_boundary[sqlite-cancel-before-commit-parallel]": 0.8708994588814676,
   "tests/core/test_tool_round_publication_failure_matrix.py::test_two_call_round_survives_cancellation_at_publication_boundary[sqlite-cancel-before-commit-serial]": 0.9715950838290155,
   "tests/core/test_tool_round_publication_failure_matrix.py::test_two_call_round_survives_cancellation_at_publication_boundary[sqlite-commit-then-cancel-parallel]": 0.8673334987834096,
-  "tests/core/test_tool_round_publication_failure_matrix.py::test_two_call_round_survives_cancellation_at_publication_boundary[sqlite-commit-then-cancel-serial]": 0.8853656249120831
+  "tests/core/test_tool_round_publication_failure_matrix.py::test_two_call_round_survives_cancellation_at_publication_boundary[sqlite-commit-then-cancel-serial]": 0.8853656249120831,
+  "tests/test_benchmark_tool_round.py::test_instrumented_batch_completes_each_concurrent_round_once": 5.21083079231903,
+  "tests/test_benchmark_tool_round.py::test_observation_preserves_protocols_and_restores_methods[False]": 0.010081000858917832,
+  "tests/test_benchmark_tool_round.py::test_observation_preserves_protocols_and_restores_methods[True]": 0.004433000227436423,
+  "tests/test_benchmark_tool_round.py::test_case_timeout_retains_finished_samples_without_reporting_completion": 0.0011585841421037912
 }

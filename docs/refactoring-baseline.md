@@ -86,3 +86,38 @@ file paths alone cannot establish lane membership.
 Measure runtime performance separately with fixed workloads, environment and
 dependency versions. Report observed operation counts, memory use and latency
 alongside structural changes.
+
+### Scripted tool-round workload
+
+Run the same [benchmark script](../scripts/benchmark_tool_round.py) and dependency
+versions from each source checkout:
+
+```sh
+PYTHONPATH=src uv run python scripts/benchmark_tool_round.py --output /tmp/tool-round.json
+```
+
+The default matrix uses 2, 16 and 64 tool calls; 0, 128 and 512 history messages;
+and 1 or 8 concurrent sessions. Each batch uses a fresh in-memory store and one
+tool round followed by a final model response per session. Results contain the
+source revision, script digest, environment, three uninstrumented latency samples
+and their median. Setup and one import-warmup batch are outside the timing window.
+The larger cases can take substantially longer than the smaller ones.
+`--output` saves the report atomically after each case. An interrupted run retains
+its completed cases with `finished: false`. Optional `--case-timeout 120` runs
+each case in an owned worker process with a 120-second budget covering startup,
+warmup, all samples and observation. The memory-only worker is terminated when
+that budget expires. Unfinished cases retain any completed
+samples with `status: timed_out`, and the report has `complete: false`. They do not
+produce a median or operation-count result. Without that option, cases have no time
+budget. Use identical budgets when comparing revisions.
+
+A separate pass counts public async store calls, including calls within backend
+methods, and checkpoint admissions through the durable-JSON walker. It records
+peak staged payload bytes from the public publication metrics. This measures
+staged payloads, not total retained memory. Optional `--trace-python-allocations`
+also records peak traced Python allocations during that pass; tracing can be
+expensive. Provider and database I/O are outside this workload.
+
+Use `--calls-per-round 2 --history-messages 0 --sessions 1 --samples 1` for a
+small smoke run. Compare matching cases under comparable machine load; the script
+reports measurements and does not enforce a performance threshold.
