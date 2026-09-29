@@ -5,7 +5,7 @@ import io
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from tests.artifacts.test_aws_s3 import _S3Client
+from tests.artifacts.test_aws_s3 import _content_keys, _S3Client
 from tests.core.session_closure_conformance import create_closure_session
 
 from cayu import CayuApp
@@ -272,8 +272,8 @@ def test_public_closure_rejects_s3_content_after_partial_deletion(entrance):
         with pytest.raises(ArtifactStoreUnavailableError):
             await store.delete(incomplete.id)
         client.delete_errors_by_suffix.clear()
-        content_key = ("bucket", store._artifact_key(incomplete.id, "content"))
-        assert content_key in client.objects
+        [content] = _content_keys(client, incomplete.id)
+        content_key = ("bucket", content)
         assert ("bucket", store._artifact_key(incomplete.id, "metadata.json")) not in client.objects
         delete_count = len(client.delete_calls)
         app = CayuApp(session_closure_stores=(ArtifactSessionClosureStore(store),))

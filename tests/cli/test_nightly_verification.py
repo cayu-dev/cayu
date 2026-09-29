@@ -1247,3 +1247,14 @@ def test_advanced_examples_have_credential_gated_provider_portability_checks(
     assert check.required_env == (key_name,)
     assert check.requires_provider_api_key is True
     assert check.requires_structured_evidence is True
+
+
+def test_s3_artifact_pins_live_check_is_explicitly_gated() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "aws-s3-artifact-pins-live")
+
+    assert check.lane == "aws-durable-services"
+    assert check.command[-1] == "examples.aws.s3_artifact_pins_live"
+    assert check.required_env_values == {"CAYU_AWS_S3_PINS_LIVE": "1"}
+    assert check.required_any_env == (("AWS_REGION", "AWS_DEFAULT_REGION"),)
+    assert check.requires_structured_evidence is True
+    assert "CAYU_AWS_S3_PINS_LIVE" in nightly._LIVE_CREDENTIAL_ENV

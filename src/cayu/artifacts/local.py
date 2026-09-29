@@ -41,6 +41,7 @@ from cayu.artifacts._local_closure import (
     load_claim,
     require_publication_open,
 )
+from cayu.artifacts._pin_owner import pin_owner_digest
 from cayu.artifacts._settlement import (
     _absent_artifact_write,
     _ArtifactWritePhaseReporter,
@@ -1746,12 +1747,10 @@ def _change_pin(
     *,
     namespace: str,
 ) -> None:
-    owner = require_unicode_scalar_text(require_clean_nonblank(owner, "pin.owner"), "pin.owner")
-    if len(owner.encode("utf-8")) > 1024:
-        raise ValueError("Artifact pin owner is too long.")
+    owner_digest = pin_owner_digest(owner)
     if not _supports_durable_publication():
         raise ArtifactStoreUnavailableError("Artifact pins require durable publication support.")
-    name = namespace + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+    name = namespace + owner_digest
     target = _artifact_dir(root, artifact_id)
     with (
         _artifact_ownership_lock(root, target.name),

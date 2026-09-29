@@ -12404,8 +12404,9 @@ Serial tool dispatch alone is not exclusive ownership. The binding must hold
 its actual lease/isolation mechanism across the tool and checkpoint window;
 a changed generation, overlapping invocation, or unknown isolation fails closed.
 `LocalArtifactStore` implements pins using the same cross-process ownership lock
-as deletion and synchronizes pin state before acknowledging it. Other stores,
-including S3, currently decline this capability unless they implement the pin
+as deletion and synchronizes pin state before acknowledging it. `S3ArtifactStore`
+implements the same contract with S3 conditional writes, described with the S3
+store below. Other stores decline this capability unless they implement the pin
 contract. Keep checkpoint storage outside the workspace projection and on storage
 whose durability covers the intended host-loss failure domain.
 
@@ -13191,6 +13192,94 @@ reads for `max_bytes`, and maps missing objects separately from unavailable S3
 backends. Ambiguous final-key failures are retained for exact retry and reported
 as reconciliation-required; the store does not infer absence or blindly delete
 keys after acknowledgement loss.
+
+`S3ArtifactStore` supports durable pins (`supports_pins` is true) without a lock
+service. Each artifact that has been pinned or deleted has one state object,
+`<prefix>/_pins/<artifact_id>.json`, holding a monotonic revision, SHA-256
+digests of pin owners (raw owner strings are not stored), and deletion fences.
+Every change is a compare-and-swap: creation uses `If-None-Match: *` and
+replacement uses `If-Match` on the ETag that was read, so the state serializes
+pins and deletions across processes. The store never removes this object, and
+the revision makes each write's bytes and ETag unique.
+
+Every publication of an artifact identity is an immutable generation. Its
+content is written to `<prefix>/<artifact_id>/<generation>/content`, a key no
+other publication uses, and its metadata object at
+`<prefix>/<artifact_id>/metadata.json` names the generation in its body. The
+metadata ETag is therefore unique to one publication, even when identical bytes
+are published again under the same ID. Artifacts written before generations
+keep their content at `<prefix>/<artifact_id>/content` and plain metadata; the
+store reads, pins, and deletes them as the `legacy` generation, and publishes
+new content only in the generation layout. Every writer of a store must run
+this layout, since an older writer would publish to the legacy content key
+again.
+
+- `pin` reads the state, then proves that the committed metadata and its
+  generation's content both exist, then conditionally adds the owner. A deletion
+  that begins or removes the artifact in between changes the state, so the
+  write fails and the retry observes the change. Pinning an absent artifact, one
+  missing either object, or one whose deletion is in flight raises
+  `FileNotFoundError`; repeating a pin for the same owner is idempotent.
+- `release_pin` removes only the exact owner, is idempotent, and raises
+  `FileNotFoundError` for an absent artifact, matching `LocalArtifactStore`.
+- `delete` and `delete_session_closure_artifact` raise
+  `ValueError("Artifact is retained by a durable pin.")` while any owner remains.
+  Otherwise deletion commits a fence naming the generations it targets, then
+  removes them with one `DeleteObjects` call, then settles its fence. The
+  targets are the current publication, any content left by an interrupted
+  publication or an earlier partial deletion, and the generations of earlier
+  fences. Content objects are removed by their generation-unique keys, and the
+  metadata object only on the ETag that was read (a per-object `ETag` condition,
+  which S3 enforces with `PreconditionFailed`). Deleting an identity with no
+  objects and no fences performs no write.
+- A deletion request that S3 applies late, for example one whose client call
+  timed out, can only remove the generations it names: their content keys are
+  never written again, and its metadata condition fails on any later
+  publication. Safety therefore depends on no time bound or clock.
+- A generation's content is sent by exactly one request. The store vetoes
+  botocore's retries of the content `PutObject` and refuses a second send, and
+  commits metadata only for a generation whose single request S3
+  acknowledged. After a transport failure or server error the generation is
+  abandoned, never referenced, and the next attempt (at most three) writes a
+  fresh generation. A retried or delayed original request can therefore only
+  recreate unreferenced content, never a generation a deletion has retired
+  after it became pinnable. Content that a deletion removes between its
+  acknowledged write and the metadata commit leaves a publication whose content
+  is missing, which `pin` refuses and a later deletion removes.
+- That guarantee needs a client the store can hold to one request per content
+  write. A botocore S3 client qualifies because it exposes `meta.events`, where
+  the store installs its guard; a wrapper that forwards `meta` to the botocore
+  client it calls qualifies the same way. Any other client must declare
+  `cayu_single_attempt_put_object = True` as a class attribute on the class
+  that defines its `put_object`, asserting that each call sends at most one
+  request. A subclass that overrides `put_object` must declare it again, and an
+  instance attribute does not count. Otherwise every content write fails before
+  anything is sent with
+  `cayu.artifacts.aws_s3.S3ArtifactClientConfigurationError` (a `TypeError`),
+  whether or not the caller pins: a publication written without the guard
+  could be pinned later by another process. Reads, listing, pinning and
+  deletion of existing artifacts still work with such a client.
+- A fence whose outcome is known, meaning no attempt was sent or exactly one
+  attempt that S3 answered with a response or a client error, is retired when
+  its call returns. Any other outcome, a transport failure, a server error, or a
+  call that needed more than one attempt, leaves the fence marked unresolved,
+  because S3 may still apply the request. `pin` raises
+  `ArtifactStoreUnavailableError` for a publication an unresolved fence targets,
+  and `FileNotFoundError` for one an in-flight fence targets. Fences never block
+  a later publication, whose generation no fence can name. A completed deletion
+  drops every fence whose targets it covered, including unresolved fences and
+  fences left by a lost process, so deleting again settles them.
+- Precondition (412) and conditional-conflict (409) responses re-read the state
+  and retry, bounded at 16 attempts, then fail with
+  `ArtifactStoreUnavailableError`. After any other write failure, the store
+  accepts the change only when readback shows the requested state; otherwise it
+  reports the failure. A pin whose outcome remains uncertain may still be
+  durable, which only retains the artifact until its owner releases it.
+- A state object holds at most 10,000 owners and 64 deletion fences of at most
+  64 generations each, and its schema version is 3.
+
+Exact-resource pins remain specific to `LocalArtifactStore`:
+`LocalArtifactResourceOwner` does not qualify S3 stores.
 
 Artifact result objects enforce consistent metadata:
 

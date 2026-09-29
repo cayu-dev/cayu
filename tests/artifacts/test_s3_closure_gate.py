@@ -122,6 +122,9 @@ def test_reopened_public_closure_recovers_only_durable_write_settlement(failure)
                 raise OSError("settlement readback unavailable")
             return super().get_object(**kwargs)
 
+        # Each put_object call below sends exactly one request.
+        cayu_single_attempt_put_object = True
+
         def put_object(self, **kwargs):
             if "/_closure/" in kwargs["Key"] and "/artifact-owners/" not in kwargs["Key"]:
                 state = json.loads(kwargs["Body"])
@@ -194,6 +197,9 @@ def test_complete_s3_objects_do_not_prove_publication_owner_has_settled():
     committed, release = Event(), Event()
 
     class Client(_S3Client):
+        # Each put_object call below sends exactly one request.
+        cayu_single_attempt_put_object = True
+
         def put_object(self, **kwargs):
             result = super().put_object(**kwargs)
             if kwargs["Key"].endswith("/metadata.json"):
@@ -242,6 +248,9 @@ def test_s3_cancellation_retains_reservation_until_dispatched_upload_settles():
     dispatched, release = Event(), Event()
 
     class Client(_S3Client):
+        # Each put_object call below sends exactly one request.
+        cayu_single_attempt_put_object = True
+
         def put_object(self, **kwargs):
             if kwargs["Key"].endswith("/content"):
                 dispatched.set()
@@ -367,6 +376,9 @@ class _ConditionalClient:
                 "ContentLength": len(self.data),
                 "ETag": sha256(self.data).hexdigest(),
             }
+
+    # Each put_object call below sends exactly one request.
+    cayu_single_attempt_put_object = True
 
     def put_object(self, **kwargs):
         with self.lock:

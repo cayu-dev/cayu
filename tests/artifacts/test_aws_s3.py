@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 from hashlib import sha256
 from threading import Barrier as ThreadBarrier
 from threading import Event as ThreadEvent
@@ -21,6 +22,13 @@ from cayu import (
 )
 
 
+def _content_keys(client: _S3Client, artifact_id: str) -> list[str]:
+    """Content keys stored for an artifact, legacy or generation-keyed."""
+
+    pattern = re.compile(rf"/{artifact_id}/(?:[0-9a-f]{{32}}/)?content\Z")
+    return sorted(key for _, key in client.objects if pattern.search(key))
+
+
 class _ClientError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.response = {"Error": {"Code": code}}
@@ -38,6 +46,9 @@ class _S3Client:
         self.fail_put_once_suffix: str | None = None
         self.fail_get_code: str | None = None
         self.fail_delete_code: str | None = None
+
+    # Each put_object call below sends exactly one request.
+    cayu_single_attempt_put_object = True
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         self.put_calls.append(kwargs)
@@ -120,6 +131,16 @@ class _S3Client:
                     }
                 )
                 continue
+            if "ETag" in item:
+                # Real S3 honours a per-object ETag condition: a missing key
+                # reports NoSuchKey and a different object PreconditionFailed.
+                current = self.objects.get((kwargs["Bucket"], item["Key"]))
+                if current is None:
+                    errors.append({"Key": item["Key"], "Code": "NoSuchKey"})
+                    continue
+                if item["ETag"] != sha256(current).hexdigest():
+                    errors.append({"Key": item["Key"], "Code": "PreconditionFailed"})
+                    continue
             self.objects.pop((kwargs["Bucket"], item["Key"]), None)
         return {"Errors": errors}
 
@@ -130,6 +151,9 @@ class _BlockingContentUploadS3Client(_S3Client):
         self.content_upload_started = ThreadEvent()
         self.release_content_upload = ThreadEvent()
         self.content_upload_finished = ThreadEvent()
+
+    # Each put_object call below sends exactly one request.
+    cayu_single_attempt_put_object = True
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         if kwargs["Key"].endswith("/content"):
@@ -148,6 +172,9 @@ class _BlockingMetadataCommitS3Client(_S3Client):
         self.metadata_commit_started = ThreadEvent()
         self.release_metadata_commit = ThreadEvent()
 
+    # Each put_object call below sends exactly one request.
+    cayu_single_attempt_put_object = True
+
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         if kwargs["Key"].endswith("/metadata.json"):
             self.metadata_commit_started.set()
@@ -162,6 +189,9 @@ class _WriteThenLoseAcknowledgementS3Client(_S3Client):
         self.suffix = suffix
         self.lost = False
 
+    # Each put_object call below sends exactly one request.
+    cayu_single_attempt_put_object = True
+
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         response = super().put_object(**kwargs)
         if not self.lost and kwargs["Key"].endswith(self.suffix):
@@ -175,6 +205,9 @@ class _ConcurrentContentUploadS3Client(_S3Client):
         super().__init__()
         self.content_barrier = ThreadBarrier(2)
         self.write_lock = ThreadLock()
+
+    # Each put_object call below sends exactly one request.
+    cayu_single_attempt_put_object = True
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         if kwargs["Key"].endswith("/content"):
@@ -264,7 +297,10 @@ def test_s3_artifact_store_rejects_partial_delete_errors(failed_suffix: str) -> 
     ):
         asyncio.run(store.delete(artifact.id))
 
-    assert ("bucket", f"cayu/artifacts/{artifact.id}{failed_suffix}") in client.objects
+    if failed_suffix == "/content":
+        assert len(_content_keys(client, artifact.id)) == 1
+    else:
+        assert ("bucket", f"cayu/artifacts/{artifact.id}{failed_suffix}") in client.objects
 
 
 def test_s3_artifact_store_rejects_errors_for_every_deleted_object() -> None:
@@ -306,11 +342,13 @@ def test_s3_artifact_store_keeps_delete_error_diagnostics_bounded() -> None:
 
 def test_s3_artifact_store_preserves_typed_backend_delete_failures() -> None:
     client = _S3Client()
-    client.fail_delete_code = "ServiceUnavailable"
     store = S3ArtifactStore("bucket", client=client)
+    # An absent identity is a no-op; exercise the DeleteObjects failure itself.
+    artifact = asyncio.run(store.put_bytes(b"content", filename="a.txt", session_id="sess_1"))
+    client.fail_delete_code = "ServiceUnavailable"
 
     with pytest.raises(ArtifactStoreUnavailableError, match="could not delete") as raised:
-        asyncio.run(store.delete(f"art_{'5' * 32}"))
+        asyncio.run(store.delete(artifact.id))
 
     assert isinstance(raised.value.__cause__, _ClientError)
 
@@ -449,10 +487,9 @@ def test_s3_concurrent_same_content_metadata_conflict_is_explicit() -> None:
     settlement = artifact_write_settlements(failures[0])
     assert len(settlement) == 1
     assert settlement[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
-    assert settlement[0].failure_codes == (
-        ArtifactWriteSettlementFailureCode.MUTATION_FAILED,
-        ArtifactWriteSettlementFailureCode.COMMIT_FAILED,
-    )
+    # Each publication writes its own generation-keyed content, so only the
+    # losing metadata commit fails.
+    assert settlement[0].failure_codes == (ArtifactWriteSettlementFailureCode.COMMIT_FAILED,)
     committed = asyncio.run(store.read_bytes(artifact_id))
     assert committed.content == b"shared"
     assert committed.metadata.filename in {"first.txt", "second.txt"}
@@ -475,7 +512,7 @@ def test_s3_supplied_identity_finishes_metadata_commit_after_retry() -> None:
     with pytest.raises(ArtifactStoreUnavailableError, match="commit"):
         asyncio.run(store.put_bytes(b"recoverable", **kwargs))
 
-    assert ("bucket", f"cayu/artifacts/{artifact_id}/content") in client.objects
+    assert len(_content_keys(client, artifact_id)) == 1
     assert ("bucket", f"cayu/artifacts/{artifact_id}/metadata.json") not in client.objects
 
     recovered = asyncio.run(store.put_bytes(b"recoverable", **kwargs))
@@ -731,7 +768,7 @@ def test_s3_generated_write_retains_identity_when_metadata_commit_fails() -> Non
     assert len(evidence) == 1
     assert evidence[0].artifact_id.startswith("art_")
     assert evidence[0].status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
-    assert any(key.endswith(f"/{evidence[0].artifact_id}/content") for _, key in client.objects)
+    assert len(_content_keys(client, evidence[0].artifact_id)) == 1
     assert client.delete_calls == []
 
 

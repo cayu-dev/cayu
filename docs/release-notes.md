@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Support durable artifact pins on `S3ArtifactStore` with conditional-write state,
+  so workspace checkpoints can use S3 artifact storage.
 - Accept already-searching OpenAI web-search registrations and completed replay
   registrations. Reconcile unoccupied completion indexes by exact item identity,
   retain terminal integrity checks, and retry function index-type collisions and

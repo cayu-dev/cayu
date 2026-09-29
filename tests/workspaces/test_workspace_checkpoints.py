@@ -366,3 +366,91 @@ def test_directory_pruning_preserves_unsafe_or_excluded_descendants(tmp_path, ad
             assert keep.is_symlink() and (tmp_path / "outside").is_dir()
 
     asyncio.run(run())
+
+
+def test_s3_checkpoint_pins_survive_store_instances_and_fence_collection(tmp_path):
+    from tests.artifacts.test_aws_s3 import _S3Client
+
+    from cayu.artifacts import S3ArtifactStore
+
+    client = _S3Client()
+
+    def open_store():
+        # Separate instances share only S3 state, like separate worker processes.
+        return S3ArtifactStore("bucket", client=client)
+
+    async def run():
+        source = workspace(tmp_path / "source")
+        await source.write_bytes("a", b"preserved")
+        await source.write_bytes_with_git_mode("bin/run", b"#!/bin/sh\n", git_mode="100755")
+        policy = WorkspaceCheckpointPolicy()
+        aid, manifest = await capture_workspace_checkpoint(
+            source,
+            open_store(),
+            policy=policy,
+            environment_name="e",
+            owner="session:r1",
+            isolation=isolation,
+        )
+        digest = hashlib.sha256(
+            canonical_durable_json_bytes(manifest.model_dump(mode="json"), "manifest")
+        ).hexdigest()
+        await pin_workspace_checkpoint(
+            open_store(), aid, owner="snapshot:r1", policy=policy, expected_manifest_sha256=digest
+        )
+        await release_workspace_checkpoint(
+            open_store(), aid, owner="session:r1", policy=policy, expected_manifest_sha256=digest
+        )
+        artifact_ids = [aid, *(entry.artifact_id for entry in manifest.files)]
+        for artifact_id in artifact_ids:
+            with pytest.raises(ValueError, match="pin"):
+                await open_store().delete(artifact_id)
+        loaded = await load_workspace_checkpoint(
+            open_store(), aid, policy=policy, expected_manifest_sha256=digest
+        )
+        dest = workspace(tmp_path / "dest")
+        await restore_workspace_checkpoint(
+            dest, open_store(), loaded, policy=policy, isolation=isolation
+        )
+        assert await workspace_checkpoint_revision(dest, policy=policy) == manifest.revision
+        assert (await dest.read_bytes("bin/run")).git_mode == "100755"
+        await release_workspace_checkpoint(
+            open_store(), aid, owner="snapshot:r1", policy=policy, expected_manifest_sha256=digest
+        )
+        for artifact_id in artifact_ids:
+            await open_store().delete(artifact_id)
+        with pytest.raises(FileNotFoundError):
+            await pin_workspace_checkpoint(
+                open_store(), aid, owner="late", policy=policy, expected_manifest_sha256=digest
+            )
+
+    asyncio.run(run())
+
+
+def test_s3_checkpoint_capture_fails_when_collection_wins_before_pin(tmp_path):
+    from tests.artifacts.test_aws_s3 import _S3Client
+
+    from cayu.artifacts import S3ArtifactStore
+
+    client = _S3Client()
+
+    class CollectedBeforePin(S3ArtifactStore):
+        async def pin(self, artifact_id, *, owner):
+            await S3ArtifactStore("bucket", client=client).delete(artifact_id)
+            await super().pin(artifact_id, owner=owner)
+
+    async def run():
+        source = workspace(tmp_path / "source")
+        await source.write_bytes("a", b"collected")
+        with pytest.raises(FileNotFoundError):
+            await capture_workspace_checkpoint(
+                source,
+                CollectedBeforePin("bucket", client=client),
+                policy=WorkspaceCheckpointPolicy(),
+                environment_name="e",
+                owner="session:r1",
+                isolation=isolation,
+            )
+        assert not any(key.endswith("/metadata.json") for _, key in client.objects)
+
+    asyncio.run(run())
