@@ -20,7 +20,10 @@ _GUIDES = {
         "Generated application convention, placement, planning, and drift checks.",
     ),
     "authoring": ("authoring.md", "Concept map and the supported authoring loop."),
-    "diagnostics": ("diagnostics.md", "Stable `cayu check` findings and fixes."),
+    "diagnostics": (
+        "diagnostics.md",
+        "Stable `cayu check` findings and fixes, and the request-cost check.",
+    ),
     "durable-operations": (
         "durable-operations.md",
         "Observe, propose, authorize, act once, verify, and recover.",

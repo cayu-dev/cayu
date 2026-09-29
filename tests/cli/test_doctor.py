@@ -53,6 +53,7 @@ def _write_partial_worker_payload(
     connection,
     _target: str | None,
     _sessions: tuple[str, ...],
+    _request_costs=None,
 ) -> None:
     os.write(connection.fileno(), struct.pack("!i", 256) + b"{")
     time.sleep(30)
@@ -62,6 +63,7 @@ def _interrupt_parent_worker(
     _connection,
     _target: str | None,
     _sessions: tuple[str, ...],
+    _request_costs=None,
 ) -> None:
     os.kill(os.getppid(), signal.SIGINT)
     time.sleep(30)
@@ -156,6 +158,7 @@ def _send_worker_payload_then_stall_shutdown(
     connection,
     _target: str | None,
     _sessions: tuple[str, ...],
+    _request_costs=None,
 ) -> None:
     thread = threading.Thread(target=time.sleep, args=(30,), daemon=False)
     thread.start()
@@ -171,6 +174,7 @@ def _send_worker_payload_then_settle_shutdown(
     connection,
     _target: str | None,
     _sessions: tuple[str, ...],
+    _request_costs=None,
 ) -> None:
     thread = threading.Thread(target=time.sleep, args=(1.5,), daemon=False)
     thread.start()

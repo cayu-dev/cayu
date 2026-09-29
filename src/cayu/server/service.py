@@ -2745,6 +2745,11 @@ def create_agent_service(
         evaluation_promotion=evaluation_promotion,
         evals=evals,
         continuation_loop_policy_provider=service._continuation_loop_policies,
+        # Development services time requests even behind authenticated access;
+        # production services follow the mount default (on under `cayu serve`).
+        # When timing is on it also covers the product API, which Cayu owns.
+        request_timing=True if mode is ServiceMode.DEVELOPMENT else None,
+        observe_host_requests=mode is ServiceMode.DEVELOPMENT or project_context is not None,
         _project_context=project_context,
         _system_diagnostics_snapshot_sink=service._attach_system_diagnostics_snapshot,
     )

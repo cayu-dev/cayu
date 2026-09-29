@@ -2,6 +2,8 @@
 
 `cayu check` renders these stable findings from the public application manifest.
 Run the correction, then rerun `cayu inspect --json` and `cayu check --json`.
+The last section, [request-cost](#request-cost), covers what a running server
+spends on each HTTP route and how to check it.
 
 ## app-no-agents
 
@@ -207,3 +209,58 @@ provider credential, remote service, sandbox, network path, or deployment is
 live. The manifest reports `has_system_prompt` but never prompt text; its
 fingerprint records prompt presence, not prompt contents. A prompt edit between
 two non-empty values therefore needs a runtime test or eval for verification.
+
+## request-cost
+
+A running Cayu server records the cost of every request: method, route
+template, status, wall time, CPU time, and response size, keyed by a hashed
+client. It is on by default under `cayu serve` and for local development
+(`ServerConfig.local_development()`, or `mount_cayu` with `OpenAccess`). With
+`mount_cayu`, pass `observe_host_requests=True` to also time the host app's
+own routes, such as the `/api/...` routes your UI polls. Records stay in memory
+only and never include raw paths, IDs, query values, cookies, or credentials.
+
+A slow request is cheap to miss locally: on a laptop with a handful of records,
+a 300 ms handler polled every 2 seconds looks fine, but in production it can
+use a third of a 0.5 vCPU web process for one idle tab and grow with every job
+stored. The server logs these warnings, once per condition:
+
+- `cayu.server.slow_request`: a GET route's median time went over 250 ms.
+- `cayu.server.growing_cost`: a GET route keeps getting slower as it is called,
+  which usually means it reads all stored history on each call.
+- `cayu.server.hot_poll`: one client called the same GET more than 12 times a
+  minute for over 2 minutes and mostly got the same response back. See
+  `cayu guide app-ui` for polling alternatives.
+
+### Leave it idle, measure, fix
+
+Check the cost of an open page before calling UI work done:
+
+1. Start the app (`cayu serve --dev`, or your own server with `mount_cayu`).
+2. Open the UI in a browser and leave it idle for 60 seconds.
+3. Measure the idle cost against a budget, for example 1% of a 0.5 vCPU web
+   process:
+
+   ```bash
+   cayu diagnostics requests --since 60s --budget-idle-cpu 0.01 --vcpu 0.5
+   ```
+
+   Add `--server-url http://127.0.0.1:8000/cayu` when Cayu is mounted at
+   `/cayu` by `mount_cayu`. The command prints requests per minute, p50/p95
+   wall time, CPU seconds per minute, and the share of `--vcpu` for each route,
+   highest CPU first. It exits 1 when the budget is exceeded and 2 when it
+   cannot read the summary. Use `--json` for machine-readable output.
+4. Fix the top route and repeat until the command exits 0. Typical fixes: poll
+   less often or stop polling a hidden tab, return 304 Not Modified when nothing
+   changed, push changes over a stream, and make GET handlers read only recent
+   or changed records instead of rebuilding everything per request.
+
+The same summary is available to operators at `GET /api/diagnostics/requests`
+(protected like the rest of the control plane) and can be added to a support
+bundle with `cayu doctor --bundle cayu-support.zip --requests-from SERVER_URL`.
+
+CPU time is process CPU shared out across the requests running at the same
+time, so work running in the background during a request, such as an agent
+run, is charged to it. Measure idle cost while no agent work is running.
+Timing adds about 15 microseconds of CPU per request (measured on an Apple M1
+Pro with Python 3.14), under 0.1% of one CPU at 50 requests per second.

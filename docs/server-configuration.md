@@ -190,7 +190,9 @@ explicit application policy decision for its exact authority.
 - `cors`: allowed origins, methods, headers, and credential behavior; and
 - `lifecycle`: replay timeout, session follow-stream heartbeat and concurrency
   caps, startup recovery, inactivity fencing, durable side-effect recovery, and
-  shutdown drain limits.
+  shutdown drain limits; and
+- `request_timing`: optional per-request cost recording and development
+  warnings (see [request timing](#request-timing)).
 
 The packaged dashboard uses the configured local control-plane API, so an
 enabled dashboard requires an enabled API. Disable both when exposing neither
@@ -222,6 +224,70 @@ The same API access policy guards `/api/contract` and
 runtime-owned deployment configuration and registrations; it is not a
 readiness endpoint or infrastructure monitor. Keep load balancer liveness
 checks on `/api/health`.
+
+## Request timing
+
+`RequestTimingConfig` turns on a pure ASGI middleware that records one entry per
+HTTP request in a bounded in-memory ring buffer (`buffer_size`, default 10,000
+records). Each entry holds the method, route template (such as
+`/api/sessions/{session_id}`; unmatched requests are `(unmatched)`), status,
+wall time, CPU time, response size, and a client key. The client key is a keyed
+BLAKE2b hash of the `Authorization` header, else the `Cookie` header, else the
+client address and user agent, with a per-process random key. Raw paths, IDs,
+query values, cookies, credentials, and addresses are never stored or logged.
+The middleware forwards every response message as it arrives, so streamed and
+SSE responses are not buffered.
+
+It is on by default where Cayu knows it is serving local development or is the
+process owner:
+
+- `ServerConfig.local_development()` enables it; pass `request_timing=None` to
+  turn it off. `ServerConfig.protected(...)` and direct construction leave it
+  off unless `request_timing=RequestTimingConfig()` is passed.
+- `cayu serve` enables it with and without `--dev`. For maintained services it
+  also covers the product API.
+- `mount_cayu(...)` enables it for `OpenAccess` mounts, mounts assembled by
+  `cayu serve`, and development-mode maintained services. Other authenticated
+  mounts opt in with `request_timing=True` or a `RequestTimingConfig`. By
+  default only the mounted Cayu routes are timed; `observe_host_requests=True`
+  also times the host application's own routes and opts in to timing.
+
+CPU time is process CPU (`time.process_time()`, all threads) apportioned across
+the requests in flight: at each request start and finish the recorder divides
+the CPU used since the previous reading equally among the running requests.
+That counts synchronous handlers running in the thread pool, which
+`time.thread_time()` on the event-loop thread would miss, and does not count
+concurrent async requests twice. CPU used while no request runs is not charged
+to any request, and background work overlapping a request, such as an agent
+run, is charged to it. An event stream stops accruing CPU once its response
+starts.
+
+With `warnings=True` (the default) the server logs, once per condition:
+
+- `cayu.server.slow_request` when a GET route's p50 exceeds
+  `slow_get_threshold_ms` (250 ms) after `slow_get_min_requests` requests in a
+  `slow_get_window_seconds` (5 minute) window, at most once per route and
+  window;
+- `cayu.server.growing_cost` when a GET route's median time rises across
+  `growing_cost_buckets` consecutive buckets of `growing_cost_bucket_requests`
+  requests by at least `growing_cost_ratio`, which usually means it reads all
+  stored history; and
+- `cayu.server.hot_poll` when one client calls the same GET route more than
+  `hot_poll_requests_per_minute` (12) times a minute for more than
+  `hot_poll_duration_seconds` (2 minutes) and at least
+  `hot_poll_identical_share` (80%) of the responses are identical. Responses
+  are compared by a hash of their first MiB and length; bodies are not kept.
+
+The protected `GET /api/diagnostics/requests?since_seconds=300&vcpu=0.5`
+route summarizes the buffer: requests per minute, p50/p95 wall time, CPU seconds
+per minute, and the estimated share of `vcpu` CPUs for each route, ordered by
+CPU. It returns `enabled: false` when timing is off, and its own requests are
+not recorded. `cayu diagnostics requests` reads it from the command line; see
+`cayu guide diagnostics#request-cost` for the idle-cost check.
+
+Measured overhead is about 15 microseconds of CPU per request on an Apple M1
+Pro with Python 3.14, about 0.08% of one CPU at 50 requests per second
+(`tests/server/test_request_timing.py` measures it and fails above 1%).
 
 `DashboardConfig.runtime_config` is serialized into the dashboard HTML and is
 therefore browser-visible. Use it only for non-secret client configuration;

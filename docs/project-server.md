@@ -35,8 +35,11 @@ For trusted local development, open access requires an explicit opt-in:
 cayu serve --dev --host 127.0.0.1 --port 8000
 ```
 
-`--dev` uses `ServerConfig.local_development()`. Without `--dev`, the command
-fails closed unless an authentication target is configured:
+`--dev` uses `ServerConfig.local_development()`. With or without `--dev`,
+`cayu serve` turns on [request timing](server-configuration.md#request-timing),
+so `cayu diagnostics requests` can report per-route cost from the running
+process. Without `--dev`, the command fails closed unless an authentication
+target is configured:
 
 ```toml
 [tool.cayu]

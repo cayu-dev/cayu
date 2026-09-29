@@ -136,10 +136,20 @@ def run_serve(args: argparse.Namespace) -> int:
                         startup_recovery_statuses=settings.startup_recovery_statuses,
                         recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
                     )
+                    # Request timing is on for every `cayu serve` process so
+                    # `cayu diagnostics requests` and support bundles can read it.
+                    request_timing = server_module.RequestTimingConfig()
                     config = (
-                        server_module.ServerConfig.local_development(lifecycle=lifecycle)
+                        server_module.ServerConfig.local_development(
+                            lifecycle=lifecycle,
+                            request_timing=request_timing,
+                        )
                         if args.dev
-                        else server_module.ServerConfig.protected(auth, lifecycle=lifecycle)
+                        else server_module.ServerConfig.protected(
+                            auth,
+                            lifecycle=lifecycle,
+                            request_timing=request_timing,
+                        )
                     )
                     server = server_module.create_server(
                         app,

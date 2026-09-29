@@ -8452,6 +8452,12 @@ available, a store that does not implement the captured-results contract reports
 supplies target, identity, and storage; its readiness projection still reflects
 the capabilities of the supplied store.
 
+The protected `GET /api/diagnostics/requests` response summarizes this
+process's bounded in-memory request-timing buffer by method and route template.
+It contains no raw paths, query values, headers, client addresses, or client
+keys, reports `enabled: false` when request timing is off, and describes one
+process only; see [server configuration](server-configuration.md#request-timing).
+
 The protected `GET /api/system/diagnostics` response is a separate, manually
 requested operator snapshot. It repeats the capability projection so the
 response is independently useful, and adds the resolved Cayu deployment name

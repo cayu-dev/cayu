@@ -31,7 +31,7 @@ factory code or custom store implementations, which remain responsible for
 side-effect-free construction. An incompatible existing built-in store produces
 a minimal `boot_failed` bundle. The command does not start a session, run a
 model or tool, probe a provider, invoke recovery, repair data, or upload the
-result.
+result. It contacts a running server only when `--requests-from` asks it to.
 
 Diagnostic read-only access is distinct from configured durability. Store
 descriptors and the embedded maintained-service checks retain the deployment
@@ -159,6 +159,30 @@ Non-built-in event types collapse to `custom.redacted`. The report includes
 first/last sequence and timestamp bounds, an explicit completeness flag, the
 returned count, and either an exact zero omitted count or a lower bound when
 more events exist; it never performs an unbounded count scan.
+
+## Optional request-cost summary
+
+The request-timing buffer lives in the running server process, so a bundle can
+include it only by reading that server. Request it explicitly:
+
+```bash
+cayu doctor --bundle cayu-support.zip --requests-from https://app.example/cayu
+```
+
+`--requests-from` takes the server root URL including any mount prefix and
+excluding `/api`; plain HTTP is accepted only for loopback hosts. The
+`request_costs` collector reads `GET /api/diagnostics/requests` for the
+`--requests-since` window (default 5 minutes) under the normal collector
+deadline, sending the Authorization header from the variable named by
+`--authorization-env` (default `CAYU_API_AUTHORIZATION`). The evidence keeps the
+window, totals, and up to the item bound of routes with their request rate,
+p50/p95 wall time, CPU seconds, vCPU share, response bytes, and 5xx count. Route
+templates are stored without their leading slash (`api/state`) so they pass the
+absolute-path rule. The URL, credential, and client keys are never written. An
+unreachable, unauthorized, or timing-disabled server makes the collector
+`unavailable` with `request_summary_unavailable`,
+`request_summary_unauthorized`, or `request_timing_disabled`. Without
+`--requests-from` the collector is not registered.
 
 ## Exclusions and redaction
 

@@ -293,6 +293,12 @@ from cayu.runtime.provider_operations import (
     copy_provider_operation_resolution_metadata,
     inspect_provider_operation,
 )
+from cayu.runtime.request_costs import (
+    DEFAULT_REQUEST_COST_WINDOW_SECONDS,
+    MAX_REQUEST_COST_WINDOW_SECONDS,
+    RequestCostSummary,
+    disabled_request_cost_summary,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
@@ -314,6 +320,7 @@ from cayu.server._evaluation_promotion_routes import (
     register_evaluation_promotion_routes,
 )
 from cayu.server._event_side_effect_health import EventSideEffectHealthResponse
+from cayu.server._request_timing import RequestTimingRecorder
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
 from cayu.server.contracts import (
@@ -4206,6 +4213,7 @@ def create_router(
     ) = None,
     _project_context: ResolvedProjectControlPlaneContext | None = None,
     _system_diagnostics_snapshot_sink: (Callable[[SystemDiagnosticsSnapshot], None] | None) = None,
+    _request_timing: RequestTimingRecorder | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -8479,6 +8487,32 @@ def create_router(
             artifact_store_fingerprints=fingerprints,
             artifact_store_total_count=total_count,
         )
+
+    @router.get(
+        "/diagnostics/requests",
+        response_model=RequestCostSummary,
+        dependencies=protected,
+        description=(
+            "Summarize this process's recent request cost from the bounded in-memory "
+            "request-timing buffer: per-route rate, wall time, apportioned CPU seconds, "
+            "and the estimated share of `vcpu` CPUs. Records use route templates and "
+            "keyed client hashes only. Returns `enabled: false` when request timing is off."
+        ),
+    )
+    async def get_request_cost_diagnostics(
+        response: Response,
+        since_seconds: Annotated[
+            float, Query(gt=0, le=MAX_REQUEST_COST_WINDOW_SECONDS)
+        ] = DEFAULT_REQUEST_COST_WINDOW_SECONDS,
+        vcpu: Annotated[float, Query(gt=0, le=1024)] = 1.0,
+    ) -> RequestCostSummary:
+        response.headers["Cache-Control"] = "private, no-store"
+        if _request_timing is None:
+            return disabled_request_cost_summary(
+                requested_window_seconds=since_seconds,
+                vcpu=vcpu,
+            )
+        return _request_timing.summary(since_seconds=since_seconds, vcpu=vcpu)
 
     @router.post(
         "/operations/snapshot",

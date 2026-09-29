@@ -14459,6 +14459,154 @@ export type RegistrationProvenance = {
 };
 
 /**
+ * RequestCostRoute
+ *
+ * Aggregated cost of one method and route template inside the window.
+ */
+export type RequestCostRoute = {
+    /**
+     * Clients
+     */
+    clients: number;
+    /**
+     * Cpu Seconds
+     */
+    cpu_seconds: number;
+    /**
+     * Cpu Seconds Per Minute
+     */
+    cpu_seconds_per_minute: number;
+    /**
+     * Method
+     */
+    method: string;
+    /**
+     * Requests
+     */
+    requests: number;
+    /**
+     * Requests Per Minute
+     */
+    requests_per_minute: number;
+    /**
+     * Response Bytes
+     */
+    response_bytes: number;
+    /**
+     * Route
+     */
+    route: string;
+    /**
+     * Status 2Xx
+     */
+    status_2xx: number;
+    /**
+     * Status 3Xx
+     */
+    status_3xx: number;
+    /**
+     * Status 4Xx
+     */
+    status_4xx: number;
+    /**
+     * Status 5Xx
+     */
+    status_5xx: number;
+    /**
+     * Streaming Requests
+     */
+    streaming_requests: number;
+    /**
+     * Vcpu Share
+     */
+    vcpu_share: number;
+    /**
+     * Wall Ms Max
+     */
+    wall_ms_max?: number | null;
+    /**
+     * Wall Ms P50
+     */
+    wall_ms_p50?: number | null;
+    /**
+     * Wall Ms P95
+     */
+    wall_ms_p95?: number | null;
+};
+
+/**
+ * RequestCostSummary
+ *
+ * Per-route request rate, latency, and CPU over a recent window.
+ *
+ * ``window_seconds`` is the span actually covered by retained records: it is
+ * shorter than ``requested_window_seconds`` when the process started more
+ * recently or when the bounded buffer has already evicted records from the
+ * requested span (``truncated``). Rates and the vCPU share use the covered
+ * span. ``vcpu_share`` is request CPU seconds per second divided by ``vcpu``.
+ * ``routes`` is ordered by CPU seconds, highest first; latency percentiles
+ * exclude streaming responses, whose duration is the stream lifetime.
+ */
+export type RequestCostSummary = {
+    /**
+     * Buffer Capacity
+     */
+    buffer_capacity: number;
+    /**
+     * Cpu Seconds
+     */
+    cpu_seconds: number;
+    /**
+     * Cpu Seconds Per Minute
+     */
+    cpu_seconds_per_minute: number;
+    /**
+     * Enabled
+     */
+    enabled: boolean;
+    /**
+     * Observed At
+     */
+    observed_at: string;
+    /**
+     * Requested Window Seconds
+     */
+    requested_window_seconds: number;
+    /**
+     * Requests
+     */
+    requests: number;
+    /**
+     * Requests Per Minute
+     */
+    requests_per_minute: number;
+    /**
+     * Route Count
+     */
+    route_count: number;
+    /**
+     * Routes
+     */
+    routes: Array<RequestCostRoute>;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+    /**
+     * Vcpu
+     */
+    vcpu: number;
+    /**
+     * Vcpu Share
+     */
+    vcpu_share: number;
+    /**
+     * Window Seconds
+     */
+    window_seconds: number;
+};
+
+/**
  * RequestFootprintConfigManifest
  */
 export type RequestFootprintConfigManifest = {
@@ -19454,6 +19602,40 @@ export type GetContractApiContractGetResponses = {
 };
 
 export type GetContractApiContractGetResponse = GetContractApiContractGetResponses[keyof GetContractApiContractGetResponses];
+
+export type GetRequestCostDiagnosticsApiDiagnosticsRequestsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Since Seconds
+         */
+        since_seconds?: number;
+        /**
+         * Vcpu
+         */
+        vcpu?: number;
+    };
+    url: '/api/diagnostics/requests';
+};
+
+export type GetRequestCostDiagnosticsApiDiagnosticsRequestsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetRequestCostDiagnosticsApiDiagnosticsRequestsGetError = GetRequestCostDiagnosticsApiDiagnosticsRequestsGetErrors[keyof GetRequestCostDiagnosticsApiDiagnosticsRequestsGetErrors];
+
+export type GetRequestCostDiagnosticsApiDiagnosticsRequestsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: RequestCostSummary;
+};
+
+export type GetRequestCostDiagnosticsApiDiagnosticsRequestsGetResponse = GetRequestCostDiagnosticsApiDiagnosticsRequestsGetResponses[keyof GetRequestCostDiagnosticsApiDiagnosticsRequestsGetResponses];
 
 export type ListEnvironmentsApiEnvironmentsGetData = {
     body?: never;

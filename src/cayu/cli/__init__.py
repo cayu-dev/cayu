@@ -30,6 +30,7 @@ def _command_specs() -> tuple[
     from cayu.cli.cloud import add_cloud_parser, run_cloud
     from cayu.cli.console import add_console_parser, run_console
     from cayu.cli.dashboard import add_dashboard_parser, run_dashboard
+    from cayu.cli.diagnostics import add_diagnostics_parser, run_diagnostics
     from cayu.cli.doctor import add_doctor_parser, run_doctor
     from cayu.cli.evals import add_eval_parser, run_eval_command
     from cayu.cli.generate import add_generate_parser, run_generate
@@ -50,6 +51,7 @@ def _command_specs() -> tuple[
         ("cloud", add_cloud_parser, run_cloud),
         ("console", add_console_parser, run_console),
         ("dashboard", add_dashboard_parser, run_dashboard),
+        ("diagnostics", add_diagnostics_parser, run_diagnostics),
         ("doctor", add_doctor_parser, run_doctor),
         ("eval", add_eval_parser, run_eval_command),
         ("generate", add_generate_parser, run_generate),

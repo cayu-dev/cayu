@@ -29034,6 +29034,233 @@
         "title": "RegistrationProvenance",
         "type": "object"
       },
+      "RequestCostRoute": {
+        "additionalProperties": false,
+        "description": "Aggregated cost of one method and route template inside the window.",
+        "properties": {
+          "clients": {
+            "minimum": 0.0,
+            "title": "Clients",
+            "type": "integer"
+          },
+          "cpu_seconds": {
+            "minimum": 0.0,
+            "title": "Cpu Seconds",
+            "type": "number"
+          },
+          "cpu_seconds_per_minute": {
+            "minimum": 0.0,
+            "title": "Cpu Seconds Per Minute",
+            "type": "number"
+          },
+          "method": {
+            "maxLength": 16,
+            "title": "Method",
+            "type": "string"
+          },
+          "requests": {
+            "minimum": 0.0,
+            "title": "Requests",
+            "type": "integer"
+          },
+          "requests_per_minute": {
+            "minimum": 0.0,
+            "title": "Requests Per Minute",
+            "type": "number"
+          },
+          "response_bytes": {
+            "minimum": 0.0,
+            "title": "Response Bytes",
+            "type": "integer"
+          },
+          "route": {
+            "maxLength": 512,
+            "title": "Route",
+            "type": "string"
+          },
+          "status_2xx": {
+            "minimum": 0.0,
+            "title": "Status 2Xx",
+            "type": "integer"
+          },
+          "status_3xx": {
+            "minimum": 0.0,
+            "title": "Status 3Xx",
+            "type": "integer"
+          },
+          "status_4xx": {
+            "minimum": 0.0,
+            "title": "Status 4Xx",
+            "type": "integer"
+          },
+          "status_5xx": {
+            "minimum": 0.0,
+            "title": "Status 5Xx",
+            "type": "integer"
+          },
+          "streaming_requests": {
+            "minimum": 0.0,
+            "title": "Streaming Requests",
+            "type": "integer"
+          },
+          "vcpu_share": {
+            "minimum": 0.0,
+            "title": "Vcpu Share",
+            "type": "number"
+          },
+          "wall_ms_max": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wall Ms Max"
+          },
+          "wall_ms_p50": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wall Ms P50"
+          },
+          "wall_ms_p95": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wall Ms P95"
+          }
+        },
+        "required": [
+          "method",
+          "route",
+          "requests",
+          "requests_per_minute",
+          "streaming_requests",
+          "status_2xx",
+          "status_3xx",
+          "status_4xx",
+          "status_5xx",
+          "cpu_seconds",
+          "cpu_seconds_per_minute",
+          "vcpu_share",
+          "response_bytes",
+          "clients"
+        ],
+        "title": "RequestCostRoute",
+        "type": "object"
+      },
+      "RequestCostSummary": {
+        "additionalProperties": false,
+        "description": "Per-route request rate, latency, and CPU over a recent window.\n\n``window_seconds`` is the span actually covered by retained records: it is\nshorter than ``requested_window_seconds`` when the process started more\nrecently or when the bounded buffer has already evicted records from the\nrequested span (``truncated``). Rates and the vCPU share use the covered\nspan. ``vcpu_share`` is request CPU seconds per second divided by ``vcpu``.\n``routes`` is ordered by CPU seconds, highest first; latency percentiles\nexclude streaming responses, whose duration is the stream lifetime.",
+        "properties": {
+          "buffer_capacity": {
+            "minimum": 0.0,
+            "title": "Buffer Capacity",
+            "type": "integer"
+          },
+          "cpu_seconds": {
+            "minimum": 0.0,
+            "title": "Cpu Seconds",
+            "type": "number"
+          },
+          "cpu_seconds_per_minute": {
+            "minimum": 0.0,
+            "title": "Cpu Seconds Per Minute",
+            "type": "number"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "requested_window_seconds": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 86400.0,
+            "title": "Requested Window Seconds",
+            "type": "number"
+          },
+          "requests": {
+            "minimum": 0.0,
+            "title": "Requests",
+            "type": "integer"
+          },
+          "requests_per_minute": {
+            "minimum": 0.0,
+            "title": "Requests Per Minute",
+            "type": "number"
+          },
+          "route_count": {
+            "minimum": 0.0,
+            "title": "Route Count",
+            "type": "integer"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/RequestCostRoute"
+            },
+            "maxItems": 200,
+            "title": "Routes",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "vcpu": {
+            "exclusiveMinimum": 0.0,
+            "title": "Vcpu",
+            "type": "number"
+          },
+          "vcpu_share": {
+            "minimum": 0.0,
+            "title": "Vcpu Share",
+            "type": "number"
+          },
+          "window_seconds": {
+            "maximum": 86400.0,
+            "minimum": 0.0,
+            "title": "Window Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "observed_at",
+          "enabled",
+          "requested_window_seconds",
+          "window_seconds",
+          "truncated",
+          "buffer_capacity",
+          "vcpu",
+          "requests",
+          "requests_per_minute",
+          "cpu_seconds",
+          "cpu_seconds_per_minute",
+          "vcpu_share",
+          "route_count",
+          "routes"
+        ],
+        "title": "RequestCostSummary",
+        "type": "object"
+      },
       "RequestFootprintConfigManifest": {
         "additionalProperties": false,
         "properties": {
@@ -38353,6 +38580,61 @@
           "title": "AuthContext",
           "type": "object"
         }
+      }
+    },
+    "/api/diagnostics/requests": {
+      "get": {
+        "description": "Summarize this process's recent request cost from the bounded in-memory request-timing buffer: per-route rate, wall time, apportioned CPU seconds, and the estimated share of `vcpu` CPUs. Records use route templates and keyed client hashes only. Returns `enabled: false` when request timing is off.",
+        "operationId": "get_request_cost_diagnostics_api_diagnostics_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since_seconds",
+            "required": false,
+            "schema": {
+              "default": 300,
+              "exclusiveMinimum": 0,
+              "maximum": 86400,
+              "title": "Since Seconds",
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "vcpu",
+            "required": false,
+            "schema": {
+              "default": 1.0,
+              "exclusiveMinimum": 0,
+              "maximum": 1024,
+              "title": "Vcpu",
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestCostSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Request Cost Diagnostics"
       }
     },
     "/api/environments": {

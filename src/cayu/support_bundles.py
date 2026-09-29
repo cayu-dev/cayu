@@ -16,7 +16,7 @@ import time
 import zipfile
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
@@ -47,6 +47,7 @@ from cayu.evals.store import EvalStore
 from cayu.events import EventType
 from cayu.runtime.checks import ProjectCheckReport
 from cayu.runtime.manifest import AppManifest
+from cayu.runtime.request_costs import RequestCostSummary
 from cayu.runtime.service_manifest import PublicServiceManifest
 from cayu.runtime.system_diagnostics import SystemDiagnosticsResponse
 from cayu.sessions.base import (
@@ -466,6 +467,77 @@ class OptionalPackagesEvidence(_SupportModel):
     packages: tuple[OptionalPackageEvidence, ...]
 
 
+class RequestCostRouteEvidence(_SupportModel):
+    method: str = Field(max_length=16)
+    # Route templates are stored without their leading slash so they cannot be
+    # mistaken for filesystem paths by the archive's content rules.
+    route: str = Field(max_length=512)
+    requests: StrictInt = Field(ge=0)
+    requests_per_minute: float = Field(ge=0)
+    streaming_requests: StrictInt = Field(ge=0)
+    status_5xx: StrictInt = Field(ge=0)
+    wall_ms_p50: float | None = Field(ge=0)
+    wall_ms_p95: float | None = Field(ge=0)
+    cpu_seconds: float = Field(ge=0)
+    cpu_seconds_per_minute: float = Field(ge=0)
+    vcpu_share: float = Field(ge=0)
+    response_bytes: StrictInt = Field(ge=0)
+
+
+class RequestCostEvidence(_SupportModel):
+    kind: Literal["request_costs"] = "request_costs"
+    requested_window_seconds: float = Field(gt=0)
+    window_seconds: float = Field(ge=0)
+    truncated: bool
+    vcpu: float = Field(gt=0)
+    requests: StrictInt = Field(ge=0)
+    requests_per_minute: float = Field(ge=0)
+    cpu_seconds: float = Field(ge=0)
+    cpu_seconds_per_minute: float = Field(ge=0)
+    vcpu_share: float = Field(ge=0)
+    route_inventory: BoundedInventory
+    routes: tuple[RequestCostRouteEvidence, ...]
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> RequestCostEvidence:
+        if self.route_inventory.included_count != len(self.routes):
+            raise ValueError("route inventory must match included routes.")
+        return self
+
+    @classmethod
+    def from_summary(cls, summary: RequestCostSummary, *, max_routes: int) -> RequestCostEvidence:
+        routes = summary.routes[:max_routes]
+        return cls(
+            requested_window_seconds=summary.requested_window_seconds,
+            window_seconds=summary.window_seconds,
+            truncated=summary.truncated,
+            vcpu=summary.vcpu,
+            requests=summary.requests,
+            requests_per_minute=summary.requests_per_minute,
+            cpu_seconds=summary.cpu_seconds,
+            cpu_seconds_per_minute=summary.cpu_seconds_per_minute,
+            vcpu_share=summary.vcpu_share,
+            route_inventory=_inventory(summary.route_count, len(routes)),
+            routes=tuple(
+                RequestCostRouteEvidence(
+                    method=route.method,
+                    route=route.route.lstrip("/"),
+                    requests=route.requests,
+                    requests_per_minute=route.requests_per_minute,
+                    streaming_requests=route.streaming_requests,
+                    status_5xx=route.status_5xx,
+                    wall_ms_p50=route.wall_ms_p50,
+                    wall_ms_p95=route.wall_ms_p95,
+                    cpu_seconds=route.cpu_seconds,
+                    cpu_seconds_per_minute=route.cpu_seconds_per_minute,
+                    vcpu_share=route.vcpu_share,
+                    response_bytes=route.response_bytes,
+                )
+                for route in routes
+            ),
+        )
+
+
 class EventEnvelopeEvidence(_SupportModel):
     sequence: StrictInt = Field(ge=1)
     type: str
@@ -559,6 +631,7 @@ SupportEvidence: TypeAlias = Annotated[
     | TaskOperationalEvidence
     | ArtifactAvailabilityEvidence
     | OptionalPackagesEvidence
+    | RequestCostEvidence
     | SessionEventTailEvidence,
     Field(discriminator="kind"),
 ]
@@ -726,6 +799,15 @@ class SupportBundleContext:
     eval_store: EvalStore | None = None
     control_plane_diagnostics: SystemDiagnosticsResponse | None = None
     limits: SupportBundleLimits = DEFAULT_SUPPORT_BUNDLE_LIMITS
+
+
+@dataclass(frozen=True, slots=True)
+class RequestCostSource:
+    """A running server's request-cost endpoint that Doctor was asked to read."""
+
+    endpoint: str
+    since_seconds: float
+    authorization: str | None = field(default=None, repr=False)
 
 
 class SupportBundleCollector(Protocol):
@@ -1101,6 +1183,7 @@ def _normalized_now(now: Callable[[], datetime]) -> datetime:
 def builtin_support_collectors(
     *,
     session_selectors: Sequence[str] = (),
+    request_costs: RequestCostSource | None = None,
 ) -> tuple[SupportBundleCollector, ...]:
     collectors: list[SupportBundleCollector] = [
         FunctionalSupportBundleCollector("runtime_identity", _collect_runtime_identity),
@@ -1115,6 +1198,13 @@ def builtin_support_collectors(
         FunctionalSupportBundleCollector("artifacts", _collect_artifacts),
         FunctionalSupportBundleCollector("optional_packages", _collect_optional_packages),
     ]
+    if request_costs is not None:
+        collectors.append(
+            FunctionalSupportBundleCollector(
+                "request_costs",
+                partial(_collect_request_costs, source=request_costs),
+            )
+        )
     for index, selector in enumerate(tuple(session_selectors), start=1):
         collectors.append(
             FunctionalSupportBundleCollector(
@@ -1466,6 +1556,51 @@ async def _collect_optional_packages(
                 )
             )
     return collected(OptionalPackagesEvidence(packages=tuple(packages)))
+
+
+async def _collect_request_costs(
+    context: SupportBundleContext,
+    *,
+    source: RequestCostSource,
+) -> SupportCollectorOutput:
+    """Read a running server's request summary; the bundle keeps no URL or credential."""
+
+    import httpx
+
+    headers = {"Accept": "application/json"}
+    if source.authorization is not None:
+        headers["Authorization"] = source.authorization
+    body = bytearray()
+    try:
+        async with (
+            httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=context.limits.collector_timeout_seconds,
+            ) as client,
+            client.stream(
+                "GET",
+                source.endpoint,
+                params={"since_seconds": source.since_seconds},
+                headers=headers,
+            ) as response,
+        ):
+            if response.status_code in {401, 403}:
+                return unavailable("request_summary_unauthorized")
+            if response.status_code != 200:
+                return unavailable("request_summary_unavailable")
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > context.limits.max_collector_bytes * 4:
+                    return unavailable("request_summary_too_large")
+    except httpx.HTTPError:
+        return unavailable("request_summary_unavailable")
+    try:
+        summary = RequestCostSummary.model_validate_json(bytes(body))
+    except ValueError:
+        return unavailable("request_summary_invalid")
+    if not summary.enabled:
+        return unavailable("request_timing_disabled")
+    return collected(RequestCostEvidence.from_summary(summary, max_routes=context.limits.max_items))
 
 
 def _event_tail_function(

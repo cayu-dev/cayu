@@ -444,6 +444,50 @@ class DocsConfig(BaseModel):
     enabled: StrictBool = False
 
 
+class RequestTimingConfig(BaseModel):
+    """Per-request cost recording and development warnings.
+
+    Records carry the method, route template, status, wall time, apportioned
+    process CPU time, response size, and a keyed client hash. They live only in
+    a bounded in-memory ring buffer of ``buffer_size`` records. ``warnings``
+    controls the ``cayu.server.slow_request``, ``cayu.server.growing_cost``, and
+    ``cayu.server.hot_poll`` log warnings; the buffer is kept either way.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    buffer_size: StrictInt = Field(default=10_000, ge=100, le=1_000_000)
+    warnings: StrictBool = True
+    slow_get_threshold_ms: float = Field(default=250.0, gt=0, le=600_000)
+    slow_get_window_seconds: float = Field(default=300.0, gt=0, le=86_400)
+    slow_get_min_requests: StrictInt = Field(default=5, ge=1, le=10_000)
+    growing_cost_bucket_requests: StrictInt = Field(default=10, ge=2, le=10_000)
+    growing_cost_buckets: StrictInt = Field(default=4, ge=2, le=100)
+    growing_cost_ratio: float = Field(default=1.5, gt=1, le=1_000)
+    growing_cost_min_ms: float = Field(default=20.0, ge=0, le=600_000)
+    hot_poll_requests_per_minute: StrictInt = Field(default=12, ge=1, le=100_000)
+    hot_poll_duration_seconds: float = Field(default=120.0, gt=0, le=86_400)
+    hot_poll_identical_share: float = Field(default=0.8, gt=0, le=1)
+
+    @field_validator(
+        "slow_get_threshold_ms",
+        "slow_get_window_seconds",
+        "growing_cost_ratio",
+        "growing_cost_min_ms",
+        "hot_poll_duration_seconds",
+        "hot_poll_identical_share",
+        mode="before",
+    )
+    @classmethod
+    def validate_finite_number(cls, value: object, info) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value):
+            raise ValueError(f"{info.field_name} must be a finite number.")
+        return float(value)
+
+
+_DEFAULT_REQUEST_TIMING = RequestTimingConfig()
+
+
 class CorsConfig(BaseModel):
     """Explicit browser cross-origin request policy."""
 
@@ -571,6 +615,7 @@ class ServerConfig(BaseModel):
     docs: DocsConfig = Field(default_factory=DocsConfig)
     cors: CorsConfig = Field(default_factory=CorsConfig)
     lifecycle: ServerLifecycleConfig = Field(default_factory=ServerLifecycleConfig)
+    request_timing: RequestTimingConfig | None = None
 
     @model_validator(mode="wrap")
     @classmethod
@@ -644,8 +689,13 @@ class ServerConfig(BaseModel):
         api: ServerApiConfig | None = None,
         dashboard: DashboardConfig | None = None,
         lifecycle: ServerLifecycleConfig | None = None,
+        request_timing: RequestTimingConfig | None = _DEFAULT_REQUEST_TIMING,
     ) -> ServerConfig:
-        """Build an explicitly open local configuration with docs and Vite CORS."""
+        """Build an explicitly open local configuration with docs and Vite CORS.
+
+        Request timing is on by default here; pass ``request_timing=None`` to
+        turn it off.
+        """
 
         return cls(
             deployment_name=deployment_name,
@@ -655,6 +705,7 @@ class ServerConfig(BaseModel):
             docs=DocsConfig(enabled=True),
             cors=CorsConfig(allowed_origins=(DEFAULT_LOCAL_CORS_ORIGIN,)),
             lifecycle=lifecycle or ServerLifecycleConfig(),
+            request_timing=request_timing,
         )
 
     @classmethod
@@ -671,10 +722,12 @@ class ServerConfig(BaseModel):
         evaluation_promotion: EvaluationPromotionConfig | None = None,
         evals: EvalsConfig | None = None,
         browser_control: BrowserControlServerConfig | None = None,
+        request_timing: RequestTimingConfig | None = None,
     ) -> ServerConfig:
         """Build a protected configuration around an application auth dependency."""
 
         return cls(
+            request_timing=request_timing,
             deployment_name=deployment_name,
             access=AuthenticatedAccess(dependency=dependency),
             api=api or ServerApiConfig(),
@@ -705,6 +758,7 @@ class ServerConfig(BaseModel):
             "evals": {"configured": self.evals is not None},
             "browser_control": {"configured": self.browser_control is not None},
             "docs": {"enabled": self.docs.enabled},
+            "request_timing": {"enabled": self.request_timing is not None},
             "cors": {
                 "allowed_origins": list(self.cors.allowed_origins),
                 "allow_methods": list(self.cors.allow_methods),

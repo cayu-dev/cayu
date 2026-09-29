@@ -66,6 +66,7 @@ try:
         ServiceMode,
     )
     from cayu.server._diagnostics import SystemDiagnosticsSnapshot, dashboard_pricing_metadata
+    from cayu.server._request_timing import RequestTimingMiddleware, RequestTimingRecorder
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
     from cayu.server.config import (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
@@ -84,6 +85,7 @@ try:
         EvalsConfig,
         EvaluationPromotionConfig,
         OpenAccess,
+        RequestTimingConfig,
         ServerAccessConfig,
         ServerApiConfig,
         ServerConfig,
@@ -168,6 +170,7 @@ __all__ = [
     "ProductResultReceiptConflict",
     "ProjectControlPlaneContext",
     "PublicServiceManifest",
+    "RequestTimingConfig",
     "RuntimeStoreDurability",
     "ServerAccessConfig",
     "ServerApiConfig",
@@ -401,6 +404,14 @@ def create_server(
             allow_headers=list(resolved_config.cors.allow_headers),
             allow_credentials=resolved_config.cors.allow_credentials,
         )
+    # Added last so it is the outermost application middleware and times the
+    # complete request, including CORS handling.
+    request_timing = _install_request_timing(
+        server,
+        resolved_config.request_timing,
+        api_path=resolved_config.api.path,
+        observe_prefix=None,
+    )
 
     session_store = app.session_store
     task_store = app.task_store
@@ -456,6 +467,7 @@ def create_server(
             generated_evals_pricing=configured_dashboard_price_book,
             evals=resolved_config.evals,
             _project_context=resolved_project_context,
+            _request_timing=request_timing,
         )
         server.include_router(router)
         if browser_control_server is not None:
@@ -543,6 +555,8 @@ def mount_cayu(
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
     ) = None,
     name: str = "cayu-dashboard",
+    request_timing: RequestTimingConfig | bool | None = None,
+    observe_host_requests: bool = False,
     _project_context: ProjectControlPlaneContext | None = None,
     _system_diagnostics_snapshot_sink: (Callable[[SystemDiagnosticsSnapshot], None] | None) = None,
 ) -> None:
@@ -574,11 +588,25 @@ def mount_cayu(
     ``continuation_loop_policy_provider`` lets an embedding boundary attach
     trusted in-process policies to control-plane continuations; HTTP callers
     cannot supply or serialize those policies.
+
+    ``request_timing`` records per-request cost for the mounted Cayu routes, and
+    for every host route as well when ``observe_host_requests`` is true. The
+    default (``None``) turns it on for local development, meaning deliberate
+    ``OpenAccess`` or a mount assembled by ``cayu serve``, and leaves it off for
+    other authenticated mounts. Pass ``True`` or a ``RequestTimingConfig`` to
+    opt in, or ``False`` to turn it off. ``observe_host_requests=True`` also opts
+    in unless timing is explicitly off.
     """
     resolved_project_context = resolve_project_control_plane_context(_project_context, app)
     auth = auth_dependency_for(access)
     mount_path = normalize_dashboard_path(path, field_name="path")
     api_path = _join_public_paths(mount_path, "api")
+    resolved_request_timing = _resolve_mount_request_timing(
+        request_timing,
+        observe_host_requests=observe_host_requests,
+        open_access=auth is None,
+        cayu_serve=resolved_project_context is not None,
+    )
     prepared_dashboard: tuple[str, DashboardStaticFiles] | None = None
     resolved_dashboard_config = normalize_dashboard_runtime_config(
         {} if dashboard_config is None else dashboard_config,
@@ -616,6 +644,14 @@ def mount_cayu(
         raise ValueError(
             "interruption_recovery_inactive_after_seconds must be a non-negative integer."
         )
+    mount_request_timing = (
+        None
+        if resolved_request_timing is None
+        else RequestTimingRecorder(
+            resolved_request_timing,
+            excluded_routes=frozenset({_request_cost_route(api_path)}),
+        )
+    )
     router = create_router(
         cayu_app=app,
         session_store=app.session_store,
@@ -656,10 +692,18 @@ def mount_cayu(
         continuation_loop_policy_provider=continuation_loop_policy_provider,
         _project_context=resolved_project_context,
         _system_diagnostics_snapshot_sink=_system_diagnostics_snapshot_sink,
+        _request_timing=mount_request_timing,
     )
 
     # All caller-controlled values and route construction are validated before
     # changing the host application. A rejected mount must leave it reusable.
+    _install_request_timing(
+        server,
+        resolved_request_timing,
+        api_path=api_path,
+        observe_prefix=None if observe_host_requests else mount_path,
+        recorder=mount_request_timing,
+    )
     _compose_interruption_drain_lifespan(
         server,
         app,
@@ -681,6 +725,59 @@ def mount_cayu(
             dashboard_app=dashboard_app,
             name=name,
         )
+
+
+def _resolve_mount_request_timing(
+    request_timing: RequestTimingConfig | bool | None,
+    *,
+    observe_host_requests: bool,
+    open_access: bool,
+    cayu_serve: bool,
+) -> RequestTimingConfig | None:
+    if type(observe_host_requests) is not bool:
+        raise TypeError("observe_host_requests must be a bool.")
+    if request_timing is None:
+        enabled = open_access or cayu_serve or observe_host_requests
+        return RequestTimingConfig() if enabled else None
+    if request_timing is True:
+        return RequestTimingConfig()
+    if request_timing is False:
+        if observe_host_requests:
+            raise ValueError("observe_host_requests requires request timing.")
+        return None
+    if type(request_timing) is not RequestTimingConfig:
+        raise TypeError("request_timing must be a RequestTimingConfig, a bool, or None.")
+    return request_timing
+
+
+def _request_cost_route(api_path: str) -> str:
+    return _join_public_paths(api_path, "diagnostics/requests")
+
+
+def _install_request_timing(
+    server: Any,
+    config: RequestTimingConfig | None,
+    *,
+    api_path: str,
+    observe_prefix: str | None,
+    recorder: RequestTimingRecorder | None = None,
+) -> RequestTimingRecorder | None:
+    if config is None:
+        return None
+    if recorder is None:
+        # The summary route itself is not recorded, so measuring cost does
+        # not add to it.
+        recorder = RequestTimingRecorder(
+            config,
+            excluded_routes=frozenset({_request_cost_route(api_path)}),
+        )
+    server.add_middleware(
+        RequestTimingMiddleware,
+        recorder=recorder,
+        observe_prefix=observe_prefix,
+    )
+    server.state.cayu_request_timing = recorder
+    return recorder
 
 
 def mount_dashboard(

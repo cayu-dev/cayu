@@ -17,6 +17,12 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.cli.check import build_project_check_report
+from cayu.cli.diagnostics import (
+    DEFAULT_AUTHORIZATION_ENV,
+    duration_seconds,
+    read_authorization,
+    request_cost_endpoint,
+)
 from cayu.cli.project import (
     build_project_app,
     build_project_service,
@@ -30,12 +36,14 @@ from cayu.cli.project_control_plane import (
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 from cayu.project_control_plane import resolve_project_control_plane_context
 from cayu.runtime.checks import DiagnosticSeverity, ProjectControlPlaneCheckEvidence
+from cayu.runtime.request_costs import DEFAULT_REQUEST_COST_WINDOW_SECONDS
 from cayu.sessions.base import MAX_SESSION_ID_BYTES
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.support_bundles import (
     DEFAULT_SUPPORT_BUNDLE_LIMITS,
     SUPPORT_BUNDLE_SCHEMA_VERSION,
     CollectorDisposition,
+    RequestCostSource,
     SupportBundleContext,
     SupportBundleOutcome,
     SupportBundleReport,
@@ -97,10 +105,42 @@ def add_doctor_parser(subparsers: Any) -> None:
         ),
     )
     parser.add_argument(
+        "--requests-from",
+        metavar="SERVER_URL",
+        type=_request_cost_endpoint_argument,
+        help=(
+            "Also read the request-cost summary from this running Cayu server "
+            "(root URL including any mount prefix, excluding /api). The bundle keeps "
+            "the summary but not the URL or credential."
+        ),
+    )
+    parser.add_argument(
+        "--requests-since",
+        metavar="DURATION",
+        type=duration_seconds,
+        default=float(DEFAULT_REQUEST_COST_WINDOW_SECONDS),
+        help="Request-cost window for --requests-from, such as 5m or 1h (default: 5m).",
+    )
+    parser.add_argument(
+        "--authorization-env",
+        default=DEFAULT_AUTHORIZATION_ENV,
+        metavar="NAME",
+        help=(
+            "Environment variable containing the complete Authorization header for --requests-from."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the stable command outcome as JSON.",
     )
+
+
+def _request_cost_endpoint_argument(value: str) -> str:
+    try:
+        return request_cost_endpoint(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def run_doctor(args: argparse.Namespace) -> int:
@@ -112,6 +152,19 @@ def _run_doctor_before_deadline(args: argparse.Namespace) -> int:
     command_deadline = time.monotonic() + DEFAULT_SUPPORT_BUNDLE_LIMITS.command_timeout_seconds
     sessions = tuple(args.session)
     request_error = _validate_session_selectors(sessions)
+    request_costs: RequestCostSource | None = None
+    requests_from = getattr(args, "requests_from", None)
+    if request_error is None and requests_from is not None:
+        try:
+            authorization = read_authorization(args.authorization_env)
+        except ValueError:
+            request_error = "invalid_request_authorization"
+        else:
+            request_costs = RequestCostSource(
+                endpoint=requests_from,
+                since_seconds=args.requests_since,
+                authorization=authorization,
+            )
     if request_error is not None:
         report = minimal_support_bundle_report(
             outcome=SupportBundleOutcome.VALIDATION_FAILED,
@@ -138,6 +191,7 @@ def _run_doctor_before_deadline(args: argparse.Namespace) -> int:
                 args.target,
                 sessions,
                 worker_timeout_seconds=worker_budget,
+                request_costs=request_costs,
             )
         )
 
@@ -426,7 +480,10 @@ def _run_bounded_worker(
     sessions: tuple[str, ...],
     *,
     worker_timeout_seconds: float = (DEFAULT_SUPPORT_BUNDLE_LIMITS.worker_timeout_seconds),
-    _worker_entry: Callable[[Connection, str | None, tuple[str, ...]], None] | None = None,
+    request_costs: RequestCostSource | None = None,
+    _worker_entry: (
+        Callable[[Connection, str | None, tuple[str, ...], RequestCostSource | None], None] | None
+    ) = None,
 ) -> SupportBundleReport:
     worker_deadline = time.monotonic() + worker_timeout_seconds
     context = multiprocessing.get_context("spawn")
@@ -439,6 +496,7 @@ def _run_bounded_worker(
             child_connection,
             target,
             sessions,
+            request_costs,
         ),
         name="cayu-doctor",
     )
@@ -517,10 +575,15 @@ def _doctor_worker_entry(
     connection: Connection,
     target: str | None,
     sessions: tuple[str, ...],
+    request_costs: RequestCostSource | None = None,
 ) -> None:
     _silence_worker_side_channels()
     try:
-        report = _collect_project_report(target=target, sessions=sessions)
+        report = _collect_project_report(
+            target=target,
+            sessions=sessions,
+            request_costs=request_costs,
+        )
         payload = report.model_dump_json().encode("utf-8")
         if len(payload) > DEFAULT_SUPPORT_BUNDLE_LIMITS.max_bundle_bytes:
             report = minimal_support_bundle_report(
@@ -558,11 +621,13 @@ def _collect_project_report(
     *,
     target: str | None,
     sessions: tuple[str, ...],
+    request_costs: RequestCostSource | None = None,
 ) -> SupportBundleReport:
     with diagnostic_store_inspection() as inspection:
         report = _collect_project_report_under_inspection(
             target=target,
             sessions=sessions,
+            request_costs=request_costs,
         )
         try:
             inspection.verify()
@@ -575,6 +640,7 @@ def _collect_project_report_under_inspection(
     *,
     target: str | None,
     sessions: tuple[str, ...],
+    request_costs: RequestCostSource | None = None,
 ) -> SupportBundleReport:
     control_plane_context = None
     report: SupportBundleReport | None = None
@@ -664,7 +730,10 @@ def _collect_project_report_under_inspection(
                     eval_store=resolved_context.eval_store,
                     control_plane_diagnostics=control_plane_diagnostics,
                 ),
-                builtin_support_collectors(session_selectors=sessions),
+                builtin_support_collectors(
+                    session_selectors=sessions,
+                    request_costs=request_costs,
+                ),
             )
         )
     except BaseException:

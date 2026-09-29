@@ -206,6 +206,8 @@ def test_serve_starts_supported_production_service_on_one_listener(
     assert manifest.mode == "production"
     assert manifest.product_access == "authenticated"
     assert manifest.operator_access == "authenticated"
+    # `cayu serve` times requests in production too, for `cayu diagnostics requests`.
+    assert launched["server"].state.cayu_request_timing is not None
 
 
 def test_serve_discovers_project_and_runs_one_local_process(
@@ -339,6 +341,7 @@ def build_app():
     server = launched["server"]
     assert launched["host"] == "0.0.0.0"
     assert server.state.cayu_server_config.access.kind == "authenticated"
+    assert server.state.cayu_server_config.request_timing is not None
     with TestClient(server) as client:
         assert client.get("/api/health").json() == {"ok": True}
         assert client.get("/api/sessions").status_code == 401
