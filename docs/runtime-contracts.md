@@ -2518,7 +2518,38 @@ lifetime and a five-minute termination allowance, AWS's maximum-duration
 enforcement is the termination proof. Before then, or when AWS's time cannot be
 read, cleanup stays `pending_allocation_cleanup`; the local clock never proves
 disposal. The proof relies on AWS enforcing SigV4 request expiry and
-`maximumDurationInSeconds`.
+`maximumDurationInSeconds`. A replay that AWS rejects for account quota
+(`ServiceQuotaExceededException`) creates nothing and does not consume the
+token; a later replay creates normally, so a quota-limited reap stays pending
+and retries rather than concluding that nothing exists. Observed token
+retention exceeded one hour, the maximum configurable replay window.
+
+Lambda MicroVM supports same-MicroVM virtual-egress reconnect. Its durable
+identity is exactly `microvm_id`, `endpoint`, `region`, `image_identifier`
+(an ARN), `image_version`, `session_id`, and `environment_name`; any other key,
+including endpoint tokens, proxy authority, or CA material, is rejected before
+the envelope is written or read. `prepare_reconnect` refuses an identity owned
+by another session, environment, or region and then builds a new proxy, broker,
+session CA, and grant set from trusted adapter configuration. Credentials,
+proxy endpoints, and CA trust from the previous binding are never reused: they
+were revoked by interrupted finalization or died with their worker. Attachment
+reads the MicroVM from the control plane, resumes it when suspended, rejects a
+failed, terminating, or terminated MicroVM without creating another, and
+requires its endpoint and image identity to match durable metadata. Before
+agent execution the adapter reinstalls the new CA, reruns setup commands and
+the network/metadata preflight, and, in `metadata_isolation="required"` mode,
+runs a guest probe proving that agent commands have no root user or group id,
+no Linux capabilities, `no_new_privs`, no AWS credential variables, and no
+readable AWS credentials file. The probe reports only exit codes. A passing
+probe upgrades `guest_privilege_containment` and `unprivileged_guest` to
+live-verified evidence for that runner. Interrupted finalization returns
+`allocation_preserved=True` only after the control plane reports `SUSPENDED`.
+`is_allocation_disposed` is true only for a `TERMINATED` readback or a
+not-found response for an identity Cayu acknowledged (MicroVM ids are never
+reused); read failures propagate and preserve reconnect. The first-party
+sidecar's suspend hook cancels its supervised commands; reconnect itself does
+not kill guest processes, and any process that outlived its command holds only
+virtual credentials that no current broker honors.
 
 E2B binds its provider
 submission to the runtime allocation id in provider metadata. Recovery lists

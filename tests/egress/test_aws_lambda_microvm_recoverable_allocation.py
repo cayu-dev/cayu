@@ -102,6 +102,7 @@ def _skip_guest_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(adapter_module, "_install_ca", no_guest_work)
     monkeypatch.setattr(adapter_module, "run_setup_commands", no_guest_work)
     monkeypatch.setattr(adapter_module, "run_enforcement_preflight", preflight)
+    monkeypatch.setattr(adapter_module, "_verify_agent_privilege_boundary", no_guest_work)
 
 
 def _adapter(model: ClientTokenLambdaModel, tmp_path: Path, **options: Any):

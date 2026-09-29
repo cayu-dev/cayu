@@ -28,7 +28,11 @@ from cayu.egress.adapter import (
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.capabilities import EgressCapabilityClaim, EgressCapabilityEvidence
-from cayu.egress.errors import UnsupportedEgressError
+from cayu.egress.errors import (
+    InvalidEgressReconnectMetadataError,
+    UnsupportedEgressCapabilityError,
+    UnsupportedEgressError,
+)
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ProxyExposure, VpcTaskProxyExposure
 from cayu.environments.admission import ExecutionCapabilityEvidence
@@ -44,6 +48,7 @@ from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMError,
     _control_client,
     lambda_microvm_run_options,
+    read_microvm_state,
     run_microvm_with_client_token,
     terminate_microvm_confirmed,
 )
@@ -69,6 +74,17 @@ _ALLOCATION_METADATA_KEYS = frozenset(
         "maximum_duration_s",
         "prepared_at_s",
         "replay_window_s",
+    }
+)
+_RECONNECT_IDENTITY_KEYS = frozenset(
+    {
+        "microvm_id",
+        "endpoint",
+        "region",
+        "image_identifier",
+        "image_version",
+        "session_id",
+        "environment_name",
     }
 )
 _METADATA_ISOLATION_UNVERIFIED_REASON = "guest_process_boundary_unverified"
@@ -120,6 +136,8 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     process_external_allocation = True
     allocation_provider = "aws-lambda-microvm"
     allocation_adapter_generation = "virtual-egress-client-token-v1"
+    supports_reconnect = True
+    supports_allocation_fingerprint = True
 
     def execution_capability_evidence(
         self,
@@ -127,6 +145,11 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     ) -> ExecutionCapabilityEvidence:
         if runner is not None and not isinstance(runner, LambdaMicroVMRunner):
             raise TypeError("Lambda MicroVM adapter received a different runner type.")
+        privilege_posture: Literal["available", "live_verified"] = (
+            "live_verified"
+            if runner is not None and runner in self._runner_privilege_verified
+            else "available"
+        )
         return _virtual_egress_execution_capability_evidence(
             runner_kind=self.runner_kind,
             runner_ready=runner is not None,
@@ -137,8 +160,8 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             credential_non_possession_posture=(
                 "unverified" if self.metadata_isolation == "unverified" else "available"
             ),
-            guest_privilege="available",
-            unprivileged_guest="available",
+            guest_privilege=privilege_posture,
+            unprivileged_guest=privilege_posture,
             host_filesystem_isolation=True,
             reconnect=self.supports_reconnect,
             network_unverified=self.metadata_isolation == "unverified",
@@ -218,6 +241,10 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             Runner,
             datetime,
         ] = weakref.WeakKeyDictionary()
+        self._runner_environment_names: weakref.WeakKeyDictionary[Runner, str] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._runner_privilege_verified: weakref.WeakSet[Runner] = weakref.WeakSet()
         reserved = {
             "region_name",
             "profile_name",
@@ -255,6 +282,38 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             loop=self.loop,
             proxy_server_factory=self.proxy_server_factory,
         )
+
+    async def prepare_reconnect(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> EgressBinding:
+        """Build fresh proxy, CA, and grant authority for the same MicroVM.
+
+        Only durable non-secret identity and trusted adapter configuration are
+        inputs. Earlier virtual credentials, proxy endpoints, and CA material
+        belonged to a broker that was revoked at interruption or died with its
+        worker, so none of it is honored by the new binding.
+        """
+
+        identity = self.validate_reconnect_metadata(reconnect_metadata)
+        if identity["session_id"] != session_id:
+            raise InvalidEgressReconnectMetadataError(
+                "Lambda MicroVM reconnect identity belongs to a different session."
+            )
+        if identity["environment_name"] != environment_name:
+            raise InvalidEgressReconnectMetadataError(
+                "Lambda MicroVM reconnect identity belongs to a different environment."
+            )
+        if identity["region"] != self.region_name:
+            raise InvalidEgressReconnectMetadataError(
+                "Lambda MicroVM reconnect identity names a different region."
+            )
+        return await self.prepare(session_id=session_id, grants=grants, broker=broker)
 
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
         common_options = self._common_runner_options(request)
@@ -529,6 +588,8 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         runner = await allocation
         if request.session_id is not None:
             self._runner_session_ids[runner] = request.session_id
+        if request.environment_name is not None:
+            self._runner_environment_names[runner] = request.environment_name
         try:
             await _install_ca(runner, request)
             await run_setup_commands(runner, request)
@@ -549,6 +610,9 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                     "verified"
                 ),
             )
+            if self.metadata_isolation == "required":
+                await _verify_agent_privilege_boundary(runner, timeout_s=self.preflight_timeout_s)
+                self._runner_privilege_verified.add(runner)
             self._runner_preflight_observations[runner] = preflight_observed_at
         except BaseException:
             if owns_allocation:
@@ -624,7 +688,67 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         session_id = self._runner_session_ids.get(runner)
         if session_id is not None:
             metadata["session_id"] = session_id
+        environment_name = self._runner_environment_names.get(runner)
+        if environment_name is not None:
+            metadata["environment_name"] = environment_name
         return metadata
+
+    def validate_reconnect_metadata(
+        self,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Allowlist the exact non-secret identity of one owned MicroVM."""
+
+        if not isinstance(reconnect_metadata, Mapping):
+            raise InvalidEgressReconnectMetadataError(
+                "Lambda MicroVM reconnect identity must be an object."
+            )
+        if set(reconnect_metadata) != _RECONNECT_IDENTITY_KEYS:
+            raise InvalidEgressReconnectMetadataError(
+                "Lambda MicroVM reconnect identity has an invalid schema."
+            )
+        identity: dict[str, Any] = {}
+        for key in sorted(_RECONNECT_IDENTITY_KEYS):
+            value = reconnect_metadata[key]
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise InvalidEgressReconnectMetadataError(
+                    f"Lambda MicroVM reconnect identity requires a clean {key}."
+                )
+            identity[key] = value
+        if not identity["image_identifier"].startswith("arn:"):
+            raise InvalidEgressReconnectMetadataError(
+                "Lambda MicroVM reconnect identity must name an image ARN."
+            )
+        return identity
+
+    async def egress_environment_fingerprint(self, runner: Runner) -> str:
+        if not isinstance(runner, LambdaMicroVMRunner):
+            raise TypeError("Lambda MicroVM egress identity requires a LambdaMicroVMRunner.")
+        return _lambda_environment_fingerprint(runner.microvm_id)
+
+    async def is_allocation_disposed(self, reconnect_metadata: Mapping[str, Any]) -> bool:
+        """Prove exact disposal from the control plane without mutating anything.
+
+        MicroVM identifiers are never reused, so a not-found response for an
+        identity Cayu durably acknowledged means AWS has retired the record.
+        Every other state, and any read failure, preserves reconnect.
+        """
+
+        identity = self.validate_reconnect_metadata(reconnect_metadata)
+        control_client, owns_client = _control_client(
+            client=self.client,
+            region_name=identity["region"],
+            profile_name=self.profile_name,
+            endpoint_url=self.endpoint_url,
+        )
+        try:
+            state = await read_microvm_state(control_client, identity["microvm_id"])
+        finally:
+            if owns_client:
+                close = getattr(control_client, "close", None)
+                if callable(close):
+                    await asyncio.to_thread(close)
+        return state in {"TERMINATED", None}
 
     async def finalize_runner(
         self,
@@ -634,9 +758,15 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     ) -> RunnerFinalizationResult:
         if not isinstance(runner, LambdaMicroVMRunner):
             raise TypeError("Lambda MicroVM adapter received a different runner type.")
-        runner.close_action = "suspend" if outcome == "interrupted" else "terminate"
+        preserve = outcome == "interrupted"
+        runner.close_action = "suspend" if preserve else "terminate"
+        # close() returns only after the control plane reports SUSPENDED or
+        # TERMINATED, which is the quiescence and preservation proof.
         await runner.close()
-        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+        return RunnerFinalizationResult(
+            workspace_mutations_quiescent=True,
+            allocation_preserved=preserve,
+        )
 
 
 async def _install_ca(
@@ -669,6 +799,68 @@ async def _install_ca(
 
 async def _ready(runner: LambdaMicroVMRunner) -> LambdaMicroVMRunner:
     return runner
+
+
+# Exit codes are the probe's whole protocol so that no guest-controlled text is
+# interpreted by the control plane.
+_PRIVILEGE_PROBE_FAILURES = {
+    10: "agent commands run with a root user or group id",
+    11: "agent commands can gain privileges (no_new_privs is not set)",
+    12: "agent commands retain Linux capabilities",
+    13: "agent command environment contains AWS credential variables",
+    14: "agent commands can read an AWS credentials file",
+}
+_PRIVILEGE_PROBE_SCRIPT = """
+import os, sys
+fields = {}
+with open('/proc/self/status') as status:
+    for line in status:
+        key, _, value = line.partition(':')
+        fields[key] = value.strip()
+ids = [int(part) for part in fields['Uid'].split() + fields['Gid'].split()]
+if 0 in ids:
+    sys.exit(10)
+if fields.get('NoNewPrivs') != '1':
+    sys.exit(11)
+if any(int(fields.get(name, '0'), 16) for name in ('CapEff', 'CapPrm', 'CapAmb')):
+    sys.exit(12)
+markers = ('ACCESS_KEY', 'SECRET', 'SESSION_TOKEN', 'CONTAINER_CREDENTIALS', 'WEB_IDENTITY')
+if any(key.startswith('AWS_') and any(m in key for m in markers) for key in os.environ):
+    sys.exit(13)
+for path in ('/root/.aws/credentials', os.path.expanduser('~/.aws/credentials')):
+    try:
+        open(path).close()
+    except OSError:
+        continue
+    sys.exit(14)
+"""
+
+
+async def _verify_agent_privilege_boundary(runner: Runner, *, timeout_s: int) -> None:
+    """Prove the agent command profile is unprivileged and holds no AWS credentials."""
+
+    result = await runner.exec(
+        ExecCommand.process("python3", "-c", _PRIVILEGE_PROBE_SCRIPT),
+        timeout_s=timeout_s,
+    )
+    if result.timed_out or result.exit_code != 0:
+        reason = _PRIVILEGE_PROBE_FAILURES.get(
+            result.exit_code, "the agent privilege probe did not complete"
+        )
+        raise UnsupportedEgressCapabilityError(
+            runner_kind="lambda-microvm",
+            capability="guest_privilege_containment",
+            reason=reason,
+            remediation=(
+                "use the first-party image, which runs agent commands as UID/GID 1000 with "
+                "no capabilities and no_new_privs, or select metadata_isolation='unverified' "
+                "and do not treat the environment as fully verified"
+            ),
+        )
+
+
+def _lambda_environment_fingerprint(microvm_id: str) -> str:
+    return sha256(f"lambda-microvm\0{microvm_id}".encode()).hexdigest()
 
 
 def _client_token(adapter_generation: str, allocation_id: str) -> str:

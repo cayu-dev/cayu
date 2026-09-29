@@ -1896,6 +1896,23 @@ async def terminate_microvm_confirmed(
         await asyncio.sleep(min(max(poll_interval_s, 0.05), remaining))
 
 
+async def read_microvm_state(client: Any, microvm_id: str) -> str | None:
+    """Return one exact MicroVM's control-plane state, or ``None`` when not found."""
+
+    identifier = require_clean_nonblank(microvm_id, "microvm_id")
+    try:
+        response = await asyncio.to_thread(client.get_microvm, microvmIdentifier=identifier)
+    except Exception as exc:
+        if _client_error_code(exc) != "ResourceNotFoundException":
+            raise
+        return None
+    if not isinstance(response, Mapping):
+        raise LambdaMicroVMProtocolError("get_microvm response must be an object.")
+    if _required_response_string(response, "microvmId") != identifier:
+        raise LambdaMicroVMProtocolError("get_microvm returned the wrong MicroVM id.")
+    return _required_response_string(response, "state")
+
+
 async def _read_adoptable_state(
     client: Any,
     *,

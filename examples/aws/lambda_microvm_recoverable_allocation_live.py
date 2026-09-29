@@ -3,8 +3,10 @@
 Each phase runs in a new Python process so recovery can use only durable,
 non-secret allocation metadata. The scenario proves that an acknowledgement
 lost to worker death is adopted by client-token replay, concurrent recovery
-converges on one MicroVM, changed parameters never create a replacement, and
-reaping leaves zero unaccounted MicroVMs.
+converges on one MicroVM, changed parameters never create a replacement, a
+suspended MicroVM is reattached by durable identity with a verified
+unprivileged agent boundary, disposal is proven only from terminal readback,
+and reaping leaves zero unaccounted MicroVMs.
 
 Guest egress enforcement is outside this contract: it needs the integrated
 private proxy and is covered by ``aws-lambda-microvm-metadata-isolation-live``.
@@ -26,7 +28,11 @@ from typing import Any
 
 from cayu import ExecCommand, LambdaMicroVMRunner
 from cayu.egress import VirtualEgressAllocationPreparation, VirtualEgressAllocationReap
-from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter, _client_token
+from cayu.egress.aws_lambda_microvm_adapter import (
+    LambdaMicroVMEgressAdapter,
+    _client_token,
+    _verify_agent_privilege_boundary,
+)
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
 from cayu.runners import LambdaMicroVMClientTokenConflict
 from cayu.runners.aws_lambda_microvm import _control_client, run_microvm_with_client_token
@@ -101,6 +107,30 @@ async def _phase(name: str, state_path: Path) -> dict[str, Any]:
         if result.exit_code != 0 or result.stdout != "adopted\n":
             raise RuntimeError("Recovered MicroVM did not execute a command.")
         return {"microvm_id": runner.microvm_id}
+    if name == "suspend":
+        runner = await LambdaMicroVMRunner.from_existing(
+            state["identity"]["microvm_id"], region_name=config["region"], close_action="suspend"
+        )
+        await runner.close()  # returns only after SUSPENDED readback
+        return {"suspended": runner.microvm_id}
+    if name == "reconnect":
+        identity = adapter.validate_reconnect_metadata(state["identity"])
+        if await adapter.is_allocation_disposed(identity):
+            raise RuntimeError("A suspended MicroVM was reported as disposed.")
+        runner = await LambdaMicroVMRunner.from_existing(
+            identity["microvm_id"], region_name=identity["region"], close_action="none"
+        )
+        if (runner.endpoint, runner.image_identifier, runner.image_version) != (
+            identity["endpoint"],
+            identity["image_identifier"],
+            identity["image_version"],
+        ):
+            raise RuntimeError("Reconnect resolved a different MicroVM identity.")
+        await _verify_agent_privilege_boundary(runner, timeout_s=30)
+        await runner.close()
+        return {"reconnected": runner.microvm_id, "privilege_boundary": "verified"}
+    if name == "disposal":
+        return {"disposed": await adapter.is_allocation_disposed(state["identity"])}
     if name == "conflict":
         options = adapter._run_options(metadata)
         options["maximumDurationInSeconds"] = metadata["maximum_duration_s"] + 1
@@ -204,11 +234,36 @@ async def main() -> None:
             if len(concurrent_ids) != 1:
                 raise RuntimeError("Concurrent recovery workers created different MicroVMs.")
             conflict = _run_phase("conflict", state_path)
+            described = client.get_microvm(microvmIdentifier=recovered["microvm_id"])
+            identity = {
+                "microvm_id": described["microvmId"],
+                "endpoint": described["endpoint"],
+                "region": config["region"],
+                "image_identifier": described["imageArn"],
+                "image_version": described["imageVersion"],
+                "session_id": "live-recoverable-allocation",
+                "environment_name": "sandbox",
+            }
+            state = json.loads(state_path.read_text())
+            state_path.write_text(json.dumps({**state, "identity": identity}))
+            _run_phase("suspend", state_path)
+            reconnect = _run_phase("reconnect", state_path)
+            if reconnect["reconnected"] != recovered["microvm_id"]:
+                raise RuntimeError("Reconnect attached a different MicroVM.")
             reap = _run_phase("reap", state_path)
+            if not _run_phase("disposal", state_path)["disposed"]:
+                raise RuntimeError("A reaped MicroVM was not proven disposed.")
         finally:
             # Reaping replays never_sent within its window and so may create it;
             # a second reap pass is idempotent and closes any partial failure.
-            _run_phase("reap", state_path)
+            # It must never mask the scenario's own failure.
+            primary = sys.exc_info()[1]
+            try:
+                _run_phase("reap", state_path)
+            except Exception as cleanup:
+                if primary is None:
+                    raise
+                primary.add_note(f"cleanup reap also failed: {cleanup}")
         census = _census(client, config["image"], started)
     live = sorted(key for key, value in census.items() if value != "TERMINATED")
     if live:
@@ -227,6 +282,9 @@ async def main() -> None:
                 "fresh_process_recovery": "verified",
                 "concurrent_recovery_single_allocation": "verified",
                 "changed_parameter_replay": conflict["conflict"],
+                "suspended_reconnect_by_durable_identity": "verified",
+                "agent_privilege_boundary": reconnect["privilege_boundary"],
+                "disposal_proof_after_reap": "verified",
                 "reaped_allocations": sorted(reap["reaped"]),
                 "unaccounted_microvms": 0,
                 "microvms_per_intent": len(census) / len(allocations),
