@@ -129,16 +129,28 @@ Live and recovered structured-output tool rounds also publish through
 `DurableToolRound`. Live execution validates the original provider arguments and
 checks the result against the durable validation snapshot; recovery uses that
 recorded snapshot. The owner binds validation and retry events to the same atomic
-transcript/checkpoint publication. It retains the distinct live and recovery event order and returns
-live cancellation to session control before auxiliary events reach the caller.
+transcript/checkpoint publication. It retains the distinct live and recovery event
+order and returns live cancellation to session control before auxiliary events
+reach the caller.
 The session engine owns model-step limits, retry scheduling and session completion.
+
+Approval and user-input continuations use the owner's private
+`ToolRoundContinuation` phase. It restores reserved capacity, retains per-call
+hook modes, seals secret snapshots, fences stages left by earlier attempts and
+publishes terminals in model order. The phase preserves the distinct paused-round
+staging rules. Closing its publication stream closes the active result stream
+before returning. Unpublished durable stages retain their capacity for recovery.
+The recovery coordinator supplies approval decisions and answers, dispatches
+authorized calls, and owns the exact pending-action closure and subsequent
+session continuation. These closures retain their approval/input receipts and
+authority checks.
 
 The owner reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation
 across checkpoint writes. Shared staging, projection and receipt algorithms keep
-their existing authority and cancellation checks. Paused continuation callers
-still await migration; some use the shared staging implementation directly.
-Session-level interruption and approval resolution retain their existing owners.
+their existing authority and cancellation checks. The recovery coordinator no
+longer constructs the private staging coordinator. Session-level interruption,
+manual outcome reconciliation and approval resolution retain their existing owners.
 
 `DurableSubagentCoordinator` owns the staged parent seed, child-session, queue-task,
 receipt, and restart-reconciliation handoff for task-backed subagents. The application

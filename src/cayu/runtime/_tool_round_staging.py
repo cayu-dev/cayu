@@ -1,16 +1,16 @@
 """Private durable terminal staging and projection for tool-round owners.
 
-Legacy recovery callers share this implementation until their owner migration.
+Execution, recovered publication and the paused-round phase share this implementation.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
 from cayu._validation import (
@@ -45,6 +45,7 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._assistant_tool_round_publication import validate_tool_exposure_terminal_event
 from cayu.runtime._event_writer import prepare_runtime_event
+from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._tool_effect_state import (
     ToolEffectReconciliationRequired,
     ToolEffectStateOwner,
@@ -67,6 +68,35 @@ from cayu.tools.terminal_publication import (
     ToolTerminalPublicationGovernor,
 )
 from cayu.vaults.redaction import SecretRedactor
+
+
+class ToolTerminalPublisher(Protocol):
+    """Execute existing result hooks using the round owner's durable callbacks."""
+
+    def __call__(
+        self,
+        *,
+        event: Event,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        result: ToolResult,
+        task_id: str | None,
+        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
+        redactor: SecretRedactor | None = None,
+        output_redactor: SecretRedactor | None = None,
+        argument_projection: tool_argument_publication.ToolArgumentProjection,
+        hook_argument_projection: tool_argument_publication.ToolArgumentProjection,
+        allow_modification: bool,
+        publish_before_hooks: bool,
+        deferred_terminal_projection_recorder: Callable[[Event], Awaitable[Event]] | None,
+        deferred_terminal_finalizer: Callable[[Event], Awaitable[Event]] | None,
+        terminal_event_emitter: Callable[[Event], Awaitable[Event]] | None,
+        hooks_already_completed: bool,
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]: ...
+
 
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],

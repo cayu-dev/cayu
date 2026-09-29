@@ -38,7 +38,9 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectRecord,
     ToolEffectStateOwner,
 )
+from cayu.runtime._tool_round_continuation import ToolRoundContinuation
 from cayu.runtime._tool_round_staging import (
+    ToolTerminalPublisher,
     _redactor_for_tool_calls,
     _staged_terminal_argument_projections,
     _terminal_publication_work_estimate,
@@ -88,34 +90,6 @@ class InterruptedToolRoundSnapshot:
     pending_round: tool_round_recovery.PendingToolRound
     tool_calls: list[runtime_records.ToolCallRequest]
     expected_transcript_cursor: int
-
-
-class ToolTerminalPublisher(Protocol):
-    """Execute existing result hooks using the round owner's durable callbacks."""
-
-    def __call__(
-        self,
-        *,
-        event: Event,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        execution_profile: ExecutionProfileIdentity | None,
-        invocation_context: InvocationContext | None,
-        redactor: SecretRedactor | None = None,
-        output_redactor: SecretRedactor | None = None,
-        argument_projection: tool_argument_publication.ToolArgumentProjection,
-        hook_argument_projection: tool_argument_publication.ToolArgumentProjection,
-        allow_modification: bool,
-        publish_before_hooks: bool,
-        deferred_terminal_projection_recorder: Callable[[Event], Awaitable[Event]] | None,
-        deferred_terminal_finalizer: Callable[[Event], Awaitable[Event]] | None,
-        terminal_event_emitter: Callable[[Event], Awaitable[Event]] | None,
-        hooks_already_completed: bool,
-    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]: ...
 
 
 @dataclass(frozen=True)
@@ -183,6 +157,7 @@ class DurableToolRound:
         self._session_store = session_store
         self._event_writer = event_writer
         self._execution: _ToolRoundExecution | None = None
+        self._continuation: ToolRoundContinuation | None = None
 
     @classmethod
     def for_execution(
@@ -249,8 +224,110 @@ class DurableToolRound:
         )
         return owner
 
+    @classmethod
+    def for_continuation(
+        cls,
+        *,
+        session: Session,
+        tool_round_identity: ToolRoundIdentity,
+        session_store: SessionStore,
+        event_writer: RuntimeEventWriter,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        task_id: str | None,
+        execution_profile: ExecutionProfileIdentity,
+        invocation_context: InvocationContext | None,
+        redactor: SecretRedactor,
+        tool_exposure: ResolvedToolExposureAuthority | None,
+        publication_governor: ToolTerminalPublicationGovernor,
+        clock: Callable[[], datetime],
+        emit_result: ToolTerminalPublisher,
+        emit_terminal: Callable[[Event], Awaitable[Event]],
+        defer_terminals: bool,
+        terminal_payload_limits: Mapping[str, int | None] | None,
+        pause_authority: dict[str, str],
+        idempotency_options: dict[str, str],
+    ) -> DurableToolRound:
+        """Attach the paused-round phase without changing ordinary staging semantics."""
+        owner = cls(
+            session=session,
+            tool_round_identity=tool_round_identity,
+            session_store=session_store,
+            event_writer=event_writer,
+        )
+        owner._continuation = ToolRoundContinuation(
+            session=session,
+            tool_round_identity=owner._identity,
+            session_store=session_store,
+            event_writer=event_writer,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            tool_calls=tool_calls,
+            task_id=task_id,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+            redactor=redactor,
+            tool_exposure=tool_exposure,
+            publication_governor=publication_governor,
+            clock=clock,
+            emit_result=emit_result,
+            emit_terminal=emit_terminal,
+            defer_terminals=defer_terminals,
+            terminal_payload_limits=terminal_payload_limits,
+            pause_authority=pause_authority,
+            idempotency_options=idempotency_options,
+        )
+        return owner
+
+    def _require_continuation(self) -> ToolRoundContinuation:
+        if self._continuation is None:
+            raise RuntimeError("Tool round has no continuation admission.")
+        return self._continuation
+
+    @property
+    def continuation_redactor(self) -> SecretRedactor | None:
+        return self._require_continuation().redactor
+
+    async def record_continuation_scope(
+        self,
+        tool_call_id: str,
+        *,
+        execution_scope_unknown: bool = False,
+    ) -> None:
+        await self._require_continuation().record_static_scope(
+            tool_call_id,
+            execution_scope_unknown=execution_scope_unknown,
+        )
+
+    async def fence_restarted_continuation(
+        self,
+        *,
+        recorded_ids: set[str],
+        resume_undispatched_siblings: bool = False,
+    ) -> set[str]:
+        return await self._require_continuation().fence_restarted(
+            recorded_ids=recorded_ids,
+            resume_undispatched_siblings=resume_undispatched_siblings,
+        )
+
+    def publish_continuation(
+        self,
+        *,
+        already_published_ids: set[str],
+        restarted_staged_ids: set[str],
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
+        return self._require_continuation().publish(
+            already_published_ids=already_published_ids,
+            restarted_staged_ids=restarted_staged_ids,
+        )
+
     @property
     def defers_terminals(self) -> bool:
+        if self._continuation is not None:
+            return self._continuation.defers_terminals
         return self._execution is not None and self._execution.coordinator is not None
 
     @property
@@ -264,6 +341,9 @@ class DurableToolRound:
 
     async def admit(self) -> None:
         """Reserve the complete private round before the caller dispatches tools."""
+        if self._continuation is not None:
+            await self._continuation.admit()
+            return
         execution = self._require_execution()
 
         if execution.admitted:
@@ -274,6 +354,9 @@ class DurableToolRound:
 
     def finish_dispatch(self) -> None:
         """Keep uncertain or durable stages fenced when dispatch stops."""
+        if self._continuation is not None:
+            self._continuation.finish_dispatch()
+            return
         execution = self._require_execution()
 
         if execution.coordinator is not None:
@@ -1392,6 +1475,9 @@ class DurableToolRound:
         tool_call_id: str,
         snapshot: invocation_secrets.InvocationPublicationSnapshot,
     ) -> None:
+        if self._continuation is not None:
+            await self._continuation.record_publication_snapshot(tool_call_id, snapshot)
+            return
         execution = self._require_admitted()
         if execution.coordinator is not None:
             await execution.coordinator.seal_call(
@@ -1414,6 +1500,9 @@ class DurableToolRound:
         tool_call_id: str,
         snapshot: InvocationRedactorSnapshot,
     ) -> None:
+        if self._continuation is not None:
+            await self._continuation.record_redactor(tool_call_id, snapshot)
+            return
         execution = self._require_admitted()
         if execution.coordinator is None:
             raise AssertionError("Round redactor observer requires a publication coordinator.")
@@ -1431,6 +1520,10 @@ class DurableToolRound:
         publish_before_hooks: bool,
         snapshot: invocation_secrets.InvocationPublicationSnapshot,
     ) -> Event:
+        if self._continuation is not None:
+            return await self._continuation.stage_terminal(
+                event, outcome, allow_modification, publish_before_hooks, snapshot
+            )
         execution = self._require_admitted()
         if execution.coordinator is None:
             raise AssertionError("Terminal staging requires a publication coordinator.")
@@ -1483,6 +1576,8 @@ class DurableToolRound:
         return await execution.coordinator.record_projected_terminal(event)
 
     async def record_workspace_capture(self, event: Event) -> Event:
+        if self._continuation is not None:
+            return await self._continuation.record_workspace_capture(event)
         execution = self._require_admitted()
         if execution.coordinator is None:
             raise AssertionError("Workspace capture recording requires a publication coordinator.")
