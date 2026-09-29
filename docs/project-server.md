@@ -151,3 +151,24 @@ trusted TLS-terminating ingress or reverse proxy with the backend listener
 restricted to that trusted network. Expose only HTTPS to customers and
 operators; neither bearer policy is safe over a directly exposed HTTP
 connection.
+
+## Migrate storage before starting a release
+
+A production server validates its Postgres schema at startup and never
+migrates it. Deploy each release in this order:
+
+1. Run `cayu storage migrate` once, as a one-off task from the release image,
+   with the service's exact environment and secrets. Without `--postgres`, the
+   command reads the same `CAYU_DATABASE_URL` or `[tool.cayu.session_store]`
+   declaration as `cayu serve`, so the connection string stays out of the task
+   command line. Set `CAYU_DATABASE_DIRECT_URL` as well when
+   `CAYU_DATABASE_URL` goes through a transaction-pooling proxy.
+2. Start `cayu serve` and any `cayu worker` processes only after that task
+   exits `0`.
+
+`cayu storage status --json` tells the deploy step beforehand whether the
+database is up to date (exit `0`), needs a forward migration (exit `3`), or
+cannot be migrated by this build with the given inputs (exit `4`). See
+[Deployment migration step](session-store-targets.md#deployment-migration-step)
+for the status fields, provider-managed backup references
+(`--backup-managed`), and the empty-database rule.

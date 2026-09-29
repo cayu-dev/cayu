@@ -1154,7 +1154,7 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
         if run_calls != 2:
             return result
 
-        input_state, _planned = result
+        input_state, _planned, _input_empty = result
 
         async def advance_with_foreign_operation() -> None:
             foreign = PostgresSessionStore(

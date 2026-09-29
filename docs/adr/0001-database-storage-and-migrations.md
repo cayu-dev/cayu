@@ -94,7 +94,10 @@ must not mutate the upgraded store, even if they recognize its other tables.
 6. **Migrations are explicit, never silent-on-import.** A separate
    `cayu storage migrate` / app-owned deploy step applies pending migrations;
    running app instances use `validate` at startup. Auto-`create` is allowed only
-   for empty databases and only when explicitly enabled.
+   for empty databases and only when explicitly enabled. The deployment form of
+   this step is documented in `docs/session-store-targets.md`: a one-off
+   `cayu storage migrate` task with the service's exact environment, before the
+   service starts.
    Published migration steps must not be relied on to repair databases that have
    already recorded those revisions. Revision 102 repairs SQLite and PostgreSQL
    databases that applied revision 96 before participant session bindings were

@@ -106,9 +106,11 @@ def _breaking_acknowledgements_after(revision: int) -> list[str]:
 
 def test_storage_status_reports_uninitialized(tmp_path, capsys):
     db = tmp_path / "s.sqlite"
-    assert main(["storage", "status", "--sqlite", str(db)]) == 0
+    assert main(["storage", "status", "--sqlite", str(db)]) == 3
     payload = json.loads(capsys.readouterr().out)
     assert payload["database"]["initialized"] is False
+    assert payload["migration"]["need"] == "forward_migration"
+    assert not db.exists()
     # A fresh DB shows every known revision as pending.
     assert payload["pending_migrations"] == [rev.revision for rev in schema.REVISIONS]
 
@@ -713,6 +715,7 @@ def test_storage_migrate_serializes_receipt_recovery_with_publication(
         sqlite=str(db),
         backup=None,
         backup_sha256=None,
+        backup_managed=None,
         waive_backup=True,
         acknowledge_breaking=[
             item.revision
@@ -722,6 +725,7 @@ def test_storage_migrate_serializes_receipt_recovery_with_publication(
         reset_empty_recall_state=False,
         output=str(output),
         output_format="json",
+        target_source="explicit",
     )
     pending_receipt = Path(f"{db}.cayu-migration-receipt.pending.json")
     real_write_receipt = storage_cli._write_durable_sqlite_receipt

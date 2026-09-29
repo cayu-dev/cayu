@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Make `cayu storage migrate` usable as a deployment step. `status`, `migrate`,
+  and `export` resolve their target from `CAYU_DATABASE_URL`, then
+  `[tool.cayu.session_store]`, when no `--sqlite`/`--postgres` is given, and
+  `migrate`/`status` prefer `CAYU_DATABASE_DIRECT_URL` for an unpooled
+  connection. `--backup-managed rds-snapshot:<id>|rds-pitr:<UTC timestamp>`
+  records a provider-managed backup in the migration receipt, and the first
+  migration of a database with no Cayu schema needs no backup authority.
+  `cayu storage status` now reports a `migration` object and exits `0` when up
+  to date, `3` when a forward migration is available, and `4` when this build
+  cannot migrate the database; scripts that treated any successful `status` as
+  exit `0` must accept `3`.
 - Support durable artifact pins on `S3ArtifactStore` with conditional-write state,
   so workspace checkpoints can use S3 artifact storage.
 - Accept already-searching OpenAI web-search registrations and completed replay

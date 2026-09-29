@@ -57,3 +57,122 @@ Target resolution only identifies and validates the requested backend. It does
 not search arbitrary directories, import an app factory, create a database, or
 run migrations. Read-only commands open the resolved target under their own
 non-mutating backend contract.
+
+## Storage commands
+
+`cayu storage status`, `cayu storage migrate`, and `cayu storage export` use
+this resolver. Without `--sqlite` or `--postgres` they select the store from
+`CAYU_DATABASE_URL`, then `[tool.cayu.session_store]`, then the existing
+`data/cayu.db` convention. An explicit option always wins, and `--postgres`
+still accepts a libpq key/value DSN as well as a URL. The JSON output names
+the selection in `target_source` (for example `explicit`,
+`environment:CAYU_DATABASE_URL`, or `project:APP_DATABASE_URL`).
+
+Output and errors never contain the connection string. The Postgres `target`
+field and the migration receipt carry only the scheme, host, port, and
+database name; credentials and query parameters are removed, including from
+driver errors after a failed connection.
+
+### Direct connection for migrations
+
+Migrations hold session-level PostgreSQL advisory locks while they build
+indexes concurrently. A transaction-pooling proxy such as PgBouncer can run
+consecutive statements of one session on different server connections, so it
+cannot preserve those locks. When the application's `CAYU_DATABASE_URL` points
+at such a pooler, also set `CAYU_DATABASE_DIRECT_URL` to an unpooled URL for
+the same database:
+
+- `cayu storage migrate` and `cayu storage status` connect through
+  `CAYU_DATABASE_DIRECT_URL` whenever it is set and the target was resolved
+  rather than passed with `--sqlite` or `--postgres`;
+- the resolved store must be Postgres, and the variable must contain a
+  Postgres URL; otherwise the command fails without connecting;
+- `cayu storage export` and the running application keep using the pooled
+  `CAYU_DATABASE_URL`.
+
+## Deployment migration step
+
+Postgres stores validate their schema at startup and never run DDL
+(ADR 0001). Apply migrations as a separate deployment step:
+
+1. Run `cayu storage migrate` as a one-off task from the release image, with
+   the service's exact environment and secrets, before the new service
+   version starts. The migration preflight reads the same configuration the
+   application reads, including the public-authority alias keyring
+   (`CAYU_PUBLIC_AUTHORITY_ALIAS_*`), so a different environment can pass or
+   fail preflight differently from the service.
+2. Keep the connection string in `CAYU_DATABASE_URL` (or the variable named
+   by `[tool.cayu.session_store]`) instead of the command line, where task
+   definitions, process listings, and logs would expose it.
+3. Start the service only after the step exits `0`. A failed migration then
+   fails the deployment instead of crash-looping application processes.
+
+A platform can ask first whether a release needs the step:
+
+```console
+cayu storage status --json
+```
+
+| Exit | `migration.need` | Meaning |
+| --- | --- | --- |
+| `0` | `up_to_date` | The database is at this build's latest revision. |
+| `3` | `forward_migration` | A forward migration is available and its read-only preflight passes with the given inputs. |
+| `4` | `incompatible` | This build cannot migrate the database with the given inputs. |
+| `1` | — | General error, such as an unresolvable target or a failed connection. |
+| `2` | — | Command-line usage error. |
+
+The `migration` object reports:
+
+- `input_revision` — the database's current revision (`0` when it has no Cayu
+  schema) and `input_empty`, which is true only when the database contains no
+  Cayu relations at all;
+- `target_revision` — this build's latest revision;
+- `breaking_boundary` and `breaking_revisions` — whether breaking revisions
+  lie between input and target, and which ones `migrate` must acknowledge. An
+  empty database has none. Both are `null` when the input state cannot be
+  interpreted;
+- `missing_acknowledgements` — breaking revisions not covered by the
+  `--acknowledge-breaking` options passed to `status`;
+- `resuming` — whether an interrupted Postgres migration left a durable
+  receipt that `migrate` will resume;
+- `reason` and `detail` — for `incompatible`: `database_newer_than_build`,
+  `invalid_schema_state`, `breaking_acknowledgement_required`, or
+  `migration_preflight_rejected` (for example a missing alias keyring or
+  schema privileges).
+
+`status` accepts the same `--acknowledge-breaking REVISION` and
+`--reset-empty-recall-state` inputs as `migrate` and runs the same read-only
+preflight, so exit `3` means the matching `migrate` invocation would pass
+preflight. `status` does not take backup options; `migrate` still requires
+backup authority for a database that holds Cayu data (see below). `status`
+never writes to the database. When `migration.resuming` is true, `migrate`
+resumes the recorded operation without repeating preflight, and `status`
+likewise skips it.
+
+### Backup authority
+
+A Postgres migration of a database that already holds Cayu data records its
+backup authority in the migration receipt. Pass exactly one of:
+
+- `--backup-managed rds-snapshot:<snapshot identifier>` for an RDS snapshot
+  taken before the migration. The identifier starts with a letter, contains
+  letters, digits, and single hyphens, does not end with a hyphen, and is at
+  most 255 characters. An automated snapshot may keep its `rds:` prefix.
+- `--backup-managed rds-pitr:<timestamp>` for an RDS point-in-time recovery
+  target. The timestamp is RFC 3339 in UTC, for example
+  `2026-09-29T12:00:00Z` (`+00:00` is also accepted).
+- `--backup-sha256 SHA256` for an application-consistent backup you hold.
+- `--waive-backup` for an explicit operator waiver.
+
+The receipt records a managed backup as
+`{"mode": "provider_managed", "reference": "<REF>", ...}`, distinct from a
+waiver (`"mode": "waived"`). `--backup-managed` is valid only for Postgres.
+
+When the database has no Cayu schema yet, the first migration needs no backup
+authority: the receipt records `input_revision: 0`, `input_empty: true`, and
+`backup.mode: "not_required"`. A backup option passed for an empty database is
+accepted and recorded as given, so a platform may always pass one.
+
+A receipt binds its exact invocation. If a migration is interrupted, rerun the
+same command with the same backup option; a new reference (for example a new
+`rds-pitr` timestamp) is rejected as a different migration invocation.

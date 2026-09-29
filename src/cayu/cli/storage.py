@@ -29,6 +29,11 @@ from cayu._filesystem_lock import cooperative_path_lock
 from cayu._version import package_version
 from cayu.build_provenance import current_runtime_build_provenance
 from cayu.cli._output import add_output_options
+from cayu.cli.store_targets import (
+    SessionStoreBackend,
+    SessionStoreTargetError,
+    resolve_session_store_target,
+)
 from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
 from cayu.sessions.exports import SessionExportLimits
 from cayu.storage import _sqlite_support as sqlite_support
@@ -39,6 +44,23 @@ _SUBCOMMANDS = (
     ("status", "Show the database schema revision and any pending migrations."),
     ("migrate", "Apply pending forward migrations under the backend lock."),
     ("export", "Export sessions (or tasks) as JSON or JSONL for backup/replay."),
+)
+
+#: ``cayu storage status`` exit codes. 1 remains a general error and 2 an
+#: argparse usage error, so deploy steps can branch on the migration need.
+STATUS_EXIT_UP_TO_DATE = 0
+STATUS_EXIT_MIGRATION_AVAILABLE = 3
+STATUS_EXIT_INCOMPATIBLE = 4
+
+#: Optional direct (unpooled) Postgres URL used by ``migrate`` and ``status``
+#: when the target is resolved rather than passed explicitly. Migrations take
+#: session-level advisory locks, which a transaction-pooling proxy such as
+#: PgBouncer cannot preserve.
+DIRECT_DATABASE_URL_ENV = "CAYU_DATABASE_DIRECT_URL"
+
+_RDS_SNAPSHOT_IDENTIFIER = re.compile(r"(?:rds:)?[A-Za-z](?:-?[A-Za-z0-9])*")
+_RFC3339_UTC_TIMESTAMP = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:[Zz]|\+00:00)"
 )
 
 
@@ -57,11 +79,32 @@ def add_storage_parser(subparsers: Any) -> None:
         sub = inner.add_parser(
             name,
             help=help_text,
-            description=f"{help_text} Use `--output FILE` to write data to a destination.",
+            description=(
+                f"{help_text} Without --sqlite or --postgres, the target resolves from "
+                "CAYU_DATABASE_URL, then [tool.cayu.session_store]. "
+                "Use `--output FILE` to write data to a destination."
+                + (
+                    " Exits 0 when up to date, 3 when a forward migration is available, "
+                    "and 4 when this build cannot migrate the database with the given inputs."
+                    if name == "status"
+                    else ""
+                )
+            ),
         )
-        target = sub.add_mutually_exclusive_group(required=True)
-        target.add_argument("--sqlite", metavar="PATH", help="Path to a SQLite database file.")
-        target.add_argument("--postgres", metavar="DSN", help="Postgres connection string.")
+        target = sub.add_mutually_exclusive_group()
+        target.add_argument(
+            "--sqlite",
+            metavar="PATH",
+            help="Path to a SQLite database file (overrides the resolved target).",
+        )
+        target.add_argument(
+            "--postgres",
+            metavar="DSN",
+            help=(
+                "Postgres connection string (overrides the resolved target). Prefer "
+                "CAYU_DATABASE_URL to keep credentials off the command line."
+            ),
+        )
         if name == "export":
             sub.add_argument(
                 "--tasks", action="store_true", help="Export tasks instead of sessions."
@@ -97,10 +140,20 @@ def add_storage_parser(subparsers: Any) -> None:
                     ),
                 )
                 backup.add_argument(
+                    "--backup-managed",
+                    metavar="REF",
+                    help=(
+                        "Record a provider-managed Postgres backup: "
+                        "rds-snapshot:<snapshot identifier> or "
+                        "rds-pitr:<RFC 3339 UTC timestamp>."
+                    ),
+                )
+                backup.add_argument(
                     "--waive-backup",
                     action="store_true",
                     help="Explicitly waive retained backup/restore authority.",
                 )
+            if name in {"migrate", "status"}:
                 sub.add_argument(
                     "--acknowledge-breaking",
                     metavar="REVISION",
@@ -126,6 +179,7 @@ def add_storage_parser(subparsers: Any) -> None:
 def run_storage(args: argparse.Namespace) -> int:
     """Dispatch a parsed ``storage`` invocation; return a process exit code."""
     try:
+        _resolve_storage_target(args)
         if args.storage_command == "status":
             return _status(args)
         if args.storage_command == "migrate":
@@ -133,9 +187,49 @@ def run_storage(args: argparse.Namespace) -> int:
         if args.storage_command == "export":
             return _export(args)
     except (schema.SchemaError, OSError, RuntimeError, ValueError) as exc:
-        _render_error(args, str(exc))
+        message = str(exc)
+        if args.postgres is not None:
+            message = _sanitize(message, args.postgres)
+        _render_error(args, message)
         return 1
     return 1
+
+
+def _resolve_storage_target(args: argparse.Namespace) -> None:
+    """Fill ``args.sqlite``/``args.postgres`` from the shared session-store resolver.
+
+    Explicit flags win and keep their historical meaning. Otherwise the target
+    comes from ``CAYU_DATABASE_URL``, then ``[tool.cayu.session_store]``, so a
+    deploy step can keep the credential-bearing DSN in the environment.
+    ``migrate`` and ``status`` prefer ``CAYU_DATABASE_DIRECT_URL`` for a resolved
+    Postgres target because migration holds session-level advisory locks.
+    """
+
+    if args.sqlite is not None or args.postgres is not None:
+        args.target_source = "explicit"
+        return
+    target = resolve_session_store_target()
+    source = target.source
+    dsn = target.postgres_dsn
+    direct = os.environ.get(DIRECT_DATABASE_URL_ENV)
+    if args.storage_command in {"migrate", "status"} and direct is not None:
+        if target.backend is not SessionStoreBackend.POSTGRES:
+            raise SessionStoreTargetError(
+                f"{DIRECT_DATABASE_URL_ENV} is set, but the resolved session store is "
+                "SQLite; unset it or resolve a Postgres session store."
+            )
+        try:
+            dsn = resolve_session_store_target(postgres=direct).postgres_dsn
+        except SessionStoreTargetError:
+            raise SessionStoreTargetError(
+                f"{DIRECT_DATABASE_URL_ENV} must contain a Postgres URL."
+            ) from None
+        source = f"environment:{DIRECT_DATABASE_URL_ENV}"
+    if target.backend is SessionStoreBackend.SQLITE:
+        args.sqlite = str(target.sqlite_path)
+    else:
+        args.postgres = dsn
+    args.target_source = source
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -245,12 +339,20 @@ def _sanitize(message: str, dsn: str) -> str:
     return out
 
 
-def _status_payload(backend: str, target: str, state: schema.SchemaState) -> dict[str, Any]:
+def _status_payload(
+    backend: str,
+    target: str,
+    state: schema.SchemaState,
+    *,
+    target_source: str,
+    migration: dict[str, object] | None = None,
+) -> dict[str, Any]:
     pending = schema.pending(state.revision)
-    return {
+    payload: dict[str, Any] = {
         "schema_version": "1",
         "backend": backend,
         "target": target,
+        "target_source": target_source,
         "database": {
             "revision": state.revision,
             "compatible_from": state.compatible_from,
@@ -263,6 +365,103 @@ def _status_payload(backend: str, target: str, state: schema.SchemaState) -> dic
         "pending_migrations": [item.revision for item in pending],
         "up_to_date": not pending,
     }
+    if migration is not None:
+        payload["migration"] = migration
+        payload["up_to_date"] = migration["need"] == "up_to_date"
+    return payload
+
+
+def _assess_migration(
+    state: schema.SchemaState,
+    *,
+    input_empty: bool,
+    acknowledged: list[int],
+    resume_state: schema.SchemaState | None = None,
+) -> dict[str, object]:
+    """Classify what ``cayu storage migrate`` would do, without preflight I/O.
+
+    ``resume_state`` is the recorded input of an interrupted Postgres migration;
+    its path, not the partially advanced live revision, decides which breaking
+    acknowledgements the resuming invocation must repeat.
+    """
+
+    assessment: dict[str, object] = {
+        "need": "up_to_date",
+        "exit_code": STATUS_EXIT_UP_TO_DATE,
+        "input_revision": state.revision,
+        "input_empty": input_empty,
+        "target_revision": schema.LATEST_REVISION,
+        "breaking_boundary": False,
+        "breaking_revisions": [],
+        "missing_acknowledgements": [],
+        "resuming": resume_state is not None,
+        "reason": None,
+        "detail": None,
+    }
+    try:
+        planned = schema.validate_migration_input(state)
+        plan_state = state if resume_state is None else resume_state
+        plan = schema.validate_migration_input(plan_state)
+    except schema.SchemaError as exc:
+        newer = state.revision > schema.LATEST_REVISION or (
+            state.compatible_from > schema.LATEST_REVISION
+        )
+        assessment.update(
+            breaking_boundary=None,
+            breaking_revisions=None,
+            missing_acknowledgements=None,
+        )
+        return _incompatible_assessment(
+            assessment,
+            reason="database_newer_than_build" if newer else "invalid_schema_state",
+            detail=str(exc),
+        )
+    if not planned:
+        return assessment
+    breaking = (
+        []
+        if plan_state.revision == schema.UNINITIALIZED
+        else [item.revision for item in plan if item.kind is schema.RevisionKind.BREAKING]
+    )
+    supplied = set(acknowledged)
+    assessment.update(
+        need="forward_migration",
+        exit_code=STATUS_EXIT_MIGRATION_AVAILABLE,
+        breaking_boundary=bool(breaking),
+        breaking_revisions=breaking,
+        missing_acknowledgements=[item for item in breaking if item not in supplied],
+    )
+    return assessment
+
+
+def _incompatible_assessment(
+    assessment: dict[str, object],
+    *,
+    reason: str,
+    detail: str,
+) -> dict[str, object]:
+    assessment.update(
+        need="incompatible",
+        exit_code=STATUS_EXIT_INCOMPATIBLE,
+        reason=reason,
+        detail=detail,
+    )
+    return assessment
+
+
+def _rejected_assessment(
+    assessment: dict[str, object],
+    exc: Exception,
+    *,
+    dsn: str | None,
+) -> dict[str, object]:
+    detail = str(exc) if dsn is None else _sanitize(str(exc), dsn)
+    missing = assessment.get("missing_acknowledgements")
+    return _incompatible_assessment(
+        assessment,
+        reason=("breaking_acknowledgement_required" if missing else "migration_preflight_rejected"),
+        detail=detail,
+    )
 
 
 def _render_status(
@@ -270,14 +469,33 @@ def _render_status(
     target: str,
     state: schema.SchemaState,
     *,
+    target_source: str,
+    migration: dict[str, object],
     output_format: str,
     output: str | None,
 ) -> None:
     with _output_stream(output) as stream:
         if output_format == "json":
-            print(json.dumps(_status_payload(backend, target, state), sort_keys=True), file=stream)
+            payload = _status_payload(
+                backend,
+                target,
+                state,
+                target_source=target_source,
+                migration=migration,
+            )
+            print(json.dumps(payload, sort_keys=True), file=stream)
             return
         _print_status(backend, target, state, stream=stream)
+        need = migration["need"]
+        print(f"  migration need: {need} (exit {migration['exit_code']})", file=stream)
+        if migration["breaking_revisions"]:
+            revisions = cast("list[int]", migration["breaking_revisions"])
+            print(
+                "  breaking revisions: " + ", ".join(str(item) for item in revisions),
+                file=stream,
+            )
+        if migration["reason"] is not None:
+            print(f"  reason: {migration['reason']}: {migration['detail']}", file=stream)
 
 
 def _print_status(
@@ -313,45 +531,133 @@ def _print_status(
 
 def _status(args: argparse.Namespace) -> int:
     if args.sqlite is not None:
-        connection = sqlite_support.connect(Path(args.sqlite))
-        try:
-            state = sqlite_support.read_schema_state(connection)
-        finally:
-            connection.close()
+        path = Path(args.sqlite)
+        state = _read_sqlite_schema_state(path)
+        migration = _assess_migration(
+            state,
+            input_empty=_sqlite_input_empty(path, state),
+            acknowledged=args.acknowledge_breaking,
+        )
+        if migration["need"] == "forward_migration":
+            try:
+                codec = public_authority_alias_codec_from_environment()
+                _preflight_sqlite_migration(path, codec, args)
+            except (schema.SchemaError, RuntimeError, ValueError) as exc:
+                migration = _rejected_assessment(migration, exc, dsn=None)
         _render_status(
             "sqlite",
             args.sqlite,
             state,
+            target_source=args.target_source,
+            migration=migration,
             output_format=args.output_format,
             output=args.output,
         )
-        return 0
+        return cast("int", migration["exit_code"])
 
-    async def run() -> schema.SchemaState:
+    async def run() -> tuple[schema.SchemaState, dict[str, object]]:
         import psycopg
 
         from cayu.storage import postgres
 
-        async with (
-            await psycopg.AsyncConnection.connect(args.postgres) as conn,
-            conn.cursor() as cur,
-        ):
-            return await postgres.read_schema_state(cur)
+        async with await psycopg.AsyncConnection.connect(args.postgres) as conn:
+            await conn.set_read_only(True)
+            async with conn.cursor() as cur:
+                state = await postgres.read_schema_state(cur)
+                pending = await postgres.read_pending_migration_receipt(cur)
+                resume_state = None if pending is None else _pending_receipt_input_state(pending[1])
+                migration = _assess_migration(
+                    state,
+                    input_empty=await _postgres_input_empty(cur, state),
+                    acknowledged=args.acknowledge_breaking,
+                    resume_state=resume_state,
+                )
+                if migration["need"] != "forward_migration":
+                    return state, migration
+                if resume_state is not None:
+                    # An interrupted migration resumes from its durable receipt
+                    # without repeating preflight, but only for the same inputs.
+                    if migration["missing_acknowledgements"]:
+                        migration = _incompatible_assessment(
+                            migration,
+                            reason="breaking_acknowledgement_required",
+                            detail=(
+                                "Resume the interrupted migration with the same "
+                                "--acknowledge-breaking revisions it recorded."
+                            ),
+                        )
+                    return state, migration
+                try:
+                    codec = public_authority_alias_codec_from_environment()
+                    await _preflight_postgres_migration(cur, state, codec, args)
+                except (schema.SchemaError, RuntimeError, ValueError) as exc:
+                    migration = _rejected_assessment(migration, exc, dsn=args.postgres)
+                return state, migration
 
-    state = _run_postgres(run, args)
-    if state is None:
+    result = _run_postgres(run, args)
+    if result is None:
         return 1
+    state, migration = result
     _render_status(
         "postgres",
         _redact_dsn(args.postgres),
         state,
+        target_source=args.target_source,
+        migration=migration,
         output_format=args.output_format,
         output=args.output,
     )
-    return 0
+    return cast("int", migration["exit_code"])
 
 
-def _run_postgres(run: Any, args: argparse.Namespace) -> schema.SchemaState | None:
+def _pending_receipt_input_state(receipt: dict[str, object]) -> schema.SchemaState:
+    revision = receipt.get("input_revision")
+    compatible_from = receipt.get("input_compatible_from")
+    if type(revision) is not int or type(compatible_from) is not int:
+        raise RuntimeError("Postgres durable migration receipt is invalid.")
+    return schema.SchemaState(revision=revision, compatible_from=compatible_from)
+
+
+def _sqlite_input_empty(path: Path, state: schema.SchemaState) -> bool:
+    """Whether a SQLite target has no Cayu schema at all (nothing to back up)."""
+
+    if state.revision != schema.UNINITIALIZED:
+        return False
+    if not path.exists():
+        return True
+    connection = sqlite_support.connect(path, read_only=True)
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name LIKE ? ESCAPE '\\' LIMIT 1",
+            (_table_prefix_pattern(),),
+        ).fetchone()
+    finally:
+        connection.close()
+    return row is None
+
+
+async def _postgres_input_empty(cur: Any, state: schema.SchemaState) -> bool:
+    """Whether a Postgres target has no Cayu relation in its current schema."""
+
+    if state.revision != schema.UNINITIALIZED:
+        return False
+    await cur.execute(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM pg_catalog.pg_class AS c "
+        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = current_schema() AND c.relname LIKE %s)",
+        (_table_prefix_pattern(),),
+    )
+    row = await cur.fetchone()
+    return row is not None and not bool(row[0])
+
+
+def _table_prefix_pattern() -> str:
+    escaped = schema.TABLE_PREFIX.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
+def _run_postgres(run: Any, args: argparse.Namespace) -> Any:
     """Run a postgres coroutine, converting connection errors to a clean,
     DSN-redacted stderr message (``None`` signals failure). Schema-compatibility
     errors propagate to the top-level handler unchanged."""
@@ -379,6 +685,8 @@ def _migrate_sqlite(args: argparse.Namespace) -> int:
         raise ValueError("SQLite migration target must not be a symbolic link.")
     if args.backup_sha256 is not None:
         raise ValueError("--backup-sha256 is only valid with --postgres.")
+    if args.backup_managed is not None:
+        raise ValueError("--backup-managed is only valid for a Postgres target.")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     pending_receipt_path, durable_receipt_path = _sqlite_migration_receipt_paths(path)
@@ -428,6 +736,7 @@ def _migrate_sqlite_locked(
         path,
         pending_receipt_path=pending_receipt_path,
         durable_receipt_path=durable_receipt_path,
+        target_source=args.target_source,
         output_format=args.output_format,
         output=args.output,
     )
@@ -438,6 +747,7 @@ def _migrate_sqlite_locked(
     runtime_build = current_runtime_build_provenance().model_dump(mode="json")
     input_state = _preflight_sqlite_migration(path, codec, args)
     planned = schema.validate_migration_input(input_state)
+    input_empty = _sqlite_input_empty(path, input_state)
     authority = migration_authority.authority_configuration_receipt(codec)
     migration_inputs: dict[str, object] = {
         "reset_empty_recall_state": bool(args.reset_empty_recall_state),
@@ -523,6 +833,7 @@ def _migrate_sqlite_locked(
                         revision=latest.revision,
                         compatible_from=latest.compatible_from,
                     ),
+                    input_empty=input_empty,
                     checks={"integrity_check": "ok", "foreign_key_violations": 0},
                     execution_mode="atomic_publish",
                     migration_inputs=migration_inputs,
@@ -606,6 +917,7 @@ def _migrate_sqlite_locked(
             str(path),
             output_state,
             receipt,
+            target_source=args.target_source,
             output_format=args.output_format,
             output=args.output,
         )
@@ -638,7 +950,7 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
     if args.backup is not None:
         raise ValueError("--backup is only valid with --sqlite.")
     _preflight_migration_output(args.output, forbidden=())
-    backup = _postgres_backup_authority(args)
+    requested_backup = _requested_postgres_backup_authority(args)
     codec = public_authority_alias_codec_from_environment()
     runtime_build = current_runtime_build_provenance().model_dump(mode="json")
     target = _redact_dsn(args.postgres)
@@ -658,7 +970,7 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
         ):
             return await postgres.read_pending_migration_receipt(cur)
 
-    async def preflight() -> tuple[schema.SchemaState, tuple[schema.Revision, ...]]:
+    async def preflight() -> tuple[schema.SchemaState, tuple[schema.Revision, ...], bool]:
         import psycopg
 
         from cayu.storage import postgres
@@ -668,30 +980,14 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
             conn.cursor() as cur,
         ):
             state = await postgres.read_schema_state(cur)
-            planned = schema.validate_migration_input(state)
-            _validate_breaking_acknowledgements(state, planned, args.acknowledge_breaking)
-            _validate_recall_reset_input(state, planned, args.reset_empty_recall_state)
-            await postgres.preflight_migration(
-                cur,
-                state,
-                allow_empty_recall_reset=args.reset_empty_recall_state,
-            )
-            await migration_authority.preflight_postgres_public_authority(cur, codec)
-            await cur.execute(
-                "SELECT has_schema_privilege(current_user, current_schema(), 'USAGE'), "
-                "has_schema_privilege(current_user, current_schema(), 'CREATE')"
-            )
-            privileges = await cur.fetchone()
-            if privileges is None or not all(bool(value) for value in privileges):
-                raise RuntimeError(
-                    "Postgres migration requires USAGE and CREATE authority on the current schema."
-                )
-            return state, planned
+            planned = await _preflight_postgres_migration(cur, state, codec, args)
+            return state, planned, await _postgres_input_empty(cur, state)
 
     try:
         pending = asyncio.run(load_pending())
         if pending is None:
-            input_state, planned = asyncio.run(preflight())
+            input_state, planned, input_empty = asyncio.run(preflight())
+            backup = _postgres_backup_authority(requested_backup, input_empty=input_empty)
             operation_sha256 = _migration_operation_sha256(
                 backend="postgres",
                 target=target,
@@ -717,6 +1013,7 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
                     revision=latest.revision,
                     compatible_from=latest.compatible_from,
                 ),
+                input_empty=input_empty,
                 checks={"schema_validation": "ok", "foreign_keys": "backend_enforced"},
                 execution_mode="resumable_revisions",
                 migration_inputs=migration_inputs,
@@ -736,6 +1033,10 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
             planned = schema.validate_migration_input(input_state)
             if receipt.get("migration_steps") != [revision.revision for revision in planned]:
                 raise RuntimeError("Postgres durable migration receipt has a stale migration path.")
+            backup = _postgres_backup_authority(
+                requested_backup,
+                input_empty=receipt.get("input_empty") is True,
+            )
             retry_operation_sha256 = _migration_operation_sha256(
                 backend="postgres",
                 target=target,
@@ -802,6 +1103,7 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
         target,
         state,
         receipt,
+        target_source=args.target_source,
         output_format=args.output_format,
         output=args.output,
     )
@@ -901,18 +1203,104 @@ def _validate_recall_reset_input(
         )
 
 
-def _postgres_backup_authority(args: argparse.Namespace) -> dict[str, object]:
-    digest = args.backup_sha256
-    if digest is None:
-        if args.waive_backup:
-            return {"mode": "waived", "path": None, "sha256": None}
-        raise ValueError(
-            "Postgres migration requires --backup-sha256 for an application-consistent "
-            "backup or the explicit --waive-backup operator waiver."
+async def _preflight_postgres_migration(
+    cur: Any,
+    state: schema.SchemaState,
+    codec: Any,
+    args: argparse.Namespace,
+) -> tuple[schema.Revision, ...]:
+    """Run every read-only migration check before the first schema write."""
+
+    from cayu.storage import postgres
+
+    planned = schema.validate_migration_input(state)
+    _validate_breaking_acknowledgements(state, planned, args.acknowledge_breaking)
+    _validate_recall_reset_input(state, planned, args.reset_empty_recall_state)
+    await postgres.preflight_migration(
+        cur,
+        state,
+        allow_empty_recall_reset=args.reset_empty_recall_state,
+    )
+    await migration_authority.preflight_postgres_public_authority(cur, codec)
+    await cur.execute(
+        "SELECT has_schema_privilege(current_user, current_schema(), 'USAGE'), "
+        "has_schema_privilege(current_user, current_schema(), 'CREATE')"
+    )
+    privileges = await cur.fetchone()
+    if privileges is None or not all(bool(value) for value in privileges):
+        raise RuntimeError(
+            "Postgres migration requires USAGE and CREATE authority on the current schema."
         )
-    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-        raise ValueError("--backup-sha256 must be a lowercase SHA-256 digest.")
-    return {"mode": "operator_attested", "path": None, "sha256": digest}
+    return planned
+
+
+def _requested_postgres_backup_authority(args: argparse.Namespace) -> dict[str, object] | None:
+    """Validate the operator's backup authority before connecting to Postgres."""
+
+    if args.backup_managed is not None:
+        return {
+            "mode": "provider_managed",
+            "path": None,
+            "sha256": None,
+            "reference": _managed_backup_reference(args.backup_managed),
+        }
+    digest = args.backup_sha256
+    if digest is not None:
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("--backup-sha256 must be a lowercase SHA-256 digest.")
+        return {"mode": "operator_attested", "path": None, "sha256": digest}
+    if args.waive_backup:
+        return {"mode": "waived", "path": None, "sha256": None}
+    return None
+
+
+def _postgres_backup_authority(
+    requested: dict[str, object] | None,
+    *,
+    input_empty: bool,
+) -> dict[str, object]:
+    """Bind the requested backup authority, or none for a database with no Cayu schema."""
+
+    if requested is not None:
+        return requested
+    if input_empty:
+        return {"mode": "not_required", "path": None, "sha256": None}
+    raise ValueError(
+        "Postgres migration requires --backup-sha256 for an application-consistent "
+        "backup, --backup-managed for a provider-managed backup, or the explicit "
+        "--waive-backup operator waiver."
+    )
+
+
+def _managed_backup_reference(value: str) -> str:
+    """Validate a provider-managed backup reference; return it unchanged."""
+
+    kind, separator, detail = value.partition(":")
+    if separator and kind == "rds-snapshot":
+        if len(detail) <= 255 and _RDS_SNAPSHOT_IDENTIFIER.fullmatch(detail) is not None:
+            return value
+        raise ValueError(
+            "--backup-managed rds-snapshot: requires an RDS snapshot identifier: a letter "
+            "followed by letters, digits, or single hyphens, not ending in a hyphen, at "
+            "most 255 characters (automated snapshots may keep their rds: prefix)."
+        )
+    if separator and kind == "rds-pitr":
+        match = _RFC3339_UTC_TIMESTAMP.fullmatch(detail)
+        if match is not None:
+            try:
+                datetime(*(int(part) for part in match.groups()[:6]), tzinfo=UTC)
+            except ValueError:
+                match = None
+        if match is not None:
+            return value
+        raise ValueError(
+            "--backup-managed rds-pitr: requires an RFC 3339 UTC timestamp such as "
+            "2026-09-29T12:00:00Z."
+        )
+    raise ValueError(
+        "--backup-managed must be rds-snapshot:<snapshot identifier> or "
+        "rds-pitr:<RFC 3339 UTC timestamp>."
+    )
 
 
 def _sqlite_migration_receipt_paths(path: Path) -> tuple[Path, Path]:
@@ -1038,6 +1426,7 @@ def _recover_sqlite_migration_receipt(
     *,
     pending_receipt_path: Path,
     durable_receipt_path: Path,
+    target_source: str,
     output_format: str,
     output: str | None,
 ) -> int | dict[str, object] | None:
@@ -1074,6 +1463,7 @@ def _recover_sqlite_migration_receipt(
                 str(path),
                 state,
                 receipt,
+                target_source=target_source,
                 output_format=output_format,
                 output=output,
             )
@@ -1320,6 +1710,7 @@ def _migration_receipt(
     runtime_build: dict[str, object],
     backup: dict[str, object],
     output_state: schema.SchemaState,
+    input_empty: bool,
     checks: dict[str, object],
     execution_mode: str,
     migration_inputs: dict[str, object],
@@ -1354,6 +1745,7 @@ def _migration_receipt(
         "target": target,
         "input_revision": input_state.revision,
         "input_compatible_from": input_state.compatible_from,
+        "input_empty": input_empty,
         "migration_steps": [revision.revision for revision in planned],
         "breaking_revisions": [
             revision.revision
@@ -1424,12 +1816,13 @@ def _render_migration(
     state: schema.SchemaState,
     receipt: dict[str, object],
     *,
+    target_source: str,
     output_format: str,
     output: str | None,
 ) -> None:
     with _output_stream(output) as stream:
         if output_format == "json":
-            payload = _status_payload(backend, target, state)
+            payload = _status_payload(backend, target, state, target_source=target_source)
             payload["migration_receipt"] = receipt
             print(json.dumps(payload, sort_keys=True), file=stream)
             return
@@ -1437,13 +1830,17 @@ def _render_migration(
         print(f"  migration receipt: {receipt['receipt_sha256']}", file=stream)
         backup = receipt["backup"]
         backup_sha256: object | None = None
+        backup_reference: object | None = None
         if isinstance(backup, dict):
             for key, value in backup.items():
                 if key == "sha256":
                     backup_sha256 = value
-                    break
+                elif key == "reference":
+                    backup_reference = value
         if backup_sha256 is not None:
             print(f"  backup sha256: {backup_sha256}", file=stream)
+        if backup_reference is not None:
+            print(f"  managed backup: {backup_reference}", file=stream)
 
 
 @contextlib.contextmanager
