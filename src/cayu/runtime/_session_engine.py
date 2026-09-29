@@ -15,7 +15,6 @@ import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from enum import StrEnum
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
@@ -23,6 +22,15 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cayu.resource_access import ResourceAccessPolicy, restore_session_stream
+from cayu.runtime._durable_tool_round import DurableToolRound
+from cayu.runtime._durable_tool_round import _environment_name as _environment_name
+from cayu.runtime._durable_tool_round import (
+    _limit_reached_tool_call_event as _limit_reached_tool_call_event,
+)
+from cayu.runtime._durable_tool_round import (
+    _limit_reached_tool_round_results as _limit_reached_tool_round_results,
+)
+from cayu.runtime._durable_tool_round import _limit_value_for_payload as _limit_value_for_payload
 
 if TYPE_CHECKING:
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
@@ -57,7 +65,6 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
-    MIN_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_value,
     copy_durable_metadata,
@@ -269,8 +276,6 @@ from cayu.runtime import _model_target as model_target
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
-from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -573,7 +578,6 @@ from cayu.runtime.execution_units import (
     ToolRoundIdentity,
     copy_model_attempt_identity,
     copy_model_step_identity,
-    copy_tool_round_identity,
     new_model_step_identity,
     strip_runtime_owned_execution_identity,
 )
@@ -814,9 +818,6 @@ from cayu.tasks.base import (
 from cayu.tasks.contracts import WorkCompletionConflict
 from cayu.tasks.dispatch import DispatchRequest
 from cayu.tasks.records import Task, TaskStatus, copy_task
-from cayu.tools.base import (
-    ToolResult,
-)
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
@@ -3902,14 +3903,6 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
     return copy_run_request(request).model_copy(update={"environment_name": environment_name})
 
 
-def _environment_name(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> str | None:
-    if registered_environment is None:
-        return None
-    return registered_environment.spec.name
-
-
 def _session_trace_event_fields(
     session: Session,
     request_metadata: dict[str, Any],
@@ -4468,89 +4461,6 @@ def _limit_reached_payload(
     if cost_summary is not None:
         payload["cost_summary"] = cost_summary.model_dump(mode="json")
     return payload
-
-
-def _limit_value_for_payload(value: int | Decimal) -> int | str:
-    if type(value) is Decimal:
-        return str(value)
-    if type(value) is int:
-        if MIN_DURABLE_JSON_INTEGER <= value <= MAX_DURABLE_JSON_INTEGER:
-            return value
-        return str(value)
-    raise TypeError("limit payload value must be an int or Decimal.")
-
-
-def _limit_reached_tool_round_results(
-    *,
-    tool_calls: list[runtime_records.ToolCallRequest],
-    decision: StopDecision,
-    tool_round_identity: ToolRoundIdentity,
-) -> list[runtime_records.ToolCallOutcome]:
-    identity = copy_tool_round_identity(tool_round_identity)
-    outcomes: list[runtime_records.ToolCallOutcome] = []
-    for tool_call in tool_calls:
-        structured = {
-            "skipped": True,
-            "reason": "limit_reached",
-            "limit": decision.limit.value,
-            "maximum": _limit_value_for_payload(decision.maximum),
-            "actual": _limit_value_for_payload(decision.actual),
-            "tool_call_id": tool_call.id,
-            "tool_name": tool_call.name,
-            **identity.payload(),
-        }
-        outcomes.append(
-            runtime_records.ToolCallOutcome(
-                call=tool_call,
-                result=ToolResult(
-                    content="Tool call skipped because a run limit was reached.",
-                    structured=structured,
-                    is_error=True,
-                ),
-            )
-        )
-    return outcomes
-
-
-def _limit_reached_tool_call_event(
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    tool_call_outcome: runtime_records.ToolCallOutcome,
-    decision: StopDecision,
-    tool_round_identity: ToolRoundIdentity,
-    execution_profile: ExecutionProfileIdentity | None,
-    approval_id: str | None = None,
-) -> Event:
-    identity = copy_tool_round_identity(tool_round_identity)
-    payload = {
-        "tool_call_id": tool_call_outcome.call.id,
-        "idempotency_key": tool_execution.tool_idempotency_key(
-            session_id=session.id,
-            tool_round_id=identity.tool_round_id,
-            tool_call_id=tool_call_outcome.call.id,
-            approval_id=approval_id,
-        ),
-        "reason": "limit_reached",
-        "limit": decision.limit.value,
-        "result": tool_call_outcome.result.model_dump(),
-        **tool_argument_publication.unavailable_argument_projection().payload_fields(),
-        **identity.payload(),
-    }
-    if approval_id is not None:
-        payload["approval_id"] = approval_id
-    return event_with_execution_profile_authority(
-        Event(
-            type=EventType.TOOL_CALL_FAILED,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=_environment_name(registered_environment),
-            tool_name=tool_call_outcome.call.name,
-            payload=payload,
-        ),
-        execution_profile,
-    )
 
 
 async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
@@ -30174,105 +30084,33 @@ class SessionEngine:
                 yield event
             return
 
-        tool_round_id = tool_round_identity.tool_round_id
-        publication_id = f"tool-round:{tool_round_id}"
-        if (
-            await self.session_store.load_runtime_publication_receipt(
-                session.id,
-                publication_id,
-            )
-            is not None
-        ):
-            await self._recovery_coordinator.materialize_deferred_input_if_present(session.id)
-            messages[:] = await self.session_store.load_transcript(session.id)
-            return
-
-        completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
-        remaining_tool_calls = [
-            tool_call for tool_call in tool_calls if tool_call.id not in completed_ids
-        ]
-        skipped_outcomes = _limit_reached_tool_round_results(
-            tool_calls=remaining_tool_calls,
-            decision=decision,
+        round_owner = DurableToolRound(
+            session=session,
             tool_round_identity=tool_round_identity,
-        )
-        completed_tool_outcomes = tool_results.redact_tool_call_outcomes(
-            completed_tool_outcomes,
-            self._secret_redactor,
-        )
-        skipped_outcomes = tool_results.redact_tool_call_outcomes(
-            skipped_outcomes,
-            self._secret_redactor,
-        )
-        base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
-            registered_agent=registered_agent,
-            tool_calls=tool_calls,
-        )
-        for skipped_outcome in skipped_outcomes:
-            await self.session_store.transform_checkpoint(
-                session.id,
-                lambda _current_session, current_checkpoint, call_id=skipped_outcome.call.id: (
-                    tool_round_recovery.checkpoint_with_assistant_publication_snapshot(
-                        current_checkpoint,
-                        tool_round_identity=tool_round_identity,
-                        tool_call_id=call_id,
-                        redactor=base_round_redactor,
-                        unsafe_output=False,
-                    )
-                ),
-            )
-            yield await self._event_writer.emit(
-                _limit_reached_tool_call_event(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call_outcome=skipped_outcome,
-                    decision=decision,
-                    tool_round_identity=tool_round_identity,
-                    execution_profile=execution_profile,
-                )
-            )
-
-        source_checkpoint = await self.session_store.load_checkpoint(session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(source_checkpoint)
-        if (
-            pending_round is None
-            or tool_round_recovery.pending_tool_round_identity(pending_round) != tool_round_identity
-        ):
-            raise RuntimeError("Limited tool round lost its durable pending marker.")
-        lifecycle_events = await self.session_store.load_tool_round_lifecycle_events_for_round(
-            session.id,
-            [call.tool_call_id for call in pending_round.tool_calls],
-            tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
-        )
-        durable_transcript_cursor = await self.session_store.load_transcript_cursor(session.id)
-        prepared = tool_round_publication.prepare_tool_round_publication(
-            session_id=session.id,
-            pending_round=pending_round,
-            source_checkpoint=source_checkpoint,
-            durable_events=lifecycle_events,
-            expected_statuses={
-                SessionStatus.RUNNING,
-                SessionStatus.INTERRUPTING,
-            },
-            expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=durable_transcript_cursor,
-        )
-        cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
-            prepared,
             session_store=self.session_store,
             event_writer=self._event_writer,
         )
-        materialized = await self._recovery_coordinator.materialize_expected_deferred_input(
-            session.id,
-            pending_round.deferred_messages,
-            cancellation=cancellation,
-        )
-        messages[:] = materialized.messages
-        cancellation = materialized.cancellation
-        if cancellation is not None:
-            raise cancellation
-        await self._session_control.raise_if_interrupted(session.id)
+        async with contextlib.aclosing(
+            round_owner.close_for_limit(
+                messages=messages,
+                tool_calls=tool_calls,
+                completed_tool_outcomes=completed_tool_outcomes,
+                decision=decision,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                redactor=self._secret_redactor,
+                materialize_deferred_input_if_present=(
+                    self._recovery_coordinator.materialize_deferred_input_if_present
+                ),
+                materialize_expected_deferred_input=(
+                    self._recovery_coordinator.materialize_expected_deferred_input
+                ),
+                raise_if_interrupted=self._session_control.raise_if_interrupted,
+            )
+        ) as closure:
+            async for event in closure:
+                yield event
 
     async def _close_limited_approval_tool_round(
         self,

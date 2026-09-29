@@ -107,12 +107,19 @@ It does not prepare the final publication request or manage individual stage
 leases. Closing the ordinary publication stream closes its active terminal hook
 stream before returning.
 
+`SessionEngine` also delegates ordinary round closure after a run limit to this
+owner. It retains completed effects, publishes skipped results for unstarted
+calls, and commits the round using the same publication operation. A repeated
+closure reads the existing receipt and transcript. Cancellation remains observable
+after publication and deferred input materialization. Only live execution creates
+dispatch state or a private staging coordinator.
+
 The owner reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation
 across checkpoint writes. Shared staging, projection and receipt algorithms keep
 their existing authority and cancellation checks. Recovery callers still use the
-shared staging implementation directly; session-level limit and interruption
-closure remain with their existing owners.
+shared staging implementation directly. Session-level interruption and approval
+resolution retain their existing owners.
 
 `DurableSubagentCoordinator` owns the staged parent seed, child-session, queue-task,
 receipt, and restart-reconciliation handoff for task-backed subagents. The application

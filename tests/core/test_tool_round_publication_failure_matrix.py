@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -14,8 +16,10 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import _run_limits as run_limits
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -551,5 +555,160 @@ def test_two_call_round_replays_exact_request_after_lost_acknowledgement(
             assert committed.replayed is False and replayed.replayed is True
             assert committed.receipt == replayed.receipt
             await _assert_published_round(store, session_id=session_id)
+
+    asyncio.run(scenario())
+
+
+def _limited_runtime(store, *, completed_first, monkeypatch, session_id):
+    # Freeze limit accounting through setup; only the first completed tool advances it.
+    elapsed = [time.monotonic()]
+    monkeypatch.setattr(
+        run_limits,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed[0]),
+    )
+
+    class LimitedTool(_SideEffectTool):
+        async def run(self, ctx, args):
+            result = await super().run(ctx, args)
+            elapsed[0] = time.monotonic() + 5
+            return result
+
+    provider = _TwoCallProvider([_tool_call_response()])
+    tool = LimitedTool()
+    app = _runtime(store, provider, tool, max_parallel_tool_calls=1)
+    request = RunRequest(
+        agent_name="assistant",
+        session_id=session_id,
+        messages=[Message.text("user", "stop at the configured limit")],
+        limits=(
+            RunLimits(max_elapsed_seconds=1) if completed_first else RunLimits(max_tool_calls=1)
+        ),
+    )
+    return app, provider, tool, request
+
+
+async def _assert_limited_round(store, app, tool, *, completed_first, session_id):
+    assert tool.calls == (["first"] if completed_first else [])
+    transcript = await store.load_transcript(session_id)
+    tool_messages = [message for message in transcript if message.role.value == "tool"]
+    assert len(tool_messages) == 1
+    results = [part for part in tool_messages[0].content if isinstance(part, ToolResultPart)]
+    assert [part.tool_call_id for part in results] == ["call-side-effect-a", "call-side-effect-b"]
+    events = await store.load_events(session_id)
+    terminals = [
+        event
+        for event in events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    ]
+    assert len(terminals) == 2
+    assert [event.type for event in terminals] == [
+        EventType.TOOL_CALL_COMPLETED if completed_first else EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_FAILED,
+    ]
+    for event in terminals[int(completed_first) :]:
+        assert event.payload["reason"] == "limit_reached"
+        assert event.payload["result"]["structured"]["skipped"] is True
+    round_id = terminals[0].payload["tool_round_id"]
+    receipt = await store.load_runtime_publication_receipt(session_id, f"tool-round:{round_id}")
+    assert receipt is not None
+    assert (
+        tool_round_recovery.pending_tool_round_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        is None
+    )
+    assert len({event.id for event in events}) == len(events)
+    metrics = app.tool_terminal_publication_status()
+    assert metrics.active_round_reservations == metrics.staged_count == 0
+
+
+@pytest.mark.parametrize("completed_first", [False, True], ids=["before-dispatch", "partial"])
+def test_limited_round_replays_exact_publication_and_repeated_close(
+    store_factory, monkeypatch, completed_first
+):
+    async def scenario():
+        async with store_factory(_LostAcknowledgementStore) as store:
+            store.fail_before_tool_publication = False
+            app, provider, tool, request = _limited_runtime(
+                store,
+                completed_first=completed_first,
+                monkeypatch=monkeypatch,
+                session_id=f"limited-lost-ack-{completed_first}",
+            )
+            close = app._session_engine._close_limited_tool_round
+            close_arguments = {}
+
+            async def capture_close(**kwargs):
+                close_arguments.update(kwargs)
+                async with aclosing(close(**kwargs)) as stream:
+                    async for event in stream:
+                        yield event
+
+            monkeypatch.setattr(app._session_engine, "_close_limited_tool_round", capture_close)
+            events = [event async for event in app.run(request)]
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+            assert (await store.load(request.session_id)).status is SessionStatus.INTERRUPTED
+            assert len(provider.requests) == 1
+            assert len(store.publication_requests) == 2
+            assert store.publication_requests[0] == store.publication_requests[1]
+            committed, replayed = store.publication_results
+            assert committed.replayed is False and replayed.replayed is True
+            assert committed.receipt == replayed.receipt
+            await _assert_limited_round(
+                store, app, tool, completed_first=completed_first, session_id=request.session_id
+            )
+
+            before_transcript = await store.load_transcript(request.session_id)
+            before_events = await store.load_events(request.session_id)
+            assert [event async for event in close(**close_arguments)] == []
+            assert await store.load_transcript(request.session_id) == before_transcript
+            assert await store.load_events(request.session_id) == before_events
+            assert len(store.publication_requests) == 2
+            assert close_arguments["messages"] == before_transcript
+            await _assert_limited_round(
+                store, app, tool, completed_first=completed_first, session_id=request.session_id
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("completed_first", [False, True], ids=["before-dispatch", "partial"])
+@pytest.mark.parametrize("boundary", ["before-commit", "after-commit"])
+def test_limited_round_preserves_repeated_cancellation_at_publication(
+    store_factory, monkeypatch, completed_first, boundary
+):
+    async def scenario():
+        async with store_factory(_PublicationBarrierStore, boundary=boundary) as store:
+            app, provider, tool, request = _limited_runtime(
+                store,
+                completed_first=completed_first,
+                monkeypatch=monkeypatch,
+                session_id=f"limited-cancel-{boundary}-{completed_first}",
+            )
+
+            async def consume():
+                return [event async for event in app.run(request)]
+
+            running = asyncio.create_task(consume())
+            try:
+                await asyncio.wait_for(store.boundary_reached.wait(), timeout=_WATCHDOG_SECONDS)
+                running.cancel("limited round cancellation")
+                running.cancel("limited round cancellation")
+                store.release_publication.set()
+                with pytest.raises(asyncio.CancelledError, match="limited round cancellation"):
+                    await asyncio.wait_for(running, timeout=_WATCHDOG_SECONDS)
+            finally:
+                store.release_publication.set()
+                if not running.done():
+                    running.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(running, return_exceptions=True), timeout=_WATCHDOG_SECONDS
+                )
+            assert running.cancelled()
+            assert len(provider.requests) == 1
+            await _assert_limited_round(
+                store, app, tool, completed_first=completed_first, session_id=request.session_id
+            )
 
     asyncio.run(scenario())

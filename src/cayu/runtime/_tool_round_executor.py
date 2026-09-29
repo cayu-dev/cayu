@@ -239,6 +239,7 @@ from cayu.runtime._tool_round_staging import (
 from cayu.runtime._tool_round_staging import (
     _redact_tool_result_for_event as _redact_tool_result_for_event,
 )
+from cayu.runtime._tool_round_staging import _redactor_for_tool_calls as _redactor_for_tool_calls
 from cayu.runtime._tool_round_staging import (
     _staged_terminal_argument_projections as _staged_terminal_argument_projections,
 )
@@ -7553,7 +7554,7 @@ class ToolRoundRun:
                 self._registered_agent.executable_tool(tool_call.name) for tool_call in tool_calls
             )
         )
-        round_owner = DurableToolRound(
+        round_owner = DurableToolRound.for_execution(
             session=session,
             tool_round_identity=tool_round_identity,
             tool_calls=tool_calls,
@@ -11034,20 +11035,3 @@ def policy_denial_payload_fields(
         "reason": require_nonblank(reason, "reason"),
         "metadata": copy_durable_metadata(metadata),
     }
-
-
-def _redactor_for_tool_calls(
-    base: SecretRedactor,
-    *,
-    registered_agent: runtime_records.RegisteredAgentState,
-    tool_calls: list[runtime_records.ToolCallRequest],
-) -> SecretRedactor:
-    redactor = base
-    for tool_call in tool_calls:
-        registered_tool = registered_agent.executable_tool(tool_call.name)
-        if registered_tool is None:
-            continue
-        tool = registered_tool.tool
-        if isinstance(tool, McpToolAdapter):
-            redactor = redactor.merged_with(tool.toolset.secret_redactor)
-    return redactor

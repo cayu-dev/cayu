@@ -34,7 +34,9 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.failure_evidence import FailureEvidence
+from cayu.mcp.tools import McpToolAdapter
 from cayu.runtime import _invocation_secrets as invocation_secrets
+from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
@@ -1232,3 +1234,20 @@ def restore_staged_terminal_authority(
             _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
         )
     return restored
+
+
+def _redactor_for_tool_calls(
+    base: SecretRedactor,
+    *,
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> SecretRedactor:
+    redactor = base
+    for tool_call in tool_calls:
+        registered_tool = registered_agent.executable_tool(tool_call.name)
+        if registered_tool is None:
+            continue
+        tool = registered_tool.tool
+        if isinstance(tool, McpToolAdapter):
+            redactor = redactor.merged_with(tool.toolset.secret_redactor)
+    return redactor

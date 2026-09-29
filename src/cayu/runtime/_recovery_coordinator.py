@@ -25,6 +25,10 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
+from cayu.runtime._durable_tool_round import (
+    DeferredInputMaterialization as DeferredInputMaterialization,
+)
+
 if TYPE_CHECKING:
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
 
@@ -1390,12 +1394,6 @@ def _retried_model_step_tool_exposure_authority(
             "ceiling."
         )
     return validated
-
-
-@dataclass(frozen=True)
-class DeferredInputMaterialization:
-    messages: list[Message]
-    cancellation: asyncio.CancelledError | None
 
 
 @dataclass(frozen=True)
