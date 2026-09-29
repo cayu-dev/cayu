@@ -663,7 +663,7 @@ CHECKS: tuple[VerificationCheck, ...] = (
         status_on_success=STATUS_VERIFIED,
         prerequisites=(
             "CAYU_LAMBDA_MICROVM_TOOL_ADMISSION_LIVE=1",
-            "CAYU_LAMBDA_MICROVM_IMAGE with python3 and bash but without rg",
+            "CAYU_LAMBDA_MICROVM_IMAGE with python3 and bash but without node",
             "AWS_REGION or AWS_DEFAULT_REGION",
             "AWS credential chain",
         ),

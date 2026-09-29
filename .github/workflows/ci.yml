@@ -242,6 +242,13 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
       - name: Install coding-composition system dependencies
         run: |
+          # Later browser setup uses these sources too. Avoid the slow regional
+          # HTTP mirror before downloading Playwright's system dependencies.
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if test -f "$source"; then
+              sudo sed -i -E 's@https?://[a-z0-9.-]+\.gce\.archive\.ubuntu\.com/ubuntu@https://archive.ubuntu.com/ubuntu@g' "$source"
+            fi
+          done
           sudo apt-get update
           sudo apt-get install --yes ripgrep
       # Core verifies the ARM64 sidecar on a native ARM runner.
