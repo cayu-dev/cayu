@@ -806,9 +806,9 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
     project = tmp_path / "project"
     pyproject = project / "pyproject.toml"
     pyproject.write_text(
-        pyproject.read_text(encoding="utf-8")
-        .replace('preset = "agent"', 'preset = "coding"')
-        .replace('database = "sqlite"', 'database = "postgres"'),
+        pyproject.read_text(encoding="utf-8").replace(
+            'preset = "agent"', 'preset = "coding"\ndatabase = "mysql"'
+        ),
         encoding="utf-8",
     )
     monkeypatch.chdir(project)
@@ -823,7 +823,16 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
 @pytest.mark.parametrize(
     ("replacements", "field"),
     (
-        ((('database = "sqlite"', 'database = "postgres"'),), "database"),
+        ((('path = "data/cayu.db"', 'path = "data/other.db"'),), "storage"),
+        (
+            (
+                (
+                    'backend = "sqlite"\npath = "data/cayu.db"',
+                    'backend = "postgres"\nenv = "DB_URL"',
+                ),
+            ),
+            "storage",
+        ),
         ((('provider = "neutral"', 'provider = "openai"'),), "provider"),
         (
             (
@@ -885,3 +894,77 @@ def test_source_check_validates_every_selected_plan_axis(
         item.code == "SCAFFOLD_PLAN_DRIFT" and item.parameters["field"] == field
         for item in findings
     )
+
+
+_LEGACY_SQLITE_STORAGE = """from cayu import SQLiteSessionStore, SQLiteTaskStore
+
+
+def build_stores(**kwargs):
+    return SQLiteSessionStore("data/cayu.db"), SQLiteTaskStore("data/cayu.db")
+"""
+
+
+@pytest.mark.parametrize("storage", ("legacy", "handwritten", "current"))
+def test_projects_from_the_retired_database_choice_report_fixed_storage(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    storage: str,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'preset = "agent"', 'preset = "agent"\ndatabase = "sqlite"'
+        ),
+        encoding="utf-8",
+    )
+    storage_module = project / "configuration/storage.py"
+    if storage == "legacy":
+        storage_module.write_text(_LEGACY_SQLITE_STORAGE, encoding="utf-8")
+    elif storage == "handwritten":
+        storage_module.write_text("def build_stores(**kwargs):\n    return None\n")
+
+    findings = [
+        item
+        for item in check_declared_scaffold_source(project)
+        if item.code == "SCAFFOLD_PLAN_DRIFT" and item.parameters["field"] == "storage"
+    ]
+
+    if storage == "current":
+        # The retired contract key alone is accepted; the storage module decides.
+        assert findings == []
+        return
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.path == "configuration/storage.py"
+    assert finding.parameters["expected"] == "open_application_stores"
+    assert finding.parameters["observed"] == ("SQLiteSessionStore" if storage == "legacy" else None)
+    assert "CAYU_DATABASE_URL" in finding.hint
+
+
+def test_coding_projects_keep_local_tooling_on_the_protected_state_database(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "coder", "--preset", "coding", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "coder"
+    pyproject = project / "pyproject.toml"
+    assert check_declared_scaffold_source(project) == ()
+
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'path = ".cayu/runtime/cayu.db"', 'path = "data/cayu.db"'
+        ),
+        encoding="utf-8",
+    )
+    (finding,) = check_declared_scaffold_source(project)
+    assert finding.code == "SCAFFOLD_PLAN_DRIFT"
+    assert finding.parameters["field"] == "storage"
+    assert finding.path == "pyproject.toml:[tool.cayu.session_store]"
+    assert finding.parameters["expected"] == {
+        "backend": "sqlite",
+        "path": ".cayu/runtime/cayu.db",
+    }

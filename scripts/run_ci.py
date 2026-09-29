@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import NoReturn
 
 _GENERAL_TEST_ENV = {
-    "CAYU_REQUIRE_POSTGRES": "1",
+    "CAYU_REQUIRE_POSTGRES_TESTS": "1",
     "CAYU_REQUIRE_DOCKER_RUNNER": "1",
     "CAYU_REQUIRE_DOCKER_EGRESS": "1",
     "CAYU_REQUIRE_CURRENT_TEST_DURATIONS": "1",

@@ -30,7 +30,7 @@ def test_postgres_fixture_uses_pgvector_container_image() -> None:
 def test_postgres_required_accepts_truthy_env_values(
     monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
-    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", value)
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES_TESTS", value)
 
     assert TEST_CONFTEST._postgres_required() is True
 
@@ -39,20 +39,20 @@ def test_postgres_required_accepts_truthy_env_values(
 def test_postgres_required_rejects_non_truthy_env_values(
     monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
-    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", value)
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES_TESTS", value)
 
     assert TEST_CONFTEST._postgres_required() is False
 
 
 def test_postgres_unavailable_skips_when_not_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CAYU_REQUIRE_POSTGRES", raising=False)
+    monkeypatch.delenv("CAYU_REQUIRE_POSTGRES_TESTS", raising=False)
 
     with pytest.raises(pytest.skip.Exception, match="missing postgres"):
         TEST_CONFTEST._skip_or_fail_postgres_unavailable("missing postgres")
 
 
 def test_postgres_unavailable_fails_when_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", "1")
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES_TESTS", "1")
 
     with pytest.raises(pytest.fail.Exception, match="missing postgres"):
         TEST_CONFTEST._skip_or_fail_postgres_unavailable("missing postgres")

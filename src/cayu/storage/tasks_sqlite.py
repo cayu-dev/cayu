@@ -87,6 +87,7 @@ from cayu.sessions.invocation import SessionInvocationBinding, TaskInvocation
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
+from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.tasks._scheduling import (
     admitted_schedule,
     require_schedule_mutation,
@@ -433,6 +434,7 @@ class SQLiteTaskStore(TaskStore):
         ownership_clock: Callable[[], datetime] | None = None,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteTaskStore")
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:

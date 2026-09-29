@@ -119,7 +119,8 @@ def test_consumer_declares_server_runtime_dependency_without_service_preset(data
     configuration = tomllib.loads(maintenance_project_files(database=database)["pyproject.toml"])
     assert configuration["tool"]["cayu"]["scaffold"]["preset"] == "coding"
     dependencies = configuration["project"]["dependencies"]
-    expected = "cayu[postgres,server]==" if database == "postgres" else "cayu[server]=="
+    # Every generated project can reach PostgreSQL through CAYU_DATABASE_URL.
+    expected = "cayu[postgres,server]=="
     assert len(dependencies) == 1 and dependencies[0].startswith(expected)
 
 

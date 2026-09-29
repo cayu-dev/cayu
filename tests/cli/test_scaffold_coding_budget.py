@@ -47,7 +47,7 @@ def denial_policy():
 def test_coding_constructors_forward_budget_owners(tmp_path, monkeypatch, execution, entrance):
     root = tmp_path / "consumer"
     for relative, content in project_files(
-        "budget-coder", preset="coding", database="sqlite", execution=execution
+        "budget-coder", preset="coding", execution=execution
     ).items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)

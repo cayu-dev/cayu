@@ -137,8 +137,9 @@ operational effects explicit:
 Cayu does not yet impose a general `CayuApp` lifecycle protocol, so a configured
 component can perform more than one responsibility in its constructor. In the
 generated local project, for example, SQLite store constructors open their files
-and ensure their schemas; `cayu console`, `cayu inspect`, and `cayu check` call
-the factory and therefore exercise that configured behavior. Keep module imports
+and ensure their schemas, while PostgreSQL stores connect lazily and only validate
+the schema that `cayu storage migrate` applied; `cayu console`, `cayu inspect`, and
+`cayu check` call the factory and therefore exercise that configured behavior. Keep module imports
 inert, keep constructor effects bounded and documented, and leave active-service
 startup and cleanup under the explicit host or process entrypoint that owns them.
 
@@ -158,6 +159,33 @@ adapters that construct the same application through its declared factory.
 One-off scripts should call that factory directly and own the lifecycle of any
 active services they start; Cayu does not ship a `cayu script` command.
 
+## Durable data
+
+Generated projects build their session, task, and knowledge stores with
+`open_application_stores(configured_database_url(), sqlite_path=...)` in
+`configuration/storage.py`. The same code runs locally and in a deployment:
+
+| Variable | Effect |
+| --- | --- |
+| `CAYU_DATABASE_URL` | `postgres://` or `postgresql://` selects PostgreSQL; an absolute `sqlite:///` URL selects that file. Unset selects SQLite at the project's absolute `sqlite_path` (`data/cayu.db`). |
+| `CAYU_DATABASE_POOL_MAX` | Maximum connections in the one pool the PostgreSQL stores share (default 5). The Evals store that `cayu serve` and `cayu check` open uses its own pool of the same size. |
+| `CAYU_DATABASE_DIRECT_URL` | Optional direct server address for the one task-admission `LISTEN` connection, kept outside the pool. Set it when `CAYU_DATABASE_URL` points at a transaction-pooling proxy such as PgBouncer, where `LISTEN` does not work. |
+| `CAYU_REQUIRE_POSTGRES` | `1` makes every Cayu SQLite store raise at construction, so a deployment missing `CAYU_DATABASE_URL` fails at startup instead of writing local files. |
+
+One PostgreSQL-backed application process opens at most `CAYU_DATABASE_POOL_MAX`
+pooled connections plus the listener, and the Evals store's pool when a Cayu
+command serves the project. Cayu CLI commands resolve `CAYU_DATABASE_URL` before
+`[tool.cayu.session_store]`, so they inspect the same database the app uses.
+
+Keep application-owned durable records in the configured database. Application
+tables may share it with their own table prefix; Cayu reserves `cayu_` for its
+tables (ADR 0001). `data/` locally and `/data` in a deployment hold files such as
+artifacts, uploads, and fixtures. Do not open SQLite files there for durable
+application state: a deployment's `/data` may be a network filesystem, where
+SQLite is slow and its WAL mode is unsupported. Deployments of applications with
+automatic memory must set `CAYU_MEMORY_EVIDENCE_KEY`, because the local
+`data/memory-evidence.key` is git-ignored and never reaches a deployment.
+
 ## Console contract
 
 `cayu console` constructs one console-local app and binds it as `app`. That name
@@ -173,7 +201,8 @@ PostgreSQL when multiple active processes need sustained write concurrency.
 
 ## Dependency boundary
 
-Generated production dependencies use base `cayu`. Interactive console support
+Generated production dependencies use `cayu[postgres]`, so any project can switch
+to PostgreSQL through `CAYU_DATABASE_URL`. Interactive console support
 is an explicit development extra such as `cayu[console]`; a production process
 does not need to install REPL tooling merely because the project declares a
 factory.

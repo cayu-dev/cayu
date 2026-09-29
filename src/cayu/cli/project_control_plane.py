@@ -25,6 +25,7 @@ from cayu.project_control_plane import (
     ProjectEvalJudgeConfiguration,
     _create_project_control_plane_context,
 )
+from cayu.storage.targets import configured_database_pool_max
 
 _DISTRIBUTION_NAME_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\Z",
@@ -307,4 +308,9 @@ def _create_eval_store(target: SessionStoreTarget | None):
         raise ProjectError(
             'PostgreSQL Evals storage requires the postgres extra. Install "cayu[postgres]".'
         ) from exc
-    return PostgresEvalStore(target.postgres_dsn)
+    try:
+        pool_max_size = configured_database_pool_max()
+    except SessionStoreTargetError as exc:
+        raise ProjectError(str(exc)) from exc
+    # The Evals store keeps its own pool, bounded like the application's shared pool.
+    return PostgresEvalStore(target.postgres_dsn, max_size=pool_max_size)

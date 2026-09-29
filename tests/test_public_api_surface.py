@@ -94,6 +94,16 @@ def test_required_names_are_importable_from_top_level() -> None:
         assert hasattr(cayu, name), f"cayu.{name} is not exported from the top level"
 
 
+def test_application_store_selection_is_public_at_the_root() -> None:
+    from cayu.storage import application, targets
+
+    assert cayu.ApplicationStores is application.ApplicationStores
+    assert cayu.open_application_stores is application.open_application_stores
+    assert cayu.configured_database_url is targets.configured_database_url
+    for name in ("ApplicationStores", "open_application_stores", "configured_database_url"):
+        assert name in cayu.__all__
+
+
 def test_execution_deadline_exports_remain_discoverable_from_root_and_runtime() -> None:
     from cayu import deadlines
 

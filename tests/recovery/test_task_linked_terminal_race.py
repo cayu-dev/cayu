@@ -41,7 +41,7 @@ pytestmark = pytest.mark.process
 
 
 def _postgres_recovery_requested() -> bool:
-    required = os.environ.get("CAYU_REQUIRE_POSTGRES", "").strip().lower()
+    required = os.environ.get("CAYU_REQUIRE_POSTGRES_TESTS", "").strip().lower()
     return bool(os.environ.get("CAYU_TEST_POSTGRES_DSN")) or required in {
         "1",
         "true",

@@ -195,9 +195,11 @@ def test_worker_binding_rejects_unsupported_graph(deployment, monkeypatch, inval
 
 
 @pytest.mark.parametrize("backend", ["sqlite"])
-def test_deployment_rejects_actual_sqlite_generated_profile(deployment, backend):
+def test_deployment_rejects_actual_sqlite_generated_profile(
+    deployment, backend, monkeypatch, tmp_path
+):
     module, source, provider = deployment
-    assert backend == module.GENERATED_STORE_PROFILE
+    monkeypatch.setenv("CAYU_DATABASE_URL", f"{backend}://{tmp_path / 'maintenance.db'}")
     with pytest.raises(ValueError, match="PostgreSQL profile"):
         module.build_maintenance_deployment(budget_policy=denial_policy(), workspace_root=source)
     assert not provider.requests
@@ -214,7 +216,7 @@ def test_deployment_rejects_missing_configuration_before_construction(
         monkeypatch.delenv("CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS")
         monkeypatch.delenv("CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID")
     else:
-        monkeypatch.setattr(module, "GENERATED_STORE_PROFILE", "sqlite")
+        monkeypatch.setenv("CAYU_DATABASE_URL", f"sqlite://{source / 'maintenance.db'}")
 
     def forbidden(*args, **kwargs):
         pytest.fail("Invalid deployment reached construction")

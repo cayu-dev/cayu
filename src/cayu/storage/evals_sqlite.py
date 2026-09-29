@@ -149,6 +149,7 @@ from cayu.evals.suite_authoring import (
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
+from cayu.storage.targets import require_sqlite_store_allowed
 
 _SQLITE_EVAL_MIN_REQUIRED_REVISION = 80
 
@@ -474,6 +475,7 @@ class SQLiteEvalStore(EvalStore):
             DEFAULT_SQLITE_EVAL_WRITER_CONTENTION_POLICY
         ),
     ) -> None:
+        require_sqlite_store_allowed("SQLiteEvalStore")
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str and path.strip():

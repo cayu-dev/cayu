@@ -102,12 +102,11 @@ uv run --no-sync cayu new --explain knowledge --json
 Resolve the full plan without writing:
 
 ```console
-uv run --no-sync cayu new my_agent --preset agent --database sqlite --provider neutral --dry-run --json
+uv run --no-sync cayu new my_agent --preset agent --provider neutral --dry-run --json
 ```
 
 Dry-run and apply use the same normalized plan. Presets select a coherent
-application shape; database, provider, and execution flags select maintained
-adapters; `--with` and `--without` change only package-shipped selectable
+application shape; provider and execution flags select maintained adapters; `--with` and `--without` change only package-shipped selectable
 capabilities. Extension-only concerns retain their canonical homes but cannot be
 claimed active through a flag. Invalid combinations fail before target creation.
 
@@ -135,7 +134,7 @@ running `cayu new` over the current repository:
 ```console
 reference_parent="$(mktemp -d)"
 uv run --no-sync cayu new my_agent_reference --agent-name my_agent --preset agent \
-  --database postgres --provider neutral --execution none \
+  --provider neutral --execution none \
   --dir "$reference_parent" --json
 ```
 
@@ -145,6 +144,40 @@ explicitly. `cayu new`, `cayu check`, and `cayu inspect` never migrate a project
 
 All presets use the same application convention. Use `--preset` and `--execution`
 to select the application and execution environment.
+
+## Durable data
+
+Every preset selects its database at runtime, not at generation time. The storage
+module (`configuration/storage.py`, or `configuration/coding_storage.py` for
+coding) calls `open_application_stores(configured_database_url(), sqlite_path=...)`:
+`CAYU_DATABASE_URL` selects PostgreSQL, and without it the stores use local SQLite
+at an absolute path under the project (`data/cayu.db`, or `.cayu/runtime/cayu.db`
+for coding). `[tool.cayu.session_store]` names that same local file for Cayu CLI
+tooling, and `CAYU_DATABASE_URL` overrides it for the app and the CLI alike. Every
+generated project depends on `cayu[postgres]`. `cayu new --database` is deprecated
+and ignored.
+
+- Keep application-owned durable records, such as orders, cases, ledgers, and
+  sync cursors, in the configured database. Application tables may share it with
+  their own table prefix; Cayu reserves `cayu_` for its tables.
+- `data/` locally and `/data` in a deployment hold files: artifacts, uploads, and
+  fixtures. Do not open SQLite files there for durable application state.
+- Deployments set `CAYU_DATABASE_URL` to a migrated PostgreSQL database, run
+  `cayu storage migrate` as a deploy step, and set `CAYU_REQUIRE_POSTGRES=1` so
+  every Cayu SQLite store refuses to open.
+- `CAYU_DATABASE_POOL_MAX` (default 5) bounds the shared connection pool. Behind a
+  transaction-pooling proxy such as PgBouncer, `CAYU_DATABASE_DIRECT_URL` gives the
+  task-admission `LISTEN` connection a direct server address.
+- Deployments of applications with automatic memory must set
+  `CAYU_MEMORY_EVIDENCE_KEY`; the local `data/memory-evidence.key` is git-ignored
+  and never reaches a deployment.
+
+`cayu check` reports `SCAFFOLD_PLAN_DRIFT` with field `storage` when the storage
+module constructs a fixed SQLite or Postgres store, or when
+`[tool.cayu.session_store]` names anything other than the local SQLite file.
+Projects generated before this convention may keep `database` in
+`[tool.cayu.scaffold]`; it is ignored. Migrate them by replacing the storage module
+with the one from a disposable `cayu new` reference.
 
 ## Explicit service extensions
 
@@ -163,7 +196,6 @@ otherwise default service with an explicit artifact extension declares:
 [tool.cayu.scaffold]
 convention = 1
 preset = "service"
-database = "sqlite"
 provider = "neutral"
 execution = "none"
 capabilities = ["approvals", "evals", "observability", "tasks"]

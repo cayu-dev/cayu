@@ -17,7 +17,7 @@ from tests.qualification.repository_maintenance_application import maintenance_p
 def reservation(request, tmp_path):
     backend = request.param
     if backend == "postgres" and not (
-        os.environ.get("CAYU_TEST_POSTGRES_DSN") or os.environ.get("CAYU_REQUIRE_POSTGRES")
+        os.environ.get("CAYU_TEST_POSTGRES_DSN") or os.environ.get("CAYU_REQUIRE_POSTGRES_TESTS")
     ):
         pytest.skip("PostgreSQL reservation conformance needs the required PostgreSQL lane")
     for name, content in maintenance_project_files().items():

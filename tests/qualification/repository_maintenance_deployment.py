@@ -5,13 +5,12 @@ from dataclasses import dataclass, field
 from math import isfinite
 
 from app import build_coding_product_application  # ty: ignore[unresolved-import]
-from configuration.coding_storage import GENERATED_STORE_PROFILE  # ty: ignore[unresolved-import]
 from configuration.settings import (  # ty: ignore[unresolved-import]
-    configured_database_url,
     configured_public_authority_alias_codec,
 )
 from workflows.coding_product import CodingProductApplication  # ty: ignore[unresolved-import]
 
+from cayu import configured_database_url
 from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import (
@@ -142,11 +141,11 @@ class MaintenanceDeployment:
 
 
 def _deployment_dsn():
-    if GENERATED_STORE_PROFILE != "postgres":
-        raise ValueError("Maintenance deployment requires the PostgreSQL profile.")
     dsn = configured_database_url()
     if type(dsn) is not str or not dsn.strip():
         raise ValueError("Maintenance deployment requires CAYU_DATABASE_URL.")
+    if not dsn.strip().lower().startswith(("postgres://", "postgresql://")):
+        raise ValueError("Maintenance deployment requires the PostgreSQL profile.")
     if configured_public_authority_alias_codec() is None:
         raise ValueError("Maintenance deployment requires persistent public authority alias keys.")
     return dsn

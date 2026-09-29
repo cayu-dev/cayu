@@ -187,7 +187,7 @@ Discover or review the Rails-style generation plan before writing:
 ```bash
 cayu new --list-presets --json
 cayu new --list-capabilities --json
-cayu new myagent --preset agent --database postgres --provider anthropic --dry-run --json
+cayu new myagent --preset agent --provider anthropic --dry-run --json
 cayu guide applications#planning --json
 ```
 

@@ -13,7 +13,6 @@ from typing import Literal, cast
 SCAFFOLD_CONVENTION_VERSION = 1
 
 PresetName = Literal["agent", "service", "coding"]
-DatabaseName = Literal["sqlite", "postgres"]
 ProviderName = Literal[
     "neutral",
     "openai",
@@ -42,7 +41,6 @@ class PresetSpec:
     name: PresetName
     summary: str
     default_capabilities: tuple[str, ...] = ()
-    supported_databases: tuple[DatabaseName, ...] = ("sqlite", "postgres")
     supported_executions: tuple[ExecutionName, ...] = ("none",)
     environment: tuple[str, ...] = ()
 
@@ -51,7 +49,6 @@ class PresetSpec:
             "name": self.name,
             "summary": self.summary,
             "default_capabilities": list(self.default_capabilities),
-            "supported_databases": list(self.supported_databases),
             "supported_executions": list(self.supported_executions),
             "environment": list(self.environment),
         }
@@ -62,7 +59,7 @@ class AdapterSpec:
     """One maintained implementation choice for an orthogonal adapter axis."""
 
     name: str
-    kind: Literal["database", "provider", "execution"]
+    kind: Literal["provider", "execution"]
     summary: str
     supported_presets: tuple[PresetName, ...]
     dependencies: tuple[str, ...] = ()
@@ -92,7 +89,6 @@ class CapabilitySpec:
     conflicts: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     environment: tuple[str, ...] = ()
-    supported_databases: tuple[DatabaseName, ...] = ("sqlite", "postgres")
     supported_executions: tuple[ExecutionName, ...] = ("none", "docker")
     files: tuple[str, ...] = ()
     verification: tuple[str, ...] = ()
@@ -111,7 +107,6 @@ class CapabilitySpec:
             "conflicts": list(self.conflicts),
             "dependencies": list(self.dependencies),
             "environment": list(self.environment),
-            "supported_databases": list(self.supported_databases),
             "supported_executions": list(self.supported_executions),
             "files": list(self.files),
             "verification": list(self.verification),
@@ -138,7 +133,6 @@ PRESETS: tuple[PresetSpec, ...] = (
         name="service",
         summary="Maintained authenticated multi-user product-service shape.",
         default_capabilities=("tasks", "approvals", "observability", "evals"),
-        supported_databases=("sqlite",),
         environment=("PRODUCT_AUTH_TOKENS_JSON", "CAYU_OPERATOR_BEARER_TOKEN"),
     ),
     PresetSpec(
@@ -157,20 +151,6 @@ PRESETS: tuple[PresetSpec, ...] = (
 )
 
 ADAPTERS: tuple[AdapterSpec, ...] = (
-    AdapterSpec(
-        name="sqlite",
-        kind="database",
-        summary="Local durable SQLite stores under data/cayu.db.",
-        supported_presets=("agent", "service", "coding"),
-    ),
-    AdapterSpec(
-        name="postgres",
-        kind="database",
-        summary="Durable Postgres stores selected by CAYU_DATABASE_URL.",
-        supported_presets=("agent", "coding"),
-        dependencies=("cayu[postgres]",),
-        environment=("CAYU_DATABASE_URL",),
-    ),
     AdapterSpec(
         name="neutral",
         kind="provider",
@@ -348,7 +328,6 @@ class ApplicationPlan:
     name: str
     agent_name: str
     preset: PresetName
-    database: DatabaseName
     provider: ProviderName
     execution: ExecutionName
     capabilities: tuple[str, ...]
@@ -367,10 +346,6 @@ class ApplicationPlan:
             else "uv run --no-sync cayu check --fail-on warning --json"
         )
         check_environment: list[str] = []
-        if self.database == "postgres":
-            check_environment.append(
-                "CAYU_DATABASE_URL=postgresql://cayu-unconfigured@127.0.0.1/cayu"
-            )
         if self.preset == "service":
             check_environment.extend(
                 (
@@ -420,7 +395,6 @@ class ApplicationPlan:
             "agent_name": self.agent_name,
             "preset": self.preset,
             "adapters": {
-                "database": self.database,
                 "provider": self.provider,
                 "execution": self.execution,
             },
@@ -475,7 +449,6 @@ def normalize_application_plan(
     name: str,
     agent_name: str,
     preset: str = "agent",
-    database: str = "sqlite",
     provider: str = "neutral",
     execution: str = "none",
     coding_toolchain: str | None = None,
@@ -486,10 +459,9 @@ def normalize_application_plan(
     """Resolve and validate every generator choice before rendering or writing."""
 
     selected_preset = preset_spec(preset)
-    database_spec = _adapter("database", database)
     provider_spec = _adapter("provider", provider)
     execution_spec = _adapter("execution", execution)
-    for adapter in (database_spec, provider_spec, execution_spec):
+    for adapter in (provider_spec, execution_spec):
         if selected_preset.name not in adapter.supported_presets:
             raise ScaffoldPlanError(
                 "unsupported_adapter",
@@ -555,11 +527,6 @@ def normalize_application_plan(
                 "unsupported_capability",
                 f"capability {name_value!r} is not supported by preset {preset!r}",
             )
-        if database_spec.name not in spec.supported_databases:
-            raise ScaffoldPlanError(
-                "unsupported_capability_database",
-                f"capability {name_value!r} does not support database {database!r}",
-            )
         if execution_spec.name not in spec.supported_executions:
             raise ScaffoldPlanError(
                 "unsupported_capability_execution",
@@ -603,7 +570,6 @@ def normalize_application_plan(
         name=name,
         agent_name=agent_name,
         preset=selected_preset.name,
-        database=cast("DatabaseName", database_spec.name),
         provider=cast("ProviderName", provider_spec.name),
         execution=cast("ExecutionName", execution_spec.name),
         capabilities=tuple(sorted(capabilities)),
@@ -612,7 +578,7 @@ def normalize_application_plan(
     )
 
 
-def _adapter(kind: Literal["database", "provider", "execution"], name: str) -> AdapterSpec:
+def _adapter(kind: Literal["provider", "execution"], name: str) -> AdapterSpec:
     try:
         return _ADAPTER_BY_KEY[(kind, name)]
     except KeyError:
@@ -639,9 +605,9 @@ def _expand_capability_arguments(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _plan_environment(plan: ApplicationPlan) -> tuple[str, ...]:
-    environment = set(_PRESET_BY_NAME[plan.preset].environment)
+    # CAYU_DATABASE_URL selects the durable store for every project.
+    environment = {"CAYU_DATABASE_URL", *_PRESET_BY_NAME[plan.preset].environment}
     for kind, name in (
-        ("database", plan.database),
         ("provider", plan.provider),
         ("execution", plan.execution),
     ):
@@ -652,9 +618,9 @@ def _plan_environment(plan: ApplicationPlan) -> tuple[str, ...]:
 
 
 def _plan_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
-    dependencies = {"cayu"}
+    # Every project can switch to PostgreSQL through CAYU_DATABASE_URL.
+    dependencies = {"cayu[postgres]"}
     for kind, name in (
-        ("database", plan.database),
         ("provider", plan.provider),
         ("execution", plan.execution),
     ):
@@ -678,10 +644,7 @@ def normalize_extension_declarations(
             )
         if name in plan.capabilities:
             raise ScaffoldPlanError("extension_overlap", "extensions must not repeat capabilities")
-        if (
-            plan.database not in spec.supported_databases
-            or plan.execution not in spec.supported_executions
-        ):
+        if plan.execution not in spec.supported_executions:
             raise ScaffoldPlanError(
                 "unsupported_extension_adapter", "extension adapters are unsupported"
             )

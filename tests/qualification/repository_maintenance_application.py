@@ -62,7 +62,6 @@ def maintenance_project_files(*, database: str = "postgres") -> dict[str, str]:
     files = project_files(
         "maintenance-app",
         preset="coding",
-        database=database,
         execution="docker",
         coding_toolchain="python",
         with_capabilities=("github-delivery",),
@@ -123,10 +122,8 @@ def maintenance_project_files(*, database: str = "postgres") -> dict[str, str]:
     )
     # The application-owned API/operator host is deployed without dev groups.
     # Keep the coding preset; this does not adopt the service execution owner.
-    runtime_extra = "[postgres]" if database == "postgres" else ""
-    deployed_extra = "[postgres,server]" if database == "postgres" else "[server]"
     files["pyproject.toml"] = _replace_once(
-        files["pyproject.toml"], f'"cayu{runtime_extra}==', f'"cayu{deployed_extra}=='
+        files["pyproject.toml"], '"cayu[postgres]==', '"cayu[postgres,server]=='
     )
     files["pyproject.toml"] = _replace_once(
         files["pyproject.toml"],

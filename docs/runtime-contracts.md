@@ -52,7 +52,14 @@ workers use recorded launch settings. These defaults do not replace aggregate
 
 Generated agent, service, and coding presets share one application layout.
 `configuration/settings.py` owns environment reads and validation;
-`configuration/runtime.py` constructs `CayuConfig` directly. Per-run overrides
+`configuration/runtime.py` constructs `CayuConfig` directly. The storage module
+builds session, task, and knowledge stores with `open_application_stores(...)`:
+`CAYU_DATABASE_URL` selects PostgreSQL stores on one shared pool bounded by
+`CAYU_DATABASE_POOL_MAX` (default 5) with `SchemaMode.VALIDATE`, and without it
+SQLite at an absolute project path. The CLI store resolver parses the same
+variable with the same code, so application stores and Cayu tooling agree.
+`CAYU_REQUIRE_POSTGRES=1` makes every Cayu SQLite store raise
+`PostgresRequiredError` at construction. Per-run overrides
 remain at the invocation boundary. Schema versions and internal validation
 ceilings remain feature-owned contracts rather than application settings.
 
@@ -4145,9 +4152,13 @@ DSN-backed store recognizes notifications from its own retained pool connection,
 suppresses that listener echo, and publishes the exact local edge after commit;
 the same local path remains available before the listener connects. A remote
 PostgreSQL edge deliberately carries no matching values, so it wakes one waiter
-as a conservative superset. Stores built around a caller-owned pool, or a
-deployment proxy that does not preserve session-level `LISTEN`, retain the same
-process-local hint and bounded polling behavior. SQLite and in-memory hints are
+as a conservative superset. A store built around a caller-owned pool listens only
+when constructed with `task_admission_listener_conninfo`, which opens the one
+`LISTEN` connection outside that pool; `open_application_stores` always supplies
+it, using `CAYU_DATABASE_DIRECT_URL` when set so the listener bypasses a
+transaction-pooling proxy. Other caller-owned pools, or a deployment proxy that
+does not preserve session-level `LISTEN`, retain the same process-local hint and
+bounded polling behavior. SQLite and in-memory hints are
 process-local to the exact store instance; reconstruction and separate processes
 converge through polling.
 

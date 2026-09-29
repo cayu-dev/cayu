@@ -24,7 +24,10 @@ def sqlite_resources(
 
 _DOCKER_SKIP_REASON = "Docker is unavailable; skipping Postgres store tests."
 _DSN_ENV_VAR = "CAYU_TEST_POSTGRES_DSN"
-_REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES"
+_REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES_TESTS"
+# The runtime flag makes every Cayu SQLite store refuse to open; it is not the
+# test-tier requirement above.
+_RUNTIME_REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES"
 _REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR = "CAYU_REQUIRE_CURRENT_TEST_DURATIONS"
 _POSTGRES_CONTAINER_IMAGE = "pgvector/pgvector:pg16"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
@@ -34,6 +37,12 @@ _CI_FAILURE_LOGGING = False
 
 def pytest_configure(config: pytest.Config) -> None:
     global _CI_FAILURE_LOGGING
+    if os.environ.get(_RUNTIME_REQUIRE_POSTGRES_ENV_VAR, "").strip() not in {"", "0"}:
+        raise pytest.UsageError(
+            f"{_RUNTIME_REQUIRE_POSTGRES_ENV_VAR} makes every Cayu SQLite store refuse to "
+            "open, so the SQLite tests cannot run. Unset it; set "
+            f"{_REQUIRE_POSTGRES_ENV_VAR}=1 to require the Postgres test tier."
+        )
     if os.environ.get("GITHUB_ACTIONS") != "true" or not config.getoption("splits", None):
         return
     owner = os.environ.setdefault("CAYU_CI_REPORT_OWNER_PID", str(os.getpid()))
@@ -267,7 +276,7 @@ def _postgres_server_dsn() -> str:
     2. A Dockerized pgvector-capable Postgres via testcontainers.
 
     Skips the whole module when neither is available, unless
-    ``CAYU_REQUIRE_POSTGRES`` is set. CI sets that flag so a lost Postgres tier
+    ``CAYU_REQUIRE_POSTGRES_TESTS`` is set. CI sets that flag so a lost Postgres tier
     fails loudly instead of disappearing behind a green check.
     Tests own their schema and ``DROP TABLE`` between runs, so the target database
     must be disposable — never point this at a database with data you care about.
@@ -322,3 +331,21 @@ def postgres_dsn(_postgres_server_dsn: str) -> str:
             connection.execute(
                 sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
             )
+
+
+@pytest.fixture(scope="module")
+def postgres_url(postgres_dsn: str) -> str:
+    """The module database as the ``postgresql://`` URL ``CAYU_DATABASE_URL`` requires."""
+    from urllib.parse import quote
+
+    from psycopg.conninfo import conninfo_to_dict
+
+    params = conninfo_to_dict(postgres_dsn)
+    credentials = quote(str(params.get("user", "")), safe="")
+    password = params.get("password")
+    if password:
+        credentials += ":" + quote(str(password), safe="")
+    host = params.get("host", "localhost")
+    port = params.get("port", 5432)
+    database = quote(str(params["dbname"]), safe="")
+    return f"postgresql://{credentials}@{host}:{port}/{database}"

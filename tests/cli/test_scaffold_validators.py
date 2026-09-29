@@ -265,8 +265,6 @@ def test_generated_service_validator_cli(tmp_path: Path) -> None:
         "validator-probe",
         "--preset",
         "service",
-        "--database",
-        "sqlite",
         "--provider",
         "openai-subscription",
         "--execution",

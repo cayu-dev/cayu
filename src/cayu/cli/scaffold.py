@@ -32,6 +32,7 @@ from cayu.cli._guarded_tree_publication import (
 from cayu.cli.scaffold_convention import (
     application_guidance,
     convention_files,
+    local_database_path,
     scaffold_contract,
 )
 from cayu.cli.scaffold_plan import (
@@ -3284,11 +3285,14 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         choices=tuple(spec.name for spec in PRESETS),
         help="Coherent application shape: agent (default), service, or coding.",
     )
+    # Deprecated: every project now selects its database at runtime through
+    # CAYU_DATABASE_URL. Existing scripts and generated AGENTS.md commands may
+    # still pass it, so both old values are accepted and ignored with a notice.
     parser.add_argument(
         "--database",
-        choices=tuple(spec.name for spec in ADAPTERS if spec.kind == "database"),
-        default="sqlite",
-        help="Database adapter for maintained generated stores (default: sqlite).",
+        choices=("sqlite", "postgres"),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--execution",
@@ -3372,7 +3376,6 @@ def project_files(
     coding_toolchain: str | None = None,
     coding_command_authority: str | None = None,
     preset: str | None = None,
-    database: str = "sqlite",
     execution: str | None = None,
     with_capabilities: tuple[str, ...] = (),
     without_capabilities: tuple[str, ...] = (),
@@ -3384,7 +3387,6 @@ def project_files(
             name=name,
             agent_name=resolved_agent_name,
             preset=preset or "agent",
-            database=database,
             provider=provider or "neutral",
             execution=execution or "none",
             coding_toolchain=coding_toolchain,
@@ -3404,15 +3406,11 @@ def project_files(
         raise ValueError("coding_command_authority conflicts with the normalized plan.")
     reviewer_name = f"{resolved_agent_name}-reviewer"
     version = _installed_cayu_version()
-    runtime_extra = (
-        "[server]"
-        if plan.preset == "service"
-        else ("[postgres]" if plan.database == "postgres" else "")
-    )
+    # Every project can switch to PostgreSQL through CAYU_DATABASE_URL.
+    runtime_extra = "[postgres,server]" if plan.preset == "service" else "[postgres]"
     dev_dependencies = ["pytest"]
     if plan.preset != "service":
-        dev_extra = "postgres,server" if plan.database == "postgres" else "server"
-        dev_dependencies.insert(0, f"cayu[{dev_extra}]=={version}")
+        dev_dependencies.insert(0, f"cayu[postgres,server]=={version}")
     if plan.preset == "service" or plan.execution == "docker":
         dev_dependencies.append("ruff>=0.15.15,<0.16")
 
@@ -3423,70 +3421,42 @@ def project_files(
         provider_display = provider or "no live provider"
         provider_literal = "None" if provider is None else json.dumps(provider)
         knowledge_selected = "knowledge" in plan.capabilities
-        if plan.database == "postgres":
-            database_readme_proof_guidance = (
-                "Run setup and proof commands in the listed order. Do not parallelize "
-                "commands that construct the application against the same configured "
-                "Postgres database; schema setup and shared-state checks require explicit "
-                "coordination."
-            )
-            database_agents_proof_guidance = (
-                "- Run setup and proof commands sequentially. Do not parallelize application-\n"
-                "  constructing commands against the same configured Postgres database."
-            )
-            database_evals_storage_guidance = "the configured durable Postgres Evals store"
-            coding_database_summary = (
-                "durable Postgres knowledge"
+        database_readme_proof_guidance = (
+            "Run setup and proof commands in the listed order. Do not parallelize "
+            "commands that construct the application against the same database; "
+            "first use of local SQLite may initialize or migrate its schema."
+        )
+        database_agents_proof_guidance = (
+            "- Run setup and proof commands sequentially. Do not parallelize application-\n"
+            "  constructing commands against the same database."
+        )
+        database_evals_storage_guidance = (
+            "the configured durable Evals store (`CAYU_DATABASE_URL`, else "
+            f"`{local_database_path(plan)}`)"
+        )
+        coding_database_summary = (
+            "durable knowledge" if knowledge_selected else "no configured knowledge store or tools"
+        )
+        coding_state_storage = (
+            "Artifact state is stored below that protected `.cayu` boundary; "
+            + (
+                "session, task, and knowledge state lives in the configured database "
+                "(`CAYU_DATABASE_URL`, else `.cayu/runtime/cayu.db`). Use the registered "
+                "Git, artifact, and knowledge tools at their authenticated boundaries instead."
                 if knowledge_selected
-                else "no configured knowledge store or tools"
+                else "session and task state lives in the configured database "
+                "(`CAYU_DATABASE_URL`, else `.cayu/runtime/cayu.db`). "
+                "No knowledge store or knowledge tools are configured."
             )
-            coding_state_storage = (
-                "Artifact state is stored below that protected `.cayu` boundary; "
-                + (
-                    "session, task, and knowledge state lives in the configured Postgres "
-                    "stores. Use the registered Git, artifact, and knowledge tools at their "
-                    "authenticated boundaries instead."
-                    if knowledge_selected
-                    else "session and task state lives in the configured Postgres stores. "
-                    "No knowledge store or knowledge tools are configured."
-                )
-            )
-        else:
-            database_readme_proof_guidance = (
-                "Run setup and proof commands in the listed order. Do not parallelize "
-                "commands that construct the application against the same local SQLite "
-                "store; first use may initialize or migrate its schema."
-            )
-            database_agents_proof_guidance = (
-                "- Run setup and proof commands sequentially. Do not parallelize application-\n"
-                "  constructing commands against the same local SQLite store."
-            )
-            database_evals_storage_guidance = "this project's durable `data/cayu.db` store"
-            coding_database_summary = (
-                "durable SQLite knowledge"
-                if knowledge_selected
-                else "no configured knowledge store or tools"
-            )
-            coding_state_storage = (
-                "Session, task, artifact, and knowledge state is stored below that "
-                "protected `.cayu` boundary; use the registered Git, artifact, and "
-                "knowledge tools at their authenticated boundaries instead."
-                if knowledge_selected
-                else "Session, task, and artifact state is stored below that protected "
-                "`.cayu` boundary. No knowledge store or knowledge tools are configured."
-            )
+        )
         if plan.preset == "coding" and not {"tasks", "artifacts"} <= set(plan.capabilities):
             states = ["session"] + [
                 item for item in ("tasks", "knowledge") if item in plan.capabilities
             ]
             coding_state_storage = (
                 ", ".join(states).capitalize()
-                + " state uses the configured "
-                + (
-                    "Postgres stores. "
-                    if plan.database == "postgres"
-                    else "protected `.cayu` SQLite stores. "
-                )
+                + " state uses the configured database (`CAYU_DATABASE_URL`, else the "
+                + "protected `.cayu/runtime/cayu.db`). "
                 + (
                     "Artifacts use protected `.cayu` storage. "
                     if "artifacts" in plan.capabilities
@@ -3528,11 +3498,8 @@ def project_files(
             "__EVAL_TARGET__": (
                 'eval_target = "evals.agent:build_eval"\n' if "evals" in plan.capabilities else ""
             ),
-            "__SESSION_STORE__": (
-                'backend = "postgres"\nenv = "CAYU_DATABASE_URL"'
-                if plan.database == "postgres"
-                else 'backend = "sqlite"\npath = "data/cayu.db"'
-            ),
+            # Local tooling default; CAYU_DATABASE_URL overrides it for the CLI and app.
+            "__SESSION_STORE__": f'backend = "sqlite"\npath = "{local_database_path(plan)}"',
             "__PROVIDER_DISPLAY__": provider_display,
             "__PROVIDER_LITERAL__": provider_literal,
             "__PROVIDER_GUIDE_POINTER__": _PROVIDER_GUIDE_POINTER,
@@ -3721,7 +3688,6 @@ def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan
         name=name,
         agent_name=agent_name,
         preset=preset,
-        database=args.database,
         provider=args.provider or "neutral",
         execution=execution,
         coding_toolchain=args.coding_toolchain,
@@ -3738,7 +3704,6 @@ def _agent_context(plan: ApplicationPlan) -> dict[str, object]:
         "scaffold_contract": "pyproject.toml:[tool.cayu.scaffold]",
         "selected_plan": {
             "preset": plan.preset,
-            "database": plan.database,
             "provider": plan.provider,
             "execution": plan.execution,
             "coding_toolchain": plan.coding_toolchain,
@@ -3867,11 +3832,7 @@ def _render_new_receipt(
     coding_toolchain: str | None,
 ) -> None:
     print(f"Scaffolded {target}/ — Cayu application convention {plan.convention}")
-    print(
-        "  Plan: "
-        f"preset={plan.preset} database={plan.database} provider={plan.provider} "
-        f"execution={plan.execution}"
-    )
+    print(f"  Plan: preset={plan.preset} provider={plan.provider} execution={plan.execution}")
     capabilities = ", ".join(plan.capabilities) if plan.capabilities else "none"
     print(f"  Capabilities: {capabilities}")
     if "memory" in plan.capabilities:
@@ -3922,6 +3883,12 @@ def run_new(args: argparse.Namespace) -> int:
             code="INTERACTIVE_JSON_CONFLICT",
             message="--interactive cannot be combined with --json",
             as_json=True,
+        )
+    if args.database is not None:
+        print(
+            "cayu new: --database is deprecated and ignored; every project selects "
+            "PostgreSQL through CAYU_DATABASE_URL and uses local SQLite otherwise.",
+            file=sys.stderr,
         )
     name = args.name
     if args.interactive:
@@ -4010,10 +3977,7 @@ def run_new(args: argparse.Namespace) -> int:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print(f"Plan for {target}/ ({len(files)} files, no writes):")
-            print(
-                f"  preset={plan.preset} database={plan.database} "
-                f"provider={plan.provider} execution={plan.execution}"
-            )
+            print(f"  preset={plan.preset} provider={plan.provider} execution={plan.execution}")
             for relative in sorted(files):
                 print(f"  create {relative}")
             if "memory" in plan.capabilities:

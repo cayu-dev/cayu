@@ -139,7 +139,7 @@ def test_successful_pytest_check_records_counts_and_env_overrides() -> None:
         capability="postgres",
         lane="postgres",
         command=("uv", "run", "pytest"),
-        env={"CAYU_REQUIRE_POSTGRES": "1"},
+        env={"CAYU_REQUIRE_POSTGRES_TESTS": "1"},
     )
     observed_env = {}
 
@@ -152,7 +152,7 @@ def test_successful_pytest_check_records_counts_and_env_overrides() -> None:
 
     result = nightly.run_checks([check], environ={}, runner=runner)[0]
 
-    assert observed_env["CAYU_REQUIRE_POSTGRES"] == "1"
+    assert observed_env["CAYU_REQUIRE_POSTGRES_TESTS"] == "1"
     assert result.status == nightly.STATUS_VERIFIED
     assert result.evidence == {"returncode": 0, "passed": 3, "skipped": 2}
     assert result.as_json()["command"] == "uv run pytest"

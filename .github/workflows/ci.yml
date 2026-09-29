@@ -84,7 +84,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
     env:
-      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_POSTGRES_TESTS: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
       CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
@@ -144,7 +144,7 @@ jobs:
           - host-journey-2
           - host-journey-3
     env:
-      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_POSTGRES_TESTS: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
       CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"

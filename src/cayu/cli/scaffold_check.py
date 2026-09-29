@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+from cayu.cli.scaffold_convention import local_database_path
 from cayu.cli.scaffold_plan import (
     ApplicationPlan,
     ScaffoldPlanError,
@@ -23,6 +24,7 @@ from cayu.runtime.manifest import AppManifest
 _VERIFY = "cayu check --fail-on warning --json"
 _DOCS = "cayu guide applications#convention"
 _MAX_DECLARATION_MODULES = 1024
+_LEGACY_DATABASE_CHOICES = ("sqlite", "postgres")
 
 
 class _DeclarationGraphLimit(Exception):
@@ -363,10 +365,14 @@ def _invalid_scaffold_contract(exc: ScaffoldPlanError) -> ProjectDiagnostic:
 
 
 def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan:
-    required_strings = ("preset", "database", "provider", "execution")
+    required_strings = ("preset", "provider", "execution")
     for field in required_strings:
         if type(contract.get(field)) is not str:
             raise ScaffoldPlanError("invalid_" + field, f"{field} must be a string")
+    # Projects generated before CAYU_DATABASE_URL selection record a retired
+    # database choice. Accept either old value; storage drift is reported separately.
+    if "database" in contract and contract["database"] not in _LEGACY_DATABASE_CHOICES:
+        raise ScaffoldPlanError("invalid_database", 'database must be "sqlite" or "postgres"')
     capabilities = contract.get("capabilities")
     if not isinstance(capabilities, list) or any(type(item) is not str for item in capabilities):
         raise ScaffoldPlanError(
@@ -383,7 +389,6 @@ def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan
         name="declared-scaffold",
         agent_name="declared-agent",
         preset=preset,
-        database=cast("str", contract["database"]),
         provider=cast("str", contract["provider"]),
         execution=cast("str", contract["execution"]),
         with_capabilities=tuple(sorted(selected - defaults)),
@@ -414,7 +419,17 @@ def _check_selected_plan_source(
 
     diagnostics: list[ProjectDiagnostic] = []
 
-    def drift(field: str, expected: object, observed: object, path: str) -> None:
+    def drift(
+        field: str,
+        expected: object,
+        observed: object,
+        path: str,
+        *,
+        hint: str = (
+            "Restore the selected generated variant or perform an explicit reviewed "
+            "plan migration; changing only scaffold metadata is not a migration."
+        ),
+    ) -> None:
         if observed == expected:
             return
         diagnostics.append(
@@ -425,10 +440,7 @@ def _check_selected_plan_source(
                     f"Declared scaffold {field} {expected!r} does not match source "
                     f"evidence {observed!r}."
                 ),
-                hint=(
-                    "Restore the selected generated variant or perform an explicit reviewed "
-                    "plan migration; changing only scaffold metadata is not a migration."
-                ),
+                hint=hint,
                 parameters={"field": field, "expected": expected, "observed": observed},
                 severity=DiagnosticSeverity.ERROR,
             )
@@ -436,33 +448,42 @@ def _check_selected_plan_source(
 
     cayu = _tool_cayu(document)
     session_store = cayu.get("session_store")
-    backend = (
-        cast("Mapping[str, object]", session_store).get("backend")
+    local_database = local_database_path(plan)
+    drift(
+        "storage",
+        {"backend": "sqlite", "path": local_database},
+        dict(cast("Mapping[str, object]", session_store))
         if isinstance(session_store, Mapping)
-        else None
+        else None,
+        "pyproject.toml:[tool.cayu.session_store]",
+        hint=(
+            f'Set [tool.cayu.session_store] to backend = "sqlite" and path = '
+            f'"{local_database}" for local tooling. Deployments select PostgreSQL with '
+            "CAYU_DATABASE_URL, which the app and every Cayu CLI command read first."
+        ),
     )
-    drift("database", plan.database, backend, "pyproject.toml:[tool.cayu.session_store].backend")
 
     configuration_path = "configuration/settings.py"
     provider = _static_assignment(root / configuration_path, "_SCAFFOLDED_PROVIDER")
     expected_provider = None if plan.provider == "neutral" else plan.provider
     drift("provider", expected_provider, provider, configuration_path)
 
-    database = _static_assignment(root / "configuration/settings.py", "SCAFFOLDED_DATABASE")
-    drift("database", plan.database, database, "configuration/settings.py")
     storage_relative = (
         "configuration/coding_storage.py" if plan.preset == "coding" else "configuration/storage.py"
     )
-    storage = root / storage_relative
-    if plan.preset == "coding":
-        storage_profile = _static_assignment(storage, "GENERATED_STORE_PROFILE")
-        drift("database", plan.database, storage_profile, storage_relative)
-    else:
-        expected_store = (
-            "PostgresSessionStore" if plan.database == "postgres" else "SQLiteSessionStore"
-        )
-        observed_store = expected_store if _source_contains_name(storage, expected_store) else None
-        drift("database", expected_store, observed_store, storage_relative)
+    drift(
+        "storage",
+        "open_application_stores",
+        _storage_selection_evidence(root / storage_relative),
+        storage_relative,
+        hint=(
+            "Build the application stores with open_application_stores("
+            "configured_database_url(), sqlite_path=...) so CAYU_DATABASE_URL selects "
+            "PostgreSQL and local development keeps SQLite. Compare with a disposable "
+            "`cayu new --dry-run` reference; a fixed SQLite or Postgres constructor "
+            "ignores the deployment's database."
+        ),
+    )
 
     logging = _runtime_logging_value(root / "configuration/runtime.py")
     expected_logging = "observability" in plan.capabilities
@@ -555,6 +576,19 @@ def _static_assignment(path: Path, name: str) -> object:
             return ast.literal_eval(value)
         except (ValueError, TypeError):
             return None
+    return None
+
+
+def _storage_selection_evidence(path: Path) -> str | None:
+    """Name how a storage module selects its backend, from source alone."""
+
+    for fixed in ("SQLiteSessionStore", "PostgresSessionStore"):
+        if _source_contains_name(path, fixed):
+            return fixed
+    if _source_contains_name(path, "open_application_stores") and _source_contains_name(
+        path, "configured_database_url"
+    ):
+        return "open_application_stores"
     return None
 
 

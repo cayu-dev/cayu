@@ -55,6 +55,7 @@ from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     copy_model_attempt_identity,
 )
+from cayu.storage.targets import require_sqlite_store_allowed
 
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
@@ -79,6 +80,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteBudgetLedger")
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:

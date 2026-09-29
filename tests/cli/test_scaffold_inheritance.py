@@ -154,8 +154,6 @@ def test_generated_service_accepts_exception_and_tool_hierarchies(
         "inheritance-probe",
         "--preset",
         "service",
-        "--database",
-        "sqlite",
         "--provider",
         "openai-subscription",
         "--execution",

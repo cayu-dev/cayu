@@ -372,6 +372,37 @@ steps:
       check = json.loads(Path("completed-check.json").read_text())
       assert check["diagnostics"] == []
       PY
+  - name: Check generated project installs the Postgres driver
+    groups: authoring
+    run: |
+      wheel="$(realpath dist/first/*.whl)"
+      postgres_root="$(mktemp -d "$RUNNER_TEMP/postgres-driver.XXXXXX")"
+      .release-venv/bin/cayu new proof-postgres --dir "$postgres_root"
+      cd "$postgres_root/proof-postgres"
+      unset PYTHONPATH
+      uv venv --python 3.11 .venv
+      # The plain built wheel satisfies the project's pinned Cayu requirement, so
+      # only the generated pyproject's declared extra can bring in the driver.
+      uv pip install --python .venv/bin/python "cayu @ file://${wheel}"
+      if .venv/bin/python -c 'import psycopg' 2>/dev/null; then
+        echo "psycopg was installed before the generated project's requirements"
+        exit 1
+      fi
+      uv pip install --python .venv/bin/python -r pyproject.toml
+      CAYU_DATABASE_URL=postgresql://cayu-unconfigured@127.0.0.1/cayu \
+        .venv/bin/python - <<'PY'
+      import psycopg
+      import psycopg_pool
+
+      from app import build_app
+      from cayu import PostgresSessionStore, PostgresTaskStore
+
+      app = build_app()
+      assert type(app.session_store) is PostgresSessionStore
+      assert type(app.task_store) is PostgresTaskStore
+      assert type(app.session_store._pool) is psycopg_pool.AsyncConnectionPool
+      assert psycopg.__version__
+      PY
   - name: Check built-wheel coding authoring contract
     groups: coding
     run: |

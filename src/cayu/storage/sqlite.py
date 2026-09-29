@@ -59,6 +59,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
+from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
     from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
@@ -1787,6 +1788,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
         ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteSessionStore")
         from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
 
         self._cost_accounting_authority = CostAccountingAuthority()

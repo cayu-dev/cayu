@@ -36,6 +36,7 @@ from cayu.observability.watchers import (
 )
 from cayu.sessions.base import EventRecord
 from cayu.storage import migrations as schema
+from cayu.storage.targets import require_sqlite_store_allowed
 
 from . import _sqlite_support as sqlite_support
 
@@ -52,6 +53,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         clock: Callable[[], datetime] | None = None,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteEventWatcherStore")
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:

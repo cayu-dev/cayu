@@ -33,7 +33,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
-      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_POSTGRES_TESTS: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
       CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"

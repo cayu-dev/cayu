@@ -46,7 +46,7 @@ def lifecycle_case(request, tmp_path):
         # Ordinary focused local runs do not allocate a database implicitly.
         # Required CI uses the canonical fixture and must not silently skip it.
         if not os.environ.get("CAYU_TEST_POSTGRES_DSN") and os.environ.get(
-            "CAYU_REQUIRE_POSTGRES", ""
+            "CAYU_REQUIRE_POSTGRES_TESTS", ""
         ).strip().lower() not in {"1", "true", "yes", "on"}:
             pytest.skip("Set CAYU_TEST_POSTGRES_DSN to run PostgreSQL lifecycle tests.")
         return request.param, tmp_path, request.getfixturevalue("conformance_postgres_dsn")
@@ -61,7 +61,7 @@ async def _session(store, sid="queue-target"):
 
 def test_required_postgres_lane_uses_canonical_fixture_without_explicit_dsn(monkeypatch, tmp_path):
     monkeypatch.delenv("CAYU_TEST_POSTGRES_DSN", raising=False)
-    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", "1")
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES_TESTS", "1")
     calls = []
 
     class Request:

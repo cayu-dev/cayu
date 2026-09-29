@@ -251,11 +251,11 @@ def main():
             if args.docker:
                 env["CAYU_REQUIRE_DOCKER_CODING"] = "1"
             if args.postgres:
-                env["CAYU_REQUIRE_POSTGRES"] = "1"
+                env["CAYU_REQUIRE_POSTGRES_TESTS"] = "1"
                 env["CAYU_QUALIFICATION_POSTGRES"] = "1"
             else:
                 env.pop("CAYU_TEST_POSTGRES_DSN", None)
-                env.pop("CAYU_REQUIRE_POSTGRES", None)
+                env.pop("CAYU_REQUIRE_POSTGRES_TESTS", None)
             manifest = json.dumps(
                 [s.__dict__ for s in SCENARIOS + POSTGRES_SCENARIOS + DOCKER_SCENARIOS],
                 sort_keys=True,

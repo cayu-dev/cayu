@@ -11,6 +11,7 @@ from cayu._clock import utc_clock
 from cayu._validation import require_nonblank
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.work_context import (
     AgentRecallCheckpoint,
     AgentRecallCheckpointKey,
@@ -214,6 +215,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
         clock=None,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteAgentWorkContextStore")
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:

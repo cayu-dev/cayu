@@ -150,6 +150,7 @@ from cayu.snapshots.base import (
 from cayu.storage.memory import (
     KnowledgeStore,
 )
+from cayu.storage.targets import require_sqlite_store_allowed
 
 MEMORY_INTERVENTION_EXECUTION_SCHEMA_VERSION = 1
 MEMORY_INTERVENTION_EXECUTION_RECORD_SCHEMA_VERSION = 2
@@ -1309,6 +1310,7 @@ class SQLiteMemoryInterventionExecutionStore(MemoryInterventionExecutionStore):
         *,
         ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteMemoryInterventionExecutionStore")
         self.path = Path(path)
         self._schema_lock = threading.Lock()
         self._schema_ready = False

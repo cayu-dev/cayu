@@ -275,11 +275,7 @@ from cayu import (
     WriteFileTool,
 )
 from agents.registration import register_coding_agents
-from configuration.coding_storage import (
-    GENERATED_KNOWLEDGE_STORE_TYPE,
-    GENERATED_STORE_PROFILE,
-    build_coding_stores,
-)
+from configuration.coding_storage import build_coding_stores
 from configuration.runtime import build_runtime_options
 from configuration.settings import configured_coding_command_environment
 from environments.coding import workspace_candidate
@@ -356,6 +352,7 @@ def _coding_environment_identity(
     knowledge_store: KnowledgeStore | None,
     scope: KnowledgeAccessScope | None,
     generated_stores: bool,
+    store_profile: str,
 ) -> ExecutionProfileBehaviorIdentity | None:
     """Declare the generated environment/store wiring version."""
 
@@ -363,18 +360,11 @@ def _coding_environment_identity(
         return None
     if artifact_store is not None and type(artifact_store) is not LocalArtifactStore:
         return None
-    if (
-        knowledge_store is not None
-        and type(knowledge_store) is not GENERATED_KNOWLEDGE_STORE_TYPE
-    ):
-        return None
-    del root, scope
+    del root, scope, knowledge_store
     return ExecutionProfileBehaviorIdentity(
         name="cayu.generated.coding.environment",
         behavior_version="2",
-        implementation_version=(
-            f"1-{GENERATED_STORE_PROFILE}-__CODING_PROFILE__"
-        ),
+        implementation_version=f"1-{store_profile}-__CODING_PROFILE__",
     )
 
 
@@ -1297,6 +1287,7 @@ def build_coding_app(
             artifact_store is None
             and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
         ),
+        store_profile=stores.store_profile,
     )
 
     runtime = build_runtime_options()
@@ -1690,26 +1681,29 @@ REVIEWER_MAX_ELAPSED_SECONDS = 120
 '''
 
 
-_SQLITE_CODING_STORAGE_PY = '''"""SQLite stores active in the maintained coding preset."""
+_CODING_STORAGE_PY = '''"""Durable stores active in the maintained coding preset.
+
+CAYU_DATABASE_URL selects PostgreSQL for deployments. Without it the stores use
+local SQLite at .cayu/runtime/cayu.db, below the protected state directory the
+coding agent's workspace tools cannot reach. The Cayu CLI reads CAYU_DATABASE_URL
+first too, then [tool.cayu.session_store], so both use the same database.
+"""
 
 from dataclasses import dataclass
 from pathlib import Path
 
 from cayu import (
+    ApplicationStores,
     KnowledgeAccessScope,
     KnowledgeStore,
     SessionStore,
-    SQLiteKnowledgeStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
     TaskStore,
+    configured_database_url,
+    open_application_stores,
 )
 
 from configuration.settings import configured_public_authority_alias_codec
 
-GENERATED_KNOWLEDGE_STORE_TYPE = SQLiteKnowledgeStore
-GENERATED_STORE_PROFILE = "sqlite"
-
 
 @dataclass(frozen=True, slots=True)
 class CodingStores:
@@ -1718,6 +1712,10 @@ class CodingStores:
     knowledge_store: KnowledgeStore | None
     generated_session_store: bool
     generated_knowledge_store: bool
+    # "sqlite" or "postgres" for generated stores; "injected" otherwise.
+    store_profile: str
+    # Stores built here and their shared connection pool; close() releases them.
+    configured: ApplicationStores | None
 
 
 def build_coding_stores(
@@ -1728,7 +1726,7 @@ def build_coding_stores(
     task_store: TaskStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
 ) -> CodingStores:
-    """Construct one coherent SQLite-backed coding store profile."""
+    """Construct one coherent coding store profile from the configured database."""
 
     if not __CODING_TASKS_ENABLED__ and task_store is not None:
         raise ValueError("task_store requires the tasks capability")
@@ -1736,113 +1734,37 @@ def build_coding_stores(
         raise ValueError("scope requires the knowledge capability")
     if scope is None and knowledge_store is not None:
         raise ValueError("knowledge_store requires the knowledge capability")
-    database = state_root / "cayu.db"
+    build_tasks = __CODING_TASKS_ENABLED__ and task_store is None
+    build_knowledge = scope is not None and knowledge_store is None
+    configured = None
+    if session_store is None or build_tasks or build_knowledge:
+        configured = open_application_stores(
+            configured_database_url(),
+            sqlite_path=state_root / "cayu.db",
+            tasks=build_tasks,
+            knowledge_scope=scope if build_knowledge else None,
+            public_authority_alias_codec=configured_public_authority_alias_codec(),
+        )
     return CodingStores(
         session_store=(
             session_store
-            if session_store is not None
-            else SQLiteSessionStore(
-                database,
-                public_authority_alias_codec=configured_public_authority_alias_codec(),
-            )
+            if session_store is not None or configured is None
+            else configured.session_store
         ),
         task_store=(
-            task_store
-            if task_store is not None
-            else (SQLiteTaskStore(database) if __CODING_TASKS_ENABLED__ else None)
+            configured.task_store
+            if build_tasks and configured is not None
+            else task_store
         ),
         knowledge_store=(
-            knowledge_store
-            if knowledge_store is not None
-            else (
-                SQLiteKnowledgeStore(database, access_scope=scope)
-                if scope is not None
-                else None
-            )
+            configured.knowledge_store
+            if build_knowledge and configured is not None
+            else knowledge_store
         ),
         generated_session_store=session_store is None,
-        generated_knowledge_store=knowledge_store is None and scope is not None,
-    )
-'''
-
-
-_POSTGRES_CODING_STORAGE_PY = '''"""Postgres stores active in the maintained coding preset."""
-
-from dataclasses import dataclass
-from pathlib import Path
-
-from cayu import (
-    KnowledgeAccessScope,
-    KnowledgeStore,
-    PostgresKnowledgeStore,
-    PostgresSessionStore,
-    PostgresTaskStore,
-    SessionStore,
-    TaskStore,
-)
-
-from configuration.settings import (
-    configured_database_url,
-    configured_public_authority_alias_codec,
-)
-
-GENERATED_KNOWLEDGE_STORE_TYPE = PostgresKnowledgeStore
-GENERATED_STORE_PROFILE = "postgres"
-_INSPECTION_DSN = "postgresql://cayu-unconfigured@127.0.0.1/cayu"
-
-
-@dataclass(frozen=True, slots=True)
-class CodingStores:
-    session_store: SessionStore
-    task_store: TaskStore | None
-    knowledge_store: KnowledgeStore | None
-    generated_session_store: bool
-    generated_knowledge_store: bool
-
-
-def build_coding_stores(
-    state_root: Path,
-    scope: KnowledgeAccessScope | None,
-    *,
-    session_store: SessionStore | None = None,
-    task_store: TaskStore | None = None,
-    knowledge_store: KnowledgeStore | None = None,
-) -> CodingStores:
-    """Construct lazy Postgres stores without connecting during import or inspect."""
-
-    del state_root
-    if not __CODING_TASKS_ENABLED__ and task_store is not None:
-        raise ValueError("task_store requires the tasks capability")
-    if not __CODING_KNOWLEDGE_ENABLED__ and scope is not None:
-        raise ValueError("scope requires the knowledge capability")
-    if scope is None and knowledge_store is not None:
-        raise ValueError("knowledge_store requires the knowledge capability")
-    conninfo = configured_database_url() or _INSPECTION_DSN
-    return CodingStores(
-        session_store=(
-            session_store
-            if session_store is not None
-            else PostgresSessionStore(
-                conninfo,
-                public_authority_alias_codec=configured_public_authority_alias_codec(),
-            )
-        ),
-        task_store=(
-            task_store
-            if task_store is not None
-            else (PostgresTaskStore(conninfo) if __CODING_TASKS_ENABLED__ else None)
-        ),
-        knowledge_store=(
-            knowledge_store
-            if knowledge_store is not None
-            else (
-                PostgresKnowledgeStore(conninfo, access_scope=scope)
-                if scope is not None
-                else None
-            )
-        ),
-        generated_session_store=session_store is None,
-        generated_knowledge_store=knowledge_store is None and scope is not None,
+        generated_knowledge_store=build_knowledge,
+        store_profile="injected" if configured is None else configured.backend.value,
+        configured=configured,
     )
 '''
 
@@ -3609,6 +3531,7 @@ def build_coding_composition(
             artifact_store is None
             and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
         ),
+        store_profile=stores.store_profile,
     )
     checks = _named_checks(toolchain_profile)
     check_names = tuple(check.name for check in checks)
@@ -6229,9 +6152,7 @@ def coding_project_files(
         )
         return render(configured)
 
-    coding_storage = (
-        _POSTGRES_CODING_STORAGE_PY if plan.database == "postgres" else _SQLITE_CODING_STORAGE_PY
-    )
+    coding_storage = _CODING_STORAGE_PY
     coding_files = {
         "app.py": _coding_app_source(files["app.py"]),
         "configuration/settings.py": (files["configuration/settings.py"] + _CODING_SETTINGS_APPEND),

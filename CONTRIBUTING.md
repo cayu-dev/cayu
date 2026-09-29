@@ -196,10 +196,11 @@ ways to run them:
 Docker runner and egress tests require a running Docker daemon and skip automatically
 when it is unavailable.
 
-CI sets `CAYU_REQUIRE_POSTGRES=1` (and the Docker equivalents) so a lost tier fails
+CI sets `CAYU_REQUIRE_POSTGRES_TESTS=1` (and the Docker equivalents) so a lost tier fails
 loudly instead of hiding behind skips. You don't need those flags locally, but a PR that
 touches stores, runners, or egress should be run at least once with the relevant tier
-active.
+active. Do not set the runtime `CAYU_REQUIRE_POSTGRES` flag for tests: it makes every
+Cayu SQLite store refuse to open, and the test suite refuses to start under it.
 
 ### Lint and types
 

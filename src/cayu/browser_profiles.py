@@ -53,6 +53,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
 )
 from cayu.egress.destinations import normalize_egress_hostname
+from cayu.storage.targets import require_sqlite_store_allowed
 
 BROWSER_PROFILE_SCHEMA_VERSION = 1
 BROWSER_PROFILE_STATE_SCHEMA_VERSION = 1
@@ -3255,6 +3256,7 @@ class SQLiteBrowserProfileStore(BrowserProfileStore):
         clock: Callable[[], datetime] = _now,
         max_ciphertext_bytes: int = BROWSER_PROFILE_MAX_CIPHERTEXT_BYTES,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteBrowserProfileStore")
         super().__init__(
             store_id=store_id,
             clock=clock,

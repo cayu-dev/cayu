@@ -287,7 +287,7 @@ CHECKS: tuple[VerificationCheck, ...] = (
         ),
         status_on_success=STATUS_VERIFIED,
         prerequisites=("Docker daemon or CAYU_TEST_POSTGRES_DSN",),
-        env={"CAYU_REQUIRE_POSTGRES": "1"},
+        env={"CAYU_REQUIRE_POSTGRES_TESTS": "1"},
         unset_env=_LIVE_CREDENTIAL_ENV,
         requires_postgres=True,
     ),

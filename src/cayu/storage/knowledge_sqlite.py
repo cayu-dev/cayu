@@ -215,6 +215,7 @@ from cayu.storage.memory import (
     prepare_knowledge_publication,
     prepare_knowledge_relations,
 )
+from cayu.storage.targets import require_sqlite_store_allowed
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
@@ -245,6 +246,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        require_sqlite_store_allowed("SQLiteKnowledgeStore")
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:

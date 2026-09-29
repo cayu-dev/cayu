@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,7 @@ def test_dry_run_and_apply_use_the_same_normalized_plan(
     assert "enable_logging=True" in runtime
     instructions = (tmp_path / "observed/AGENTS.md").read_text(encoding="utf-8")
     expected_reference = (
-        "uv run --no-sync cayu new observed_reference --preset agent --database sqlite "
+        "uv run --no-sync cayu new observed_reference --preset agent "
         "--provider neutral --execution none --json "
         '--agent-name "observed" --dir "$reference_parent"'
     )
@@ -118,7 +119,8 @@ def test_default_agent_plan_is_the_complete_safe_local_profile() -> None:
     )
     files = project_files("standard", application_plan=plan)
     assert "AutomaticRecallContextPolicy" in files["memory/context.py"]
-    assert "SQLiteKnowledgeStore" in files["configuration/storage.py"]
+    assert "open_application_stores(" in files["configuration/storage.py"]
+    assert "knowledge_scope=knowledge_scope if build_knowledge" in files["configuration/storage.py"]
     assert "LocalArtifactStore" in files["environments/local.py"]
     assert "StaticToolExposurePolicy" in files["policies/tools.py"]
     assert "tests/test_memory.py" in files
@@ -244,7 +246,7 @@ def test_without_flags_disable_each_safe_default_deterministically(
     assert "enable_logging=False" in (project / "configuration" / "runtime.py").read_text(
         encoding="utf-8"
     )
-    assert 'SQLiteTaskStore("data/cayu.db") if False else None' in (
+    assert "build_tasks = False and task_store is None" in (
         project / "configuration" / "storage.py"
     ).read_text(encoding="utf-8")
     assert "if not False:" in (project / "memory" / "context.py").read_text(encoding="utf-8")
@@ -335,64 +337,63 @@ def test_legacy_coding_flags_normalize_to_the_canonical_plan(
     assert _json_output(capsys) == canonical_payload
 
 
-def test_postgres_coding_plan_selects_every_active_database_store() -> None:
-    plan = normalize_application_plan(
-        name="coder",
-        agent_name="coder",
-        preset="coding",
-        database="postgres",
+@pytest.mark.parametrize("preset", ("agent", "service", "coding"))
+def test_every_plan_selects_its_database_at_runtime(preset: str) -> None:
+    plan = normalize_application_plan(name="app", agent_name="app", preset=preset)
+    files = project_files("app", application_plan=plan)
+    pyproject = tomllib.loads(files["pyproject.toml"])
+    storage = files[
+        "configuration/coding_storage.py" if preset == "coding" else "configuration/storage.py"
+    ]
+    local_database = ".cayu/runtime/cayu.db" if preset == "coding" else "data/cayu.db"
+
+    assert pyproject["project"]["dependencies"][0].startswith(
+        "cayu[postgres,server]==" if preset == "service" else "cayu[postgres]=="
     )
-    files = project_files("coder", application_plan=plan)
-    pyproject = files["pyproject.toml"]
-    storage = files["configuration/coding_storage.py"]
-    readme = files["README.md"]
-    instructions = files["AGENTS.md"]
+    assert "database" not in pyproject["tool"]["cayu"]["scaffold"]
+    assert pyproject["tool"]["cayu"]["session_store"] == {
+        "backend": "sqlite",
+        "path": local_database,
+    }
+    assert "open_application_stores(" in storage
+    assert "configured_database_url()" in storage
+    for fixed in ("SQLiteSessionStore", "PostgresSessionStore", "cayu-unconfigured"):
+        assert fixed not in storage
+    assert "SCAFFOLDED_DATABASE" not in files["configuration/settings.py"]
+    assert "cayu[postgres]" in plan.as_dict()["dependencies"][0]
+    assert "CAYU_DATABASE_URL" in plan.as_dict()["environment"]
+    assert "database" not in plan.as_dict()["adapters"]
+    for guidance in (files["README.md"], files["AGENTS.md"]):
+        assert "## Durable data" in guidance
+        assert "CAYU_DATABASE_URL" in guidance
+        assert "CAYU_REQUIRE_POSTGRES=1" in guidance
+        assert "CAYU_DATABASE_DIRECT_URL" in guidance
+        assert "`cayu_` prefix" in guidance
+        assert "Do not open SQLite files there for durable application state" in guidance
+        assert f"`{local_database}`" in guidance
+        assert "--database" not in guidance
+    if "memory" in plan.capabilities:
+        assert "Deployments must set `CAYU_MEMORY_EVIDENCE_KEY`" in files["AGENTS.md"]
 
-    assert 'dependencies = ["cayu[postgres]==' in pyproject
-    assert 'dev = ["cayu[postgres,server]==' in pyproject
-    assert 'backend = "postgres"\nenv = "CAYU_DATABASE_URL"' in pyproject
-    for store in ("PostgresSessionStore", "PostgresTaskStore", "PostgresKnowledgeStore"):
-        assert store in storage
-    assert "SQLite" not in storage
-    assert "SQLite" not in readme
-    assert "SQLite" not in instructions
-    assert "data/cayu.db" not in readme
-    assert "configured durable Postgres Evals store" in readme
-    assert "durable Postgres knowledge" in readme
-    assert "session, task, and knowledge state lives in the configured Postgres stores" in readme
-    assert "same configured Postgres database" in readme
-    assert "same configured Postgres database" in instructions
 
-
-def test_postgres_service_plan_is_rejected_before_writes(
+@pytest.mark.parametrize("database", ("sqlite", "postgres"))
+@pytest.mark.parametrize("preset", ("agent", "service", "coding"))
+def test_retired_database_flag_is_accepted_and_ignored(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    preset: str,
+    database: str,
 ) -> None:
-    target = tmp_path / "service"
+    command = ["new", "app", "--preset", preset, "--dir", str(tmp_path), "--dry-run", "--json"]
 
-    assert (
-        main(
-            [
-                "new",
-                target.name,
-                "--preset",
-                "service",
-                "--database",
-                "postgres",
-                "--dir",
-                str(tmp_path),
-                "--json",
-            ]
-        )
-        == 1
-    )
+    assert main(command) == 0
+    canonical = _json_output(capsys)
+    assert main([*command, "--database", database]) == 0
+    captured = capsys.readouterr()
 
-    payload = _json_output(capsys)
-    assert payload["error"] == {
-        "code": "UNSUPPORTED_ADAPTER",
-        "message": "database 'postgres' is not supported by preset 'service'",
-    }
-    assert not target.exists()
+    assert json.loads(captured.out) == canonical
+    assert "--database is deprecated and ignored" in captured.err
+    assert not (tmp_path / "app").exists()
 
 
 def test_service_plan_declares_and_supplies_non_secret_auth_proof_environment() -> None:
@@ -404,6 +405,7 @@ def test_service_plan_declares_and_supplies_non_secret_auth_proof_environment() 
 
     payload = plan.as_dict()
     assert payload["environment"] == [
+        "CAYU_DATABASE_URL",
         "CAYU_OPERATOR_BEARER_TOKEN",
         "PRODUCT_AUTH_TOKENS_JSON",
     ]
@@ -528,23 +530,22 @@ def test_discovery_reports_truthful_capability_status_and_complete_metadata(
         "requires",
         "conflicts",
         "supported_presets",
-        "supported_databases",
         "supported_executions",
         "verification",
     ):
         assert field in by_name["observability"]
 
 
-def test_discovery_reports_only_coherent_preset_databases(
+def test_discovery_offers_no_generation_time_database_choice(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert main(["new", "--list-presets", "--json"]) == 0
     payload = _json_output(capsys)
-    by_name = {item["name"]: item for item in payload["presets"]}
 
-    assert by_name["agent"]["supported_databases"] == ["sqlite", "postgres"]
-    assert by_name["service"]["supported_databases"] == ["sqlite"]
-    assert by_name["coding"]["supported_databases"] == ["sqlite", "postgres"]
+    assert all("supported_databases" not in item for item in payload["presets"])
+    assert main(["new", "--list-capabilities", "--json"]) == 0
+    capabilities = _json_output(capsys)["capabilities"]
+    assert all("supported_databases" not in item for item in capabilities)
 
 
 def test_importing_every_default_project_module_is_inert(

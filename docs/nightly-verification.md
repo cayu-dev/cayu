@@ -134,9 +134,9 @@ Postgres tier (or `CAYU_TEST_POSTGRES_DSN` set), run omitted interpreters
 manually with the same loud Postgres requirement as CI:
 
 ```console
-$ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.11 pytest -q
-$ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.12 pytest -q
-$ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.13 pytest -q
+$ CAYU_REQUIRE_POSTGRES_TESTS=1 uv run --frozen --extra dev --extra server --python 3.11 pytest -q
+$ CAYU_REQUIRE_POSTGRES_TESTS=1 uv run --frozen --extra dev --extra server --python 3.12 pytest -q
+$ CAYU_REQUIRE_POSTGRES_TESTS=1 uv run --frozen --extra dev --extra server --python 3.13 pytest -q
 ```
 
 ### Core CI sharding

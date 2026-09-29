@@ -108,6 +108,15 @@ def test_impossible_exclusions_rejected_before_publication(
     assert list(tmp_path.iterdir()) == []
 
 
+def _select_database(monkeypatch, database: str) -> None:
+    """Select the generated stores' backend the way a deployment does."""
+    if database == "postgres":
+        # Unreachable on purpose: construction is lazy and must not connect.
+        monkeypatch.setenv("CAYU_DATABASE_URL", "postgresql://cayu-unconfigured@127.0.0.1/cayu")
+    else:
+        monkeypatch.delenv("CAYU_DATABASE_URL", raising=False)
+
+
 def _write_project(root: Path, **options) -> Path:
     root.mkdir()
     for relative, content in project_files("profile", **options).items():
@@ -120,11 +129,8 @@ def _write_project(root: Path, **options) -> Path:
 
 
 @pytest.mark.parametrize("preset", ("agent", "service", "coding"))
-@pytest.mark.parametrize("database", ("sqlite", "postgres"))
-def test_rendered_capability_owners_are_formatted(preset, database):
-    if preset == "service" and database == "postgres":
-        pytest.skip("Postgres service is not a supported scaffold profile")
-    files = project_files("profile", preset=preset, database=database)
+def test_rendered_capability_owners_are_formatted(preset):
+    files = project_files("profile", preset=preset)
     paths = ["environments/local.py", "configuration/storage.py"]
     if preset == "coding":
         paths += ["configuration/coding_storage.py", "operations/coding.py", "tools/coding.py"]
@@ -164,9 +170,8 @@ _EXCLUSIONS = (
 @pytest.mark.parametrize("database", ("sqlite", "postgres"))
 @pytest.mark.parametrize("excluded", _EXCLUSIONS)
 def test_coding_local_capability_matrix(tmp_path, monkeypatch, database, excluded):
-    project = _write_project(
-        tmp_path / "profile", preset="coding", database=database, without_capabilities=excluded
-    )
+    _select_database(monkeypatch, database)
+    project = _write_project(tmp_path / "profile", preset="coding", without_capabilities=excluded)
     with project_context(project):
         coding = importlib.import_module("operations.coding")
         monkeypatch.setattr(coding, "_verify_coding_dependencies", lambda root: None)
@@ -201,11 +206,11 @@ def test_coding_local_capability_matrix(tmp_path, monkeypatch, database, exclude
     ),
 )
 def test_coding_docker_capability_matrix(tmp_path, monkeypatch, database, excluded):
+    _select_database(monkeypatch, database)
     project = _write_project(
         tmp_path / "profile",
         preset="coding",
         execution="docker",
-        database=database,
         without_capabilities=excluded,
     )
     with project_context(project):
@@ -225,11 +230,13 @@ def test_coding_docker_capability_matrix(tmp_path, monkeypatch, database, exclud
 
 @pytest.mark.parametrize("database", ("sqlite", "postgres"))
 @pytest.mark.parametrize("preset", ("agent", "coding"))
-def test_excluded_knowledge_cannot_be_restored_through_storage_seam(tmp_path, database, preset):
+def test_excluded_knowledge_cannot_be_restored_through_storage_seam(
+    tmp_path, monkeypatch, database, preset
+):
+    _select_database(monkeypatch, database)
     project = _write_project(
         tmp_path / "profile",
         preset=preset,
-        database=database,
         without_capabilities=("memory", "knowledge") if preset == "agent" else ("knowledge",),
     )
     with project_context(project):
@@ -426,8 +433,8 @@ def test_cli_reports_live_task_store_drift(tmp_path, capsys, monkeypatch, comman
     project = tmp_path / "profile"
     storage = project / "configuration/storage.py"
     source = storage.read_text()
-    old = f'SQLiteTaskStore("data/cayu.db") if {not add} else None'
-    new = f'SQLiteTaskStore("data/cayu.db") if {add} else None'
+    old = f"build_tasks = {not add} and task_store is None"
+    new = f"build_tasks = {add} and task_store is None"
     assert old in source
     storage.write_text(source.replace(old, new))
     monkeypatch.chdir(project)

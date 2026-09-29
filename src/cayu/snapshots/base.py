@@ -42,6 +42,7 @@ from cayu.build_provenance import (
     RuntimeBuildProvenance,
     legacy_runtime_build_provenance,
 )
+from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
     from cayu.evals.models import Trajectory
@@ -4145,6 +4146,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
     """Small durable journal for manifests and evaluation lineage records."""
 
     def __init__(self, path: str | Path) -> None:
+        require_sqlite_store_allowed("SQLiteAgentSnapshotStore")
         self.path = Path(path)
         self._write_lock = threading.RLock()
         self._initialize()

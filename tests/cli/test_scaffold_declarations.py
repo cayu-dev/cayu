@@ -180,8 +180,6 @@ def test_generated_composed_service(tmp_path):
         "composed",
         "--preset",
         "service",
-        "--database",
-        "sqlite",
         "--provider",
         "openai-subscription",
         "--execution",

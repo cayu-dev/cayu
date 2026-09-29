@@ -126,9 +126,7 @@ from cayu import (
 )
 
 from configuration.settings import (
-    SCAFFOLDED_DATABASE,
     configured_anthropic_api_key,
-    configured_database_url,
     configured_model_override,
     configured_openai_api_key,
     configured_openrouter_api_key,
@@ -216,10 +214,6 @@ def configured_provider() -> ModelProvider:
 def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
     """Run the target and adapter preflight used by live entry points."""
 
-    if SCAFFOLDED_DATABASE == "postgres" and not configured_database_url():
-        raise RuntimeError(
-            "database 'postgres' is selected but CAYU_DATABASE_URL is not set"
-        )
     manifest_agent = next(
         agent for agent in app.describe().agents if agent.name == agent_name
     )
@@ -243,7 +237,6 @@ from cayu import (
 
 _PROJECT_ROOT = Path(__file__).parents[1]
 _LOCAL_MEMORY_KEY = _PROJECT_ROOT / "data" / "memory-evidence.key"
-SCAFFOLDED_DATABASE = "__DATABASE__"
 _SCAFFOLDED_PROVIDER = __PROVIDER_LITERAL__
 _SUPPORTED_PROVIDERS = {"openai", "anthropic", "openrouter", "openai-subscription"}
 _PROVIDER_NAMES = {
@@ -322,16 +315,16 @@ def configured_openrouter_router_metadata_enabled() -> bool:
     raise RuntimeError(message)
 
 
-def configured_database_url() -> str | None:
-    return os.environ.get("CAYU_DATABASE_URL")
-
-
 def configured_public_authority_alias_codec() -> PublicAuthorityAliasCodec | None:
     return public_authority_alias_codec_from_environment()
 
 
 def configured_memory_evidence_key() -> str:
-    """Resolve private memory-key material at the configuration boundary."""
+    """Resolve private memory-key material at the configuration boundary.
+
+    Deployments must set CAYU_MEMORY_EVIDENCE_KEY: the local key file is
+    git-ignored and never reaches a deployed copy of the project.
+    """
 
     key = os.environ.get("CAYU_MEMORY_EVIDENCE_KEY")
     if key is not None:
@@ -345,28 +338,40 @@ def configured_memory_evidence_key() -> str:
         ) from exc
 '''
 
-_SQLITE_STORAGE_PY = '''"""Construct the selected durable application stores."""
+_STORAGE_PY = '''"""Construct the application's durable stores from the configured database.
+
+CAYU_DATABASE_URL selects PostgreSQL for deployments. Without it the stores use
+local SQLite at data/cayu.db under the project root, whatever the working
+directory. The Cayu CLI reads CAYU_DATABASE_URL first too, then
+[tool.cayu.session_store], so the app, `cayu session`, `cayu serve`, and Evals
+use the same database.
+"""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from cayu import (
+    ApplicationStores,
     KnowledgeAccessScope,
     KnowledgeStore,
     SessionStore,
-    SQLiteKnowledgeStore,
-    SQLiteSessionStore,
-    SQLiteTaskStore,
     TaskStore,
+    configured_database_url,
+    open_application_stores,
 )
 
 from configuration.settings import configured_public_authority_alias_codec
 
+LOCAL_DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "cayu.db"
+
 
 @dataclass(frozen=True, slots=True)
-class ApplicationStores:
+class ProjectStores:
     session_store: SessionStore
     task_store: TaskStore | None
     knowledge_store: KnowledgeStore | None
+    # Stores built here and their shared connection pool; close() releases them.
+    configured: ApplicationStores | None
 
 
 def build_stores(
@@ -375,8 +380,8 @@ def build_stores(
     task_store: TaskStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
     knowledge_scope: KnowledgeAccessScope | None = None,
-) -> ApplicationStores:
-    """Build SQLite stores unless a caller injects hermetic test stores."""
+) -> ProjectStores:
+    """Build the configured stores unless a caller injects hermetic test stores."""
 
     if not __TASKS_ENABLED__ and task_store is not None:
         raise ValueError("task_store requires the tasks capability")
@@ -384,100 +389,28 @@ def build_stores(
         raise ValueError("knowledge_scope requires the knowledge capability")
     if knowledge_scope is None and knowledge_store is not None:
         raise ValueError("knowledge_store requires the knowledge capability")
-    return ApplicationStores(
-        session_store=(
-            session_store
-            if session_store is not None
-            else SQLiteSessionStore(
-                "data/cayu.db",
-                public_authority_alias_codec=configured_public_authority_alias_codec(),
-            )
-        ),
-        task_store=(
-            task_store
-            if task_store is not None
-            else (SQLiteTaskStore("data/cayu.db") if __TASKS_ENABLED__ else None)
-        ),
-        knowledge_store=(
-            knowledge_store
-            if knowledge_store is not None
-            else (
-                SQLiteKnowledgeStore("data/cayu.db", access_scope=knowledge_scope)
-                if knowledge_scope is not None
-                else None
-            )
-        ),
+    build_tasks = __TASKS_ENABLED__ and task_store is None
+    build_knowledge = knowledge_scope is not None and knowledge_store is None
+    if session_store is not None and not build_tasks and not build_knowledge:
+        return ProjectStores(
+            session_store, task_store, knowledge_store, configured=None
+        )
+    configured = open_application_stores(
+        configured_database_url(),
+        sqlite_path=LOCAL_DATABASE_PATH,
+        tasks=build_tasks,
+        knowledge_scope=knowledge_scope if build_knowledge else None,
+        public_authority_alias_codec=configured_public_authority_alias_codec(),
     )
-'''
-
-_POSTGRES_STORAGE_PY = '''"""Construct the selected durable Postgres application stores."""
-
-from dataclasses import dataclass
-
-from cayu import (
-    KnowledgeAccessScope,
-    KnowledgeStore,
-    PostgresKnowledgeStore,
-    PostgresSessionStore,
-    PostgresTaskStore,
-    SessionStore,
-    TaskStore,
-)
-
-from configuration.settings import (
-    configured_database_url,
-    configured_public_authority_alias_codec,
-)
-
-_INSPECTION_DSN = "postgresql://cayu-unconfigured@127.0.0.1/cayu"
-
-
-@dataclass(frozen=True, slots=True)
-class ApplicationStores:
-    session_store: SessionStore
-    task_store: TaskStore | None
-    knowledge_store: KnowledgeStore | None
-
-
-def build_stores(
-    *,
-    session_store: SessionStore | None = None,
-    task_store: TaskStore | None = None,
-    knowledge_store: KnowledgeStore | None = None,
-    knowledge_scope: KnowledgeAccessScope | None = None,
-) -> ApplicationStores:
-    """Build lazy Postgres stores without connecting during import or inspection."""
-
-    conninfo = configured_database_url() or _INSPECTION_DSN
-    if not __TASKS_ENABLED__ and task_store is not None:
-        raise ValueError("task_store requires the tasks capability")
-    if not __KNOWLEDGE_ENABLED__ and knowledge_scope is not None:
-        raise ValueError("knowledge_scope requires the knowledge capability")
-    if knowledge_scope is None and knowledge_store is not None:
-        raise ValueError("knowledge_store requires the knowledge capability")
-    return ApplicationStores(
+    return ProjectStores(
         session_store=(
-            session_store
-            if session_store is not None
-            else PostgresSessionStore(
-                conninfo,
-                public_authority_alias_codec=configured_public_authority_alias_codec(),
-            )
+            session_store if session_store is not None else configured.session_store
         ),
-        task_store=(
-            task_store
-            if task_store is not None
-            else (PostgresTaskStore(conninfo) if __TASKS_ENABLED__ else None)
-        ),
+        task_store=configured.task_store if build_tasks else task_store,
         knowledge_store=(
-            knowledge_store
-            if knowledge_store is not None
-            else (
-                PostgresKnowledgeStore(conninfo, access_scope=knowledge_scope)
-                if knowledge_scope is not None
-                else None
-            )
+            configured.knowledge_store if build_knowledge else knowledge_store
         ),
+        configured=configured,
     )
 '''
 
@@ -1328,18 +1261,33 @@ arbitrary Python, start lifecycle work during import, or delete the scaffold
 contract to silence diagnostics. A custom layout is an explicit migration.
 """
 
-_POSTGRES_GUIDANCE = """
+_STORAGE_GUIDANCE = """
 
-### Postgres database profile
+## Durable data
 
-`CAYU_DATABASE_URL` is the only DSN source; never commit it. The generated
-session, task, and every other active database-backed store use Postgres
-coherently and construct lazily. Live runs require a real migrated database.
-Credential-free inspect/tests use injected stores or inert construction. The
-printed check command supplies a non-secret unreachable placeholder DSN only so
-read-only construction can prove the manifest; it does not prove connectivity
-or schema readiness. Exercise production against a disposable real Postgres
-database before deployment.
+Cayu's session, task, and knowledge stores live in the configured database.
+`__STORAGE_MODULE__` opens them with `open_application_stores`:
+`CAYU_DATABASE_URL` selects PostgreSQL, and without it they use local SQLite at
+`__LOCAL_DATABASE__`. Cayu CLI commands resolve `CAYU_DATABASE_URL` before
+`[tool.cayu.session_store]`, so they read the same database as the app.
+
+- Keep application-owned durable records, such as orders, cases, ledgers, and
+  sync cursors, in that configured database. Application tables may share it
+  with their own table prefix; Cayu reserves the `cayu_` prefix for its tables.
+- `data/` locally and `/data` in a deployment hold files: artifacts, uploads,
+  and fixtures. Do not open SQLite files there for durable application state; a
+  deployment's `/data` may be a network filesystem.
+- Deployments set `CAYU_DATABASE_URL` to a migrated PostgreSQL database
+  (`cayu storage migrate` is a deploy step; running apps only validate the
+  schema) and set `CAYU_REQUIRE_POSTGRES=1`, which makes every Cayu SQLite store
+  refuse to open instead of silently writing local files.
+- `CAYU_DATABASE_POOL_MAX` (default 5) bounds the shared connection pool. Behind
+  a transaction-pooling proxy such as PgBouncer, set `CAYU_DATABASE_DIRECT_URL`
+  to a direct server address for the task-admission `LISTEN` connection.
+"""
+
+_MEMORY_KEY_GUIDANCE = """- Deployments must set `CAYU_MEMORY_EVIDENCE_KEY`. The local
+  `data/memory-evidence.key` is git-ignored and never reaches a deployment.
 """
 
 
@@ -1389,7 +1337,6 @@ def convention_files(
             "__MEMORY_ENABLED__": repr("memory" in selected),
             "__RECOVERY_ENABLED__": repr("recovery" in selected),
             "__TASKS_ENABLED__": repr("tasks" in selected),
-            "__DATABASE__": plan.database,
             "__ENABLE_LOGGING__": repr("observability" in selected),
             "__PUBLIC_APP_FACTORIES__": public_app_factories,
             "__TEST_KNOWLEDGE_IMPORT__": (
@@ -1427,9 +1374,7 @@ def convention_files(
             "configuration/__init__.py": _CONFIGURATION_INIT_PY,
             "configuration/settings.py": settings,
             "configuration/providers.py": _PROVIDERS_PY,
-            "configuration/storage.py": configured(
-                _POSTGRES_STORAGE_PY if plan.database == "postgres" else _SQLITE_STORAGE_PY
-            ),
+            "configuration/storage.py": configured(_STORAGE_PY),
             "configuration/runtime.py": configured(_RUNTIME_PY),
             "agents/agent.py": configured(_AGENT_PY),
             "agents/registration.py": configured(_AGENT_REGISTRATION_PY),
@@ -1500,7 +1445,6 @@ def scaffold_contract(plan: ApplicationPlan) -> str:
         "\n[tool.cayu.scaffold]\n"
         f"convention = {plan.convention}\n"
         f'preset = "{plan.preset}"\n'
-        f'database = "{plan.database}"\n'
         f'provider = "{plan.provider}"\n'
         f'execution = "{plan.execution}"\n'
         + (
@@ -1518,6 +1462,14 @@ def scaffold_contract(plan: ApplicationPlan) -> str:
     )
 
 
+def local_database_path(plan: ApplicationPlan) -> str:
+    """Return the project-relative local SQLite database for one plan."""
+
+    # Coding keeps runtime state under the protected `.cayu` directory, which the
+    # coding agent's workspace tools cannot read or change.
+    return ".cayu/runtime/cayu.db" if plan.preset == "coding" else "data/cayu.db"
+
+
 def application_guidance(plan: ApplicationPlan) -> str:
     """Return shared concise ownership and working-contract guidance."""
 
@@ -1530,11 +1482,17 @@ def application_guidance(plan: ApplicationPlan) -> str:
         "__APPLY_COMMAND__",
         reference,
     )
-    return (
-        _capability_summary(plan)
-        + guidance
-        + (_POSTGRES_GUIDANCE if plan.database == "postgres" else "")
-    )
+    storage = _STORAGE_GUIDANCE.replace(
+        "__STORAGE_MODULE__",
+        (
+            "configuration/coding_storage.py"
+            if plan.preset == "coding"
+            else "configuration/storage.py"
+        ),
+    ).replace("__LOCAL_DATABASE__", local_database_path(plan))
+    if "memory" in plan.capabilities:
+        storage += _MEMORY_KEY_GUIDANCE
+    return _capability_summary(plan) + guidance + storage
 
 
 def _capability_summary(plan: ApplicationPlan) -> str:
@@ -1576,8 +1534,6 @@ def _creation_command(plan: ApplicationPlan, *, name: str) -> str:
         name,
         "--preset",
         plan.preset,
-        "--database",
-        plan.database,
         "--provider",
         plan.provider,
         "--execution",

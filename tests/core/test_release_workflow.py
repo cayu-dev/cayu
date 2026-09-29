@@ -313,7 +313,7 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     assert "docker build --platform linux/arm64" in sidecar_verifier
     assert "docker run --rm --platform linux/arm64" in sidecar_verifier
     assert "mktemp -d)" not in package_manifest
-    assert package_manifest.count('mktemp -d "$RUNNER_TEMP/') == 7
+    assert package_manifest.count('mktemp -d "$RUNNER_TEMP/') == 8
 
     for preserved_check in (
         "Verify the installed-wheel dashboard-to-local eval journey",

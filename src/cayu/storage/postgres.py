@@ -42563,7 +42563,15 @@ class PostgresSessionStore(
 
 @model_store_surface("tasks")
 class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore):
-    """Postgres-backed task store for durable multi-tenant work items."""
+    """Postgres-backed task store for durable multi-tenant work items.
+
+    Task-admission wakeups use one dedicated ``LISTEN`` connection outside the
+    connection pool. A store that owns its DSN listens on that DSN, or on
+    ``task_admission_listener_conninfo`` when given (for example a direct server
+    address behind a transaction-pooling proxy). A store built on a caller-owned
+    ``pool`` listens only when ``task_admission_listener_conninfo`` is supplied;
+    otherwise workers fall back to bounded claim polling.
+    """
 
     task_access_version: ClassVar[int | None] = 1
 
@@ -42692,7 +42700,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         clock: Callable[[], datetime] | None = None,
         schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
         read_only: bool = False,
+        task_admission_listener_conninfo: str | None = None,
     ) -> None:
+        if task_admission_listener_conninfo is not None:
+            if type(task_admission_listener_conninfo) is not str:
+                raise TypeError("task_admission_listener_conninfo must be a string.")
+            task_admission_listener_conninfo = require_nonblank(
+                task_admission_listener_conninfo,
+                "task_admission_listener_conninfo",
+            )
         if pool is not None:
             _require_quiescent_postgres_mutation_pool(pool)
         super().__init__(
@@ -42716,6 +42732,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         self._clock = utc_clock(clock)
         self._clock_is_injected = clock is not None
         self._enable_task_admission_wakeups()
+        # A caller-owned pool has no DSN of its own, so shared-pool callers pass
+        # the address for one dedicated LISTEN connection outside that pool.
+        self._task_admission_listener_conninfo = (
+            task_admission_listener_conninfo
+            if task_admission_listener_conninfo is not None
+            else self._conninfo
+        )
         self._task_admission_listener_task: asyncio.Task[None] | None = None
         self._task_admission_listener_first_attempt: asyncio.Event | None = None
         self._task_admission_listener_connection: Any | None = None
@@ -42730,9 +42753,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         return await TaskStore._task_admission_wakeup(self, queries)
 
     def _ensure_task_admission_listener(self) -> None:
-        """Start one empty-payload LISTEN connection when this store owns a DSN."""
+        """Start one empty-payload LISTEN connection when a listener DSN is known."""
 
-        if self._conninfo is None or self._task_admission_listener_closing:
+        if self._task_admission_listener_conninfo is None or self._task_admission_listener_closing:
             return
         listener = self._task_admission_listener_task
         if listener is None or listener.done():
@@ -42745,7 +42768,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             self._task_admission_listener_task = listener
 
     async def _run_task_admission_listener(self, first_attempt: asyncio.Event) -> None:
-        conninfo = self._conninfo
+        conninfo = self._task_admission_listener_conninfo
         if conninfo is None:
             first_attempt.set()
             return

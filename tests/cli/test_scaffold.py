@@ -238,21 +238,25 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
     assert 'os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)' in configuration_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'dependencies = ["cayu=={cayu_version}"]' in pyproject
+    assert f'dependencies = ["cayu[postgres]=={cayu_version}"]' in pyproject
     assert 'console = ["cayu[console]"]' not in pyproject
-    assert f'dev = ["cayu[server]=={cayu_version}", "pytest"]' in pyproject
+    assert f'dev = ["cayu[postgres,server]=={cayu_version}", "pytest"]' in pyproject
     assert '[tool.uv]\ncache-dir = ".cayu/uv-cache"' in pyproject
     assert (proj / ".gitignore").read_text(encoding="utf-8").startswith(".cayu/\n")
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
-    assert 'else SQLiteSessionStore(\n                "data/cayu.db",' in storage_source
+    assert (
+        'LOCAL_DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "cayu.db"'
+        in storage_source
+    )
+    assert "        configured_database_url(),\n" in storage_source
     assert "configured_public_authority_alias_codec()" in storage_source
     assert "public_authority_alias_codec_from_environment()" in configuration_source
     assert "os.environ" not in provider_source
     assert "os.environ" not in storage_source
     assert "config=runtime.config" in app_source
-    assert 'SQLiteTaskStore("data/cayu.db")' in storage_source
+    assert "build_tasks = True and task_store is None" in storage_source
     assert "sessions.sqlite" not in storage_source
     assert "def build_app(" in app_source
     assert "class " not in app_source
@@ -414,9 +418,9 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
     assert "AllRegisteredToolsExposurePolicy" in (project / "agents/registration.py").read_text(
         encoding="utf-8"
     )
-    assert "SQLiteKnowledgeStore" in (project / "configuration/coding_storage.py").read_text(
-        encoding="utf-8"
-    )
+    assert 'sqlite_path=state_root / "cayu.db"' in (
+        project / "configuration/coding_storage.py"
+    ).read_text(encoding="utf-8")
     assert "mode=SubagentExecutionMode.BACKGROUND" in composition
     settings_source = (project / "configuration/settings.py").read_text(encoding="utf-8")
     assert 'os.environ.get("CAYU_WORKSPACE_ROOT", ".")' in settings_source
@@ -1529,7 +1533,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     ):
         assert (project / filename).is_file()
     pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'dependencies = ["cayu[server]=={cayu_version}"]' in pyproject
+    assert f'dependencies = ["cayu[postgres,server]=={cayu_version}"]' in pyproject
     assert 'dev = ["pytest", "ruff>=0.15.15,<0.16"]' in pyproject
     assert 'service_factory = "service:build_service"' in pyproject
     assert 'factory = "app:build_app"' in pyproject

@@ -25,6 +25,15 @@
   runner diagnostics instead of becoming `"unknown"`/`"Exception"`. The
   Microsandbox proxy exposure now lives in `cayu.egress.microsandbox_adapter`;
   its former import path still works.
+- Add `open_application_stores` and `configured_database_url`. Every `cayu new`
+  project now selects PostgreSQL from `CAYU_DATABASE_URL` at runtime (one shared
+  pool bounded by `CAYU_DATABASE_POOL_MAX`, default 5, plus one task-admission
+  `LISTEN` connection that can use `CAYU_DATABASE_DIRECT_URL`) and local SQLite
+  otherwise, and depends on `cayu[postgres]`. `cayu new --database` is deprecated
+  and ignored; existing projects get a `SCAFFOLD_PLAN_DRIFT` storage finding until
+  their storage module uses the helper. `CAYU_REQUIRE_POSTGRES=1` now makes every
+  Cayu SQLite store refuse to open; the test suite's Postgres-tier flag is renamed
+  `CAYU_REQUIRE_POSTGRES_TESTS`.
 
 ## v0.7.0
 

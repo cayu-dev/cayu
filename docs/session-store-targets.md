@@ -53,6 +53,29 @@ untyped value.
 configuration. It accepts a Postgres URL or an absolute SQLite URL such as
 `sqlite:///srv/cayu/cayu.db`.
 
+## Application stores
+
+Application factories select their stores from the same variable with
+`open_application_stores(configured_database_url(), sqlite_path=...)`, which parses
+URLs with this resolver's implementation (`cayu.storage.targets`). Generated
+projects keep `[tool.cayu.session_store]` pointed at the local SQLite file that
+the factory uses without `CAYU_DATABASE_URL`, so the CLI and the app select the
+same store for every combination of the variable and that section. Explicit
+`--sqlite` and `--postgres` options still override both for one command.
+
+| Variable | Read by | Effect |
+| --- | --- | --- |
+| `CAYU_DATABASE_URL` | App factories and the CLI | Postgres URL, or absolute SQLite URL. Unset selects the project's local SQLite file. A set but blank value is an error. |
+| `CAYU_DATABASE_POOL_MAX` | `open_application_stores` and the project Evals store | Maximum connections per pool (default 5). The application's PostgreSQL session, task, and knowledge stores share one pool. |
+| `CAYU_DATABASE_DIRECT_URL` | `open_application_stores` | Optional Postgres URL for the task-admission `LISTEN` connection. `LISTEN` does not survive transaction pooling, so set it to a direct server address when `CAYU_DATABASE_URL` points at PgBouncer or a similar proxy. Pooled store traffic keeps using `CAYU_DATABASE_URL`. |
+| `CAYU_REQUIRE_POSTGRES` | Every Cayu SQLite store | `1` makes SQLite stores raise at construction; `0` or unset changes nothing. Deployments set it so a missing `CAYU_DATABASE_URL` fails at startup. |
+
+A PostgreSQL-backed application process therefore opens at most
+`CAYU_DATABASE_POOL_MAX` pooled connections, one dedicated listener connection,
+and, when `cayu serve` or `cayu check` assembles the project, the Evals store's
+pool. The PostgreSQL application stores validate the schema; apply migrations
+with `cayu storage migrate` as a deploy step.
+
 Target resolution only identifies and validates the requested backend. It does
 not search arbitrary directories, import an app factory, create a database, or
 run migrations. Read-only commands open the resolved target under their own
