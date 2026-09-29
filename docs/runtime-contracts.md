@@ -12226,8 +12226,40 @@ extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for
 sidecar health interface, and terminates a newly created MicroVM if setup fails or is cancelled.
 `from_existing(...)` restores identity from `get_microvm` and generates a fresh endpoint token;
 JWE tokens are memory-only and never belong in reconnect metadata. Both process and shell forms
-cross sidecar protocol version `2` without host-environment inheritance; readiness rejects an
-image that reports another version. Endpoint authentication and the first-party sidecar are
+cross sidecar protocol version `3` without host-environment inheritance; readiness rejects an
+image that reports another version. Protocol 3 adds a single-owner fence: each runner claims the
+MicroVM once, with a random memory-only claim whose digest alone is kept by the sidecar, and
+every command start carries that claim. A newer claim cancels earlier owners' commands, resets
+the agent proxy relay, and makes the sidecar reject older owners' starts, which surface as
+`LambdaMicroVMOwnershipSuperseded` and permanently poison that runner. An older owner's command
+that was still running is reported with `cancel_reason="owner_superseded"` and raises the same
+error instead of returning an ordinary cancelled result. Concurrent recovery workers that adopt
+the same MicroVM therefore converge on one executing owner. Readiness after resume
+only confirms an existing claim, so a stale runner cannot take a MicroVM back. Every
+control-plane suspend or terminate, whether from `suspend()`, `terminate()`, `close()`, or
+`kill()`, first takes the sidecar's lifecycle lease, which atomically confirms the claim is
+current and refuses any other claim or command while it is held. Each lease authorizes exactly
+one provider request, signed within 60 seconds of the lease: SDK retries are refused before
+they are sent, and a host retry needs a new lease, which only the current owner can take. The
+runner counts the requests that actually crossed the send boundary and releases the lease early
+only when none was sent or AWS definitively rejected the one that was. After a timeout or any
+other ambiguous outcome it keeps the lease. The lease never expires by time, because no elapsed
+interval proves that an accepted request has finished; it ends only when the guest's terminate
+hook runs (any lease) or its suspend or resume hook runs (a suspend lease). The cost is
+liveness: after a host dies holding a lease, or when its request never takes effect, no other
+host can claim the MicroVM until the runtime's allocation reap terminates it or AWS ends it at
+its maximum duration. A MicroVM idle policy suspends on its own and fires the same hooks, so
+with an idle policy a suspend lease can be settled by the platform's suspension instead of the
+owner's request. A superseded runner raises
+`LambdaMicroVMOwnershipSuperseded` and sends nothing. If the sidecar cannot confirm ownership,
+the runner raises `LambdaMicroVMOwnershipUnverified` and sends nothing either: an unreachable
+sidecar is not proof that no successor exists, so cleanup stays pending for the runtime's
+allocation reap, which runs under the durable allocation fence, or for the MicroVM's maximum
+duration. Terminating a suspended MicroVM resumes it first so the claim can be checked. A host
+that meets another owner's lease sees `LambdaMicroVMLifecycleInProgress` and retries while it
+waits for readiness. A directly constructed runner claims before its first command or
+lifecycle mutation. Images built with protocol 2 must be
+rebuilt. Endpoint authentication and the first-party sidecar are
 fixed to port 8080. The guest supervisor
 owns process groups, drains bounded stdout/stderr, enforces timeouts, and confirms command or
 sandbox cleanup using the same `cayu.runner_cleanup.v1` artifacts as the other remote runners.
@@ -12257,9 +12289,19 @@ restoration until reclamation succeeds. This conservative identifier fence does
 not coordinate different processes.
 An abandoned attach
 waits for dispatched resume work to settle before closing owned transports. If it
-resumed a suspended allocation, reclamation restores suspension; it does not
-terminate that application-owned VM. The same drain method includes these pending
-attachments.
+resumed a suspended allocation after claiming it, reclamation restores suspension
+under the lifecycle lease; it does not terminate that application-owned VM. The same
+drain method includes these pending attachments.
+
+Allocation cleanup never derives disposal authority from the absence of its own
+claim. A `create()` that fails before claiming the MicroVM terminates it without
+the fence only when it submitted without a `client_token`: that identifier was
+never returned to anyone, so no other host can hold it. With a client token,
+another creator can obtain the same MicroVM by replaying the token and may already
+own it, and an attachment's identifier came from outside. In those cases the
+unclaimed constructor sends no suspend or terminate, notes on its failure that
+cleanup is deferred, and leaves the MicroVM to the runtime's allocation reap or
+its maximum duration.
 
 Bounded allocation and terminal-cleanup observers preserve failures already
 observed before a later phase stalls. A timeout is reported alongside those

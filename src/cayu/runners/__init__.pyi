@@ -28,6 +28,15 @@ from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMEndpointUnauthorized as LambdaMicroVMEndpointUnauthorized,
 )
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMError as LambdaMicroVMError
+from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMLifecycleInProgress as LambdaMicroVMLifecycleInProgress,
+)
+from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMOwnershipSuperseded as LambdaMicroVMOwnershipSuperseded,
+)
+from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMOwnershipUnverified as LambdaMicroVMOwnershipUnverified,
+)
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMProtocolError as LambdaMicroVMProtocolError
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMRunner as LambdaMicroVMRunner
 from cayu.runners.aws_lambda_microvm import (

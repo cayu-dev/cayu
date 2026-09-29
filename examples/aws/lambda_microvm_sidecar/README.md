@@ -94,13 +94,56 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `2`. `GET /health` returns
-`{"status":"ok","protocol_version":"2"}` so the host can reject an incompatible image before
-sending a command. Version 2 adds the boolean `omit_truncated_output` command field: redacted
+The sidecar implements Cayu Lambda MicroVM command protocol version `3`. `GET /health` returns
+`{"status":"ok","protocol_version":"3"}` so the host can reject an incompatible image before
+sending a command. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
 secret, while ordinary and trusted executions retain their bounded output.
 
+Version 3 adds a single-owner fence. A host claims the MicroVM with `POST /v1/owner` and a
+random 32 to 128 character `claim_id` that it keeps in memory; the sidecar stores only its
+SHA-256 digest. Every command start carries `owner_claim`, and a start from any other claim, or
+before any claim, is rejected with HTTP 412. A claim that supersedes another cancels every
+command of earlier owners, reporting them with `"cancel_reason": "owner_superseded"`, and resets
+the agent proxy relay so the new owner's proxy can be installed. Re-presenting the current claim is idempotent. `POST /v1/owner/check` reports whether
+a claim is still current. The fence lives in sidecar memory, so it survives suspend and resume;
+a restarted sidecar forgets it and every earlier host becomes stale until a new claim.
+
+Takeover is atomic with command admission. The owner check, request validation (which may
+install the agent proxy relay), and registration of a start all run while the fence is held,
+and a claim swaps the owner, resets the relay under the same lock, then cancels every command
+admitted by an earlier generation before it responds. A start is therefore either refused or
+registered in time to be cancelled; a completed claim leaves no earlier owner's command able to
+run. Cancellation is generation-specific, so it never stops a newer owner's commands, and a
+command cancelled before it spawned never starts.
+
+Before a control-plane suspend or terminate, the host takes a lifecycle lease with
+`POST /v1/owner/lifecycle` and `{"claim_id", "action": "suspend" | "terminate"}`. The lease
+confirms the caller is the current owner (HTTP 412 otherwise) and, until it ends, every other
+claim and every command start is refused with HTTP 423. The host sends exactly one provider
+request per lease: SDK retries are refused before they are sent, and a host retry takes a new
+lease, which only the current owner can do.
+
+The lease never expires by time, because no elapsed interval proves that an accepted request
+has finished. It ends only on authoritative evidence:
+
+- the guest's terminate hook (for any lease), or its suspend or resume hook (for a suspend
+  lease), which show the provider acted;
+- `POST /v1/owner/lifecycle/release` from the owner when its single request was never sent or
+  AWS definitively rejected it. After a timeout or other ambiguous outcome the host keeps the
+  lease.
+
+The cost is liveness: if a host dies while holding a lease, or its request never takes effect,
+no other host can claim this MicroVM until it ends. The runtime's allocation reap can terminate
+it, and at the latest AWS ends it at its maximum duration. A MicroVM idle policy suspends on its
+own and also fires the suspend hook, so with an idle policy configured a suspend lease can be
+settled by the platform's suspension rather than the owner's request.
+
 - `GET /health`
+- `POST /v1/owner`
+- `POST /v1/owner/check`
+- `POST /v1/owner/lifecycle`
+- `POST /v1/owner/lifecycle/release`
 - `POST /v1/commands`
 - `GET /v1/commands/{command_id}`
 - `DELETE /v1/commands/{command_id}`

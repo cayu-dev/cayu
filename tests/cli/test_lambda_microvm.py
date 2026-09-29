@@ -15,6 +15,7 @@ import pytest
 from cayu.cli import _guarded_tree_publication as publication
 from cayu.cli import lambda_microvm as sidecar_cli
 from cayu.cli import main
+from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 
 _SOURCE = Path(__file__).resolve().parents[2] / "examples" / "aws" / "lambda_microvm_sidecar"
 _MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
@@ -84,7 +85,7 @@ def test_lambda_microvm_sidecar_export_is_reproducible(
     assert manifest["schema_version"] == 1
     assert manifest["artifact_version"] == 1
     assert manifest["cayu_version"] == _project_version()
-    assert manifest["protocol_version"] == "2"
+    assert manifest["protocol_version"] == LAMBDA_MICROVM_PROTOCOL_VERSION
     assert manifest["content_digest"] in first_output.out
     assert set(_tree_contents(first)) == {
         _MANIFEST,
@@ -551,7 +552,7 @@ def test_lambda_microvm_sidecar_export_replaces_bound_prior_version(tmp_path: Pa
         sidecar_cli._render_manifest(
             second_contents,
             cayu_version=_project_version(),
-            protocol_version="2",
+            protocol_version=LAMBDA_MICROVM_PROTOCOL_VERSION,
         )
     )
 
@@ -593,7 +594,7 @@ def test_lambda_microvm_sidecar_export_retires_safe_historical_receipt(
         sidecar_cli._render_manifest(
             second_contents,
             cayu_version=_project_version(),
-            protocol_version="2",
+            protocol_version=LAMBDA_MICROVM_PROTOCOL_VERSION,
         )
     )
     sidecar_cli._export_sidecar(

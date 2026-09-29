@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -13,6 +15,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -26,12 +29,160 @@ READ_CHUNK_BYTES = 64 * 1024
 _TERMINAL_STATES = frozenset({"completed", "cancelled", "failed"})
 _PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
 _AGENT_PROXY_RELAY_PORT = 18080
+LIFECYCLE_ACTIONS = frozenset({"suspend", "terminate"})
 
 ExecutionProfile = Literal["agent", "trusted"]
 
 
 class CommandRequestError(ValueError):
     """The command request is invalid."""
+
+
+class OwnerSupersededError(RuntimeError):
+    """A command was submitted by an owner that a later claim has fenced."""
+
+
+class OwnerLifecycleLeasedError(RuntimeError):
+    """The current owner holds a lifecycle lease; no claim or command is admitted."""
+
+
+@dataclass(frozen=True)
+class _LifecycleLease:
+    action: str
+    generation: int
+
+
+class OwnerFence:
+    """Single current host owner of this MicroVM's command execution.
+
+    Each claim is a random host-held secret; only its digest is kept here. A
+    new claim supersedes every earlier one, and the caller must cancel the
+    earlier owner's commands. Re-presenting the current claim is idempotent.
+
+    Command admission and lifecycle leases hold the fence's lock while they
+    check the owner, so neither can interleave with a takeover. A lifecycle
+    lease lets the current owner call the provider's suspend or terminate
+    without a successor claiming the MicroVM between the check and the call.
+
+    A lease never expires by time: an accepted provider request is not proven
+    finished by any elapsed interval. It ends only on authoritative evidence:
+    the owner releasing it after its single attempt was refused or definitively
+    rejected, or the guest hook for the leased action (``settle_lifecycle``).
+    Until then no claim or command is admitted, so a host that dies while
+    holding a lease blocks takeover of this MicroVM until it ends (at the
+    latest at its maximum duration) or the allocation reap terminates it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._digest: bytes | None = None
+        self._lease: _LifecycleLease | None = None
+
+    def claim(
+        self,
+        claim_id: object,
+        *,
+        on_supersede: Callable[[], None] | None = None,
+    ) -> tuple[int, bool]:
+        """Return the current generation and whether this claim superseded another.
+
+        ``on_supersede`` runs under the fence's lock after the swap, before any
+        command of the new owner can be admitted.
+        """
+
+        digest = _claim_digest(claim_id)
+        with self._lock:
+            if self._digest is not None and hmac.compare_digest(self._digest, digest):
+                return self._generation, False
+            if self._lease is not None:
+                raise OwnerLifecycleLeasedError(
+                    "the current MicroVM owner is suspending or terminating it"
+                )
+            superseded = self._digest is not None
+            self._generation += 1
+            self._digest = digest
+            if superseded and on_supersede is not None:
+                on_supersede()
+            return self._generation, superseded
+
+    def is_current(self, claim_id: object) -> bool:
+        try:
+            digest = _claim_digest(claim_id)
+        except CommandRequestError:
+            return False
+        with self._lock:
+            return self._is_current_locked(digest)
+
+    @contextlib.contextmanager
+    def admitted(self, claim_id: object) -> Iterator[int]:
+        """Hold the fence while the caller registers work for the current owner.
+
+        Yields the owner's generation. A takeover waits until the block exits,
+        so work registered here is visible to the takeover's cancellation.
+        """
+
+        try:
+            digest: bytes | None = _claim_digest(claim_id)
+        except CommandRequestError:
+            digest = None
+        with self._lock:
+            if digest is None or not self._is_current_locked(digest):
+                raise OwnerSupersededError("command owner is not the current MicroVM owner")
+            if self._lease is not None:
+                raise OwnerLifecycleLeasedError("the MicroVM owner is suspending or terminating it")
+            yield self._generation
+
+    def require(self, claim_id: object) -> int:
+        with self.admitted(claim_id) as generation:
+            return generation
+
+    def acquire_lifecycle(self, claim_id: object, action: object) -> dict[str, Any]:
+        """Atomically confirm the owner and block takeover until the lease ends."""
+
+        if action not in LIFECYCLE_ACTIONS:
+            raise CommandRequestError("lifecycle action must be suspend or terminate")
+        digest = _claim_digest(claim_id)
+        with self._lock:
+            if not self._is_current_locked(digest):
+                raise OwnerSupersededError("lifecycle caller is not the current MicroVM owner")
+            self._lease = _LifecycleLease(action=str(action), generation=self._generation)
+            return {"generation": self._generation, "action": action}
+
+    def release_lifecycle(self, claim_id: object) -> None:
+        digest = _claim_digest(claim_id)
+        with self._lock:
+            if not self._is_current_locked(digest):
+                raise OwnerSupersededError("lifecycle caller is not the current MicroVM owner")
+            self._lease = None
+
+    def settle_lifecycle(self, hook: str) -> None:
+        """Called by the guest's own lifecycle hooks: the provider has acted.
+
+        A terminate hook settles any lease, since nothing survives it. A
+        suspend or resume hook settles only a suspend lease: either proves the
+        MicroVM went through suspension, and the leased attempt, which the host
+        never retries, is the only suspend a fenced host can send while the
+        lease is held. (A MicroVM idle policy suspends on its own; the runtime
+        contract describes that limit.) A terminate lease stays held until its
+        own hook.
+        """
+
+        with self._lock:
+            lease = self._lease
+            if lease is None:
+                return
+            if hook == "terminate" or (hook in {"suspend", "resume"} and lease.action == "suspend"):
+                self._lease = None
+
+    def _is_current_locked(self, digest: bytes) -> bool:
+        return self._digest is not None and hmac.compare_digest(self._digest, digest)
+
+
+def _claim_digest(claim_id: object) -> bytes:
+    if type(claim_id) is not str or not 32 <= len(claim_id) <= 128 or not claim_id.isascii():
+        raise CommandRequestError("owner claim must be 32 to 128 ASCII characters")
+    return hashlib.sha256(claim_id.encode("ascii")).digest()
 
 
 class CommandConflictError(RuntimeError):
@@ -206,9 +357,11 @@ class CommandExecutionBoundary:
 class _CommandRecord:
     command_id: str
     payload_fingerprint: str | None
+    owner_generation: int | None = None
     state: str = "accepted"
     process: subprocess.Popen[bytes] | None = None
     cancel_requested: bool = False
+    cancel_reason: str | None = None
     result: dict[str, Any] | None = None
     finished_at: float | None = None
     finished: threading.Event = field(default_factory=threading.Event)
@@ -257,7 +410,20 @@ class CommandSupervisor:
         self._records: dict[str, _CommandRecord] = {}
         self._lock = threading.Lock()
 
-    def start(self, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def start(
+        self,
+        command_id: str,
+        payload: dict[str, Any],
+        *,
+        owner_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Register and start one command.
+
+        ``owner_generation`` records which owner admitted it, so a takeover
+        cancels exactly the earlier owners' commands. The sidecar calls this
+        inside ``OwnerFence.admitted`` so registration cannot straddle a claim.
+        """
+
         identifier = _command_id(command_id)
         validated = _validated_payload(
             payload,
@@ -277,7 +443,11 @@ class CommandSupervisor:
                         f"Command id {identifier!r} was already used with another payload"
                     )
                 return self._snapshot(existing)
-            record = _CommandRecord(command_id=identifier, payload_fingerprint=fingerprint)
+            record = _CommandRecord(
+                command_id=identifier,
+                payload_fingerprint=fingerprint,
+                owner_generation=owner_generation,
+            )
             self._records[identifier] = record
         threading.Thread(
             target=self._run,
@@ -296,7 +466,7 @@ class CommandSupervisor:
             return {"command_id": identifier, "state": "not_found"}
         return self._snapshot(record)
 
-    def cancel(self, command_id: str) -> dict[str, Any]:
+    def cancel(self, command_id: str, *, reason: str | None = None) -> dict[str, Any]:
         identifier = _command_id(command_id)
         self._prune()
         with self._lock:
@@ -317,18 +487,40 @@ class CommandSupervisor:
             if record.state in _TERMINAL_STATES:
                 return self._snapshot_locked(record)
             record.cancel_requested = True
+            record.cancel_reason = reason
             process = record.process
         if process is not None:
             _stop_process_group(process)
         record.finished.wait(timeout=self.cancel_timeout_s)
         return self._snapshot(record)
 
-    def cancel_all(self) -> None:
+    def cancel_all(
+        self,
+        *,
+        reason: str | None = None,
+        before_generation: int | None = None,
+    ) -> None:
+        """Cancel commands; ``reason`` is reported on commands it stops.
+
+        With ``before_generation`` only commands admitted by earlier owners are
+        cancelled, so a takeover never stops a newer owner's work, and the
+        execution boundary is left to the takeover. Without it every command is
+        cancelled and the agent proxy relay is closed.
+        """
         with self._lock:
-            command_ids = list(self._records)
+            command_ids = [
+                command_id
+                for command_id, record in self._records.items()
+                if before_generation is None
+                or (
+                    record.owner_generation is not None
+                    and record.owner_generation < before_generation
+                )
+            ]
         for command_id in command_ids:
-            self.cancel(command_id)
-        self.execution_boundary.close()
+            self.cancel(command_id, reason=reason)
+        if before_generation is None:
+            self.execution_boundary.close()
 
     def _run(self, record: _CommandRecord, payload: dict[str, Any]) -> None:
         stdout = _LimitedBuffer(payload["output_limit_bytes"])
@@ -338,21 +530,32 @@ class CommandSupervisor:
         timed_out = False
         try:
             argv = payload["argv"]
-            process = subprocess.Popen(
-                argv,
-                cwd=payload["cwd"],
-                env=payload["env"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
+            # Spawning under the record lock orders it with cancel(): a command
+            # cancelled before this point never starts, and one cancelled after
+            # it has a process for cancel() to stop.
             with record.lock:
+                if record.cancel_requested:
+                    record.state = "cancelled"
+                    record.result = {
+                        **_cancelled_result(record.command_id),
+                        **(
+                            {"cancel_reason": record.cancel_reason}
+                            if record.cancel_reason is not None
+                            else {}
+                        ),
+                    }
+                    return
+                process = subprocess.Popen(
+                    argv,
+                    cwd=payload["cwd"],
+                    env=payload["env"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
                 record.process = process
                 record.state = "running"
-                cancel_requested = record.cancel_requested
-            if cancel_requested:
-                _stop_process_group(process)
 
             pending_readers = [
                 (
@@ -396,6 +599,7 @@ class CommandSupervisor:
                     timed_out=timed_out,
                     cancelled=cancelled,
                     omit_truncated_output=payload["omit_truncated_output"],
+                    cancel_reason=record.cancel_reason if cancelled else None,
                 )
         except BaseException as exc:
             if process is not None and process.poll() is None:
@@ -417,6 +621,7 @@ class CommandSupervisor:
                     cancelled=cancelled,
                     omit_truncated_output=payload["omit_truncated_output"],
                     error=exc,
+                    cancel_reason=record.cancel_reason if cancelled else None,
                 )
         finally:
             with record.lock:
@@ -661,6 +866,7 @@ def _result(
     cancelled: bool,
     omit_truncated_output: bool,
     error: BaseException | None = None,
+    cancel_reason: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "command_id": command_id,
@@ -685,6 +891,8 @@ def _result(
     }
     if error is not None:
         result["error_type"] = type(error).__name__
+    if cancel_reason is not None:
+        result["cancel_reason"] = cancel_reason
     return result
 
 

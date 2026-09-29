@@ -20,7 +20,9 @@ from tests.runners.conformance import (
 )
 from tests.runners.lambda_microvm_harness import (
     ConformanceLambdaClient,
+    OwnerFencedTransport,
     SupervisorTransport,
+    guest_lifecycle_hook,
 )
 
 import cayu
@@ -28,6 +30,7 @@ import cayu.runners as runners_module
 from cayu.runners._cleanup import RunnerCleanupPolicy
 from cayu.runners._subprocess import SubprocessCommand, run_subprocess
 from cayu.runners.aws_lambda_microvm import (
+    LAMBDA_MICROVM_PROTOCOL_VERSION,
     LambdaMicroVMEndpointTransientError,
     LambdaMicroVMProtocolError,
     LambdaMicroVMRunner,
@@ -651,14 +654,17 @@ async def _probe_lambda_microvm_ambiguous_start(
     await runner.close()
 
 
-class _ProtocolTransport:
+class _ProtocolTransport(OwnerFencedTransport):
     def __init__(
         self,
         *,
         health: dict[str, Any] | None = None,
         command: dict[str, Any] | None = None,
     ) -> None:
-        self.health_response = health or {"status": "ok", "protocol_version": "2"}
+        self.health_response = health or {
+            "status": "ok",
+            "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
+        }
         self.command_response = command or {"state": "not_found"}
 
     async def health(self, **_kwargs: Any) -> dict[str, Any]:
@@ -782,6 +788,7 @@ class _FailFirstSuspendClient(ConformanceLambdaClient):
             self._fail_suspend = False
             raise RuntimeError("transient suspend failure")
         self.state = "SUSPENDED"
+        guest_lifecycle_hook("suspend")
         return {}
 
 

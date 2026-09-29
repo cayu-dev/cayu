@@ -81,6 +81,18 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "LambdaMicroVMEndpointUnauthorized",
     ),
     "LambdaMicroVMError": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMError"),
+    "LambdaMicroVMLifecycleInProgress": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMLifecycleInProgress",
+    ),
+    "LambdaMicroVMOwnershipSuperseded": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMOwnershipSuperseded",
+    ),
+    "LambdaMicroVMOwnershipUnverified": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMOwnershipUnverified",
+    ),
     "LambdaMicroVMProtocolError": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMProtocolError"),
     "LambdaMicroVMRunner": ("cayu.runners.aws_lambda_microvm", "LambdaMicroVMRunner"),
     "LambdaMicroVMSubmissionClosed": (
@@ -169,6 +181,9 @@ PUBLIC_NAMES = [
     "LambdaMicroVMEndpointTransport",
     "LambdaMicroVMEndpointUnauthorized",
     "LambdaMicroVMError",
+    "LambdaMicroVMLifecycleInProgress",
+    "LambdaMicroVMOwnershipSuperseded",
+    "LambdaMicroVMOwnershipUnverified",
     "LambdaMicroVMProtocolError",
     "LambdaMicroVMRunner",
     "LambdaMicroVMSubmissionClosed",

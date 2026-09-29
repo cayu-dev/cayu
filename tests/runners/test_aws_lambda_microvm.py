@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.runners.lambda_microvm_harness import OwnerFencedTransport, guest_lifecycle_hook
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
 from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
@@ -562,16 +563,19 @@ class FakeLambdaMicroVMClient:
     def suspend_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.suspend_calls.append(kwargs)
         self.state = "SUSPENDED"
+        guest_lifecycle_hook("suspend")
         return {}
 
     def resume_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.resume_calls.append(kwargs)
         self.state = "RUNNING"
+        guest_lifecycle_hook("resume")
         return {}
 
     def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.terminate_calls.append(kwargs)
         self.state = "TERMINATED"
+        guest_lifecycle_hook("terminate")
         return {}
 
 
@@ -617,7 +621,7 @@ class TerminatingLambdaMicroVMClient(FakeLambdaMicroVMClient):
         return response
 
 
-class FakeEndpointTransport:
+class FakeEndpointTransport(OwnerFencedTransport):
     def __init__(self, *, result_overrides: dict[str, Any] | None = None) -> None:
         self.health_calls: list[dict[str, Any]] = []
         self.start_calls: list[dict[str, Any]] = []
@@ -639,6 +643,7 @@ class FakeEndpointTransport:
         payload: dict[str, Any],
         timeout_s: float,
     ) -> dict[str, Any]:
+        payload = self.admit_start(payload)
         self.start_calls.append(
             {
                 "endpoint": endpoint,
@@ -923,6 +928,8 @@ async def test_poll_does_not_dispatch_after_token_refresh_consumes_deadline(monk
         endpoint_transport=transport,
         request_timeout_s=0.02,
     )
+    # Claim ownership first so the token-call numbering targets the poll.
+    await runner._claim_owner()
     original = runner._endpoint_token
     calls = 0
     polls = 0
@@ -1283,7 +1290,7 @@ class FailingStartEndpointTransport(FakeEndpointTransport):
         raise LambdaMicroVMError("connection lost after start")
 
 
-class SupervisorEndpointTransport:
+class SupervisorEndpointTransport(OwnerFencedTransport):
     def __init__(self, root: Path) -> None:
         self.supervisor = CommandSupervisor(root=root)
 
@@ -1299,7 +1306,10 @@ class SupervisorEndpointTransport:
         payload: dict[str, Any],
         timeout_s: float,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self.supervisor.start, command_id, payload)
+        admitted, generation = self.admit_start_with_generation(payload)
+        return await asyncio.to_thread(
+            self.supervisor.start, command_id, admitted, owner_generation=generation
+        )
 
     async def get_command(
         self,
@@ -1320,6 +1330,9 @@ class SupervisorEndpointTransport:
         timeout_s: float,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(self.supervisor.cancel, command_id)
+
+    def on_owner_superseded(self, generation: int) -> None:
+        self.supervisor.cancel_all(reason="owner_superseded", before_generation=generation)
 
 
 class DelayedStartSupervisorEndpointTransport(SupervisorEndpointTransport):
@@ -1934,7 +1947,10 @@ async def test_lambda_microvm_runner_rejects_sidecar_protocol_mismatch(
 ) -> None:
     client = FakeLambdaMicroVMClient()
 
-    with pytest.raises(LambdaMicroVMProtocolError, match="expected 2"):
+    with pytest.raises(
+        LambdaMicroVMProtocolError,
+        match=f"expected {lambda_microvm_module.LAMBDA_MICROVM_PROTOCOL_VERSION}",
+    ):
         await asyncio.wait_for(
             LambdaMicroVMRunner.create(
                 "arn:aws:lambda:us-west-2:123:microvm-image:cayu",

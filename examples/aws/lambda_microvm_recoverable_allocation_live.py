@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -34,7 +35,7 @@ from cayu.egress.aws_lambda_microvm_adapter import (
     _verify_agent_privilege_boundary,
 )
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
-from cayu.runners import LambdaMicroVMClientTokenConflict
+from cayu.runners import LambdaMicroVMClientTokenConflict, LambdaMicroVMOwnershipSuperseded
 from cayu.runners.aws_lambda_microvm import _control_client, run_microvm_with_client_token
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
@@ -102,11 +103,55 @@ async def _phase(name: str, state_path: Path) -> dict[str, Any]:
             client_token=_token(adapter, state["allocations"][key]),
             close_action="none",
         )
-        result = await runner.exec(ExecCommand.process("python3", "-c", "print('adopted')"))
+        try:
+            result = await runner.exec(ExecCommand.process("python3", "-c", "print('adopted')"))
+        except LambdaMicroVMOwnershipSuperseded:
+            # A concurrent recovery worker claimed after this one; only the
+            # latest claimant may execute.
+            await runner.close()
+            return {"microvm_id": runner.microvm_id, "exec": "fenced"}
         await runner.close()
         if result.exit_code != 0 or result.stdout != "adopted\n":
             raise RuntimeError("Recovered MicroVM did not execute a command.")
-        return {"microvm_id": runner.microvm_id}
+        return {"microvm_id": runner.microvm_id, "exec": "executed"}
+    if name == "stale-owner":
+        runner = await LambdaMicroVMRunner.from_existing(
+            state["identity"]["microvm_id"], region_name=config["region"], close_action="none"
+        )
+        await runner.exec(ExecCommand.process("true"))
+        go = state_path.with_suffix(".successor-attached")
+        (state_path.with_suffix(".stale-ready")).write_text("ready")
+        deadline = time.monotonic() + 120
+        while not go.exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("successor never attached")
+            await asyncio.sleep(0.5)
+        outcomes = {}
+        # The stale owner has not seen a rejection yet, so only the sidecar's
+        # lifecycle lease can stop this direct terminate.
+        try:
+            await runner.terminate()
+            outcomes["terminate"] = "allowed"
+        except LambdaMicroVMOwnershipSuperseded:
+            outcomes["terminate"] = "fenced"
+        try:
+            await runner.exec(ExecCommand.process("true"))
+            outcomes["exec"] = "allowed"
+        except (LambdaMicroVMOwnershipSuperseded, RuntimeError):
+            outcomes["exec"] = "fenced"
+        runner.close_action = "none"
+        with contextlib.suppress(Exception):
+            await runner.close()
+        return outcomes
+    if name == "successor":
+        runner = await LambdaMicroVMRunner.from_existing(
+            state["identity"]["microvm_id"], region_name=config["region"], close_action="none"
+        )
+        state_path.with_suffix(".successor-attached").write_text("attached")
+        await asyncio.sleep(8)  # let the stale owner try while this owner is current
+        result = await runner.exec(ExecCommand.process("python3", "-c", "print('successor')"))
+        await runner.close()
+        return {"successor_exec": result.stdout.strip()}
     if name == "suspend":
         runner = await LambdaMicroVMRunner.from_existing(
             state["identity"]["microvm_id"], region_name=config["region"], close_action="suspend"
@@ -223,6 +268,8 @@ async def main() -> None:
             observed.add(died["observed_microvm_id"])
             recovered = _run_phase("recover", state_path)
             observed.add(recovered["microvm_id"])
+            if recovered["exec"] != "executed":
+                raise RuntimeError("The only recovery worker was fenced.")
             if recovered["microvm_id"] != died["observed_microvm_id"]:
                 raise RuntimeError("Recovery adopted a different MicroVM than the lost request.")
             concurrent = await asyncio.gather(
@@ -233,6 +280,8 @@ async def main() -> None:
             observed.update(concurrent_ids)
             if len(concurrent_ids) != 1:
                 raise RuntimeError("Concurrent recovery workers created different MicroVMs.")
+            if "executed" not in {item["exec"] for item in concurrent}:
+                raise RuntimeError("No concurrent recovery worker could execute.")
             conflict = _run_phase("conflict", state_path)
             described = client.get_microvm(microvmIdentifier=recovered["microvm_id"])
             identity = {
@@ -246,6 +295,21 @@ async def main() -> None:
             }
             state = json.loads(state_path.read_text())
             state_path.write_text(json.dumps({**state, "identity": identity}))
+            stale = asyncio.create_task(asyncio.to_thread(_run_phase, "stale-owner", state_path))
+            ready = state_path.with_suffix(".stale-ready")
+            deadline = time.monotonic() + 120
+            while not ready.exists() and not stale.done():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("stale owner never attached")
+                await asyncio.sleep(0.5)
+            successor = _run_phase("successor", state_path)
+            stale_outcomes = await stale
+            if stale_outcomes != {"exec": "fenced", "terminate": "fenced"}:
+                raise RuntimeError(f"Stale owner was not fenced: {stale_outcomes}")
+            if successor["successor_exec"] != "successor":
+                raise RuntimeError("Successor owner could not execute.")
+            if client.get_microvm(microvmIdentifier=recovered["microvm_id"])["state"] != "RUNNING":
+                raise RuntimeError("A stale owner changed its successor's MicroVM lifecycle.")
             _run_phase("suspend", state_path)
             reconnect = _run_phase("reconnect", state_path)
             if reconnect["reconnected"] != recovered["microvm_id"]:
@@ -283,6 +347,8 @@ async def main() -> None:
                 "concurrent_recovery_single_allocation": "verified",
                 "changed_parameter_replay": conflict["conflict"],
                 "suspended_reconnect_by_durable_identity": "verified",
+                "cross_process_stale_owner_exec": stale_outcomes["exec"],
+                "cross_process_stale_owner_terminate": stale_outcomes["terminate"],
                 "agent_privilege_boundary": reconnect["privilege_boundary"],
                 "disposal_proof_after_reap": "verified",
                 "reaped_allocations": sorted(reap["reaped"]),

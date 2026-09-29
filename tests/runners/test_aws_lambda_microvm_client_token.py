@@ -8,7 +8,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from tests.runners.lambda_microvm_harness import ClientTokenLambdaModel, FakeLambdaClientError
+from tests.runners.lambda_microvm_harness import (
+    ClientTokenLambdaModel,
+    FakeLambdaClientError,
+    OwnerFencedTransport,
+)
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
 from cayu import LambdaMicroVMRunner
@@ -28,13 +32,16 @@ IMAGE = ClientTokenLambdaModel.image_arn
 TOKEN = "cayu-" + "a" * 64
 
 
-class HealthyTransport:
+class HealthyTransport(OwnerFencedTransport):
     def __init__(self) -> None:
         self.health_calls = 0
 
     async def health(self, **_kwargs: Any) -> dict[str, str]:
         self.health_calls += 1
-        return {"status": "ok", "protocol_version": "2"}
+        return {
+            "status": "ok",
+            "protocol_version": lambda_microvm_module.LAMBDA_MICROVM_PROTOCOL_VERSION,
+        }
 
     async def start_command(self, **_kwargs: Any) -> dict[str, Any]:
         raise AssertionError("allocation tests never dispatch guest work")

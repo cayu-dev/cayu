@@ -3,11 +3,92 @@ from __future__ import annotations
 import asyncio
 import copy
 import email.utils
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from examples.aws.lambda_microvm_sidecar.supervisor import CommandSupervisor
+from examples.aws.lambda_microvm_sidecar.supervisor import (
+    CommandSupervisor,
+    OwnerFence,
+    OwnerLifecycleLeasedError,
+    OwnerSupersededError,
+)
+
+from cayu.runners import LambdaMicroVMOwnershipSuperseded
+from cayu.runners.aws_lambda_microvm import (
+    LAMBDA_MICROVM_PROTOCOL_VERSION,
+    LambdaMicroVMLifecycleInProgress,
+)
+
+_FENCED_TRANSPORTS: weakref.WeakSet[OwnerFencedTransport] = weakref.WeakSet()
+
+
+def guest_lifecycle_hook(hook: str) -> None:
+    """Deliver the guest's suspend, resume, or terminate hook to every fake sidecar.
+
+    Fake control planes call this when they change a MicroVM's state, as AWS
+    delivers those hooks to the real sidecar, which settles a matching lease.
+    """
+
+    for transport in list(_FENCED_TRANSPORTS):
+        transport.owner_fence.settle_lifecycle(hook)
+
+
+class OwnerFencedTransport:
+    """The sidecar's real owner-fence semantics for fake endpoint transports."""
+
+    _fence: OwnerFence | None = None
+
+    @property
+    def owner_fence(self) -> OwnerFence:
+        if self._fence is None:
+            self._fence = OwnerFence()
+            _FENCED_TRANSPORTS.add(self)
+        return self._fence
+
+    def on_owner_superseded(self, generation: int) -> None:
+        """Cancel earlier owners' commands, as the sidecar does on a new claim."""
+
+    async def claim_owner(self, *, claim_id: str, **_kwargs: Any) -> dict[str, Any]:
+        try:
+            generation, superseded = self.owner_fence.claim(claim_id)
+        except OwnerLifecycleLeasedError as exc:
+            raise LambdaMicroVMLifecycleInProgress(str(exc)) from exc
+        if superseded:
+            self.on_owner_superseded(generation)
+        return {"generation": generation, "superseded_previous": superseded}
+
+    async def check_owner(self, *, claim_id: str, **_kwargs: Any) -> dict[str, bool]:
+        return {"current": self.owner_fence.is_current(claim_id)}
+
+    async def acquire_lifecycle(
+        self, *, claim_id: str, action: str, **_kwargs: Any
+    ) -> dict[str, Any]:
+        try:
+            return self.owner_fence.acquire_lifecycle(claim_id, action)
+        except OwnerSupersededError as exc:
+            raise LambdaMicroVMOwnershipSuperseded(str(exc)) from exc
+
+    async def release_lifecycle(self, *, claim_id: str, **_kwargs: Any) -> dict[str, str]:
+        try:
+            self.owner_fence.release_lifecycle(claim_id)
+        except OwnerSupersededError as exc:
+            raise LambdaMicroVMOwnershipSuperseded(str(exc)) from exc
+        return {"status": "released"}
+
+    def admit_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.admit_start_with_generation(payload)[0]
+
+    def admit_start_with_generation(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        admitted = dict(payload)
+        try:
+            generation = self.owner_fence.require(admitted.pop("owner_claim", None))
+        except OwnerSupersededError as exc:
+            raise LambdaMicroVMOwnershipSuperseded("fake sidecar reports a newer owner") from exc
+        except OwnerLifecycleLeasedError as exc:
+            raise LambdaMicroVMLifecycleInProgress(str(exc)) from exc
+        return admitted, generation
 
 
 class ConformanceLambdaClient:
@@ -41,20 +122,23 @@ class ConformanceLambdaClient:
     def suspend_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         self.suspend_calls += 1
         self.state = "SUSPENDED"
+        guest_lifecycle_hook("suspend")
         return {}
 
     def resume_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         self.resume_calls += 1
         self.state = "RUNNING"
+        guest_lifecycle_hook("resume")
         return {}
 
     def terminate_microvm(self, **_kwargs: Any) -> dict[str, Any]:
         self.terminate_calls += 1
         self.state = "TERMINATED"
+        guest_lifecycle_hook("terminate")
         return {}
 
 
-class SupervisorTransport:
+class SupervisorTransport(OwnerFencedTransport):
     """Lambda sidecar transport shared by runner conformance and composition tests."""
 
     def __init__(
@@ -70,7 +154,7 @@ class SupervisorTransport:
         self._scripted_results: dict[str, dict[str, Any]] = {}
 
     async def health(self, **_kwargs: Any) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": "2"}
+        return {"status": "ok", "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION}
 
     async def start_command(
         self,
@@ -79,6 +163,7 @@ class SupervisorTransport:
         payload: dict[str, Any],
         **_kwargs: Any,
     ) -> dict[str, Any]:
+        payload, generation = self.admit_start_with_generation(payload)
         copied = copy.deepcopy(payload)
         self.execution_profiles.append(copied["execution_profile"])
         self.payloads.append(copied)
@@ -90,7 +175,9 @@ class SupervisorTransport:
                     exit_code=exit_code,
                 )
                 return {"command_id": command_id, "state": "accepted"}
-        return await asyncio.to_thread(self.supervisor.start, command_id, payload)
+        return await asyncio.to_thread(
+            self.supervisor.start, command_id, payload, owner_generation=generation
+        )
 
     async def get_command(self, *, command_id: str, **_kwargs: Any) -> dict[str, Any]:
         scripted = self._scripted_results.get(command_id)
@@ -102,6 +189,9 @@ class SupervisorTransport:
         if command_id in self._scripted_results:
             return {"command_id": command_id, "state": "cancelled"}
         return await asyncio.to_thread(self.supervisor.cancel, command_id)
+
+    def on_owner_superseded(self, generation: int) -> None:
+        self.supervisor.cancel_all(reason="owner_superseded", before_generation=generation)
 
 
 def _terminal_result(command_id: str, *, exit_code: int) -> dict[str, Any]:
@@ -152,6 +242,8 @@ class ClientTokenLambdaModel:
         self.tokens: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         self.run_calls: list[dict[str, Any]] = []
         self.terminate_calls: list[str] = []
+        self.suspend_calls: list[str] = []
+        self.resume_calls: list[str] = []
         self.image_calls: list[str] = []
         self.run_failures: list[BaseException] = []
         self.lose_acknowledgements = 0
@@ -259,11 +351,15 @@ class ClientTokenLambdaModel:
         return {"authToken": {"X-aws-proxy-auth": "model-token"}}
 
     def suspend_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        self.suspend_calls.append(kwargs["microvmIdentifier"])
         self.microvms[kwargs["microvmIdentifier"]]["state"] = "SUSPENDED"
+        guest_lifecycle_hook("suspend")
         return {}
 
     def resume_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        self.resume_calls.append(kwargs["microvmIdentifier"])
         self.microvms[kwargs["microvmIdentifier"]]["state"] = "RUNNING"
+        guest_lifecycle_hook("resume")
         return {}
 
     def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
@@ -275,4 +371,5 @@ class ClientTokenLambdaModel:
         if microvm["state"] != "TERMINATED":
             microvm["state"] = "TERMINATING"
             microvm["polls_until_terminated"] = self.terminal_after_polls
+        guest_lifecycle_hook("terminate")
         return {}

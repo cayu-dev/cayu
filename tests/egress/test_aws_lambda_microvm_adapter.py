@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from tests.runners.lambda_microvm_harness import OwnerFencedTransport
 
 import cayu.egress.aws_lambda_microvm_adapter as adapter_module
 from cayu import ExecCommand, ExecResult
@@ -978,20 +979,28 @@ def test_lambda_microvm_adapter_closes_owned_transports_when_suspend_fails(
     closed = []
 
     class Client:
+        def create_microvm_auth_token(self, **kwargs):
+            return {"authToken": {"X-aws-proxy-auth": "token"}}
+
         def suspend_microvm(self, **kwargs):
             raise RuntimeError("suspend failed")
 
         def close(self):
             closed.append("provider")
 
+    class Transport(OwnerFencedTransport):
+        async def aclose(self):
+            closed.append("http")
+
     runner = adapter_module.LambdaMicroVMRunner(
-        Client(), microvm_id="mvm-123", endpoint="mvm.internal", owns_client=True
+        Client(),
+        microvm_id="mvm-123",
+        endpoint="mvm.internal",
+        owns_client=True,
+        endpoint_transport=Transport(),
     )
-
-    async def close_http():
-        closed.append("http")
-
-    monkeypatch.setattr(runner._endpoint_transport, "aclose", close_http)
+    # The adapter closes transports the runner owns, as it does for the default.
+    runner._owns_endpoint_transport = True
 
     with pytest.raises(RuntimeError, match="suspend failed"):
         asyncio.run(adapter.finalize_runner(runner, outcome="interrupted"))

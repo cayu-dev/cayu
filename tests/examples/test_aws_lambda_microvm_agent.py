@@ -29,6 +29,7 @@ from examples.aws.lambda_microvm_agent.runtime import (
 from cayu import ExecResult, ToolContext
 from cayu.artifacts import S3ArtifactStore
 from cayu.environments import EFSAccessPointBinding, S3FilesAccessPointBinding
+from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 from cayu.vaults import SecretsManagerVault
 
 
@@ -509,7 +510,7 @@ def test_microvm_package_binds_provenance_to_the_packaged_sidecar(
     assert provenance["sidecar_artifact_version"] == 1
     assert provenance["sidecar_cayu_version"] == project_version
     assert provenance["sidecar_content_digest"].startswith("sha256:")
-    assert provenance["sidecar_protocol_version"] == "2"
+    assert provenance["sidecar_protocol_version"] == LAMBDA_MICROVM_PROTOCOL_VERSION
 
 
 def test_guest_audit_treats_unreadable_root_paths_as_absent() -> None:

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.runners.lambda_microvm_harness import OwnerFencedTransport, guest_lifecycle_hook
 
 from cayu import (
     EnvironmentAllocationUnsupportedError,
@@ -13,6 +14,7 @@ from cayu import (
     RunnerWorkspace,
 )
 from cayu.runners import LambdaMicroVMProtocolError
+from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 
 _EXAMPLE = (
     Path(__file__).resolve().parents[2] / "examples" / "aws" / "environments" / "lambda_microvm.py"
@@ -57,15 +59,18 @@ class FakeControlClient:
     def suspend_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.suspend_calls += 1
         self.states[kwargs["microvmIdentifier"]] = "SUSPENDED"
+        guest_lifecycle_hook("suspend")
         return {}
 
     def resume_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.states[kwargs["microvmIdentifier"]] = "RUNNING"
+        guest_lifecycle_hook("resume")
         return {}
 
     def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.terminate_calls += 1
         self.states[kwargs["microvmIdentifier"]] = "TERMINATED"
+        guest_lifecycle_hook("terminate")
         return {}
 
 
@@ -78,9 +83,9 @@ class FailOnceTerminateControlClient(FakeControlClient):
         return {}
 
 
-class HealthyTransport:
+class HealthyTransport(OwnerFencedTransport):
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": "2"}
+        return {"status": "ok", "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION}
 
 
 def test_lambda_microvm_factory_reports_unsupported_recoverable_allocation_before_create() -> None:

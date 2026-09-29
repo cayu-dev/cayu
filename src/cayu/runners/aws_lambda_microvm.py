@@ -6,6 +6,7 @@ import calendar
 import importlib
 import json
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -71,11 +72,23 @@ DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "2"
+LAMBDA_MICROVM_PROTOCOL_VERSION = "3"
 LAMBDA_MICROVM_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES + 2) // 3)
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
 _LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_LAMBDA_OWNER_SUPERSEDED_HTTP_STATUS = 412
+_LAMBDA_OWNER_LIFECYCLE_LEASED_HTTP_STATUS = 423
+_LAMBDA_OWNER_SUPERSEDED_CANCEL_REASON = "owner_superseded"
+# A lifecycle lease authorizes exactly one provider request, and only if it is
+# signed within this window of the ownership check. The window bounds how stale
+# that check may be; it is not a claim about when the request finishes.
+_LAMBDA_LIFECYCLE_DISPATCH_WINDOW_SECONDS = 60.0
+_LAMBDA_LIFECYCLE_OPERATIONS = ("SuspendMicrovm", "TerminateMicrovm")
+_LAMBDA_AMBIGUOUS_PROVIDER_ERROR_CODES = frozenset(
+    {"InternalServerException", "ServiceUnavailableException"}
+)
+_LIFECYCLE_DISPATCH = threading.local()
 LAMBDA_MICROVM_CLIENT_TOKEN_MAX_LENGTH = 128
 # Only a client-token submission may be retried: AWS returns the original
 # allocation for a replay of identical parameters instead of creating another.
@@ -132,6 +145,10 @@ class _LambdaAllocationReclamation:
     restore_suspended: bool = False
     abandoned: bool = False
     attachment_identifier: str | None = None
+    # The MicroVM identifier can reach another host: a client-token submission
+    # (a replay returns the same MicroVM) or an attachment by identifier.
+    shared_identity: bool = False
+    cleanup_deferred: bool = False
 
     def release_attachment(self) -> None:
         identifier = self.attachment_identifier
@@ -162,15 +179,34 @@ class _LambdaAllocationReclamation:
         # the control client usable until deletion is positively reconciled.
         if not self.termination_confirmed:
             if not self.attachment or self.restore_suspended:
-                if self.attachment:
-                    await runner._suspend()
+                if not runner._owner_claimed and self.shared_identity:
+                    # Not having claimed proves only that this runner never
+                    # owned the MicroVM, not that nobody else does: another
+                    # creator replaying the token, or the attachment's source,
+                    # may already hold the claim. Leave disposal to the
+                    # allocation reap or the MicroVM's maximum duration.
+                    self.cleanup_deferred = True
+                    _LOGGER.warning(
+                        "Lambda MicroVM %s was not claimed by its failed constructor; its "
+                        "cleanup is deferred to the allocation reap or its maximum duration.",
+                        runner.microvm_id,
+                    )
                 else:
-                    await runner._terminate()
-                await runner._wait_for_lifecycle_state(
-                    terminal_state="SUSPENDED" if self.attachment else "TERMINATED",
-                    transitional_states={"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"},
-                    timeout_s=runner.cancel_timeout_s,
-                )
+                    # A claimed runner mutates only under the sidecar's lease.
+                    # An unclaimed one here made a tokenless create whose
+                    # identifier it never returned, so no other host can hold
+                    # the MicroVM and it is disposed of without the fence.
+                    fenced = runner._owner_claimed
+                    if self.attachment:
+                        await runner._suspend(fenced=fenced)
+                    else:
+                        await runner._terminate(fenced=fenced)
+                    await runner._wait_for_lifecycle_state(
+                        terminal_state="SUSPENDED" if self.attachment else "TERMINATED",
+                        transitional_states={"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"},
+                        timeout_s=runner.cancel_timeout_s,
+                    )
+            # Local cleanup is settled; a deferred MicroVM is not this owner's to dispose of.
             self.termination_confirmed = True
         await runner._close_transports(progress=self.progress)
         runner._closed = True
@@ -226,6 +262,35 @@ class LambdaMicroVMEndpointTransientError(LambdaMicroVMError):
     """A transport failure eligible for bounded command-state read retry only."""
 
 
+class LambdaMicroVMOwnershipSuperseded(LambdaMicroVMError):
+    """A later host claimed this MicroVM; this runner may no longer act on it.
+
+    Execution is permanently closed and lifecycle mutations are skipped so a
+    stale owner cannot run commands in, suspend, or terminate its successor's
+    MicroVM.
+    """
+
+
+class LambdaMicroVMOwnershipUnverified(LambdaMicroVMError):
+    """The sidecar could not confirm this runner still owns the MicroVM.
+
+    No suspend or terminate was sent. An unreachable sidecar is not proof that
+    no successor owns the MicroVM, so the mutation is refused and cleanup stays
+    pending for an authoritative path: the runtime's allocation reap, which
+    runs under the durable allocation fence, or the MicroVM's maximum duration.
+    """
+
+
+class LambdaMicroVMLifecycleInProgress(LambdaMicroVMError):
+    """The current owner is suspending or terminating the MicroVM.
+
+    The sidecar refuses new claims and commands until the lease is settled:
+    the owner releases it after a provider request that was never sent or was
+    definitively rejected, or the guest's matching suspend/terminate hook
+    observes the request's effect. The lease never expires by time.
+    """
+
+
 class LambdaMicroVMClientTokenConflict(LambdaMicroVMError):
     """AWS rejected a client-token replay because its request parameters changed.
 
@@ -278,6 +343,43 @@ class LambdaMicroVMEndpointTransport(Protocol):
         endpoint: str,
         token: str,
         command_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]: ...
+
+    async def claim_owner(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]: ...
+
+    async def check_owner(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]: ...
+
+    async def acquire_lifecycle(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        action: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]: ...
+
+    async def release_lifecycle(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
         timeout_s: float,
     ) -> Mapping[str, Any]: ...
 
@@ -347,6 +449,75 @@ class HttpxLambdaMicroVMEndpointTransport:
             timeout_s=timeout_s,
         )
 
+    async def claim_owner(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path="/v1/owner",
+            payload={"claim_id": claim_id},
+            timeout_s=timeout_s,
+        )
+
+    async def check_owner(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path="/v1/owner/check",
+            payload={"claim_id": claim_id},
+            timeout_s=timeout_s,
+        )
+
+    async def acquire_lifecycle(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        action: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path="/v1/owner/lifecycle",
+            payload={"claim_id": claim_id, "action": action},
+            timeout_s=timeout_s,
+        )
+
+    async def release_lifecycle(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        claim_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path="/v1/owner/lifecycle/release",
+            payload={"claim_id": claim_id},
+            timeout_s=timeout_s,
+        )
+
     async def _request(
         self,
         method: str,
@@ -373,6 +544,14 @@ class HttpxLambdaMicroVMEndpointTransport:
                     if response.status_code in {401, 403}:
                         raise LambdaMicroVMEndpointUnauthorized(
                             "Lambda MicroVM endpoint token was rejected."
+                        )
+                    if response.status_code == _LAMBDA_OWNER_SUPERSEDED_HTTP_STATUS:
+                        raise LambdaMicroVMOwnershipSuperseded(
+                            "Lambda MicroVM sidecar reports a newer owner."
+                        )
+                    if response.status_code == _LAMBDA_OWNER_LIFECYCLE_LEASED_HTTP_STATUS:
+                        raise LambdaMicroVMLifecycleInProgress(
+                            "Lambda MicroVM owner is suspending or terminating it."
                         )
                     if response.status_code >= 400:
                         error_type = (
@@ -489,6 +668,10 @@ class LambdaMicroVMRunner(Runner):
         self._exec_closed_reason = None
         self._suspended = False
         self._termination_requested = False
+        # Memory-only bearer claim; the sidecar keeps only its digest.
+        self._owner_claim = secrets.token_hex(32)
+        self._owner_claimed = False
+        self._owner_superseded = False
 
     @classmethod
     async def create(
@@ -566,7 +749,9 @@ class LambdaMicroVMRunner(Runner):
             profile_name=profile_name,
             endpoint_url=endpoint_url,
         )
-        reclamation = _LambdaAllocationReclamation(cls, control_client, owns_client)
+        reclamation = _LambdaAllocationReclamation(
+            cls, control_client, owns_client, shared_identity=token is not None
+        )
 
         async def allocate() -> LambdaMicroVMRunner:
             runner: LambdaMicroVMRunner | None = None
@@ -629,6 +814,7 @@ class LambdaMicroVMRunner(Runner):
                     raise BaseExceptionGroup(
                         "Lambda MicroVM allocation failed.", [primary, cleanup]
                     ) from None
+                _note_deferred_cleanup(primary, reclamation)
                 raise
 
         return await cls._observe_binding(
@@ -751,7 +937,7 @@ class LambdaMicroVMRunner(Runner):
         if identifier in _LAMBDA_ATTACHMENT_OWNERS:
             raise LambdaMicroVMError("A Lambda MicroVM attachment or its cleanup is still pending.")
         reclamation = _LambdaAllocationReclamation(
-            cls, attachment=True, attachment_identifier=identifier
+            cls, attachment=True, attachment_identifier=identifier, shared_identity=True
         )
         _LAMBDA_ATTACHMENT_OWNERS[identifier] = reclamation
         try:
@@ -818,6 +1004,7 @@ class LambdaMicroVMRunner(Runner):
                     raise BaseExceptionGroup(
                         "Lambda MicroVM attachment failed.", [primary, cleanup]
                     ) from None
+                _note_deferred_cleanup(primary, reclamation)
                 raise
 
         return await cls._observe_binding(
@@ -1046,6 +1233,11 @@ class LambdaMicroVMRunner(Runner):
                     response = await self._endpoint_get(command_id)
                     state = _required_response_string(response, "state")
                     if state in {"completed", "cancelled", "failed"}:
+                        if response.get("cancel_reason") == _LAMBDA_OWNER_SUPERSEDED_CANCEL_REASON:
+                            self._mark_superseded()
+                            raise LambdaMicroVMOwnershipSuperseded(
+                                "A newer Lambda MicroVM owner cancelled this command."
+                            )
                         result = _exec_result(response)
                         if output_redactor is not None:
                             result = redact_completed_exec_result(
@@ -1192,10 +1384,13 @@ class LambdaMicroVMRunner(Runner):
                 timeout_s=timeout_s,
             )
 
-    async def _suspend(self) -> None:
+    async def _suspend(self, *, fenced: bool = True) -> None:
         if self._suspended or self._termination_requested:
             return
-        await asyncio.to_thread(self._client.suspend_microvm, microvmIdentifier=self.microvm_id)
+        if fenced:
+            await self._owned_provider_mutation("suspend", self._client.suspend_microvm)
+        else:
+            await asyncio.to_thread(self._client.suspend_microvm, microvmIdentifier=self.microvm_id)
         self._suspended = True
         self._close_exec("Lambda MicroVM is suspended")
 
@@ -1386,12 +1581,105 @@ class LambdaMicroVMRunner(Runner):
             if failures:
                 raise BaseExceptionGroup("Lambda MicroVM finalization failed.", failures)
 
-    async def _terminate(self) -> None:
+    async def _terminate(self, *, fenced: bool = True) -> None:
         if self._termination_requested:
             return
-        await asyncio.to_thread(self._client.terminate_microvm, microvmIdentifier=self.microvm_id)
+        if not fenced:
+            await asyncio.to_thread(
+                self._client.terminate_microvm, microvmIdentifier=self.microvm_id
+            )
+            self._termination_requested = True
+            self._close_exec("Lambda MicroVM termination was requested")
+            return
+        if self._suspended:
+            # A suspended guest cannot answer for its owner. Resuming is not
+            # destructive, and readiness re-checks the claim, so a successor
+            # that suspended this MicroVM after taking it over is never
+            # terminated by this runner.
+            await self._resume()
+        await self._owned_provider_mutation("terminate", self._client.terminate_microvm)
         self._termination_requested = True
         self._close_exec("Lambda MicroVM termination was requested")
+
+    async def _owned_provider_mutation(
+        self, action: Literal["suspend", "terminate"], operation: Callable[..., Any]
+    ) -> None:
+        """Send one provider suspend or terminate under the sidecar's lifecycle lease.
+
+        The lease atomically confirms this runner is the current owner and
+        refuses any claim until it ends, so no successor can take over between
+        the check and the provider call. It authorizes exactly one request,
+        signed within the dispatch window; SDK retries are refused before they
+        are sent. The lease is released here only when no request was sent or
+        AWS definitively rejected the one that was. Otherwise (success, a
+        timeout, a server error, or cancellation while the send is in flight)
+        it stays held until the guest's lifecycle hook settles it.
+        """
+
+        started = time.monotonic()
+        await self._acquire_lifecycle_lease(action)
+        dispatch = _LifecycleDispatch(deadline=started + _LAMBDA_LIFECYCLE_DISPATCH_WINDOW_SECONDS)
+        observed = _install_lifecycle_send_guard(self._client)
+
+        def send() -> None:
+            if time.monotonic() > dispatch.deadline:
+                raise _LifecycleSendRefused(
+                    f"Lambda MicroVM {action} was not sent within its lifecycle lease."
+                )
+            if not observed:
+                # Without SDK events the one call is the one request.
+                dispatch.sent = 1
+            _LIFECYCLE_DISPATCH.value = dispatch
+            try:
+                operation(microvmIdentifier=self.microvm_id)
+            except BaseException as error:
+                if not observed and _is_definitive_provider_rejection(error):
+                    dispatch.rejected = 1
+                raise
+            finally:
+                _LIFECYCLE_DISPATCH.value = None
+
+        try:
+            await asyncio.to_thread(send)
+        except asyncio.CancelledError:
+            # The send may still be running in its thread; keep the lease.
+            raise
+        except BaseException:
+            if dispatch.unapplied:
+                await self._release_lifecycle_lease()
+            raise
+
+    async def _acquire_lifecycle_lease(self, action: str) -> None:
+        if self._owner_superseded:
+            raise LambdaMicroVMOwnershipSuperseded("Lambda MicroVM has a newer owner.")
+        try:
+            if not self._owner_claimed:
+                # A directly constructed runner attaches before it acts.
+                await self._claim_owner()
+            response = await self._endpoint_call(
+                "acquire_lifecycle", claim_id=self._owner_claim, action=action
+            )
+        except LambdaMicroVMOwnershipSuperseded:
+            self._mark_superseded()
+            raise
+        except (LambdaMicroVMLifecycleInProgress, LambdaMicroVMProtocolError):
+            raise
+        except Exception as exc:
+            raise LambdaMicroVMOwnershipUnverified(
+                f"Lambda MicroVM sidecar could not confirm ownership; {action} was not sent "
+                "and cleanup remains pending."
+            ) from exc
+        generation = response.get("generation")
+        if type(generation) is not int or generation <= 0 or response.get("action") != action:
+            raise LambdaMicroVMProtocolError("Lambda MicroVM lifecycle lease was malformed.")
+
+    async def _release_lifecycle_lease(self) -> None:
+        try:
+            await self._endpoint_call("release_lifecycle", claim_id=self._owner_claim)
+        except Exception:
+            # The lease stays held until the guest settles it; the original
+            # failure is reported.
+            _LOGGER.debug("Lambda MicroVM lifecycle lease release failed.", exc_info=True)
 
     async def _wait_for_lifecycle_state(
         self,
@@ -1464,8 +1752,9 @@ class LambdaMicroVMRunner(Runner):
         while True:
             try:
                 await self._endpoint_health()
+                await self._claim_owner()
                 return
-            except _LambdaMicroVMProtocolVersionMismatch:
+            except (_LambdaMicroVMProtocolVersionMismatch, LambdaMicroVMOwnershipSuperseded):
                 raise
             except Exception as exc:
                 last_error = exc
@@ -1528,10 +1817,45 @@ class LambdaMicroVMRunner(Runner):
                 f"expected {LAMBDA_MICROVM_PROTOCOL_VERSION}, got {reported_version}."
             )
 
+    async def _claim_owner(self) -> None:
+        """Become the MicroVM's only command owner; later claims fence this runner.
+
+        A runner claims once. Readiness after resume only confirms the existing
+        claim, so a stale runner can never take the MicroVM back from its
+        successor; a sidecar that lost its fence also reports it as superseded.
+        """
+
+        if self._owner_superseded:
+            raise LambdaMicroVMOwnershipSuperseded("Lambda MicroVM has a newer owner.")
+        if self._owner_claimed:
+            response = await self._endpoint_call("check_owner", claim_id=self._owner_claim)
+            if response.get("current") is not True:
+                self._mark_superseded()
+                raise LambdaMicroVMOwnershipSuperseded("Lambda MicroVM has a newer owner.")
+            return
+        response = await self._endpoint_call("claim_owner", claim_id=self._owner_claim)
+        generation = response.get("generation")
+        if type(generation) is not int or generation <= 0:
+            raise LambdaMicroVMProtocolError("Lambda MicroVM owner claim returned no generation.")
+        self._owner_claimed = True
+
+    def _mark_superseded(self) -> None:
+        self._owner_superseded = True
+        self._poison_exec("Lambda MicroVM ownership was superseded")
+
     async def _endpoint_start(self, command_id: str, payload: dict[str, Any]) -> Mapping[str, Any]:
-        response = await self._endpoint_call(
-            "start_command", command_id=command_id, payload=payload
-        )
+        try:
+            if not self._owner_claimed:
+                # A directly constructed runner claims before its first command.
+                await self._claim_owner()
+            response = await self._endpoint_call(
+                "start_command",
+                command_id=command_id,
+                payload={**payload, "owner_claim": self._owner_claim},
+            )
+        except LambdaMicroVMOwnershipSuperseded:
+            self._mark_superseded()
+            raise
         returned_id = _required_response_string(response, "command_id")
         if returned_id != command_id:
             raise LambdaMicroVMProtocolError("Lambda MicroVM start returned the wrong command id.")
@@ -2036,6 +2360,101 @@ def _is_client_token_conflict(error: BaseException) -> bool:
         _client_error_code(error) in {"ValidationException", "ConflictException"}
         and "clienttoken" in _client_error_message(error).replace(" ", "").lower()
     )
+
+
+def _is_definitive_provider_rejection(error: BaseException) -> bool:
+    """AWS answered with an error that means the request was not applied."""
+
+    code = _client_error_code(error)
+    return code is not None and code not in _LAMBDA_AMBIGUOUS_PROVIDER_ERROR_CODES
+
+
+@dataclass
+class _LifecycleDispatch:
+    """Send accounting for the one provider request a lifecycle lease authorizes."""
+
+    deadline: float
+    sent: int = 0
+    rejected: int = 0
+
+    @property
+    def unapplied(self) -> bool:
+        """Every request that crossed the send boundary was definitively rejected."""
+
+        return self.sent == self.rejected
+
+
+class _LifecycleSendRefused(LambdaMicroVMOwnershipUnverified):
+    """The send guard stopped a lifecycle request before it left the host."""
+
+
+def _note_deferred_cleanup(error: BaseException, reclamation: _LambdaAllocationReclamation) -> None:
+    runner = reclamation.runner
+    if reclamation.cleanup_deferred and runner is not None:
+        error.add_note(
+            f"Lambda MicroVM {runner.microvm_id} was not claimed before this failure and may "
+            "belong to another host; it was not suspended or terminated. Its cleanup is "
+            "deferred to the allocation reap or its maximum duration."
+        )
+
+
+def _guard_lifecycle_send(**_kwargs: Any) -> None:
+    dispatch = getattr(_LIFECYCLE_DISPATCH, "value", None)
+    if dispatch is None:
+        return
+    if dispatch.sent:
+        raise _LifecycleSendRefused(
+            "Lambda MicroVM lifecycle retry was refused: a lifecycle lease authorizes one "
+            "request, and the earlier one stays unresolved under the lease."
+        )
+    if time.monotonic() > dispatch.deadline:
+        raise _LifecycleSendRefused(
+            "Lambda MicroVM lifecycle request was not sent within its lifecycle lease."
+        )
+    dispatch.sent += 1
+
+
+def _observe_lifecycle_attempt(
+    response: Any = None, caught_exception: BaseException | None = None, **_kwargs: Any
+) -> bool | None:
+    dispatch = getattr(_LIFECYCLE_DISPATCH, "value", None)
+    if dispatch is None:
+        return None
+    if caught_exception is None and response is not None:
+        status = getattr(response[0], "status_code", None)
+        if type(status) is int and 400 <= status < 500:
+            # AWS answered and refused the request; it was not applied.
+            dispatch.rejected += 1
+    # A lease authorizes one request: never let the SDK retry it.
+    return False
+
+
+def _install_lifecycle_send_guard(client: Any) -> bool:
+    """Count and bound every lifecycle send; return whether sends are observable.
+
+    The before-send guard refuses a request signed after the lease window and
+    any second request in the same call, so an SDK retry is never sent. The
+    needs-retry observer, registered on the exact operation so it runs before
+    the service-wide retry handler, records definitive rejections and vetoes
+    retries.
+    """
+
+    events = getattr(getattr(client, "meta", None), "events", None)
+    register = getattr(events, "register", None)
+    if not callable(register):
+        return False
+    for operation in _LAMBDA_LIFECYCLE_OPERATIONS:
+        register(
+            f"before-send.lambda-microvms.{operation}",
+            _guard_lifecycle_send,
+            unique_id=f"cayu-lifecycle-lease-{operation}",
+        )
+        register(
+            f"needs-retry.lambda-microvms.{operation}",
+            _observe_lifecycle_attempt,
+            unique_id=f"cayu-lifecycle-attempt-{operation}",
+        )
+    return True
 
 
 def _is_transient_control_error(error: BaseException) -> bool:

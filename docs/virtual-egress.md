@@ -913,7 +913,7 @@ Reconnect support is explicit by adapter:
 | Adapter | Virtual-egress reconnect |
 | --- | --- |
 | Microsandbox | Supported; attested single-owner sandbox plus host-listener and guest-endpoint ports, fresh grants/broker/CA, full preflight. |
-| Lambda MicroVM | Supported for the same MicroVM: allowlisted non-secret identity, resume when suspended, never replaces an ended MicroVM, fresh grants/broker/CA, full preflight plus an agent privilege probe. Cross-process single-owner fencing requires sidecar protocol 3. |
+| Lambda MicroVM | Supported for the same MicroVM: allowlisted non-secret identity, resume when suspended, never replaces an ended MicroVM, fresh grants/broker/CA, full preflight plus an agent privilege probe. A sidecar owner claim (protocol 3) fences stale owners across processes: their commands are cancelled and rejected, and a lifecycle lease stops them from suspending or terminating the successor's MicroVM; an unconfirmable owner mutates nothing. |
 | Docker | Opt-in local POSIX ownership directory, exact container/network identity, fresh proxy/CA, repeated preflight; see below. Default configuration remains unsupported. |
 | E2B | Generic reconnect is unsupported; crash-safe creation/recovery instead uses the durable exact-sandbox handoff described below. |
 
