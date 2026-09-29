@@ -66,7 +66,7 @@ same store for every combination of the variable and that section. Explicit
 | Variable | Read by | Effect |
 | --- | --- | --- |
 | `CAYU_DATABASE_URL` | App factories and the CLI | Postgres URL, or absolute SQLite URL. Unset selects the project's local SQLite file. A set but blank value is an error. |
-| `CAYU_DATABASE_POOL_MAX` | `open_application_stores` and the project Evals store | Maximum connections per pool (default 5). The application's PostgreSQL session, task, and knowledge stores share one pool. |
+| `CAYU_DATABASE_POOL_MAX` | `open_application_stores` and the project Evals store | Maximum connections per pool (default 5). The application's PostgreSQL session, task, knowledge, and (with `product_operations=True`) product operation stores share one pool. |
 | `CAYU_DATABASE_DIRECT_URL` | `open_application_stores` | Optional Postgres URL for the task-admission `LISTEN` connection. `LISTEN` does not survive transaction pooling, so set it to a direct server address when `CAYU_DATABASE_URL` points at PgBouncer or a similar proxy. Pooled store traffic keeps using `CAYU_DATABASE_URL`. |
 | `CAYU_REQUIRE_POSTGRES` | Every Cayu SQLite store | `1` makes SQLite stores raise at construction; `0` or unset changes nothing. Deployments set it so a missing `CAYU_DATABASE_URL` fails at startup. |
 

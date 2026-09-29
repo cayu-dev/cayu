@@ -70,6 +70,10 @@ from cayu.storage._participant_bindings_schema import (
     SQLITE_PARTICIPANT_BINDINGS_DDL,
     validate_sqlite_participant_bindings,
 )
+from cayu.storage._product_operation_schema import (
+    SQLITE_PRODUCT_OPERATION_DDL,
+    validate_sqlite_product_operation_schema,
+)
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
     SQLITE_TASK_GROUP_DDL,
@@ -1034,6 +1038,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     """,
     107: SQLITE_COLLABORATION_PLANNING_DDL,
     111: SQLITE_COLLABORATION_WAIT_DDL,
+    112: SQLITE_PRODUCT_OPERATION_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,
@@ -6543,6 +6548,8 @@ def reconcile_schema(
         _validate_producer_cleanup_receipts(connection)
     if current.revision >= 111:
         validate_sqlite_wait_discovery(connection)
+    if current.revision >= 112:
+        validate_sqlite_product_operation_schema(connection)
     if app_min_supported >= 39:
         _validate_task_invocation_column(connection)
     if app_min_supported >= 41:
@@ -11220,6 +11227,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             validate_sqlite_context_selection_schema(connection)
         if rev.revision == 111:
             validate_sqlite_wait_discovery(connection)
+        if rev.revision == 112:
+            validate_sqlite_product_operation_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

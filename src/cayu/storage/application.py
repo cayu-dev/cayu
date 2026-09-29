@@ -1,4 +1,4 @@
-"""Environment-selected session, task, and knowledge stores for applications."""
+"""Environment-selected session, task, knowledge, and product stores for applications."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from cayu.storage.targets import (
 if TYPE_CHECKING:
     from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+    from cayu.server import ProductOperationStore
     from cayu.sessions.base import SessionStore
     from cayu.storage.memory import KnowledgeStore
     from cayu.tasks.base import TaskStore
@@ -43,6 +44,7 @@ class ApplicationStores:
         "_knowledge_store",
         "_pool",
         "_pool_max_size",
+        "_product_store",
         "_session_store",
         "_task_admission_listener",
         "_task_store",
@@ -55,6 +57,7 @@ class ApplicationStores:
         session_store: SessionStore,
         task_store: TaskStore | None,
         knowledge_store: KnowledgeStore | None,
+        product_store: ProductOperationStore | None = None,
         pool: Any | None = None,
         pool_max_size: int | None = None,
         task_admission_listener: bool = False,
@@ -63,6 +66,7 @@ class ApplicationStores:
         self._session_store = session_store
         self._task_store = task_store
         self._knowledge_store = knowledge_store
+        self._product_store = product_store
         self._pool = pool
         self._pool_max_size = pool_max_size
         self._task_admission_listener = task_admission_listener
@@ -75,6 +79,7 @@ class ApplicationStores:
             f"backend={self._backend.value!r}, "
             f"tasks={self._task_store is not None!r}, "
             f"knowledge={self._knowledge_store is not None!r}, "
+            f"product_operations={self._product_store is not None!r}, "
             f"pool_max_size={self._pool_max_size!r})"
         )
 
@@ -93,6 +98,12 @@ class ApplicationStores:
     @property
     def knowledge_store(self) -> KnowledgeStore | None:
         return self._knowledge_store
+
+    @property
+    def product_store(self) -> ProductOperationStore | None:
+        """The maintained service's product operation store, when requested."""
+
+        return self._product_store
 
     @property
     def pool_max_size(self) -> int | None:
@@ -118,7 +129,12 @@ class ApplicationStores:
             self._closed = True
         errors: list[Exception] = []
         # The task store first: it owns the dedicated LISTEN connection.
-        for store in (self._task_store, self._knowledge_store, self._session_store):
+        for store in (
+            self._task_store,
+            self._product_store,
+            self._knowledge_store,
+            self._session_store,
+        ):
             close = getattr(store, "close", None)
             if close is None:
                 continue
@@ -149,6 +165,7 @@ def open_application_stores(
     sqlite_path: str | os.PathLike[str],
     tasks: bool = True,
     knowledge_scope: KnowledgeAccessScope | None = None,
+    product_operations: bool = False,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     pool_max_size: int | None = None,
     direct_database_url: str | None = None,
@@ -170,12 +187,16 @@ def open_application_stores(
     selects that file instead, matching the CLI's store resolution. Any other URL
     scheme raises :class:`~cayu.storage.targets.SessionStoreTargetError`.
 
-    ``tasks`` and ``knowledge_scope`` choose which optional stores exist. Nothing
-    connects during construction.
+    ``tasks`` and ``knowledge_scope`` choose which optional stores exist.
+    ``product_operations=True`` adds the maintained service's product operation
+    store (it requires the server extra); on PostgreSQL it shares the pool, so the
+    connection budget is unchanged. Nothing connects during construction.
     """
 
     if type(tasks) is not bool:
         raise TypeError("tasks must be a bool.")
+    if type(product_operations) is not bool:
+        raise TypeError("product_operations must be a bool.")
     target = application_store_target(database_url, sqlite_path=sqlite_path)
     if target.backend is SessionStoreBackend.SQLITE:
         assert target.sqlite_path is not None
@@ -183,6 +204,7 @@ def open_application_stores(
             target.sqlite_path,
             tasks=tasks,
             knowledge_scope=knowledge_scope,
+            product_operations=product_operations,
             public_authority_alias_codec=public_authority_alias_codec,
         )
     assert target.postgres_dsn is not None
@@ -206,6 +228,7 @@ def open_application_stores(
         pool_max_size=pool_max_size,
         tasks=tasks,
         knowledge_scope=knowledge_scope,
+        product_operations=product_operations,
         public_authority_alias_codec=public_authority_alias_codec,
     )
 
@@ -215,6 +238,7 @@ def _open_sqlite_stores(
     *,
     tasks: bool,
     knowledge_scope: KnowledgeAccessScope | None,
+    product_operations: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -233,11 +257,17 @@ def _open_sqlite_stores(
         if knowledge_scope is not None
         else None
     )
+    product_store = None
+    if product_operations:
+        from cayu.storage.product_operations_sqlite import SQLiteProductOperationStore
+
+        product_store = SQLiteProductOperationStore(path)
     return ApplicationStores(
         backend=SessionStoreBackend.SQLITE,
         session_store=session_store,
         task_store=task_store,
         knowledge_store=knowledge_store,
+        product_store=product_store,
     )
 
 
@@ -248,6 +278,7 @@ def _open_postgres_stores(
     pool_max_size: int,
     tasks: bool,
     knowledge_scope: KnowledgeAccessScope | None,
+    product_operations: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     try:
@@ -265,6 +296,12 @@ def _open_postgres_stores(
         raise SessionStoreTargetError(
             'PostgreSQL application stores require the postgres extra. Install "cayu[postgres]".'
         ) from exc
+
+    product_store_type: Any = None
+    if product_operations:
+        from cayu.storage.product_operations_postgres import PostgresProductOperationStore
+
+        product_store_type = PostgresProductOperationStore
 
     if current_diagnostic_store_inspection() is not None:
         # Diagnostic inspection opens read-only stores, which must own their pools.
@@ -284,6 +321,11 @@ def _open_postgres_stores(
             session_store=session_store,
             task_store=task_store,
             knowledge_store=knowledge_store,
+            product_store=(
+                product_store_type(dsn, max_size=pool_max_size)
+                if product_store_type is not None
+                else None
+            ),
         )
 
     pool = AsyncConnectionPool(
@@ -319,11 +361,17 @@ def _open_postgres_stores(
         if knowledge_scope is not None
         else None
     )
+    product_store = (
+        product_store_type(pool=pool, schema_mode=SchemaMode.VALIDATE)
+        if product_store_type is not None
+        else None
+    )
     return ApplicationStores(
         backend=SessionStoreBackend.POSTGRES,
         session_store=session_store,
         task_store=task_store,
         knowledge_store=knowledge_store,
+        product_store=product_store,
         pool=pool,
         pool_max_size=pool_max_size,
         task_admission_listener=task_store is not None,

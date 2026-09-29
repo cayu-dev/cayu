@@ -1528,10 +1528,11 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
 
     for filename in (
         "service.py",
-        "product_store.py",
         "tests/test_public_service_security.py",
     ):
         assert (project / filename).is_file()
+    # The product operation store is Cayu's, selected with the other stores.
+    assert not (project / "product_store.py").exists()
     pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
     assert f'dependencies = ["cayu[postgres,server]=={cayu_version}"]' in pyproject
     assert 'dev = ["pytest", "ruff>=0.15.15,<0.16"]' in pyproject
@@ -1540,17 +1541,12 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
 
     service_source = (project / "service.py").read_text(encoding="utf-8")
     settings_source = (project / "configuration/settings.py").read_text(encoding="utf-8")
-    product_store_source = (project / "product_store.py").read_text(encoding="utf-8")
+    storage_source = (project / "configuration/storage.py").read_text(encoding="utf-8")
     assert "create_agent_service(" in service_source
-    assert "await asyncio.to_thread" in product_store_source
-    assert "claim_execution" in product_store_source
-    assert "heartbeat_execution" in product_store_source
-    assert "release_execution" in product_store_source
-    assert "record_result_receipt" in product_store_source
-    assert "result_receipt" in product_store_source
-    assert "find_by_session_id" in product_store_source
-    assert "execution_claim_id" in product_store_source
-    assert "ProductExecutionClaimLost" in product_store_source
+    assert "product_operations=True" in service_source
+    assert "from product_store" not in service_source
+    assert "product_operations=build_product" in storage_source
+    assert "open_application_stores(" in storage_source
     assert "AuthenticatedProductAccess" in service_source
     assert "AuthenticatedAccess" in service_source
     assert "PlaceholderOperatorAccess" in service_source

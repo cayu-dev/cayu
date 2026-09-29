@@ -688,6 +688,10 @@ from cayu.storage._postgres_verified_work import (
     _require_quiescent_postgres_mutation_connection,
     _require_quiescent_postgres_mutation_pool,
 )
+from cayu.storage._product_operation_schema import (
+    POSTGRES_PRODUCT_OPERATION_DDL,
+    validate_postgres_product_operation_schema,
+)
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._task_graph_schema import POSTGRES_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
@@ -1534,6 +1538,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
     107: POSTGRES_COLLABORATION_PLANNING_DDL,
     111: POSTGRES_COLLABORATION_WAIT_DDL,
+    112: POSTGRES_PRODUCT_OPERATION_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
@@ -6824,6 +6829,8 @@ class _PostgresStoreBase:
                             await validate_postgres_participant_bindings(cur)
                         if current_state.revision >= 111:
                             await validate_postgres_wait_discovery(cur)
+                        if current_state.revision >= 112:
+                            await validate_postgres_product_operation_schema(cur)
                         if self._min_required_revision >= 36:
                             await self._validate_session_invocation_column(cur)
                         if self._min_required_revision >= 38:
@@ -7205,6 +7212,8 @@ class _PostgresStoreBase:
             await validate_postgres_participant_bindings(cur)
         if state.revision >= 111:
             await validate_postgres_wait_discovery(cur)
+        if state.revision >= 112:
+            await validate_postgres_product_operation_schema(cur)
         if state.revision >= 93:
             await validate_postgres_collaboration_schema(
                 cur,
@@ -7375,6 +7384,8 @@ class _PostgresStoreBase:
             await self._validate_producer_cleanup_receipts(cur)
         if revision.revision == 111:
             await validate_postgres_wait_discovery(cur)
+        if revision.revision == 112:
+            await validate_postgres_product_operation_schema(cur)
         if revision.revision == 102:
             await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:

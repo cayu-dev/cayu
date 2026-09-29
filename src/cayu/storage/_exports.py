@@ -226,6 +226,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "PostgresEvalStore": ("cayu.storage.evals_postgres", "PostgresEvalStore"),
     "PostgresEventWatcherStore": ("cayu.storage.postgres", "PostgresEventWatcherStore"),
     "PostgresKnowledgeStore": ("cayu.storage.postgres", "PostgresKnowledgeStore"),
+    "PostgresProductOperationStore": (
+        "cayu.storage.product_operations_postgres",
+        "PostgresProductOperationStore",
+    ),
     "PostgresSessionStore": ("cayu.storage.postgres", "PostgresSessionStore"),
     "PostgresTaskStore": ("cayu.storage.postgres", "PostgresTaskStore"),
     "SQLiteAgentWorkContextStore": (
@@ -240,6 +244,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "SQLiteEventWatcherStore": ("cayu.storage.event_watchers", "SQLiteEventWatcherStore"),
     "SQLiteKnowledgeStore": ("cayu.storage.knowledge_sqlite", "SQLiteKnowledgeStore"),
+    "SQLiteProductOperationStore": (
+        "cayu.storage.product_operations_sqlite",
+        "SQLiteProductOperationStore",
+    ),
     "SQLiteSessionStore": ("cayu.storage.sqlite", "SQLiteSessionStore"),
     "SQLiteTaskStore": ("cayu.storage.tasks_sqlite", "SQLiteTaskStore"),
     "assess_knowledge_revision_transition": (
@@ -401,6 +409,7 @@ PUBLIC_NAMES = [
     "PostgresEvalStore",
     "PostgresEventWatcherStore",
     "PostgresKnowledgeStore",
+    "PostgresProductOperationStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
     "SQLiteAgentWorkContextStore",
@@ -409,6 +418,7 @@ PUBLIC_NAMES = [
     "SQLiteEvalWriterContentionPolicy",
     "SQLiteEventWatcherStore",
     "SQLiteKnowledgeStore",
+    "SQLiteProductOperationStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
     "assess_knowledge_revision_transition",

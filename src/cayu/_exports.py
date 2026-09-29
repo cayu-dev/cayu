@@ -4034,6 +4034,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "PostgresEvalStore": ("cayu.storage.evals_postgres", "PostgresEvalStore"),
     "PostgresEventWatcherStore": ("cayu.storage.postgres", "PostgresEventWatcherStore"),
     "PostgresKnowledgeStore": ("cayu.storage.postgres", "PostgresKnowledgeStore"),
+    "PostgresProductOperationStore": (
+        "cayu.storage.product_operations_postgres",
+        "PostgresProductOperationStore",
+    ),
     "PostgresSessionStore": ("cayu.storage.postgres", "PostgresSessionStore"),
     "PostgresTaskStore": ("cayu.storage.postgres", "PostgresTaskStore"),
     "PreparedEvalJudgeCalibration": ("cayu.evals.calibration", "PreparedEvalJudgeCalibration"),
@@ -4616,6 +4620,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SQLiteMemoryInterventionExecutionStore": (
         "cayu.memory.execution",
         "SQLiteMemoryInterventionExecutionStore",
+    ),
+    "SQLiteProductOperationStore": (
+        "cayu.storage.product_operations_sqlite",
+        "SQLiteProductOperationStore",
     ),
     "SQLiteSessionStore": ("cayu.storage.sqlite", "SQLiteSessionStore"),
     "SQLiteTaskStore": ("cayu.storage.tasks_sqlite", "SQLiteTaskStore"),
@@ -8392,6 +8400,7 @@ PUBLIC_NAMES = [
     "PostgresEvalStore",
     "PostgresEventWatcherStore",
     "PostgresKnowledgeStore",
+    "PostgresProductOperationStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
     "PreparedEvalJudgeCalibration",
@@ -8756,6 +8765,7 @@ PUBLIC_NAMES = [
     "SQLiteEventWatcherStore",
     "SQLiteKnowledgeStore",
     "SQLiteMemoryInterventionExecutionStore",
+    "SQLiteProductOperationStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
     "STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA",

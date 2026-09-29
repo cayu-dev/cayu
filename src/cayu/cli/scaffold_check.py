@@ -490,7 +490,7 @@ def _check_selected_plan_source(
     drift("capabilities", expected_logging, logging, "configuration/runtime.py")
 
     service_factory = cayu.get("service_factory")
-    service_files = ("service.py", "product_store.py", "tests/test_public_service_security.py")
+    service_files = ("service.py", "tests/test_public_service_security.py")
     coding_files = (
         "configuration/coding_storage.py",
         "operations/coding.py",
@@ -504,6 +504,21 @@ def _check_selected_plan_source(
         drift("preset", "service:build_service", service_factory, "pyproject.toml:[tool.cayu]")
         for relative in service_files:
             drift("preset", "present", _path_state(root / relative), relative)
+        drift(
+            "storage",
+            "absent",
+            _path_state(root / "product_store.py"),
+            "product_store.py",
+            hint=(
+                "Service projects use Cayu's SQLiteProductOperationStore or "
+                "PostgresProductOperationStore, selected by CAYU_DATABASE_URL like the "
+                "other stores. Build it with build_stores(..., product_operations=True) "
+                "in service.py as a `cayu new --preset service --dry-run` reference "
+                "shows, copy existing rows from data/product.db (table "
+                "product_operations) into cayu_product_operations if they must be "
+                "kept, then delete the generated product_store.py."
+            ),
+        )
     else:
         drift("preset", None, service_factory, "pyproject.toml:[tool.cayu]")
     app_path = root / "app.py"

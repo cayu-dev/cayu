@@ -131,7 +131,8 @@ def test_explicit_service_extension_strict_cli(tmp_path, monkeypatch, capsys, ca
     project = tmp_path / "profile"
     monkeypatch.chdir(project)
     protected = {
-        name: (project / name).read_bytes() for name in ("app.py", "service.py", "product_store.py")
+        name: (project / name).read_bytes()
+        for name in ("app.py", "service.py", "tests/test_public_service_security.py")
     }
     _check(capsys, 0)
     config = project / "pyproject.toml"

@@ -963,7 +963,8 @@ from configuration.settings import (
     configured_operator_bearer_token,
     configured_product_auth_tokens_json,
 )
-from product_store import SQLiteProductOperationStore
+from configuration.storage import build_stores
+from knowledge.retrieval import build_knowledge_scope
 
 _BEARER_TOKEN_RE = re.compile(r"[-A-Za-z0-9._~+/]+=*", flags=re.ASCII)
 _MAX_BEARER_TOKEN_CHARS = 4096
@@ -1070,13 +1071,27 @@ def build_service(
     product_access=None,
     operator_access: OperatorAccess | None = None,
 ):
-    """Build the one service used by serving, checks, docs, and security tests."""
+    """Build the one service used by serving, checks, docs, and security tests.
+
+    Cayu's product operation store is the product authorization boundary. It
+    lives in the configured database beside the session and task stores:
+    CAYU_DATABASE_URL selects PostgreSQL, which several service processes can
+    share, and local development uses SQLite at data/cayu.db.
+    """
 
     mode = ServiceMode(mode)
-    app = build_app(
-        provider=provider,
+    stores = build_stores(
         session_store=session_store,
         task_store=task_store,
+        knowledge_scope=build_knowledge_scope(),
+        product_store=product_store,
+        product_operations=True,
+    )
+    app = build_app(
+        provider=provider,
+        session_store=stores.session_store,
+        task_store=stores.task_store,
+        knowledge_store=stores.knowledge_store,
     )
     selected_product_access = (
         product_access
@@ -1096,11 +1111,6 @@ def build_service(
             else _production_operator_access()
         )
     )
-    selected_product_store = (
-        product_store
-        if product_store is not None
-        else SQLiteProductOperationStore("data/product.db")
-    )
     return create_agent_service(
         app,
         agent_name="__AGENT_NAME__",
@@ -1108,610 +1118,8 @@ def build_service(
         project_context=project_context,
         product_access=selected_product_access,
         operator_access=selected_operator_access,
-        product_store=selected_product_store,
+        product_store=stores.product_store,
     )
-'''
-
-_PRODUCT_STORE_PY = '''"""Application-owned tenant/resource identity storage.
-
-This store, not Cayu labels, metadata, or runtime identifiers, is the product
-authorization boundary. SQLite is durable for the generated single-process
-service; replace it with an equivalently atomic shared store before scaling to
-multiple service processes. Execution claims use store-owned lease time, and
-terminal updates are conditional on the current claim so only one valid owner
-can settle an operation. Content-bound publication receipts are written before
-Cayu session completion and are required for a completed product result. The
-private session-id lookup exists only for trusted continuation hooks; product
-HTTP reads remain tenant-qualified by public id.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import json
-import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
-from pathlib import Path
-from threading import RLock
-
-from cayu.server import (
-    ProductExecutionClaimLost,
-    ProductIdempotencyConflict,
-    ProductOperation,
-    ProductOperationExecutionClaim,
-    ProductOperationReservation,
-    ProductOperationSettlementConflict,
-    ProductRecoveryStatus,
-    ProductResultReceipt,
-    ProductResultReceiptConflict,
-    ServiceIdentityStoreKind,
-)
-
-
-class SQLiteProductOperationStore:
-    category = ServiceIdentityStoreKind.DURABLE
-
-    def __init__(self, path: str) -> None:
-        self.path = Path(path)
-        self._memory_connection: sqlite3.Connection | None = None
-        self._memory_lock = RLock()
-        self.category = (
-            ServiceIdentityStoreKind.DEVELOPMENT
-            if str(self.path) == ":memory:"
-            else ServiceIdentityStoreKind.DURABLE
-        )
-        if self.category is ServiceIdentityStoreKind.DEVELOPMENT:
-            self._memory_connection = sqlite3.connect(
-                ":memory:", timeout=30, check_same_thread=False
-            )
-            self._memory_connection.row_factory = sqlite3.Row
-        else:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS product_operations (
-                    work_id TEXT PRIMARY KEY,
-                    public_id TEXT NOT NULL UNIQUE,
-                    tenant_id TEXT NOT NULL,
-                    subject_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    request_fingerprint TEXT NOT NULL,
-                    session_id TEXT NOT NULL UNIQUE,
-                    task_id TEXT NOT NULL UNIQUE,
-                    request_text TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    result TEXT,
-                    result_receipt TEXT,
-                    recovery_status TEXT,
-                    execution_claim_id TEXT,
-                    execution_claim_expires_at INTEGER
-                )"""
-            )
-            columns = {
-                row[1]: (str(row[2]).upper(), int(row[3]))
-                for row in connection.execute("PRAGMA table_info(product_operations)")
-            }
-            if columns.get("subject_id") != ("TEXT", 1):
-                raise RuntimeError(
-                    "The product operation store predates required invocation "
-                    "provenance. Recreate the prerelease product database."
-                )
-
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        if self._memory_connection is not None:
-            with self._memory_lock, self._memory_connection as connection:
-                yield connection
-            return
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
-
-    async def reserve(
-        self,
-        *,
-        tenant_id: str,
-        subject_id: str,
-        idempotency_key: str,
-        request_fingerprint: str,
-        public_id: str,
-        work_id: str,
-        session_id: str,
-        task_id: str,
-        request_text: str,
-    ) -> ProductOperationReservation:
-        return await asyncio.to_thread(
-            self._reserve_sync,
-            tenant_id=tenant_id,
-            subject_id=subject_id,
-            idempotency_key=idempotency_key,
-            request_fingerprint=request_fingerprint,
-            public_id=public_id,
-            work_id=work_id,
-            session_id=session_id,
-            task_id=task_id,
-            request_text=request_text,
-        )
-
-    def _reserve_sync(
-        self,
-        *,
-        tenant_id: str,
-        subject_id: str,
-        idempotency_key: str,
-        request_fingerprint: str,
-        public_id: str,
-        work_id: str,
-        session_id: str,
-        task_id: str,
-        request_text: str,
-    ) -> ProductOperationReservation:
-        requested = ProductOperation(
-            tenant_id=tenant_id,
-            subject_id=subject_id,
-            public_id=public_id,
-            work_id=work_id,
-            idempotency_key=idempotency_key,
-            request_fingerprint=request_fingerprint,
-            session_id=session_id,
-            task_id=task_id,
-            request_text=request_text,
-            status="pending",
-            result=None,
-        )
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if row is not None:
-                operation = self._operation(row)
-                if (
-                    operation.tenant_id != tenant_id
-                    or operation.request_fingerprint != request_fingerprint
-                ):
-                    raise ProductIdempotencyConflict
-                return ProductOperationReservation(operation=operation, created=False)
-            connection.execute(
-                """INSERT INTO product_operations (
-                    work_id, public_id, tenant_id, subject_id, idempotency_key,
-                    request_fingerprint, session_id, task_id, request_text, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
-                (
-                    requested.work_id,
-                    requested.public_id,
-                    requested.tenant_id,
-                    requested.subject_id,
-                    requested.idempotency_key,
-                    requested.request_fingerprint,
-                    requested.session_id,
-                    requested.task_id,
-                    requested.request_text,
-                ),
-            )
-        return ProductOperationReservation(operation=requested, created=True)
-
-    async def find(self, *, tenant_id: str, public_id: str) -> ProductOperation | None:
-        return await asyncio.to_thread(
-            self._find_sync,
-            tenant_id=tenant_id,
-            public_id=public_id,
-        )
-
-    def _find_sync(self, *, tenant_id: str, public_id: str) -> ProductOperation | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """SELECT * FROM product_operations
-                   WHERE tenant_id = ? AND public_id = ?""",
-                (tenant_id, public_id),
-            ).fetchone()
-        return None if row is None else self._operation(row)
-
-    async def find_by_session_id(self, *, session_id: str) -> ProductOperation | None:
-        return await asyncio.to_thread(
-            self._find_by_session_id_sync,
-            session_id=session_id,
-        )
-
-    def _find_by_session_id_sync(self, *, session_id: str) -> ProductOperation | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        return None if row is None else self._operation(row)
-
-    async def claim_execution(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        lease_seconds: int,
-    ) -> ProductOperationExecutionClaim | None:
-        return await asyncio.to_thread(
-            self._claim_execution_sync,
-            work_id=work_id,
-            claim_id=claim_id,
-            lease_seconds=lease_seconds,
-        )
-
-    def _claim_execution_sync(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        lease_seconds: int,
-    ) -> ProductOperationExecutionClaim | None:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-            if row is None:
-                return None
-            operation = self._operation(row)
-            if operation.status != "pending":
-                return ProductOperationExecutionClaim(
-                    operation=operation, acquired=False
-                )
-            changed = connection.execute(
-                """UPDATE product_operations
-                   SET execution_claim_id = ?,
-                       execution_claim_expires_at = MAX(
-                           COALESCE(execution_claim_expires_at, 0),
-                           CAST(strftime('%s', 'now') AS INTEGER) + ?
-                       )
-                   WHERE work_id = ?
-                     AND status = 'pending'
-                     AND (
-                         execution_claim_id = ?
-                         OR execution_claim_id IS NULL
-                         OR execution_claim_expires_at IS NULL
-                         OR execution_claim_expires_at <=
-                             CAST(strftime('%s', 'now') AS INTEGER)
-                     )""",
-                (claim_id, lease_seconds, work_id, claim_id),
-            ).rowcount
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Product work disappeared during execution claim.")
-        return ProductOperationExecutionClaim(
-            operation=self._operation(row),
-            acquired=changed == 1,
-        )
-
-    async def heartbeat_execution(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        lease_seconds: int,
-    ) -> bool:
-        return await asyncio.to_thread(
-            self._heartbeat_execution_sync,
-            work_id=work_id,
-            claim_id=claim_id,
-            lease_seconds=lease_seconds,
-        )
-
-    def _heartbeat_execution_sync(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        lease_seconds: int,
-    ) -> bool:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            changed = connection.execute(
-                """UPDATE product_operations
-                   SET execution_claim_expires_at = MAX(
-                       COALESCE(execution_claim_expires_at, 0),
-                       CAST(strftime('%s', 'now') AS INTEGER) + ?
-                   )
-                   WHERE work_id = ?
-                     AND status = 'pending'
-                     AND execution_claim_id = ?""",
-                (lease_seconds, work_id, claim_id),
-            ).rowcount
-            if changed == 1:
-                return True
-            row = connection.execute(
-                "SELECT status, execution_claim_id FROM product_operations "
-                "WHERE work_id = ?",
-                (work_id,),
-            ).fetchone()
-        return (
-            row is not None
-            and row["status"] != "pending"
-            and row["execution_claim_id"] == claim_id
-        )
-
-    async def release_execution(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-    ) -> bool:
-        return await asyncio.to_thread(
-            self._release_execution_sync,
-            work_id=work_id,
-            claim_id=claim_id,
-        )
-
-    def _release_execution_sync(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-    ) -> bool:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT status, execution_claim_id FROM product_operations "
-                "WHERE work_id = ?",
-                (work_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(
-                    "Product work disappeared during execution-claim release."
-                )
-            if row["status"] != "pending" or row["execution_claim_id"] != claim_id:
-                return row["status"] == "pending" and row["execution_claim_id"] is None
-            changed = connection.execute(
-                """UPDATE product_operations
-                   SET execution_claim_id = NULL,
-                       execution_claim_expires_at = NULL
-                   WHERE work_id = ?
-                     AND status = 'pending'
-                     AND execution_claim_id = ?""",
-                (work_id, claim_id),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError(
-                    "Product execution claim changed during atomic release."
-                )
-            return True
-
-    async def record_result_receipt(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        receipt: ProductResultReceipt,
-    ) -> ProductResultReceipt:
-        return await asyncio.to_thread(
-            self._record_result_receipt_sync,
-            work_id=work_id,
-            claim_id=claim_id,
-            receipt=receipt,
-        )
-
-    def _record_result_receipt_sync(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        receipt: ProductResultReceipt,
-    ) -> ProductResultReceipt:
-        receipt = ProductResultReceipt.model_validate(receipt.model_dump(mode="python"))
-        encoded = json.dumps(
-            receipt.model_dump(mode="json"),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(
-                    "Product work disappeared during result publication."
-                )
-            operation = self._operation(row)
-            if operation.status != "pending" or row["execution_claim_id"] != claim_id:
-                if (
-                    operation.status != "pending"
-                    and row["execution_claim_id"] == claim_id
-                    and operation.result_receipt == receipt
-                ):
-                    return receipt
-                raise ProductExecutionClaimLost(
-                    "Product execution ownership was lost before result publication."
-                )
-            if (
-                receipt.work_id != operation.work_id
-                or receipt.public_id != operation.public_id
-                or receipt.request_fingerprint != operation.request_fingerprint
-                or receipt.session_id != operation.session_id
-                or receipt.task_id != operation.task_id
-            ):
-                raise ProductResultReceiptConflict(
-                    "Result receipt does not belong to this product operation."
-                )
-            if operation.result_receipt is not None:
-                if operation.result_receipt == receipt:
-                    return operation.result_receipt
-                if receipt.source_event_sequence <= (
-                    operation.result_receipt.source_event_sequence
-                ):
-                    raise ProductResultReceiptConflict(
-                        "Product work already has newer result evidence."
-                    )
-            changed = connection.execute(
-                """UPDATE product_operations
-                   SET result_receipt = ?, recovery_status = NULL
-                   WHERE work_id = ?
-                     AND status = 'pending'
-                     AND result_receipt IS ?
-                     AND execution_claim_id = ?""",
-                (encoded, work_id, row["result_receipt"], claim_id),
-            ).rowcount
-            if changed != 1:
-                raise ProductExecutionClaimLost(
-                    "Product execution ownership was lost before result publication."
-                )
-        return receipt
-
-    async def record_recovery_status(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        recovery_status: ProductRecoveryStatus,
-    ) -> ProductOperation:
-        return await asyncio.to_thread(
-            self._record_recovery_status_sync,
-            work_id=work_id,
-            claim_id=claim_id,
-            recovery_status=recovery_status,
-        )
-
-    def _record_recovery_status_sync(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        recovery_status: ProductRecoveryStatus,
-    ) -> ProductOperation:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(
-                    "Product work disappeared during recovery reporting."
-                )
-            operation = self._operation(row)
-            if operation.status != "pending" or row["execution_claim_id"] != claim_id:
-                raise ProductExecutionClaimLost(
-                    "Product execution ownership was lost before recovery reporting."
-                )
-            changed = connection.execute(
-                """UPDATE product_operations
-                   SET recovery_status = ?
-                   WHERE work_id = ?
-                     AND status = 'pending'
-                     AND execution_claim_id = ?""",
-                (recovery_status, work_id, claim_id),
-            ).rowcount
-            if changed != 1:
-                raise ProductExecutionClaimLost(
-                    "Product execution ownership was lost before recovery reporting."
-                )
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-            if row is None:
-                raise RuntimeError(
-                    "Product work disappeared during recovery reporting."
-                )
-            return self._operation(row)
-
-    async def finish(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        status: str,
-        result: str | None,
-    ) -> ProductOperation:
-        return await asyncio.to_thread(
-            self._finish_sync,
-            work_id=work_id,
-            claim_id=claim_id,
-            status=status,
-            result=result,
-        )
-
-    def _finish_sync(
-        self,
-        *,
-        work_id: str,
-        claim_id: str,
-        status: str,
-        result: str | None,
-    ) -> ProductOperation:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("Product work disappeared during completion.")
-            operation = self._operation(row)
-            receipt = operation.result_receipt
-            if status == "completed" and (
-                receipt is None
-                or receipt.publication_status != "completed"
-                or receipt.result != result
-            ):
-                raise ProductOperationSettlementConflict(
-                    "Completed product work does not match its result receipt."
-                )
-            if status == "failed" and result is not None:
-                raise ProductOperationSettlementConflict(
-                    "Failed product work cannot persist a public result."
-                )
-            if operation.status != "pending":
-                if (
-                    row["execution_claim_id"] == claim_id
-                    and operation.status == status
-                    and operation.result == result
-                ):
-                    return operation
-                if row["execution_claim_id"] != claim_id:
-                    raise ProductExecutionClaimLost(
-                        "Product execution ownership was lost before completion."
-                    )
-                raise ProductOperationSettlementConflict(
-                    "Product work already has a different terminal result."
-                )
-            if row["execution_claim_id"] != claim_id:
-                raise ProductExecutionClaimLost(
-                    "Product execution ownership was lost before completion."
-                )
-            changed = connection.execute(
-                """UPDATE product_operations
-                   SET status = ?, result = ?, recovery_status = NULL,
-                       execution_claim_expires_at = NULL
-                   WHERE work_id = ?
-                     AND status = 'pending'
-                     AND execution_claim_id = ?""",
-                (status, result, work_id, claim_id),
-            ).rowcount
-            if changed != 1:
-                raise ProductExecutionClaimLost(
-                    "Product execution ownership was lost before completion."
-                )
-            row = connection.execute(
-                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Product work disappeared during completion.")
-        return self._operation(row)
-
-    @staticmethod
-    def _operation(row: sqlite3.Row) -> ProductOperation:
-        fields = dict(row)
-        fields.pop("execution_claim_id", None)
-        fields.pop("execution_claim_expires_at", None)
-        raw_receipt = fields.get("result_receipt")
-        fields["result_receipt"] = (
-            None if raw_receipt is None else json.loads(raw_receipt)
-        )
-        return ProductOperation(**fields)
 '''
 
 _SERVICE_SECURITY_TEST_PY = """from __future__ import annotations
@@ -1719,6 +1127,8 @@ _SERVICE_SECURITY_TEST_PY = """from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.metadata import version
 
@@ -1748,6 +1158,7 @@ from cayu import (
     SessionIdentity,
     SessionInvocationBinding,
     SessionStatus,
+    SQLiteProductOperationStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
     TaskCreate,
@@ -1767,18 +1178,25 @@ from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,
     BasicAuth,
-    ProductExecutionClaimLost,
     ProductOperation,
-    ProductOperationSettlementConflict,
     ProductPrincipal,
-    ProductResultReceipt,
-    ProductResultReceiptConflict,
     ServiceMode,
     create_agent_service,
 )
 
-from product_store import SQLiteProductOperationStore
 from service import build_service
+
+
+@contextmanager
+def product_database(store):
+    # Inspect or fault the runtime product store's SQLite table directly.
+    connection = sqlite3.connect(store.path)
+    connection.row_factory = sqlite3.Row
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def product_request_fingerprint(request_text: str, *, agent_name: str) -> str:
@@ -1954,9 +1372,11 @@ def test_invalid_request_is_rejected_without_a_durable_reservation(tmp_path) -> 
     }
     assert oversized.headers["cache-control"] == "private, no-store"
     assert provider.requests == []
-    with store._connect() as connection:
+    with product_database(store) as connection:
         assert (
-            connection.execute("SELECT COUNT(*) FROM product_operations").fetchone()[0]
+            connection.execute(
+                "SELECT COUNT(*) FROM cayu_product_operations"
+            ).fetchone()[0]
             == 0
         )
 
@@ -1974,9 +1394,11 @@ def test_invalid_request_is_rejected_without_a_durable_reservation(tmp_path) -> 
                 request_text="   ",
             )
         )
-    with store._connect() as connection:
+    with product_database(store) as connection:
         assert (
-            connection.execute("SELECT COUNT(*) FROM product_operations").fetchone()[0]
+            connection.execute(
+                "SELECT COUNT(*) FROM cayu_product_operations"
+            ).fetchone()[0]
             == 0
         )
 
@@ -2129,8 +1551,10 @@ def test_cross_tenant_enumeration_and_mutation_are_denied(tmp_path) -> None:
         headers={"Authorization": "Bearer customer-a", "Idempotency-Key": "shared"},
         json={"request": "work"},
     ).json()
-    with store._connect() as connection:
-        private = next(iter(connection.execute("SELECT * FROM product_operations")))
+    with product_database(store) as connection:
+        private = next(
+            iter(connection.execute("SELECT * FROM cayu_product_operations"))
+        )
     assert (
         client.get(
             f"/api/operations/{created['id']}",
@@ -2164,8 +1588,10 @@ def test_idempotency_and_public_response_redaction(tmp_path) -> None:
     assert second.status_code == 200
     assert first.json() == second.json()
     assert len(provider.requests) == 1
-    with store._connect() as connection:
-        private = next(iter(connection.execute("SELECT * FROM product_operations")))
+    with product_database(store) as connection:
+        private = next(
+            iter(connection.execute("SELECT * FROM cayu_product_operations"))
+        )
     receipt = json.loads(private["result_receipt"])
     assert receipt["publication_status"] == "completed"
     assert receipt["result"] == first.json()["result"]
@@ -2209,8 +1635,10 @@ def test_control_plane_separation_and_background_ownership_reload(tmp_path) -> N
     assert completed.status == "completed"
     assert completed.result == "allow-listed answer"
     assert len(provider.requests) == 1
-    with reloaded_store._connect() as connection:
-        private = next(iter(connection.execute("SELECT * FROM product_operations")))
+    with product_database(reloaded_store) as connection:
+        private = next(
+            iter(connection.execute("SELECT * FROM cayu_product_operations"))
+        )
     assert private["tenant_id"] == "tenant-a"
     assert private["public_id"] == "op_background"
 
@@ -2341,15 +1769,15 @@ def test_replacement_worker_settles_terminal_receipt_without_redispatch(
 
         with pytest.raises(RuntimeError, match="product settlement unavailable"):
             await first_service.execute_work(reservation.operation.work_id)
-        with first_store._connect() as connection:
+        with product_database(first_store) as connection:
             row = connection.execute(
-                "SELECT status, result_receipt FROM product_operations WHERE work_id = ?",
+                "SELECT status, result_receipt FROM cayu_product_operations WHERE work_id = ?",
                 (reservation.operation.work_id,),
             ).fetchone()
             assert row["status"] == "pending"
             assert json.loads(row["result_receipt"])["result"] == "allow-listed answer"
             connection.execute(
-                "UPDATE product_operations SET execution_claim_expires_at = 0 WHERE work_id = ?",
+                "UPDATE cayu_product_operations SET execution_claim_expires_at = 0 WHERE work_id = ?",
                 (reservation.operation.work_id,),
             )
 
@@ -2441,9 +1869,9 @@ def test_durable_receipt_and_settlement_acknowledgements_are_reconstructed(
         assert store.receipt_calls == 2
         assert store.finish_calls == 2
         assert len(provider.requests) == 1
-        with store._connect() as connection:
+        with product_database(store) as connection:
             row = connection.execute(
-                "SELECT status, result, result_receipt FROM product_operations WHERE work_id = ?",
+                "SELECT status, result, result_receipt FROM cayu_product_operations WHERE work_id = ?",
                 (reservation.operation.work_id,),
             ).fetchone()
         assert row["status"] == "completed"
@@ -2751,9 +2179,11 @@ def test_workload_secret_is_rejected_before_generated_store_write(tmp_path) -> N
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid product request."}
     assert provider.requests == []
-    with store._connect() as connection:
+    with product_database(store) as connection:
         assert (
-            connection.execute("SELECT COUNT(*) FROM product_operations").fetchone()[0]
+            connection.execute(
+                "SELECT COUNT(*) FROM cayu_product_operations"
+            ).fetchone()[0]
             == 0
         )
 
@@ -2798,9 +2228,9 @@ def test_split_model_secret_is_redacted_before_generated_store_write(tmp_path) -
 
     assert response.status_code == 201
     assert response.json()["result"] == "[REDACTED_SECRET]"
-    with store._connect() as connection:
+    with product_database(store) as connection:
         row = connection.execute(
-            "SELECT result, result_receipt FROM product_operations"
+            "SELECT result, result_receipt FROM cayu_product_operations"
         ).fetchone()
     result = row["result"]
     receipt = row["result_receipt"]
@@ -2808,297 +2238,6 @@ def test_split_model_secret_is_redacted_before_generated_store_write(tmp_path) -
     assert secret not in result
     assert secret not in receipt
     assert json.loads(receipt)["result"] == "[REDACTED_SECRET]"
-
-
-def test_product_execution_claim_and_terminal_settlement_are_authoritative(
-    tmp_path,
-) -> None:
-    store = SQLiteProductOperationStore(str(tmp_path / "claims.db"))
-
-    async def scenario() -> None:
-        reservation = await store.reserve(
-            tenant_id="tenant-a",
-            subject_id="test-subject",
-            idempotency_key="claim",
-            request_fingerprint="claim-fingerprint",
-            public_id="op_claim",
-            work_id="work_claim",
-            session_id="session_claim",
-            task_id="task_claim",
-            request_text="work",
-        )
-        first = await store.claim_execution(
-            work_id="work_claim", claim_id="claim-one", lease_seconds=3600
-        )
-        assert first is not None and first.acquired
-        with store._connect() as connection:
-            initial_expiry = connection.execute(
-                "SELECT execution_claim_expires_at FROM product_operations "
-                "WHERE work_id = 'work_claim'"
-            ).fetchone()[0]
-        assert await store.heartbeat_execution(
-            work_id="work_claim", claim_id="claim-one", lease_seconds=120
-        )
-        with store._connect() as connection:
-            heartbeat_expiry = connection.execute(
-                "SELECT execution_claim_expires_at FROM product_operations "
-                "WHERE work_id = 'work_claim'"
-            ).fetchone()[0]
-        assert heartbeat_expiry >= initial_expiry
-        reconstructed = await store.claim_execution(
-            work_id="work_claim", claim_id="claim-one", lease_seconds=60
-        )
-        assert reconstructed is not None and reconstructed.acquired
-        with store._connect() as connection:
-            reconstructed_expiry = connection.execute(
-                "SELECT execution_claim_expires_at FROM product_operations "
-                "WHERE work_id = 'work_claim'"
-            ).fetchone()[0]
-        assert reconstructed_expiry >= heartbeat_expiry
-        duplicate = await store.claim_execution(
-            work_id="work_claim", claim_id="claim-two", lease_seconds=120
-        )
-        assert duplicate is not None and not duplicate.acquired
-        assert not await store.heartbeat_execution(
-            work_id="work_claim", claim_id="claim-two", lease_seconds=120
-        )
-        with pytest.raises(ProductExecutionClaimLost):
-            await store.finish(
-                work_id="work_claim",
-                claim_id="claim-two",
-                status="failed",
-                result=None,
-            )
-
-        receipt = ProductResultReceipt.create(
-            work_id=reservation.operation.work_id,
-            public_id=reservation.operation.public_id,
-            request_fingerprint=reservation.operation.request_fingerprint,
-            session_id=reservation.operation.session_id,
-            task_id=reservation.operation.task_id,
-            source_event_id="model-completed-one",
-            source_event_sequence=10,
-            model_step_id="model-step-one",
-            model_attempt_id="model-attempt-one",
-            interaction_id="interaction-one",
-            publication_status="completed",
-            result="answer",
-        )
-        assert (
-            await store.record_result_receipt(
-                work_id="work_claim",
-                claim_id="claim-one",
-                receipt=receipt,
-            )
-            == receipt
-        )
-        assert (
-            await store.record_result_receipt(
-                work_id="work_claim",
-                claim_id="claim-one",
-                receipt=receipt,
-            )
-            == receipt
-        )
-        conflicting_receipt = ProductResultReceipt.create(
-            work_id=reservation.operation.work_id,
-            public_id=reservation.operation.public_id,
-            request_fingerprint=reservation.operation.request_fingerprint,
-            session_id=reservation.operation.session_id,
-            task_id=reservation.operation.task_id,
-            source_event_id="model-completed-conflict",
-            source_event_sequence=10,
-            model_step_id="model-step-one",
-            model_attempt_id="model-attempt-conflict",
-            interaction_id="interaction-one",
-            publication_status="completed",
-            result="different answer",
-        )
-        with pytest.raises(ProductResultReceiptConflict):
-            await store.record_result_receipt(
-                work_id="work_claim",
-                claim_id="claim-one",
-                receipt=conflicting_receipt,
-            )
-        foreign_receipt = ProductResultReceipt.create(
-            work_id="other-work",
-            public_id=reservation.operation.public_id,
-            request_fingerprint=reservation.operation.request_fingerprint,
-            session_id=reservation.operation.session_id,
-            task_id=reservation.operation.task_id,
-            source_event_id="model-completed-foreign",
-            source_event_sequence=20,
-            model_step_id="model-step-foreign",
-            model_attempt_id="model-attempt-foreign",
-            interaction_id="interaction-foreign",
-            publication_status="completed",
-            result="foreign answer",
-        )
-        with pytest.raises(ProductResultReceiptConflict):
-            await store.record_result_receipt(
-                work_id="work_claim",
-                claim_id="claim-one",
-                receipt=foreign_receipt,
-            )
-        with store._connect() as connection:
-            connection.execute(
-                "UPDATE product_operations SET execution_claim_expires_at = 0 "
-                "WHERE work_id = 'work_claim'"
-            )
-        replacement = await store.claim_execution(
-            work_id="work_claim", claim_id="claim-two", lease_seconds=120
-        )
-        assert replacement is not None and replacement.acquired
-        with pytest.raises(ProductExecutionClaimLost):
-            await store.record_result_receipt(
-                work_id="work_claim",
-                claim_id="claim-one",
-                receipt=receipt,
-            )
-
-        completed = await store.finish(
-            work_id="work_claim",
-            claim_id="claim-two",
-            status="completed",
-            result="answer",
-        )
-        assert completed.status == "completed"
-        assert await store.heartbeat_execution(
-            work_id="work_claim", claim_id="claim-two", lease_seconds=120
-        )
-        assert not await store.heartbeat_execution(
-            work_id="work_claim", claim_id="claim-one", lease_seconds=120
-        )
-        assert (
-            await store.finish(
-                work_id="work_claim",
-                claim_id="claim-two",
-                status="completed",
-                result="answer",
-            )
-            == completed
-        )
-        with pytest.raises(ProductExecutionClaimLost):
-            await store.finish(
-                work_id="work_claim",
-                claim_id="claim-one",
-                status="completed",
-                result="answer",
-            )
-        with pytest.raises(ProductOperationSettlementConflict):
-            await store.finish(
-                work_id="work_claim",
-                claim_id="claim-two",
-                status="failed",
-                result=None,
-            )
-
-        await store.reserve(
-            tenant_id="tenant-a",
-            subject_id="test-subject",
-            idempotency_key="expired-claim",
-            request_fingerprint="expired-fingerprint",
-            public_id="op_expired",
-            work_id="work_expired",
-            session_id="session_expired",
-            task_id="task_expired",
-            request_text="work",
-        )
-        abandoned = await store.claim_execution(
-            work_id="work_expired", claim_id="abandoned", lease_seconds=120
-        )
-        assert abandoned is not None and abandoned.acquired
-        with store._connect() as connection:
-            connection.execute(
-                "UPDATE product_operations SET execution_claim_expires_at = 0 "
-                "WHERE work_id = 'work_expired'"
-            )
-        recovered = await store.claim_execution(
-            work_id="work_expired", claim_id="recovered", lease_seconds=120
-        )
-        assert recovered is not None and recovered.acquired
-        assert not await store.release_execution(
-            work_id="work_expired", claim_id="abandoned"
-        )
-        assert await store.heartbeat_execution(
-            work_id="work_expired", claim_id="recovered", lease_seconds=120
-        )
-        assert await store.release_execution(
-            work_id="work_expired", claim_id="recovered"
-        )
-        assert await store.release_execution(
-            work_id="work_expired", claim_id="recovered"
-        )
-        takeover = await store.claim_execution(
-            work_id="work_expired", claim_id="takeover", lease_seconds=120
-        )
-        assert takeover is not None and takeover.acquired
-        assert not await store.release_execution(
-            work_id="work_expired", claim_id="recovered"
-        )
-        assert await store.heartbeat_execution(
-            work_id="work_expired", claim_id="takeover", lease_seconds=120
-        )
-
-    asyncio.run(scenario())
-
-
-def test_in_memory_product_store_keeps_one_shared_database() -> None:
-    store = SQLiteProductOperationStore(":memory:")
-
-    async def scenario() -> None:
-        reservation = await store.reserve(
-            tenant_id="tenant-a",
-            subject_id="test-subject",
-            idempotency_key="memory-operation",
-            request_fingerprint="memory-fingerprint",
-            public_id="op_memory",
-            work_id="work_memory",
-            session_id="session_memory",
-            task_id="task_memory",
-            request_text="work",
-        )
-        assert reservation.created
-        assert (
-            await store.find(tenant_id="tenant-a", public_id="op_memory")
-            == reservation.operation
-        )
-        claim = await store.claim_execution(
-            work_id="work_memory",
-            claim_id="memory-claim",
-            lease_seconds=120,
-        )
-        assert claim is not None and claim.acquired
-        await store.record_result_receipt(
-            work_id="work_memory",
-            claim_id="memory-claim",
-            receipt=ProductResultReceipt.create(
-                work_id=reservation.operation.work_id,
-                public_id=reservation.operation.public_id,
-                request_fingerprint=reservation.operation.request_fingerprint,
-                session_id=reservation.operation.session_id,
-                task_id=reservation.operation.task_id,
-                source_event_id="model-completed-memory",
-                source_event_sequence=10,
-                model_step_id="model-step-memory",
-                model_attempt_id="model-attempt-memory",
-                interaction_id="interaction-memory",
-                publication_status="completed",
-                result="answer",
-            ),
-        )
-        completed = await store.finish(
-            work_id="work_memory",
-            claim_id="memory-claim",
-            status="completed",
-            result="answer",
-        )
-        assert completed.status == "completed"
-        assert (
-            await store.find(tenant_id="tenant-a", public_id="op_memory") == completed
-        )
-
-    asyncio.run(scenario())
 
 
 def test_provider_error_and_prompt_sentinels_are_redacted(tmp_path) -> None:
@@ -3127,14 +2266,19 @@ _SERVICE_GUIDANCE = """
 
 This project uses Cayu's maintained public-service factory. Product customers
 authenticate at `/api/operations`; `/cayu/` is a separate operator-only control
-plane. Every product read is tenant-qualified through the application-owned
-mapping in `product_store.py`. Never authorize from request tenant fields, Cayu
+plane. Every product read is tenant-qualified through the product operation
+store, which `build_service()` opens with the other stores in
+`configuration/storage.py`. Never authorize from request tenant fields, Cayu
 IDs, labels, metadata, model output, or tool input, and never return raw runtime
 records to customers.
 
-The product store's execution claim, heartbeat, and terminal write are one
-durability contract. Preserve their atomic, same-claim replay behavior when
-replacing SQLite. The worker must match the reservation's canonical agent/request
+The product operation store is Cayu's `SQLiteProductOperationStore` locally and
+`PostgresProductOperationStore` when `CAYU_DATABASE_URL` selects PostgreSQL. Its
+records live in the `cayu_product_operations` table of the configured database,
+so `cayu storage migrate` creates them, and several service processes can share
+one PostgreSQL database. Its execution claim, heartbeat, and terminal write are
+one durability contract; a replacement store must keep their atomic, same-claim
+replay behavior. The worker must match the reservation's canonical agent/request
 fingerprint before it creates Cayu work. Recheck the claim immediately before
 provider execution, and retain the settling claim identity on terminal rows so
 late heartbeats and acknowledgement reconstruction cannot confuse a successful
@@ -3579,7 +2723,6 @@ def project_files(
                 files["configuration/settings.py"].rstrip() + _SERVICE_SETTINGS_APPEND
             ),
             "service.py": render(_SERVICE_PY),
-            "product_store.py": _PRODUCT_STORE_PY,
             "tests/test_public_service_security.py": _SERVICE_SECURITY_TEST_PY,
             "README.md": files["README.md"] + _SERVICE_GUIDANCE,
             "AGENTS.md": files["AGENTS.md"] + _SERVICE_AGENTS_GUIDANCE,

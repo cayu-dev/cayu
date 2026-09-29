@@ -50,6 +50,7 @@ def _sqlite_store_constructors(path: Path):
         SQLiteEvalStore,
         SQLiteEventWatcherStore,
         SQLiteKnowledgeStore,
+        SQLiteProductOperationStore,
         SQLiteSessionStore,
         SQLiteTaskStore,
     )
@@ -70,6 +71,7 @@ def _sqlite_store_constructors(path: Path):
             lambda: SQLiteMemoryInterventionExecutionStore(path)
         ),
         "SQLiteAgentSnapshotStore": lambda: SQLiteAgentSnapshotStore(path),
+        "SQLiteProductOperationStore": lambda: SQLiteProductOperationStore(path),
     }
 
 
@@ -166,8 +168,49 @@ def test_optional_application_stores_follow_the_selected_capabilities(tmp_path: 
         ) as stores:
             assert stores.task_store is None
             assert stores.knowledge_store is None
+            assert stores.product_store is None
 
     asyncio.run(scenario())
+
+
+def test_product_operation_store_is_opt_in_and_shares_the_sqlite_database(
+    tmp_path: Path,
+) -> None:
+    from cayu import SQLiteProductOperationStore
+
+    database = tmp_path / "data" / "cayu.db"
+
+    async def scenario() -> None:
+        async with open_application_stores(
+            None, sqlite_path=database, product_operations=True
+        ) as stores:
+            assert isinstance(stores.product_store, SQLiteProductOperationStore)
+            assert stores.product_store.path == database
+            assert stores.connection_budget == 0
+            reservation = await stores.product_store.reserve(
+                tenant_id="tenant-a",
+                subject_id="alice",
+                idempotency_key="local",
+                request_fingerprint="fingerprint",
+                public_id="op_local",
+                work_id="work_local",
+                session_id="session_local",
+                task_id="task_local",
+                request_text="work",
+            )
+            assert reservation.created
+        async with open_application_stores(
+            None, sqlite_path=database, product_operations=True
+        ) as reopened:
+            assert reopened.product_store is not None
+            assert (
+                await reopened.product_store.find(tenant_id="tenant-a", public_id="op_local")
+                == reservation.operation
+            )
+
+    asyncio.run(scenario())
+    with pytest.raises(TypeError, match="product_operations"):
+        open_application_stores(None, sqlite_path=database, product_operations="yes")
 
 
 def test_application_sqlite_path_must_be_absolute() -> None:
@@ -285,7 +328,30 @@ def test_postgres_stores_share_one_lazy_pool_without_connecting(
         assert store._owns_pool is False
         assert store._schema_mode is SchemaMode.VALIDATE
     assert stores.task_store._task_admission_listener_conninfo == configured_database_url()
+    assert stores.product_store is None
     assert not (tmp_path / "cayu.db").exists()
+    asyncio.run(stores.close())
+
+
+def test_postgres_product_store_shares_the_pool_without_extra_connections(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cayu import PostgresProductOperationStore
+    from cayu.storage.migrations import SchemaMode
+
+    monkeypatch.setenv("CAYU_DATABASE_POOL_MAX", "3")
+    stores = open_application_stores(
+        "postgresql://app@127.0.0.1:1/unreachable",
+        sqlite_path=tmp_path / "cayu.db",
+        product_operations=True,
+    )
+    assert isinstance(stores.product_store, PostgresProductOperationStore)
+    assert stores.product_store._pool is stores.session_store._pool
+    assert stores.product_store._owns_pool is False
+    assert stores.product_store._schema_mode is SchemaMode.VALIDATE
+    assert stores.connection_budget == 4
+    assert "product_operations=True" in repr(stores)
     asyncio.run(stores.close())
 
 
@@ -301,6 +367,17 @@ def test_diagnostic_inspection_builds_read_only_store_owned_pools(tmp_path: Path
     for store in (stores.session_store, stores.task_store, stores.knowledge_store):
         assert store._owns_pool is True
         assert store._read_only is True
+    asyncio.run(stores.close())
+
+    with diagnostic_store_inspection():
+        stores = open_application_stores(
+            "postgresql://app@127.0.0.1:1/unreachable",
+            sqlite_path=tmp_path / "cayu.db",
+            product_operations=True,
+        )
+    assert stores.product_store is not None
+    assert stores.product_store._owns_pool is True
+    assert stores.product_store._read_only is True
     asyncio.run(stores.close())
 
 
@@ -339,6 +416,39 @@ async def _connections_by_application(dsn: str, *names: str) -> dict[str, int]:
     counts = dict.fromkeys(names, 0)
     counts.update({name: count for name, count in rows})
     return counts
+
+
+def test_postgres_application_product_store_uses_the_migrated_database(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        token = uuid4().hex
+        async with open_application_stores(
+            migrated_postgres_url,
+            sqlite_path=tmp_path / "unused.db",
+            product_operations=True,
+        ) as stores:
+            assert stores.product_store is not None
+            reservation = await stores.product_store.reserve(
+                tenant_id="tenant-a",
+                subject_id="alice",
+                idempotency_key=f"key-{token}",
+                request_fingerprint="fingerprint",
+                public_id=f"op_{token}",
+                work_id=f"work_{token}",
+                session_id=f"session_{token}",
+                task_id=f"task_{token}",
+                request_text="work",
+            )
+            assert reservation.created
+            assert (
+                await stores.product_store.find_by_session_id(session_id=f"session_{token}")
+                == reservation.operation
+            )
+        assert not (tmp_path / "unused.db").exists()
+
+    asyncio.run(scenario())
 
 
 def test_shared_pool_task_admission_wakeups_arrive_through_listen(

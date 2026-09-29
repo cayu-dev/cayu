@@ -13,6 +13,19 @@
   to date, `3` when a forward migration is available, and `4` when this build
   cannot migrate the database; scripts that treated any successful `status` as
   exit `0` must accept `3`.
+- Add runtime-owned `SQLiteProductOperationStore` and
+  `PostgresProductOperationStore` implementations of `ProductOperationStore`.
+  The PostgreSQL store lets more than one maintained service process share
+  product authorization, claims, receipts, and settlement. Storage revision
+  **112** adds `cayu_product_operations`; it is additive, so run
+  `cayu storage migrate` before using either store against an existing database.
+  `open_application_stores(..., product_operations=True)` builds the store in the
+  configured database, sharing the PostgreSQL pool. The `service` preset no longer
+  generates `product_store.py`; it uses the runtime store, so `CAYU_DATABASE_URL`
+  moves product records to PostgreSQL and local runs keep SQLite in
+  `data/cayu.db`. Existing service projects get a `SCAFFOLD_PLAN_DRIFT` storage
+  finding while `product_store.py` remains; copy any rows that must be kept from
+  `data/product.db` before removing it.
 - Support durable artifact pins on `S3ArtifactStore` with conditional-write state,
   so workspace checkpoints can use S3 artifact storage.
 - Accept already-searching OpenAI web-search registrations and completed replay

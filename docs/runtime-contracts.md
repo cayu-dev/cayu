@@ -59,7 +59,9 @@ builds session, task, and knowledge stores with `open_application_stores(...)`:
 SQLite at an absolute project path. The CLI store resolver parses the same
 variable with the same code, so application stores and Cayu tooling agree.
 `CAYU_REQUIRE_POSTGRES=1` makes every Cayu SQLite store raise
-`PostgresRequiredError` at construction. Per-run overrides
+`PostgresRequiredError` at construction. The service preset also passes
+`product_operations=True`, so its product operation store lives in the same
+database and, on PostgreSQL, the same pool. Per-run overrides
 remain at the invocation boundary. Schema versions and internal validation
 ceilings remain feature-owned contracts rather than application settings.
 
@@ -426,6 +428,19 @@ Application `ProductOperationStore` implementations provide the exact indexed
 `find_by_session_id`, claim-fenced `record_result_receipt`, and bounded
 `record_recovery_status` operations used by this contract; these are durable
 authority operations, not scans or optional compatibility hooks.
+Cayu ships two implementations with identical semantics and one shared
+contract suite: `SQLiteProductOperationStore` for one host and
+`PostgresProductOperationStore` for service processes sharing a database.
+Both keep this state in `cayu_product_operations` (storage revision 112, an
+additive revision), so `cayu storage migrate` creates and upgrades it with the
+other Cayu tables. The PostgreSQL store follows the other Postgres stores:
+it validates by default and requires the explicit migration step. Each
+operation's claim, heartbeat, receipt, and settlement write locks that one row
+and evaluates lease expiry against the database clock after acquiring the lock,
+so processes on different hosts agree on ownership. As in the application
+contract, idempotency keys are unique across tenants and a key reused by
+another tenant is an idempotency conflict. Both stores accept an injected clock
+for deterministic lease tests.
 The store retains the originating subject on the pending operation so a
 replacement worker reconstructs the exact `server_verified` task origin after
 process loss; it is never returned by the public product projection.

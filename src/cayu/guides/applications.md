@@ -155,7 +155,9 @@ at an absolute path under the project (`data/cayu.db`, or `.cayu/runtime/cayu.db
 for coding). `[tool.cayu.session_store]` names that same local file for Cayu CLI
 tooling, and `CAYU_DATABASE_URL` overrides it for the app and the CLI alike. Every
 generated project depends on `cayu[postgres]`. `cayu new --database` is deprecated
-and ignored.
+and ignored. The service preset keeps its product operation records (tenant
+authorization, claims, and settlement) in the same database with
+`product_operations=True`, so several service processes can share PostgreSQL.
 
 - Keep application-owned durable records, such as orders, cases, ledgers, and
   sync cursors, in the configured database. Application tables may share it with

@@ -237,3 +237,49 @@ def test_generated_project_imports_the_postgres_driver(
         assert type(stores.configured.session_store._pool) is psycopg_pool.AsyncConnectionPool
         assert psycopg.AsyncConnection is not None
         asyncio.run(stores.configured.close())
+
+
+def test_service_product_store_lives_in_the_local_cayu_database(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cayu import SQLiteProductOperationStore
+    from cayu.server import ServiceMode
+
+    project = _generate(tmp_path, "service", capsys)
+    assert not (project / "product_store.py").exists()
+    database = (project / "data" / "cayu.db").resolve()
+
+    with project_context(project):
+        service = importlib.import_module("service").build_service(mode=ServiceMode.DEVELOPMENT)
+        product_store = service.product_store
+        try:
+            assert isinstance(product_store, SQLiteProductOperationStore)
+            assert Path(product_store.path).resolve() == database
+            assert Path(service.cayu_app.session_store.path).resolve() == database
+        finally:
+            asyncio.run(
+                _close(product_store, service.cayu_app.task_store, service.cayu_app.session_store)
+            )
+    assert not (project / "data" / "product.db").exists()
+    assert check_declared_scaffold_source(project) == ()
+
+
+def test_service_project_with_a_generated_product_store_reports_storage_drift(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = _generate(tmp_path, "service", capsys)
+    (project / "product_store.py").write_text(
+        "class SQLiteProductOperationStore:\n    pass\n", encoding="utf-8"
+    )
+
+    (finding,) = check_declared_scaffold_source(project)
+
+    assert finding.code == "SCAFFOLD_PLAN_DRIFT"
+    assert finding.path == "product_store.py"
+    assert finding.parameters["field"] == "storage"
+    assert finding.parameters["expected"] == "absent"
+    assert finding.parameters["observed"] == "present"
+    assert "product_operations=True" in finding.hint
+    assert "cayu_product_operations" in finding.hint

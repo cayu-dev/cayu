@@ -107,6 +107,14 @@ def test_revision_110_fences_writers_without_producer_retention() -> None:
     m.validate(state, app_latest=110, app_min_supported=110)
 
 
+def test_revision_112_adds_product_operations_without_fencing_older_writers() -> None:
+    revision = m.revision(112)
+    assert revision.kind is m.RevisionKind.ADDITIVE
+    assert revision.compatible_from == 111
+    # Older binaries never touch cayu_product_operations and keep operating.
+    m.validate(m.SchemaState(revision=112, compatible_from=111), app_latest=111)
+
+
 def test_revision_thirty_one_rejects_pre_input_contract_readers() -> None:
     state = m.SchemaState(revision=31, compatible_from=31)
 
