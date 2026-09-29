@@ -100,6 +100,7 @@ def _versioned_checkpoint_transform(
             callback_checkpoint = _copy_checkpoint_for_transform(
                 decoded,
                 session_id=session_id,
+                decoded=True,
             )
             transformed = checkpoint_transform(session, callback_checkpoint)
             if transformed is None:
@@ -117,6 +118,7 @@ def _versioned_checkpoint_transform(
                 preserve_session_exports=preserve_session_exports,
                 preserve_session_continuations=preserve_session_continuations,
                 session_id=session_id,
+                decoded_replacement=True,
             )
         except BaseException:
             checkpoint = None
@@ -208,6 +210,7 @@ def _versioned_operation_transform(
             callback_checkpoint = _copy_checkpoint_for_transform(
                 decoded,
                 session_id=session_id,
+                decoded=True,
             )
             publication = operation_transform(session, callback_checkpoint, operation_record)
             if type(publication) is not SessionOperationPublication:
@@ -221,9 +224,10 @@ def _versioned_operation_transform(
             if versioned is None:
                 raise TypeError("Session operation checkpoint must be an object.")
             versioned = _replace_checkpoint_preserving_completion_result_event_publications(
-                checkpoint,
+                decoded,
                 versioned,
                 session_id=session_id,
+                decoded_replacement=True,
             )
             return SessionOperationPublication(
                 checkpoint=versioned,

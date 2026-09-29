@@ -4994,6 +4994,7 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     preserve_session_exports: bool = True,
     preserve_session_continuations: bool = True,
     session_id: str,
+    decoded_replacement: bool = False,
 ) -> dict[str, Any]:
     """Replace caller state while retaining decoded runtime-owned checkpoint authority."""
 
@@ -5022,7 +5023,11 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
         authoritative_current = decode_runtime_checkpoint(current, session_id=session_id)
     lifecycle_mutation_allowed = _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get()
     workspace_mutation_allowed = _WORKSPACE_OBSERVATION_AUTHORITY_MUTATION_ALLOWED.get()
-    if lifecycle_mutation_allowed:
+    if decoded_replacement:
+        # The runtime adapter owns this freshly decoded result. Projection below
+        # still enforces private-root authority and the final document ceiling.
+        updated = replacement
+    elif lifecycle_mutation_allowed:
         # Typed lifecycle commands already own the current-schema authority
         # mutation. Keeping this private path literal also permits migration
         # fixtures to inject historical durable representations.
@@ -5130,6 +5135,7 @@ def _copy_checkpoint_for_transform(
     checkpoint: dict[str, Any] | None,
     *,
     session_id: str,
+    decoded: bool = False,
 ) -> dict[str, Any] | None:
     """Validate and detach callback-visible state from store-owned authority."""
 
@@ -5143,7 +5149,9 @@ def _copy_checkpoint_for_transform(
         _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get()
         or _INVOCATION_LIFECYCLE_AUTHORITY_READ_ALLOWED.get()
     )
-    if lifecycle_authority_allowed or CHECKPOINT_SCHEMA_VERSION_KEY not in checkpoint:
+    if decoded:
+        copied = dict(checkpoint)
+    elif lifecycle_authority_allowed or CHECKPOINT_SCHEMA_VERSION_KEY not in checkpoint:
         copied = copy_durable_json_object(checkpoint, "checkpoint")
     else:
         # Generic callbacks are an untrusted checkpoint entrance. Validate and
@@ -5152,6 +5160,7 @@ def _copy_checkpoint_for_transform(
         copied = decode_runtime_checkpoint(checkpoint, session_id=session_id)
         if copied is None:
             raise AssertionError("Stored checkpoint decoded to no state.")
+    if not lifecycle_authority_allowed and CHECKPOINT_SCHEMA_VERSION_KEY in checkpoint:
         copied.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
         copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
         copied.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY, None)
@@ -5169,7 +5178,7 @@ def _copy_checkpoint_for_transform(
         copied.pop(continuations.ROOT_KEY, None)
     if not producers.checkpoint_visible(session_id=session_id) and not lifecycle_authority_allowed:
         copied.pop(producers.ROOT_KEY, None)
-    return copied
+    return deepcopy(copied) if decoded else copied
 
 
 def _checkpoint_transform_result_preserving_completion_result_event_publications(

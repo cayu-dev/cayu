@@ -80,6 +80,7 @@ from cayu.storage._task_group_schema import (
     SQLITE_TASK_GROUP_QUIESCENCE_DDL,
 )
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
+from cayu.storage._validated_cache import validated_row_cache
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.tasks.base import (
     TaskInterruptedHandoffRequest,
@@ -11444,6 +11445,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
     )
 
 
+@validated_row_cache
 def task_from_row(row: sqlite3.Row) -> Task:
     status_payload_json = row["status_payload_json"]
     result_json = row["result_json"]
@@ -11604,6 +11606,7 @@ def task_topology_node_from_row(row: sqlite3.Row) -> TaskTopologyNode:
         ) from exc
 
 
+@validated_row_cache
 def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> Session:
     return Session(
         id=row["id"],

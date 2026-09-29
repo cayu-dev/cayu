@@ -882,21 +882,24 @@ def _session_topology_node_from_sqlite_row(row: sqlite3.Row) -> SessionTopologyN
     )
 
 
+@sqlite_support.validated_row_cache
+def _checkpoint_from_json(value: str) -> dict[str, Any]:
+    return copy_durable_json_object(json.loads(value), "checkpoint")
+
+
+def _load_checkpoint_json(connection: sqlite3.Connection, session_id: str) -> str | None:
+    row = connection.execute(
+        "SELECT state_json FROM cayu_checkpoints WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return None if row is None else row["state_json"]
+
+
 def _load_checkpoint_state(
     connection: sqlite3.Connection,
     session_id: str,
 ) -> dict[str, Any] | None:
-    row = connection.execute(
-        """
-        SELECT state_json
-        FROM cayu_checkpoints
-        WHERE session_id = ?
-        """,
-        (session_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    return copy_durable_json_object(json.loads(row["state_json"]), "checkpoint")
+    value = _load_checkpoint_json(connection, session_id)
+    return None if value is None else _checkpoint_from_json(value)
 
 
 def _reject_new_work_after_steering(connection: sqlite3.Connection, session: Session) -> None:
@@ -1150,7 +1153,7 @@ _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
 
 
 def _event_from_row(row: sqlite3.Row) -> Event:
-    """Reconstruct an :class:`Event` from its individual cayu_events columns."""
+    """Validate an owned Event without adding cache-copy work to history scans."""
     input_contract_runtime_owned = row["input_contract_runtime_owned"]
     if type(input_contract_runtime_owned) is not int or input_contract_runtime_owned not in {
         0,
@@ -1858,19 +1861,32 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         except BaseException:
             self._connection.close()
             raise
-        # Hot-path queries run on a dedicated read-only connection in worker
-        # threads so the event loop never blocks on SQLite I/O and reads never
-        # queue behind the writer connection's transactions. In-memory
-        # databases are private to their connection, so they fall back to the
-        # writer connection (and its lock).
-        if self._read_only or str(effective_db_path) == ":memory:":
-            self._read_connection = self._connection
-            self._read_lock = self._lock
-        else:
-            self._read_connection = self._connect_read_only(effective_db_path)
-            self._read_lock = asyncio.Lock()
-        self._read_connection.execute("PRAGMA temp_store = FILE")
-        self._read_connection.execute("PRAGMA temp.cache_size = -2048")
+        # Each leased reader retains physical ownership through cancellation.
+        # Private in-memory databases must continue sharing the writer.
+        self._closed = False
+        self._readers: list[tuple[asyncio.Lock, sqlite3.Connection]] = []
+        try:
+            if str(effective_db_path) == ":memory:":
+                self._readers.append((self._lock, self._connection))
+            else:
+                for _ in range(4):
+                    connection = self._connect_read_only(effective_db_path)
+                    self._readers.append((asyncio.Lock(), connection))
+            for _, connection in self._readers:
+                connection.execute("PRAGMA temp_store = FILE")
+                connection.execute("PRAGMA temp.cache_size = -2048")
+        except BaseException:
+            for _, connection in self._readers:
+                if connection is not self._connection:
+                    connection.close()
+            self._connection.close()
+            raise
+        self._read_lock, self._read_connection = self._readers[0]
+        self._available_readers: asyncio.LifoQueue[tuple[asyncio.Lock, sqlite3.Connection]] = (
+            asyncio.LifoQueue()
+        )
+        for reader in reversed(self._readers):
+            self._available_readers.put_nowait(reader)
 
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return the primary SQLite file for state-boundary validation."""
@@ -2201,23 +2217,22 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
             self._require_current_public_authority_configuration(connection)
             return query(connection)
 
-        if _settled_evidence_reads_required():
-            return await _run_off_thread_with_connection_ownership(
-                self._read_lock,
-                self._read_connection,
-                guarded,
-                interrupt_on_cancellation=True,
-            )
+        async def read_with_lease() -> _T:
+            reader = await self._available_readers.get()
+            try:
+                if self._closed:
+                    raise RuntimeError("SQLite session store is closed.")
+                lock, connection = reader
+                return await _run_off_thread_with_connection_ownership(
+                    lock, connection, guarded, interrupt_on_cancellation=True
+                )
+            finally:
+                self._available_readers.put_nowait(reader)
 
-        owner = asyncio.create_task(
-            _run_off_thread_with_connection_ownership(
-                self._read_lock,
-                self._read_connection,
-                guarded,
-                interrupt_on_cancellation=True,
-            ),
-            name="cayu-sqlite-read-owner",
-        )
+        if _settled_evidence_reads_required():
+            return await read_with_lease()
+
+        owner = asyncio.create_task(read_with_lease(), name="cayu-sqlite-read-owner")
         try:
             return await asyncio.shield(owner)
         except asyncio.CancelledError:
@@ -13204,7 +13219,7 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
 
-        def query(connection: sqlite3.Connection) -> list[Event]:
+        def query(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             rows = connection.execute(
@@ -13216,13 +13231,14 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 """,
                 (session_id,),
             ).fetchall()
-            return [_event_from_row(row) for row in rows]
+            return rows
 
         from cayu.storage._session_access_records import sqlite_owner_read
 
-        return await self._run_read(
+        rows = await self._run_read(
             lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
         )
+        return await asyncio.to_thread(lambda: [_event_from_row(row) for row in rows])
 
     async def load_user_input_supersession_events(
         self,
@@ -18247,15 +18263,19 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         session_id = require_clean_nonblank(session_id, "session_id")
         from cayu.storage._session_access_records import sqlite_owner_read
 
-        return await self._run_read(
+        value = await self._run_read(
             lambda connection: sqlite_owner_read(
                 connection,
                 access_bounds,
                 session_id,
-                lambda conn: _load_checkpoint_state(conn, session_id),
+                lambda conn: _load_checkpoint_json(conn, session_id),
                 action="inspect_state",
             )
         )
+
+        if value is None:
+            return None
+        return await asyncio.to_thread(_checkpoint_from_json, value)
 
     async def load_interruption_cascade_marker(
         self,
@@ -18276,10 +18296,12 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
         return _load_checkpoint_state(self._connection, session_id)
 
     async def close(self) -> None:
+        self._closed = True
         async with self._lock:
-            if self._read_connection is not self._connection:
-                async with self._read_lock:
-                    self._read_connection.close()
+            for lock, connection in self._readers:
+                if connection is not self._connection:
+                    async with lock:
+                        connection.close()
             self._connection.close()
 
     def _connect(self, path: Path) -> sqlite3.Connection:

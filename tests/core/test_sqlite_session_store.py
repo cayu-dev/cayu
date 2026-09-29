@@ -4311,7 +4311,9 @@ def test_sqlite_off_thread_reader_retains_connection_ownership_during_cancellati
 
         owner.cancel()
         follower = asyncio.create_task(store._run_read(follower_read))
-        await asyncio.sleep(0)
+        # A second reader may finish while the cancelled reader still owns
+        # its physical connection. Shutdown must wait for that original owner.
+        assert await asyncio.wait_for(follower, timeout=2) == 2
         close_task = asyncio.create_task(store.close())
         await asyncio.sleep(0)
 
@@ -4319,12 +4321,11 @@ def test_sqlite_off_thread_reader_retains_connection_ownership_during_cancellati
         assert owner.done()
         with pytest.raises(asyncio.CancelledError):
             await owner
-        assert not follower_started.is_set()
-        assert not follower.done()
+        assert follower_started.is_set()
+        assert follower.done()
         assert not close_task.done()
 
         release_worker.set()
-        assert await follower == 2
         await close_task
 
     asyncio.run(run())

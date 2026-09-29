@@ -81,6 +81,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Release notes](release-notes.md)
 - [Releasing](releasing.md)
 - [Session-operation fault harness](session-operation-fault-harness.md)
+- [SQLite store performance](sqlite-store-performance.md)
 
 ## Architecture and implemented design records
 
