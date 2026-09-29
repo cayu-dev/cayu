@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import pytest
@@ -23,8 +24,13 @@ from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionStatus,
+    SessionStore,
 )
+from cayu.storage.migrations import SchemaMode
+from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
+
+_WATCHDOG_SECONDS = 20  # Includes durable-backend startup; faults use explicit barriers.
 
 
 class _TwoCallProvider(ModelProvider):
@@ -74,11 +80,11 @@ class _SideEffectTool(Tool):
         return ToolResult(content=f"executed {args['value']}")
 
 
-class _PublicationBarrierStore(InMemorySessionStore):
+class _PublicationBarrierStore:
     invocation_lifecycle_command_version = 1
 
-    def __init__(self, *, boundary: Literal["before-commit", "after-commit"]) -> None:
-        super().__init__()
+    def __init__(self, *args, boundary: Literal["before-commit", "after-commit"], **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.boundary = boundary
         self.boundary_reached = asyncio.Event()
         self.release_publication = asyncio.Event()
@@ -116,11 +122,11 @@ class _SimulatedProcessLoss(BaseException):
     pass
 
 
-class _ProcessLossStore(InMemorySessionStore):
+class _ProcessLossStore:
     invocation_lifecycle_command_version = 1
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.fail_before_tool_publication = True
         self.tool_publication_attempted = asyncio.Event()
 
@@ -148,8 +154,8 @@ class _ProcessLossStore(InMemorySessionStore):
 class _ConcurrentProcessLossStore(_ProcessLossStore):
     invocation_lifecycle_command_version = 1
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.block_recovery_claim = False
         self.claim_fenced = asyncio.Event()
         self.release_claim = asyncio.Event()
@@ -162,6 +168,57 @@ class _ConcurrentProcessLossStore(_ProcessLossStore):
             self.claim_fenced.set()
             await self.release_claim.wait()
         return fenced
+
+
+class _LostAcknowledgementStore(_ProcessLossStore):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.publication_requests: list[RuntimePublicationRequest] = []
+        self.publication_results: list[RuntimePublicationResult] = []
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        result = await super().publish_runtime_publication(session_id, request=request, **kwargs)
+        if request.kind == "tool-round":
+            self.publication_requests.append(request.model_copy(deep=True))
+            self.publication_results.append(result)
+            if len(self.publication_results) == 1:
+                assert result.replayed is False
+                raise ConnectionError("tool-round publication acknowledgement lost")
+        return result
+
+
+@pytest.fixture(params=["memory", "sqlite", pytest.param("postgres", marks=pytest.mark.postgres)])
+def store_factory(request, tmp_path):
+    """Keep the fault schedule above the real backend's transaction boundary."""
+    backend = request.param
+    dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+    if backend == "postgres":
+        from cayu.storage.postgres import PostgresSessionStore
+
+        backend_type = PostgresSessionStore
+    else:
+        backend_type = InMemorySessionStore if backend == "memory" else SQLiteSessionStore
+
+    @asynccontextmanager
+    async def open_store(fault_type, **fault_options):
+        class FaultStore(fault_type, backend_type):
+            invocation_lifecycle_command_version = 1
+
+        if backend == "memory":
+            store = FaultStore(**fault_options)
+        elif backend == "sqlite":
+            store = FaultStore(tmp_path / "round-publication.sqlite", **fault_options)
+        else:
+            store = FaultStore(
+                dsn, schema_mode=SchemaMode.CREATE, min_size=1, max_size=2, **fault_options
+            )
+        try:
+            yield store
+        finally:
+            if backend != "memory":
+                await store.close()
+
+    return open_store
 
 
 def _tool_call_response() -> list[ModelStreamEvent]:
@@ -181,7 +238,7 @@ def _tool_call_response() -> list[ModelStreamEvent]:
 
 
 def _runtime(
-    store: InMemorySessionStore,
+    store: SessionStore,
     provider: _TwoCallProvider,
     tool: _SideEffectTool,
     *,
@@ -216,7 +273,7 @@ async def _collect_run(app: CayuApp, *, session_id: str) -> list[Event]:
 
 
 async def _assert_published_round(
-    store: InMemorySessionStore,
+    store: SessionStore,
     *,
     session_id: str,
 ) -> None:
@@ -264,32 +321,41 @@ async def _assert_published_round(
 def test_two_call_round_survives_cancellation_at_publication_boundary(
     max_parallel_tool_calls: int,
     boundary: Literal["before-commit", "after-commit"],
+    store_factory,
 ) -> None:
     async def scenario() -> None:
-        store = _PublicationBarrierStore(boundary=boundary)
-        provider = _TwoCallProvider([_tool_call_response()])
-        tool = _SideEffectTool()
-        session_id = f"tool-round-{boundary}-{max_parallel_tool_calls}"
-        app = _runtime(
-            store,
-            provider,
-            tool,
-            max_parallel_tool_calls=max_parallel_tool_calls,
-        )
+        async with store_factory(_PublicationBarrierStore, boundary=boundary) as store:
+            provider = _TwoCallProvider([_tool_call_response()])
+            tool = _SideEffectTool()
+            session_id = f"tool-round-{boundary}-{max_parallel_tool_calls}"
+            app = _runtime(
+                store,
+                provider,
+                tool,
+                max_parallel_tool_calls=max_parallel_tool_calls,
+            )
 
-        running = asyncio.create_task(_collect_run(app, session_id=session_id))
-        await asyncio.wait_for(store.boundary_reached.wait(), timeout=5)
-        running.cancel(f"{boundary} caller cancellation")
-        store.release_publication.set()
-        with pytest.raises(asyncio.CancelledError, match=boundary):
-            await asyncio.wait_for(running, timeout=5)
+            running = asyncio.create_task(_collect_run(app, session_id=session_id))
+            try:
+                await asyncio.wait_for(store.boundary_reached.wait(), timeout=_WATCHDOG_SECONDS)
+                running.cancel(f"{boundary} caller cancellation")
+                store.release_publication.set()
+                with pytest.raises(asyncio.CancelledError, match=boundary):
+                    await asyncio.wait_for(running, timeout=_WATCHDOG_SECONDS)
+            finally:
+                store.release_publication.set()
+                if not running.done():
+                    running.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(running, return_exceptions=True), timeout=_WATCHDOG_SECONDS
+                )
 
-        assert sorted(tool.calls) == ["first", "second"]
-        assert len(tool.calls) == 2
-        assert len(provider.requests) == 1
-        assert running.cancelling() == 0
-        assert running.cancelled() is True
-        await _assert_published_round(store, session_id=session_id)
+            assert sorted(tool.calls) == ["first", "second"]
+            assert len(tool.calls) == 2
+            assert len(provider.requests) == 1
+            assert running.cancelling() == 0
+            assert running.cancelled() is True
+            await _assert_published_round(store, session_id=session_id)
 
     asyncio.run(scenario())
 
@@ -343,28 +409,29 @@ async def _create_process_loss_round(
 )
 def test_two_call_round_recovers_after_process_loss_without_reexecution(
     max_parallel_tool_calls: int,
+    store_factory,
 ) -> None:
     async def scenario() -> None:
-        store = _ProcessLossStore()
-        session_id = f"tool-round-process-loss-{max_parallel_tool_calls}"
-        app, provider, tool = await _create_process_loss_round(
-            store=store,
-            max_parallel_tool_calls=max_parallel_tool_calls,
-            session_id=session_id,
-        )
+        async with store_factory(_ProcessLossStore) as store:
+            session_id = f"tool-round-process-loss-{max_parallel_tool_calls}"
+            app, provider, tool = await _create_process_loss_round(
+                store=store,
+                max_parallel_tool_calls=max_parallel_tool_calls,
+                session_id=session_id,
+            )
 
-        recovery = await app.recover_incomplete_session(
-            IncompleteSessionRecoveryRequest(session_id=session_id)
-        )
+            recovery = await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
 
-        assert recovery.actions == (
-            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
-            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
-        )
-        assert sorted(tool.calls) == ["first", "second"]
-        assert len(tool.calls) == 2
-        assert len(provider.requests) == 1
-        await _assert_published_round(store, session_id=session_id)
+            assert recovery.actions == (
+                IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+                IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            )
+            assert sorted(tool.calls) == ["first", "second"]
+            assert len(tool.calls) == 2
+            assert len(provider.requests) == 1
+            await _assert_published_round(store, session_id=session_id)
 
     asyncio.run(scenario())
 
@@ -378,46 +445,111 @@ def test_two_call_round_recovers_after_process_loss_without_reexecution(
 )
 def test_two_call_round_concurrent_recovery_has_one_publication_winner(
     max_parallel_tool_calls: int,
+    store_factory,
 ) -> None:
     async def scenario() -> None:
-        store = _ConcurrentProcessLossStore()
-        session_id = f"tool-round-concurrent-recovery-{max_parallel_tool_calls}"
-        app, provider, tool = await _create_process_loss_round(
-            store=store,
-            max_parallel_tool_calls=max_parallel_tool_calls,
-            session_id=session_id,
-        )
-        competing_provider = _TwoCallProvider([])
-        competing_tool = _SideEffectTool()
-        competing_app = _runtime(
-            store,
-            competing_provider,
-            competing_tool,
-            max_parallel_tool_calls=max_parallel_tool_calls,
-        )
-        store.block_recovery_claim = True
-        request = IncompleteSessionRecoveryRequest(session_id=session_id)
+        async with store_factory(_ConcurrentProcessLossStore) as store:
+            session_id = f"tool-round-concurrent-recovery-{max_parallel_tool_calls}"
+            app, provider, tool = await _create_process_loss_round(
+                store=store,
+                max_parallel_tool_calls=max_parallel_tool_calls,
+                session_id=session_id,
+            )
+            competing_provider = _TwoCallProvider([])
+            competing_tool = _SideEffectTool()
+            competing_app = _runtime(
+                store,
+                competing_provider,
+                competing_tool,
+                max_parallel_tool_calls=max_parallel_tool_calls,
+            )
+            store.block_recovery_claim = True
+            request = IncompleteSessionRecoveryRequest(session_id=session_id)
 
-        first_recovery = asyncio.create_task(app.recover_incomplete_session(request))
-        await asyncio.wait_for(store.claim_fenced.wait(), timeout=5)
-        competing = await asyncio.wait_for(
-            competing_app.recover_incomplete_session(request),
-            timeout=5,
-        )
-        assert competing.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+            first_recovery = asyncio.create_task(app.recover_incomplete_session(request))
+            try:
+                await asyncio.wait_for(store.claim_fenced.wait(), timeout=_WATCHDOG_SECONDS)
+                competing = await asyncio.wait_for(
+                    competing_app.recover_incomplete_session(request),
+                    timeout=_WATCHDOG_SECONDS,
+                )
+                assert competing.actions == (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
 
-        store.release_claim.set()
-        winner = await asyncio.wait_for(first_recovery, timeout=5)
+                store.release_claim.set()
+                winner = await asyncio.wait_for(first_recovery, timeout=_WATCHDOG_SECONDS)
+            finally:
+                store.release_claim.set()
+                if not first_recovery.done():
+                    first_recovery.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(first_recovery, return_exceptions=True),
+                    timeout=_WATCHDOG_SECONDS,
+                )
 
-        assert winner.actions == (
-            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
-            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
-        )
-        assert sorted(tool.calls) == ["first", "second"]
-        assert len(tool.calls) == 2
-        assert competing_tool.calls == []
-        assert len(provider.requests) == 1
-        assert competing_provider.requests == []
-        await _assert_published_round(store, session_id=session_id)
+            assert winner.actions == (
+                IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+                IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+            )
+            assert sorted(tool.calls) == ["first", "second"]
+            assert len(tool.calls) == 2
+            assert competing_tool.calls == []
+            assert len(provider.requests) == 1
+            assert competing_provider.requests == []
+            await _assert_published_round(store, session_id=session_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entrance", ["run", "recovery"])
+@pytest.mark.parametrize(
+    "max_parallel_tool_calls", [pytest.param(1, id="serial"), pytest.param(2, id="parallel")]
+)
+def test_two_call_round_replays_exact_request_after_lost_acknowledgement(
+    store_factory, entrance, max_parallel_tool_calls
+) -> None:
+    async def scenario() -> None:
+        async with store_factory(_LostAcknowledgementStore) as store:
+            session_id = f"tool-round-lost-ack-{entrance}-{max_parallel_tool_calls}"
+            if entrance == "recovery":
+                app, provider, tool = await _create_process_loss_round(
+                    store=store,
+                    max_parallel_tool_calls=max_parallel_tool_calls,
+                    session_id=session_id,
+                )
+                recovery = await app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+                assert recovery.actions == (
+                    IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+                    IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+                )
+                assert len(provider.requests) == 1
+            else:
+                store.fail_before_tool_publication = False
+                provider = _TwoCallProvider(
+                    [
+                        _tool_call_response(),
+                        [
+                            ModelStreamEvent.text_delta("done"),
+                            ModelStreamEvent.completed({"finish_reason": "stop"}),
+                        ],
+                    ]
+                )
+                tool = _SideEffectTool()
+                app = _runtime(
+                    store, provider, tool, max_parallel_tool_calls=max_parallel_tool_calls
+                )
+                events = await _collect_run(app, session_id=session_id)
+                assert events[-1].type is EventType.SESSION_COMPLETED
+                assert (await store.load(session_id)).status is SessionStatus.COMPLETED
+                assert len(provider.requests) == 2
+
+            assert sorted(tool.calls) == ["first", "second"]
+            assert len(store.publication_requests) == 2
+            assert store.publication_requests[0] == store.publication_requests[1]
+            committed, replayed = store.publication_results
+            assert committed.replayed is False and replayed.replayed is True
+            assert committed.receipt == replayed.receipt
+            await _assert_published_round(store, session_id=session_id)
 
     asyncio.run(scenario())
