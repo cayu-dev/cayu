@@ -15743,8 +15743,10 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
         from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+        from cayu.runtime._usage_accounting import SessionUsageCache
 
         self._cost_accounting_authority = CostAccountingAuthority()
+        self._session_usage_cache = SessionUsageCache()
         self._accounting_generation = 0
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
@@ -24443,15 +24445,26 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
     ) -> UsageAccountingSnapshot:
         from cayu.runtime._usage_accounting import (
             USAGE_ACCOUNTING_PAGE_SIZE,
+            SessionUsageCache,
             UsageAccountingReducer,
             usage_accounting_query,
         )
 
         query = usage_accounting_query(query)
-        reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
-        event_types = frozenset(str(kind) for kind in query.event_types)
+        cached_session_id = SessionUsageCache.session_scope(
+            query, by_session=by_session, by_identity=by_identity
+        )
         async with self._lock:
             generation = self._accounting_generation
+            prior = (
+                None
+                if cached_session_id is None
+                else self._session_usage_cache.resume_after(cached_session_id, generation)
+            )
+            if prior is not None:
+                query = copy_event_query(query, update={"after_sequence": prior.scanned_through})
+            reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
+            event_types = frozenset(str(kind) for kind in query.event_types)
             # Reuse durable indexes without merging complete per-type/session lists.
             candidates = (
                 self._session_event_records.get(query.session_id, [])
@@ -24477,6 +24490,14 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                     await asyncio.sleep(0)
             if page:
                 reducer.add_page(page)
+            if cached_session_id is not None:
+                return self._session_usage_cache.settle(
+                    cached_session_id,
+                    generation,
+                    prior,
+                    reducer.snapshot(),
+                    boundary=candidates[-1].sequence if candidates else 0,
+                )
         return reducer.snapshot().model_copy(update={"generation": generation})
 
     @runtime_session_query

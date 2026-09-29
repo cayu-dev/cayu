@@ -32,6 +32,10 @@
   registrations. Reconcile unoccupied completion indexes by exact item identity,
   retain terminal integrity checks, and retry function index-type collisions and
   unregistered argument completions under the caller's transient retry budget.
+- Make whole-session usage reads incremental in the memory, SQLite, and PostgreSQL
+  stores, add `ETag`/`If-None-Match` to `GET /api/sessions/{session_id}/usage`, add
+  `include=usage` to the session list, and list the usage and cost endpoints under
+  `accounting` in `/api/contract`.
 - Add experimental `cayu.extensions.runners` and `cayu.extensions.egress` seams
   for externally packaged adapters, including an explicit runner adapter
   identity registry so registered adapter names and error classes survive in

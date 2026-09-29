@@ -482,6 +482,7 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundLimitRequest,
 )
+from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime._verified_task_decision_coordinator import (
     VerifiedTaskDecisionCoordinator,
     VerifiedTaskDecisionDependencies,
@@ -10283,19 +10284,29 @@ class CayuApp:
         return await self.task_store.resume_task(task_id)
 
     async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
+        return (await self._session_usage_snapshot(session_id)).summary
+
+    async def _session_usage_snapshot(self, session_id: str) -> UsageAccountingSnapshot:
+        """Return exposed session usage with its generation and accounted sequence."""
         session_id = await self._resolve_public_session_id(
             require_clean_nonblank(session_id, "session_id")
         )
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
-        summary = (
-            await self.session_store.read_usage_accounting(EventQuery(session_id=session_id))
-        ).summary
-        return summary.model_copy(
+        return self._expose_session_usage_snapshot(
+            session_id,
+            await self.session_store.read_usage_accounting(EventQuery(session_id=session_id)),
+        )
+
+    def _expose_session_usage_snapshot(
+        self, session_id: str, snapshot: UsageAccountingSnapshot
+    ) -> UsageAccountingSnapshot:
+        summary = snapshot.summary.model_copy(
             update={"session_id": self.project_session_id_for_exposure(session_id)},
             deep=True,
         )
+        return snapshot.model_copy(update={"summary": summary})
 
     async def get_causal_budget_usage(
         self,

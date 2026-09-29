@@ -1818,6 +1818,43 @@ CAPTURED_EVALUATION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
+class SessionUsageEndpointContract(ApiBaseModel):
+    """Exact session token usage, maintained incrementally by the session store."""
+
+    supported: StrictBool
+    method: Literal["GET"] = "GET"
+    path: str
+    response_schema: Literal["SessionUsageSummary"] = "SessionUsageSummary"
+    etag_header: Literal["ETag"] = "ETag"
+    conditional_request_header: Literal["If-None-Match"] = "If-None-Match"
+    not_modified_status: Literal[304] = 304
+    session_list_include: Literal["usage"] = Field(
+        default="usage",
+        description="Pass as `include` on the session list to embed each session's usage.",
+    )
+
+
+class SessionCostEndpointContract(ApiBaseModel):
+    """Estimated session cost from a caller-supplied price book."""
+
+    supported: StrictBool
+    method: Literal["POST"] = "POST"
+    path: str
+    request_schema: Literal["SessionCostBody"] = "SessionCostBody"
+    response_schema: Literal["SessionCostSummary"] = "SessionCostSummary"
+
+
+class AccountingContract(ApiBaseModel):
+    """Server-owned token and cost accounting.
+
+    Clients read these endpoints instead of folding raw `model.completed`
+    events, which would skip cache, provider-attempt, and price-book semantics.
+    """
+
+    usage: SessionUsageEndpointContract
+    cost: SessionCostEndpointContract
+
+
 class VersioningContract(ApiBaseModel):
     contract_version: str = SERVER_CONTRACT_VERSION
     compatibility: Literal["additive-with-explicit-breaking-review"] = (
@@ -1833,6 +1870,7 @@ class ServerContractResponse(ApiBaseModel):
     api_prefix: str = SERVER_API_PREFIX
     contract_version: str = SERVER_CONTRACT_VERSION
     versioning: VersioningContract = Field(default_factory=VersioningContract)
+    accounting: AccountingContract
     sse: SseContract = Field(default_factory=SseContract)
     client_generation: ClientGenerationContract = Field(default_factory=ClientGenerationContract)
     capabilities: ControlPlaneCapabilities
@@ -1905,6 +1943,13 @@ class ListSessionsResponse(ApiBaseModel):
     sessions: list[ApiSessionBase]
     next_cursor: str | None
     total_count: StrictInt | None = Field(default=None, ge=0)
+    usage: list[SessionUsageSummary] | None = Field(
+        default=None,
+        description=(
+            "Present only for `include=usage`: one exact usage summary per listed "
+            "session, in the same order as `sessions`."
+        ),
+    )
 
 
 class SessionTopologyRequest(ApiBaseModel):

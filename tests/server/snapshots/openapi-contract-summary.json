@@ -1,5 +1,23 @@
 {
   "components": {
+    "AccountingContract": {
+      "additionalProperties": false,
+      "description": "Server-owned token and cost accounting.\n\nClients read these endpoints instead of folding raw `model.completed`\nevents, which would skip cache, provider-attempt, and price-book semantics.",
+      "properties": {
+        "cost": {
+          "$ref": "#/components/schemas/SessionCostEndpointContract"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/SessionUsageEndpointContract"
+        }
+      },
+      "required": [
+        "usage",
+        "cost"
+      ],
+      "title": "AccountingContract",
+      "type": "object"
+    },
     "AgentsResponse": {
       "additionalProperties": false,
       "properties": {
@@ -6713,6 +6731,21 @@
             }
           ],
           "title": "Total Count"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/SessionUsageSummary"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only for `include=usage`: one exact usage summary per listed session, in the same order as `sessions`.",
+          "title": "Usage"
         }
       },
       "required": [
@@ -8747,6 +8780,9 @@
     "ServerContractResponse": {
       "additionalProperties": false,
       "properties": {
+        "accounting": {
+          "$ref": "#/components/schemas/AccountingContract"
+        },
         "api_prefix": {
           "default": "/api",
           "title": "Api Prefix",
@@ -8771,6 +8807,7 @@
         }
       },
       "required": [
+        "accounting",
         "capabilities"
       ],
       "title": "ServerContractResponse",
@@ -8882,6 +8919,44 @@
         "pricing"
       ],
       "title": "SessionCostBody",
+      "type": "object"
+    },
+    "SessionCostEndpointContract": {
+      "additionalProperties": false,
+      "description": "Estimated session cost from a caller-supplied price book.",
+      "properties": {
+        "method": {
+          "const": "POST",
+          "default": "POST",
+          "title": "Method",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "request_schema": {
+          "const": "SessionCostBody",
+          "default": "SessionCostBody",
+          "title": "Request Schema",
+          "type": "string"
+        },
+        "response_schema": {
+          "const": "SessionCostSummary",
+          "default": "SessionCostSummary",
+          "title": "Response Schema",
+          "type": "string"
+        },
+        "supported": {
+          "title": "Supported",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "path"
+      ],
+      "title": "SessionCostEndpointContract",
       "type": "object"
     },
     "SessionCostSummary": {
@@ -9921,6 +9996,63 @@
         "total_messages"
       ],
       "title": "SessionTranscriptResponse",
+      "type": "object"
+    },
+    "SessionUsageEndpointContract": {
+      "additionalProperties": false,
+      "description": "Exact session token usage, maintained incrementally by the session store.",
+      "properties": {
+        "conditional_request_header": {
+          "const": "If-None-Match",
+          "default": "If-None-Match",
+          "title": "Conditional Request Header",
+          "type": "string"
+        },
+        "etag_header": {
+          "const": "ETag",
+          "default": "ETag",
+          "title": "Etag Header",
+          "type": "string"
+        },
+        "method": {
+          "const": "GET",
+          "default": "GET",
+          "title": "Method",
+          "type": "string"
+        },
+        "not_modified_status": {
+          "const": 304,
+          "default": 304,
+          "title": "Not Modified Status",
+          "type": "integer"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "response_schema": {
+          "const": "SessionUsageSummary",
+          "default": "SessionUsageSummary",
+          "title": "Response Schema",
+          "type": "string"
+        },
+        "session_list_include": {
+          "const": "usage",
+          "default": "usage",
+          "description": "Pass as `include` on the session list to embed each session's usage.",
+          "title": "Session List Include",
+          "type": "string"
+        },
+        "supported": {
+          "title": "Supported",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "path"
+      ],
+      "title": "SessionUsageEndpointContract",
       "type": "object"
     },
     "SessionUsageSummary": {
@@ -15145,6 +15277,26 @@
           },
           {
             "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "const": "usage",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
+          },
+          {
+            "in": "query",
             "name": "label",
             "required": false,
             "schema": {
@@ -17236,6 +17388,22 @@
         "operation_id": "get_session_usage_api_sessions__session_id__usage_get",
         "parameters": [
           {
+            "in": "header",
+            "name": "if-none-match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-None-Match"
+            }
+          },
+          {
             "in": "path",
             "name": "session_id",
             "required": true,
@@ -17256,6 +17424,9 @@
                 "$ref": "#/components/schemas/SessionUsageSummary"
               }
             }
+          },
+          "304": {
+            "content": {}
           },
           "422": {
             "content": {

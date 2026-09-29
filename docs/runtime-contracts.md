@@ -7621,7 +7621,29 @@ message contract yet.
 
 `CayuApp.get_session_usage(session_id)` derives totals from durable session
 events. The optional FastAPI server exposes the same value at
-`GET /api/sessions/{session_id}/usage`. Usage summaries are observability
+`GET /api/sessions/{session_id}/usage`, and `GET /api/sessions?include=usage`
+returns one summary per listed session in a `usage` array aligned with
+`sessions`. `GET /api/contract` lists both accounting endpoints under
+`accounting.usage` and `accounting.cost`.
+
+Built-in session stores carry whole-session usage forward. A plain
+`read_usage_accounting(EventQuery(session_id=...))` keeps a per-store-instance
+snapshot keyed by session, accounting generation, the last accounted sequence,
+and the session's highest sequence already inspected, then reduces only rows
+appended after that boundary. A repeated read with no new events hydrates no
+event rows; a read after k appended events inspects those k rows. Per-session
+appends are serialized on every built-in store, so rows committed later always
+land above the boundary. Deleting usage-bearing events anywhere, through session
+deletion or retention pruning, advances the accounting generation and forces a
+cold read. Filtered, windowed, grouped, multi-session, and access-bounded reads
+bypass the carried-forward snapshot. The cache holds at most 4,096 sessions per
+store instance and is not shared across processes; each process pays one full
+read per session after start or after a generation change.
+
+The usage endpoint returns an `ETag` derived from the accounting generation and
+the last accounted sequence, and answers `If-None-Match` with `304 Not Modified`
+while both are unchanged. Applications should use these endpoints instead of
+folding raw `model.completed` events. Usage summaries are observability
 records; retry, budget, and stop policies should consume them instead of parsing
 provider-specific payloads directly. Their `usage` field is an
 `AggregateUsageMetrics`: individual completion counters remain signed 64-bit

@@ -178,6 +178,23 @@ source. Begin with `GET /api/contract`, honor its capability projection, use the
 detail APIs, and fail closed on an unsupported `contract_version`. Authentication,
 authorization, redaction, and capability contracts are identical regardless of frontend.
 
+Show tokens and cost with the accounting endpoints that the contract lists under
+`accounting.usage` and `accounting.cost`, each with its `path` and a `supported` flag:
+
+- `GET /api/sessions/{session_id}/usage` returns the session's `SessionUsageSummary`. The
+  session store carries the summary forward and reads only events appended since the
+  previous read, so polling does not get slower as the session grows. Each response has an
+  `ETag`; send it back as `If-None-Match` and the server answers `304 Not Modified` until the
+  usage changes.
+- `GET /api/sessions?include=usage` adds a `usage` array with one summary per listed session,
+  in the same order as `sessions`, so an overview page needs one request instead of one per
+  session.
+- `POST /api/sessions/{session_id}/cost` estimates cost from a `PriceBook` in the request body.
+
+Do not compute tokens or cost by folding raw `model.completed` events in the UI or in
+application code. That skips cache read and write counters, auxiliary provider attempts,
+hosted-tool usage, and price-book rules, and its cost grows with the whole event history.
+
 Provider-operation resolution is an explicit mutation capability. When session
 state reports `provider_operation_unavailable` or `ambiguous_submission`, the
 UI must display the exact `stage_id` and `run_epoch`, recovery reason,

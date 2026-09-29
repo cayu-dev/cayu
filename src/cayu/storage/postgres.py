@@ -25840,8 +25840,10 @@ class PostgresSessionStore(
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+        from cayu.runtime._usage_accounting import SessionUsageCache
 
         self._cost_accounting_authority = CostAccountingAuthority()
+        self._session_usage_cache = SessionUsageCache()
         self._clock = utc_clock(clock)
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
@@ -37983,12 +37985,17 @@ class PostgresSessionStore(
     ) -> UsageAccountingSnapshot:
         from cayu.runtime._usage_accounting import (
             USAGE_ACCOUNTING_PAGE_SIZE,
+            SessionUsageCache,
             UsageAccountingReducer,
             usage_accounting_query,
         )
 
         query = usage_accounting_query(query)
-        reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
+        cached_session_id = SessionUsageCache.session_scope(
+            query, by_session=by_session, by_identity=by_identity
+        )
+        prior = None
+        boundary = 0
         await self._ensure_ready()
         async with self._connection() as conn:
             async with conn.cursor() as cur:
@@ -38000,7 +38007,22 @@ class PostgresSessionStore(
                 if generation_row is None:
                     raise RuntimeError("Accounting deletion revision is missing.")
                 generation = generation_row[0]
+                if cached_session_id is not None:
+                    prior = self._session_usage_cache.resume_after(cached_session_id, generation)
+                    if prior is not None:
+                        query = copy_event_query(
+                            query, update={"after_sequence": prior.scanned_through}
+                        )
+                    # The session's event counter row lock serializes its appends,
+                    # so a later commit for this session cannot land below this.
+                    await cur.execute(
+                        "SELECT MAX(sequence) FROM cayu_events WHERE session_id = %s",
+                        (cached_session_id,),
+                    )
+                    boundary_row = await cur.fetchone()
+                    boundary = 0 if boundary_row is None else boundary_row[0] or 0
 
+            reducer = UsageAccountingReducer(query, by_session=by_session, by_identity=by_identity)
             plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
             # A named server cursor prevents libpq from buffering all rows in the
             # client, while REPEATABLE READ pins one snapshot across fetches.
@@ -38021,6 +38043,10 @@ class PostgresSessionStore(
                             for row in rows
                         ]
                     )
+            if cached_session_id is not None:
+                return self._session_usage_cache.settle(
+                    cached_session_id, generation, prior, reducer.snapshot(), boundary=boundary
+                )
             return reducer.snapshot().model_copy(update={"generation": generation})
 
     @runtime_session_query

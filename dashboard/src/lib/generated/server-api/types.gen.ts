@@ -5,6 +5,19 @@ export type ClientOptions = {
 };
 
 /**
+ * AccountingContract
+ *
+ * Server-owned token and cost accounting.
+ *
+ * Clients read these endpoints instead of folding raw `model.completed`
+ * events, which would skip cache, provider-attempt, and price-book semantics.
+ */
+export type AccountingContract = {
+    cost: SessionCostEndpointContract;
+    usage: SessionUsageEndpointContract;
+};
+
+/**
  * AgentAuthoringState
  *
  * Explicit application-authoring state carried by an agent specification.
@@ -9784,6 +9797,12 @@ export type ListSessionsResponse = {
      * Total Count
      */
     total_count?: number | null;
+    /**
+     * Usage
+     *
+     * Present only for `include=usage`: one exact usage summary per listed session, in the same order as `sessions`.
+     */
+    usage?: Array<SessionUsageSummary> | null;
 };
 
 /**
@@ -15423,6 +15442,7 @@ export type ServerContractActor = {
  * ServerContractResponse
  */
 export type ServerContractResponse = {
+    accounting: AccountingContract;
     /**
      * Api Prefix
      */
@@ -15488,6 +15508,34 @@ export type SessionCostBody = {
      */
     currency?: string;
     pricing: PriceBook;
+};
+
+/**
+ * SessionCostEndpointContract
+ *
+ * Estimated session cost from a caller-supplied price book.
+ */
+export type SessionCostEndpointContract = {
+    /**
+     * Method
+     */
+    method?: 'POST';
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Request Schema
+     */
+    request_schema?: 'SessionCostBody';
+    /**
+     * Response Schema
+     */
+    response_schema?: 'SessionCostSummary';
+    /**
+     * Supported
+     */
+    supported: boolean;
 };
 
 /**
@@ -16094,6 +16142,48 @@ export type SessionTranscriptResponse = {
      * Total Messages
      */
     total_messages: number;
+};
+
+/**
+ * SessionUsageEndpointContract
+ *
+ * Exact session token usage, maintained incrementally by the session store.
+ */
+export type SessionUsageEndpointContract = {
+    /**
+     * Conditional Request Header
+     */
+    conditional_request_header?: 'If-None-Match';
+    /**
+     * Etag Header
+     */
+    etag_header?: 'ETag';
+    /**
+     * Method
+     */
+    method?: 'GET';
+    /**
+     * Not Modified Status
+     */
+    not_modified_status?: 304;
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Response Schema
+     */
+    response_schema?: 'SessionUsageSummary';
+    /**
+     * Session List Include
+     *
+     * Pass as `include` on the session list to embed each session's usage.
+     */
+    session_list_include?: 'usage';
+    /**
+     * Supported
+     */
+    supported: boolean;
 };
 
 /**
@@ -22086,6 +22176,10 @@ export type ListSessionsApiSessionsGetData = {
          * Label Selector
          */
         label_selector?: Array<string> | null;
+        /**
+         * Include
+         */
+        include?: Array<'usage'> | null;
     };
     url: '/api/sessions';
 };
@@ -23195,6 +23289,12 @@ export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse = GetS
 
 export type GetSessionUsageApiSessionsSessionIdUsageGetData = {
     body?: never;
+    headers?: {
+        /**
+         * If-None-Match
+         */
+        'if-none-match'?: string | null;
+    };
     path: {
         /**
          * Session Id

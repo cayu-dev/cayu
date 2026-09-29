@@ -1790,8 +1790,10 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
     ) -> None:
         require_sqlite_store_allowed("SQLiteSessionStore")
         from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
+        from cayu.runtime._usage_accounting import SessionUsageCache
 
         self._cost_accounting_authority = CostAccountingAuthority()
+        self._session_usage_cache = SessionUsageCache()
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:
@@ -13383,12 +13385,16 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
     ) -> UsageAccountingSnapshot:
         from cayu.runtime._usage_accounting import (
             USAGE_ACCOUNTING_PAGE_SIZE,
+            SessionUsageCache,
             UsageAccountingReducer,
             usage_accounting_query,
         )
 
         query = usage_accounting_query(query)
         plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+        cached_session_id = SessionUsageCache.session_scope(
+            query, by_session=by_session, by_identity=by_identity
+        )
 
         def read(connection: sqlite3.Connection) -> UsageAccountingSnapshot:
             with connection:
@@ -13399,8 +13405,31 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 if generation_row is None:
                     raise RuntimeError("Accounting deletion revision is missing.")
                 generation = generation_row[0]
+                read_query = query
+                read_plan = plan
+                prior = None
+                boundary = 0
+                if cached_session_id is not None:
+                    prior = self._session_usage_cache.resume_after(cached_session_id, generation)
+                    if prior is not None:
+                        # A cached scope carries no access bounds, so this plan
+                        # adds only the sequence cursor to the one built above.
+                        read_query = copy_event_query(
+                            query, update={"after_sequence": prior.scanned_through}
+                        )
+                        read_plan = session_store_sql.build_accounting_event_query_sql(
+                            read_query, dialect=_SQL_DIALECT
+                        )
+                    # SQLite serializes writers, so later commits land above this.
+                    boundary = (
+                        connection.execute(
+                            "SELECT MAX(sequence) FROM cayu_events WHERE session_id = ?",
+                            (cached_session_id,),
+                        ).fetchone()[0]
+                        or 0
+                    )
                 reducer = UsageAccountingReducer(
-                    query, by_session=by_session, by_identity=by_identity
+                    read_query, by_session=by_session, by_identity=by_identity
                 )
                 event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
                 # One statement holds one read snapshot. fetchmany bounds hydration;
@@ -13408,8 +13437,8 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 cursor = connection.execute(
                     f"SELECT cayu_events.sequence, {event_columns} FROM cayu_events "
                     "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
-                    f"{plan.where_sql} ORDER BY cayu_events.sequence ASC",
-                    plan.params,
+                    f"{read_plan.where_sql} ORDER BY cayu_events.sequence ASC",
+                    read_plan.params,
                 )
                 try:
                     while rows := cursor.fetchmany(USAGE_ACCOUNTING_PAGE_SIZE):
@@ -13419,9 +13448,17 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                                 for row in rows
                             ]
                         )
-                    return reducer.snapshot().model_copy(update={"generation": generation})
                 finally:
                     cursor.close()
+                if cached_session_id is not None:
+                    return self._session_usage_cache.settle(
+                        cached_session_id,
+                        generation,
+                        prior,
+                        reducer.snapshot(),
+                        boundary=boundary,
+                    )
+                return reducer.snapshot().model_copy(update={"generation": generation})
 
         return await self._run_read(read)
 

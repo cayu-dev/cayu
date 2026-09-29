@@ -272,6 +272,7 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
+from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
@@ -340,6 +341,7 @@ from cayu.server.contracts import (
     STREAMING_ENDPOINT_RESPONSES,
     TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
     USAGE_ROLLUP_ENDPOINT_RESPONSES,
+    AccountingContract,
     AgentsResponse,
     ApiErrorResponse,
     ApiInteractionSummary,
@@ -410,12 +412,14 @@ from cayu.server.contracts import (
     PendingKnowledgeDetailResponse,
     PendingKnowledgeListResponse,
     ServerContractResponse,
+    SessionCostEndpointContract,
     SessionsSummaryResponse,
     SessionStateResponse,
     SessionSummaryResponse,
     SessionTopologyRequest,
     SessionTopologyResponse,
     SessionTranscriptResponse,
+    SessionUsageEndpointContract,
     SystemDiagnosticsResponse,
     UsageBreakdownItem,
     UsageRollupRequest,
@@ -473,6 +477,7 @@ from cayu.sessions.base import (
     SessionOutcome,
     SessionQuery,
     SessionStatus,
+    SessionStore,
     SessionTopologyCycle,
     SessionTopologyDepthExceeded,
     SessionTopologyNode,
@@ -2779,6 +2784,21 @@ def _require_safe_usage_session_authority(
             )
 
 
+def _session_usage_etag(snapshot: UsageAccountingSnapshot) -> str:
+    # Usage changes only when a usage-bearing event is appended (advancing the
+    # accounted sequence) or accounting evidence is deleted (advancing the
+    # generation), so the pair identifies one exact summary.
+    return f'"usage-{snapshot.generation}-{snapshot.through_sequence}"'
+
+
+def _if_none_match(header: str, etag: str) -> bool:
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate == "*" or candidate.removeprefix("W/") == etag:
+            return True
+    return False
+
+
 def _serialize_session_cursor(cayu_app: Any, cursor: str | None) -> str | None:
     """Return a pagination cursor only when its keyset authority is secret-free."""
 
@@ -4309,6 +4329,18 @@ def create_router(
             eval_runtime is not None and eval_runtime.store.captured_results
         ),
     )
+    accounting_contract = AccountingContract(
+        usage=SessionUsageEndpointContract(
+            supported=type(session_store).read_usage_accounting
+            is not SessionStore.read_usage_accounting,
+            path=f"{api_prefix}/sessions/{{session_id}}/usage",
+        ),
+        cost=SessionCostEndpointContract(
+            supported=type(session_store).read_cost_accounting
+            is not SessionStore.read_cost_accounting,
+            path=f"{api_prefix}/sessions/{{session_id}}/cost",
+        ),
+    )
     if dashboard_access_authenticated is None and dashboard_configured:
         dashboard_access_authenticated = auth is not None
     diagnostics_snapshot = inspect_system_diagnostics(
@@ -4614,6 +4646,7 @@ def create_router(
         response.headers["Cache-Control"] = "private, no-store"
         return ServerContractResponse(
             api_prefix=api_prefix,
+            accounting=accounting_contract,
             client_generation=ClientGenerationContract(openapi_url=openapi_url),
             capabilities=capability_snapshot.project(
                 auth_context,
@@ -10192,6 +10225,7 @@ def create_router(
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
         label_selector: Annotated[list[str] | None, Query()] = None,
+        include: Annotated[list[Literal["usage"]] | None, Query()] = None,
     ):
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
@@ -10228,10 +10262,22 @@ def create_router(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        usage = None
+        if include is not None and "usage" in include:
+            # Each read is incremental in the session store, so a polled page
+            # costs the events appended since the last poll, not full histories.
+            usage = [
+                cayu_app._expose_session_usage_snapshot(
+                    session.id,
+                    await session_store.read_usage_accounting(EventQuery(session_id=session.id)),
+                ).summary
+                for session in result.sessions
+            ]
         return {
             "sessions": [_serialize_session_base(cayu_app, session) for session in result.sessions],
             "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
             "total_count": result.total_count,
+            "usage": usage,
         }
 
     async def get_session_topology(
@@ -10619,14 +10665,23 @@ def create_router(
     @router.get(
         "/sessions/{session_id}/usage",
         response_model=SessionUsageSummary,
+        responses={304: {"description": "The summary still matches `If-None-Match`."}},
         dependencies=protected,
     )
-    async def get_session_usage(session_id: NonBlankString):
+    async def get_session_usage(
+        session_id: NonBlankString,
+        response: Response,
+        if_none_match: Annotated[str | None, Header()] = None,
+    ):
         try:
-            summary = await cayu_app.get_session_usage(session_id)
+            snapshot = await cayu_app._session_usage_snapshot(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        return summary
+        headers = {"ETag": _session_usage_etag(snapshot), "Cache-Control": "private, no-cache"}
+        if if_none_match is not None and _if_none_match(if_none_match, headers["ETag"]):
+            return Response(status_code=304, headers=headers)
+        response.headers.update(headers)
+        return snapshot.summary
 
     @router.post(
         "/sessions/{session_id}/cost",

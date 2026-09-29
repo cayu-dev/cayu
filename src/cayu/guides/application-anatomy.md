@@ -207,6 +207,21 @@ is an explicit development extra such as `cayu[console]`; a production process
 does not need to install REPL tooling merely because the project declares a
 factory.
 
+## Usage and cost
+
+Read token usage and cost from Cayu instead of computing them in the
+application. In Python, call `await app.get_session_usage(session_id)` and
+`await app.get_session_cost(session_id, pricing)`. Over HTTP, use
+`GET /api/sessions/{session_id}/usage`, `GET /api/sessions?include=usage` for a
+page of sessions, and `POST /api/sessions/{session_id}/cost`; `GET /api/contract`
+lists these paths under `accounting`. Usage reads are incremental in every
+built-in session store, and the HTTP usage endpoint supports `ETag` and
+`If-None-Match`, so a UI can poll it cheaply.
+
+Do not fold raw `model.completed` events to compute tokens or cost. That misses
+cache counters, auxiliary provider attempts, hosted-tool usage, and price-book
+rules, and it rereads the whole event history on every refresh.
+
 ## Anti-patterns
 
 Avoid these shapes:
@@ -214,7 +229,8 @@ Avoid these shapes:
 - a module-global `CayuApp` used as shared application state;
 - calling `build_app()` during module import;
 - starting migrations, recovery, workers, watchers, schedulers, models, or tools
-  as an import side effect; and
+  as an import side effect;
+- summing `model.completed` event payloads to show tokens or cost; and
 - treating the console-local `app` binding as a runtime-wide registry.
 
 ## Verify the contract
